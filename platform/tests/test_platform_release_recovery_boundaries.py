@@ -6,8 +6,10 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -82,7 +84,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertFalse((self.app_dir / "previous").exists())
         self.assertFalse(candidate.exists())
 
-    def test_immutable_recovery_wrapper_first_install_validates_but_does_not_use_snapshot(
+    def test_immutable_recovery_wrapper_first_install_restores_transaction_systemd_snapshot(
         self,
     ) -> None:
         generation = self.install_recovery_generation()
@@ -92,9 +94,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "first-install-complete-snapshot",
             complete_snapshot=True,
         )
-        systemctl, systemctl_log = self.write_failing_systemctl(
-            "first-install-complete-snapshot"
-        )
+        systemctl = self.write_initial_systemctl()
+        self.run_transaction("capture-initial-systemd", "--systemctl", str(systemctl))
 
         result = self.run_script(
             generation / RECOVERY_WRAPPER.name,
@@ -106,9 +107,56 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(systemctl_log.exists())
         self.assertFalse((self.shared / STATE_NAME).exists())
         self.assertFalse(candidate.exists())
+        enabled = json.loads((self.root / "systemd-enabled.json").read_text())
+        state = json.loads((self.root / "systemd-state.json").read_text())
+        for unit in (
+            "deadlock-api.service",
+            "deadlock-worker.service",
+            "deadlock-web.service",
+            "deadlock-maintenance.timer",
+            "deadlock-logrotate.timer",
+            "deadlock-cloudflare-ips.timer",
+            "deadlock-health-monitor.timer",
+        ):
+            self.assertEqual(enabled[unit], "disabled", unit)
+        for unit in (
+            "deadlock-api",
+            "deadlock-worker",
+            "deadlock-web",
+            "deadlock-maintenance.timer",
+            "deadlock-logrotate.timer",
+            "deadlock-cloudflare-ips.timer",
+            "deadlock-health-monitor.timer",
+        ):
+            self.assertEqual(state[unit], "inactive", unit)
+
+    def test_pending_recovery_first_install_restores_before_cleanup(self) -> None:
+        generation = self.install_recovery_generation()
+        candidate = self.create_wrapper_transaction(
+            None,
+            None,
+            "pending-first-install-systemd",
+            complete_snapshot=True,
+        )
+        systemctl = self.write_initial_systemctl()
+        self.run_transaction("capture-initial-systemd", "--systemctl", str(systemctl))
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+        log = (self.root / "systemctl.log").read_text(encoding="utf-8")
+        self.assertIn("stop deadlock-api.service", log)
+        self.assertIn("disable deadlock-health-monitor.timer", log)
+        self.assertNotIn("offsite", log)
 
     def test_operationless_first_install_quiesce_v1_v2_is_systemd_free(self) -> None:
         """Pre-promotion first-install receipts are validated as no-op cleanup."""
@@ -869,6 +917,24 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                     self.assertTrue((tree / "linked.txt").is_symlink())
                 else:
                     self.assertTrue((tree / "special").exists())
+
+    def test_recursive_release_cleanup_unlinks_allowed_symlink_without_chmod_target(self) -> None:
+        tree = self.root / "cleanup-venv-symlink"
+        tree.mkdir(mode=0o700)
+        outside = self.root / "external-venv-target"
+        outside.mkdir(mode=0o555)
+        (outside / "marker").write_text("must remain", encoding="ascii")
+        link = tree / "lib64"
+        link.symlink_to(outside, target_is_directory=True)
+        before_mode = stat.S_IMODE(outside.stat().st_mode)
+
+        transaction._remove_tree(tree, allowed_symlink_roots=(tree,))
+
+        self.assertFalse(tree.exists())
+        self.assertFalse(link.exists())
+        self.assertTrue(outside.exists())
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), before_mode)
+        self.assertEqual((outside / "marker").read_text(encoding="ascii"), "must remain")
 
     def test_recursive_release_cleanup_quarantines_only_rechecked_inode(self) -> None:
         tree = self.root / "cleanup-race"
@@ -2561,6 +2627,775 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertFalse(systemctl_log.exists())
         self.assertIn("-m alembic upgrade head", fake_python_log.read_text(encoding="utf-8"))
 
+    def test_first_install_activation_uses_durable_transaction_boundary(self) -> None:
+        """Production deploy activates seven units only after the durable boundary."""
+
+        candidate, systemctl, enabled_path = self.prepare_initial_systemd_activation_state(
+            "first-install-activation"
+        )
+        installer = candidate / "tools/platform_install_systemd_units.sh"
+        installer.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "if [[ \"${PLATFORM_ENABLE_SYSTEMD_UNITS:-0}\" != 1 ]]; then exit 0; fi\n"
+            f"{systemctl} enable deadlock-api.service deadlock-worker.service deadlock-web.service\n"
+            f"{systemctl} enable deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n"
+            f"{systemctl} start deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n",
+            encoding="utf-8",
+        )
+        installer.chmod(0o755)
+        receipt = json.loads((self.shared / STATE_NAME).read_text(encoding="ascii"))
+        self.assertEqual(
+            set(receipt["systemd_state_before"]),
+            {
+                "deadlock-api.service",
+                "deadlock-worker.service",
+                "deadlock-web.service",
+                "deadlock-maintenance.timer",
+                "deadlock-logrotate.timer",
+                "deadlock-cloudflare-ips.timer",
+                "deadlock-health-monitor.timer",
+            },
+        )
+        self.assertNotIn("deadlock-offsite-backup.timer", receipt["systemd_state_before"])
+        deploy = self.copy_deploy_script_with_fault(
+            "deploy-first-install-activation.sh", None, None, systemctl
+        )
+        result = self.run_script(
+            deploy,
+            "--resume",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="first-install"),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertEqual((self.app_dir / "current").resolve(), candidate)
+        final_enabled = json.loads(enabled_path.read_text(encoding="utf-8"))
+        for unit in (
+            "deadlock-api.service",
+            "deadlock-worker.service",
+            "deadlock-web.service",
+            "deadlock-maintenance.timer",
+            "deadlock-logrotate.timer",
+            "deadlock-cloudflare-ips.timer",
+            "deadlock-health-monitor.timer",
+        ):
+            self.assertEqual(final_enabled[unit], "enabled", unit)
+        self.assertEqual(final_enabled["deadlock-offsite-backup.timer"], "disabled")
+        final_state = json.loads((self.root / "systemd-state.json").read_text())
+        for unit in (
+            "deadlock-api",
+            "deadlock-worker",
+            "deadlock-web",
+            "deadlock-maintenance.timer",
+            "deadlock-logrotate.timer",
+            "deadlock-cloudflare-ips.timer",
+            "deadlock-health-monitor.timer",
+        ):
+            self.assertEqual(final_state[unit], "active", unit)
+        log = (self.root / "systemctl.log").read_text(encoding="utf-8")
+        self.assertNotIn("offsite", log)
+        self.assertLess(log.index("disable deadlock-api.service"), log.index("enable deadlock-api.service"))
+
+    def test_first_install_systemd_failures_restore_receipt_before_retry(self) -> None:
+        """Enablement/readiness failures retain and restore the same receipt."""
+
+        for failure in ("service-enable", "timer-enable", "readiness"):
+            with self.subTest(failure=failure):
+                self.tearDown()
+                self.setUp()
+                candidate, systemctl, enabled_path = self.prepare_initial_systemd_activation_state(
+                    f"first-install-failure-{failure}"
+                )
+                mode_path = self.root / "initial-systemd-failure"
+                mode_path.write_text(failure + "\n", encoding="ascii")
+                installer = candidate / "tools/platform_install_systemd_units.sh"
+                installer.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "set -euo pipefail\n"
+                    "if [[ \"${PLATFORM_ENABLE_SYSTEMD_UNITS:-0}\" != 1 ]]; then exit 0; fi\n"
+                    f"{systemctl} enable deadlock-api.service deadlock-worker.service deadlock-web.service\n"
+                    f"if [[ \"$(cat {mode_path})\" == service-enable ]]; then exit 41; fi\n"
+                    f"{systemctl} enable deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n"
+                    f"if [[ \"$(cat {mode_path})\" == timer-enable ]]; then exit 42; fi\n"
+                    f"{systemctl} start deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n",
+                    encoding="utf-8",
+                )
+                installer.chmod(0o755)
+                if failure == "readiness":
+                    failed_deploy = self.copy_deploy_script_with_fault(
+                        "deploy-first-install-readiness-failure.sh",
+                        "  set_phase systemd-activation-pending systemd-activated\n",
+                        "  /bin/false\n  set_phase systemd-activation-pending systemd-activated\n",
+                        systemctl,
+                    )
+                else:
+                    failed_deploy = self.copy_deploy_script_with_fault(
+                        f"deploy-first-install-{failure}-failure.sh", None, None, systemctl
+                    )
+                result = self.run_script(
+                    failed_deploy,
+                    "--resume",
+                    "--app-dir",
+                    str(self.app_dir),
+                    env=self.runtime_env(label=f"first-install-{failure}"),
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.state_phase(), "systemd-activation-pending")
+                self.assertTrue((self.shared / STATE_NAME).exists())
+                record = json.loads((self.shared / STATE_NAME).read_text(encoding="ascii"))
+                self.assertEqual(record["systemd_state_before"]["deadlock-api.service"]["active"], "inactive")
+                live_state = json.loads((self.root / "systemd-state.json").read_text())
+                self.assertTrue(all(live_state.get(unit) == "inactive" for unit in (
+                    "deadlock-api", "deadlock-worker", "deadlock-web",
+                    "deadlock-maintenance.timer", "deadlock-logrotate.timer",
+                    "deadlock-cloudflare-ips.timer", "deadlock-health-monitor.timer",
+                )))
+                live_enabled = json.loads(enabled_path.read_text(encoding="utf-8"))
+                self.assertTrue(all(live_enabled[unit] == "disabled" for unit in (
+                    "deadlock-api.service", "deadlock-worker.service", "deadlock-web.service",
+                    "deadlock-maintenance.timer", "deadlock-logrotate.timer",
+                    "deadlock-cloudflare-ips.timer", "deadlock-health-monitor.timer",
+                )))
+                self.assertNotIn("offsite", (self.root / "systemctl.log").read_text())
+                mode_path.write_text("none\n", encoding="ascii")
+                resume = self.copy_deploy_script_with_fault(
+                    f"deploy-first-install-{failure}-retry.sh", None, None, systemctl
+                )
+                result = self.run_script(
+                    resume,
+                    "--resume",
+                    "--app-dir",
+                    str(self.app_dir),
+                    env=self.runtime_env(label=f"first-install-{failure}-retry"),
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((self.shared / STATE_NAME).exists())
+                self.assertEqual((self.app_dir / "current").resolve(), candidate)
+
+    def test_first_install_post_activation_failure_rewinds_phase_before_retry(self) -> None:
+        """A failure after either activation marker must leave a retryable phase."""
+
+        for marker in (
+            "systemd-activation-pending systemd-activated",
+            "systemd-activated activation-committed",
+        ):
+            with self.subTest(marker=marker):
+                self.tearDown()
+                self.setUp()
+                candidate, systemctl, enabled_path = self.prepare_initial_systemd_activation_state(
+                    f"first-install-post-{marker.split()[-1]}"
+                )
+                installer = candidate / "tools/platform_install_systemd_units.sh"
+                installer.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "set -euo pipefail\n"
+                    "if [[ \"${PLATFORM_ENABLE_SYSTEMD_UNITS:-0}\" != 1 ]]; then exit 0; fi\n"
+                    f"{systemctl} enable deadlock-api.service deadlock-worker.service deadlock-web.service\n"
+                    f"{systemctl} enable deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n"
+                    f"{systemctl} start deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n",
+                    encoding="utf-8",
+                )
+                installer.chmod(0o755)
+                needle = f"  set_phase {marker}\n"
+                failed_deploy = self.copy_deploy_script_with_fault(
+                    f"deploy-first-install-post-{marker.split()[-1]}-failure.sh",
+                    needle,
+                    needle + "  /bin/false\n",
+                    systemctl,
+                )
+                result = self.run_script(
+                    failed_deploy,
+                    "--resume",
+                    "--app-dir",
+                    str(self.app_dir),
+                    env=self.runtime_env(label=f"first-install-post-{marker.split()[-1]}"),
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.state_phase(), "systemd-activation-pending")
+                self.assertTrue((self.shared / STATE_NAME).exists())
+                enabled = json.loads(enabled_path.read_text(encoding="utf-8"))
+                self.assertTrue(
+                    all(
+                        enabled[unit] == "disabled"
+                        for unit in (
+                            "deadlock-api.service",
+                            "deadlock-worker.service",
+                            "deadlock-web.service",
+                            "deadlock-maintenance.timer",
+                            "deadlock-logrotate.timer",
+                            "deadlock-cloudflare-ips.timer",
+                            "deadlock-health-monitor.timer",
+                        )
+                    )
+                )
+                retry = self.copy_deploy_script_with_fault(
+                    f"deploy-first-install-post-{marker.split()[-1]}-retry.sh",
+                    None,
+                    None,
+                    systemctl,
+                )
+                result = self.run_script(
+                    retry,
+                    "--resume",
+                    "--app-dir",
+                    str(self.app_dir),
+                    env=self.runtime_env(label=f"first-install-post-{marker.split()[-1]}-retry"),
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((self.shared / STATE_NAME).exists())
+                self.assertEqual((self.app_dir / "current").resolve(), candidate)
+
+    def test_first_install_sigkill_after_activation_marker_resumes(self) -> None:
+        """SIGKILL after either durable activation marker remains resumable."""
+
+        for marker in (
+            "systemd-activation-pending systemd-activated",
+            "systemd-activated activation-committed",
+        ):
+            with self.subTest(marker=marker):
+                self.tearDown()
+                self.setUp()
+                candidate, systemctl, enabled_path = self.prepare_initial_systemd_activation_state(
+                    f"first-install-kill-{marker.split()[-1]}"
+                )
+                installer = candidate / "tools/platform_install_systemd_units.sh"
+                installer.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "set -euo pipefail\n"
+                    "if [[ \"${PLATFORM_ENABLE_SYSTEMD_UNITS:-0}\" != 1 ]]; then exit 0; fi\n"
+                    f"{systemctl} enable deadlock-api.service deadlock-worker.service deadlock-web.service\n"
+                    f"{systemctl} enable deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n"
+                    f"{systemctl} start deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n",
+                    encoding="utf-8",
+                )
+                installer.chmod(0o755)
+                needle = f"  set_phase {marker}\n"
+                interrupted = self.copy_deploy_script_with_fault(
+                    f"deploy-first-install-kill-{marker.split()[-1]}.sh",
+                    needle,
+                    needle + '  /bin/kill -KILL "$$"\n',
+                    systemctl,
+                )
+                result = self.run_script(
+                    interrupted,
+                    "--resume",
+                    "--app-dir",
+                    str(self.app_dir),
+                    env=self.runtime_env(label=f"first-install-kill-{marker.split()[-1]}"),
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.state_phase(), marker.split()[-1])
+                enabled = json.loads(enabled_path.read_text(encoding="utf-8"))
+                self.assertTrue(
+                    all(
+                        enabled[unit] == "enabled"
+                        for unit in (
+                            "deadlock-api.service",
+                            "deadlock-worker.service",
+                            "deadlock-web.service",
+                            "deadlock-maintenance.timer",
+                            "deadlock-logrotate.timer",
+                            "deadlock-cloudflare-ips.timer",
+                            "deadlock-health-monitor.timer",
+                        )
+                    )
+                )
+                retry = self.copy_deploy_script_with_fault(
+                    f"deploy-first-install-kill-{marker.split()[-1]}-retry.sh",
+                    None,
+                    None,
+                    systemctl,
+                )
+                result = self.run_script(
+                    retry,
+                    "--resume",
+                    "--app-dir",
+                    str(self.app_dir),
+                    env=self.runtime_env(label=f"first-install-kill-{marker.split()[-1]}-retry"),
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((self.shared / STATE_NAME).exists())
+                self.assertEqual((self.app_dir / "current").resolve(), candidate)
+
+    def test_first_install_abort_restores_systemd_before_removing_candidate(self) -> None:
+        candidate, systemctl, enabled_path = self.prepare_initial_systemd_activation_state(
+            "first-install-abort"
+        )
+        installer = candidate / "tools/platform_install_systemd_units.sh"
+        installer.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            "if [[ \"${PLATFORM_ENABLE_SYSTEMD_UNITS:-0}\" != 1 ]]; then exit 0; fi\n"
+            f"{systemctl} enable deadlock-api.service deadlock-worker.service deadlock-web.service\n"
+            f"{systemctl} enable deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n"
+            f"{systemctl} start deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n"
+            "exit 42\n",
+            encoding="utf-8",
+        )
+        installer.chmod(0o755)
+        failed = self.copy_deploy_script_with_fault(
+            "deploy-first-install-abort-failure.sh", None, None, systemctl
+        )
+        result = self.run_script(
+            failed,
+            "--resume",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="first-install-abort"),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+        self.assertFalse(os.path.lexists(self.app_dir / "current"))
+        enabled = json.loads(enabled_path.read_text(encoding="utf-8"))
+        self.assertEqual(enabled["deadlock-api.service"], "disabled")
+        self.assertEqual(enabled["deadlock-maintenance.timer"], "disabled")
+        self.assertNotIn("offsite", (self.root / "systemctl.log").read_text())
+
+    def test_first_install_abort_verifies_baseline_at_staged_and_restored_phases(self) -> None:
+        for phase in ("staged", "recovery-restored"):
+            with self.subTest(phase=phase):
+                self.tearDown()
+                self.setUp()
+                if phase == "staged":
+                    candidate = self.create_wrapper_transaction(
+                        None,
+                        None,
+                        "first-install-abort-staged-baseline",
+                        complete_snapshot=True,
+                    )
+                    systemctl = self.write_initial_systemctl()
+                    self.run_transaction(
+                        "capture-initial-systemd", "--systemctl", str(systemctl)
+                    )
+                else:
+                    candidate, systemctl, _enabled_path = self.prepare_initial_systemd_activation_state(
+                        "first-install-abort-restored-baseline"
+                    )
+                    # ``recover`` refuses an uncertain activation phase until
+                    # the operator has durably acknowledged that migration
+                    # was not reversed.  The deploy abort path then owns the
+                    # final baseline proof and cleanup for recovery-restored.
+                    self.run_transaction(
+                        "authorize-recovery", "--confirm", "MIGRATION_NOT_REVERSED"
+                    )
+                    self.run_transaction("recover", "--retain")
+                    self.assertEqual(self.state_phase(), "recovery-restored")
+                abort = self.copy_abort_script_with_systemctl(systemctl)
+                result = self.run_script(
+                    abort,
+                    "--abort-retained",
+                    "--confirm-migration-not-reversed",
+                    "--app-dir",
+                    str(self.app_dir),
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((self.shared / STATE_NAME).exists())
+                self.assertFalse(candidate.exists())
+
+    def test_first_install_abort_retries_partial_systemd_restore_before_cleanup(self) -> None:
+        """A killed restore retains the receipt and retries before cleanup."""
+
+        candidate, systemctl, _enabled_path = self.prepare_initial_systemd_activation_state(
+            "first-install-abort-partial-restore"
+        )
+        for expected, next_phase in (
+            ("activation-pending", "services-restarted"),
+            ("services-restarted", "nginx-pending"),
+            ("nginx-pending", "nginx-applied"),
+            ("nginx-applied", "smoke-passed"),
+            ("smoke-passed", "systemd-activation-pending"),
+            ("systemd-activation-pending", "systemd-activated"),
+        ):
+            self.run_transaction("phase", "--expected", expected, "--phase", next_phase)
+        units = (
+            "deadlock-api.service",
+            "deadlock-worker.service",
+            "deadlock-web.service",
+            "deadlock-maintenance.timer",
+            "deadlock-logrotate.timer",
+            "deadlock-cloudflare-ips.timer",
+            "deadlock-health-monitor.timer",
+        )
+        subprocess.run([str(systemctl), "enable", *units], check=True)
+        subprocess.run([str(systemctl), "start", *units], check=True)
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        interrupted = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            env={"PLATFORM_TEST_SYSTEMCTL_KILL_AFTER": "stop deadlock-api.service"},
+            check=False,
+        )
+        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertEqual(self.state_phase(), "systemd-activated")
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertTrue(candidate.exists())
+
+        retry = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+        self.assertFalse(os.path.lexists(self.app_dir / "current"))
+
+    def test_initial_systemd_restore_has_per_call_and_aggregate_deadlines(self) -> None:
+        _candidate, systemctl, _enabled_path = self.prepare_initial_systemd_activation_state(
+            "first-install-systemd-deadlines"
+        )
+        with mock.patch.object(
+            transaction.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired([str(systemctl), "stop"], 30),
+        ) as run:
+            with self.assertRaises(transaction.TransactionError):
+                transaction._run_systemctl(str(systemctl), "stop", "deadlock-api.service")
+        self.assertEqual(run.call_args.kwargs["timeout"], transaction.SYSTEMD_CALL_TIMEOUT_SECONDS)
+
+        deadlines: list[float | None] = []
+
+        def record_systemctl(
+            _systemctl: str, *_arguments: str, deadline: float | None = None
+        ) -> str:
+            deadlines.append(deadline)
+            return ""
+
+        start = time.monotonic()
+        with mock.patch.object(transaction, "_run_systemctl", side_effect=record_systemctl):
+            with mock.patch.object(
+                transaction, "_verify_initial_systemd_snapshot", return_value=None
+            ):
+                transaction.restore_initial_systemd(
+                    self.shared / STATE_NAME, systemctl=str(systemctl)
+                )
+        self.assertEqual(
+            len(deadlines), 2 * len(transaction.INITIAL_SYSTEMD_UNITS)
+        )
+        self.assertEqual(len(set(deadlines)), 1)
+        assert deadlines[0] is not None
+        self.assertGreater(deadlines[0], start)
+        self.assertLessEqual(
+            deadlines[0] - start,
+            transaction.SYSTEMD_OPERATION_TIMEOUT_SECONDS + 1.0,
+        )
+
+    def test_first_install_recovery_authorized_requires_verified_baseline(self) -> None:
+        """An authorized receipt cannot clean up while units are still active."""
+
+        candidate, systemctl, _enabled_path = self.prepare_initial_systemd_activation_state(
+            "first-install-authorized-window"
+        )
+        for expected, next_phase in (
+            ("activation-pending", "services-restarted"),
+            ("services-restarted", "nginx-pending"),
+            ("nginx-pending", "nginx-applied"),
+            ("nginx-applied", "smoke-passed"),
+            ("smoke-passed", "systemd-activation-pending"),
+            ("systemd-activation-pending", "systemd-activated"),
+        ):
+            self.run_transaction("phase", "--expected", expected, "--phase", next_phase)
+        units = (
+            "deadlock-api.service",
+            "deadlock-worker.service",
+            "deadlock-web.service",
+            "deadlock-maintenance.timer",
+            "deadlock-logrotate.timer",
+            "deadlock-cloudflare-ips.timer",
+            "deadlock-health-monitor.timer",
+        )
+        subprocess.run([str(systemctl), "enable", *units], check=True)
+        subprocess.run([str(systemctl), "start", *units], check=True)
+        self.run_transaction(
+            "authorize-recovery", "--confirm", "MIGRATION_NOT_REVERSED"
+        )
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        failed = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertTrue(candidate.exists())
+        self.assertEqual(self.state_phase(), "recovery-authorized")
+        state = json.loads((self.root / "systemd-state.json").read_text())
+        self.assertTrue(
+            all(
+                state[unit] == "inactive"
+                for unit in (
+                    "deadlock-api",
+                    "deadlock-worker",
+                    "deadlock-web",
+                    "deadlock-maintenance.timer",
+                    "deadlock-logrotate.timer",
+                    "deadlock-cloudflare-ips.timer",
+                    "deadlock-health-monitor.timer",
+                )
+            )
+        )
+        retry = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+
+    def test_initial_systemd_shell_budget_bounds_hanging_installer(self) -> None:
+        """The shell boundary caps an installer hang and retains recovery state."""
+
+        candidate, systemctl, _enabled_path = self.prepare_initial_systemd_activation_state(
+            "first-install-systemd-shell-budget"
+        )
+        installer = candidate / "tools/platform_install_systemd_units.sh"
+        installer.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "if [[ \"${PLATFORM_ENABLE_SYSTEMD_UNITS:-0}\" != 1 ]]; then exit 0; fi\n"
+            f"{systemctl} enable deadlock-api.service deadlock-worker.service deadlock-web.service\n"
+            f"{systemctl} enable deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n"
+            f"{systemctl} start deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n",
+            encoding="utf-8",
+        )
+        installer.chmod(0o755)
+        deploy = self.copy_deploy_script_with_fault(
+            "deploy-first-install-systemd-shell-budget.sh", None, None, systemctl
+        )
+        deploy.write_text(
+            deploy.read_text(encoding="utf-8").replace(
+                "SYSTEMD_OPERATION_TIMEOUT_SECONDS=120",
+                "SYSTEMD_OPERATION_TIMEOUT_SECONDS=2",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        deploy.chmod(0o755)
+        started = time.monotonic()
+        result = self.run_script(
+            deploy,
+            "--resume",
+            "--app-dir",
+            str(self.app_dir),
+            env={
+                **self.runtime_env(label="first-install-systemd-shell-budget"),
+                "PLATFORM_TEST_SYSTEMCTL_SLEEP_SECONDS": "10",
+                "PLATFORM_TEST_SYSTEMCTL_SLEEP_ACTION": "enable",
+            },
+            check=False,
+        )
+        elapsed = time.monotonic() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(elapsed, 12.0, result.stderr)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertTrue(candidate.exists())
+        self.assertEqual(self.state_phase(), "systemd-activation-pending")
+
+    def test_initial_live_qa_reconcile_budget_retains_receipt_and_retries(self) -> None:
+        """A hanging live-QA reconcile is bounded before activation can continue."""
+
+        candidate, systemctl, _enabled_path = self.prepare_initial_systemd_activation_state(
+            "first-install-liveqa-reconcile"
+        )
+        self.install_initial_systemd_units_fixture(candidate, systemctl)
+        mode_path = self.root / "liveqa-reconcile-mode"
+        log_path = self.root / "liveqa-reconcile.log"
+        self.install_live_qa_reconcile_fixture(candidate, mode_path, log_path)
+        mode_path.write_text("hang\n", encoding="ascii")
+        deploy = self.copy_deploy_script_with_fault(
+            "deploy-first-install-liveqa-reconcile.sh", None, None, systemctl
+        )
+        deploy.write_text(
+            deploy.read_text(encoding="utf-8").replace(
+                "SYSTEMD_OPERATION_TIMEOUT_SECONDS=120",
+                "SYSTEMD_OPERATION_TIMEOUT_SECONDS=2",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        deploy.chmod(0o755)
+
+        started = time.monotonic()
+        result = self.run_script(
+            deploy,
+            "--resume",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="first-install-liveqa-reconcile"),
+            check=False,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 12.0, result.stderr)
+        self.assertEqual(self.state_phase(), "activation-pending")
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertTrue(candidate.exists())
+        self.assertIn("reconcile\n", log_path.read_text(encoding="ascii"))
+
+        mode_path.write_text("ok\n", encoding="ascii")
+        retry = self.copy_deploy_script_with_fault(
+            "deploy-first-install-liveqa-reconcile-retry.sh", None, None, systemctl
+        )
+        result = self.run_script(
+            retry,
+            "--resume",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="first-install-liveqa-reconcile-retry"),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertEqual((self.app_dir / "current").resolve(), candidate)
+
+    def test_initial_activation_readiness_budget_retains_receipt_and_retries(self) -> None:
+        """Both activation readiness phases enforce the same aggregate budget."""
+
+        for target_phase in ("activation-pending", "systemd-activation-pending"):
+            with self.subTest(target_phase=target_phase):
+                self.tearDown()
+                self.setUp()
+                candidate, systemctl, _enabled_path = self.prepare_initial_systemd_activation_state(
+                    f"first-install-readiness-{target_phase}"
+                )
+                self.install_initial_systemd_units_fixture(candidate, systemctl)
+                if target_phase == "systemd-activation-pending":
+                    interrupted = self.copy_deploy_script_with_fault(
+                        "deploy-first-install-readiness-phase-kill.sh",
+                        "    set_phase smoke-passed systemd-activation-pending\n",
+                        "    set_phase smoke-passed systemd-activation-pending\n"
+                        '    /bin/kill -KILL "$$"\n',
+                        systemctl,
+                    )
+                    result = self.run_script(
+                        interrupted,
+                        "--resume",
+                        "--app-dir",
+                        str(self.app_dir),
+                        env=self.runtime_env(
+                            label=f"first-install-readiness-{target_phase}-interrupted"
+                        ),
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.state_phase(), target_phase)
+
+                mode_path = self.root / f"readiness-{target_phase}-mode"
+                log_path = self.root / f"readiness-{target_phase}.log"
+                curl = self.write_hanging_curl(mode_path, log_path)
+                mode_path.write_text("hang\n", encoding="ascii")
+                timeout_seconds = 2 if target_phase == "activation-pending" else 10
+                deploy = self.copy_deploy_script_with_curl(
+                    f"deploy-first-install-readiness-{target_phase}.sh",
+                    systemctl,
+                    curl,
+                    timeout_seconds=timeout_seconds,
+                )
+                started = time.monotonic()
+                result = self.run_script(
+                    deploy,
+                    "--resume",
+                    "--app-dir",
+                    str(self.app_dir),
+                    env=self.runtime_env(label=f"first-install-readiness-{target_phase}"),
+                    check=False,
+                )
+                elapsed = time.monotonic() - started
+
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertLess(elapsed, 20.0, result.stderr)
+                self.assertEqual(self.state_phase(), target_phase)
+                self.assertTrue((self.shared / STATE_NAME).exists())
+                self.assertTrue(candidate.exists())
+                self.assertTrue(log_path.read_text(encoding="ascii"))
+
+                mode_path.write_text("ok\n", encoding="ascii")
+                retry = self.copy_deploy_script_with_curl(
+                    f"deploy-first-install-readiness-{target_phase}-retry.sh",
+                    systemctl,
+                    curl,
+                )
+                result = self.run_script(
+                    retry,
+                    "--resume",
+                    "--app-dir",
+                    str(self.app_dir),
+                    env=self.runtime_env(
+                        label=f"first-install-readiness-{target_phase}-retry"
+                    ),
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((self.shared / STATE_NAME).exists())
+                self.assertEqual((self.app_dir / "current").resolve(), candidate)
+
+    def test_first_install_missing_or_invalid_systemd_receipt_fails_before_mutation(self) -> None:
+        for mutation in ("missing", "invalid"):
+            with self.subTest(mutation=mutation):
+                self.tearDown()
+                self.setUp()
+                candidate, systemctl, _enabled_path = self.prepare_initial_systemd_activation_state(
+                    f"first-install-receipt-{mutation}"
+                )
+                state = self.shared / STATE_NAME
+                record = json.loads(state.read_text(encoding="ascii"))
+                if mutation == "missing":
+                    record.pop("systemd_state_before")
+                else:
+                    record["systemd_state_before"]["deadlock-api.service"]["active"] = "active"
+                state.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="ascii")
+                state.chmod(0o600)
+                (self.root / "systemctl.log").write_text("", encoding="ascii")
+                deploy = self.copy_deploy_script_with_fault(
+                    f"deploy-first-install-{mutation}-receipt.sh", None, None, systemctl
+                )
+                result = self.run_script(
+                    deploy,
+                    "--resume",
+                    "--app-dir",
+                    str(self.app_dir),
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(state.exists())
+                self.assertTrue(candidate.exists())
+                self.assertEqual((self.root / "systemctl.log").read_text(), "")
+
     def test_mutable_first_install_staged_failure_uses_optional_snapshot_policy(self) -> None:
         """A staged first-install failure cleans only a safe nullable receipt."""
 
@@ -3137,6 +3972,77 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.switch_pointer("current", candidate)
         return current, previous, candidate
 
+    def prepare_initial_systemd_activation_state(
+        self, label: str
+    ) -> tuple[Path, Path, Path]:
+        candidate = self.add_release(f"{label}-candidate")
+        (candidate / ".rollback").mkdir()
+        peer = self.shared / f".venv-install-{label}-candidate.0000"
+        self.add_fake_venv(peer, marker="first-install")
+        self.run_transaction(
+            "create",
+            "--operation",
+            "install",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--shared-venv",
+            str(self.shared / "venv"),
+            "--peer",
+            str(peer),
+            "--snapshot",
+            str(candidate / ".rollback" / "shared-venv-before-install"),
+            "--transition",
+            "create",
+        )
+        self.run_transaction("rename", "--mode", "activate-created")
+        self.run_transaction(
+            "phase", "--expected", "prepared", "--phase", "venv-transitioned"
+        )
+        self.run_transaction(
+            "phase", "--expected", "venv-transitioned", "--phase", "staged"
+        )
+        self.add_runtime_stubs(candidate)
+        systemctl = self.write_initial_systemctl()
+        self.run_transaction("capture-initial-systemd", "--systemctl", str(systemctl))
+        self.run_transaction(
+            "record-services",
+            "--service-state",
+            "deadlock-api=inactive",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=inactive",
+            "--timer-active-before",
+            "inactive",
+            "--service-enabled",
+            "deadlock-api=disabled",
+            "--service-enabled",
+            "deadlock-worker=disabled",
+            "--service-enabled",
+            "deadlock-web=disabled",
+            "--timer-enabled-before",
+            "disabled",
+        )
+        self.run_transaction(
+            "phase", "--expected", "staged", "--phase", "migration-pending"
+        )
+        self.run_transaction(
+            "phase", "--expected", "migration-pending", "--phase", "migration-applied"
+        )
+        self.switch_pointer("current", candidate)
+        self.run_transaction(
+            "phase", "--expected", "migration-applied", "--phase", "current-switched"
+        )
+        self.run_transaction(
+            "phase", "--expected", "current-switched", "--phase", "pointers-switched"
+        )
+        self.run_transaction(
+            "phase", "--expected", "pointers-switched", "--phase", "activation-pending"
+        )
+        return candidate, systemctl, self.root / "systemd-enabled.json"
+
     def prepare_rollback_state(self) -> tuple[Path, Path]:
         current = self.add_release("rollback-current")
         previous = self.add_release("rollback-previous")
@@ -3447,6 +4353,33 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         target.chmod(0o755)
         return target
 
+    def copy_deploy_script_with_curl(
+        self,
+        name: str,
+        systemctl: Path,
+        curl: Path,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> Path:
+        script = self.script_with_physical_tools(DEPLOY_SCRIPT)
+        script = script.replace("/usr/bin/systemctl", str(systemctl))
+        script = script.replace(
+            "  release_preflight\n  set_phase nginx-applied smoke-passed\n",
+            "  /usr/bin/true\n  set_phase nginx-applied smoke-passed\n",
+            1,
+        )
+        script = script.replace("/usr/bin/curl", str(curl))
+        if timeout_seconds is not None:
+            script = script.replace(
+                "SYSTEMD_OPERATION_TIMEOUT_SECONDS=120",
+                f"SYSTEMD_OPERATION_TIMEOUT_SECONDS={timeout_seconds}",
+                1,
+            )
+        target = self.root / name
+        target.write_text(script)
+        target.chmod(0o755)
+        return target
+
     def copy_runtime_with_fault(
         self, name: str, needle: str, replacement: str
     ) -> Path:
@@ -3654,6 +4587,64 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             helper = tools / name
             helper.write_text("#!/usr/bin/env bash\nexit 0\n" if name.endswith(".sh") else "# test stub\n")
             helper.chmod(0o755)
+
+    def install_live_qa_reconcile_fixture(
+        self, release: Path, mode_path: Path, log_path: Path
+    ) -> None:
+        runtime_installer = release / "tools/platform_live_qa_runtime_install.py"
+        runtime_installer.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "import time\n"
+            f"mode_path = Path({str(mode_path)!r})\n"
+            f"log_path = Path({str(log_path)!r})\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == 'reconcile':\n"
+            "    with log_path.open('a', encoding='ascii') as stream:\n"
+            "        stream.write('reconcile\\n')\n"
+            "    if mode_path.read_text(encoding='ascii').strip() == 'hang':\n"
+            "        time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        python = self.shared / "venv/bin/python"
+        python.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "if [[ \"${1:-}\" == \"-I\" && \"${2:-}\" == *platform_live_qa_runtime_install.py ]]; then\n"
+            "  exec /usr/bin/python3 \"$@\"\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        python.chmod(0o755)
+
+    def install_initial_systemd_units_fixture(
+        self, release: Path, systemctl: Path
+    ) -> None:
+        installer = release / "tools/platform_install_systemd_units.sh"
+        installer.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "if [[ \"${PLATFORM_ENABLE_SYSTEMD_UNITS:-0}\" != 1 ]]; then exit 0; fi\n"
+            f"{systemctl} enable deadlock-api.service deadlock-worker.service deadlock-web.service\n"
+            f"{systemctl} enable deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n"
+            f"{systemctl} start deadlock-maintenance.timer deadlock-logrotate.timer deadlock-cloudflare-ips.timer deadlock-health-monitor.timer\n",
+            encoding="utf-8",
+        )
+        installer.chmod(0o755)
+
+    def write_hanging_curl(self, mode_path: Path, log_path: Path) -> Path:
+        curl = self.root / f"curl-{mode_path.stem}"
+        curl.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"printf '%s\\n' \"$*\" >> {str(log_path)!r}\n"
+            f"if [[ \"$(cat {str(mode_path)!r})\" == hang ]]; then sleep 60; fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        return curl
+
     def add_release(self, name: str) -> Path:
         release = self.releases / name
         release.mkdir()
@@ -3868,16 +4859,25 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "def state_unit(unit):\n"
             "    if unit in state:\n"
             "        return unit\n"
+            "    if unit.endswith('.service') and unit[:-8] in state:\n"
+            "        return unit[:-8]\n"
             "    service_unit = unit + '.service'\n"
             "    return service_unit if service_unit in state else unit\n"
             "def enabled_unit(unit):\n"
             "    if unit in enabled:\n"
             "        return unit\n"
+            "    if unit.endswith('.service') and unit[:-8] in enabled:\n"
+            "        return unit[:-8]\n"
             "    service_unit = unit + '.service'\n"
             "    return service_unit if service_unit in enabled else unit\n"
             "argv = sys.argv[1:]\n"
             "action = argv[0] if argv else \"\"\n"
             "units = [value for value in argv[1:] if not value.startswith(\"-\")]\n"
+            "sleep_seconds = os.getenv(\"PLATFORM_TEST_SYSTEMCTL_SLEEP_SECONDS\")\n"
+            "sleep_action = os.getenv(\"PLATFORM_TEST_SYSTEMCTL_SLEEP_ACTION\")\n"
+            "if sleep_seconds and (not sleep_action or sleep_action == action):\n"
+            "    import time\n"
+            "    time.sleep(float(sleep_seconds))\n"
             "if action == \"is-active\":\n"
             "    unit = units[0]\n"
             "    value = state.get(state_unit(unit), \"inactive\")\n"
@@ -3919,6 +4919,35 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         )
         path.chmod(0o755)
         return path
+
+    def write_initial_systemctl(self) -> Path:
+        """Return a fake manager with the strict clean-install baseline."""
+
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-maintenance.timer": "inactive",
+                "deadlock-logrotate.timer": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+                "deadlock-health-monitor.timer": "inactive",
+            }
+        )
+        enabled_path = self.root / "systemd-enabled.json"
+        enabled = json.loads(enabled_path.read_text(encoding="utf-8"))
+        for unit in (
+            "deadlock-api.service",
+            "deadlock-worker.service",
+            "deadlock-web.service",
+            "deadlock-maintenance.timer",
+            "deadlock-logrotate.timer",
+            "deadlock-cloudflare-ips.timer",
+            "deadlock-health-monitor.timer",
+        ):
+            enabled[unit] = "disabled"
+        enabled_path.write_text(json.dumps(enabled, sort_keys=True))
+        return systemctl
 
     def script_with_physical_tools(self, source: Path) -> str:
         script = source.read_text()

@@ -686,9 +686,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
 
         prepare = '"$ROOT_DIR/tools/platform_prepare_service_user.sh"'
         self.assertIn(prepare, systemd_installer)
+        prepare_index = systemd_installer.index(prepare)
+        daemon_reload_index = systemd_installer.index(
+            "\nrun_systemctl daemon-reload\n", prepare_index
+        )
         self.assertLess(
-            systemd_installer.index(prepare),
-            systemd_installer.index("systemctl daemon-reload"),
+            prepare_index,
+            daemon_reload_index,
         )
         self.assertIn(
             "Install units and prepare release-specific writable paths",

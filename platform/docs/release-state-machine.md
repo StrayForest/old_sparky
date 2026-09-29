@@ -2,7 +2,7 @@
 
 - Status: Active release design
 - Owner: Production operator and platform maintainers
-- Last reviewed: 2026-09-27
+- Last reviewed: 2026-09-29
 
 This document owns the end-to-end release transaction. The normal production
 path is `tools/platform_release_deploy.sh`; the low-level installer is a
@@ -17,6 +17,7 @@ canonical release lock `/run/lock/oldsparky-platform-release.lock`
     -> quiesce writers
 candidate artifact
     -> staged
+    -> first-install systemd baseline captured (initial installs only)
     -> migration-pending
     -> migration-applied
     -> activation-pending
@@ -24,6 +25,8 @@ candidate artifact
     -> nginx-pending
     -> nginx-applied
     -> smoke-passed
+    -> systemd-activation-pending (initial install only)
+    -> systemd-activated (initial install only)
     -> activation-committed
 ```
 
@@ -51,16 +54,40 @@ rollback and runtime restore and keeps it held for the final Nginx/readiness che
 
 Preflight is explicit about pointer topology. A clean first install has no
 `current` or `previous` pointer and performs only layout, lock, shared-runtime
-and candidate checks; it never invokes an old-release runtime or systemd
-helper. A current-only install validates `current` and deliberately permits no
+and candidate checks; it never invokes an old-release runtime. Once the staged
+operation receipt exists, the wrapper captures the exact inactive and disabled
+state of the seven platform-owned application units/timers into that same
+receipt before any first-install systemd mutation. The receipt is the
+authority for first-install activation and every abort/recovery retry. A
+current-only install validates `current` and deliberately permits no
 `previous`; it requires a complete API/worker/web/timer snapshot, permits no
-systemd receipt, and uses the immutable transaction helper to restore that
-snapshot before cleanup. A clean first install has no prior current or
-snapshot; if no snapshot is present, it performs no systemd operation, while a
-complete snapshot is validated but not used. An upgrade requires both
-canonical pointers and uses the full runtime/systemd snapshot contract. A
-previous pointer without current, or any pointer/symlink identity mismatch, is
+first-install systemd receipt, and uses the immutable transaction helper to
+restore that snapshot before cleanup. An upgrade requires both canonical
+pointers and uses the full runtime/systemd snapshot contract. A previous
+pointer without current, or any pointer/symlink identity mismatch, is
 rejected. Rollback remains a separate two-pointer operation.
+
+### Initial-install systemd boundary
+
+The initial install keeps unit-file preparation separate from persistent
+activation. During `activation-pending`, the installer runs with
+`PLATFORM_ENABLE_SYSTEMD_UNITS=0`; services are restarted and readiness/smoke
+checks run while the receipt remains durable. After smoke, the wrapper records
+`systemd-activation-pending`, restores the captured baseline, and runs the
+installer with `PLATFORM_ENABLE_SYSTEMD_UNITS=1`. It then verifies all seven
+units are enabled, the three services and four timers are active, and both
+readiness endpoints pass before recording `systemd-activated`.
+
+Every restore/installer/live-QA-reconcile/enable/restart/readiness/verify
+sequence is bounded by one 120-second operation deadline, with each
+individual systemctl/installer/reconcile call capped at 30 seconds. A timeout or non-zero result leaves the candidate
+and receipt retained. Failures after `systemd-activated` or
+`activation-committed` first restore and verify the captured baseline, then
+rewind to `systemd-activation-pending` so the next resume does not require
+units that recovery has already stopped. A stale or incomplete legacy
+`.release-systemd-state.json` alongside an initial transaction is rejected
+before cleanup; only the transaction-bound `systemd_state_before` snapshot is
+accepted.
 
 Recovery provenance is a three-way identity chain. The security
 checkout/source SHA is **A**; the immutable producer workflow code SHA is
@@ -122,10 +149,12 @@ retained before
 the first systemd call. This pre-promotion branch is not the legacy
 `recovery-restored` cleanup bridge.
 
-For a no-current first-install topology, a complete all-inactive snapshot is
-accepted only as compatibility evidence: version 2 must also be all-disabled,
-while version 1 has no enablement fields. The wrapper treats that receipt as a
-filesystem-only no-op and never calls `systemctl`.
+For a no-current, operation-less pre-promotion topology, a complete
+all-inactive snapshot is accepted only as compatibility evidence: version 2
+must also be all-disabled, while version 1 has no enablement fields. That
+specific bridge is a filesystem-only no-op and never calls `systemctl`. It is
+distinct from a staged operation-ID first install, whose durable
+`systemd_state_before` snapshot is required for activation and recovery.
 
 Rollback uses the same receipt discipline after switching pointers:
 
@@ -203,6 +232,15 @@ compatibility handoff needed for the normal cross-release boundary.
   failure. Do not delete the state file, downgrade Alembic, or run a second
   unrelated install. Resume first; rollback remains a code/runtime operation
   and never reverses database migrations automatically.
+- A clean first-install failure in `activation-pending` or any later phase
+  retains the candidate and operation receipt. The failure handler restores
+  and verifies the receipt-bound seven-unit baseline before returning. A
+  failure after a durable activation marker rewinds the marker to
+  `systemd-activation-pending`; retry is therefore idempotent and never
+  assumes that stopped units are still active. Abort at `staged` or
+  `recovery-restored` proves the exact baseline before completing filesystem
+  cleanup. If that proof, its timeout budget, or the receipt pair fails, no
+  candidate or receipt is removed.
 - `nginx-pending` is an explicit uncertainty boundary. If the process stops
   after Nginx has been mutated but before `nginx-applied`, abort recovery first
   restores the recorded pointers/venv and then reinstalls the previous
@@ -218,14 +256,15 @@ compatibility handoff needed for the normal cross-release boundary.
   Recovery is invoked through the shared bundle, including when `current`
   already resolves to the previous release. A missing, stale or malformed
   systemd-state receipt never authorizes an enable/start operation.
-- An interrupted first install with a new operation ID and no systemd receipt
-  is recovered by the generic transaction state machine, including the valid
-  case where `current_before` and `previous_before` are absent. It never enters
-  rollback-specific recovery or calls systemd. A current-only receipt must
-  instead carry the complete pre-quiesce service/timer snapshot; immutable
-  recovery restores it before candidate and receipt cleanup, with a durable
-  retry marker if restoration is interrupted. A paired systemd receipt is
-  retained for the operation-aware release-recover path instead.
+- An operation-ID first install with both pointers absent is recovered only
+  with its transaction-bound `systemd_state_before` snapshot; immutable
+  recovery restores and verifies that baseline before candidate/receipt
+  cleanup. A stale separate `.release-systemd-state.json`, missing snapshot,
+  or incomplete pair fails closed. The operation-less pre-promotion bridge is
+  the separate systemd-free compatibility path described above. A current-only
+  receipt must instead carry the complete pre-quiesce service/timer snapshot;
+  immutable recovery restores it before candidate and receipt cleanup, with a
+  durable retry marker if restoration is interrupted.
 - A legacy v2 install receipt in `recovery-restored` has no operation ID and is
   not upgraded in place. Only the immutable recovery-bootstrap bridge may
   consume it, and only when the systemd receipt is absent, the candidate is

@@ -53,6 +53,13 @@ run_systemctl() {
   "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s "$SYSTEMCTL_BIN" "$@"
 }
 
+json_field() {
+  local field="$1"
+  /usr/bin/python3 -I -c \
+    'import json,sys; value=json.load(sys.stdin)[sys.argv[1]]; print("" if value is None else value)' \
+    "$field" 2>/dev/null
+}
+
 run_nginx_config_test() {
   "$NGINX_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${NGINX_CONFIG_TIMEOUT_SECONDS}s" \
     "$NGINX_BIN" -t >/dev/null 2>/dev/null
@@ -414,11 +421,6 @@ if [[ "$pending_operation" == "rollback" ]]; then
 fi
 
 if [[ -z "$original_previous" ]]; then
-  # First-install/current-only recovery never queries retained release tools.
-  # A first install has no prior runtime: an absent snapshot (or a complete
-  # inactive one) therefore performs no systemctl operation. Current-only has
-  # a complete immutable snapshot and must restore it before the
-  # transaction/candidate cleanup is authorized.
   [[ ! -e "$SYSTEMD_STATE" && ! -L "$SYSTEMD_STATE" ]] \
     || { public_status failed topology >&2; exit 1; }
   # Validate the live pair against the durable phase before any pointer or
@@ -431,13 +433,65 @@ if [[ -z "$original_previous" ]]; then
     --state "$STATE" >/dev/null 2>/dev/null \
     || { public_status failed topology >&2; exit 1; }
   if [[ -z "$original_current" ]]; then
+    initial_systemd_authority=0
+    case "$transaction_phase" in
+      staged|migration-pending|migration-failed|migration-applied|activation-pending|\
+      services-restarted|nginx-pending|nginx-applied|smoke-passed|\
+      systemd-activation-pending|systemd-activated|activation-committed|\
+      recovery-authorized|recovery-restored)
+        initial_systemd_authority=1
+        ;;
+    esac
+    if [[ "$initial_systemd_authority" -eq 1 ]]; then
+      # Initial-install recovery uses the same durable transaction receipt as
+      # deploy/abort. Restore and verify systemd before authorizing migration
+      # recovery or allowing any candidate/receipt cleanup.
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-initial-systemd \
+        --state "$STATE" --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
+        || { public_status failed systemd_state >&2; exit 1; }
+      if [[ "$transaction_phase" != "recovery-restored" ]]; then
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" restore-initial-systemd \
+          --state "$STATE" --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
+          || { public_status failed systemd_state >&2; exit 1; }
+      fi
+      case "$transaction_phase" in
+        migration-pending|migration-failed|migration-applied|activation-pending|\
+        services-restarted|nginx-pending|nginx-applied|smoke-passed|\
+        systemd-activation-pending|systemd-activated|activation-committed)
+          /usr/bin/python3 -I "$TRANSACTION_TOOL" authorize-recovery \
+            --state "$STATE" --confirm MIGRATION_NOT_REVERSED \
+            >/dev/null 2>/dev/null \
+            || { public_status failed transaction >&2; exit 1; }
+          ;;
+      esac
+      transaction_phase="$(/usr/bin/python3 -I "$TRANSACTION_TOOL" status \
+        --state "$STATE" --json 2>/dev/null | json_field phase)" \
+        || { public_status failed transaction >&2; exit 1; }
+    fi
     /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-service-snapshot \
       --state "$STATE" --require optional \
       >/dev/null 2>/dev/null \
       || { public_status failed service_state >&2; exit 1; }
-    /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$STATE" \
-      >/dev/null 2>/dev/null \
-      || { public_status failed transaction >&2; exit 1; }
+    if [[ "$initial_systemd_authority" -eq 1 ]]; then
+      if [[ "$transaction_phase" != "recovery-restored" ]]; then
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --retain --state "$STATE" \
+          >/dev/null 2>/dev/null \
+          || { public_status failed transaction >&2; exit 1; }
+      fi
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+        --retain-receipt --state "$STATE" >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" verify-initial-systemd \
+        --state "$STATE" --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+        --state "$STATE" >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+    else
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+    fi
     test ! -e "$STATE" && test ! -L "$STATE" \
       || { public_status failed transaction >&2; exit 1; }
     public_status passed

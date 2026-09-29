@@ -288,6 +288,34 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             str(self.app),
         )
 
+    def test_initial_systemd_snapshot_rejects_empty_pointer_strings(self) -> None:
+        transaction = self.write_install_transaction()
+        record = json.loads(transaction.read_text(encoding="utf-8"))
+        record["current_before"] = ""
+        record["previous_before"] = ""
+        record["current_before_identity"] = None
+        record["previous_before_identity"] = None
+        record["systemd_state_before"] = {
+            unit: {"active": "inactive", "enabled": "disabled"}
+            for unit in platform_release_systemd_state.INITIAL_SYSTEMD_UNITS
+        }
+        transaction.write_text(json.dumps(record, sort_keys=True) + "\n")
+        transaction.chmod(0o600)
+        result = self.run_helper(
+            "capture-transaction",
+            "--state",
+            str(self.receipt),
+            "--transaction",
+            str(transaction),
+            "--require-helper-manifest",
+            "--app-dir",
+            str(self.app),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(self.log_path.read_text(), "")
+
     def test_mismatched_valid_transaction_cannot_touch_systemd_or_clear_receipt(self) -> None:
         transaction = self.write_install_transaction()
         self.run_helper(

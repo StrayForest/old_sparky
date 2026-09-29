@@ -1,8 +1,13 @@
 # Immutable recovery bootstrap for retained release abort
 
-- Status: Accepted
+- Status: Accepted (compatibility and operation-less recovery scope)
 - Date: 2026-09-27
 - Owners: Platform maintainers
+
+The operation-ID clean first-install systemd contract in this ADR is
+superseded by [Durable first-install systemd activation](first-install-systemd-activation.md).
+This ADR remains authoritative for the operation-less v1/v2 compatibility
+bridges and retained-release recovery provenance.
 
 ## Context
 
@@ -55,13 +60,15 @@ immutable control plane. It transfers or reuses the exact attested bundle
 whose SHA is bound to the security-run/recovery-run evidence, installs it
 under that content address, validates its closed manifest and requested
 `recover_pending` capability, and invokes only
-`platform_recover_pending.sh`. A first-install receipt with no prior current
-has no service snapshot and therefore runs only the generation's
-lock/transaction helpers, with zero systemd calls; a complete snapshot, when
-present, is validated but never used to call systemd. A current-only receipt must
-carry a complete API/worker/web/timer snapshot; it has no systemd receipt, but
-the generation restores that exact snapshot before transaction cleanup and
-records a durable `filesystem-restored-services-pending` phase for retry. Neither topology
+`platform_recover_pending.sh`. A staged operation-ID first-install receipt with
+no prior current is governed by the durable `systemd_state_before` snapshot and
+the `systemd-activation-pending`/`systemd-activated` phases in the superseding
+ADR; the generation restores and verifies that baseline before transaction
+cleanup. An operation-less pre-promotion receipt is the separate systemd-free
+compatibility path described below. A current-only receipt must carry a complete
+API/worker/web/timer snapshot; it has no first-install systemd receipt, but the
+generation restores that exact snapshot before transaction cleanup and records
+a durable `filesystem-restored-services-pending` phase for retry. Neither topology
 sources `current/tools`. Upgrade and rollback use that same generation wrapper
 for the two-pointer systemd contract, while release-specific data-plane
 helpers are accepted only through the systemd manifest bound to the recorded

@@ -321,10 +321,18 @@ The wrapper leaves a durable transaction until migration, restart/readiness,
 Nginx apply and both smoke paths pass. It prepares service-owned runtime paths
 before restart and refreshes scoped env files. A rollback or recovery runtime
 restore installs unit files with `PLATFORM_ENABLE_SYSTEMD_UNITS=0`; restoring
-unit files never implicitly enables or starts a service or timer. The normal
-activation path owns the reviewed health, Cloudflare and maintenance timer
-enablement, and installs the off-site-backup unit/timer without silently
-enabling off-site backup before its manual restore-drill gate.
+unit files never implicitly enables or starts a service or timer. On a clean
+first install, the staged operation receipt first captures the exact inactive
+and disabled state of the seven application/service timers. The initial
+activation boundary then prepares unit files with enablement disabled, and only
+after smoke restores that baseline, enables the intended units, verifies all
+seven enabled/active states, reconciles the live-QA runtime, and reruns
+readiness. This boundary has one aggregate 120-second budget and 30-second
+per-call caps; a timeout retains the
+candidate and receipt for retry. The normal activation path owns the reviewed
+health, Cloudflare and maintenance timer enablement, and installs the
+off-site-backup unit/timer without silently enabling off-site backup before its
+manual restore-drill gate.
 
 If candidate activation fails, the workflow records read-only filesystem,
 inode, mount and API sandbox facts, plus a sanitized systemd snapshot and the
@@ -461,16 +469,20 @@ the exact root-owned, immutable recovery generation bound to the supplied
 security run/attempt and recovery build run/attempt/job evidence. If that
 content address or capability is unavailable, recovery fails closed; it never
 scans for a latest or sole generation and never resolves helpers from a missing
-current release. This path accepts only a new operation-ID receipt whose
-current and previous identities are both absent, requires no systemd receipt,
-and performs zero systemd calls, even when a complete inactive snapshot is
-present. The deliberate current-only topology also
-requires no systemd receipt, but its immutable receipt must contain the
-complete pre-quiesce API/worker/web/timer snapshot; recovery restores those
-exact states before cleanup and retries from a durable
+current release. A staged operation-ID receipt requires its complete,
+transaction-bound `systemd_state_before` snapshot. Recovery validates the
+receipt and restores/verifies that baseline before candidate or transaction
+cleanup; a stale `.release-systemd-state.json`, missing snapshot or incomplete
+pair is retained without systemd mutation. Failures are retryable and never
+delete the candidate before the baseline proof. The separate operation-less
+pre-promotion v1/v2 compatibility bridge has no operation ID and no systemd
+receipt; only that bridge performs the documented zero-systemd no-op for an
+all-inactive/disabled first-install snapshot. A deliberate current-only
+topology has no first-install systemd receipt, but its immutable receipt must
+contain the complete pre-quiesce API/worker/web/timer snapshot; recovery
+restores those exact states before cleanup and retries from a durable
 `filesystem-restored-services-pending` phase after an interruption. Partial or
-missing current-only snapshots remain
-retained before any systemd call.
+missing current-only snapshots remain retained before any systemd call.
 
 ## Smoke
 

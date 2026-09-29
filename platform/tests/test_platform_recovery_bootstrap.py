@@ -454,6 +454,111 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertNotIn("--downgrade", script)
         self.assertIn("--generation", script)
 
+    def test_initial_receipt_stale_systemd_pair_is_retained_then_retryable(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("initial recovery contract requires root")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "app"
+            releases = app / "releases"
+            shared = app / "shared"
+            candidate = releases / "initial-candidate"
+            releases.mkdir(parents=True)
+            shared.mkdir()
+            candidate.mkdir()
+            for path in (app, releases, shared, candidate):
+                path.chmod(0o755)
+            state = shared / ".release-operation.json"
+            stale_systemd = shared / ".release-systemd-state.json"
+            snapshot = {
+                unit: {"active": "inactive", "enabled": "disabled"}
+                for unit in recovery.INITIAL_SYSTEMD_UNITS
+            }
+            metadata = candidate.lstat()
+            receipt = {
+                "version": 2,
+                "operation": "install",
+                "operation_id": "a" * 32,
+                "phase": "staged",
+                "app_dir": str(app),
+                "current_before": None,
+                "previous_before": None,
+                "candidate_release": str(candidate),
+                "shared_venv": str(shared / "venv"),
+                "peer": str(shared / ".venv-install-initial-candidate.none"),
+                "snapshot": str(candidate / ".rollback/shared-venv-before-install"),
+                "transition": "none",
+                "shared_before": None,
+                "peer_before": None,
+                "current_before_identity": None,
+                "previous_before_identity": None,
+                "candidate_identity": {"dev": metadata.st_dev, "ino": metadata.st_ino},
+                "remove_env_on_recovery": False,
+                "service_state_before": {
+                    "deadlock-api": "inactive",
+                    "deadlock-worker": "inactive",
+                    "deadlock-web": "inactive",
+                },
+                "service_enabled_before": {
+                    "deadlock-api": "disabled",
+                    "deadlock-worker": "disabled",
+                    "deadlock-web": "disabled",
+                },
+                "quiesced_services": [
+                    "deadlock-api",
+                    "deadlock-worker",
+                    "deadlock-web",
+                ],
+                "timer_active_before": False,
+                "timer_enabled_before": "disabled",
+                "systemd_state_before": snapshot,
+            }
+            state.write_text(json.dumps(receipt, sort_keys=True) + "\n", encoding="ascii")
+            state.chmod(0o600)
+            stale_systemd.write_text("{}\n", encoding="ascii")
+            stale_systemd.chmod(0o600)
+            generation = root / ("b" * 64)
+
+            with (
+                mock.patch.object(recovery.os, "geteuid", return_value=0),
+                mock.patch.object(recovery, "_validate_generation_tree"),
+                mock.patch.object(recovery, "_run_recovery_child") as child,
+            ):
+                with self.assertRaises(recovery.RecoveryBootstrapError):
+                    recovery.abort_retained_only(app_dir=app, generation=generation)
+                child.assert_not_called()
+                self.assertTrue(state.exists())
+                self.assertTrue(candidate.exists())
+                self.assertTrue(stale_systemd.exists())
+
+                stale_systemd.unlink()
+
+                def complete_cleanup(command: list[str]) -> None:
+                    if "complete-recovery" not in command:
+                        return
+                    if "--retain-receipt" in command:
+                        candidate.rmdir()
+                    else:
+                        state.unlink()
+
+                child.side_effect = complete_cleanup
+                recovery.abort_retained_only(app_dir=app, generation=generation)
+
+            commands = [call.args[0] for call in child.call_args_list]
+            restore_index = next(
+                index
+                for index, command in enumerate(commands)
+                if "restore-initial-systemd" in command
+            )
+            cleanup_index = next(
+                index
+                for index, command in enumerate(commands)
+                if "complete-recovery" in command and "--retain-receipt" in command
+            )
+            self.assertLess(restore_index, cleanup_index)
+            self.assertFalse(state.exists())
+            self.assertFalse(candidate.exists())
+
     def test_build_workflow_is_trusted_default_branch_secret_free_and_non_deployable(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-build.yml").read_text(encoding="utf-8")
         publisher = (REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-publish.yml").read_text(encoding="utf-8")

@@ -49,6 +49,15 @@ OWNED_UNITS: Final = (
     "deadlock-health-monitor.service",
     "deadlock-health-monitor.timer",
 )
+INITIAL_SYSTEMD_UNITS: Final = (
+    "deadlock-api.service",
+    "deadlock-worker.service",
+    "deadlock-web.service",
+    "deadlock-maintenance.timer",
+    "deadlock-logrotate.timer",
+    "deadlock-cloudflare-ips.timer",
+    "deadlock-health-monitor.timer",
+)
 
 RECEIPT_KEYS: Final = frozenset(
     {
@@ -90,8 +99,12 @@ TRANSACTION_KEYS: Final = frozenset(
         "quiesced_services",
         "timer_active_before",
         "timer_enabled_before",
+        "systemd_state_before",
     }
 )
+TRANSACTION_KEYS_WITHOUT_SYSTEMD_STATE: Final = TRANSACTION_KEYS - {
+    "systemd_state_before"
+}
 TRANSACTION_SERVICE_UNITS: Final = (
     "deadlock-api.service",
     "deadlock-worker.service",
@@ -460,6 +473,31 @@ def _validate_active_overrides(
             raise StateError("systemd receipt transaction state changed")
 
 
+def _validate_initial_systemd_snapshot(record: dict[str, object]) -> None:
+    """Reject malformed clean-install systemd authority before side effects."""
+
+    snapshot = record.get("systemd_state_before")
+    if snapshot is None:
+        return
+    if (
+        record.get("operation") != "install"
+        or record.get("current_before") is not None
+        or record.get("previous_before") is not None
+    ):
+        raise StateError("initial systemd snapshot is unexpected")
+    if not isinstance(snapshot, dict) or set(snapshot) != set(INITIAL_SYSTEMD_UNITS):
+        raise StateError("initial systemd snapshot is incomplete")
+    for unit in INITIAL_SYSTEMD_UNITS:
+        state = snapshot.get(unit)
+        if (
+            not isinstance(state, dict)
+            or set(state) != {"active", "enabled"}
+            or state.get("active") != "inactive"
+            or state.get("enabled") != "disabled"
+        ):
+            raise StateError("initial systemd snapshot is invalid")
+
+
 def _read_transaction(
     path: Path, app_dir: Path
 ) -> tuple[
@@ -479,8 +517,12 @@ def _read_transaction(
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise StateError("release transaction is invalid") from exc
-    if not isinstance(record, dict) or set(record) != TRANSACTION_KEYS:
+    if not isinstance(record, dict) or set(record) not in (
+        TRANSACTION_KEYS,
+        TRANSACTION_KEYS_WITHOUT_SYSTEMD_STATE,
+    ):
         raise StateError("release transaction schema is invalid")
+    _validate_initial_systemd_snapshot(record)
     if record.get("version") != 2 or record.get("operation") not in {"install", "rollback"}:
         raise StateError("release transaction is not a supported recovery")
     operation_id = record.get("operation_id")

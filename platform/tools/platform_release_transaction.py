@@ -11,12 +11,27 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import stat
 import subprocess
 import sys
+import time
 from typing import cast
 from uuid import uuid4
+
+try:
+    from .platform_release_systemd_state import INITIAL_SYSTEMD_UNITS
+except ImportError:  # The immutable recovery generation runs this file directly.
+    # ``python -I`` deliberately removes the script directory from
+    # ``sys.path``.  Load the sibling by its trusted, generation-local path
+    # instead of weakening isolation by adding an arbitrary import path.
+    _systemd_state_path = Path(__file__).resolve().with_name(
+        "platform_release_systemd_state.py"
+    )
+    INITIAL_SYSTEMD_UNITS = runpy.run_path(str(_systemd_state_path))[
+        "INITIAL_SYSTEMD_UNITS"
+    ]
 
 
 STATE_NAME = ".release-operation.json"
@@ -32,6 +47,8 @@ AT_FDCWD = -100
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 OPERATION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SERVICE_UNITS = ("deadlock-api", "deadlock-worker", "deadlock-web")
+SYSTEMD_CALL_TIMEOUT_SECONDS = 30.0
+SYSTEMD_OPERATION_TIMEOUT_SECONDS = 120.0
 PHASES = {
     "prepared",
     "venv-transitioned",
@@ -48,6 +65,8 @@ PHASES = {
     "nginx-pending",
     "nginx-applied",
     "smoke-passed",
+    "systemd-activation-pending",
+    "systemd-activated",
     "activation-committed",
     "recovery-authorized",
     "restart-pending",
@@ -93,11 +112,21 @@ PHASE_TRANSITIONS = {
     "nginx-pending": {"nginx-applied", "recovery-authorized"},
     "nginx-applied": {"smoke-passed", "recovery-authorized"},
     "smoke-passed": {
+        "systemd-activation-pending",
         "activation-committed",
         "rollback-runtime-applied",
         "recovery-authorized",
     },
-    "activation-committed": {"recovery-authorized"},
+    "systemd-activation-pending": {
+        "systemd-activated",
+        "recovery-authorized",
+    },
+    "systemd-activated": {
+        "systemd-activation-pending",
+        "activation-committed",
+        "recovery-authorized",
+    },
+    "activation-committed": {"systemd-activation-pending", "recovery-authorized"},
     "recovery-authorized": set(),
     "restart-pending": {
         "services-restarted",
@@ -124,8 +153,39 @@ MIGRATION_OUTCOME_UNCERTAIN_PHASES = {
     "nginx-pending",
     "nginx-applied",
     "smoke-passed",
+    "systemd-activation-pending",
+    "systemd-activated",
     "activation-committed",
 }
+INITIAL_SYSTEMD_PHASES = frozenset(
+    {
+        "staged",
+        "migration-pending",
+        "migration-failed",
+        "migration-applied",
+        "activation-pending",
+        "services-restarted",
+        "nginx-pending",
+        "nginx-applied",
+        "smoke-passed",
+        "systemd-activation-pending",
+        "systemd-activated",
+        "activation-committed",
+        "recovery-authorized",
+        "recovery-restored",
+    }
+)
+INITIAL_RECOVERY_PHASES = frozenset(
+    {
+        "prepared",
+        "venv-transitioned",
+        "snapshot-placed",
+        "current-switched",
+        "previous-switched",
+        "pointers-switched",
+        *INITIAL_SYSTEMD_PHASES,
+    }
+)
 RECOVERY_CONFIRMATION = "MIGRATION_NOT_REVERSED"
 RECORD_KEYS = {
     "operation_id",
@@ -151,8 +211,15 @@ RECORD_KEYS = {
     "quiesced_services",
     "timer_active_before",
     "timer_enabled_before",
+    "systemd_state_before",
 }
-LEGACY_RECORD_KEYS = RECORD_KEYS - {"operation_id", "service_enabled_before", "timer_enabled_before"}
+LEGACY_RECORD_KEYS = RECORD_KEYS - {
+    "operation_id",
+    "service_enabled_before",
+    "timer_enabled_before",
+    "systemd_state_before",
+}
+RECORD_KEYS_WITHOUT_SYSTEMD_STATE = RECORD_KEYS - {"systemd_state_before"}
 QUIESCE_RECORD_KEYS = {
     "version",
     "operation",
@@ -234,6 +301,38 @@ def _validate_service_snapshot(record: dict[str, object]) -> None:
         raise TransactionError("pre-migration timer state is invalid")
     if timer_enabled not in {"enabled", "disabled"}:
         raise TransactionError("pre-migration enabled timer state is invalid")
+
+
+def _validate_initial_systemd_snapshot(record: dict[str, object]) -> None:
+    """Validate the clean-install systemd baseline bound to the transaction.
+
+    The snapshot is deliberately narrow: it is only an authority for a
+    first-install operation with no prior release, and every intended unit
+    must have been inactive and disabled before the installer can mutate the
+    unit files or enablement topology.  Missing snapshots remain valid for
+    older receipts, but they cannot authorize initial activation/recovery.
+    """
+
+    snapshot = record.get("systemd_state_before")
+    if snapshot is None:
+        return
+    if (
+        record.get("operation") != "install"
+        or record.get("current_before") is not None
+        or record.get("previous_before") is not None
+    ):
+        raise TransactionError("initial systemd snapshot is unexpected")
+    if not isinstance(snapshot, dict) or set(snapshot) != set(INITIAL_SYSTEMD_UNITS):
+        raise TransactionError("initial systemd snapshot is incomplete")
+    for unit in INITIAL_SYSTEMD_UNITS:
+        state = snapshot.get(unit)
+        if (
+            not isinstance(state, dict)
+            or set(state) != {"active", "enabled"}
+            or state.get("active") != "inactive"
+            or state.get("enabled") != "disabled"
+        ):
+            raise TransactionError("initial systemd snapshot is not inactive/disabled")
 
 
 def _validate_legacy_quiesce_snapshot(record: dict[str, object]) -> None:
@@ -531,8 +630,16 @@ def _validate_record(
         set(record) == LEGACY_RECORD_KEYS
         and record.get("phase") == "recovery-restored"
     )
-    if (set(record) != RECORD_KEYS and not legacy_recovery) or record.get("version") != STATE_VERSION:
+    if (
+        set(record) not in (RECORD_KEYS, RECORD_KEYS_WITHOUT_SYSTEMD_STATE)
+        and not legacy_recovery
+    ) or record.get("version") != STATE_VERSION:
         raise TransactionError("release operation record schema is invalid")
+    if "systemd_state_before" not in record:
+        # Existing v2 receipts predate first-install systemd activation. Keep
+        # them readable, but normalize the optional field in memory so every
+        # subsequent durable write has one unambiguous schema.
+        record = {**record, "systemd_state_before": None}
     if not legacy_recovery and (
         not isinstance(record.get("operation_id"), str)
         or OPERATION_ID_PATTERN.fullmatch(record["operation_id"]) is None
@@ -556,6 +663,7 @@ def _validate_record(
     if type(record.get("remove_env_on_recovery")) is not bool:
         raise TransactionError("release env recovery flag is invalid")
     _validate_service_snapshot(record)
+    _validate_initial_systemd_snapshot(record)
 
     app = Path(str(record.get("app_dir")))
     _safe_directory(app, label="application directory")
@@ -874,6 +982,7 @@ def create_record(
         "quiesced_services": None,
         "timer_active_before": None,
         "timer_enabled_before": None,
+        "systemd_state_before": None,
     }
     validated = _validate_record(state, record)
     _write_record(state, _record_for_write(validated), creating=True)
@@ -1126,6 +1235,7 @@ def promote_quiesce(
         "quiesced_services": pre["quiesced_services"],
         "timer_active_before": pre["timer_active_before"],
         "timer_enabled_before": pre["timer_enabled_before"],
+        "systemd_state_before": None,
     }
     validated = _validate_record(state, record)
     _write_record(state, _record_for_write(validated), creating=False)
@@ -1309,7 +1419,18 @@ def _systemctl_path(value: str) -> str:
     return value
 
 
-def _run_systemctl(systemctl: str, *arguments: str) -> str:
+def _systemd_deadline_timeout(deadline: float | None) -> float:
+    if deadline is None:
+        return SYSTEMD_CALL_TIMEOUT_SECONDS
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TransactionError("systemd operation deadline exceeded")
+    return min(SYSTEMD_CALL_TIMEOUT_SECONDS, remaining)
+
+
+def _run_systemctl(
+    systemctl: str, *arguments: str, deadline: float | None = None
+) -> str:
     try:
         result = subprocess.run(
             [systemctl, *arguments],
@@ -1318,7 +1439,7 @@ def _run_systemctl(systemctl: str, *arguments: str) -> str:
             stderr=subprocess.DEVNULL,
             text=True,
             check=False,
-            timeout=30,
+            timeout=_systemd_deadline_timeout(deadline),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise TransactionError("systemctl operation failed") from exc
@@ -1330,7 +1451,9 @@ def _run_systemctl(systemctl: str, *arguments: str) -> str:
     return output
 
 
-def _read_systemctl_state(systemctl: str, unit: str) -> str:
+def _read_systemctl_state(
+    systemctl: str, unit: str, *, deadline: float | None = None
+) -> str:
     try:
         result = subprocess.run(
             [systemctl, "is-active", unit],
@@ -1339,7 +1462,7 @@ def _read_systemctl_state(systemctl: str, unit: str) -> str:
             stderr=subprocess.DEVNULL,
             text=True,
             check=False,
-            timeout=30,
+            timeout=_systemd_deadline_timeout(deadline),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise TransactionError("systemctl state query failed") from exc
@@ -1353,7 +1476,9 @@ def _read_systemctl_state(systemctl: str, unit: str) -> str:
     return output
 
 
-def _read_systemctl_enabled(systemctl: str, unit: str) -> str:
+def _read_systemctl_enabled(
+    systemctl: str, unit: str, *, deadline: float | None = None
+) -> str:
     try:
         result = subprocess.run(
             [systemctl, "is-enabled", unit],
@@ -1362,7 +1487,7 @@ def _read_systemctl_enabled(systemctl: str, unit: str) -> str:
             stderr=subprocess.DEVNULL,
             text=True,
             check=False,
-            timeout=30,
+            timeout=_systemd_deadline_timeout(deadline),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise TransactionError("systemctl enabled state query failed") from exc
@@ -1374,6 +1499,138 @@ def _read_systemctl_enabled(systemctl: str, unit: str) -> str:
     ):
         raise TransactionError("systemctl enabled state/status mismatch")
     return output
+
+
+def _initial_systemd_snapshot(
+    systemctl: str, *, deadline: float | None = None
+) -> dict[str, dict[str, str]]:
+    return {
+        unit: {
+            "active": _read_systemctl_state(systemctl, unit, deadline=deadline),
+            "enabled": _read_systemctl_enabled(systemctl, unit, deadline=deadline),
+        }
+        for unit in INITIAL_SYSTEMD_UNITS
+    }
+
+
+def _require_initial_systemd_record(
+    record: dict[str, object],
+    *,
+    allowed_phases: set[str],
+    require_snapshot: bool = True,
+) -> dict[str, dict[str, str]]:
+    if (
+        record["operation"] != "install"
+        or record["current_before_path"] is not None
+        or record["previous_before_path"] is not None
+        or record["phase"] not in allowed_phases
+    ):
+        raise TransactionError("transaction is not a clean first-install systemd operation")
+    _validate_initial_systemd_snapshot(record)
+    snapshot = record.get("systemd_state_before")
+    if snapshot is None and not require_snapshot:
+        return {}
+    if not isinstance(snapshot, dict):
+        raise TransactionError("clean first-install systemd snapshot is missing")
+    return cast(dict[str, dict[str, str]], snapshot)
+
+
+def _verify_initial_systemd_snapshot(
+    systemctl: str,
+    snapshot: dict[str, dict[str, str]],
+    *,
+    deadline: float | None = None,
+) -> None:
+    if deadline is None:
+        deadline = time.monotonic() + SYSTEMD_OPERATION_TIMEOUT_SECONDS
+    actual = _initial_systemd_snapshot(systemctl, deadline=deadline)
+    if actual != snapshot:
+        raise TransactionError("clean first-install systemd baseline changed")
+
+
+def capture_initial_systemd(state: Path, *, systemctl: str) -> None:
+    """Persist the inactive/disabled clean-install baseline atomically."""
+
+    systemctl = _systemctl_path(systemctl)
+    record = _load_record(state)
+    snapshot = _require_initial_systemd_record(
+        record, allowed_phases={"staged"}, require_snapshot=False
+    )
+    deadline = time.monotonic() + SYSTEMD_OPERATION_TIMEOUT_SECONDS
+    if record.get("systemd_state_before") is not None:
+        _verify_initial_systemd_snapshot(systemctl, snapshot, deadline=deadline)
+        return
+    captured = _initial_systemd_snapshot(systemctl, deadline=deadline)
+    probe = {**record, "systemd_state_before": captured}
+    _validate_initial_systemd_snapshot(probe)
+    record["systemd_state_before"] = captured
+    _write_record(state, _record_for_write(record), creating=False)
+    _verify_initial_systemd_snapshot(systemctl, captured, deadline=deadline)
+
+
+def restore_initial_systemd(state: Path, *, systemctl: str) -> None:
+    """Return clean-install units to their receipt-bound baseline.
+
+    Each operation is idempotent. A failed stop/disable or verification leaves
+    the transaction and candidate untouched so a later retry can finish the
+    restore before filesystem recovery is attempted.
+    """
+
+    systemctl = _systemctl_path(systemctl)
+    record = _load_record(state)
+    snapshot = _require_initial_systemd_record(
+        record,
+        allowed_phases={
+            *INITIAL_SYSTEMD_PHASES,
+        },
+    )
+    _verify_recovery_pointers(record)
+    deadline = time.monotonic() + SYSTEMD_OPERATION_TIMEOUT_SECONDS
+    for unit in INITIAL_SYSTEMD_UNITS:
+        _run_systemctl(systemctl, "stop", unit, deadline=deadline)
+        _run_systemctl(systemctl, "disable", unit, deadline=deadline)
+    _verify_initial_systemd_snapshot(systemctl, snapshot, deadline=deadline)
+
+
+def verify_initial_systemd(state: Path, *, systemctl: str) -> None:
+    systemctl = _systemctl_path(systemctl)
+    record = _load_record(state)
+    snapshot = _require_initial_systemd_record(
+        record,
+        allowed_phases={
+            *INITIAL_SYSTEMD_PHASES,
+        },
+    )
+    _verify_recovery_pointers(record)
+    _verify_initial_systemd_snapshot(systemctl, snapshot)
+
+
+def validate_initial_systemd(state: Path) -> None:
+    record = _load_record(state)
+    _require_initial_systemd_record(
+        record,
+        allowed_phases={
+            *INITIAL_SYSTEMD_PHASES,
+        },
+    )
+    _verify_recovery_pointers(record)
+
+
+def verify_initial_systemd_activated(state: Path, *, systemctl: str) -> None:
+    systemctl = _systemctl_path(systemctl)
+    record = _load_record(state)
+    _require_initial_systemd_record(
+        record,
+        allowed_phases={"systemd-activated", "activation-committed"},
+    )
+    _verify_recovery_pointers(record)
+    deadline = time.monotonic() + SYSTEMD_OPERATION_TIMEOUT_SECONDS
+    actual = _initial_systemd_snapshot(systemctl, deadline=deadline)
+    if any(
+        state.get("active") != "active" or state.get("enabled") != "enabled"
+        for state in actual.values()
+    ):
+        raise TransactionError("clean first-install systemd activation is incomplete")
 
 
 def restore_quiesce(state: Path, *, systemctl: str) -> None:
@@ -1693,7 +1950,10 @@ def _verify_recovery_pointers(record: dict[str, object]) -> None:
             "nginx-pending": ((candidate, desired_previous),),
             "nginx-applied": ((candidate, desired_previous),),
             "smoke-passed": ((candidate, desired_previous),),
+            "systemd-activation-pending": ((candidate, desired_previous),),
+            "systemd-activated": ((candidate, desired_previous),),
             "activation-committed": ((candidate, desired_previous),),
+            "recovery-restored": ((None, None),),
         }
         allowed = (original, *phase_pairs.get(phase, ()))
     else:
@@ -1769,7 +2029,10 @@ def _restore_venv(record: dict[str, object]) -> None:
 
 
 def _remove_tree(
-    path: Path, *, expected_identity: dict[str, int] | None = None
+    path: Path,
+    *,
+    expected_identity: dict[str, int] | None = None,
+    allowed_symlink_roots: tuple[Path, ...] = (),
 ) -> None:
     metadata = _safe_directory(path, label=f"cleanup path {path.name}")
     if expected_identity is not None and _identity(metadata) != expected_identity:
@@ -1794,14 +2057,38 @@ def _remove_tree(
             except OSError as exc:
                 raise TransactionError("release cleanup entry cannot be inspected") from exc
             mode = child_metadata.st_mode
+            child = Path(entry.path)
+            is_symlink = stat.S_ISLNK(mode)
+            symlink_root_allowed = any(
+                child == allowed_root or allowed_root in child.parents
+                for allowed_root in allowed_symlink_roots
+            )
             if (
                 child_metadata.st_dev != device
                 or child_metadata.st_uid != 0
                 or child_metadata.st_gid != 0
-                or stat.S_IMODE(mode) & 0o022
+                or (
+                    not is_symlink
+                    and stat.S_IMODE(mode) & 0o022
+                )
+                or (
+                    is_symlink
+                    and (
+                        not symlink_root_allowed
+                        or child_metadata.st_nlink != 1
+                    )
+                )
             ):
                 raise TransactionError("release cleanup entry metadata is unsafe")
-            child = Path(entry.path)
+            if is_symlink:
+                # A staged Python virtualenv normally contains interpreter
+                # symlinks (bin/python*, lib64).  They are safe to unlink
+                # after the exact receipt-bound venv root has been moved into
+                # quarantine: shutil.rmtree never follows symlinks.  Keep the
+                # default strict for release trees and arbitrary cleanup
+                # callers; only exact receipt-bound venv roots opt into this
+                # narrow compatibility path.
+                continue
             if stat.S_ISDIR(mode):
                 if child_metadata.st_nlink < 2:
                     raise TransactionError("release cleanup directory identity is invalid")
@@ -1844,8 +2131,24 @@ def _remove_tree(
         ):
             for directory in directories:
                 child = Path(root) / directory
-                os.chmod(child, stat.S_IMODE(child.lstat().st_mode) | 0o700)
-            os.chmod(root, stat.S_IMODE(Path(root).lstat().st_mode) | 0o700)
+                child_mode = child.lstat().st_mode
+                if stat.S_ISLNK(child_mode):
+                    # Symlinks are receipt-bound unlink-only entries.  chmod
+                    # follows a directory symlink on this platform, so never
+                    # apply the directory permission repair to one. Remove it
+                    # explicitly because shutil.rmtree refuses symlink roots.
+                    child.unlink()
+                    continue
+                os.chmod(child, stat.S_IMODE(child_mode) | 0o700)
+            for filename in _files:
+                child = Path(root) / filename
+                if stat.S_ISLNK(child.lstat().st_mode):
+                    # Allowed receipt-bound file links are unlink-only too;
+                    # never follow or chmod them.
+                    child.unlink()
+            root_path = Path(root)
+            if not stat.S_ISLNK(root_path.lstat().st_mode):
+                os.chmod(root_path, stat.S_IMODE(root_path.lstat().st_mode) | 0o700)
         shutil.rmtree(quarantine)
     except Exception as exc:
         # Preserve the receipt and the quarantined tree on every validation or
@@ -1880,7 +2183,11 @@ def _cleanup_recovered_install(
     if _lexists(peer):
         if not isinstance(peer_before, dict):
             raise TransactionError("install cleanup peer identity is invalid")
-        _remove_tree(peer, expected_identity=peer_before)
+        _remove_tree(
+            peer,
+            expected_identity=peer_before,
+            allowed_symlink_roots=(peer,),
+        )
     if _lexists(candidate):
         if (
             _read_pointer(record["app"], "current") == candidate
@@ -1888,7 +2195,11 @@ def _cleanup_recovered_install(
         ):
             raise TransactionError("candidate release is still active during cleanup")
         candidate_identity = cast(dict[str, int], record["candidate_identity"])
-        _remove_tree(candidate, expected_identity=candidate_identity)
+        _remove_tree(
+            candidate,
+            expected_identity=candidate_identity,
+            allowed_symlink_roots=(candidate / ".rollback/shared-venv-before-install",),
+        )
     if record["remove_env_on_recovery"]:
         env_file = shared / ".env.platform"
         if _lexists(env_file):
@@ -2219,6 +2530,16 @@ def _build_parser() -> argparse.ArgumentParser:
     restore_services_parser = commands.add_parser("restore-services")
     restore_services_parser.add_argument("--state", required=True, type=Path)
     restore_services_parser.add_argument("--systemctl", required=True)
+    for name in (
+        "capture-initial-systemd",
+        "restore-initial-systemd",
+        "verify-initial-systemd",
+        "validate-initial-systemd",
+        "verify-initial-systemd-activated",
+    ):
+        initial_systemd_parser = commands.add_parser(name)
+        initial_systemd_parser.add_argument("--state", required=True, type=Path)
+        initial_systemd_parser.add_argument("--systemctl", required=True)
     status_quiesce_parser = commands.add_parser("status-quiesce")
     status_quiesce_parser.add_argument("--state", required=True, type=Path)
     status_quiesce_parser.add_argument("--json", action="store_true", dest="as_json")
@@ -2324,6 +2645,16 @@ def main() -> int:
             validate_service_snapshot(args.state, require=args.require)
         elif args.command == "restore-services":
             restore_services(args.state, systemctl=args.systemctl)
+        elif args.command == "capture-initial-systemd":
+            capture_initial_systemd(args.state, systemctl=args.systemctl)
+        elif args.command == "restore-initial-systemd":
+            restore_initial_systemd(args.state, systemctl=args.systemctl)
+        elif args.command == "verify-initial-systemd":
+            verify_initial_systemd(args.state, systemctl=args.systemctl)
+        elif args.command == "validate-initial-systemd":
+            validate_initial_systemd(args.state)
+        elif args.command == "verify-initial-systemd-activated":
+            verify_initial_systemd_activated(args.state, systemctl=args.systemctl)
         elif args.command == "status-quiesce":
             record = _load_quiesce_record(args.state)
             if args.as_json:

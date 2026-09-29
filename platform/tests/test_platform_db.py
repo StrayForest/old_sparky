@@ -91,7 +91,11 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
         db._session_factory = None
         settings = Mock(
             platform_database_url="postgresql+asyncpg://platform_user@127.0.0.1/platformdb",
-            platform_environment="production",
+            # This test covers engine timeout wiring, not the independent
+            # production host/media/secret policy.  Use the development
+            # validation profile so a lightweight Mock cannot accidentally
+            # satisfy (or bypass) the production network-boundary contract.
+            platform_environment="development",
             platform_db_schema="platform",
             platform_load_test_source_ips="",
             platform_api_workers=2,

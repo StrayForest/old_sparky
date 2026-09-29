@@ -25,11 +25,33 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import runpy
 import signal
 import stat
 import subprocess
 import sys
 import zipfile
+
+try:
+    from .platform_release_systemd_state import INITIAL_SYSTEMD_UNITS
+    from .platform_release_transaction import (
+        INITIAL_RECOVERY_PHASES,
+        INITIAL_SYSTEMD_PHASES,
+        MIGRATION_OUTCOME_UNCERTAIN_PHASES,
+    )
+except ImportError:  # The immutable recovery generation runs this file directly.
+    _systemd_state_globals = runpy.run_path(
+        str(Path(__file__).resolve().with_name("platform_release_systemd_state.py"))
+    )
+    _transaction_globals = runpy.run_path(
+        str(Path(__file__).resolve().with_name("platform_release_transaction.py"))
+    )
+    INITIAL_SYSTEMD_UNITS = _systemd_state_globals["INITIAL_SYSTEMD_UNITS"]
+    INITIAL_RECOVERY_PHASES = _transaction_globals["INITIAL_RECOVERY_PHASES"]
+    INITIAL_SYSTEMD_PHASES = _transaction_globals["INITIAL_SYSTEMD_PHASES"]
+    MIGRATION_OUTCOME_UNCERTAIN_PHASES = _transaction_globals[
+        "MIGRATION_OUTCOME_UNCERTAIN_PHASES"
+    ]
 
 
 SCHEMA = 1
@@ -1826,6 +1848,38 @@ def _receipt_release_path(value: object, *, app_dir: Path, label: str) -> Path |
     return path
 
 
+def _validate_initial_systemd_snapshot(receipt: dict[str, object]) -> None:
+    """Validate the transaction-bound clean-install systemd baseline.
+
+    The recovery generation must understand this field before it can consume
+    a v2 operation receipt.  Missing fields remain accepted only for legacy
+    receipts; a present field is never treated as advisory metadata.
+    """
+
+    snapshot = receipt.get("systemd_state_before")
+    if snapshot is None:
+        return
+    if (
+        receipt.get("operation") != "install"
+        or receipt.get("current_before") is not None
+        or receipt.get("previous_before") is not None
+    ):
+        raise RecoveryBootstrapError("release receipt initial systemd snapshot is unexpected")
+    if not isinstance(snapshot, dict) or set(snapshot) != set(INITIAL_SYSTEMD_UNITS):
+        raise RecoveryBootstrapError("release receipt initial systemd snapshot is incomplete")
+    for unit in INITIAL_SYSTEMD_UNITS:
+        state = snapshot.get(unit)
+        if (
+            not isinstance(state, dict)
+            or set(state) != {"active", "enabled"}
+            or state.get("active") != "inactive"
+            or state.get("enabled") != "disabled"
+        ):
+            raise RecoveryBootstrapError(
+                "release receipt initial systemd snapshot is invalid"
+            )
+
+
 def _validate_receipt_directory(path: Path, identity: dict[str, int], *, label: str) -> None:
     try:
         metadata = path.lstat()
@@ -1850,17 +1904,19 @@ def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Pat
         "shared_venv", "peer", "snapshot", "transition", "shared_before", "peer_before", "current_before_identity",
         "previous_before_identity", "candidate_identity", "remove_env_on_recovery", "service_state_before",
         "service_enabled_before", "quiesced_services", "timer_active_before",
-        "timer_enabled_before",
+        "timer_enabled_before", "systemd_state_before",
     }
     # Operation-less receipts are the narrowly supported pre-operation v2
     # bridge. They predate enabled-state capture and may only be consumed by
     # the cleanup-only path; a mixed legacy/v2 schema is not supported.
     legacy_expected = expected - {
-        "operation_id", "service_enabled_before", "timer_enabled_before"
+        "operation_id", "service_enabled_before", "timer_enabled_before",
+        "systemd_state_before",
     }
+    v2_without_systemd = expected - {"systemd_state_before"}
     legacy = set(receipt) == legacy_expected
     if (
-        (set(receipt) != expected and not legacy)
+        (set(receipt) not in (expected, v2_without_systemd) and not legacy)
         or type(receipt.get("version")) is not int
         or receipt.get("version") != 2
         or receipt.get("operation") != "install"
@@ -1871,8 +1927,9 @@ def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Pat
         or OPERATION_ID_RE.fullmatch(receipt["operation_id"]) is None
     ):
         raise RecoveryBootstrapError("release receipt operation identity is invalid")
+    _validate_initial_systemd_snapshot(receipt)
     phase = receipt.get("phase")
-    if phase in {"migration-pending", "migration-failed", "migration-applied", "activation-pending", "services-restarted", "nginx-pending", "nginx-applied", "smoke-passed", "activation-committed"}:
+    if phase in MIGRATION_OUTCOME_UNCERTAIN_PHASES:
         raise RecoveryBootstrapError("migration outcome is uncertain")
     if phase != "recovery-restored":
         raise RecoveryBootstrapError("release receipt is not recovery-restored")
@@ -1970,6 +2027,204 @@ def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Pat
     return current
 
 
+def _validate_initial_receipt_identity(
+    receipt: dict[str, object], app_dir: Path
+) -> None:
+    """Validate a clean first-install receipt before immutable cleanup."""
+
+    if (
+        receipt.get("version") != 2
+        or receipt.get("operation") != "install"
+        or receipt.get("current_before") is not None
+        or receipt.get("previous_before") is not None
+        or receipt.get("app_dir") != str(app_dir)
+    ):
+        raise RecoveryBootstrapError("initial release receipt topology is invalid")
+    if (
+        not isinstance(receipt.get("operation_id"), str)
+        or OPERATION_ID_RE.fullmatch(receipt["operation_id"]) is None
+    ):
+        raise RecoveryBootstrapError("initial release receipt operation identity is invalid")
+    phase = receipt.get("phase")
+    if phase not in INITIAL_RECOVERY_PHASES:
+        raise RecoveryBootstrapError("initial release receipt phase is invalid")
+    _validate_initial_systemd_snapshot(receipt)
+    if phase in INITIAL_SYSTEMD_PHASES and not isinstance(
+        receipt.get("systemd_state_before"), dict
+    ):
+        raise RecoveryBootstrapError(
+            "initial release receipt systemd snapshot is missing"
+        )
+    if type(receipt.get("remove_env_on_recovery")) is not bool:
+        raise RecoveryBootstrapError("release receipt recovery flag is invalid")
+    if receipt.get("candidate_release") is None:
+        raise RecoveryBootstrapError("initial release receipt candidate is invalid")
+    candidate = _receipt_release_path(
+        receipt.get("candidate_release"), app_dir=app_dir, label="candidate identity"
+    )
+    assert candidate is not None
+    candidate_identity = _receipt_identity(
+        receipt.get("candidate_identity"), required=True
+    )
+    assert candidate_identity is not None
+    if os.path.lexists(candidate):
+        _validate_receipt_directory(candidate, candidate_identity, label="candidate release")
+    elif phase != "recovery-restored":
+        raise RecoveryBootstrapError("initial release receipt candidate is unavailable")
+
+    shared_venv = Path(str(receipt.get("shared_venv")))
+    snapshot = Path(str(receipt.get("snapshot")))
+    peer = Path(str(receipt.get("peer")))
+    if (
+        shared_venv != app_dir / "shared" / "venv"
+        or snapshot != candidate / ".rollback" / "shared-venv-before-install"
+        or peer.parent != app_dir / "shared"
+        or not peer.name.startswith(f".venv-install-{candidate.name}.")
+    ):
+        raise RecoveryBootstrapError("initial release receipt venv paths are invalid")
+    transition = receipt.get("transition")
+    shared_before = receipt.get("shared_before")
+    peer_before = receipt.get("peer_before")
+    if transition == "exchange":
+        _receipt_identity(shared_before, required=True)
+        _receipt_identity(peer_before, required=True)
+        if shared_before == peer_before:
+            raise RecoveryBootstrapError("initial venv identities are ambiguous")
+    elif transition == "create":
+        if shared_before is not None or _receipt_identity(peer_before, required=True) is None:
+            raise RecoveryBootstrapError("initial created venv identity is invalid")
+    elif transition == "none":
+        if peer_before is not None:
+            raise RecoveryBootstrapError("initial no-op peer identity is invalid")
+        if shared_before is not None:
+            _receipt_identity(shared_before, required=True)
+    else:
+        raise RecoveryBootstrapError("initial release receipt venv transition is invalid")
+
+    current_pointer = app_dir / "current"
+    previous_pointer = app_dir / "previous"
+    if os.path.lexists(previous_pointer):
+        raise RecoveryBootstrapError("unexpected initial previous release pointer")
+    if os.path.lexists(current_pointer):
+        current = _release_pointer(app_dir, "current")
+        if current != candidate:
+            raise RecoveryBootstrapError("initial current pointer does not match receipt")
+    elif phase in {
+        "current-switched",
+        "previous-switched",
+        "pointers-switched",
+        "activation-pending",
+        "services-restarted",
+        "nginx-pending",
+        "nginx-applied",
+        "smoke-passed",
+        "systemd-activation-pending",
+        "systemd-activated",
+        "activation-committed",
+        "recovery-authorized",
+    }:
+        raise RecoveryBootstrapError("initial current pointer is missing")
+
+
+def _abort_initial_retained_only(*, app_dir: Path, generation: Path) -> None:
+    """Recover a clean install through the canonical transaction boundary."""
+
+    shared = app_dir / "shared"
+    state = shared / ".release-operation.json"
+    transaction = generation / "platform_release_transaction.py"
+    receipt = _receipt_json(state)
+    _validate_initial_receipt_identity(receipt, app_dir)
+    phase = str(receipt["phase"])
+    systemd_authority = phase in INITIAL_SYSTEMD_PHASES
+    if systemd_authority:
+        _run_recovery_child(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(transaction),
+                "validate-initial-systemd",
+                "--state",
+                str(state),
+                "--systemctl",
+                "/usr/bin/systemctl",
+            ]
+        )
+        _run_recovery_child(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(transaction),
+                "restore-initial-systemd",
+                "--state",
+                str(state),
+                "--systemctl",
+                "/usr/bin/systemctl",
+            ]
+        )
+    if phase in MIGRATION_OUTCOME_UNCERTAIN_PHASES:
+        # Authorization is intentionally after systemd restoration.  A crash
+        # before this write leaves the original uncertain phase retryable.
+        _run_recovery_child(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(transaction),
+                "authorize-recovery",
+                "--state",
+                str(state),
+                "--confirm",
+                "MIGRATION_NOT_REVERSED",
+            ]
+        )
+        phase = "recovery-authorized"
+    if phase != "recovery-restored":
+        _run_recovery_child(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(transaction),
+                "recover",
+                "--retain",
+                "--state",
+                str(state),
+            ]
+        )
+    _run_recovery_child(
+        [
+            "/usr/bin/python3",
+            "-I",
+            str(transaction),
+            "complete-recovery",
+            "--retain-receipt",
+            "--state",
+            str(state),
+        ]
+    )
+    if systemd_authority:
+        _run_recovery_child(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(transaction),
+                "verify-initial-systemd",
+                "--state",
+                str(state),
+                "--systemctl",
+                "/usr/bin/systemctl",
+            ]
+        )
+    _run_recovery_child(
+        [
+            "/usr/bin/python3",
+            "-I",
+            str(transaction),
+            "complete-recovery",
+            "--state",
+            str(state),
+        ]
+    )
+
+
 def _terminate_recovery_child_group(process: subprocess.Popen[bytes]) -> None:
     """Terminate a timed-out immutable helper and its descendants."""
 
@@ -2042,6 +2297,23 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
             raise RecoveryBootstrapError("retained recovery receipts are incomplete")
         return
     receipt = _receipt_json(state)
+    if (
+        receipt.get("operation") == "install"
+        and receipt.get("version") == 2
+        and receipt.get("current_before") is None
+        and receipt.get("previous_before") is None
+    ):
+        # A clean first-install receipt is governed by its single transaction
+        # snapshot. A second systemd receipt is an ambiguous/stale pair: do
+        # not let the transaction cleanup proceed while that state could
+        # still describe a different operation. Retain both for an explicit
+        # operator recovery path and make a retry deterministic.
+        if systemd_state_present:
+            raise RecoveryBootstrapError(
+                "initial release has an unexpected systemd receipt"
+            )
+        _abort_initial_retained_only(app_dir=app_dir, generation=generation)
+        return
     release = _validate_receipt_identity(receipt, app_dir)
     transaction = generation / "platform_release_transaction.py"
     runtime = generation / "platform_release_restore_runtime.sh"
