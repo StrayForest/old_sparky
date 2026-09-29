@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import subprocess  # nosec B404 - all argv below is fixed or validated data.
 import sys
@@ -116,6 +117,12 @@ ARTIFACT_DIR_HELPER = ACTIVE_TOOLS_DIR / "platform_prepare_artifact_dir.py"
 EXTERNAL_EXPORT_PREFIX = "/tmp/old-sparky-production-retained-load-"
 CLEANUP_EXPORT_PREFIX = "/tmp/old-sparky-production-retained-cleanup-"
 SUDO = "/usr/bin/sudo"
+DEPLOY_OPERATION_TIMEOUT_SECONDS = 900.0
+CLEANUP_OPERATION_TIMEOUT_SECONDS = 300.0
+ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS = 120.0
+LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 300.0
+LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0
+CHILD_TERMINATION_GRACE_SECONDS = 5.0
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 HOST_GENERATION_RE = re.compile(r"^[0-9a-f]{40}$")
 HOST_TOOL_FILES = (
@@ -144,20 +151,77 @@ def _fail() -> int:
     return 2
 
 
-def _run_sudo(helper: Path, arguments: list[str]) -> int:
+def _run_sudo(
+    helper: Path,
+    arguments: list[str],
+    *,
+    timeout_seconds: float,
+) -> int:
     if not _trusted_helper(helper):
         return 2
     command = [SUDO, "-n", "--", str(helper), *arguments]
-    completed = subprocess.run(command, check=False)  # nosec B603
-    return completed.returncode
+    return _run_bounded_child(command, timeout_seconds=timeout_seconds)
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Terminate a timed-out dispatcher child and every process it spawned."""
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.terminate()
+    try:
+        process.wait(timeout=CHILD_TERMINATION_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.kill()
+    try:
+        process.wait(timeout=CHILD_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        # The caller still returns failure.  Do not turn a timeout into a
+        # false success merely because a hostile child ignored both signals.
+        pass
+
+
+def _run_bounded_child(command: list[str], *, timeout_seconds: float) -> int:
+    """Run one synchronous privileged child with process-group cleanup."""
+
+    try:
+        process = subprocess.Popen(  # nosec B603
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        return 2
+    try:
+        return process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(process)
+        return 124
 
 
 def _run_trusted_live_launch(arguments: list[str]) -> int:
     if not _trusted_live_launch_helper():
         return 2
     command = [SUDO, "-n", "--", str(TRUSTED_LIVE_LAUNCH), *arguments]
-    completed = subprocess.run(command, check=False)  # nosec B603
-    return completed.returncode
+    # The trusted helper performs the synchronous handoff to its supervisor;
+    # bound that handoff while retaining the supervisor's own detached work.
+    return _run_bounded_child(
+        command,
+        timeout_seconds=LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS,
+    )
 
 
 def _trusted_helper(helper: Path) -> bool:
@@ -640,8 +704,10 @@ def _prepare_deployment(payload: dict[str, str]) -> int:
         str(ARTIFACT_DIR_HELPER),
         payload["artifact_remote_dir"],
     ]
-    completed = subprocess.run(command, check=False)  # nosec B603
-    return completed.returncode
+    return _run_bounded_child(
+        command,
+        timeout_seconds=ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -715,6 +781,7 @@ def main(argv: list[str] | None = None) -> int:
                     payload["control_email"],
                     payload["run_id"],
                 ],
+                timeout_seconds=CLEANUP_OPERATION_TIMEOUT_SECONDS,
             )
         if arguments == ["external-cleanup-exports"]:
             return _remove_exports(
@@ -735,6 +802,7 @@ def main(argv: list[str] | None = None) -> int:
                     payload["control_email"],
                     payload["cleanup_run_id"],
                 ],
+                timeout_seconds=CLEANUP_OPERATION_TIMEOUT_SECONDS,
             )
         if arguments == ["retained-cleanup-exports"]:
             return _remove_exports(
@@ -762,6 +830,7 @@ def main(argv: list[str] | None = None) -> int:
                         else []
                     ),
                 ],
+                timeout_seconds=DEPLOY_OPERATION_TIMEOUT_SECONDS,
             )
         if arguments == ["live-user-qa"]:
             if (
@@ -770,7 +839,11 @@ def main(argv: list[str] | None = None) -> int:
                 or payload["marker"] != ""
             ):
                 return _fail()
-            return _run_sudo(LIVE_USER_QA_HELPER, [payload["target_sha"]])
+            return _run_sudo(
+                LIVE_USER_QA_HELPER,
+                [payload["target_sha"]],
+                timeout_seconds=LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS,
+            )
         return _run_trusted_live_launch(
             [
                 payload["base_url"],

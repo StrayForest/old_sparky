@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -57,6 +58,8 @@ MAX_FILES = 32
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_PROVENANCE_BYTES = 64 * 1024
 MAX_PUBLISH_PAGE_ROWS = 100
+RECOVERY_SUBPROCESS_TIMEOUT_SECONDS = 120.0
+RECOVERY_CHILD_TERMINATION_GRACE_SECONDS = 5.0
 EXECUTABLE_MODE = 0o555
 DATA_MODE = 0o444
 
@@ -745,6 +748,112 @@ def _publisher_bundle_candidate(
     }
 
 
+def publisher_bundle_artifact_name(
+    *,
+    source_sha: str,
+    security_run_id: str,
+    security_run_attempt: str,
+    producer_run_id: str,
+    producer_run_attempt: str,
+    publisher_run_id: str,
+    publisher_run_attempt: str,
+) -> str:
+    """Return the content-address-independent outer publisher artifact name.
+
+    The producer's inner filename remains bound to B.  The upload-artifact
+    envelope is owned by publisher run C, so each publisher rerun gets a
+    distinct artifact name even when it republishes the same B bytes.
+    """
+
+    source = _publish_string(source_sha, pattern=SOURCE_SHA_RE, label="source SHA")
+    security_id = _publish_id(security_run_id, label="security run id")
+    security_attempt = _publish_id(
+        security_run_attempt, label="security run attempt"
+    )
+    producer_id = _publish_id(producer_run_id, label="producer run id")
+    producer_attempt = _publish_id(
+        producer_run_attempt, label="producer run attempt"
+    )
+    publisher_id = _publish_id(publisher_run_id, label="publisher run id")
+    publisher_attempt = _publish_id(
+        publisher_run_attempt, label="publisher run attempt"
+    )
+    return (
+        f"platform-recovery-bootstrap-publisher-{source}-{security_id}-"
+        f"{security_attempt}-{producer_id}-{producer_attempt}-"
+        f"{publisher_id}-{publisher_attempt}.zip"
+    )
+
+
+def validate_publisher_artifact_metadata(
+    metadata: Path,
+    *,
+    expected_name: str,
+    expected_run_id: str,
+    expected_run_attempt: str,
+    expected_workflow_sha: str,
+) -> dict[str, object]:
+    """Select the exact C-side outer bundle artifact and API digest."""
+
+    expected_run = _publish_id(expected_run_id, label="publisher run id")
+    expected_attempt = _publish_id(
+        expected_run_attempt, label="publisher run attempt"
+    )
+    expected_workflow_sha = _publish_string(
+        expected_workflow_sha,
+        pattern=SOURCE_SHA_RE,
+        label="publisher workflow SHA",
+    )
+    expected_name = _publish_string(
+        expected_name,
+        pattern=re.compile(
+            r"^platform-recovery-bootstrap-publisher-[0-9a-f]{40,64}-"
+            r"[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-"
+            r"[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-"
+            r"[1-9][0-9]{0,31}-[1-9][0-9]{0,31}\.zip$"
+        ),
+        label="publisher bundle artifact name",
+    )
+    rows = _publish_rows(
+        _read_publish_json(metadata, label="publisher artifacts"),
+        key="artifacts",
+        label="publisher artifacts",
+    )
+    matches: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        workflow_run = row.get("workflow_run")
+        digest = row.get("digest")
+        if (
+            row.get("name") != expected_name
+            or row.get("expired") is not False
+            or type(row.get("id")) is not int
+            or row["id"] <= 0
+            or not isinstance(workflow_run, dict)
+            or workflow_run.get("id") != expected_run
+            or workflow_run.get("head_sha") != expected_workflow_sha
+            or (
+                "run_attempt" in workflow_run
+                and workflow_run.get("run_attempt") != expected_attempt
+            )
+            or not isinstance(digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+        ):
+            continue
+        matches.append(row)
+    if len(matches) != 1:
+        raise RecoveryBootstrapError("exact publisher bundle artifact is missing")
+    row = matches[0]
+    return {
+        "publisher_bundle_name": expected_name,
+        "publisher_bundle_artifact_id": _publish_id(
+            row["id"], label="publisher bundle artifact id"
+        ),
+        "publisher_bundle_artifact_sha256": str(row["digest"])[len("sha256:") :],
+    }
+
+
 def select_publisher_bundle_metadata(
     metadata: Path,
     *,
@@ -1041,6 +1150,9 @@ def build_publish_evidence(
     publisher_run_id: str | None = None,
     publisher_run_attempt: str | None = None,
     publisher_job_id: str | None = None,
+    publisher_bundle_name: str | None = None,
+    publisher_bundle_artifact_id: str | None = None,
+    publisher_bundle_artifact_sha256: str | None = None,
 ) -> dict[str, object]:
     """Build the closed, non-deployable recovery evidence payload."""
 
@@ -1067,6 +1179,9 @@ def build_publish_evidence(
             publisher_run_id,
             publisher_run_attempt,
             publisher_job_id,
+            publisher_bundle_name,
+            publisher_bundle_artifact_id,
+            publisher_bundle_artifact_sha256,
         )
     )
     if legacy_publisher and bundle_artifact_sha256 is not None:
@@ -1086,11 +1201,43 @@ def build_publish_evidence(
             publisher_run_id,
             publisher_run_attempt,
             publisher_job_id,
+            publisher_bundle_name,
+            publisher_bundle_artifact_id,
+            publisher_bundle_artifact_sha256,
         )
     ):
         raise RecoveryBootstrapError("publisher evidence identity is incomplete")
+    publisher_bundle_name_value: str | None = None
+    publisher_bundle_artifact_id_value: str | None = None
+    publisher_bundle_artifact_sha256_value: str | None = None
+    if not legacy_publisher:
+        publisher_run = _publish_id(str(publisher_run_id), label="publisher run id")
+        publisher_attempt = _publish_id(
+            str(publisher_run_attempt), label="publisher run attempt"
+        )
+        publisher_bundle_name_value = _publish_string(
+            str(publisher_bundle_name),
+            pattern=re.compile(
+                rf"platform-recovery-bootstrap-publisher-{provenance['source_sha']}-"
+                rf"{provenance['run_id']}-{provenance['run_attempt']}-"
+                rf"{recovery_run}-{recovery_attempt}-"
+                rf"{publisher_run}-{publisher_attempt}\.zip"
+            ),
+            label="publisher bundle name",
+        )
+        publisher_bundle_artifact_id_value = str(
+            _publish_id(
+                str(publisher_bundle_artifact_id),
+                label="publisher bundle artifact id",
+            )
+        )
+        publisher_bundle_artifact_sha256_value = _publish_string(
+            str(publisher_bundle_artifact_sha256),
+            pattern=HEX64_RE,
+            label="publisher bundle artifact SHA",
+        )
     payload: dict[str, object] = {
-        "schema": 1 if legacy_publisher else 2,
+        "schema": 1 if legacy_publisher else 3,
         "capability": "recovery_bootstrap",
         "capabilities": [CAPABILITY, RECOVER_PENDING_CAPABILITY],
         "deployable": False,
@@ -1111,15 +1258,14 @@ def build_publish_evidence(
                     pattern=SOURCE_SHA_RE,
                     label="publisher workflow SHA",
                 ),
-                "publisher_run_id": str(
-                    _publish_id(str(publisher_run_id), label="publisher run id")
-                ),
-                "publisher_run_attempt": str(
-                    _publish_id(str(publisher_run_attempt), label="publisher run attempt")
-                ),
+                "publisher_run_id": str(publisher_run),
+                "publisher_run_attempt": str(publisher_attempt),
                 "publisher_job_id": str(
                     _publish_id(str(publisher_job_id), label="publisher job id")
                 ),
+                "publisher_bundle_name": publisher_bundle_name_value,
+                "publisher_bundle_artifact_id": publisher_bundle_artifact_id_value,
+                "publisher_bundle_artifact_sha256": publisher_bundle_artifact_sha256_value,
             }
         )
     return payload
@@ -1824,6 +1970,59 @@ def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Pat
     return current
 
 
+def _terminate_recovery_child_group(process: subprocess.Popen[bytes]) -> None:
+    """Terminate a timed-out immutable helper and its descendants."""
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.terminate()
+    try:
+        process.wait(timeout=RECOVERY_CHILD_TERMINATION_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.kill()
+    try:
+        process.wait(timeout=RECOVERY_CHILD_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_recovery_child(command: list[str]) -> None:
+    """Run one immutable recovery child with a bounded fail-closed deadline."""
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise RecoveryBootstrapError(
+            "retained recovery child could not start; receipts remain for retry"
+        ) from exc
+    try:
+        return_code = process.wait(timeout=RECOVERY_SUBPROCESS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_recovery_child_group(process)
+        raise RecoveryBootstrapError(
+            "retained recovery child timed out; receipts remain for retry"
+        ) from exc
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
+
+
 def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
     """Restore runtime and complete only an already pointer-restored receipt."""
 
@@ -1865,14 +2064,14 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
         peer = Path(peer_value)
         if os.path.lexists(peer):
             raise RecoveryBootstrapError("legacy release receipt peer is present")
-        subprocess.run([
+        _run_recovery_child([
             "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
             "--state", str(state), "--retain-receipt",
-        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
-        subprocess.run([
+        ])
+        _run_recovery_child([
             "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
             "--state", str(state),
-        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        ])
         return
     if systemd_state_present:
         if (
@@ -1887,14 +2086,14 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
         # unit files, Nginx, or the live-QA runtime.  A stale systemd receipt
         # may be individually valid after a crash; it is not valid for a new
         # transaction merely because the app directory still matches.
-        subprocess.run([
+        _run_recovery_child([
             "/usr/bin/python3", "-I", str(systemd), "validate",
             "--state", str(systemd_state),
             "--app-dir", str(app_dir),
             "--helper-release", str(release),
             "--transaction", str(state),
             "--systemctl", "/usr/bin/systemctl",
-        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        ])
         command = [
             str(runtime),
             "--app-dir", str(app_dir),
@@ -1904,30 +2103,30 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
             "--systemctl", "/usr/bin/systemctl",
             "--live-qa-runtime-installer", str(liveqa),
         ]
-        subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        _run_recovery_child(command)
         if _release_pointer(app_dir, "current") != release:
             raise RecoveryBootstrapError("current release changed during retained recovery")
         if receipt.get("previous_before") is not None and _release_pointer(app_dir, "previous") != Path(str(receipt["previous_before"])):
             raise RecoveryBootstrapError("previous release changed during retained recovery")
-        subprocess.run([
+        _run_recovery_child([
             "/usr/bin/python3", "-I", str(systemd), "verify", "--state", str(systemd_state),
             "--app-dir", str(app_dir), "--helper-release", str(release),
             "--transaction", str(state),
             "--systemctl", "/usr/bin/systemctl",
-        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        ])
         # Remove candidate/venv cleanup artifacts but retain the operation
         # receipt until the durable systemd receipt is also cleared.  A crash
         # after either side effect can therefore resume without guessing.
-        subprocess.run([
+        _run_recovery_child([
             "/usr/bin/python3", "-I", str(transaction), "complete-recovery", "--state", str(state),
             "--retain-receipt",
-        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
-        subprocess.run([
+        ])
+        _run_recovery_child([
             "/usr/bin/python3", "-I", str(systemd), "clear", "--state", str(systemd_state),
             "--app-dir", str(app_dir), "--helper-release", str(release),
             "--transaction", str(state),
             "--systemctl", "/usr/bin/systemctl",
-        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        ])
     else:
         # The first attempt may have retained the operation receipt after
         # completing its filesystem cleanup, then removed the systemd receipt
@@ -1943,9 +2142,9 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
     # This is the only operation that removes the release receipt.  It is
     # deliberately after successful systemd clear, and is safe to retry after
     # a failure in either prior subprocess.
-    subprocess.run([
+    _run_recovery_child([
         "/usr/bin/python3", "-I", str(transaction), "complete-recovery", "--state", str(state),
-    ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+    ])
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2032,6 +2231,13 @@ def _parser() -> argparse.ArgumentParser:
     publish_artifact.add_argument("--recovery-run-attempt", required=True)
     publish_artifact.add_argument("--source-sha", required=True)
     publish_artifact.add_argument("--recovery-workflow-sha", required=True)
+    publisher_artifact = commands.add_parser("publisher-artifact")
+    publisher_artifact.add_argument("--metadata", type=Path, required=True)
+    publisher_artifact.add_argument("--artifact-name", required=True)
+    publisher_artifact.add_argument("--publisher-run-id", required=True)
+    publisher_artifact.add_argument("--publisher-run-attempt", required=True)
+    publisher_artifact.add_argument("--publisher-workflow-sha", required=True)
+    publisher_artifact.add_argument("--github-output", type=Path, required=True)
     publish_bundle = commands.add_parser("publish-bundle")
     publish_bundle.add_argument("--archive", type=Path, required=True)
     publish_bundle.add_argument("--output", type=Path, required=True)
@@ -2052,6 +2258,9 @@ def _parser() -> argparse.ArgumentParser:
     publish_evidence.add_argument("--publisher-run-id")
     publish_evidence.add_argument("--publisher-run-attempt")
     publish_evidence.add_argument("--publisher-job-id")
+    publish_evidence.add_argument("--publisher-bundle-name")
+    publish_evidence.add_argument("--publisher-bundle-artifact-id")
+    publish_evidence.add_argument("--publisher-bundle-artifact-sha256")
     return parser
 
 
@@ -2204,6 +2413,21 @@ def main(argv: list[str] | None = None) -> int:
             args.artifact_id_output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             args.artifact_id_output.write_text(f"{artifact_id}\n", encoding="ascii")
             args.artifact_id_output.chmod(0o600)
+        elif args.command == "publisher-artifact":
+            result = validate_publisher_artifact_metadata(
+                args.metadata,
+                expected_name=args.artifact_name,
+                expected_run_id=args.publisher_run_id,
+                expected_run_attempt=args.publisher_run_attempt,
+                expected_workflow_sha=args.publisher_workflow_sha,
+            )
+            with args.github_output.open("a", encoding="ascii") as stream:
+                for key in (
+                    "publisher_bundle_name",
+                    "publisher_bundle_artifact_id",
+                    "publisher_bundle_artifact_sha256",
+                ):
+                    stream.write(f"{key}={result[key]}\n")
         elif args.command == "publish-bundle":
             extract_publish_bundle(
                 args.archive,
@@ -2232,6 +2456,9 @@ def main(argv: list[str] | None = None) -> int:
                 publisher_run_id=args.publisher_run_id,
                 publisher_run_attempt=args.publisher_run_attempt,
                 publisher_job_id=args.publisher_job_id,
+                publisher_bundle_name=args.publisher_bundle_name,
+                publisher_bundle_artifact_id=args.publisher_bundle_artifact_id,
+                publisher_bundle_artifact_sha256=args.publisher_bundle_artifact_sha256,
             )
             if args.evidence.exists() or args.evidence.is_symlink():
                 raise RecoveryBootstrapError("recovery evidence output already exists")

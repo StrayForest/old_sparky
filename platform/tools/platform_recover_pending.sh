@@ -7,6 +7,9 @@ ORIGINAL_ARGS=("$@")
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
 SYSTEMCTL_BIN="/usr/bin/systemctl"
 SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"
+NGINX_BIN="/usr/sbin/nginx"
+NGINX_TIMEOUT_BIN="/usr/bin/timeout"
+NGINX_CONFIG_TIMEOUT_SECONDS=30
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
 
@@ -48,6 +51,11 @@ done
 # checks with the same trusted timeout policy as every other systemctl call.
 run_systemctl() {
   "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s "$SYSTEMCTL_BIN" "$@"
+}
+
+run_nginx_config_test() {
+  "$NGINX_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${NGINX_CONFIG_TIMEOUT_SECONDS}s" \
+    "$NGINX_BIN" -t >/dev/null 2>/dev/null
 }
 
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -592,7 +600,7 @@ PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$RESTORE_TOOL" \
   --transaction "$STATE" --helper-release "$current_release" \
   --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
   || { public_status failed systemd_state >&2; exit 1; }
-/usr/sbin/nginx -t >/dev/null 2>/dev/null
+run_nginx_config_test || { public_status failed nginx >&2; exit 1; }
 for service in deadlock-api.service deadlock-worker.service deadlock-web.service; do
   expected_state="$({
     /usr/bin/python3 -I - "$SYSTEMD_STATE" "$service" <<'PY'

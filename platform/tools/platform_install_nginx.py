@@ -72,7 +72,10 @@ EXPECTED_TLS_DIRECTIVES = (
     "ssl_prefer_server_ciphers off;",
     "ssl_session_tickets off;",
 )
+SYSTEMCTL_BIN = "/usr/bin/systemctl"
+OPENSSL_TIMEOUT_SECONDS = 30.0
 SYSTEMCTL_RELOAD_TIMEOUT_SECONDS = 30.0
+NGINX_CONFIG_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -127,7 +130,17 @@ def run_checked(command: list[str], *, timeout: float | None = None) -> None:
 
 
 def run_captured(command: list[str]) -> bytes:
-    completed = subprocess.run(command, capture_output=True, check=False, timeout=15)
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            timeout=OPENSSL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Command timed out safely after {OPENSSL_TIMEOUT_SECONDS:g}s: {' '.join(command)}"
+        ) from exc
     if completed.returncode != 0:
         raise RuntimeError(f"Command failed safely: {command[0]} {command[1]}")
     return completed.stdout
@@ -159,7 +172,8 @@ def validate_certificate_pair(certificate: Path, private_key: Path) -> None:
     if certificate_public_key != private_public_key:
         raise ValueError("Origin certificate and private key do not match.")
     run_checked(
-        ["openssl", "x509", "-in", str(certificate), "-noout", "-checkhost", "old-sparky.com"]
+        ["openssl", "x509", "-in", str(certificate), "-noout", "-checkhost", "old-sparky.com"],
+        timeout=OPENSSL_TIMEOUT_SECONDS,
     )
     run_checked(
         [
@@ -170,10 +184,12 @@ def validate_certificate_pair(certificate: Path, private_key: Path) -> None:
             "-noout",
             "-checkhost",
             "media.old-sparky.com",
-        ]
+        ],
+        timeout=OPENSSL_TIMEOUT_SECONDS,
     )
     run_checked(
-        ["openssl", "x509", "-in", str(certificate), "-noout", "-checkend", str(30 * 86_400)]
+        ["openssl", "x509", "-in", str(certificate), "-noout", "-checkend", str(30 * 86_400)],
+        timeout=OPENSSL_TIMEOUT_SECONDS,
     )
 
 
@@ -432,7 +448,10 @@ def validate_candidate(
             "}\n",
             encoding="utf-8",
         )
-        run_checked([nginx_bin, "-t", "-c", str(main_config)])
+        run_checked(
+            [nginx_bin, "-t", "-c", str(main_config)],
+            timeout=NGINX_CONFIG_TIMEOUT_SECONDS,
+        )
 
 
 def validate_main_config(source: Path) -> None:
@@ -568,7 +587,7 @@ def install(
     if not changed:
         if reload_nginx:
             run_checked(
-                ["systemctl", "reload", "nginx.service"],
+                [SYSTEMCTL_BIN, "reload", "nginx.service"],
                 timeout=SYSTEMCTL_RELOAD_TIMEOUT_SECONDS,
             )
         return False
@@ -586,10 +605,10 @@ def install(
         if main_source is not None and main_destination is not None:
             atomic_copy(main_source, main_destination)
         atomic_symlink(str(available), enabled)
-        run_checked([nginx_bin, "-t"])
+        run_checked([nginx_bin, "-t"], timeout=NGINX_CONFIG_TIMEOUT_SECONDS)
         if reload_nginx:
             run_checked(
-                ["systemctl", "reload", "nginx.service"],
+                [SYSTEMCTL_BIN, "reload", "nginx.service"],
                 timeout=SYSTEMCTL_RELOAD_TIMEOUT_SECONDS,
             )
         return True

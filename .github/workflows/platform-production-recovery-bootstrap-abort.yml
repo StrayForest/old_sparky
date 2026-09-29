@@ -94,7 +94,7 @@ jobs:
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "$api/actions/runs/$SECURITY_RUN_ID" --output "$metadata/run.json"
+            "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT" --output "$metadata/run.json"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
@@ -150,7 +150,7 @@ jobs:
           ):
               raise SystemExit("security run provenance is not exact")
           rows = jobs.get("jobs")
-          if not isinstance(rows, list) or type(jobs.get("total_count")) is not int or jobs["total_count"] != len(rows):
+          if not isinstance(rows, list) or type(jobs.get("total_count")) is not int or not 0 <= jobs["total_count"] <= 100 or jobs["total_count"] != len(rows):
               raise SystemExit("security jobs response is incomplete")
           security_matches = [
               row for row in rows or []
@@ -169,7 +169,7 @@ jobs:
           if not isinstance(rows, list) or len(security_matches) != 1:
               raise SystemExit("exact successful security verification job is missing")
           artifact_rows = artifacts.get("artifacts")
-          if not isinstance(artifact_rows, list) or type(artifacts.get("total_count")) is not int or artifacts["total_count"] != len(artifact_rows):
+          if not isinstance(artifact_rows, list) or type(artifacts.get("total_count")) is not int or not 0 <= artifacts["total_count"] <= 100 or artifacts["total_count"] != len(artifact_rows):
               raise SystemExit("security artifacts response is incomplete")
           route_matches = [row for row in artifact_rows if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") > 0 and row.get("name") == f"platform-ci-route-{run_id}-{attempt}" and row.get("expired") is False and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == run_id and row["workflow_run"].get("head_sha") == run.get("head_sha")]
           if len(route_matches) != 1:
@@ -198,6 +198,7 @@ jobs:
               stream.write(f"recovery_workflow_sha={recovery_run['head_sha']}\n")
               stream.write(f"route_digest={route['digest'].removeprefix('sha256:')}\n")
               stream.write(f"bundle_name=platform-recovery-bootstrap-{source_sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}.zip\n")
+              stream.write(f"publisher_bundle_name=platform-recovery-bootstrap-publisher-{source_sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}-{os.environ['PUBLISHER_RUN_ID']}-{os.environ['PUBLISHER_RUN_ATTEMPT']}.zip\n")
               stream.write(f"evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}-{os.environ['PUBLISHER_RUN_ID']}-{os.environ['PUBLISHER_RUN_ATTEMPT']}.json\n")
           # Evidence and bundle are downloaded by the next step; the host is
           # not contacted and no production secret has been read yet.
@@ -221,7 +222,7 @@ jobs:
 
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           rows = payload.get("jobs") if isinstance(payload, dict) else None
-          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or payload["total_count"] != len(rows):
+          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 100 or payload["total_count"] != len(rows):
               raise SystemExit("recovery build jobs response is malformed")
           expected_run_id = int(sys.argv[3])
           expected_attempt = int(sys.argv[4])
@@ -281,7 +282,7 @@ jobs:
               raise SystemExit("exact publisher run is missing or invalid")
           jobs = json.loads((root / "publisher-jobs.json").read_text(encoding="ascii"))
           rows = jobs.get("jobs") if isinstance(jobs, dict) else None
-          if not isinstance(rows, list) or jobs.get("total_count") != len(rows):
+          if not isinstance(rows, list) or type(jobs.get("total_count")) is not int or not 0 <= jobs["total_count"] <= 100 or jobs["total_count"] != len(rows):
               raise SystemExit("publisher jobs response is incomplete")
           matches = [row for row in rows if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") > 0
                      and row.get("name") == "Publish retained-release recovery bootstrap evidence"
@@ -293,24 +294,32 @@ jobs:
               raise SystemExit("exact successful publisher job is missing")
           artifacts = json.loads((root / "publisher-artifacts.json").read_text(encoding="ascii"))
           artifact_rows = artifacts.get("artifacts") if isinstance(artifacts, dict) else None
-          if not isinstance(artifact_rows, list) or artifacts.get("total_count") != len(artifact_rows):
+          if not isinstance(artifact_rows, list) or type(artifacts.get("total_count")) is not int or not 0 <= artifacts["total_count"] <= 100 or artifacts["total_count"] != len(artifact_rows):
               raise SystemExit("publisher artifacts response is incomplete")
-          names = {
-              "bundle": next(line.split("=", 1)[1] for line in output.read_text(encoding="ascii").splitlines() if line.startswith("bundle_name=")),
-              "evidence": next(line.split("=", 1)[1] for line in output.read_text(encoding="ascii").splitlines() if line.startswith("evidence_name=")),
-          }
+          output_lines = output.read_text(encoding="ascii").splitlines()
+          name_values = {}
+          for kind, prefix in (("bundle", "publisher_bundle_name="), ("evidence", "evidence_name=")):
+              values = [line.split("=", 1)[1] for line in output_lines if line.startswith(prefix)]
+              if len(values) != 1 or not values[0]:
+                  raise SystemExit(f"exact publisher {kind} name is missing")
+              name_values[kind] = values[0]
+          names = name_values
           ids = {}
           for kind, name in names.items():
               found = [row for row in artifact_rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(os.environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == publisher_sha and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"]))]
               if len(found) != 1:
                   raise SystemExit(f"exact publisher {kind} artifact is missing")
               ids[kind] = found[0]["id"]
+          bundle_rows = [row for row in artifact_rows if isinstance(row, dict) and row.get("id") == ids["bundle"]]
+          if len(bundle_rows) != 1 or not isinstance(bundle_rows[0].get("digest"), str) or re.fullmatch(r"sha256:[0-9a-f]{64}", bundle_rows[0]["digest"]) is None:
+              raise SystemExit("publisher bundle artifact digest is missing")
           with output.open("a", encoding="ascii") as stream:
               stream.write(f"publisher_run_id={os.environ['PUBLISHER_RUN_ID']}\n")
               stream.write(f"publisher_run_attempt={os.environ['PUBLISHER_RUN_ATTEMPT']}\n")
               stream.write(f"publisher_workflow_sha={publisher_sha}\n")
               stream.write(f"publisher_job_id={matches[0]['id']}\n")
               stream.write(f"publisher_bundle_artifact_id={ids['bundle']}\n")
+              stream.write(f"publisher_bundle_artifact_sha256={bundle_rows[0]['digest'].removeprefix('sha256:')}\n")
               stream.write(f"publisher_evidence_artifact_id={ids['evidence']}\n")
           PY
 
@@ -322,6 +331,7 @@ jobs:
           RECOVERY_RUN_ID: ${{ steps.evidence.outputs.recovery_run_id }}
           RECOVERY_RUN_ATTEMPT: ${{ steps.evidence.outputs.recovery_run_attempt }}
           BUNDLE_NAME: ${{ steps.evidence.outputs.bundle_name }}
+          PUBLISHER_BUNDLE_NAME: ${{ steps.evidence.outputs.publisher_bundle_name }}
           EVIDENCE_NAME: ${{ steps.evidence.outputs.evidence_name }}
           SOURCE_SHA: ${{ steps.evidence.outputs.source_sha }}
           RECOVERY_WORKFLOW_SHA: ${{ steps.evidence.outputs.recovery_workflow_sha }}
@@ -331,6 +341,8 @@ jobs:
           PUBLISHER_RUN_ATTEMPT: ${{ steps.evidence.outputs.publisher_run_attempt }}
           PUBLISHER_WORKFLOW_SHA: ${{ steps.evidence.outputs.publisher_workflow_sha }}
           PUBLISHER_JOB_ID: ${{ steps.evidence.outputs.publisher_job_id }}
+          PUBLISHER_BUNDLE_ARTIFACT_ID: ${{ steps.evidence.outputs.publisher_bundle_artifact_id }}
+          PUBLISHER_BUNDLE_ARTIFACT_SHA256: ${{ steps.evidence.outputs.publisher_bundle_artifact_sha256 }}
         run: |
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/platform-recovery-bootstrap-artifacts"
@@ -343,13 +355,13 @@ jobs:
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "$api/actions/runs/$PUBLISHER_RUN_ID/artifacts?per_page=100&page=1" --output "$artifact_dir/artifacts.json"
-          /usr/bin/python3 -I -B - "$artifact_dir/artifacts.json" "$BUNDLE_NAME" "$EVIDENCE_NAME" "$artifact_dir" "$GITHUB_OUTPUT" <<'PY'
+          /usr/bin/python3 -I -B - "$artifact_dir/artifacts.json" "$PUBLISHER_BUNDLE_NAME" "$EVIDENCE_NAME" "$artifact_dir" "$GITHUB_OUTPUT" <<'PY'
           import json, sys
           from pathlib import Path
           root = Path(sys.argv[4])
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           rows = payload.get("artifacts") if isinstance(payload, dict) else None
-          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or payload["total_count"] != len(rows):
+          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 100 or payload["total_count"] != len(rows):
               raise SystemExit("recovery artifacts response is malformed")
           def select(name):
               matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(__import__("os").environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == __import__("os").environ["PUBLISHER_WORKFLOW_SHA"] and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(__import__("os").environ["PUBLISHER_RUN_ATTEMPT"]))]
@@ -438,9 +450,9 @@ jobs:
           evidence = one(root / "evidence.zip", evidence_name)
           bundle = one(root / "bundle.zip", bundle_name)
           payload = json.loads(evidence.read_text(encoding="ascii"))
-          if set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "bundle_artifact_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance", "publisher_workflow_sha", "publisher_run_id", "publisher_run_attempt", "publisher_job_id"} or payload.get("schema") != 2 or payload.get("capability") != "recovery_bootstrap" or payload.get("capabilities") != ["abort_retained_only", "recover_pending"] or payload.get("deployable") is not False:
+          if set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "bundle_artifact_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance", "publisher_workflow_sha", "publisher_run_id", "publisher_run_attempt", "publisher_job_id", "publisher_bundle_name", "publisher_bundle_artifact_id", "publisher_bundle_artifact_sha256"} or payload.get("schema") != 3 or payload.get("capability") != "recovery_bootstrap" or payload.get("capabilities") != ["abort_retained_only", "recover_pending"] or payload.get("deployable") is not False:
               raise SystemExit("recovery evidence schema is not closed")
-          if not isinstance(payload.get("bundle_name"), str) or payload["bundle_name"] != bundle.name or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_sha256"))) or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_artifact_sha256"))):
+          if not isinstance(payload.get("bundle_name"), str) or payload["bundle_name"] != bundle.name or payload.get("publisher_bundle_name") != os.environ["PUBLISHER_BUNDLE_NAME"] or payload.get("publisher_bundle_artifact_id") != os.environ["PUBLISHER_BUNDLE_ARTIFACT_ID"] or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_sha256"))) or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_artifact_sha256"))) or payload.get("publisher_bundle_artifact_sha256") != os.environ["PUBLISHER_BUNDLE_ARTIFACT_SHA256"]:
               raise SystemExit("recovery evidence bundle identity is invalid")
           if payload.get("recovery_run_id") != __import__("os").environ["RECOVERY_RUN_ID"] or payload.get("recovery_run_attempt") != __import__("os").environ["RECOVERY_RUN_ATTEMPT"]:
               raise SystemExit("recovery evidence run identity is invalid")
@@ -468,10 +480,13 @@ jobs:
               raise SystemExit("recovery evidence provenance is invalid")
           if hashlib.sha256(bundle.read_bytes()).hexdigest() != payload["bundle_sha256"]:
               raise SystemExit("recovery bundle digest mismatch")
+          if hashlib.sha256((root / "bundle.zip").read_bytes()).hexdigest() != payload["publisher_bundle_artifact_sha256"]:
+              raise SystemExit("publisher bundle artifact digest mismatch")
           with output.open("a", encoding="ascii") as stream:
               stream.write(f"bundle={bundle}\n")
               stream.write(f"bundle_sha={payload['bundle_sha256']}\n")
               stream.write(f"bundle_artifact_sha256={payload['bundle_artifact_sha256']}\n")
+              stream.write(f"publisher_bundle_artifact_sha256={payload['publisher_bundle_artifact_sha256']}\n")
           PY
           # GitHub's attestation verifier binds the bundle to the trusted
           # default-branch builder; no host side trust is inferred from it.
@@ -616,7 +631,7 @@ jobs:
         run: |
           set -euo pipefail
           remote_stage="$(
-            ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s" <<'REMOTE'
+            timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s" <<'REMOTE'
           set -Eeuo pipefail
           umask 077
           test "$(id -u)" -eq 0
@@ -648,7 +663,7 @@ jobs:
             local status="$?"
             trap - EXIT
             set +e
-            ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage'" >/dev/null 2>&1 <<'REMOTE'
+            timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage'" >/dev/null 2>&1 <<'REMOTE'
           set -Eeuo pipefail
           umask 077
           stage="$1"
@@ -689,7 +704,7 @@ jobs:
           }
           trap cleanup_remote_stage EXIT
 
-          ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage'" <<'REMOTE'
+          timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage'" <<'REMOTE'
           set -Eeuo pipefail
           umask 077
           stage="$1"
@@ -718,8 +733,8 @@ jobs:
           os.close(fd)
           PY
           REMOTE
-          scp -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_bundle"
-          ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$ROUTE_DIGEST'" <<'REMOTE'
+          timeout --foreground 300s scp -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_bundle"
+          timeout --foreground 300s ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$ROUTE_DIGEST'" <<'REMOTE'
           set -Eeuo pipefail
           umask 077
           stage="$1"; expected_sha="$2"; source_sha="$3"; security_run_id="$4"; security_run_attempt="$5"; recovery_run_id="$6"; recovery_run_attempt="$7"; recovery_job_id="$8"; recovery_workflow_sha="$9"; route_digest="${10}"; bundle="$stage/bundle.zip"; app_dir=/opt/oldsparky/platform

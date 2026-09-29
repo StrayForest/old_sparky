@@ -1243,7 +1243,11 @@ def abort_quiesce(state: Path) -> None:
             if path.is_symlink():
                 raise TransactionError("pre-quiesce temporary path is a symlink")
             if path.is_dir():
-                _remove_tree(path)
+                # The operation-less pre-quiesce receipt carries no inode or
+                # content identity for a staging directory.  Never turn a
+                # filename pattern into recursive deletion authority; retain
+                # the receipt for an operator if a directory is present.
+                raise TransactionError("pre-quiesce temporary directory is unbound")
             else:
                 _optional_safe_private_file(path, label="pre-quiesce temporary file")
                 path.unlink()
@@ -1770,13 +1774,91 @@ def _remove_tree(
     metadata = _safe_directory(path, label=f"cleanup path {path.name}")
     if expected_identity is not None and _identity(metadata) != expected_identity:
         raise TransactionError("release cleanup identity changed")
-    for root, directories, _files in os.walk(path, topdown=False, followlinks=False):
-        for directory in directories:
-            child = Path(root) / directory
-            if not child.is_symlink():
+
+    # Validate the complete tree before changing permissions or deleting
+    # anything.  A receipt binds only the root inode; every descendant must
+    # still be ordinary root-owned data on the same filesystem.  Symlinks,
+    # hardlinks, special files and group/world-writable content are retained
+    # with the receipt instead of becoming recursive cleanup authority.
+    device = metadata.st_dev
+    pending = [path]
+    while pending:
+        root = pending.pop()
+        try:
+            entries = list(os.scandir(root))
+        except OSError as exc:
+            raise TransactionError("release cleanup tree cannot be inspected") from exc
+        for entry in entries:
+            try:
+                child_metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise TransactionError("release cleanup entry cannot be inspected") from exc
+            mode = child_metadata.st_mode
+            if (
+                child_metadata.st_dev != device
+                or child_metadata.st_uid != 0
+                or child_metadata.st_gid != 0
+                or stat.S_IMODE(mode) & 0o022
+            ):
+                raise TransactionError("release cleanup entry metadata is unsafe")
+            child = Path(entry.path)
+            if stat.S_ISDIR(mode):
+                if child_metadata.st_nlink < 2:
+                    raise TransactionError("release cleanup directory identity is invalid")
+                pending.append(child)
+            elif stat.S_ISREG(mode):
+                if child_metadata.st_nlink != 1:
+                    raise TransactionError("release cleanup hardlink is unsafe")
+            else:
+                raise TransactionError("release cleanup entry type is unsafe")
+    # Move the fully checked tree into a private, same-parent quarantine before
+    # deleting it.  The rename closes the pathname replacement window between
+    # validation and recursive deletion: cleanup is now rooted at the inode
+    # that was rechecked immediately before the atomic rename.  The parent is
+    # root-owned and non-writable to group/other, so the generated name cannot
+    # be planted by an untrusted process.
+    parent = path.parent
+    _safe_directory(parent, label="release cleanup parent")
+    quarantine = parent / f".{path.name}.cleanup-{uuid4().hex}"
+    if _lexists(quarantine):
+        raise TransactionError("release cleanup quarantine already exists")
+    latest = _safe_directory(path, label=f"cleanup path {path.name}")
+    if expected_identity is not None and _identity(latest) != expected_identity:
+        raise TransactionError("release cleanup identity changed")
+    if latest.st_dev != metadata.st_dev or latest.st_ino != metadata.st_ino:
+        raise TransactionError("release cleanup path changed during validation")
+    try:
+        os.rename(path, quarantine)
+    except OSError as exc:
+        raise TransactionError("release cleanup quarantine could not be created") from exc
+    try:
+        quarantined = _safe_directory(quarantine, label="release cleanup quarantine")
+        if _identity(quarantined) != _identity(metadata):
+            raise TransactionError("release cleanup quarantine identity changed")
+        if expected_identity is not None and _identity(quarantined) != expected_identity:
+            raise TransactionError("release cleanup quarantine identity changed")
+        if quarantined.st_dev != device:
+            raise TransactionError("release cleanup quarantine device changed")
+        for root, directories, _files in os.walk(
+            quarantine, topdown=False, followlinks=False
+        ):
+            for directory in directories:
+                child = Path(root) / directory
                 os.chmod(child, stat.S_IMODE(child.lstat().st_mode) | 0o700)
-        os.chmod(root, stat.S_IMODE(Path(root).lstat().st_mode) | 0o700)
-    shutil.rmtree(path)
+            os.chmod(root, stat.S_IMODE(Path(root).lstat().st_mode) | 0o700)
+        shutil.rmtree(quarantine)
+    except Exception as exc:
+        # Preserve the receipt and the quarantined tree on every validation or
+        # deletion failure. Restore the original pathname only when it is still
+        # absent; never overwrite a replacement supplied by another actor.
+        if _lexists(quarantine) and not _lexists(path):
+            try:
+                os.rename(quarantine, path)
+            except OSError:
+                pass
+        if isinstance(exc, TransactionError):
+            raise
+        raise TransactionError("release cleanup deletion failed") from exc
     _fsync_directory(path.parent)
 
 

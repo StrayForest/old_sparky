@@ -201,6 +201,23 @@ closed. Revision `20260913_0053` provides the same validation/repair as a
 forward migration for databases that already recorded 0051/0052; no downgrade
 or automatic migration reversal is performed.
 
+The migration wrapper has a bounded 300-second outer operation deadline that
+covers preflight, partial-0051 repair and the final `upgrade head` command. The
+checked-in Alembic environment applies 30-second asyncpg connect and command
+bounds plus PostgreSQL `statement_timeout` and `lock_timeout` to each
+`current`, `heads` and `upgrade` command; recovery and preflight engines use
+the same settings. Strict environment overrides may only remain within this
+bounded contract. These are defense-in-depth within the same operation
+boundary. A timeout exits
+nonzero (124 from `timeout(1)`) while retaining the durable
+`migration-pending` receipt; operators must inspect the database and resume or
+abort through the release state machine rather than retrying or downgrading.
+
+The read-only health gate budgets four 10-second service probes, one 5-second
+loopback readiness probe and one 10-second certificate probe (55 seconds),
+with a 35-second margin in the systemd unit (`TimeoutStartSec=90s`). A timeout
+is a failed health result, never a successful readiness signal.
+
 ### Manual workflow fallback
 
 `Platform production deploy` keeps `workflow_dispatch` as an operator fallback,
@@ -387,11 +404,14 @@ after reviewing the retained receipt and confirming that the migration was
 not reversed. Supply the exact successful security run ID/attempt, the exact
 completed recovery-build producer run ID/attempt, and the exact completed
 publisher run ID/attempt; then type `ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY`.
-The workflow validates those exact attempts, route artifact, schema-2 evidence,
+The workflow validates those exact attempts, route artifact, schema-3 evidence,
 bundle digest and build attestation before it reads `PROD_SSH_*` secrets or
 opens SSH. The bundle source SHA **A**, producer workflow SHA **B**, and
 publisher workflow SHA **C** are separate bindings: attestation uses **B**,
-while the evidence and bundle name bind **A**, **P**, and **C**. A rerun is
+while the evidence and inner bundle name bind **A**, **P**, and **C**. The
+publisher's outer artifact name includes its exact **C** run/attempt; its
+positive API artifact ID and digest are carried in schema-3 evidence and are
+checked against the downloaded outer ZIP. A rerun is
 selected only by its supplied ID and attempt; a latest-by-SHA match is never
 accepted. The downloaded bundle is re-hashed and re-stat'ed immediately before
 transfer; publisher evidence also carries the producer artifact API digest,
@@ -401,6 +421,17 @@ no source checkout to the host. GitHub's certificate
 workflow therefore binds the numeric producer and publisher job IDs selected
 from their exact attempt jobs APIs into the closed evidence artifact and
 rejects any evidence/API pairing drift before accepting the attestation.
+
+The complete recovery handoff is the six exact operator inputs
+`security_run_id/security_run_attempt`, `recovery_run_id/recovery_run_attempt`,
+and `publisher_run_id/publisher_run_attempt`. The corresponding security,
+producer, and publisher job IDs are not operator-supplied: each is selected
+exactly once from that run's attempt jobs API and carried into the closed
+evidence. The handoff therefore binds source **A**, producer workflow/run/job
+**B/P**, publisher workflow/run/job **C**, the route digest, the producer
+artifact digest, the publisher outer artifact name/ID/digest, and the bundle
+member digest. Missing, duplicate, over-100, expired, or mismatched API rows
+fail before SSH or host mutation.
 
 The host installs the verified bundle as one immutable generation and invokes
 only its fixed `platform_abort_retained_only.sh` entrypoint for this workflow.
@@ -416,6 +447,14 @@ states are clean. A retry after one of those side effects resumes from the
 remaining receipt and never repeats an unproven runtime transition. This workflow is
 non-deployable recovery authority: it does not run normal deploy, Alembic
 downgrade or a manually selected `systemctl` command.
+
+The normal systemd installer uses the same crash discipline for retired unit
+cleanup: it persists an fsynced, root-owned file/digest/state record before
+the first stop or disable. After the new unit set and reload verify, it marks
+that record `phase=cleanup-pending` before deleting any backup. If a process
+dies during an unlink, directory removal, or final record removal, the next
+retry validates only the identity-bound remaining paths and converges cleanup;
+it never adopts an unknown backup or clears an unsafe record.
 
 For an interrupted first install with no `current`, release recovery selects
 the exact root-owned, immutable recovery generation bound to the supplied
@@ -456,6 +495,10 @@ tools/platform_release_preflight.sh \
 ```
 
 `--edge-insecure-loopback` is allowed only for loopback. Public smoke keeps normal certificate verification. The expected CSP mode must match the active release.
+
+Remote production deploy/preflight also requires a complete structured
+`RELEASE_DEPLOY schema=1` marker. A zero SSH exit without that marker is a
+transport failure and cannot be reported as a successful deployment.
 
 ## Nginx-only changes
 

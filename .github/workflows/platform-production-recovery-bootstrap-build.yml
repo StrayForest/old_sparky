@@ -67,7 +67,7 @@ jobs:
           api="$GITHUB_API_URL/repos/$REPOSITORY"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' "$api/actions/runs/$SECURITY_RUN_ID" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT" \
             --output "$metadata/run.json"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
@@ -101,7 +101,7 @@ jobs:
           )):
               raise SystemExit("security run provenance is not exact")
           job_rows = jobs.get("jobs") if isinstance(jobs, dict) else None
-          if not isinstance(job_rows, list) or jobs.get("total_count") != len(job_rows):
+          if not isinstance(job_rows, list) or type(jobs.get("total_count")) is not int or not 0 <= jobs["total_count"] <= 100 or jobs["total_count"] != len(job_rows):
               raise SystemExit("security jobs response is incomplete")
           matches = [row for row in job_rows if isinstance(row, dict)
                      and type(row.get("id")) is int and row.get("id") > 0 and row.get("name") == env["SECURITY_JOB"]
@@ -112,7 +112,7 @@ jobs:
           if len(matches) != 1:
               raise SystemExit("exact successful security verification job is missing")
           artifact_rows = artifacts.get("artifacts") if isinstance(artifacts, dict) else None
-          if not isinstance(artifact_rows, list) or artifacts.get("total_count") != len(artifact_rows):
+          if not isinstance(artifact_rows, list) or type(artifacts.get("total_count")) is not int or not 0 <= artifacts["total_count"] <= 100 or artifacts["total_count"] != len(artifact_rows):
               raise SystemExit("security artifact response is incomplete")
           name = f"platform-ci-route-{env['SECURITY_RUN_ID']}-{env['SECURITY_RUN_ATTEMPT']}"
           route = [row for row in artifact_rows if isinstance(row, dict)

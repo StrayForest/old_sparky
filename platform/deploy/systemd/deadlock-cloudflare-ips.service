@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=210s
 User=root
 Group=root
 WorkingDirectory=/opt/oldsparky/platform/current

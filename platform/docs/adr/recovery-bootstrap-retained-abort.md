@@ -20,8 +20,11 @@ modes and member digests. The producer recovery workflow has its own reviewed
 workflow SHA **B**; a separate completed-run publisher has workflow SHA **C**.
 The producer only builds, attests and uploads the bundle. The publisher is
 triggered by that completed producer run, re-reads the exact producer
-run/attempt/job and security run/attempt from the API, and uploads schema-2
-evidence containing both producer and publisher identities. Operators pass all
+run/attempt/job and security run/attempt from the API, and uploads schema-3
+evidence containing both producer and publisher identities plus the
+publisher-owned outer artifact name, positive artifact ID and API digest.
+The outer artifact name includes publisher run/attempt **C**, while the
+inner producer bundle name and digest remain bound to producer **B**. Operators pass all
 three exact run/attempt pairs to recovery or abort; no workflow performs a
 latest-by-SHA or same-run self-publication lookup. Consumers verify the bundle
 attestation against **B**, independently bind bundle source **A**, and
@@ -108,11 +111,26 @@ performs receipt-owned candidate cleanup only, never synthesizes an ID or
 executes a retained release helper. Missing, mismatched, or present systemd
 state fails closed.
 
+The mutable systemd installer follows the same durable-boundary rule for
+retired unit files. Before its first stop/disable it records exact source and
+backup identities, digests, and active/enabled states in an fsynced,
+root-owned schema-2 record. It writes `phase=cleanup-pending` before deleting
+any backup after a verified install/reload. Retries in that phase validate and
+remove only identity-bound remnants, then clear the record last; a kill at any
+unlink, directory removal, or record-clear boundary therefore converges
+without adopting an orphan.
+
 The trusted workflow also rejects duplicate or unsafe outer/inner ZIP members,
 bounded-size/compression violations, symlink/special/non-regular entries, and
 unsafe staging directories. Recovery staging cleanup reports both the primary
 operation and cleanup result; a cleanup failure cannot turn a failed recovery
-into success.
+into success. Recursive cleanup of a receipt-bound release tree first validates
+the complete root-owned, single-link, non-writable regular-file/directory tree
+on one device. The operation-less pre-quiesce bridge has no inode binding for
+a temporary `.venv-install-*` or `.freeze-check-*` directory, so it retains
+any such directory (and its receipt) instead of recursively deleting it;
+unexpected symlinks, hardlinks, special files or occupied content are never
+cleanup authority.
 
 ## Consequences
 

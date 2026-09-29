@@ -18,6 +18,9 @@ SYSTEMD_STATE=""
 TRANSACTION_STATE=""
 SYSTEMCTL_BIN="/usr/bin/systemctl"
 SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"
+NGINX_BIN="/usr/sbin/nginx"
+NGINX_TIMEOUT_BIN="/usr/bin/timeout"
+NGINX_CONFIG_TIMEOUT_SECONDS=30
 LIVE_QA_RUNTIME_INSTALLER=""
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
@@ -282,6 +285,11 @@ run_systemctl() {
   "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s "$SYSTEMCTL_BIN" "$@"
 }
 
+run_nginx_config_test() {
+  "$NGINX_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${NGINX_CONFIG_TIMEOUT_SECONDS}s" \
+    "$NGINX_BIN" -t >/dev/null 2>/dev/null
+}
+
 restore_systemd_enabled_state() {
   [[ -n "$SYSTEMD_STATE" ]] || return 0
   local transaction_args=()
@@ -312,7 +320,7 @@ if [[ "$PREPARE_RUNTIME" -eq 1 ]]; then
     # The installer restores its disk snapshots on failure. Validate and reload
     # that restored disk state before returning failure so active Nginx cannot
     # remain divergent from the recovery contour.
-    /usr/sbin/nginx -t >/dev/null 2>/dev/null
+    run_nginx_config_test || { public_status failed nginx >&2; exit "$nginx_status"; }
     run_systemctl reload nginx.service >/dev/null 2>/dev/null
     exit "$nginx_status"
   fi

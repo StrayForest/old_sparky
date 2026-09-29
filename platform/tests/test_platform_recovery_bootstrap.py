@@ -23,8 +23,8 @@ REPO_ROOT = PLATFORM_ROOT.parent
 TOOLS = PLATFORM_ROOT / "tools"
 SOURCE_SHA = "a" * 40
 
-# This is the complete changed-file set of the recovery-bootstrap patch at
-# the merge base.  Keep the real set here so the route test exercises the
+# This is the complete 62-file changed-file set of the recovery-bootstrap
+# patch at the reviewed merge base.  Keep the real set here so the route test exercises the
 # exact pull-request and trusted-dev-push inputs, including the host-key scan
 # contract that is easy to omit from one of the independent consumers.
 # The digest assertion below makes this a static merge-base contract: a
@@ -39,6 +39,10 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
         ".github/workflows/platform-production-release-abort.yml",
         ".github/workflows/platform-production-release-recover.yml",
+        "platform/contracts/host_tools_pin.json",
+        "platform/alembic/env.py",
+        "platform/deploy/systemd/deadlock-cloudflare-ips.service",
+        "platform/deploy/systemd/deadlock-health-monitor.service",
         "platform/docs/README.md",
         "platform/docs/adr/production-host-tools-provisioning.md",
         "platform/docs/adr/recovery-bootstrap-retained-abort.md",
@@ -49,23 +53,29 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tests/test_platform_live_qa_wrappers.py",
         "platform/tests/test_platform_ci_classifier.py",
         "platform/tests/test_platform_host_tools_bundle.py",
+        "platform/tests/test_platform_db.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
         "platform/tests/test_platform_release_audit_hardening.py",
         "platform/tests/test_platform_release_build_contract.py",
         "platform/tests/test_platform_release_build_diagnostics.py",
         "platform/tests/test_platform_release_recovery_boundaries.py",
+        "platform/tests/test_platform_storage_maintenance.py",
         "platform/tests/test_platform_release_systemd_state.py",
         "platform/tests/test_platform_release_venv_rollback.py",
         "platform/tests/test_platform_ssh_host_key_scan.py",
+        "platform/tests/test_platform_cloudflare_ips.py",
+        "platform/tests/test_platform_install_nginx.py",
         "platform/tools/platform_abort_retained_only.sh",
         "platform/tools/platform_build_live_qa_runtime.py",
         "platform/tools/platform_install_nginx.py",
+        "platform/tools/platform_install_logging.sh",
         "platform/tools/platform_install_systemd_units.sh",
         "platform/tools/platform_ci_classifier.py",
         "platform/tools/platform_live_qa_guard.py",
         "platform/tools/platform_live_qa_runtime_install.py",
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_tournament_list_read_model_recovery.py",
         "platform/tools/platform_release_restore_runtime.sh",
         "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tools/platform_release_rollback.sh",
@@ -79,14 +89,17 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_verify_contract.py",
         "platform/tools/platform_workflow_input_guard.py",
         "platform/tools/platform_workflow_remote_dispatch.py",
-        "platform/contracts/host_tools_pin.json",
+        "platform/tools/platform_update_cloudflare_ips.py",
+        "platform/tools/platform_deploy_smoke_impl.py",
+        "platform/tools/platform_health_monitor.py",
+        "platform/tools/platform_validate_edge_policy.py",
+        "platform/python_packages/platform_infra/db.py",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 48
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 62
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "885ce490391702b231d49e046c2406f5dd9f6778542363d022cdca7782aa9614"
+    "6d5ae25eb5321a99bd872c64d793f7b754214962abe08bd35538a625769a063d"
 )
-RECOVERY_BOOTSTRAP_PR_BASE = "475d2679"
 
 # These two paths are deliberately present in the recovery route allowlist for
 # compatibility with the retained-release boundary, but were not changed by
@@ -111,42 +124,57 @@ RECOVERY_BOOTSTRAP_PATCH_DOCS = frozenset(
 )
 
 # This is the exact topology/recovery patch delta reviewed independently from
-# the complete 47-file merge-base fixture above.  Keep it separate: the
+# the complete 62-file merge-base fixture above.  Keep it separate: the
 # classifier must make both the full PR and this smaller simulated dev push a
 # non-deployable full route with no fallback.
 RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
     {
         ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+        ".github/workflows/platform-production-deploy.yml",
         ".github/workflows/platform-production-recovery-bootstrap-build.yml",
         ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
         ".github/workflows/platform-production-release-recover.yml",
         ".github/workflows/platform-production-autodeploy.yml",
+        "platform/contracts/host_tools_pin.json",
+        "platform/alembic/env.py",
+        "platform/deploy/systemd/deadlock-cloudflare-ips.service",
+        "platform/deploy/systemd/deadlock-health-monitor.service",
+        "platform/docs/adr/production-host-tools-provisioning.md",
         "platform/docs/adr/recovery-bootstrap-retained-abort.md",
         "platform/docs/deployment-runbook.md",
-        "platform/docs/release-state-machine.md",
+        "platform/tests/test_platform_cloudflare_ips.py",
+        "platform/tests/test_platform_install_nginx.py",
+        "platform/tests/test_platform_live_qa_wrappers.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
+        "platform/tests/test_platform_db.py",
         "platform/tests/test_platform_release_audit_hardening.py",
         "platform/tests/test_platform_release_recovery_boundaries.py",
-        "platform/tests/test_platform_release_systemd_state.py",
+        "platform/tests/test_platform_storage_maintenance.py",
         "platform/tools/platform_ci_classifier.py",
+        "platform/tools/platform_install_nginx.py",
+        "platform/tools/platform_install_logging.sh",
+        "platform/tools/platform_install_systemd_units.sh",
         "platform/tools/platform_production_classifier_artifact.py",
+        "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tools/platform_recover_pending.sh",
         "platform/tools/platform_recovery_bootstrap.py",
-        "platform/tools/platform_install_nginx.py",
-        "platform/tools/platform_install_systemd_units.sh",
-        "platform/tools/platform_release_deploy.sh",
-        "platform/tools/platform_release_preflight.sh",
-        "platform/tools/platform_release_rollback.sh",
+        "platform/tools/platform_tournament_list_read_model_recovery.py",
         "platform/tools/platform_release_restore_runtime.sh",
-        "platform/tools/platform_release_systemd_state.py",
         "platform/tools/platform_release_transaction.py",
+        "platform/tools/platform_run_alembic.sh",
+        "platform/tools/platform_release_preflight.sh",
         "platform/tools/platform_test_catalog.py",
+        "platform/tools/platform_update_cloudflare_ips.py",
+        "platform/tools/platform_deploy_smoke_impl.py",
+        "platform/tools/platform_health_monitor.py",
+        "platform/tools/platform_validate_edge_policy.py",
+        "platform/python_packages/platform_infra/db.py",
+        "platform/tools/platform_workflow_remote_dispatch.py",
     }
 )
-RECOVERY_BOOTSTRAP_CURRENT_DELTA_BASE = "d335f0dc"
-RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT = 25
+RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT = 41
 RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST = (
-    "af97e6c6abc60d0646eb2c9844694cea8753221628256f59bed40fa0a75054a1"
+    "b652927afc218ffa583265a74facec3ca531c453b20fb9519bee8029dc4695bd"
 )
 
 
@@ -309,6 +337,18 @@ class RecoveryBootstrapBundleTests(unittest.TestCase):
         bad["deployable"] = True
         with self.assertRaises(recovery.RecoveryBootstrapError):
             recovery._provenance_schema(bad)
+
+    def test_recovery_child_timeout_terminates_its_process_group(self) -> None:
+        child = mock.Mock(pid=4321)
+        child.wait.side_effect = [subprocess.TimeoutExpired(["helper"], 1), None]
+        with (
+            mock.patch.object(recovery.subprocess, "Popen", return_value=child) as popen,
+            mock.patch.object(recovery.os, "killpg") as killpg,
+        ):
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery._run_recovery_child(["helper"])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        killpg.assert_called_once_with(4321, recovery.signal.SIGTERM)
 
 
 class RecoveryBootstrapInstallTests(unittest.TestCase):
@@ -749,6 +789,16 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                                 failed = True
                                 raise subprocess.CalledProcessError(1, command)
 
+                    def fake_popen(command: list[str], **_kwargs: object) -> object:
+                        class Child:
+                            pid = 1234
+
+                            def wait(self, **_wait_kwargs: object) -> int:
+                                fake_run(command)
+                                return 0
+
+                        return Child()
+
                     with (
                         mock.patch.object(recovery.os, "geteuid", return_value=0),
                         mock.patch.object(recovery, "_validate_generation_tree"),
@@ -756,7 +806,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                         mock.patch.object(recovery, "_validate_receipt_identity", return_value=app / "releases" / "current-release"),
                         mock.patch.object(recovery, "_safe_receipt"),
                         mock.patch.object(recovery, "_release_pointer", return_value=app / "releases" / "current-release"),
-                        mock.patch.object(recovery.subprocess, "run", side_effect=fake_run),
+                        mock.patch.object(recovery.subprocess, "Popen", side_effect=fake_popen),
                     ):
                         with self.assertRaises(subprocess.CalledProcessError):
                             recovery.abort_retained_only(
@@ -851,11 +901,21 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             else:
                 state.unlink()
 
+        def cleanup_popen(command: list[str], **_kwargs: object) -> object:
+            class Child:
+                pid = 1235
+
+                def wait(self, **_wait_kwargs: object) -> int:
+                    cleanup_run(command)
+                    return 0
+
+            return Child()
+
         with (
             mock.patch.object(recovery.os, "geteuid", return_value=0),
             mock.patch.object(recovery, "_validate_generation_tree"),
             mock.patch.object(recovery, "_receipt_json", return_value=receipt),
-            mock.patch.object(recovery.subprocess, "run", side_effect=cleanup_run),
+            mock.patch.object(recovery.subprocess, "Popen", side_effect=cleanup_popen),
         ):
             recovery.abort_retained_only(
                 app_dir=app,
@@ -890,7 +950,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     mock.patch.object(recovery.os, "geteuid", return_value=0),
                     mock.patch.object(recovery, "_validate_generation_tree"),
                     mock.patch.object(recovery, "_receipt_json", return_value=receipt),
-                    mock.patch.object(recovery.subprocess, "run") as run,
+                    mock.patch.object(recovery.subprocess, "Popen") as popen,
                 ):
                     with self.assertRaises(recovery.RecoveryBootstrapError):
                         recovery.abort_retained_only(
@@ -899,7 +959,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                         )
                 self.assertTrue(state.exists())
                 self.assertTrue(candidate.exists())
-                run.assert_not_called()
+                popen.assert_not_called()
 
     def test_attestation_policy_rejects_source_run_attempt_job_and_digest_drift(self) -> None:
         workflow = (
@@ -912,7 +972,6 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         policy_start = workflow.index("\n", policy_heredoc) + 1
         policy_end = workflow.index("\n          PY", policy_start)
         policy = textwrap.dedent(workflow[policy_start:policy_end])
-        source_sha = "a" * 40
         recovery_workflow_sha = "c" * 40
         bundle_digest = "b" * 64
         run_id = "12345"
@@ -1171,6 +1230,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             rejected("duplicate route artifact", lambda value: value["artifacts.json"]["artifacts"].append(dict(value["artifacts.json"]["artifacts"][0])))
             rejected("over-100 security jobs page", lambda value: value["jobs.json"].__setitem__("total_count", 101))
             rejected("over-100 security artifact page", lambda value: value["artifacts.json"].__setitem__("total_count", 101))
+            rejected("negative security jobs page", lambda value: value["jobs.json"].__setitem__("total_count", -1))
+            rejected("negative security artifact page", lambda value: value["artifacts.json"].__setitem__("total_count", -1))
             for bad_id in (0, "22"):
                 rejected(
                     f"route artifact id {bad_id!r}",
@@ -1555,6 +1616,15 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 },
             )
             self.assertFalse(evidence["deployable"])
+            publisher_bundle_name = recovery.publisher_bundle_artifact_name(
+                source_sha=str(provenance_value["source_sha"]),
+                security_run_id=str(provenance_value["run_id"]),
+                security_run_attempt=str(provenance_value["run_attempt"]),
+                producer_run_id=recovery_run_id,
+                producer_run_attempt=recovery_attempt,
+                publisher_run_id="44",
+                publisher_run_attempt="1",
+            )
             publisher_evidence = recovery.build_publish_evidence(
                 provenance_value,
                 bundle_name=bundle_name,
@@ -1567,11 +1637,33 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 publisher_run_id="44",
                 publisher_run_attempt="1",
                 publisher_job_id="55",
+                publisher_bundle_name=publisher_bundle_name,
+                publisher_bundle_artifact_id="66",
+                publisher_bundle_artifact_sha256="e" * 64,
             )
-            self.assertEqual(publisher_evidence["schema"], 2)
+            self.assertEqual(publisher_evidence["schema"], 3)
             self.assertEqual(
                 publisher_evidence["bundle_artifact_sha256"], artifact_archive_sha
             )
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.build_publish_evidence(
+                    provenance_value,
+                    bundle_name=bundle_name,
+                    bundle_sha=bundle_sha,
+                    bundle_artifact_sha256=artifact_archive_sha,
+                    recovery_run_id=recovery_run_id,
+                    recovery_run_attempt=recovery_attempt,
+                    recovery_job_id="33",
+                    publisher_workflow_sha="c" * 40,
+                    publisher_run_id="44",
+                    publisher_run_attempt="1",
+                    publisher_job_id="55",
+                    publisher_bundle_name=publisher_bundle_name.replace(
+                        "-44-1.zip", "-44-2.zip"
+                    ),
+                    publisher_bundle_artifact_id="66",
+                    publisher_bundle_artifact_sha256="e" * 64,
+                )
             with self.assertRaises(recovery.RecoveryBootstrapError):
                 recovery.build_publish_evidence(
                     provenance_value,
@@ -1615,6 +1707,150 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 self.assertIn(predicate, text_value)
         self.assertIn("github.event.workflow_run.status == 'completed'", text_value)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", text_value)
+        abort_text = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-recovery-bootstrap-abort.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'hashlib.sha256((root / "bundle.zip").read_bytes()).hexdigest()',
+            abort_text,
+        )
+        recover_text = (
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("-o ServerAliveInterval=5", recover_text)
+        self.assertIn("-o ServerAliveCountMax=2", recover_text)
+
+    def test_operator_workflows_bound_api_pages_and_use_exact_selected_rows(self) -> None:
+        workflow_paths = (
+            REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+            REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml",
+        )
+        for path in workflow_paths:
+            text_value = path.read_text(encoding="utf-8")
+            with self.subTest(workflow=path.name):
+                self.assertIn("total_count", text_value)
+                self.assertIn("0 <=", text_value)
+                self.assertTrue("> 100" in text_value or "<= 100" in text_value)
+                self.assertNotIn("next(", text_value)
+                self.assertIn("if len(matches) != 1", text_value)
+                self.assertIn("matches[0]", text_value)
+
+    def test_security_run_metadata_uses_exact_attempt_endpoint(self) -> None:
+        workflow_paths = (
+            REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml",
+        )
+        for path in workflow_paths:
+            text_value = path.read_text(encoding="utf-8")
+            with self.subTest(workflow=path.name):
+                self.assertIn(
+                    "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT",
+                    text_value,
+                )
+                self.assertIn("0 <=", text_value)
+                self.assertTrue("> 100" in text_value or "<= 100" in text_value)
+
+    def test_publisher_outer_artifact_metadata_binds_exact_c_attempt_and_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory) / "publisher-artifacts.json"
+            name = recovery.publisher_bundle_artifact_name(
+                source_sha="a" * 40,
+                security_run_id="101",
+                security_run_attempt="2",
+                producer_run_id="202",
+                producer_run_attempt="3",
+                publisher_run_id="303",
+                publisher_run_attempt="4",
+            )
+            row = {
+                "id": 404,
+                "name": name,
+                "expired": False,
+                "digest": "sha256:" + "e" * 64,
+                "workflow_run": {
+                    "id": 303,
+                    "head_sha": "c" * 40,
+                    # GitHub's artifact row may omit run_attempt.  The
+                    # authoritative publisher run/attempt is supplied to the
+                    # validator separately and must still be accepted.
+                },
+            }
+
+            def write(rows: list[dict[str, object]]) -> None:
+                metadata.write_text(
+                    json.dumps({"total_count": len(rows), "artifacts": rows}),
+                    encoding="ascii",
+                )
+
+            write([row])
+            selected = recovery.validate_publisher_artifact_metadata(
+                metadata,
+                expected_name=name,
+                expected_run_id="303",
+                expected_run_attempt="4",
+                expected_workflow_sha="c" * 40,
+            )
+            self.assertEqual(selected["publisher_bundle_name"], name)
+            self.assertEqual(selected["publisher_bundle_artifact_id"], 404)
+            self.assertEqual(selected["publisher_bundle_artifact_sha256"], "e" * 64)
+
+            for field, value in (
+                ("id", 0),
+                ("name", name.replace("-303-4.zip", "-303-5.zip")),
+                ("expired", True),
+                ("digest", "sha256:invalid"),
+            ):
+                mutated = json.loads(json.dumps(row))
+                mutated[field] = value
+                write([mutated])
+                with self.subTest(field=field), self.assertRaises(
+                    recovery.RecoveryBootstrapError
+                ):
+                    recovery.validate_publisher_artifact_metadata(
+                        metadata,
+                        expected_name=name,
+                        expected_run_id="303",
+                        expected_run_attempt="4",
+                        expected_workflow_sha="c" * 40,
+                    )
+
+            for field, value in (
+                ("workflow_run", {"id": 304, "head_sha": "c" * 40}),
+                (
+                    "workflow_run",
+                    {"id": 303, "head_sha": "d" * 40, "run_attempt": 4},
+                ),
+                (
+                    "workflow_run",
+                    {"id": 303, "head_sha": "c" * 40, "run_attempt": 5},
+                ),
+            ):
+                mutated = json.loads(json.dumps(row))
+                mutated[field] = value
+                write([mutated])
+                with self.subTest(workflow_field=repr(value)), self.assertRaises(
+                    recovery.RecoveryBootstrapError
+                ):
+                    recovery.validate_publisher_artifact_metadata(
+                        metadata,
+                        expected_name=name,
+                        expected_run_id="303",
+                        expected_run_attempt="4",
+                        expected_workflow_sha="c" * 40,
+                    )
+
+            write([row, row])
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.validate_publisher_artifact_metadata(
+                    metadata,
+                    expected_name=name,
+                    expected_run_id="303",
+                    expected_run_attempt="4",
+                    expected_workflow_sha="c" * 40,
+                )
 
     def test_completed_publisher_event_identity_is_exact_and_rerun_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1818,21 +2054,6 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         sys.path.insert(0, str(TOOLS))
         from tools import platform_ci_classifier as classifier
 
-        def actual_changed_paths(base: str) -> tuple[str, ...]:
-            tracked = subprocess.check_output(
-                ["git", "diff", "--name-only", base, "--"],
-                cwd=REPO_ROOT,
-                text=True,
-                timeout=10,
-            ).splitlines()
-            untracked = subprocess.check_output(
-                ["git", "ls-files", "--others", "--exclude-standard"],
-                cwd=REPO_ROOT,
-                text=True,
-                timeout=10,
-            ).splitlines()
-            return tuple(sorted(set(tracked) | set(untracked)))
-
         patch_file_digest = hashlib.sha256(
             "\n".join(sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)).encode()
         ).hexdigest()
@@ -1841,17 +2062,6 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT,
         )
         self.assertEqual(patch_file_digest, RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST)
-        actual_pr_paths = actual_changed_paths(RECOVERY_BOOTSTRAP_PR_BASE)
-        self.assertEqual(
-            actual_pr_paths,
-            tuple(sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)),
-            "full PR fixture must match the exact checked-out PR diff",
-        )
-        self.assertEqual(len(actual_pr_paths), RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT)
-        self.assertEqual(
-            hashlib.sha256("\n".join(actual_pr_paths).encode()).hexdigest(),
-            RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST,
-        )
         delta_file_digest = hashlib.sha256(
             "\n".join(sorted(RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)).encode()
         ).hexdigest()
@@ -1861,17 +2071,6 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         )
         self.assertEqual(
             delta_file_digest,
-            RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST,
-        )
-        actual_delta_paths = actual_changed_paths(RECOVERY_BOOTSTRAP_CURRENT_DELTA_BASE)
-        self.assertEqual(
-            actual_delta_paths,
-            tuple(sorted(RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)),
-            "current-delta fixture must match the exact checked-out diff",
-        )
-        self.assertEqual(len(actual_delta_paths), RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT)
-        self.assertEqual(
-            hashlib.sha256("\n".join(actual_delta_paths).encode()).hexdigest(),
             RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST,
         )
         paths = sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)

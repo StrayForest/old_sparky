@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - direct script execution on a host
 
 DEFAULT_NGINX_INCLUDE = Path("/etc/nginx/cloudflare-real-ip.conf")
 WEB_PORTS = (80, 443)
+UFW_COMMAND_TIMEOUT_SECONDS = 30.0
 MANAGED_COMMENT = "oldsparky-cloudflare-origin"
 CIDR_RE = re.compile(r"(?<![A-Za-z0-9:])(?:[0-9a-fA-F:.]+)/(?:[0-9]{1,3})(?![A-Za-z0-9])")
 WEB_PROFILE_NAMES = frozenset(
@@ -219,6 +220,7 @@ def run_ufw(ufw_bin: str, *arguments: str) -> str:
             check=True,
             capture_output=True,
             text=True,
+            timeout=UFW_COMMAND_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         raise EdgePolicyError(

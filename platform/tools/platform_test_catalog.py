@@ -452,10 +452,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 158,
     "module_digest": "a77d2cff5b4122f04ba7932d758aac60cd98e15405d3d09e4cb45da7c1207310",
-    "test_count": 1433,
-    "test_id_digest": "d528c9817a8283ff4afefb7acab05a3a8d5b98afd6c678cc7c769b2772d73cfc",
-    "backend_test_count": 1389,
-    "backend_test_id_digest": "55c0fd773581a000809c89799597695c86c59ef652c31eaf9cfe0f090a653563",
+    "test_count": 1458,
+    "test_id_digest": "d804487b9221b1d5bb25dd400c6ea6f5cb4baf958ff7be34776fbf18759dd282",
+    "backend_test_count": 1414,
+    "backend_test_id_digest": "bb804d7bcc8b2cab0b2b0bff014a6a718ac1573607f88f02347f435ee46ffd5a",
     "verification_test_count": 44,
     "verification_test_id_digest": "d8873be495648857a31f012be4e6b1b1438b091214bc6fb046fa620f34debd32",
     "verification_classifier_test_count": 23,
@@ -478,14 +478,14 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-unit": {
         "module_count": 47,
         "module_digest": "e77e33f73d1f13d0175f2f90b2b069905a6105b11373005d0a67143728488a67",
-        "test_count": 291,
-        "test_id_digest": "b4562feed9869d37ca4e0fec1a4aae800b4e8b8f9f127501b5a791a724b8c891",
+        "test_count": 292,
+        "test_id_digest": "202a63f36a29fc545ef5e43670414e5dacf82a405888b072cd760b9c6fe4a649",
     },
     "backend-tool-contract": {
         "module_count": 44,
         "module_digest": "693edb2005c56249ac84c9d1d7367b64e2e3291ef18c6bc05e41ea98967ea406",
-        "test_count": 319,
-        "test_id_digest": "de1d23f22175c839ac572cceefb9b817aa56a5e09f41481df29a751dcfbc7559",
+        "test_count": 326,
+        "test_id_digest": "99739f343743eceed7a12cabe8bd273a0540142c0807b4ee29d518e89c605729",
     },
     "backend-integration": {
         "module_count": 41,
@@ -496,8 +496,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 23,
         "module_digest": "2034d1a0a01dffe5b141118aa1b90c060268b28eadc0bf2165954c36c260dc1e",
-        "test_count": 396,
-        "test_id_digest": "f04352d1e6f2baccabc26ebff0e32c91e5f2c26f31ddf5fe327fcfd7aea929ce",
+        "test_count": 413,
+        "test_id_digest": "970a8abe54783aca52b600fe154cffa4ceb4c9c54703ce905e5f12cae2f7a1ab",
     },
     "performance-contract": {
         "module_count": 10,

@@ -11,6 +11,8 @@ REQUIRE_VERIFIED_BACKUP=0
 REQUIRE_EDGE_PARITY=0
 BACKUP_MAX_AGE_HOURS="24"
 EXPECTED_NODE_VERSION="26.3.1"
+DB_TIMEOUT_BIN="/usr/bin/timeout"
+DB_OPERATION_TIMEOUT_SECONDS="30"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -366,6 +368,10 @@ DB_CHECK_OUTPUT="$(
   cd "$CURRENT_TARGET" && \
   PLATFORM_ENV_FILE="$ENV_FILE" \
   PLATFORM_PYTHON_BIN="$PYTHON_BIN" \
+  PLATFORM_DB_CONNECT_TIMEOUT_SECONDS="$DB_OPERATION_TIMEOUT_SECONDS" \
+  PLATFORM_DB_COMMAND_TIMEOUT_SECONDS="$DB_OPERATION_TIMEOUT_SECONDS" \
+  PLATFORM_DB_STATEMENT_TIMEOUT_MS="30000" \
+  PLATFORM_DB_LOCK_TIMEOUT_MS="30000" \
   PYTHONPATH="$CURRENT_TARGET" \
   "$PYTHON_BIN" -B -c "import asyncio; from python_packages.platform_infra.db import warm_up_engine; asyncio.run(warm_up_engine()); print('platform-db-ok')" \
   2>/dev/null
@@ -379,11 +385,13 @@ pass
 ALEMBIC_CURRENT="$(
   cd "$CURRENT_TARGET" && \
   PYTHONPATH="$CURRENT_TARGET" \
+  "$DB_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${DB_OPERATION_TIMEOUT_SECONDS}s" \
   "$PYTHON_BIN" -B -m alembic current 2>/dev/null | tail -n 1 | awk '{print $1}'
 )"
 ALEMBIC_HEAD="$(
   cd "$CURRENT_TARGET" && \
   PYTHONPATH="$CURRENT_TARGET" \
+  "$DB_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${DB_OPERATION_TIMEOUT_SECONDS}s" \
   "$PYTHON_BIN" -B -m alembic heads 2>/dev/null | tail -n 1 | awk '{print $1}'
 )"
 

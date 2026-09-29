@@ -9,9 +9,11 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from tests import platform_test_lock_support as lock_support
 from tools import platform_recovery_bootstrap as recovery
+from tools import platform_release_transaction as transaction
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -838,6 +840,128 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             self.assertTrue(os.path.lexists(candidate), mutation)
             if mutation == "occupied":
                 self.assertTrue((candidate / "unbound.txt").exists())
+
+    def test_recursive_release_cleanup_validates_complete_tree_before_delete(self) -> None:
+        for mutation in ("hardlink", "symlink", "special"):
+            with self.subTest(mutation=mutation):
+                tree = self.root / f"unsafe-cleanup-{mutation}"
+                tree.mkdir(mode=0o700)
+                safe_file = tree / "safe.txt"
+                safe_file.write_text("retained", encoding="ascii")
+                safe_file.chmod(0o600)
+                if mutation == "hardlink":
+                    outside = self.root / "outside-hardlink"
+                    outside.write_text("outside", encoding="ascii")
+                    outside.chmod(0o600)
+                    (tree / "linked.txt").hardlink_to(outside)
+                elif mutation == "symlink":
+                    (tree / "linked.txt").symlink_to(safe_file)
+                else:
+                    os.mkfifo(tree / "special")
+
+                with self.assertRaises(transaction.TransactionError):
+                    transaction._remove_tree(tree)
+                self.assertTrue(tree.exists())
+                self.assertTrue(safe_file.exists())
+                if mutation == "hardlink":
+                    self.assertTrue((self.root / "outside-hardlink").exists())
+                elif mutation == "symlink":
+                    self.assertTrue((tree / "linked.txt").is_symlink())
+                else:
+                    self.assertTrue((tree / "special").exists())
+
+    def test_recursive_release_cleanup_quarantines_only_rechecked_inode(self) -> None:
+        tree = self.root / "cleanup-race"
+        tree.mkdir(mode=0o700)
+        (tree / "original.txt").write_text("original", encoding="ascii")
+        (tree / "original.txt").chmod(0o600)
+        replacement = self.root / "cleanup-race-original"
+        real_rename = os.rename
+
+        def replace_before_quarantine(source: str | bytes | os.PathLike[str], destination: str | bytes | os.PathLike[str]) -> None:
+            if Path(source) == tree:
+                real_rename(source, replacement)
+                tree.mkdir(mode=0o700)
+                marker = tree / "replacement.txt"
+                marker.write_text("replacement", encoding="ascii")
+                marker.chmod(0o600)
+            real_rename(source, destination)
+
+        with mock.patch.object(transaction.os, "rename", side_effect=replace_before_quarantine):
+            with self.assertRaises(transaction.TransactionError):
+                transaction._remove_tree(tree)
+        self.assertTrue(replacement.exists())
+        self.assertTrue(tree.exists())
+        self.assertTrue((tree / "replacement.txt").exists())
+
+    def test_recursive_release_cleanup_partial_delete_is_retained_and_retryable(self) -> None:
+        tree = self.root / "cleanup-partial"
+        tree.mkdir(mode=0o700)
+        first = tree / "first.txt"
+        second = tree / "second.txt"
+        first.write_text("first", encoding="ascii")
+        second.write_text("second", encoding="ascii")
+        for path in (first, second):
+            path.chmod(0o600)
+        outside = self.root / "cleanup-outside"
+        outside.write_text("must remain", encoding="ascii")
+        outside.chmod(0o600)
+        real_rmtree = transaction.shutil.rmtree
+
+        def partial_delete(path: str | bytes | os.PathLike[str], *args, **kwargs) -> None:
+            quarantined_first = Path(path) / first.name
+            quarantined_first.unlink()
+            raise OSError("injected partial cleanup failure")
+
+        with mock.patch.object(transaction.shutil, "rmtree", side_effect=partial_delete):
+            with self.assertRaises(transaction.TransactionError):
+                transaction._remove_tree(tree)
+        # The failed quarantine is put back under its original receipt-bound
+        # name, while unrelated paths remain untouched and cleanup can retry.
+        self.assertTrue(tree.exists())
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        self.assertEqual(outside.read_text(encoding="ascii"), "must remain")
+        with mock.patch.object(transaction.shutil, "rmtree", wraps=real_rmtree):
+            transaction._remove_tree(tree)
+        self.assertFalse(tree.exists())
+        self.assertTrue(outside.exists())
+
+    def test_abort_quiesce_retains_unbound_temporary_directory(self) -> None:
+        current = self.add_release("abort-temp-current")
+        (self.app_dir / "current").symlink_to(current)
+        candidate = self.releases / "abort-temp-candidate"
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "inactive",
+        )
+        temporary = self.shared / f".venv-install-{candidate.name}.0000"
+        temporary.mkdir(mode=0o700)
+        marker = temporary / "unbound.txt"
+        marker.write_text("must remain", encoding="ascii")
+        marker.chmod(0o600)
+
+        result = self.run_script(
+            TRANSACTION_TOOL,
+            "abort-quiesce",
+            "--state",
+            str(self.shared / STATE_NAME),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertTrue(marker.exists())
 
     def test_abort_quiesce_empty_candidate_and_mutable_wrapper_cleanup(self) -> None:
         current = self.add_release("abort-empty-current")

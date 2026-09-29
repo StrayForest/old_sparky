@@ -904,13 +904,17 @@ jobs:
           generation="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA"
           # Every call through this array is read-only; keep runner-side
           # sidecars on the runner instead of allowing SSH to consume stdin.
-          remote=(ssh -n -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$ssh_dir/config" -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
-          test "$("${remote[@]}" /usr/bin/id -u | tr -d '\r\n')" = 0
+          remote=(ssh -n -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$ssh_dir/config" -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          run_remote_readonly() {
+            /usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s \
+              "${remote[@]}" "$@"
+          }
+          test "$(run_remote_readonly /usr/bin/id -u | tr -d '\r\n')" = 0
           [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$generation" = "/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA" ]]
-          "${remote[@]}" /usr/bin/test -d "$generation"
-          "${remote[@]}" /usr/bin/test ! -L "$generation"
-          test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
+          run_remote_readonly /usr/bin/test -d "$generation"
+          run_remote_readonly /usr/bin/test ! -L "$generation"
+          test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
           contract_dir="$RUNNER_TEMP/host-tools-download/contract"
           expected_payload_count="$(wc -l < "$contract_dir/files.sha256" | tr -d ' ')"
           expected_mode_payload_count="$(wc -l < "$contract_dir/files.modes" | tr -d ' ')"
@@ -921,29 +925,29 @@ jobs:
             [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]
             [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$|^manifest\.json$ ]]
             remote_path="$generation/$expected_path"
-            "${remote[@]}" /usr/bin/test -f "$remote_path"
-            "${remote[@]}" /usr/bin/test ! -L "$remote_path"
+            run_remote_readonly /usr/bin/test -f "$remote_path"
+            run_remote_readonly /usr/bin/test ! -L "$remote_path"
             case "$expected_path" in
               capabilities.txt|manifest.json) expected_mode=444 ;;
               *) expected_mode=555 ;;
             esac
-            test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_path")" = "regular file:0:0:1:$expected_mode"
-            remote_digest="$("${remote[@]}" /usr/bin/sha256sum -- "$remote_path")"
+            test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_path")" = "regular file:0:0:1:$expected_mode"
+            remote_digest="$(run_remote_readonly /usr/bin/sha256sum -- "$remote_path")"
             test "${remote_digest%% *}" = "$expected_hash"
             digest_count=$((digest_count + 1))
           done < "$contract_dir/files.sha256"
           test "$digest_count" -eq "$expected_payload_count"
           IFS= read -r expected_manifest_hash < "$contract_dir/manifest.sha256"
           IFS= read -r expected_capabilities_hash < "$contract_dir/capabilities.sha256"
-          test "$("${remote[@]}" /usr/bin/sha256sum -- "$generation/manifest.json")" = "$expected_manifest_hash  $generation/manifest.json"
-          test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/manifest.json")" = "regular file:0:0:1:444"
-          test "$("${remote[@]}" /usr/bin/sha256sum -- "$generation/capabilities.txt")" = "$expected_capabilities_hash  $generation/capabilities.txt"
-          test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/capabilities.txt")" = "regular file:0:0:1:444"
+          test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/manifest.json")" = "$expected_manifest_hash  $generation/manifest.json"
+          test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/manifest.json")" = "regular file:0:0:1:444"
+          test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/capabilities.txt")" = "$expected_capabilities_hash  $generation/capabilities.txt"
+          test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/capabilities.txt")" = "regular file:0:0:1:444"
           declare -A expected_entries=([capabilities.txt]=1 [manifest.json]=1)
           mode_count=0
           while read -r expected_mode expected_path; do
             remote_path="$generation/$expected_path"
-            remote_mode="$("${remote[@]}" /usr/bin/stat -c '%a' -- "$remote_path")"
+            remote_mode="$(run_remote_readonly /usr/bin/stat -c '%a' -- "$remote_path")"
             test "$remote_mode" = "$expected_mode"
             expected_entries["$expected_path"]=1
             mode_count=$((mode_count + 1))
@@ -957,7 +961,7 @@ jobs:
           # NUL-delimited find output is base64-wrapped before it crosses the
           # SSH boundary.  This preserves dotfiles and makes newline/control
           # names observable instead of allowing line-oriented ambiguity.
-          "${remote[@]}" /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -print0 \
+          run_remote_readonly /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -print0 \
             | /usr/bin/base64 -w 0 > "$inventory_encoded"
           test "$(stat -c '%F:%h' -- "$inventory_encoded")" = "regular file:1"
           test "$(stat -c '%s' -- "$inventory_encoded")" -le 16384
@@ -1149,7 +1153,7 @@ jobs:
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/config")" = "regular file:1:600"
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/known_hosts")" = "regular file:1:600"
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
-          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
           expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"
           expected_bytes="$(printf '%s\n' "$expected_output" | wc -c | tr -d '[:space:]')"
@@ -1722,14 +1726,21 @@ jobs:
           umask 077
           : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
           set +e
-          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+          timeout --foreground 300s ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
             -F "$PREFLIGHT_SSH_DIR/config" -i "$PREFLIGHT_SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" \
             production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
-          grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) ' "$remote_log" | tail -n 1 || true
+          public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed))? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
+          if [[ -z "$public_line" ]]; then
+            public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
+            printf '%s\n' "$public_line"
+            (( remote_status != 0 )) && exit "$remote_status"
+            exit 1
+          fi
+          printf '%s\n' "$public_line"
           rm -f -- "$remote_log" "$remote_error"
           exit "$remote_status"
 
@@ -2152,7 +2163,11 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
-          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" true >/dev/null
+          timeout --foreground --signal=TERM --kill-after=5s 30s \
+            ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" true >/dev/null
 
       - name: Revalidate host-tools contract before production side effects
         shell: bash
@@ -2619,8 +2634,12 @@ jobs:
           PY
           test "$(stat -c '%F:%h:%a' -- "$input_path")" = "regular file:1:600"
           expected_remote="HOST_TOOLS_CONTRACT source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA manifest_sha256=$HOST_TOOLS_MANIFEST_SHA256 capabilities_sha256=$HOST_TOOLS_CAPABILITIES_SHA256"
-          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
-          "${remote[@]}" /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-contract \
+          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          run_remote_readonly() {
+            /usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s \
+              "${remote[@]}" "$@"
+          }
+          run_remote_readonly /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-contract \
             "$HOST_TOOLS_SHA" "$HOST_TOOLS_MANIFEST_SHA256" "$HOST_TOOLS_CAPABILITIES_SHA256" \
             | /usr/bin/head -c 512 | cmp -s <(printf '%s\n' "$expected_remote")
 
@@ -2641,11 +2660,11 @@ jobs:
             test "$dev_sha" = "$TARGET_SHA" || { echo "Refusing production side effects: dev moved from $TARGET_SHA to $dev_sha." >&2; exit 1; }
           }
           require_current_dev_head
-          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+          timeout --foreground 300s ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-prepare-artifact < "$input_path"
-          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_ARTIFACT" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
-          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_PROVENANCE" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
-          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_CHECKSUM" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          timeout --foreground 300s scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_ARTIFACT" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          timeout --foreground 300s scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_PROVENANCE" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          timeout --foreground 300s scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_CHECKSUM" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
 
       - name: Run production preflight or deployment
         shell: bash
@@ -2663,12 +2682,17 @@ jobs:
           remote_error="$RUNNER_TEMP/platform-production-deploy-remote-error.log"
           umask 077; : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
           set +e
-          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+          timeout --foreground 900s ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
           public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed))? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
-          [[ -n "$public_line" ]] || public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
+          if [[ -z "$public_line" ]]; then
+            public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
+            printf '%s\n' "$public_line"
+            (( remote_status != 0 )) && exit "$remote_status"
+            exit 1
+          fi
           printf '%s\n' "$public_line"
           exit "$remote_status"
 

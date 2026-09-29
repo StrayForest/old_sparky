@@ -100,7 +100,7 @@ jobs:
           install -d -m 700 "$metadata"
           api="$GITHUB_API_URL/repos/$REPOSITORY"
           gh_header=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
-          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID" --output "$metadata/security-run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT" --output "$metadata/security-run.json"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100" --output "$metadata/security-jobs.json"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/security-artifacts.json"
           source_sha="$(/usr/bin/python3 -I - "$metadata/security-run.json" <<'PY'
@@ -142,9 +142,9 @@ jobs:
               raise SystemExit("security run provenance is not exact")
           security_jobs_payload = json.loads((root / "security-jobs.json").read_text(encoding="utf-8"))
           security_artifacts_payload = json.loads((root / "security-artifacts.json").read_text(encoding="utf-8"))
-          if not isinstance(jobs, list) or type(security_jobs_payload.get("total_count")) is not int or security_jobs_payload["total_count"] != len(jobs):
+          if not isinstance(jobs, list) or type(security_jobs_payload.get("total_count")) is not int or not 0 <= security_jobs_payload["total_count"] <= 100 or security_jobs_payload["total_count"] != len(jobs):
               raise SystemExit("security jobs response is incomplete")
-          if not isinstance(artifacts, list) or type(security_artifacts_payload.get("total_count")) is not int or security_artifacts_payload["total_count"] != len(artifacts):
+          if not isinstance(artifacts, list) or type(security_artifacts_payload.get("total_count")) is not int or not 0 <= security_artifacts_payload["total_count"] <= 100 or security_artifacts_payload["total_count"] != len(artifacts):
               raise SystemExit("security artifacts response is incomplete")
           security_matches = [
               row for row in jobs
@@ -188,6 +188,7 @@ jobs:
               stream.write(f"recovery_run_attempt={recovery_run['run_attempt']}\n")
               stream.write(f"recovery_workflow_sha={recovery_run['head_sha']}\n")
               stream.write(f"bundle_name=platform-recovery-bootstrap-{source}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}.zip\n")
+              stream.write(f"publisher_bundle_name=platform-recovery-bootstrap-publisher-{source}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}-{os.environ['PUBLISHER_RUN_ID']}-{os.environ['PUBLISHER_RUN_ATTEMPT']}.zip\n")
               stream.write(f"evidence_name=platform-recovery-bootstrap-evidence-{source}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}-{os.environ['PUBLISHER_RUN_ID']}-{os.environ['PUBLISHER_RUN_ATTEMPT']}.json\n")
           PY
           recovery_run_id="$(awk -F= '$1 == "recovery_run_id" {print $2}' "$GITHUB_OUTPUT")"
@@ -200,7 +201,7 @@ jobs:
           import sys
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           rows = payload.get("jobs") if isinstance(payload, dict) else None
-          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or payload["total_count"] != len(rows):
+          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 100 or payload["total_count"] != len(rows):
               raise SystemExit("recovery jobs response is malformed")
           run_id, attempt = int(sys.argv[3]), int(sys.argv[4])
           source = json.loads((Path(sys.argv[1]).parent / "recovery-run.json").read_text(encoding="utf-8")).get("head_sha")
@@ -240,7 +241,7 @@ jobs:
               raise SystemExit("exact publisher run is missing or invalid")
           jobs = json.loads((root / "publisher-jobs.json").read_text(encoding="ascii"))
           rows = jobs.get("jobs") if isinstance(jobs, dict) else None
-          if not isinstance(rows, list) or jobs.get("total_count") != len(rows):
+          if not isinstance(rows, list) or type(jobs.get("total_count")) is not int or not 0 <= jobs["total_count"] <= 100 or jobs["total_count"] != len(rows):
               raise SystemExit("publisher jobs response is incomplete")
           matches = [row for row in rows if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") > 0
                      and row.get("name") == "Publish retained-release recovery bootstrap evidence"
@@ -252,24 +253,36 @@ jobs:
               raise SystemExit("exact successful publisher job is missing")
           artifacts = json.loads((root / "publisher-artifacts.json").read_text(encoding="ascii"))
           artifact_rows = artifacts.get("artifacts") if isinstance(artifacts, dict) else None
-          if not isinstance(artifact_rows, list) or artifacts.get("total_count") != len(artifact_rows):
+          if not isinstance(artifact_rows, list) or type(artifacts.get("total_count")) is not int or not 0 <= artifacts["total_count"] <= 100 or artifacts["total_count"] != len(artifact_rows):
               raise SystemExit("publisher artifacts response is incomplete")
-          evidence_name = next(line.split("=", 1)[1] for line in out.read_text(encoding="ascii").splitlines() if line.startswith("evidence_name="))
-          bundle_name = next(line.split("=", 1)[1] for line in out.read_text(encoding="ascii").splitlines() if line.startswith("bundle_name="))
+          output_lines = out.read_text(encoding="ascii").splitlines()
+          def exact_output_value(prefix):
+              values = [line.split("=", 1)[1] for line in output_lines if line.startswith(prefix)]
+              if len(values) != 1 or not values[0]:
+                  raise SystemExit(f"exact output {prefix} is missing")
+              return values[0]
+          evidence_name = exact_output_value("evidence_name=")
+          bundle_name = exact_output_value("publisher_bundle_name=")
+          selected = {}
           for name in (bundle_name, evidence_name):
               found = [row for row in artifact_rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(os.environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == sha and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"]))]
               if len(found) != 1:
                   raise SystemExit("exact publisher artifact is missing")
+              if not isinstance(found[0].get("digest"), str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", found[0]["digest"]):
+                  raise SystemExit("publisher artifact digest is invalid")
+              selected[name] = found[0]
           with out.open("a", encoding="ascii") as stream:
               stream.write(f"publisher_run_id={os.environ['PUBLISHER_RUN_ID']}\n")
               stream.write(f"publisher_run_attempt={os.environ['PUBLISHER_RUN_ATTEMPT']}\n")
               stream.write(f"publisher_workflow_sha={sha}\n")
               stream.write(f"publisher_job_id={matches[0]['id']}\n")
+              stream.write(f"publisher_bundle_artifact_id={selected[bundle_name]['id']}\n")
+              stream.write(f"publisher_bundle_artifact_sha256={selected[bundle_name]['digest'].removeprefix('sha256:')}\n")
           PY
           artifact_dir="$RUNNER_TEMP/platform-production-release-recover-artifacts"
           install -d -m 700 "$artifact_dir"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$PUBLISHER_RUN_ID/artifacts?per_page=100&page=1" --output "$artifact_dir/artifacts.json"
-          RECOVERY_RUN_ID="$recovery_run_id" RECOVERY_RUN_ATTEMPT="$recovery_run_attempt" RECOVERY_WORKFLOW_SHA="$(awk -F= '$1 == "recovery_workflow_sha" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_RUN_ID="$PUBLISHER_RUN_ID" PUBLISHER_RUN_ATTEMPT="$PUBLISHER_RUN_ATTEMPT" PUBLISHER_WORKFLOW_SHA="$(awk -F= '$1 == "publisher_workflow_sha" {print $2}' "$GITHUB_OUTPUT")" SOURCE_SHA="$source_sha" RECOVERY_JOB_ID="$recovery_job_id" PUBLISHER_JOB_ID="$(awk -F= '$1 == "publisher_job_id" {print $2}' "$GITHUB_OUTPUT")" BUNDLE_NAME="$(awk -F= '$1 == "bundle_name" {print $2}' "$GITHUB_OUTPUT")" EVIDENCE_NAME="$(awk -F= '$1 == "evidence_name" {print $2}' "$GITHUB_OUTPUT")"             /usr/bin/python3 -I - "$artifact_dir/artifacts.json" "$artifact_dir" <<'PY'
+          RECOVERY_RUN_ID="$recovery_run_id" RECOVERY_RUN_ATTEMPT="$recovery_run_attempt" RECOVERY_WORKFLOW_SHA="$(awk -F= '$1 == "recovery_workflow_sha" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_RUN_ID="$PUBLISHER_RUN_ID" PUBLISHER_RUN_ATTEMPT="$PUBLISHER_RUN_ATTEMPT" PUBLISHER_WORKFLOW_SHA="$(awk -F= '$1 == "publisher_workflow_sha" {print $2}' "$GITHUB_OUTPUT")" SOURCE_SHA="$source_sha" RECOVERY_JOB_ID="$recovery_job_id" PUBLISHER_JOB_ID="$(awk -F= '$1 == "publisher_job_id" {print $2}' "$GITHUB_OUTPUT")" BUNDLE_NAME="$(awk -F= '$1 == "bundle_name" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_BUNDLE_NAME="$(awk -F= '$1 == "publisher_bundle_name" {print $2}' "$GITHUB_OUTPUT")" EVIDENCE_NAME="$(awk -F= '$1 == "evidence_name" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_BUNDLE_ARTIFACT_ID="$(awk -F= '$1 == "publisher_bundle_artifact_id" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_BUNDLE_ARTIFACT_SHA256="$(awk -F= '$1 == "publisher_bundle_artifact_sha256" {print $2}' "$GITHUB_OUTPUT")"             /usr/bin/python3 -I - "$artifact_dir/artifacts.json" "$artifact_dir" <<'PY'
           import json
           import os
           from pathlib import Path
@@ -277,11 +290,11 @@ jobs:
           root = Path(sys.argv[2])
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           rows = payload.get("artifacts") if isinstance(payload, dict) else None
-          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or payload["total_count"] != len(rows):
+          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 100 or payload["total_count"] != len(rows):
               raise SystemExit("recovery artifacts response is malformed")
           run_id = int(os.environ["PUBLISHER_RUN_ID"])
           attempt = int(os.environ["PUBLISHER_RUN_ATTEMPT"])
-          for name, output in ((os.environ["BUNDLE_NAME"], "bundle.id"), (os.environ["EVIDENCE_NAME"], "evidence.id")):
+          for name, output in ((os.environ["PUBLISHER_BUNDLE_NAME"], "bundle.id"), (os.environ["EVIDENCE_NAME"], "evidence.id")):
               matches = [
                   row for row in rows
                   if isinstance(row, dict) and row.get("name") == name
@@ -301,7 +314,7 @@ jobs:
             curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/artifacts/$id/zip" --output "$artifact_dir/$kind.download.zip"
           done
           source_sha="$(awk -F= '$1 == "source_sha" {print $2}' "$GITHUB_OUTPUT")"
-          RECOVERY_RUN_ID="$recovery_run_id" RECOVERY_RUN_ATTEMPT="$recovery_run_attempt" RECOVERY_JOB_ID="$recovery_job_id" RECOVERY_WORKFLOW_SHA="$(awk -F= '$1 == "recovery_workflow_sha" {print $2}' "$GITHUB_OUTPUT")" SOURCE_SHA="$source_sha" SECURITY_RUN_ID="$SECURITY_RUN_ID" SECURITY_RUN_ATTEMPT="$SECURITY_RUN_ATTEMPT" ROUTE_DIGEST="$(awk -F= '$1 == "route_digest" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_RUN_ID="$PUBLISHER_RUN_ID" PUBLISHER_RUN_ATTEMPT="$PUBLISHER_RUN_ATTEMPT" PUBLISHER_WORKFLOW_SHA="$(awk -F= '$1 == "publisher_workflow_sha" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_JOB_ID="$(awk -F= '$1 == "publisher_job_id" {print $2}' "$GITHUB_OUTPUT")" BUNDLE_NAME="$(awk -F= '$1 == "bundle_name" {print $2}' "$GITHUB_OUTPUT")" EVIDENCE_NAME="$(awk -F= '$1 == "evidence_name" {print $2}' "$GITHUB_OUTPUT")"             /usr/bin/python3 -I - "$artifact_dir" "$GITHUB_OUTPUT" <<'PY'
+          RECOVERY_RUN_ID="$recovery_run_id" RECOVERY_RUN_ATTEMPT="$recovery_run_attempt" RECOVERY_JOB_ID="$recovery_job_id" RECOVERY_WORKFLOW_SHA="$(awk -F= '$1 == "recovery_workflow_sha" {print $2}' "$GITHUB_OUTPUT")" SOURCE_SHA="$source_sha" SECURITY_RUN_ID="$SECURITY_RUN_ID" SECURITY_RUN_ATTEMPT="$SECURITY_RUN_ATTEMPT" ROUTE_DIGEST="$(awk -F= '$1 == "route_digest" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_RUN_ID="$PUBLISHER_RUN_ID" PUBLISHER_RUN_ATTEMPT="$PUBLISHER_RUN_ATTEMPT" PUBLISHER_WORKFLOW_SHA="$(awk -F= '$1 == "publisher_workflow_sha" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_JOB_ID="$(awk -F= '$1 == "publisher_job_id" {print $2}' "$GITHUB_OUTPUT")" BUNDLE_NAME="$(awk -F= '$1 == "bundle_name" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_BUNDLE_NAME="$(awk -F= '$1 == "publisher_bundle_name" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_BUNDLE_ARTIFACT_ID="$(awk -F= '$1 == "publisher_bundle_artifact_id" {print $2}' "$GITHUB_OUTPUT")" PUBLISHER_BUNDLE_ARTIFACT_SHA256="$(awk -F= '$1 == "publisher_bundle_artifact_sha256" {print $2}' "$GITHUB_OUTPUT")" EVIDENCE_NAME="$(awk -F= '$1 == "evidence_name" {print $2}' "$GITHUB_OUTPUT")"             /usr/bin/python3 -I - "$artifact_dir" "$GITHUB_OUTPUT" <<'PY'
           import hashlib
           import json
           import os
@@ -335,13 +348,13 @@ jobs:
           evidence = extract(root / "evidence.download.zip", os.environ["EVIDENCE_NAME"])
           payload = json.loads(evidence.read_text(encoding="ascii"))
           if (
-              set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "bundle_artifact_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance", "publisher_workflow_sha", "publisher_run_id", "publisher_run_attempt", "publisher_job_id"}
-              or payload.get("schema") != 2 or payload.get("capability") != "recovery_bootstrap"
+              set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "bundle_artifact_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance", "publisher_workflow_sha", "publisher_run_id", "publisher_run_attempt", "publisher_job_id", "publisher_bundle_name", "publisher_bundle_artifact_id", "publisher_bundle_artifact_sha256"}
+              or payload.get("schema") != 3 or payload.get("capability") != "recovery_bootstrap"
               or payload.get("capabilities") != ["abort_retained_only", "recover_pending"]
               or payload.get("deployable") is not False
           ):
               raise SystemExit("recovery evidence schema is not closed")
-          if payload.get("bundle_name") != bundle.name or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_sha256"))) or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_artifact_sha256"))):
+          if payload.get("bundle_name") != bundle.name or payload.get("publisher_bundle_name") != os.environ["PUBLISHER_BUNDLE_NAME"] or payload.get("publisher_bundle_artifact_id") != os.environ["PUBLISHER_BUNDLE_ARTIFACT_ID"] or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_sha256"))) or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_artifact_sha256"))) or payload.get("publisher_bundle_artifact_sha256") != os.environ["PUBLISHER_BUNDLE_ARTIFACT_SHA256"]:
               raise SystemExit("recovery evidence bundle identity is invalid")
           if (
               payload.get("recovery_run_id") != os.environ["RECOVERY_RUN_ID"]
@@ -373,6 +386,8 @@ jobs:
           digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
           if digest != payload["bundle_sha256"]:
               raise SystemExit("recovery bundle digest mismatch")
+          if hashlib.sha256((root / "bundle.download.zip").read_bytes()).hexdigest() != payload["publisher_bundle_artifact_sha256"]:
+              raise SystemExit("publisher bundle artifact digest mismatch")
           with out.open("a", encoding="ascii") as stream:
               stream.write(f"bundle_path={bundle}\n")
               stream.write(f"bundle_sha={digest}\n")
@@ -505,6 +520,8 @@ jobs:
             -o StrictHostKeyChecking=yes
             -o UserKnownHostsFile="$SSH_DIR/known_hosts"
             -o ConnectTimeout=10
+            -o ServerAliveInterval=5
+            -o ServerAliveCountMax=2
             -i "$SSH_DIR/id_ed25519"
           )
           remote_stage=""
@@ -532,10 +549,10 @@ jobs:
             exit "$status"
           }
           trap cleanup_remote_upload EXIT
-          remote_stage="$(ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" 'umask 077; test "$(id -u)" -eq 0; d="$(mktemp -d --tmpdir=/tmp oldsparky-recovery-upload.XXXXXX)"; chmod 700 "$d"; printf "%s" "$d"')"
+          remote_stage="$(timeout --foreground 300s ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" 'umask 077; test "$(id -u)" -eq 0; d="$(mktemp -d --tmpdir=/tmp oldsparky-recovery-upload.XXXXXX)"; chmod 700 "$d"; printf "%s" "$d"')"
           [[ "$remote_stage" =~ ^/tmp/oldsparky-recovery-upload\.[A-Za-z0-9]{6}$ ]]
-          scp -p "${ssh_common[@]}" "$BUNDLE_PATH" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/bundle.zip"
-          ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA'" <<'REMOTE'
+          timeout --foreground 300s scp -p "${ssh_common[@]}" "$BUNDLE_PATH" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/bundle.zip"
+          timeout --foreground 300s ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA'" <<'REMOTE'
           set -Eeuo pipefail
           stage="$1"
           expected="$2"
@@ -592,7 +609,7 @@ jobs:
           }
           trap cleanup_recovery_capture EXIT
           set +e
-          ssh \
+          timeout --foreground 900s ssh \
             -F /dev/null \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -670,41 +687,6 @@ jobs:
               "deployable": False,
           }
           raw = (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-          with os.fdopen(descriptor, "wb") as stream:
-              stream.write(raw)
-              stream.flush()
-              os.fsync(stream.fileno())
-          PY
-          handoff_path="$install_stage/publisher-provenance.json"
-          /usr/bin/python3 -I - "$handoff_path" "$source_sha" "$recovery_workflow_sha" "$recovery_run_id" "$recovery_run_attempt" "$recovery_job_id" "$publisher_workflow_sha" "$publisher_run_id" "$publisher_run_attempt" "$publisher_job_id" <<'PY'
-          import json
-          import os
-          import re
-          import sys
-          from pathlib import Path
-          destination = Path(sys.argv[1])
-          values = sys.argv[2:]
-          if len(values) != 9 or any(not isinstance(value, str) or not value for value in values):
-              raise SystemExit("publisher handoff is incomplete")
-          source, producer_sha, producer_run, producer_attempt, producer_job, publisher_sha, publisher_run, publisher_attempt, publisher_job = values
-          if re.fullmatch(r"[0-9a-f]{40,64}", source) is None or re.fullmatch(r"[0-9a-f]{40,64}", producer_sha) is None or re.fullmatch(r"[0-9a-f]{40,64}", publisher_sha) is None:
-              raise SystemExit("publisher handoff SHA is invalid")
-          if any(re.fullmatch(r"[1-9][0-9]{0,31}", value) is None for value in (producer_run, producer_attempt, producer_job, publisher_run, publisher_attempt, publisher_job)):
-              raise SystemExit("publisher handoff identity is invalid")
-          payload = {
-              "schema": 1,
-              "source_sha": source,
-              "recovery_workflow_sha": producer_sha,
-              "recovery_run_id": producer_run,
-              "recovery_run_attempt": producer_attempt,
-              "recovery_job_id": producer_job,
-              "publisher_workflow_sha": publisher_sha,
-              "publisher_run_id": publisher_run,
-              "publisher_run_attempt": publisher_attempt,
-              "publisher_job_id": publisher_job,
-          }
-          raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
           descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
           with os.fdopen(descriptor, "wb") as stream:
               stream.write(raw)

@@ -12,7 +12,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tools import platform_workflow_input_guard, platform_workflow_remote_dispatch
 from tools.platform_workflow_input_guard import (
@@ -338,20 +338,20 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 BytesIO((json.dumps(valid_live) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
+            child = Mock(pid=1234)
+            child.wait.return_value = 0
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_ROOT", root), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_LAUNCH", helper), \
                 patch.object(
-                    platform_workflow_remote_dispatch.subprocess,
-                    "run",
-                    return_value=type("Result", (), {"returncode": 0})(),
-                ) as run:
+                    platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child
+                ) as popen:
                 self.assertEqual(
                     platform_workflow_remote_dispatch.main(["live-launch"]),
                     0,
                 )
             self.assertEqual(
-                run.call_args.args[0],
+                popen.call_args.args[0],
                 [
                     "/usr/bin/sudo",
                     "-n",
@@ -363,6 +363,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     valid_live["target_sha"],
                 ],
             )
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
         # The local handoff is an atomic private file, not a shell fragment or
         # an Actions artifact.
@@ -750,22 +751,22 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 BytesIO((json.dumps(valid_deploy) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
+            child = Mock(pid=1235)
+            child.wait.return_value = 0
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_root), \
                 patch.object(platform_workflow_remote_dispatch, "DEPLOY_HELPER", helper), \
                 patch.object(platform_workflow_remote_dispatch, "_trusted_generation", return_value=True), \
                 patch.object(platform_workflow_remote_dispatch, "_verify_host_tools_contract", return_value=True), \
                 patch.object(
-                    platform_workflow_remote_dispatch.subprocess,
-                    "run",
-                    return_value=type("Result", (), {"returncode": 0})(),
-                ) as run:
+                    platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child
+                ) as popen:
                 self.assertEqual(
                     platform_workflow_remote_dispatch.main(["production-deploy"]),
                     0,
                 )
             self.assertEqual(
-                run.call_args.args[0],
+                popen.call_args.args[0],
                 [
                     "/usr/bin/sudo",
                     "-n",
@@ -791,6 +792,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 BytesIO((json.dumps(valid_deploy) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
+            child = Mock(pid=1236)
+            child.wait.return_value = 0
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_root), \
                 patch.object(platform_workflow_remote_dispatch, "ARTIFACT_DIR_HELPER", helper), \
@@ -798,16 +801,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 patch.object(platform_workflow_remote_dispatch, "_verify_host_tools_contract", return_value=True), \
                 patch.object(platform_workflow_remote_dispatch.sys, "executable", "/usr/bin/python3.12"), \
                 patch.object(
-                    platform_workflow_remote_dispatch.subprocess,
-                    "run",
-                    return_value=type("Result", (), {"returncode": 0})(),
-                ) as run:
+                    platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child
+                ) as popen:
                 self.assertEqual(
                     platform_workflow_remote_dispatch.main(["production-prepare-artifact"]),
                     0,
                 )
             self.assertEqual(
-                run.call_args.args[0],
+                popen.call_args.args[0],
                 [
                     "/usr/bin/sudo",
                     "-n",
@@ -819,6 +820,27 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     valid["artifact_remote_dir"],
                 ],
             )
+
+    def test_bounded_dispatch_child_terminates_process_group_on_timeout(self) -> None:
+        child = Mock(pid=9876)
+        child.wait.side_effect = [
+            subprocess.TimeoutExpired(["helper"], 1),
+            None,
+        ]
+        with (
+            patch.object(
+                platform_workflow_remote_dispatch.subprocess,
+                "Popen",
+                return_value=child,
+            ) as popen,
+            patch.object(platform_workflow_remote_dispatch.os, "killpg") as killpg,
+        ):
+            result = platform_workflow_remote_dispatch._run_bounded_child(
+                ["helper"], timeout_seconds=1
+            )
+        self.assertEqual(result, 124)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        killpg.assert_called_once_with(9876, platform_workflow_remote_dispatch.signal.SIGTERM)
 
     def test_cleanup_export_inventory_is_closed_and_idempotent(self) -> None:
         def build_root(prefix: str, run_id: str, names: tuple[str, ...]) -> Path:
