@@ -16,6 +16,21 @@ SPEC.loader.exec_module(MODULE)
 
 
 class CloudflareIpUpdaterTests(unittest.TestCase):
+    @staticmethod
+    def _write_nginx_validation_fixture(directory: Path) -> Path:
+        fixture = directory / "nginx-fixture"
+        fixture.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "if [ \"$#\" -ne 1 ] || [ \"$1\" != \"-t\" ]; then\n"
+            "    exit 64\n"
+            "fi\n"
+            "printf '%s\\n' \"$@\" > \"$0.argv\"\n",
+            encoding="ascii",
+        )
+        fixture.chmod(0o700)
+        return fixture
+
     def test_operation_budget_matches_service_timeout_margin(self) -> None:
         self.assertEqual(MODULE.FETCH_TIMEOUT_MAX_SECONDS, 30.0)
         self.assertEqual(MODULE.SUBPROCESS_TIMEOUT_SECONDS, 30.0)
@@ -41,12 +56,14 @@ class CloudflareIpUpdaterTests(unittest.TestCase):
 
     def test_changed_candidate_is_installed_and_unchanged_candidate_is_not_rewritten(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
+            nginx_fixture = self._write_nginx_validation_fixture(Path(temporary))
             output = Path(temporary) / "cloudflare-real-ip.conf"
             output.write_text("old\n", encoding="ascii")
-            self.assertTrue(MODULE.install_candidate(output, "new\n", "nginx", False))
+            self.assertTrue(MODULE.install_candidate(output, "new\n", str(nginx_fixture), False))
             self.assertEqual(output.read_text(encoding="ascii"), "new\n")
+            self.assertEqual(nginx_fixture.with_name(f"{nginx_fixture.name}.argv").read_text(), "-t\n")
             with mock.patch.object(MODULE, "run_checked") as run_checked:
-                self.assertFalse(MODULE.install_candidate(output, "new\n", "nginx", False))
+                self.assertFalse(MODULE.install_candidate(output, "new\n", str(nginx_fixture), False))
                 run_checked.assert_not_called()
 
     def test_validation_timeout_rolls_back_exact_previous_content(self) -> None:
