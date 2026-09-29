@@ -3,7 +3,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_workflow_remote_dispatch.py",
-      "sha256": "233d7f5ca758415cda5f7f0517612703ae3a1ac88628b6d91d7fd19930409c16"
+      "sha256": "4520e1552f0e60bfe56eac7aa95a1abb089872b34135d698e23a0696af50305b"
     },
     {
       "mode": 493,
@@ -18,7 +18,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_production_deploy_supervisor.sh",
-      "sha256": "951733d758dad451d4c2c26becfdc4b0273b3e5f273b7695b2f03457f5d22572"
+      "sha256": "9c29876df2967c09a7bb3c2345c08ec90e05143f8d4bdb4d11657d1ee5c733ce"
     },
     {
       "mode": 493,
@@ -28,7 +28,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_release_preflight.sh",
-      "sha256": "bdbec8ac62e57c8bc37b2f617f0c174f8daf07a6b4a9af4f9f69f9a24d35b2d8"
+      "sha256": "bd434b2413233b2c7d5d4bfe8a4845386083e01260c743c73b64f320b7603924"
     },
     {
       "mode": 493,
@@ -48,7 +48,7 @@
     {
       "mode": 420,
       "path": "platform/tools/platform_validate_edge_policy.py",
-      "sha256": "872c6b1a5c5e4ad7461b1880fdbd86a30fd1d22b4a11942be121f86b9019fc9e"
+      "sha256": "21fbb3154982cf508df6974c40323ac44f044e1ea20f022b94a151d613ab82cf"
     },
     {
       "mode": 420,
@@ -58,7 +58,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_update_cloudflare_ips.py",
-      "sha256": "018fba78669836bcec3e751082bac9e7421d601cedf1dc0970f4f4550e272f8b"
+      "sha256": "41b68ecdb58e767554483c9db4032a7d8b150861d32d1cbed7a2afb3f57c3e4e"
     },
     {
       "mode": 420,
@@ -66,7 +66,7 @@
       "sha256": "2fe2c8ebfdea6f24ee6d7c7e1a4539a88fdc70449c66cc50eedf9caab3ae2ebf"
     }
   ],
-  "host_tools_sha": "4f1a265c1e59d32a7ad552d33093865c2b06ce2a",
+  "host_tools_sha": "8fa938a9a87d4f7e93c808d8e5ca03abf96f08f5",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }
