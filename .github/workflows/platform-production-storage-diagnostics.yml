@@ -52,10 +52,69 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  contract:
+    name: Prepare canonical diagnostics contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact workflow source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Package canonical diagnostics contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          contract_dir="$RUNNER_TEMP/platform-storage-contract"
+          install -d -m 700 "$contract_dir"
+          source_path="$GITHUB_WORKSPACE/platform/tools/platform_storage_diagnostics_contract.py"
+          test -f "$source_path" && test ! -L "$source_path"
+          install -m 600 "$source_path" "$contract_dir/platform_storage_diagnostics_contract.py"
+          (
+            cd "$contract_dir"
+            sha256sum -- platform_storage_diagnostics_contract.py > manifest.sha256
+          )
+          chmod 600 "$contract_dir/manifest.sha256"
+
+      - name: Validate canonical prepare-failure schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          validation_dir="$RUNNER_TEMP/platform-storage-contract-validation"
+          test ! -e "$validation_dir" && test ! -L "$validation_dir"
+          install -d -m 700 "$validation_dir"
+          failure_artifact="$validation_dir/prepare-failure.json"
+          trap 'rm -f -- "$failure_artifact"; rmdir -- "$validation_dir"' EXIT HUP INT TERM
+          /usr/bin/python3 -I "$RUNNER_TEMP/platform-storage-contract/platform_storage_diagnostics_contract.py" \
+            --write-failure "$failure_artifact" \
+            --expected-sha "$GITHUB_SHA" \
+            --remote-exit-code 1 \
+            --remote-stderr-bytes 0 \
+            --report-present false \
+            --phase capture \
+            --reason remote_collection_failed \
+            --action inspect_remote_collection
+          test -f "$failure_artifact" && test ! -L "$failure_artifact"
+          test "$(stat -c '%F:%h:%a' -- "$failure_artifact")" = "regular file:1:600"
+          /usr/bin/python3 -I "$RUNNER_TEMP/platform-storage-contract/platform_storage_diagnostics_contract.py" \
+            --validate "$failure_artifact"
+
+      - name: Upload canonical diagnostics contract
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-production-storage-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-storage-contract
+          if-no-files-found: error
+          retention-days: 1
+
   collect:
     name: Collect read-only storage evidence
     if: ${{ always() }}
-    needs: prepare
+    needs:
+      - prepare
+      - contract
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: production
@@ -71,14 +130,6 @@ jobs:
 
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "expected_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
-
-      - name: Checkout canonical diagnostics contract fallback
-        if: ${{ always() }}
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 1
-          persist-credentials: false
 
       - name: Download exact diagnostics projector
         if: ${{ needs.prepare.result == 'success' }}
@@ -98,6 +149,28 @@ jobs:
           done
           (
             cd "$projector_dir"
+            sha256sum --strict --check -- manifest.sha256
+          )
+
+      - name: Download canonical diagnostics contract
+        if: ${{ needs.contract.result == 'success' }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-storage-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-storage-contract
+
+      - name: Verify canonical diagnostics contract
+        if: ${{ needs.contract.result == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          contract_dir="$RUNNER_TEMP/platform-storage-contract"
+          test -f "$contract_dir/platform_storage_diagnostics_contract.py" \
+            && test ! -L "$contract_dir/platform_storage_diagnostics_contract.py"
+          test -f "$contract_dir/manifest.sha256" \
+            && test ! -L "$contract_dir/manifest.sha256"
+          (
+            cd "$contract_dir"
             sha256sum --strict --check -- manifest.sha256
           )
 
@@ -507,7 +580,7 @@ jobs:
             local action="$3"
             local contract_tool="$RUNNER_TEMP/platform-storage-projector/platform_storage_diagnostics_contract.py"
             if [[ ! -f "$contract_tool" || -L "$contract_tool" ]]; then
-              contract_tool="$GITHUB_WORKSPACE/platform/tools/platform_storage_diagnostics_contract.py"
+              contract_tool="$RUNNER_TEMP/platform-storage-contract/platform_storage_diagnostics_contract.py"
             fi
             test -f "$contract_tool" && test ! -L "$contract_tool"
             local truncation_args=()
@@ -530,7 +603,7 @@ jobs:
           validate_artifact() {
             local contract_tool="$RUNNER_TEMP/platform-storage-projector/platform_storage_diagnostics_contract.py"
             if [[ ! -f "$contract_tool" || -L "$contract_tool" ]]; then
-              contract_tool="$GITHUB_WORKSPACE/platform/tools/platform_storage_diagnostics_contract.py"
+              contract_tool="$RUNNER_TEMP/platform-storage-contract/platform_storage_diagnostics_contract.py"
             fi
             test -f "$contract_tool" && test ! -L "$contract_tool"
             /usr/bin/python3 -I "$contract_tool" --validate "$1"
@@ -644,6 +717,16 @@ jobs:
             rmdir -- "$projector_dir"
           fi
           test ! -e "$projector_dir" && test ! -L "$projector_dir"
+          contract_dir="$RUNNER_TEMP/platform-storage-contract"
+          if [[ -L "$contract_dir" ]]; then
+            rm -f -- "$contract_dir"
+          elif [[ -d "$contract_dir" ]]; then
+            rm -f -- \
+              "$contract_dir/platform_storage_diagnostics_contract.py" \
+              "$contract_dir/manifest.sha256"
+            rmdir -- "$contract_dir"
+          fi
+          test ! -e "$contract_dir" && test ! -L "$contract_dir"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
@@ -651,7 +734,7 @@ jobs:
           printf '%s\n' 'DIAGNOSTICS_REPORT_PRESENT=' >> "$GITHUB_ENV"
 
       - name: Upload storage diagnostic evidence
-        if: ${{ always() && steps.cleanup_captures.outcome == 'success' }}
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.cleanup_captures.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: platform-production-storage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}

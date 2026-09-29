@@ -365,7 +365,15 @@ def summarize_backup(raw: str, *, phase: str) -> dict[str, object]:
 def _section_summary(section: Any) -> dict[str, object]:
     if not isinstance(section, dict):
         section = {}
+
     def count(name: str) -> int | None:
+        # The maintenance producer emits explicit counts from its retention
+        # plan.  Prefer those producer values so the projected contract stays
+        # aligned even when a safe-id list is filtered; retain the list-length
+        # fallback for older deployed helpers that predate the count fields.
+        explicit = _safe_int(section.get(f"{name}_count"), maximum=10**18)
+        if explicit is not None:
+            return explicit
         value = section.get(name)
         return len(value) if isinstance(value, list) else None
     reclaimable = _safe_int(section.get("reclaimable_bytes"), maximum=10**18)
@@ -384,6 +392,9 @@ def _live_qa_section_summary(section: Any) -> dict[str, object]:
         section = {}
 
     def count(name: str) -> int | None:
+        explicit = _safe_int(section.get(f"{name}_count"), maximum=10**18)
+        if explicit is not None:
+            return explicit
         value = section.get(name)
         return len(value) if isinstance(value, list) else None
 

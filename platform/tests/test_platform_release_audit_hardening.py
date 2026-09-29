@@ -1798,6 +1798,9 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         contract_source = self.read_tool("platform_storage_diagnostics_contract.py")
         self.assertIn("os.replace(temporary, path)", contract_source)
         self.assertIn("allow_nan=False", contract_source)
+        self.assertIn("Validate canonical prepare-failure schema", workflow)
+        self.assertIn('--write-failure "$failure_artifact"', workflow)
+        self.assertIn('--validate "$failure_artifact"', workflow)
         self.assertIn("validate_artifact()", workflow)
         self.assertIn("needs.prepare.result == 'success'", workflow)
         self.assertIn('remote_stderr_bytes="$(wc -c <"$ssh_error"', workflow)
@@ -1858,7 +1861,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             "platform-production-storage-diagnostics-artifact.txt", cleanup
         )
         self.assertIn(
-            "if: ${{ always() && steps.cleanup_captures.outcome == 'success' }}",
+            "if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.cleanup_captures.outcome == 'success' }}",
             upload,
         )
         self.assertNotIn("\n      - name:", upload)
@@ -1870,6 +1873,9 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         )
         probe_end = workflow.index("          PY", probe_start)
         probe = textwrap.dedent(workflow[probe_start:probe_end])
+        self.assertIn("os.O_RDONLY", probe)
+        self.assertIn("getattr(os, \"O_NOFOLLOW\", 0)", probe)
+        self.assertIn("fcntl.LOCK_EX | fcntl.LOCK_NB", probe)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             lock_path = root / "retained-load.lock"

@@ -110,12 +110,18 @@ def valid_storage_report() -> bytes:
                         "protected": [],
                         "retained": [],
                         "deleted": [],
+                        "protected_count": 0,
+                        "retained_count": 0,
+                        "deleted_count": 0,
                         "reclaimable_bytes": 0,
                     },
                     "source_release_artifacts": {
                         "protected": [],
                         "retained": [],
                         "deleted": [],
+                        "protected_count": 0,
+                        "retained_count": 0,
+                        "deleted_count": 0,
                         "reclaimable_bytes": 0,
                     },
                     "live_qa_runtime_caches": {
@@ -448,12 +454,18 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
                             "operator@example.test",
                             "/home/operator/private-report.json",
                         ],
+                        "protected_count": 1,
+                        "retained_count": 1,
+                        "deleted_count": 2,
                         "reclaimable_bytes": 8192,
                     },
                     "source_release_artifacts": {
                         "protected": ["release-20260912"],
                         "retained": [],
                         "deleted": [],
+                        "protected_count": 1,
+                        "retained_count": 0,
+                        "deleted_count": 0,
                         "reclaimable_bytes": 0,
                     },
                     "live_qa_runtime_caches": {
@@ -598,6 +610,30 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
             )
             self.assertNotIn(
                 "reclaimable_bytes",
+                projected["categories"]["live_qa_runtime"],
+            )
+
+            # Exercise the real maintenance producer through the same report
+            # framing and closed artifact validator used by the workflow.
+            report_path = root / "producer-report"
+            stderr_path = root / "producer-stderr"
+            producer_report = valid_storage_report().split(
+                b"=== storage_retention_dry_run ===\n", 1
+            )[0] + b"=== storage_retention_dry_run ===\n" + completed.stdout.encode()
+            report_path.write_bytes(producer_report)
+            stderr_path.write_bytes(b"")
+            artifact = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(artifact["status"], "passed")
+            self.assertTrue(diagnostics_contract.validate_artifact(artifact))
+            self.assertEqual(
+                artifact["sections"]["retention"]["categories"]["live_qa_runtime"],
                 projected["categories"]["live_qa_runtime"],
             )
 
