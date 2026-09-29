@@ -1,4 +1,6 @@
+from copy import deepcopy
 import json
+import re
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +17,67 @@ from tools.platform_production_qa import (
 
 
 class SsrObservabilityTests(unittest.TestCase):
+    def _assert_timeout_diagnostic_id_scope(
+        self,
+        summary: dict[str, object],
+        expected_ids: tuple[str, ...],
+        forbidden_values: tuple[str, ...],
+    ) -> None:
+        """Keep correlators in the one bounded, non-sensitive evidence path."""
+
+        expected = sorted(expected_ids)
+        timeout = summary.get("timeout_diagnostics")
+        self.assertIsInstance(timeout, dict)
+        assert isinstance(timeout, dict)
+        rows = timeout.get("rows")
+        self.assertIsInstance(rows, list)
+        assert isinstance(rows, list)
+        self.assertLessEqual(len(rows), 20_000)
+        self.assertEqual(timeout.get("requested_ids"), len(expected))
+        self.assertEqual(timeout.get("nginx_records"), len(rows))
+
+        actual_ids: list[object] = []
+        for row in rows:
+            self.assertIsInstance(row, dict)
+            assert isinstance(row, dict)
+            diagnostic_id = row.get("diagnostic_id")
+            self.assertIsInstance(diagnostic_id, str)
+            assert isinstance(diagnostic_id, str)
+            self.assertRegex(diagnostic_id, r"^tdiag-[0-9]{1,32}-[0-9]{5}$")
+            actual_ids.append(diagnostic_id)
+        self.assertEqual(actual_ids, expected)
+        self.assertEqual(len(actual_ids), len(set(actual_ids)))
+
+        serialized = json.dumps(summary, sort_keys=True)
+        self.assertEqual(
+            sorted(re.findall(r"tdiag-[0-9]{1,32}-[0-9]{5}", serialized)),
+            expected,
+        )
+        for value in forbidden_values:
+            self.assertNotIn(value.casefold(), serialized.casefold())
+
+        def assert_id_placement(value: object, path: tuple[object, ...] = ()) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    child_path = (*path, key)
+                    if key == "diagnostic_id":
+                        self.assertEqual(
+                            child_path[:2],
+                            ("timeout_diagnostics", "rows"),
+                        )
+                        self.assertEqual(child_path[-1], "diagnostic_id")
+                    assert_id_placement(child, child_path)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    assert_id_placement(child, (*path, index))
+            elif isinstance(value, str) and re.fullmatch(
+                r"tdiag-[0-9]{1,32}-[0-9]{5}", value
+            ):
+                self.assertEqual(path[:2], ("timeout_diagnostics", "rows"))
+                self.assertEqual(path[-1], "diagnostic_id")
+
+        assert_id_placement(summary)
+
     def test_ssr_stage_parser_keeps_only_safe_scalar_diagnostics(self) -> None:
         row = parse_ssr_perf_line(
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=tournament_workspace "
@@ -290,6 +353,16 @@ class SsrObservabilityTests(unittest.TestCase):
 
     def test_ssr_summary_joins_diagnostic_identity_to_nginx_and_api(self) -> None:
         diagnostic_id = "tdiag-123-00001"
+        forbidden_values = (
+            "nginx-owned-id",
+            "ray-1",
+            "/tournaments/fixture",
+            "/api/v1/auth/bootstrap",
+            "__Host-old_sparky_session=session-secret",
+            "csrf-secret",
+            "token-secret",
+            "operator@example.test",
+        )
         summary = summarize_ssr_observability(
             [
                 f"ssr_perf request_id={diagnostic_id} cf_ray=ray-1 "
@@ -306,13 +379,18 @@ class SsrObservabilityTests(unittest.TestCase):
                     "request_time": "0.050",
                     "upstream_header_time": "0.040",
                     "upstream_time": "0.045",
+                    "cookie": "__Host-old_sparky_session=session-secret",
+                    "csrf_token": "csrf-secret",
+                    "token": "token-secret",
+                    "user": "operator@example.test",
                 }
             ],
             [
-                "request_perf request_id=tdiag-123-00001 method=GET "
+                f"request_perf request_id={diagnostic_id} method=GET "
                 "path=/api/v1/auth/bootstrap route=/api/v1/auth/bootstrap "
                 "status=200 total_ms=18.5 sql_ms=2.5",
             ],
+            timeout_diagnostic_ids=(diagnostic_id,),
         )
 
         correlated = summary["correlated_html"]
@@ -321,7 +399,40 @@ class SsrObservabilityTests(unittest.TestCase):
         self.assertEqual(correlated["api_request_perf_join"]["matched_by_request_id"], 0)
         self.assertNotIn("diagnostic_id", correlated["timeline"][0])
         self.assertEqual(correlated["timeline"][0]["api_request_perf_correlation"], "diagnostic_id")
-        self.assertNotIn(diagnostic_id, json.dumps(summary))
+        self._assert_timeout_diagnostic_id_scope(
+            summary,
+            (diagnostic_id,),
+            forbidden_values,
+        )
+
+        leaked = deepcopy(summary)
+        leaked["correlated_html"]["timeline"][0]["diagnostic_id"] = diagnostic_id
+        with self.assertRaises(AssertionError):
+            self._assert_timeout_diagnostic_id_scope(
+                leaked,
+                (diagnostic_id,),
+                forbidden_values,
+            )
+
+        duplicated = deepcopy(summary)
+        duplicated["timeout_diagnostics"]["rows"].append(
+            deepcopy(duplicated["timeout_diagnostics"]["rows"][0])
+        )
+        with self.assertRaises(AssertionError):
+            self._assert_timeout_diagnostic_id_scope(
+                duplicated,
+                (diagnostic_id,),
+                forbidden_values,
+            )
+
+        malformed = deepcopy(summary)
+        malformed["timeout_diagnostics"]["rows"][0]["diagnostic_id"] = "tdiag-123-secret"
+        with self.assertRaises(AssertionError):
+            self._assert_timeout_diagnostic_id_scope(
+                malformed,
+                ("tdiag-123-secret",),
+                forbidden_values,
+            )
 
     def test_ssr_summary_marks_close_without_finish_as_response_integrity_failure(self) -> None:
         summary = summarize_ssr_observability(
