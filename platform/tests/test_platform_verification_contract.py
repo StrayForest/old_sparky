@@ -1147,6 +1147,19 @@ except lock.VerificationLockError as exc:
                 for issue in _external_load_recovery_workflow_issues(missing_recovery_bound)
             )
         )
+        missing_recovery_host_key_retry = recovery.replace(
+            "known_hosts.scan.1",
+            "known_hosts.scan.missing",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "bounded exact-artifact marker known_hosts.scan.1" in issue
+                for issue in _external_load_recovery_workflow_issues(
+                    missing_recovery_host_key_retry
+                )
+            )
+        )
         for public_path, trusted_path, kind, inputs in (
             (RETAINED_CLEANUP_WORKFLOW, TRUSTED_RETAINED_CLEANUP_WORKFLOW, "cleanup", RETAINED_CLEANUP_INPUTS),
             (RETAINED_ABORT_WORKFLOW, TRUSTED_RETAINED_ABORT_WORKFLOW, "abort", RETAINED_ABORT_INPUTS),

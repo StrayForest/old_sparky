@@ -108,7 +108,16 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                     block,
                     path.name,
                 )
-                self.assertIn('>"$ssh_scan_attempt" 2>/dev/null', block, path.name)
+                self.assertTrue(
+                    (
+                        '>"$ssh_scan_attempt" 2>/dev/null' in block
+                        or '2>/dev/null | /usr/bin/head -c 65536 >"$ssh_scan_attempt"'
+                        in block
+                    ),
+                    path.name,
+                )
+                if '2>/dev/null | /usr/bin/head -c 65536 >"$ssh_scan_attempt"' in block:
+                    self.assertIn("head -c 65536", block, path.name)
                 self.assertIn('install -m 600 /dev/null "$ssh_scan_attempt"', block, path.name)
                 self.assertIn(
                     'NF == 3 && $1 == host && $2 == "ssh-ed25519"',
@@ -132,10 +141,14 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                     else standard_blocks
                 )
                 target.append(block)
-        self.assertEqual(workflow_count, 20)
-        self.assertEqual(site_count, 23)
-        self.assertEqual(len(standard_blocks), 22)
-        self.assertEqual(len(set(standard_blocks)), 1)
+        self.assertEqual(workflow_count, 21)
+        self.assertEqual(site_count, 24)
+        self.assertEqual(len(standard_blocks), 23)
+        self.assertEqual(len(set(standard_blocks)), 2)
+        self.assertEqual(
+            sum("head -c 65536" in block for block in standard_blocks),
+            5,
+        )
         self.assertEqual(len(as12_blocks), 1)
         self.assertEqual(
             as12_blocks[0],

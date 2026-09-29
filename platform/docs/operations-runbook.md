@@ -573,8 +573,7 @@ When the external load completes, clean only the exact load workflow run:
 gh workflow run platform-production-retained-load-cleanup.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=DELETE-PRODUCTION-RETAINED-LOAD \
-  -f load_run_id=<load-run-id> \
-  -f target_sha=<source-sha-recorded-by-load-run> \
+  -f load_run_id=<load-run-id> -f target_sha=<source-sha-recorded-by-load-run> \
   -f control_email=<designated-control-account>
 gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 ```

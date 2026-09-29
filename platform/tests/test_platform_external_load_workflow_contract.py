@@ -479,9 +479,6 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("TARGET_SHA: ${{ inputs.target_sha }}", cleanup_trusted)
         self.assertNotIn("TARGET_SHA: ${{ github.sha }}", cleanup)
-        abort = (
-            REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"
-        ).read_text(encoding="utf-8")
         abort_trusted = (
             REPO_ROOT / ".github/workflows/platform-production-retained-load-abort-trusted.yml"
         ).read_text(encoding="utf-8")

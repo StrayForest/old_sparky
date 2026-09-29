@@ -17,6 +17,8 @@ import textwrap
 import unittest
 import zipfile
 
+import yaml
+
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
 from tests.test_platform_validate_release_artifact import (
     ArchiveBuilder as ReleaseArtifactFixtureBuilder,
@@ -2474,9 +2476,17 @@ cleanup
         self.assertIn("- name: Remove fixture-setup SSH material", workflow)
         self.assertIn("- name: Remove finalizer SSH material", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
-        self.assertIn(
-            "needs:\n      - resolve-trusted-runner\n      - validate-external-inputs\n      - fixture-setup\n      - load-client",
-            workflow,
+        workflow_document = yaml.safe_load(workflow)
+        self.assertEqual(
+            set(workflow_document["jobs"]["evaluate-load"]["needs"]),
+            {
+                "validate-caller-identity",
+                "resolve-trusted-runner",
+                "validate-external-inputs",
+                "fixture-setup",
+                "fixture-finalize",
+                "load-client",
+            },
         )
         self.assertIn("steps.fixture-setup.outputs.setup_status", workflow)
         self.assertIn("steps.external-finalize.outputs.remote_status", workflow)
