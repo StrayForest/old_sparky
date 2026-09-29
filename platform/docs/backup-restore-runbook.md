@@ -43,7 +43,7 @@ production-release, source-artifact, transient-browser or live-QA retention.
 After the backup is restore/Alembic/checksum/freshness verified, the backup
 owner may rotate only its own archive/metadata set, bounded to 14 retained
 copies. A create or restore failure exits before rotation or any other
-pruning path.
+pruning path, and leaves all existing backup archives untouched.
 
 Check freshness without restoring production:
 

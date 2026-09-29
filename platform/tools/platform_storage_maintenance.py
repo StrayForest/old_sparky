@@ -694,16 +694,6 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                         "preprod_screenshots": 0,
                     },
                 )
-                live_qa_guard.prune_runtime_cache_release_lock_held(
-                    apply=False,
-                    keep=args.live_qa_runtime_keep,
-                    root=getattr(
-                        args,
-                        "live_qa_runtime_root",
-                        live_qa_guard.RUNNER_CACHE_ROOT,
-                    ),
-                    app_dir=app_dir,
-                )
                 live_qa_plan = live_qa_guard.RuntimeCacheRetentionPlan((), (), (), ())
             else:
                 maintenance_result = _plan_and_maybe_apply(

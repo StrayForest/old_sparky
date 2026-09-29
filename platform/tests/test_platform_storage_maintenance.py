@@ -455,14 +455,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             yield self.release_dir
             events.append("locks-exit")
 
-        live_qa_plan = maintenance.live_qa_guard.RuntimeCacheRetentionPlan(
-            protected=(),
-            retained=(),
-            candidates=(),
-            tombstones=(),
-        )
         with (
             mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
+            mock.patch.object(maintenance, "_plan_and_maybe_apply") as retention_plan,
             mock.patch.object(
                 maintenance,
                 "run_backup",
@@ -480,8 +475,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             mock.patch.object(
                 maintenance.live_qa_guard,
                 "prune_runtime_cache_release_lock_held",
-                return_value=live_qa_plan,
-            ),
+            ) as live_qa_prune,
         ):
             report = run_maintenance(args)
 
@@ -493,6 +487,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             keep=14,
             max_age_hours=24.0,
         )
+        live_qa_prune.assert_not_called()
+        retention_plan.assert_not_called()
         self.assertTrue(candidate.exists())
         self.assertTrue(web_candidate.exists())
         self.assertEqual(report["production_releases"]["deleted_count"], 0)
@@ -718,7 +714,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "else:", backup_only_start
         )]
         self.assertIn("run_backup(", backup_only)
-        self.assertIn("apply=False", backup_only)
+        self.assertNotIn("prune_runtime_cache_release_lock_held", backup_only)
         self.assertNotIn("_plan_and_maybe_apply(", backup_only)
 
     def test_apply_lock_order_and_live_qa_report_are_rollback_safe(self) -> None:

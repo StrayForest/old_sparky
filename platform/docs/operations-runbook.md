@@ -58,13 +58,13 @@ Maintenance keeps:
 | Nginx/system text logs | rotate at 50 MiB, keep 7 compressed files |
 | failed-login `btmp` | rotate at 16 MiB, keep 2 uncompressed files |
 
-It never deletes shared env/runtimes, upload staging, current/previous releases,
-the active trusted live-QA generation, trusted generations for current/previous
+It never deletes shared env/runtimes, upload staging, current/previous releases, the active trusted live-QA generation, or trusted generations for current/previous
 source commits, legacy live-QA caches for the current/previous source commits,
 business rows or canonical retained reports. Backup failure stops all pruning.
 A successful backup-only run may rotate only verified backup archives, bounded
-to 14 retained copies; it never applies release, source-artifact, transient-browser
-or live-QA retention. Live-QA cache pruning also takes the machine-wide live-QA lock, requires the dedicated browser cgroup
+to 14 retained copies; it never plans or applies release, source-artifact,
+transient-browser or live-QA retention. Live-QA cache pruning also takes the
+machine-wide live-QA lock, requires the dedicated browser cgroup
 and user identity to be idle, accepts only root-owned non-symlink
 `runtime-<40 lowercase hex>` trees with the published read-only manifest
 contract, and always retains at least the newest valid unprotected fallback.
