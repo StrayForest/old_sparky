@@ -455,5 +455,122 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(report["categories"]["production_releases"]["reclaimable_bytes"], 8192)
         self.assertEqual(report["transient_reclaimable_bytes"]["failed_builds"], 1024)
 
+    def test_failure_schema_is_closed_and_success_validation_is_strict(self) -> None:
+        failure_keys = {
+            "schema",
+            "kind",
+            "status",
+            "raw_output_included",
+            "expected_sha",
+            "remote_exit_code",
+            "remote_stderr_bytes",
+            "stderr_truncated",
+            "report_present",
+            "report_truncated",
+            "phase",
+            "reason",
+            "action",
+            "active_release_id",
+            "active_source_sha",
+            "sections",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            stderr_path.write_bytes(b"")
+
+            before_report = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=255,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=False,
+            )
+            self.assertEqual(set(before_report), failure_keys)
+            self.assertEqual(before_report["reason"], "ssh_transport")
+            self.assertIn(before_report["phase"], diagnostics_sanitizer.SAFE_FAILURE_PHASES)
+            self.assertIn(before_report["reason"], diagnostics_sanitizer.SAFE_FAILURE_REASONS)
+            self.assertIn(before_report["action"], diagnostics_sanitizer.SAFE_FAILURE_ACTIONS)
+            self.assertEqual(before_report["active_source_sha"], "unavailable")
+            self.assertFalse(before_report["raw_output_included"])
+
+            malformed = valid_storage_report().replace(
+                b'"active_source_sha":"' + b"a" * 40 + b'"}',
+                b'"active_source_sha":"' + b"a" * 40 + b'","unexpected":"drop"}',
+            )
+            report_path.write_bytes(malformed)
+            invalid = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(invalid["reason"], "report_schema_incomplete")
+            self.assertEqual(set(invalid), failure_keys | {"active_release_id", "active_source_sha", "sections"})
+
+            unknown_record = valid_storage_report().replace(
+                b"--- df root\n", b"--- unexpected root\n--- df root\n", 1
+            )
+            report_path.write_bytes(unknown_record)
+            invalid = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(invalid["reason"], "report_schema_incomplete")
+
+            malformed_report_path = root / "malformed-report"
+            malformed_report_path.write_bytes(
+                valid_storage_report().replace(
+                    b"state=unlocked", b"state=unlocked\x00\x1b[31m", 1
+                )
+            )
+            malformed_report = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=malformed_report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(malformed_report["status"], "failed")
+            self.assertEqual(malformed_report["reason"], "report_schema_incomplete")
+            self.assert_no_forbidden_values(malformed_report)
+
+            report_path.write_bytes(valid_storage_report())
+            stderr_path.write_bytes(b"warning=\xff\x00\x1b[31m")
+            noisy_success = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=11,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(noisy_success["status"], "failed")
+            self.assertFalse(noisy_success["raw_output_included"])
+            self.assert_no_forbidden_values(noisy_success)
+
+            sanitized = diagnostics_sanitizer._failure_summary(
+                expected_sha="a" * 40,
+                remote_exit_code=1,
+                remote_stderr_bytes=0,
+                report_present=False,
+                phase="private-secret",
+                reason="private-secret",
+                action="private-secret",
+            )
+            self.assertEqual(sanitized["phase"], "capture")
+            self.assertEqual(sanitized["reason"], "remote_collection_failed")
+            self.assertEqual(sanitized["action"], "inspect_remote_collection")
+            self.assert_no_forbidden_values(sanitized)
+
 if __name__ == "__main__":
     unittest.main()

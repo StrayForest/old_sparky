@@ -29,6 +29,7 @@ if str(TOOLS_DIR) not in sys.path:
 
 from platform_storage_evidence_summary import (  # noqa: E402
     EvidenceInputError,
+    SERVICE_PROPERTY_KEYS,
     summarize_df,
     summarize_du,
     summarize_inode,
@@ -46,6 +47,87 @@ MAX_COUNT = 1_000_000
 MAX_REPORTED_BYTES = 1_000_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+
+# Failure details are a public contract.  Keep these sets closed so a
+# producer-controlled string can never become an artifact field, even if a
+# future caller passes an unexpected value into ``_failure_summary``.
+SAFE_FAILURE_PHASES = frozenset(
+    {
+        "capture",
+        "precondition",
+        "transport",
+        "remote",
+        "report",
+        "filesystem",
+        "journal",
+        "service",
+        "category",
+        "retention",
+        "cleanup",
+    }
+)
+SAFE_FAILURE_REASONS = frozenset(
+    {
+        "active_release_id_invalid",
+        "active_release_manifest_missing",
+        "active_sha_mismatch",
+        "category_usage_producer",
+        "current_release_missing",
+        "disk_usage_producer",
+        "inode_usage_producer",
+        "journal_usage_producer",
+        "maintenance_tool_missing",
+        "privilege",
+        "python_runtime_missing",
+        "remote_collection_failed",
+        "remote_report_missing",
+        "remote_timeout",
+        "report_schema_incomplete",
+        "report_truncated",
+        "retention_producer",
+        "retention_summary",
+        "sanitizer_exception",
+        "sanitizer_unavailable",
+        "service_state_producer",
+        "ssh_cleanup_failed",
+        "ssh_transport",
+    }
+)
+SAFE_FAILURE_ACTIONS = frozenset(
+    {
+        "inspect_current_release_manifest",
+        "inspect_deployed_storage_tool",
+        "inspect_current_release_pointer",
+        "inspect_production_runner_identity",
+        "inspect_release_identity",
+        "inspect_remote_collection",
+        "inspect_remote_diagnostics_command",
+        "inspect_remote_diagnostics_contract",
+        "inspect_remote_output_volume",
+        "inspect_remote_transport_timeout",
+        "inspect_runner_evidence_projector",
+        "inspect_runner_ssh_cleanup",
+        "inspect_service_state_producer",
+        "inspect_shared_runtime",
+        "inspect_ssh_transport_and_host_key",
+        "inspect_category_usage_producer",
+        "inspect_disk_usage_producer",
+        "inspect_inode_usage_producer",
+        "inspect_journal_usage_producer",
+        "inspect_retention_dry_run",
+        "inspect_retention_summary",
+        "recalculate_expected_sha_from_release",
+    }
+)
+
+EXPECTED_SECTIONS = (
+    "lock",
+    "filesystem",
+    "journal",
+    "services",
+    "categories",
+    "retention",
+)
 
 SAFE_CATEGORIES = (
     "root",
@@ -166,10 +248,10 @@ def _safe_int(value: object, *, maximum: int = MAX_COUNT) -> int | None:
 
 
 def _safe_bool(value: object) -> bool:
-    return value is True or value == "true"
+    return value is True or (isinstance(value, str) and value == "true")
 
 
-def _read_bounded(path: Path) -> tuple[str, bool]:
+def _read_bounded(path: Path) -> tuple[bytes, bool]:
     """Read a bounded regular file, rejecting symlinks and special files."""
 
     try:
@@ -185,10 +267,21 @@ def _read_bounded(path: Path) -> tuple[str, bool]:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError("capture is unavailable")
-        raw = os.read(descriptor, MAX_INPUT_BYTES + 1)
+        # Read in bounded chunks rather than asking the kernel for an
+        # attacker-sized file in one call.  The extra byte distinguishes a
+        # complete capture at the boundary from a truncated one.
+        chunks: list[bytes] = []
+        remaining = MAX_INPUT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
     finally:
         os.close(descriptor)
-    return raw[:MAX_INPUT_BYTES].decode("utf-8", errors="replace"), len(raw) > MAX_INPUT_BYTES
+    raw = b"".join(chunks)
+    return raw[:MAX_INPUT_BYTES], len(raw) > MAX_INPUT_BYTES
 
 
 def _empty_sections() -> dict[str, object]:
@@ -210,33 +303,49 @@ def _safe_projection(function: Any, raw: str, **kwargs: object) -> dict[str, obj
     return result if isinstance(result, dict) else None
 
 
-def _split_report(raw: str) -> dict[str, list[str]]:
+def _split_report(raw: str) -> tuple[dict[str, list[str]], bool]:
     """Split only fixed section/record labels; discard unlabeled structure."""
 
     sections: dict[str, list[str]] = {"header": []}
     current = "header"
-    for line in raw.splitlines()[:MAX_LINES]:
-        if line == "=== retained_load_lock ===":
-            current = "lock"
+    malformed = "\ufffd" in raw or any(
+        ord(character) == 0x7F
+        or (ord(character) < 0x20 and character not in "\t\n\r")
+        for character in raw
+    )
+    known_sections = {
+        "=== retained_load_lock ===": "lock",
+        "=== filesystem_usage ===": "filesystem",
+        "=== journal_usage ===": "journal",
+        "=== service_sandbox ===": "services",
+        "=== known_category_usage ===": "categories",
+        "=== storage_retention_dry_run ===": "retention",
+    }
+    seen_sections = {"header"}
+    section_order = tuple(known_sections.values())
+    last_section_index = -1
+    lines = raw.splitlines()
+    if len(lines) > MAX_LINES:
+        malformed = True
+    for line in lines[:MAX_LINES]:
+        if line in known_sections:
+            current = known_sections[line]
+            if current in seen_sections:
+                malformed = True
+            section_index = section_order.index(current)
+            if section_index <= last_section_index:
+                malformed = True
+            last_section_index = max(last_section_index, section_index)
+            seen_sections.add(current)
             sections[current] = []
-        elif line == "=== filesystem_usage ===":
-            current = "filesystem"
-            sections[current] = []
-        elif line == "=== journal_usage ===":
-            current = "journal"
-            sections[current] = []
-        elif line == "=== service_sandbox ===":
-            current = "services"
-            sections[current] = []
-        elif line == "=== known_category_usage ===":
-            current = "categories"
-            sections[current] = []
-        elif line == "=== storage_retention_dry_run ===":
-            current = "retention"
-            sections[current] = []
+        elif line.startswith("==="):
+            malformed = True
+            sections.setdefault(current, []).append(line)
         else:
             sections.setdefault(current, []).append(line)
-    return sections
+    if set(sections) - {"header", *EXPECTED_SECTIONS}:
+        malformed = True
+    return sections, malformed
 
 
 def _parse_fixed_record(line: str, prefix: str) -> tuple[str, str] | None:
@@ -274,25 +383,115 @@ def _fixed_records(lines: list[str], prefix: str) -> list[tuple[str, str]]:
     return records
 
 
+def _parse_provenance(lines: list[str]) -> tuple[str, str, bool]:
+    """Validate the one-line producer envelope without echoing its values."""
+
+    candidates = [line for line in lines if line.startswith("{")]
+    if len(candidates) != 1:
+        return "unavailable", "unavailable", False
+    try:
+        payload = json.loads(candidates[0])
+    except (json.JSONDecodeError, TypeError):
+        return "unavailable", "unavailable", False
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema",
+        "kind",
+        "active_release_id",
+        "active_source_sha",
+    }:
+        return "unavailable", "unavailable", False
+    if payload.get("schema") != SCHEMA or payload.get("kind") != "platform_storage_diagnostics":
+        return "unavailable", "unavailable", False
+    release_id = payload.get("active_release_id")
+    source_sha = payload.get("active_source_sha")
+    if not isinstance(release_id, str) or RELEASE_ID_RE.fullmatch(release_id) is None:
+        return "unavailable", "unavailable", False
+    if not isinstance(source_sha, str) or SHA_RE.fullmatch(source_sha) is None:
+        return "unavailable", "unavailable", False
+    return release_id, source_sha, True
+
+
+def _records_by_name(
+    records: list[tuple[str, str]], allowed: tuple[str, ...]
+) -> tuple[dict[str, str], bool]:
+    names = {name for name, _ in records}
+    if len(names) != len(records) or names != set(allowed):
+        return {}, False
+    return dict(records), True
+
+
+def _record_labels_valid(lines: list[str], prefixes: tuple[str, ...]) -> bool:
+    """Reject an unknown record label instead of silently dropping it."""
+
+    for line in lines:
+        if line.startswith("--- ") and not line.startswith(prefixes):
+            return False
+    return True
+
+
+def _service_summary_complete(value: object) -> bool:
+    if not isinstance(value, dict) or value.get("status") != "ok":
+        return False
+    properties = value.get("properties")
+    if not isinstance(properties, dict) or set(properties) != set(SERVICE_PROPERTY_KEYS):
+        return False
+    # Unknown enum values indicate that systemd returned a producer shape we
+    # do not understand.  Do not call that a successful strict report.
+    for key in ("ActiveState", "SubState", "Result"):
+        if properties.get(key) in (None, "unknown"):
+            return False
+    return True
+
+
+def _strict_section_success(result: dict[str, object]) -> bool:
+    """Require every producer to have yielded its complete closed summary."""
+
+    lock = result.get("lock")
+    if not isinstance(lock, dict) or lock.get("status") != "ok":
+        return False
+    journal = result.get("journal")
+    if not isinstance(journal, dict) or journal.get("status") != "ok":
+        return False
+    filesystem = result.get("filesystem")
+    if not isinstance(filesystem, dict) or set(filesystem) != set(SAFE_CATEGORIES):
+        return False
+    for value in filesystem.values():
+        if (
+            not isinstance(value, dict)
+            or value.get("status") != "ok"
+            or not isinstance(value.get("inode"), dict)
+            or value["inode"].get("status") != "ok"
+        ):
+            return False
+    services = result.get("services")
+    if not isinstance(services, dict) or set(services) != set(SAFE_SERVICES):
+        return False
+    if not all(_service_summary_complete(value) for value in services.values()):
+        return False
+    categories = result.get("categories")
+    if not isinstance(categories, dict) or set(categories) != set(SAFE_DU_CATEGORIES):
+        return False
+    if not all(
+        isinstance(value, dict) and value.get("status") == "ok"
+        for value in categories.values()
+    ):
+        return False
+    retention = result.get("retention")
+    if not isinstance(retention, dict):
+        return False
+    return (
+        retention.get("status") == "ok"
+        and retention.get("ok") is True
+        and retention.get("mode") == "dry-run"
+    )
+
+
 def _project_report(raw: str) -> tuple[dict[str, object], bool]:
-    sections = _split_report(raw)
+    sections, malformed = _split_report(raw)
     result = _empty_sections()
-    active_release_id = "unavailable"
-    active_source_sha = "unavailable"
-    for line in sections.get("header", ()):
-        if not line.startswith("{"):
-            continue
-        try:
-            payload = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        candidate_id = payload.get("active_release_id")
-        candidate_sha = payload.get("active_source_sha")
-        if isinstance(candidate_id, str) and RELEASE_ID_RE.fullmatch(candidate_id):
-            active_release_id = candidate_id
-        active_source_sha = _safe_sha(candidate_sha)
+    active_release_id, active_source_sha, provenance_valid = _parse_provenance(
+        sections.get("header", [])
+    )
 
     lock_raw = "\n".join(sections.get("lock", ()))
     if lock_raw:
@@ -300,12 +499,21 @@ def _project_report(raw: str) -> tuple[dict[str, object], bool]:
 
     filesystem: dict[str, object] = {}
     filesystem_lines = sections.get("filesystem", [])
-    for category, payload in _fixed_records(filesystem_lines, "--- df "):
+    filesystem_labels_valid = _record_labels_valid(
+        filesystem_lines, ("--- df ", "--- inode ")
+    )
+    filesystem_records, filesystem_records_valid = _records_by_name(
+        _fixed_records(filesystem_lines, "--- df "), SAFE_CATEGORIES
+    )
+    for category, payload in filesystem_records.items():
         if category in SAFE_CATEGORIES:
             summary = _safe_projection(summarize_df, payload, category=category)
             if summary is not None:
                 filesystem[category] = summary
-    for category, payload in _fixed_records(filesystem_lines, "--- inode "):
+    inode_records, inode_records_valid = _records_by_name(
+        _fixed_records(filesystem_lines, "--- inode "), SAFE_CATEGORIES
+    )
+    for category, payload in inode_records.items():
         if category in SAFE_CATEGORIES:
             summary = _safe_projection(summarize_inode, payload, category=category)
             current = filesystem.get(category)
@@ -318,7 +526,13 @@ def _project_report(raw: str) -> tuple[dict[str, object], bool]:
         result["journal"] = _safe_projection(summarize_journal, journal_raw)
 
     services: dict[str, object] = {}
-    for service, payload in _fixed_records(sections.get("services", []), "--- service "):
+    service_labels_valid = _record_labels_valid(
+        sections.get("services", []), ("--- service ",)
+    )
+    service_records, service_records_valid = _records_by_name(
+        _fixed_records(sections.get("services", []), "--- service "), SAFE_SERVICES
+    )
+    for service, payload in service_records.items():
         if service in SAFE_SERVICES:
             summary = _safe_projection(
                 summarize_service, payload, service=service
@@ -328,9 +542,13 @@ def _project_report(raw: str) -> tuple[dict[str, object], bool]:
     result["services"] = services
 
     categories: dict[str, object] = {}
-    for category, payload in _fixed_records(
-        sections.get("categories", []), "--- category "
-    ):
+    category_labels_valid = _record_labels_valid(
+        sections.get("categories", []), ("--- category ",)
+    )
+    category_records, category_records_valid = _records_by_name(
+        _fixed_records(sections.get("categories", []), "--- category "), SAFE_DU_CATEGORIES
+    )
+    for category, payload in category_records.items():
         if category in SAFE_DU_CATEGORIES:
             summary = _safe_projection(
                 summarize_du, payload, category=category
@@ -348,20 +566,19 @@ def _project_report(raw: str) -> tuple[dict[str, object], bool]:
         return isinstance(entry, dict) and isinstance(entry.get("inode"), dict)
 
     complete = bool(
-        active_release_id != "unavailable"
+        not malformed
+        and provenance_valid
+        and active_release_id != "unavailable"
         and active_source_sha != "unavailable"
-        and result["lock"] is not None
-        and len(filesystem) == len(SAFE_CATEGORIES)
+        and filesystem_records_valid
+        and inode_records_valid
+        and service_records_valid
+        and category_records_valid
+        and filesystem_labels_valid
+        and service_labels_valid
+        and category_labels_valid
+        and _strict_section_success(result)
         and all(filesystem_entry_complete(category) for category in SAFE_CATEGORIES)
-        and result["journal"] is not None
-        and len(services) == len(SAFE_SERVICES)
-        and all(isinstance(services.get(service), dict) for service in SAFE_SERVICES)
-        and len(categories) == len(SAFE_DU_CATEGORIES)
-        and all(
-            isinstance(categories.get(category), dict)
-            for category in SAFE_DU_CATEGORIES
-        )
-        and result["retention"] is not None
     )
     return {
         "active_release_id": active_release_id,
@@ -420,6 +637,12 @@ def _failure_summary(
             report_truncated=report_truncated,
             report_complete=False,
         )
+    if not isinstance(phase, str) or phase not in SAFE_FAILURE_PHASES:
+        phase = "capture"
+    if not isinstance(reason, str) or reason not in SAFE_FAILURE_REASONS:
+        reason = "remote_collection_failed"
+    if not isinstance(action, str) or action not in SAFE_FAILURE_ACTIONS:
+        action = "inspect_remote_collection"
     return {
         "schema": SCHEMA,
         "kind": "platform_storage_diagnostics_failure",
@@ -434,6 +657,9 @@ def _failure_summary(
         "phase": phase,
         "reason": reason,
         "action": action,
+        "active_release_id": "unavailable",
+        "active_source_sha": "unavailable",
+        "sections": _empty_sections(),
     }
 
 
@@ -451,12 +677,11 @@ def project_public_artifact(
     stderr = b""
     stderr_truncated = False
     try:
-        stderr_text, stderr_truncated = _read_bounded(stderr_path)
-        stderr = stderr_text.encode("utf-8", errors="replace")
+        stderr, stderr_truncated = _read_bounded(stderr_path)
     except (OSError, ValueError):
         stderr = b""
     try:
-        report_text, report_truncated = _read_bounded(report_path)
+        report_bytes, report_truncated = _read_bounded(report_path)
     except (OSError, ValueError):
         return _failure_summary(
             expected_sha=expected_sha,
@@ -468,7 +693,9 @@ def project_public_artifact(
             report_truncated=False,
         )
 
-    report_payload, report_complete = _project_report(report_text)
+    report_payload, report_complete = _project_report(
+        report_bytes.decode("utf-8", errors="replace")
+    )
     exit_code = _safe_int(remote_exit_code, maximum=255)
     expected = _safe_sha(expected_sha)
     active_sha = report_payload["active_source_sha"]
@@ -478,6 +705,8 @@ def project_public_artifact(
         and not report_truncated
         and report_complete
         and report_sha_matches
+        and not stderr_truncated
+        and _safe_int(remote_stderr_bytes, maximum=MAX_REPORTED_BYTES) == 0
     )
     if exit_code == 0 and report_ok:
         return {
@@ -578,7 +807,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_sha=args.expected_sha,
             remote_exit_code=args.remote_exit_code,
             remote_stderr_bytes=args.remote_stderr_bytes,
-            report_present=False,
+            report_present=args.report_present,
             phase="capture",
             reason="sanitizer_exception",
             action="inspect_runner_evidence_projector",

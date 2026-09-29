@@ -115,7 +115,7 @@ gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
 Collect bounded read-only evidence before cleanup with `gh workflow run platform-production-storage-diagnostics.yml --repo StrayForest/old_sparky --ref dev -f expected_sha=<exact-source-sha-currently-deployed>`; it reports blocks/inodes, mounts, journald, service sandbox, top-level usage and retention candidates without deleting files or applying runtime settings.
-The runner normalizes successful output into fixed counters/enums and never uploads the raw remote report. A remote failure remains fail-closed and uploads only a bounded `platform_storage_diagnostics_failure` JSON record (exit/byte metadata plus fixed `phase`, `reason` and `action`; no paths, URIs, output or secrets); always-run cleanup removes private captures.
+The remote precondition is self-contained and reads only the deployed release manifest plus the existing maintenance tool, so diagnostics remain compatible with an older active release that predates newer workflow helpers. The runner accepts success only after strict provenance/section validation, normalizes it into fixed counters/enums and never uploads the raw remote report. A remote failure remains fail-closed and uploads only a bounded `platform_storage_diagnostics_failure` JSON record (exit/byte metadata plus fixed `phase`, `reason` and `action`; no paths, URIs, output or secrets); always-run cleanup removes private captures.
 Treat the record as an actionable failure hint, not proof of release, pointer, lock or retention state: stop and inspect the canonical production gates before any further maintenance or cleanup.
 
 Preview storage cleanup without backup or deletion:

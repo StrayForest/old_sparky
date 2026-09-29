@@ -1792,6 +1792,9 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn('if [[ "$remote_status" = 0 && "$report_present" = true ]]', workflow)
         self.assertIn('DIAGNOSTICS_REMOTE_STATUS=', workflow)
         self.assertIn('DIAGNOSTICS_REPORT_PRESENT=', workflow)
+        self.assertIn('SSH_CLEANUP_OUTCOME:', workflow)
+        self.assertIn('write_fallback()', workflow)
+        self.assertIn('>/dev/null 2>/dev/null', workflow)
         self.assertIn('raw_output_included', workflow)
         self.assertIn('regular file:1:600', workflow)
         self.assertIn('bounded evidence was published', workflow)
@@ -1825,6 +1828,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             workflow.index("- name: Upload storage diagnostic evidence"),
             workflow.index("- name: Remove private storage diagnostic captures"),
         )
+        self.assertIn('rmdir -- "$projector_dir"', workflow)
 
     def test_as12_proof_is_read_only_and_sha_locked(self) -> None:
         proof = (WORKFLOW_DIR / "platform-production-as12-proof.yml").read_text(

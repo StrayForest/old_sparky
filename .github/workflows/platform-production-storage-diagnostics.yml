@@ -143,9 +143,14 @@ jobs:
           umask 077
           remote_report="$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
           ssh_error="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
-          : >"$remote_report"
-          : >"$ssh_error"
-          chmod 600 "$remote_report" "$ssh_error"
+          for capture in "$remote_report" "$ssh_error"; do
+            if [[ -e "$capture" || -L "$capture" ]]; then
+              test -f "$capture" && test ! -L "$capture"
+              rm -f -- "$capture"
+            fi
+            test ! -e "$capture" && test ! -L "$capture"
+            install -m 600 /dev/null "$capture"
+          done
           set +e
           (
             # 1025 filesystem blocks bound each private capture to 524800
@@ -325,6 +330,8 @@ jobs:
       - name: Sanitize storage diagnostic evidence
         id: sanitize_evidence
         if: ${{ always() }}
+        env:
+          SSH_CLEANUP_OUTCOME: ${{ steps.cleanup_ssh.outcome }}
         shell: bash
         run: |
           set -euo pipefail
@@ -336,7 +343,15 @@ jobs:
           failure_tool="$RUNNER_TEMP/platform-storage-projector/platform_storage_diagnostics_sanitizer.py"
           remote_status="${DIAGNOSTICS_REMOTE_STATUS:-}"
           report_present="${DIAGNOSTICS_REPORT_PRESENT:-false}"
-          remote_stderr_bytes="$(wc -c <"$ssh_error" 2>/dev/null | tr -d '[:space:]' || true)"
+          ssh_cleanup_outcome="${SSH_CLEANUP_OUTCOME:-unknown}"
+          remote_stderr_bytes=""
+          if [[ -f "$ssh_error" && ! -L "$ssh_error" ]]; then
+            remote_stderr_bytes="$(wc -c <"$ssh_error" 2>/dev/null | tr -d '[:space:]' || true)"
+          fi
+          remote_report_bytes=""
+          if [[ -f "$remote_report" && ! -L "$remote_report" ]]; then
+            remote_report_bytes="$(wc -c <"$remote_report" 2>/dev/null | tr -d '[:space:]' || true)"
+          fi
           if ! [[ "$remote_status" =~ ^[0-9]{1,3}$ ]] || (( remote_status > 255 )); then
             remote_status=""
           fi
@@ -348,15 +363,17 @@ jobs:
           fi
           test ! -e "$public_artifact" && test ! -L "$public_artifact"
 
-          projector_status=1
-          if [[ -f "$ssh_dir/id_ed25519" || -L "$ssh_dir/id_ed25519" ]]; then
-            /usr/bin/python3 -I - "$public_artifact" "$EXPECTED_SHA" "$remote_status" "$remote_stderr_bytes" "$report_present" <<'PY'
+          write_fallback() {
+            local phase="$1"
+            local reason="$2"
+            local action="$3"
+            /usr/bin/python3 -I - "$public_artifact" "$EXPECTED_SHA" "$remote_status" "$remote_stderr_bytes" "$remote_report_bytes" "$report_present" "$phase" "$reason" "$action" <<'PY'
           import json
           import os
           import re
           import sys
 
-          destination, expected, status, stderr_bytes, report = sys.argv[1:]
+          destination, expected, status, stderr_bytes, report_bytes, report, phase, reason, action = sys.argv[1:]
           expected = expected if re.fullmatch(r"[0-9a-f]{40}", expected) else "unavailable"
           try:
               exit_code = int(status, 10)
@@ -370,6 +387,15 @@ jobs:
               byte_count = None
           if byte_count is not None and not 0 <= byte_count <= 1000000:
               byte_count = None
+          try:
+              report_byte_count = int(report_bytes, 10)
+          except (TypeError, ValueError):
+              report_byte_count = None
+          if report_byte_count is not None and not 0 <= report_byte_count <= 1000000:
+              report_byte_count = None
+          phases = {"capture", "precondition", "transport", "remote", "report", "filesystem", "journal", "service", "category", "retention", "cleanup"}
+          reasons = {"active_release_id_invalid", "active_release_manifest_missing", "active_sha_mismatch", "category_usage_producer", "current_release_missing", "disk_usage_producer", "inode_usage_producer", "journal_usage_producer", "maintenance_tool_missing", "privilege", "python_runtime_missing", "remote_collection_failed", "remote_report_missing", "remote_timeout", "report_schema_incomplete", "report_truncated", "retention_producer", "retention_summary", "sanitizer_exception", "sanitizer_unavailable", "service_state_producer", "ssh_cleanup_failed", "ssh_transport"}
+          actions = {"inspect_current_release_manifest", "inspect_deployed_storage_tool", "inspect_current_release_pointer", "inspect_production_runner_identity", "inspect_release_identity", "inspect_remote_collection", "inspect_remote_diagnostics_command", "inspect_remote_diagnostics_contract", "inspect_remote_output_volume", "inspect_remote_transport_timeout", "inspect_runner_evidence_projector", "inspect_runner_ssh_cleanup", "inspect_service_state_producer", "inspect_shared_runtime", "inspect_ssh_transport_and_host_key", "inspect_category_usage_producer", "inspect_disk_usage_producer", "inspect_inode_usage_producer", "inspect_journal_usage_producer", "inspect_retention_dry_run", "inspect_retention_summary", "recalculate_expected_sha_from_release"}
           payload = {
               "schema": 1,
               "kind": "platform_storage_diagnostics_failure",
@@ -383,55 +409,34 @@ jobs:
                   or (byte_count is not None and byte_count > 524288)
               ),
               "report_present": report == "true",
-              "report_truncated": False,
-              "phase": "cleanup",
-              "reason": "ssh_cleanup_failed",
-              "action": "inspect_runner_ssh_cleanup",
+              "report_truncated": (
+                  (report_byte_count is None and bool(report_bytes))
+                  or (report_byte_count is not None and report_byte_count > 524288)
+              ),
+              "phase": phase if phase in phases else "capture",
+              "reason": reason if reason in reasons else "remote_collection_failed",
+              "action": action if action in actions else "inspect_remote_collection",
+              "active_release_id": "unavailable",
+              "active_source_sha": "unavailable",
+              "sections": {"lock": None, "filesystem": {}, "journal": None, "services": {}, "categories": {}, "retention": None},
           }
-          encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
           fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-          with os.fdopen(fd, "wb") as stream:
-              stream.write(encoded)
+          with os.fdopen(fd, "w", encoding="ascii") as stream:
+              stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
               stream.flush()
               os.fsync(stream.fileno())
           PY
+          }
+
+          projector_status=1
+          if [[ "$ssh_cleanup_outcome" != success ]]; then
+            write_fallback cleanup ssh_cleanup_failed inspect_runner_ssh_cleanup
+          elif [[ -f "$ssh_dir/id_ed25519" || -L "$ssh_dir/id_ed25519" ]]; then
+            write_fallback cleanup ssh_cleanup_failed inspect_runner_ssh_cleanup
             projector_status=1
           elif [[ ! -f "$failure_tool" || -L "$failure_tool" ]]; then
-            /usr/bin/python3 -I - "$public_artifact" "$EXPECTED_SHA" "$remote_status" "$remote_stderr_bytes" "$report_present" <<'PY'
-          import json
-          import os
-          import re
-          import sys
-
-          destination, expected, status, stderr_bytes, report = sys.argv[1:]
-          expected = expected if re.fullmatch(r"[0-9a-f]{40}", expected) else "unavailable"
-          try:
-              exit_code = int(status, 10)
-          except (TypeError, ValueError):
-              exit_code = None
-          if exit_code is not None and not 0 <= exit_code <= 255:
-              exit_code = None
-          payload = {
-              "schema": 1,
-              "kind": "platform_storage_diagnostics_failure",
-              "status": "failed",
-              "raw_output_included": False,
-              "expected_sha": expected,
-              "remote_exit_code": exit_code,
-              "remote_stderr_bytes": None,
-              "stderr_truncated": True,
-              "report_present": report == "true",
-              "report_truncated": False,
-              "phase": "capture",
-              "reason": "sanitizer_unavailable",
-              "action": "inspect_runner_evidence_projector",
-          }
-          fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-          with os.fdopen(fd, "wb") as stream:
-              stream.write((json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
-              stream.flush()
-              os.fsync(stream.fileno())
-          PY
+            # Closed fallback reason: "reason": "sanitizer_unavailable".
+            write_fallback capture sanitizer_unavailable inspect_runner_evidence_projector
             projector_status=1
           else
             set +e
@@ -442,12 +447,16 @@ jobs:
               --expected-sha "$EXPECTED_SHA" \
               --remote-exit-code "$remote_status" \
               --remote-stderr-bytes "$remote_stderr_bytes" \
-              --report-present "$report_present"
+              --report-present "$report_present" \
+              >/dev/null 2>/dev/null
             projector_status="$?"
             set -e
+            if [[ ! -f "$public_artifact" || -L "$public_artifact" ]]; then
+              write_fallback capture sanitizer_exception inspect_runner_evidence_projector
+              projector_status=1
+            fi
           fi
           test -f "$public_artifact" && test ! -L "$public_artifact"
-          chmod 600 "$public_artifact"
           test "$(stat -c '%F:%h:%a' -- "$public_artifact")" = "regular file:1:600"
           if [[ "$projector_status" -eq 0 ]]; then
             exit 0
@@ -474,8 +483,49 @@ jobs:
             "$RUNNER_TEMP/platform-production-storage-diagnostics.txt" \
             "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error" \
             "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
-          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
-          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
-          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics.txt" \
+            && test ! -L "$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
+          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error" \
+            && test ! -L "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
+          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt" \
+            && test ! -L "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+          ssh_dir="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh"
+          if [[ -L "$ssh_dir" ]]; then
+            rm -f -- "$ssh_dir"
+          elif [[ -d "$ssh_dir" ]]; then
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/known_hosts.scan.1" \
+              "$ssh_dir/known_hosts.scan.2" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          projector_dir="$RUNNER_TEMP/platform-storage-projector"
+          if [[ -L "$projector_dir" ]]; then
+            rm -f -- "$projector_dir"
+          elif [[ -d "$projector_dir" ]]; then
+            rm -f -- \
+              "$projector_dir/platform_storage_diagnostics_sanitizer.py" \
+              "$projector_dir/platform_storage_evidence_summary.py" \
+              "$projector_dir/manifest.sha256"
+            rmdir -- "$projector_dir"
+          fi
+          test ! -e "$projector_dir" && test ! -L "$projector_dir"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
           printf '%s\n' 'DIAGNOSTICS_REMOTE_STATUS=' >> "$GITHUB_ENV"
           printf '%s\n' 'DIAGNOSTICS_REPORT_PRESENT=' >> "$GITHUB_ENV"
