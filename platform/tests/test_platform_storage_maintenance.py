@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -97,38 +98,56 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         releases_dir = app_dir / "releases"
         current = releases_dir / "release-current"
         previous = releases_dir / "release-previous"
-        current.mkdir(parents=True)
-        previous.mkdir()
-        (app_dir / "shared" / "preprod-screenshots").mkdir(parents=True)
+        root.mkdir(mode=0o700)
+        app_dir.mkdir(mode=0o700)
+        releases_dir.mkdir(mode=0o700)
+        current.mkdir(mode=0o700)
+        previous.mkdir(mode=0o700)
+        shared_dir = app_dir / "shared"
+        shared_dir.mkdir(mode=0o700)
+        (shared_dir / "preprod-screenshots").mkdir(mode=0o700)
         source_dir = root / "dist" / "releases"
-        source_dir.mkdir(parents=True)
+        (root / "dist").mkdir(mode=0o700)
+        source_dir.mkdir(mode=0o700)
         web_dir = root / "web"
-        web_dir.mkdir()
+        web_dir.mkdir(mode=0o700)
         live_qa_root = root / "live-qa"
-        live_qa_root.mkdir()
-        (current / "RELEASE.json").write_text(
+        live_qa_root.mkdir(mode=0o755)
+        live_qa_root.chmod(0o755)
+        current_manifest = current / "RELEASE.json"
+        previous_manifest = previous / "RELEASE.json"
+        current_manifest.write_text(
             json.dumps({"source_git_commit": "a" * 40}) + "\n",
             encoding="utf-8",
         )
-        (previous / "RELEASE.json").write_text(
+        previous_manifest.write_text(
             json.dumps({"source_git_commit": "b" * 40}) + "\n",
             encoding="utf-8",
         )
+        current_manifest.chmod(0o600)
+        previous_manifest.chmod(0o600)
         (app_dir / "current").symlink_to(current)
         (app_dir / "previous").symlink_to(previous)
 
-        fixture_paths = (
-            root,
-            app_dir,
-            releases_dir,
-            current,
-            previous,
-            source_dir,
-            web_dir,
-            live_qa_root,
-        )
-        for path in fixture_paths:
-            self.assertEqual(path.lstat().st_uid, 0, path)
+        fixture_paths = {
+            root: 0o700,
+            app_dir: 0o700,
+            releases_dir: 0o700,
+            current: 0o700,
+            previous: 0o700,
+            shared_dir: 0o700,
+            shared_dir / "preprod-screenshots": 0o700,
+            root / "dist": 0o700,
+            source_dir: 0o700,
+            web_dir: 0o700,
+            live_qa_root: 0o755,
+            current_manifest: 0o600,
+            previous_manifest: 0o600,
+        }
+        for path, expected_mode in fixture_paths.items():
+            metadata = path.lstat()
+            self.assertEqual(metadata.st_uid, 0, path)
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), expected_mode, path)
 
         completed = subprocess.run(
             [
@@ -154,7 +173,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             text=True,
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
         raw_report = json.loads(completed.stdout)
         self.assertEqual(
             set(raw_report["live_qa_runtime_caches"]),
@@ -195,6 +218,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         )
         report_path.write_bytes(producer_report)
         stderr_path.write_bytes(b"")
+        report_path.chmod(0o600)
+        stderr_path.chmod(0o600)
         artifact = project_public_artifact(
             expected_sha="a" * 40,
             remote_exit_code=0,
