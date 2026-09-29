@@ -106,7 +106,6 @@ def assert_matrix(web_root: Path) -> dict[str, int]:
 
     smoke_grouped = _by_key(smoke)
     source_grouped = _by_key(source)
-    participant_grouped = _by_key(participant)
     responsive_projects = {"desktop", "wide-1300", "tablet-820", "mobile-layout"}
 
     route_keys = [key for key in smoke_grouped if key[0] == "platform-routes.spec.ts"]
