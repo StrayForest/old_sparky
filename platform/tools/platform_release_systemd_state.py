@@ -11,6 +11,7 @@ boundary.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ SYSTEMCTL: Final = "/usr/bin/systemctl"
 SYSTEMCTL_PATH = SYSTEMCTL
 RECEIPT_MAX_BYTES: Final = 64 * 1024
 SLUG_PATTERN: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+OPERATION_ID_PATTERN: Final = re.compile(r"^[0-9a-f]{32}$")
 ACTIVE_STATES: Final = frozenset(("active", "inactive"))
 ENABLED_STATES: Final = frozenset(("enabled", "disabled", "static"))
 
@@ -47,22 +49,34 @@ OWNED_UNITS: Final = (
     "deadlock-health-monitor.service",
     "deadlock-health-monitor.timer",
 )
+INITIAL_SYSTEMD_UNITS: Final = (
+    "deadlock-api.service",
+    "deadlock-worker.service",
+    "deadlock-web.service",
+    "deadlock-maintenance.timer",
+    "deadlock-logrotate.timer",
+    "deadlock-cloudflare-ips.timer",
+    "deadlock-health-monitor.timer",
+)
 
 RECEIPT_KEYS: Final = frozenset(
     {
         "schema",
         "operation",
+        "operation_id",
         "app_dir",
         "current_before",
         "previous_before",
         "current_before_identity",
         "previous_before_identity",
+        "helper_digests",
         "units",
     }
 )
 UNIT_KEYS: Final = frozenset(("name", "active", "enabled"))
 TRANSACTION_KEYS: Final = frozenset(
     {
+        "operation_id",
         "version",
         "operation",
         "phase",
@@ -81,20 +95,64 @@ TRANSACTION_KEYS: Final = frozenset(
         "candidate_identity",
         "remove_env_on_recovery",
         "service_state_before",
+        "service_enabled_before",
         "quiesced_services",
         "timer_active_before",
+        "timer_enabled_before",
+        "systemd_state_before",
     }
 )
+TRANSACTION_KEYS_WITHOUT_SYSTEMD_STATE: Final = TRANSACTION_KEYS - {
+    "systemd_state_before"
+}
 TRANSACTION_SERVICE_UNITS: Final = (
     "deadlock-api.service",
     "deadlock-worker.service",
     "deadlock-web.service",
 )
 TRANSACTION_TIMER_UNIT: Final = "deadlock-cloudflare-ips.timer"
+HELPER_RELATIVE_PATHS: Final = (
+    "tools/platform_install_systemd_units.sh",
+    "tools/platform_install_nginx.py",
+    "tools/platform_deploy_smoke.py",
+    "tools/platform_live_qa_runtime_install.py",
+    "tools/platform_install_logging.sh",
+    "tools/platform_prepare_service_user.sh",
+    "tools/platform_render_service_envs.py",
+    "tools/platform_deploy_smoke_impl.py",
+    "tools/platform_safe_env_exec.py",
+    "tools/platform_release_restore_runtime.sh",
+    "tools/platform_release_systemd_state.py",
+    "tools/platform_release_transaction.py",
+    "tools/platform_release_lock.sh",
+)
 
 
 class StateError(RuntimeError):
     """The systemd receipt or an operation on it cannot be trusted."""
+
+
+def _validate_systemctl_path(value: str) -> str:
+    if not isinstance(value, str) or not value.startswith("/") or "\x00" in value or "\n" in value:
+        raise StateError("systemctl path is invalid")
+    path = Path(value)
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise StateError("systemctl path is unavailable") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not stat.S_IMODE(metadata.st_mode) & 0o111
+        or resolved != path
+    ):
+        raise StateError("systemctl path metadata is unsafe")
+    return value
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -118,6 +176,8 @@ def _identity(path: Path, *, label: str) -> dict[str, int]:
         or not stat.S_ISDIR(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
         or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink < 2
         or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
         raise StateError(f"{label} metadata is unsafe")
@@ -135,6 +195,73 @@ def _valid_identity(value: object) -> bool:
     )
 
 
+def _helper_digests(release: Path) -> dict[str, str]:
+    _identity(release / "tools", label="release tools directory")
+    result: dict[str, str] = {}
+    for relative in HELPER_RELATIVE_PATHS:
+        path = release / relative
+        try:
+            metadata = path.lstat()
+        except OSError:
+            raise StateError("release helper manifest is incomplete") from None
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or not stat.S_IMODE(metadata.st_mode) & 0o111
+            or metadata.st_size > 4 * 1024 * 1024
+        ):
+            raise StateError("release helper metadata is unsafe")
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as exc:
+            raise StateError("release helper is unavailable") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev != metadata.st_dev
+                or opened.st_ino != metadata.st_ino
+                or opened.st_uid != 0
+                or opened.st_gid != 0
+                or opened.st_nlink != 1
+                or not stat.S_ISREG(opened.st_mode)
+                or stat.S_IMODE(opened.st_mode) & 0o022
+                or not stat.S_IMODE(opened.st_mode) & 0o111
+                or opened.st_size != metadata.st_size
+            ):
+                raise StateError("release helper changed during validation")
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            final = os.fstat(descriptor)
+            if (
+                final.st_dev != opened.st_dev
+                or final.st_ino != opened.st_ino
+                or final.st_uid != opened.st_uid
+                or final.st_gid != opened.st_gid
+                or final.st_nlink != opened.st_nlink
+                or final.st_mode != opened.st_mode
+                or final.st_size != opened.st_size
+                or final.st_mtime_ns != opened.st_mtime_ns
+                or final.st_ctime_ns != opened.st_ctime_ns
+            ):
+                raise StateError("release helper changed during validation")
+            result[relative] = digest.hexdigest()
+        except OSError as exc:
+            raise StateError("release helper cannot be read") from exc
+        finally:
+            os.close(descriptor)
+    return result
+
+
 def _safe_receipt(path: Path) -> os.stat_result:
     try:
         metadata = path.lstat()
@@ -144,6 +271,7 @@ def _safe_receipt(path: Path) -> os.stat_result:
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != 0
+        or metadata.st_gid != 0
         or metadata.st_nlink != 1
         or stat.S_IMODE(metadata.st_mode) != 0o600
         or metadata.st_size > RECEIPT_MAX_BYTES
@@ -206,7 +334,7 @@ def _read_active(unit: str) -> str:
     if value not in ACTIVE_STATES:
         raise StateError("owned unit active state is unsupported")
     if (value == "active" and status != 0) or (
-        value == "inactive" and status == 0
+        value == "inactive" and status != 3
     ):
         raise StateError("owned unit active state/status mismatch")
     return value
@@ -216,12 +344,12 @@ def _read_enabled(unit: str) -> str:
     status, value = _run_systemctl("is-enabled", unit)
     if value not in ENABLED_STATES:
         raise StateError("owned unit enabled state is unsupported")
-    # systemctl is-enabled returns zero for enabled and non-zero for disabled
-    # and static.  Do not infer a state from the exit code alone: the text is
-    # the authoritative state and both dimensions are retained in the receipt.
-    if value == "enabled" and status != 0:
+    # Keep the systemctl contract closed.  ``disabled`` is the one normal
+    # state whose query returns rc=1; static units are successful rc=0.  Do
+    # not accept arbitrary non-zero statuses as a disabled/static result.
+    if value in {"enabled", "static"} and status != 0:
         raise StateError("owned unit enabled state/status mismatch")
-    if value != "enabled" and status == 0:
+    if value == "disabled" and status != 1:
         raise StateError("owned unit enabled state/status mismatch")
     return value
 
@@ -254,6 +382,11 @@ def _read_receipt(path: Path) -> dict[str, object]:
         raise StateError("systemd receipt schema is invalid")
     if record.get("schema") != SCHEMA_VERSION or record.get("operation") != "rollback":
         raise StateError("systemd receipt schema is invalid")
+    if (
+        not isinstance(record.get("operation_id"), str)
+        or OPERATION_ID_PATTERN.fullmatch(record["operation_id"]) is None
+    ):
+        raise StateError("systemd receipt operation identity is invalid")
     if not isinstance(record.get("app_dir"), str):
         raise StateError("systemd receipt application path is invalid")
     if not isinstance(record.get("current_before"), str) or not isinstance(
@@ -264,6 +397,24 @@ def _read_receipt(path: Path) -> dict[str, object]:
         record.get("previous_before_identity")
     ):
         raise StateError("systemd receipt release identities are invalid")
+    helper_digests = record.get("helper_digests")
+    if not isinstance(helper_digests, dict):
+        raise StateError("systemd receipt helper manifest is invalid")
+    if set(helper_digests) not in (
+        {"current_before"},
+        {"current_before", "previous_before"},
+    ) or any(
+        not isinstance(manifest, dict)
+        or set(manifest) != set(HELPER_RELATIVE_PATHS)
+        or any(
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for key, value in manifest.items()
+        )
+        for manifest in helper_digests.values()
+    ):
+        raise StateError("systemd receipt helper manifest is invalid")
     units = record.get("units")
     if not isinstance(units, list) or len(units) != len(OWNED_UNITS):
         raise StateError("systemd receipt unit set is invalid")
@@ -322,7 +473,42 @@ def _validate_active_overrides(
             raise StateError("systemd receipt transaction state changed")
 
 
-def _read_transaction(path: Path, app_dir: Path) -> tuple[str, str, dict[str, str]]:
+def _validate_initial_systemd_snapshot(record: dict[str, object]) -> None:
+    """Reject malformed clean-install systemd authority before side effects."""
+
+    snapshot = record.get("systemd_state_before")
+    if snapshot is None:
+        return
+    if (
+        record.get("operation") != "install"
+        or record.get("current_before") is not None
+        or record.get("previous_before") is not None
+    ):
+        raise StateError("initial systemd snapshot is unexpected")
+    if not isinstance(snapshot, dict) or set(snapshot) != set(INITIAL_SYSTEMD_UNITS):
+        raise StateError("initial systemd snapshot is incomplete")
+    for unit in INITIAL_SYSTEMD_UNITS:
+        state = snapshot.get(unit)
+        if (
+            not isinstance(state, dict)
+            or set(state) != {"active", "enabled"}
+            or state.get("active") != "inactive"
+            or state.get("enabled") != "disabled"
+        ):
+            raise StateError("initial systemd snapshot is invalid")
+
+
+def _read_transaction(
+    path: Path, app_dir: Path
+) -> tuple[
+    str,
+    str,
+    str,
+    str,
+    dict[str, int],
+    dict[str, int],
+    dict[str, str],
+]:
     _safe_receipt(path)
     try:
         raw = path.read_text(encoding="ascii")
@@ -331,10 +517,17 @@ def _read_transaction(path: Path, app_dir: Path) -> tuple[str, str, dict[str, st
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise StateError("release transaction is invalid") from exc
-    if not isinstance(record, dict) or set(record) != TRANSACTION_KEYS:
+    if not isinstance(record, dict) or set(record) not in (
+        TRANSACTION_KEYS,
+        TRANSACTION_KEYS_WITHOUT_SYSTEMD_STATE,
+    ):
         raise StateError("release transaction schema is invalid")
-    if record.get("version") != 2 or record.get("operation") != "install":
-        raise StateError("release transaction is not an install recovery")
+    _validate_initial_systemd_snapshot(record)
+    if record.get("version") != 2 or record.get("operation") not in {"install", "rollback"}:
+        raise StateError("release transaction is not a supported recovery")
+    operation_id = record.get("operation_id")
+    if not isinstance(operation_id, str) or OPERATION_ID_PATTERN.fullmatch(operation_id) is None:
+        raise StateError("release transaction operation identity is invalid")
     if record.get("app_dir") != str(app_dir):
         raise StateError("release transaction application path changed")
     current_before = record.get("current_before")
@@ -364,35 +557,112 @@ def _read_transaction(path: Path, app_dir: Path) -> tuple[str, str, dict[str, st
         or SLUG_PATTERN.fullmatch(candidate_path.name) is None
     ):
         raise StateError("release transaction candidate escapes releases")
-    candidate_identity = _identity(candidate_path, label="release transaction candidate")
-    if candidate_identity != record.get("candidate_identity"):
-        raise StateError("release transaction candidate identity changed")
+    if os.path.lexists(candidate_path):
+        candidate_identity = _identity(candidate_path, label="release transaction candidate")
+        if candidate_identity != record.get("candidate_identity"):
+            raise StateError("release transaction candidate identity changed")
+    elif record.get("phase") != "recovery-restored":
+        raise StateError("release transaction candidate is unavailable")
     service_state = record.get("service_state_before")
     expected_service_names = {
         unit.removesuffix(".service") for unit in TRANSACTION_SERVICE_UNITS
     }
     expected_service_order = [unit.removesuffix(".service") for unit in TRANSACTION_SERVICE_UNITS]
     timer_active_before = record.get("timer_active_before")
+    service_enabled = record.get("service_enabled_before")
+    timer_enabled_before = record.get("timer_enabled_before")
+    if service_state is None and service_enabled is None and record.get("quiesced_services") is None and timer_active_before is None and timer_enabled_before is None:
+        active_overrides: dict[str, str] = {}
+    else:
+        if (
+            record.get("operation") != "install"
+            or not isinstance(service_state, dict)
+            or set(service_state) != expected_service_names
+            or any(
+                type(value) is not str or value not in ACTIVE_STATES
+                for value in service_state.values()
+            )
+            or record.get("quiesced_services") != expected_service_order
+            or type(timer_active_before) is not bool
+            or not isinstance(service_enabled, dict)
+            or set(service_enabled) != expected_service_names
+            or any(type(value) is not str or value not in {"enabled", "disabled"} for value in service_enabled.values())
+            or timer_enabled_before not in {"enabled", "disabled"}
+        ):
+            raise StateError("release transaction service state is invalid")
+        typed_service_state = cast(dict[str, str], service_state)
+        active_overrides = {
+            **{
+                unit: typed_service_state[unit.removesuffix(".service")]
+                for unit in TRANSACTION_SERVICE_UNITS
+            },
+            TRANSACTION_TIMER_UNIT: "active" if timer_active_before else "inactive",
+        }
+    assert current_identity is not None
+    assert previous_identity is not None
+    return (
+        operation_id,
+        cast(str, record["operation"]),
+        current_before,
+        previous_before,
+        current_identity,
+        previous_identity,
+        active_overrides,
+    )
+
+
+def _validate_transaction_binding(
+    record: dict[str, object],
+    transaction: Path,
+    app_dir: Path,
+    helper_release: Path | None = None,
+) -> None:
+    (
+        operation_id,
+        operation,
+        current_before,
+        previous_before,
+        current_identity,
+        previous_identity,
+        active_overrides,
+    ) = _read_transaction(transaction, app_dir)
+    _validate_context(record, app_dir, current_before, previous_before)
     if (
-        not isinstance(service_state, dict)
-        or set(service_state) != expected_service_names
-        or any(
-            type(value) is not str or value not in ACTIVE_STATES
-            for value in service_state.values()
-        )
-        or record.get("quiesced_services") != expected_service_order
-        or type(timer_active_before) is not bool
+        record.get("operation_id") != operation_id
+        or record.get("current_before_identity") != current_identity
+        or record.get("previous_before_identity") != previous_identity
     ):
-        raise StateError("release transaction service state is invalid")
-    typed_service_state = cast(dict[str, str], service_state)
-    active_overrides = {
-        **{
-            unit: typed_service_state[unit.removesuffix(".service")]
-            for unit in TRANSACTION_SERVICE_UNITS
-        },
-        TRANSACTION_TIMER_UNIT: "active" if timer_active_before else "inactive",
+        raise StateError("systemd receipt transaction identity mismatch")
+    helper_digests = record.get("helper_digests")
+    if not isinstance(helper_digests, dict):
+        raise StateError("systemd receipt helper manifest is missing")
+    expected_releases = {
+        "current_before": Path(current_before),
     }
-    return current_before, previous_before, active_overrides
+    if operation == "rollback":
+        expected_releases["previous_before"] = Path(previous_before)
+    if set(helper_digests) != set(expected_releases):
+        raise StateError("systemd receipt helper manifest is missing")
+    if helper_release is None:
+        helper_label = "previous_before" if operation == "rollback" else "current_before"
+    elif helper_release == expected_releases["current_before"]:
+        helper_label = "current_before"
+    elif (
+        "previous_before" in expected_releases
+        and helper_release == expected_releases["previous_before"]
+    ):
+        helper_label = "previous_before"
+    else:
+        raise StateError("systemd receipt helper release mismatch")
+    expected_manifests = {
+        label: _helper_digests(path)
+        for label, path in expected_releases.items()
+    }
+    if helper_digests != expected_manifests:
+        raise StateError("systemd receipt helper manifest changed")
+    if helper_digests[helper_label] != _helper_digests(expected_releases[helper_label]):
+        raise StateError("systemd receipt helper release changed")
+    _validate_active_overrides(record, active_overrides)
 
 
 def _write_receipt(path: Path, record: dict[str, object]) -> None:
@@ -443,52 +713,115 @@ def capture(
     app_dir: Path,
     current_before: str,
     previous_before: str,
+    operation_id: str,
+    helper_digests: dict[str, object] | None = None,
     active_overrides: dict[str, str] | None = None,
 ) -> None:
     if os.geteuid() != 0:
         raise StateError("systemd receipts require root")
+    if OPERATION_ID_PATTERN.fullmatch(operation_id) is None:
+        raise StateError("systemd receipt operation identity is invalid")
+    current, previous = Path(current_before), Path(previous_before)
+    if helper_digests is None:
+        helper_digests = {
+            "current_before": _helper_digests(current),
+            "previous_before": _helper_digests(previous),
+        }
+    elif set(helper_digests) not in (
+        {"current_before"},
+        {"current_before", "previous_before"},
+    ):
+        raise StateError("systemd receipt helper manifest is invalid")
     _release_context(app_dir, current_before, previous_before)
     if os.path.lexists(path):
         existing = _read_receipt(path)
         _validate_context(existing, app_dir, current_before, previous_before)
+        if existing.get("operation_id") != operation_id:
+            raise StateError("systemd receipt operation identity changed")
+        if existing.get("helper_digests") != helper_digests:
+            raise StateError("systemd receipt helper manifest changed")
         if active_overrides is not None:
             _validate_active_overrides(existing, active_overrides)
         return
-    current, previous = Path(current_before), Path(previous_before)
     current_identity = _identity(current, label="original current release")
     previous_identity = _identity(previous, label="original previous release")
     record: dict[str, object] = {
         "schema": SCHEMA_VERSION,
         "operation": "rollback",
+        "operation_id": operation_id,
         "app_dir": str(app_dir),
         "current_before": current_before,
         "previous_before": previous_before,
         "current_before_identity": current_identity,
         "previous_before_identity": previous_identity,
+        "helper_digests": helper_digests,
         "units": _unit_snapshot(active_overrides),
     }
     _write_receipt(path, record)
     _validate_context(_read_receipt(path), app_dir, current_before, previous_before)
 
 
-def capture_transaction(path: Path, *, transaction: Path, app_dir: Path) -> None:
+def capture_transaction(
+    path: Path,
+    *,
+    transaction: Path,
+    app_dir: Path,
+    require_helper_manifest: bool = False,
+    helper_release: Path | None = None,
+) -> None:
     if os.geteuid() != 0:
         raise StateError("systemd receipts require root")
-    current_before, previous_before, active_overrides = _read_transaction(
+    (
+        operation_id,
+        operation,
+        current_before,
+        previous_before,
+        _,
+        _,
+        active_overrides,
+    ) = _read_transaction(
         transaction, app_dir
     )
+    if operation == "install" and not active_overrides:
+        # The low-level transaction schema permits an install receipt to be
+        # created before the deploy wrapper records its service snapshot.
+        # Recovery must never turn that nullable representation into a live
+        # systemd observation: doing so would create an authoritative receipt
+        # from state that was not captured before quiesce.
+        raise StateError("install transaction service snapshot is incomplete")
+    expected_releases = {"current_before": Path(current_before)}
+    if operation == "rollback":
+        expected_releases["previous_before"] = Path(previous_before)
+    if helper_release is not None and helper_release not in expected_releases.values():
+        raise StateError("systemd receipt helper release mismatch")
+    if not require_helper_manifest:
+        raise StateError("transaction helper manifest assertion is required")
+    helper_digests = {
+        label: _helper_digests(path)
+        for label, path in expected_releases.items()
+    }
     capture(
         path,
         app_dir=app_dir,
         current_before=current_before,
         previous_before=previous_before,
+        operation_id=operation_id,
+        helper_digests=helper_digests,
         active_overrides=active_overrides,
     )
 
 
-def validate(path: Path, *, app_dir: Path) -> None:
+def validate(
+    path: Path,
+    *,
+    app_dir: Path,
+    transaction: Path | None = None,
+    helper_release: Path | None = None,
+) -> None:
     record = _read_receipt(path)
     _validate_context(record, app_dir)
+    if transaction is not None:
+        _validate_transaction_binding(record, transaction, app_dir, helper_release)
 
 
 def _receipt_units(record: dict[str, object]) -> list[dict[str, str]]:
@@ -523,19 +856,36 @@ def _apply_active(record: dict[str, object]) -> None:
             raise StateError("owned unit active-state restore did not verify")
 
 
-def restore(path: Path, *, app_dir: Path, active: bool) -> None:
+def restore(
+    path: Path,
+    *,
+    app_dir: Path,
+    active: bool,
+    transaction: Path | None = None,
+    helper_release: Path | None = None,
+) -> None:
     if os.geteuid() != 0:
         raise StateError("systemd receipts require root")
     record = _read_receipt(path)
     _validate_context(record, app_dir)
+    if transaction is not None:
+        _validate_transaction_binding(record, transaction, app_dir, helper_release)
     _apply_enabled(record)
     if active:
         _apply_active(record)
 
 
-def verify(path: Path, *, app_dir: Path) -> None:
+def verify(
+    path: Path,
+    *,
+    app_dir: Path,
+    transaction: Path | None = None,
+    helper_release: Path | None = None,
+) -> None:
     record = _read_receipt(path)
     _validate_context(record, app_dir)
+    if transaction is not None:
+        _validate_transaction_binding(record, transaction, app_dir, helper_release)
     for item in _receipt_units(record):
         if _read_active(item["name"]) != item["active"] or _read_enabled(
             item["name"]
@@ -543,9 +893,17 @@ def verify(path: Path, *, app_dir: Path) -> None:
             raise StateError("owned unit state does not match receipt")
 
 
-def clear(path: Path, *, app_dir: Path) -> None:
+def clear(
+    path: Path,
+    *,
+    app_dir: Path,
+    transaction: Path | None = None,
+    helper_release: Path | None = None,
+) -> None:
     record = _read_receipt(path)
     _validate_context(record, app_dir)
+    if transaction is not None:
+        _validate_transaction_binding(record, transaction, app_dir, helper_release)
     path.unlink()
     descriptor = os.open(
         path.parent,
@@ -566,15 +924,20 @@ def _parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("--app-dir", required=True, type=Path)
     capture_parser.add_argument("--current-before", required=True)
     capture_parser.add_argument("--previous-before", required=True)
+    capture_parser.add_argument("--operation-id", required=True)
     transaction_capture_parser = commands.add_parser("capture-transaction")
     transaction_capture_parser.add_argument("--systemctl", default=SYSTEMCTL)
     transaction_capture_parser.add_argument("--state", required=True, type=Path)
     transaction_capture_parser.add_argument("--transaction", required=True, type=Path)
     transaction_capture_parser.add_argument("--app-dir", required=True, type=Path)
+    transaction_capture_parser.add_argument("--helper-release", type=Path)
+    transaction_capture_parser.add_argument("--require-helper-manifest", action="store_true")
     for name in ("validate", "restore-enabled", "restore", "verify", "clear"):
         command = commands.add_parser(name)
         command.add_argument("--systemctl", default=SYSTEMCTL)
         command.add_argument("--state", required=True, type=Path)
+        command.add_argument("--transaction", type=Path)
+        command.add_argument("--helper-release", type=Path)
         command.add_argument("--app-dir", required=True, type=Path)
     return parser
 
@@ -583,32 +946,60 @@ def main() -> int:
     args = _parser().parse_args()
     try:
         global SYSTEMCTL_PATH
-        if not isinstance(args.systemctl, str) or not args.systemctl.startswith("/"):
-            raise StateError("systemctl path is invalid")
-        SYSTEMCTL_PATH = args.systemctl
+        SYSTEMCTL_PATH = _validate_systemctl_path(args.systemctl)
         if args.command == "capture":
             capture(
                 args.state,
                 app_dir=args.app_dir,
                 current_before=args.current_before,
                 previous_before=args.previous_before,
+                operation_id=args.operation_id,
             )
         elif args.command == "capture-transaction":
             capture_transaction(
                 args.state,
                 transaction=args.transaction,
                 app_dir=args.app_dir,
+                require_helper_manifest=args.require_helper_manifest,
+                helper_release=args.helper_release,
             )
         elif args.command == "validate":
-            validate(args.state, app_dir=args.app_dir)
+            validate(
+                args.state,
+                app_dir=args.app_dir,
+                transaction=args.transaction,
+                helper_release=args.helper_release,
+            )
         elif args.command == "restore-enabled":
-            restore(args.state, app_dir=args.app_dir, active=False)
+            restore(
+                args.state,
+                app_dir=args.app_dir,
+                active=False,
+                transaction=args.transaction,
+                helper_release=args.helper_release,
+            )
         elif args.command == "restore":
-            restore(args.state, app_dir=args.app_dir, active=True)
+            restore(
+                args.state,
+                app_dir=args.app_dir,
+                active=True,
+                transaction=args.transaction,
+                helper_release=args.helper_release,
+            )
         elif args.command == "verify":
-            verify(args.state, app_dir=args.app_dir)
+            verify(
+                args.state,
+                app_dir=args.app_dir,
+                transaction=args.transaction,
+                helper_release=args.helper_release,
+            )
         elif args.command == "clear":
-            clear(args.state, app_dir=args.app_dir)
+            clear(
+                args.state,
+                app_dir=args.app_dir,
+                transaction=args.transaction,
+                helper_release=args.helper_release,
+            )
         else:
             raise StateError("unknown systemd state command")
         return 0

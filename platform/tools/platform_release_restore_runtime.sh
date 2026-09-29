@@ -15,7 +15,13 @@ EDGE_ORIGIN="https://127.0.0.1"
 EDGE_HOST="old-sparky.com"
 PUBLIC_EDGE_ORIGIN="https://old-sparky.com"
 SYSTEMD_STATE=""
+TRANSACTION_STATE=""
 SYSTEMCTL_BIN="/usr/bin/systemctl"
+SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"
+NGINX_BIN="/usr/sbin/nginx"
+NGINX_TIMEOUT_BIN="/usr/bin/timeout"
+NGINX_CONFIG_TIMEOUT_SECONDS=30
+LIVE_QA_RUNTIME_INSTALLER=""
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
 
@@ -86,9 +92,19 @@ while [[ $# -gt 0 ]]; do
       SYSTEMD_STATE="$2"
       shift 2
       ;;
+    --transaction)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      TRANSACTION_STATE="$2"
+      shift 2
+      ;;
     --systemctl)
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       SYSTEMCTL_BIN="$2"
+      shift 2
+      ;;
+    --live-qa-runtime-installer)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      LIVE_QA_RUNTIME_INSTALLER="$2"
       shift 2
       ;;
     --skip-smoke)
@@ -209,8 +225,14 @@ if [[ ! -x "$UNITS_TOOL" || ! -f "$NGINX_TOOL" || ! -x "$SHARED_VENV/bin/python"
   exit 1
 fi
 if [[ -n "$SYSTEMD_STATE" ]]; then
-  if [[ ! -f "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE" || ! -x "$SYSTEMD_STATE_TOOL" ]]; then
+  systemd_state_tool_metadata="$(stat -c '%u:%g:%h:%a' "$SYSTEMD_STATE_TOOL" 2>/dev/null || true)"
+  if [[ ! -f "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE_TOOL" \
+    || "$systemd_state_tool_metadata" != "0:0:1:444" && "$systemd_state_tool_metadata" != "0:0:1:755" ]]; then
     public_status failed systemd_state >&2
+    exit 1
+  fi
+  if [[ -z "$TRANSACTION_STATE" || ! -f "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
+    public_status failed transaction_state >&2
     exit 1
   fi
 fi
@@ -218,10 +240,24 @@ if [[ "$RUN_SMOKE" -eq 1 && ! -f "$SMOKE_TOOL" ]]; then
   public_status failed tooling >&2
   exit 1
 fi
-LIVE_QA_RUNTIME_INSTALLER="$RELEASE/tools/platform_live_qa_runtime_install.py"
-if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
+if [[ -z "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
+  LIVE_QA_RUNTIME_INSTALLER="$RELEASE/tools/platform_live_qa_runtime_install.py"
+fi
+if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" \
+  || "$LIVE_QA_RUNTIME_INSTALLER" != /* ]]; then
   public_status failed liveqa_runtime >&2
   exit 1
+fi
+if [[ -n "$SYSTEMD_STATE" ]]; then
+  # Correlate the durable systemd receipt, transaction operation and helper
+  # manifest before live-QA reconciliation or any release helper can mutate
+  # runtime files.  The bootstrap performs the same check, but rollback calls
+  # this script directly during retry recovery.
+  "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
+    validate --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+    --transaction "$TRANSACTION_STATE" --helper-release "$RELEASE" \
+    --systemctl "$SYSTEMCTL_BIN" \
+    >/dev/null 2>/dev/null
 fi
 # Rollback/recovery uses this same path, so reconcile the digest-bound
 # generation before units, Nginx, readiness or smoke can observe the restored
@@ -234,6 +270,7 @@ prepare_runtime_private() {
   # to enable/start for a first activation, so every rollback/recovery call
   # must override that default explicitly before it can touch systemd.
   export PLATFORM_ENABLE_SYSTEMD_UNITS=0
+  export PLATFORM_SYSTEMCTL_BIN="$SYSTEMCTL_BIN"
   PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"
   set +e
   PLATFORM_APP_DIR="$APP_DIR" "$SHARED_VENV/bin/python" \
@@ -242,19 +279,38 @@ prepare_runtime_private() {
   set -e
 }
 
+# Keep all direct systemctl calls bounded just like the immutable systemd
+# receipt helper.  A hung manager must retain the caller's recovery receipt.
+run_systemctl() {
+  "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s "$SYSTEMCTL_BIN" "$@"
+}
+
+run_nginx_config_test() {
+  "$NGINX_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${NGINX_CONFIG_TIMEOUT_SECONDS}s" \
+    "$NGINX_BIN" -t >/dev/null 2>/dev/null
+}
+
 restore_systemd_enabled_state() {
   [[ -n "$SYSTEMD_STATE" ]] || return 0
+  local transaction_args=()
+  [[ -n "$TRANSACTION_STATE" ]] && transaction_args=(--transaction "$TRANSACTION_STATE")
   "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
     restore-enabled --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+    --helper-release "$RELEASE" \
     --systemctl "$SYSTEMCTL_BIN" \
+    "${transaction_args[@]}" \
     >/dev/null 2>/dev/null
 }
 
 restore_systemd_state() {
   [[ -n "$SYSTEMD_STATE" ]] || return 0
+  local transaction_args=()
+  [[ -n "$TRANSACTION_STATE" ]] && transaction_args=(--transaction "$TRANSACTION_STATE")
   "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
     restore --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+    --helper-release "$RELEASE" \
     --systemctl "$SYSTEMCTL_BIN" \
+    "${transaction_args[@]}" \
     >/dev/null 2>/dev/null
 }
 
@@ -264,8 +320,8 @@ if [[ "$PREPARE_RUNTIME" -eq 1 ]]; then
     # The installer restores its disk snapshots on failure. Validate and reload
     # that restored disk state before returning failure so active Nginx cannot
     # remain divergent from the recovery contour.
-    /usr/sbin/nginx -t >/dev/null 2>/dev/null
-    /usr/bin/systemctl reload nginx.service >/dev/null 2>/dev/null
+    run_nginx_config_test || { public_status failed nginx >&2; exit "$nginx_status"; }
+    run_systemctl reload nginx.service >/dev/null 2>/dev/null
     exit "$nginx_status"
   fi
   # --prepare-only must never start an inactive unit.  It may repair the
@@ -278,16 +334,16 @@ if [[ "$RUN_RESTART" -eq 1 && "$RESTART_AFTER" -eq 1 ]]; then
   if [[ -n "$SYSTEMD_STATE" ]]; then
     restore_systemd_state
   else
-    /usr/bin/systemctl restart deadlock-api deadlock-worker deadlock-web >/dev/null 2>/dev/null
+    run_systemctl restart deadlock-api deadlock-worker deadlock-web >/dev/null 2>/dev/null
     for service in deadlock-api deadlock-worker deadlock-web; do
-      /usr/bin/systemctl is-active --quiet "$service" >/dev/null 2>/dev/null
+      run_systemctl is-active --quiet "$service" >/dev/null 2>/dev/null
     done
   fi
-  if /usr/bin/systemctl is-active --quiet deadlock-api >/dev/null 2>/dev/null; then
+  if run_systemctl is-active --quiet deadlock-api >/dev/null 2>/dev/null; then
     /usr/bin/curl --fail --silent --show-error --max-time 10 \
       http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null
   fi
-  if /usr/bin/systemctl is-active --quiet deadlock-web >/dev/null 2>/dev/null; then
+  if run_systemctl is-active --quiet deadlock-web >/dev/null 2>/dev/null; then
     /usr/bin/curl --fail --silent --show-error --max-time 10 \
       http://127.0.0.1:3000/ >/dev/null 2>/dev/null
   fi

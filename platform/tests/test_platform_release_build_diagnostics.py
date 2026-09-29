@@ -6,7 +6,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import time
 import unittest
 from unittest import mock
 
@@ -542,6 +541,12 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                 phase_writer,
             )
             os.chmod(phase_writer, 0o755)
+            guard = tools / "platform_live_qa_guard.py"
+            shutil.copyfile(
+                REPO_ROOT / "platform/tools/platform_live_qa_guard.py",
+                guard,
+            )
+            os.chmod(guard, 0o755)
             bootstrap = tools / "platform_bootstrap.sh"
             bootstrap.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="ascii")
             os.chmod(bootstrap, 0o755)
@@ -609,32 +614,26 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
             self.assertEqual(missing_phase_log.returncode, 1, missing_phase_log.stderr)
             self.assertNotIn(str(root), missing_phase_log.stderr)
 
-            collision_ref = "identity-test"
-            current_timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            next_timestamp = time.strftime(
-                "%Y%m%dT%H%M%SZ", time.gmtime(time.time() + 1)
-            )
-            for timestamp in {current_timestamp, next_timestamp}:
-                (output / f"{collision_ref}-{timestamp}.tar.gz").write_bytes(
-                    b"fixture"
+            collision_slug = "gha-1-1-aaaaaaaaaaaa"
+            (output / f"{collision_slug}.tar.gz").write_bytes(b"fixture")
+            for _attempt in range(2):
+                collided = subprocess.run(
+                    [str(tools / BUILD_SCRIPT.name), "--release-slug", collision_slug],
+                    cwd=platform,
+                    env={
+                        **os.environ,
+                        "PLATFORM_RELEASE_OUTPUT_DIR": str(output),
+                    },
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
                 )
-            collided = subprocess.run(
-                [str(tools / BUILD_SCRIPT.name), collision_ref],
-                cwd=platform,
-                env={
-                    **os.environ,
-                    "PLATFORM_RELEASE_OUTPUT_DIR": str(output),
-                },
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertEqual(collided.returncode, 1, collided.stderr)
-            self.assertIn(
-                "Release output already exists for slug: identity-test-",
-                collided.stderr,
-            )
+                self.assertEqual(collided.returncode, 1, collided.stderr)
+                self.assertEqual(
+                    collided.stderr.strip(),
+                    "Release output already exists for slug: gha-1-1-aaaaaaaaaaaa",
+                )
             parsed_marker_stream = self._run_parser(phase_log)
             self.assertEqual(parsed_marker_stream.returncode, 0, parsed_marker_stream.stderr)
             self.assertIn("failed_phase=canonical-preflight", parsed_marker_stream.stdout)

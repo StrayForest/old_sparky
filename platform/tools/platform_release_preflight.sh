@@ -5,10 +5,14 @@ export PYTHONDONTWRITEBYTECODE=1
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REQUIRE_PREVIOUS=0
+ALLOW_NO_PREVIOUS=0
+ALLOW_INITIAL_INSTALL=0
 REQUIRE_VERIFIED_BACKUP=0
 REQUIRE_EDGE_PARITY=0
 BACKUP_MAX_AGE_HOURS="24"
 EXPECTED_NODE_VERSION="26.3.1"
+DB_TIMEOUT_BIN="/usr/bin/timeout"
+DB_OPERATION_TIMEOUT_SECONDS="30"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -22,6 +26,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --require-previous)
       REQUIRE_PREVIOUS=1
+      shift
+      ;;
+    --allow-no-previous)
+      ALLOW_NO_PREVIOUS=1
+      shift
+      ;;
+    --allow-initial-install)
+      ALLOW_INITIAL_INSTALL=1
+      ALLOW_NO_PREVIOUS=1
       shift
       ;;
     --require-verified-backup)
@@ -43,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       cat <<'EOF'
 Usage: platform_release_preflight.sh [--app-dir <path>] [--require-previous]
+       [--allow-no-previous] [--allow-initial-install]
        [--require-verified-backup] [--require-edge-parity]
        [--backup-max-age-hours <hours>]
 
@@ -57,16 +71,51 @@ EOF
   esac
 done
 
-CURRENT_TARGET="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
-PREVIOUS_TARGET="$(readlink -f "$APP_DIR/previous" 2>/dev/null || true)"
-SHARED_DIR="$APP_DIR/shared"
-ENV_FILE="$SHARED_DIR/.env.platform"
-PYTHON_BIN="$SHARED_DIR/venv/bin/python"
-NODE_BIN="${PLATFORM_NODE_BIN:-$SHARED_DIR/node-v26.3.1/bin/node}"
+if [[ "$REQUIRE_PREVIOUS" -eq 1 && "$ALLOW_NO_PREVIOUS" -eq 1 ]]; then
+  echo "--require-previous and --allow-no-previous are mutually exclusive." >&2
+  exit 1
+fi
+
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
 PUBLIC_RESULT_STATUS="passed"
 
+public_status() {
+  local status="$1"
+  printf 'RELEASE_PREFLIGHT schema=1 status=%s class=preflight release_slug=%s source_sha=%s\n' \
+    "$status" "$PUBLIC_RELEASE_SLUG" "$PUBLIC_SOURCE_SHA"
+}
+
+fail() {
+  exit 1
+}
+
+on_exit() {
+  local exit_status="$?"
+  trap - EXIT
+  if [[ "$exit_status" -ne 0 ]]; then
+    public_status failed >&2
+  fi
+  exit "$exit_status"
+}
+trap on_exit EXIT
+
+CURRENT_TARGET=""
+PREVIOUS_TARGET=""
+if [[ -L "$APP_DIR/current" ]]; then
+  CURRENT_TARGET="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
+elif [[ -e "$APP_DIR/current" ]]; then
+  fail "Current release pointer is unsafe."
+fi
+if [[ -L "$APP_DIR/previous" ]]; then
+  PREVIOUS_TARGET="$(readlink -f "$APP_DIR/previous" 2>/dev/null || true)"
+elif [[ -e "$APP_DIR/previous" ]]; then
+  fail "Previous release pointer is unsafe."
+fi
+SHARED_DIR="$APP_DIR/shared"
+ENV_FILE="$SHARED_DIR/.env.platform"
+PYTHON_BIN="$SHARED_DIR/venv/bin/python"
+NODE_BIN="${PLATFORM_NODE_BIN:-$SHARED_DIR/node-v26.3.1/bin/node}"
 if [[ -n "$CURRENT_TARGET" && -d "$CURRENT_TARGET" ]]; then
   candidate_slug="$(basename "$CURRENT_TARGET")"
   if [[ "$candidate_slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]]; then
@@ -92,26 +141,6 @@ PY
   fi
 fi
 
-public_status() {
-  local status="$1"
-  printf 'RELEASE_PREFLIGHT schema=1 status=%s class=preflight release_slug=%s source_sha=%s\n' \
-    "$status" "$PUBLIC_RELEASE_SLUG" "$PUBLIC_SOURCE_SHA"
-}
-
-on_exit() {
-  local exit_status="$?"
-  trap - EXIT
-  if [[ "$exit_status" -ne 0 ]]; then
-    public_status failed >&2
-  fi
-  exit "$exit_status"
-}
-trap on_exit EXIT
-
-fail() {
-  exit 1
-}
-
 pass() {
   return 0
 }
@@ -133,8 +162,84 @@ load_env_as_data() {
   done <<<"$encoded_assignments"
 }
 
-[[ -n "$CURRENT_TARGET" && -d "$CURRENT_TARGET" ]] || fail "Current release is missing."
+if [[ -z "$CURRENT_TARGET" || ! -d "$CURRENT_TARGET" ]]; then
+  if [[ "$ALLOW_INITIAL_INSTALL" -ne 1 ]]; then
+    fail "Current release is missing."
+  fi
+  [[ -z "$PREVIOUS_TARGET" ]] || fail "Initial install cannot have a previous release."
+  [[ ! -e "$APP_DIR/current" && ! -L "$APP_DIR/current" ]] \
+    || fail "Initial install current pointer is not absent."
+  [[ ! -e "$APP_DIR/previous" && ! -L "$APP_DIR/previous" ]] \
+    || fail "Initial install previous pointer is not absent."
+  [[ ! -e "$SHARED_DIR/.release-systemd-state.json" \
+    && ! -L "$SHARED_DIR/.release-systemd-state.json" ]] \
+    || fail "Initial install has a systemd receipt."
+  initial_transaction="$SHARED_DIR/.release-operation.json"
+  initial_pending=0
+  if [[ -e "$initial_transaction" || -L "$initial_transaction" ]]; then
+    [[ -f "$initial_transaction" && ! -L "$initial_transaction" ]] \
+      || fail "Initial install transaction metadata is unsafe."
+    [[ "$(stat -c '%u:%g:%a:%h' "$initial_transaction" 2>/dev/null)" == "0:0:600:1" ]] \
+      || fail "Initial install transaction metadata is unsafe."
+    initial_context="$({
+      /usr/bin/python3 -I - "$initial_transaction" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if (
+    not isinstance(record, dict)
+    or record.get("operation") != "install"
+    or record.get("current_before") is not None
+    or record.get("previous_before") is not None
+    or record.get("phase") not in {
+        "quiesce-pending", "staged", "migration-pending", "migration-failed",
+        "migration-applied", "activation-pending", "services-restarted",
+        "nginx-pending", "nginx-applied", "smoke-passed", "activation-committed",
+    }
+):
+    raise SystemExit(1)
+print(record["phase"])
+PY
+    } 2>/dev/null)" || fail "Initial install transaction topology is invalid."
+    initial_pending=1
+    [[ "$initial_context" != "quiesce-pending" || ! -e "$SHARED_DIR/venv" ]] \
+      || fail "Initial install quiesce receipt has an unexpected runtime."
+  fi
+  if [[ "$initial_pending" -eq 1 ]]; then
+    [[ -d "$SHARED_DIR/venv" && ! -L "$SHARED_DIR/venv" ]] \
+      || fail "Staged initial install runtime is missing."
+    [[ "$(stat -c '%u:%g:%a:%h' "$SHARED_DIR/venv" 2>/dev/null)" =~ ^0:0:[0-7]+:[2-9][0-9]*$ ]] \
+      || fail "Staged initial install runtime metadata is unsafe."
+    [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] \
+      || fail "Staged initial install env is missing."
+    [[ "$(stat -c '%u:%g:%a:%h' "$ENV_FILE" 2>/dev/null)" == "0:0:600:1" ]] \
+      || fail "Staged initial install env metadata is unsafe."
+  else
+    [[ ! -e "$SHARED_DIR/venv" && ! -L "$SHARED_DIR/venv" ]] \
+      || fail "Initial install has an existing shared runtime."
+  fi
+  PUBLIC_RESULT_STATUS="review"
+  public_status "$PUBLIC_RESULT_STATUS"
+  exit 0
+fi
 pass
+
+if [[ "$ALLOW_NO_PREVIOUS" -eq 1 ]]; then
+  [[ -n "$CURRENT_TARGET" && -d "$CURRENT_TARGET" ]] \
+    || fail "--allow-no-previous requires an existing current release."
+  [[ ! -e "$APP_DIR/previous" && ! -L "$APP_DIR/previous" ]] \
+    || fail "--allow-no-previous requires an absent previous release pointer."
+  [[ -z "$PREVIOUS_TARGET" ]] \
+    || fail "--allow-no-previous requires no previous release target."
+  [[ ! -e "$SHARED_DIR/.release-systemd-state.json" \
+    && ! -L "$SHARED_DIR/.release-systemd-state.json" ]] \
+    || fail "--allow-no-previous requires no systemd receipt."
+fi
 
 if [[ "$REQUIRE_PREVIOUS" -eq 1 ]]; then
   [[ -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]] || fail "Previous release is missing."
@@ -263,6 +368,10 @@ DB_CHECK_OUTPUT="$(
   cd "$CURRENT_TARGET" && \
   PLATFORM_ENV_FILE="$ENV_FILE" \
   PLATFORM_PYTHON_BIN="$PYTHON_BIN" \
+  PLATFORM_DB_CONNECT_TIMEOUT_SECONDS="$DB_OPERATION_TIMEOUT_SECONDS" \
+  PLATFORM_DB_COMMAND_TIMEOUT_SECONDS="$DB_OPERATION_TIMEOUT_SECONDS" \
+  PLATFORM_DB_STATEMENT_TIMEOUT_MS="30000" \
+  PLATFORM_DB_LOCK_TIMEOUT_MS="30000" \
   PYTHONPATH="$CURRENT_TARGET" \
   "$PYTHON_BIN" -B -c "import asyncio; from python_packages.platform_infra.db import warm_up_engine; asyncio.run(warm_up_engine()); print('platform-db-ok')" \
   2>/dev/null
@@ -276,11 +385,13 @@ pass
 ALEMBIC_CURRENT="$(
   cd "$CURRENT_TARGET" && \
   PYTHONPATH="$CURRENT_TARGET" \
+  "$DB_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${DB_OPERATION_TIMEOUT_SECONDS}s" \
   "$PYTHON_BIN" -B -m alembic current 2>/dev/null | tail -n 1 | awk '{print $1}'
 )"
 ALEMBIC_HEAD="$(
   cd "$CURRENT_TARGET" && \
   PYTHONPATH="$CURRENT_TARGET" \
+  "$DB_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${DB_OPERATION_TIMEOUT_SECONDS}s" \
   "$PYTHON_BIN" -B -m alembic heads 2>/dev/null | tail -n 1 | awk '{print $1}'
 )"
 

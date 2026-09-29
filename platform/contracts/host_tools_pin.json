@@ -3,12 +3,12 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_workflow_remote_dispatch.py",
-      "sha256": "a1f0585b9000951fe154e3a56effa64b50713034221d9a7854d452a03cfd937b"
+      "sha256": "4520e1552f0e60bfe56eac7aa95a1abb089872b34135d698e23a0696af50305b"
     },
     {
       "mode": 493,
       "path": "platform/tools/platform_workflow_input_guard.py",
-      "sha256": "47c757b88ca0b5d47ef65c89d39c56524ad34f2c9e395dbb0d12404f4b660813"
+      "sha256": "6cba6cb4bcd1950be9221ea2bc28f09d47412a14015325da42e49295c7652220"
     },
     {
       "mode": 493,
@@ -18,7 +18,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_production_deploy_supervisor.sh",
-      "sha256": "1789714ad588745d8ce39b864cb247dc17313c8677887af2d77ac381649bfb5d"
+      "sha256": "9c29876df2967c09a7bb3c2345c08ec90e05143f8d4bdb4d11657d1ee5c733ce"
     },
     {
       "mode": 493,
@@ -28,7 +28,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_release_preflight.sh",
-      "sha256": "65ec1dae072f96165d8076f16aca253a9c4d634e217b419161554575c99cee09"
+      "sha256": "bd434b2413233b2c7d5d4bfe8a4845386083e01260c743c73b64f320b7603924"
     },
     {
       "mode": 493,
@@ -48,7 +48,7 @@
     {
       "mode": 420,
       "path": "platform/tools/platform_validate_edge_policy.py",
-      "sha256": "872c6b1a5c5e4ad7461b1880fdbd86a30fd1d22b4a11942be121f86b9019fc9e"
+      "sha256": "21fbb3154982cf508df6974c40323ac44f044e1ea20f022b94a151d613ab82cf"
     },
     {
       "mode": 420,
@@ -58,7 +58,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_update_cloudflare_ips.py",
-      "sha256": "018fba78669836bcec3e751082bac9e7421d601cedf1dc0970f4f4550e272f8b"
+      "sha256": "41b68ecdb58e767554483c9db4032a7d8b150861d32d1cbed7a2afb3f57c3e4e"
     },
     {
       "mode": 420,
@@ -66,7 +66,7 @@
       "sha256": "2fe2c8ebfdea6f24ee6d7c7e1a4539a88fdc70449c66cc50eedf9caab3ae2ebf"
     }
   ],
-  "host_tools_sha": "fad2b6cd8e43466d444c0b59ab1c3440718caef9",
+  "host_tools_sha": "e2400a179c2b9d2dd5d8b256e3e79f08c6309a02",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }

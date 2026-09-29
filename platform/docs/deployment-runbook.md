@@ -201,6 +201,23 @@ closed. Revision `20260913_0053` provides the same validation/repair as a
 forward migration for databases that already recorded 0051/0052; no downgrade
 or automatic migration reversal is performed.
 
+The migration wrapper has a bounded 300-second outer operation deadline that
+covers preflight, partial-0051 repair and the final `upgrade head` command. The
+checked-in Alembic environment applies 30-second asyncpg connect and command
+bounds plus PostgreSQL `statement_timeout` and `lock_timeout` to each
+`current`, `heads` and `upgrade` command; recovery and preflight engines use
+the same settings. Strict environment overrides may only remain within this
+bounded contract. These are defense-in-depth within the same operation
+boundary. A timeout exits
+nonzero (124 from `timeout(1)`) while retaining the durable
+`migration-pending` receipt; operators must inspect the database and resume or
+abort through the release state machine rather than retrying or downgrading.
+
+The read-only health gate budgets four 10-second service probes, one 5-second
+loopback readiness probe and one 10-second certificate probe (55 seconds),
+with a 35-second margin in the systemd unit (`TimeoutStartSec=90s`). A timeout
+is a failed health result, never a successful readiness signal.
+
 ### Manual workflow fallback
 
 `Platform production deploy` keeps `workflow_dispatch` as an operator fallback,
@@ -304,10 +321,18 @@ The wrapper leaves a durable transaction until migration, restart/readiness,
 Nginx apply and both smoke paths pass. It prepares service-owned runtime paths
 before restart and refreshes scoped env files. A rollback or recovery runtime
 restore installs unit files with `PLATFORM_ENABLE_SYSTEMD_UNITS=0`; restoring
-unit files never implicitly enables or starts a service or timer. The normal
-activation path owns the reviewed health, Cloudflare and maintenance timer
-enablement, and installs the off-site-backup unit/timer without silently
-enabling off-site backup before its manual restore-drill gate.
+unit files never implicitly enables or starts a service or timer. On a clean
+first install, the staged operation receipt first captures the exact inactive
+and disabled state of the seven application/service timers. The initial
+activation boundary then prepares unit files with enablement disabled, and only
+after smoke restores that baseline, enables the intended units, verifies all
+seven enabled/active states, reconciles the live-QA runtime, and reruns
+readiness. This boundary has one aggregate 120-second budget and 30-second
+per-call caps; a timeout retains the
+candidate and receipt for retry. The normal activation path owns the reviewed
+health, Cloudflare and maintenance timer enablement, and installs the
+off-site-backup unit/timer without silently enabling off-site backup before its
+manual restore-drill gate.
 
 If candidate activation fails, the workflow records read-only filesystem,
 inode, mount and API sandbox facts, plus a sanitized systemd snapshot and the
@@ -321,6 +346,15 @@ an Alembic downgrade. Abort restores units and Nginx without an unconditional
 restart, then checks only services that were active before quiesce. Intentionally
 inactive services and timers remain stopped. A pointer, identity, restart or
 readiness mismatch retains the receipt for another guarded attempt.
+
+An interrupted pre-promotion install has a separate immutable recovery path.
+Only an exact operation-less version-1 `quiesce-pending` receipt with complete
+service/timer state, unchanged pointer identities, an absent candidate and no
+systemd receipt is accepted; an empty, canonical root-owned candidate directory
+is also safe to remove. The recovery generation restores the recorded
+snapshot and then consumes the receipt with `abort-quiesce`; malformed,
+partial, occupied-candidate or other operation-less receipts fail before a
+systemd query. This is not the legacy `recovery-restored` cleanup bridge.
 
 If an operator explicitly chooses code/runtime rollback after reviewing
 database compatibility, use the guarded abort command. It restores the
@@ -342,21 +376,113 @@ Rollback has a separate root-owned
 `shared/.release-systemd-state.json` receipt. Before switching pointers it
 records the exact active (`active|inactive`) and enablement
 (`enabled|disabled|static`) state of every unit owned by the platform unit
-installer. The receipt is validated against the original release identities
-and is retained on an installer, restart, smoke or interruption failure.
+installer. The transaction and systemd receipts share one immutable
+`operation_id` and are validated together against both canonical release
+paths/inode identities before any runtime helper, systemd operation or receipt
+clear. The receipt also carries digest manifests for both rollback targets,
+including the live-QA runtime installer; runtime restoration must name the
+target whose manifest is being executed. It is retained on an installer,
+restart, smoke or interruption failure.
 Recovery restores only that closed owned set, first without `--now` enablement
 and then to the recorded active state; an unsupported or malformed state fails
 closed. `--no-restart` installs the files with activation disabled and verifies
 the recorded active state without starting units. The receipt is removed only
-after the rollback transaction has completed successfully.
+after the rollback transaction has completed successfully. When a rollback
+filesystem restore completes before its runtime restore, the immutable
+transaction records `filesystem-restored-runtime-pending`; retries replay the
+bound runtime/systemd restore before advancing to `recovery-restored`, so a
+crash in that window cannot skip runtime repair. A legacy v2
+`install`/`recovery-restored` receipt with no operation ID is recoverable only
+when the systemd receipt is absent and the candidate is inactive; that bridge
+performs receipt cleanup only and never executes retained release helpers.
 
-The production abort workflow applies the same receipt authority: it accepts
-only a validated v2 transaction (or the exact pre-quiesce receipt), selects a
-release whose identity contract includes the v2 recovery implementation, and
-checks every API/worker/web unit and the Cloudflare timer against the durable
-pre-quiesce snapshot. It does not require intentionally inactive units to be
-active, and it fails closed while retaining the receipt if recovery, pointer,
-identity, or readiness evidence is incomplete.
+The legacy production release-abort workflow is only a compatibility bridge.
+It accepts the exact operation-less v2 `install`/`recovery-restored` receipt,
+requires a missing systemd receipt, inactive candidate and absent peer, and
+uses the supplied installed recovery-generation SHA. It performs receipt-owned
+cleanup only; it never parses an operation-ID receipt and never executes a
+retained release's deploy, runtime or systemd helper. Operation-ID receipts use
+the immutable recovery-bootstrap workflow below. A malformed, mismatched or
+systemd-paired receipt remains retained.
+
+## Immutable recovery bootstrap
+
+Use the manual **Platform production recovery bootstrap abort** workflow only
+after reviewing the retained receipt and confirming that the migration was
+not reversed. Supply the exact successful security run ID/attempt, the exact
+completed recovery-build producer run ID/attempt, and the exact completed
+publisher run ID/attempt; then type `ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY`.
+The workflow validates those exact attempts, route artifact, schema-3 evidence,
+bundle digest and build attestation before it reads `PROD_SSH_*` secrets or
+opens SSH. The bundle source SHA **A**, producer workflow SHA **B**, and
+publisher workflow SHA **C** are separate bindings: attestation uses **B**,
+while the evidence and inner bundle name bind **A**, **P**, and **C**. The
+publisher's outer artifact name includes its exact **C** run/attempt; its
+positive API artifact ID and digest are carried in schema-3 evidence and are
+checked against the downloaded outer ZIP. A rerun is
+selected only by its supplied ID and attempt; a latest-by-SHA match is never
+accepted. The downloaded bundle is re-hashed and re-stat'ed immediately before
+transfer; publisher evidence also carries the producer artifact API digest,
+which is checked before the publisher extracts the bundle member. It transfers
+no source checkout to the host. GitHub's certificate
+`runInvocationURI` is scoped to the run and attempt, not an individual job; the
+workflow therefore binds the numeric producer and publisher job IDs selected
+from their exact attempt jobs APIs into the closed evidence artifact and
+rejects any evidence/API pairing drift before accepting the attestation.
+
+The complete recovery handoff is the six exact operator inputs
+`security_run_id/security_run_attempt`, `recovery_run_id/recovery_run_attempt`,
+and `publisher_run_id/publisher_run_attempt`. The corresponding security,
+producer, and publisher job IDs are not operator-supplied: each is selected
+exactly once from that run's attempt jobs API and carried into the closed
+evidence. The handoff therefore binds source **A**, producer workflow/run/job
+**B/P**, publisher workflow/run/job **C**, the route digest, the producer
+artifact digest, the publisher outer artifact name/ID/digest, and the bundle
+member digest. Missing, duplicate, over-100, expired, or mismatched API rows
+fail before SSH or host mutation.
+
+The host installs the verified bundle as one immutable generation and invokes
+only its fixed `platform_abort_retained_only.sh` entrypoint for this workflow.
+The separate operation-aware release-recover workflow requests the explicit
+`recover_pending` capability and invokes only
+`platform_recover_pending.sh`. The abort entrypoint
+accepts only an install receipt in `phase=recovery-restored`; uncertain
+migration phases, missing identities, lock contention and any runtime,
+systemd, pointer or completion failure remain retained. It first keeps the
+operation receipt while cleaning candidate/venv artifacts, then clears the
+systemd receipt, and removes the operation receipt only after both durable
+states are clean. A retry after one of those side effects resumes from the
+remaining receipt and never repeats an unproven runtime transition. This workflow is
+non-deployable recovery authority: it does not run normal deploy, Alembic
+downgrade or a manually selected `systemctl` command.
+
+The normal systemd installer uses the same crash discipline for retired unit
+cleanup: it persists an fsynced, root-owned file/digest/state record before
+the first stop or disable. After the new unit set and reload verify, it marks
+that record `phase=cleanup-pending` before deleting any backup. If a process
+dies during an unlink, directory removal, or final record removal, the next
+retry validates only the identity-bound remaining paths and converges cleanup;
+it never adopts an unknown backup or clears an unsafe record.
+
+For an interrupted first install with no `current`, release recovery selects
+the exact root-owned, immutable recovery generation bound to the supplied
+security run/attempt and recovery build run/attempt/job evidence. If that
+content address or capability is unavailable, recovery fails closed; it never
+scans for a latest or sole generation and never resolves helpers from a missing
+current release. A staged operation-ID receipt requires its complete,
+transaction-bound `systemd_state_before` snapshot. Recovery validates the
+receipt and restores/verifies that baseline before candidate or transaction
+cleanup; a stale `.release-systemd-state.json`, missing snapshot or incomplete
+pair is retained without systemd mutation. Failures are retryable and never
+delete the candidate before the baseline proof. The separate operation-less
+pre-promotion v1/v2 compatibility bridge has no operation ID and no systemd
+receipt; only that bridge performs the documented zero-systemd no-op for an
+all-inactive/disabled first-install snapshot. A deliberate current-only
+topology has no first-install systemd receipt, but its immutable receipt must
+contain the complete pre-quiesce API/worker/web/timer snapshot; recovery
+restores those exact states before cleanup and retries from a durable
+`filesystem-restored-services-pending` phase after an interruption. Partial or
+missing current-only snapshots remain retained before any systemd call.
 
 ## Smoke
 
@@ -382,6 +508,10 @@ tools/platform_release_preflight.sh \
 
 `--edge-insecure-loopback` is allowed only for loopback. Public smoke keeps normal certificate verification. The expected CSP mode must match the active release.
 
+Remote production deploy/preflight also requires a complete structured
+`RELEASE_DEPLOY schema=1` marker. A zero SSH exit without that marker is a
+transport failure and cannot be reported as a successful deployment.
+
 ## Nginx-only changes
 
 ```bash
@@ -404,14 +534,22 @@ recovery bundle and a compatibility handoff in the previous release before
 switching `current`, so recovery remains available if the process dies after
 the pointer switch.
 
-If a rollback is interrupted, recover with the stable bundle (or the
-`current/tools/platform_release_rollback.sh` shim, which delegates to it):
+If an operation-ID rollback is interrupted, use the exact content-addressed
+generation selected and verified by the release-recover workflow. Invoke its
+immutable wrapper directly; do not use `current/tools` or a release rollback
+shim as recovery control code:
 
 ```bash
-/opt/oldsparky/platform/shared/.release-recovery/platform_release_rollback.sh \
-  --recover-pending \
+/opt/oldsparky/platform/shared/.release-recovery/generations/<bundle-sha256>/platform_recover_pending.sh \
   --app-dir /opt/oldsparky/platform
 ```
+
+The wrapper resumes the recorded rollback phase, validates the operation-ID
+and systemd receipt pair before systemd or runtime work, and completes receipt
+cleanup in two phases. A crash after receipt clear is finished from the
+transaction phase without querying systemd. The legacy shim remains only for
+normal rollback handoff compatibility and is not an operation-ID recovery
+authority.
 
 After rollback, repeat preflight plus origin/SNI and public smoke against the restored release.
 

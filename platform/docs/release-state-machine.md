@@ -2,7 +2,7 @@
 
 - Status: Active release design
 - Owner: Production operator and platform maintainers
-- Last reviewed: 2026-09-12
+- Last reviewed: 2026-09-29
 
 This document owns the end-to-end release transaction. The normal production
 path is `tools/platform_release_deploy.sh`; the low-level installer is a
@@ -17,6 +17,7 @@ canonical release lock `/run/lock/oldsparky-platform-release.lock`
     -> quiesce writers
 candidate artifact
     -> staged
+    -> first-install systemd baseline captured (initial installs only)
     -> migration-pending
     -> migration-applied
     -> activation-pending
@@ -24,6 +25,8 @@ candidate artifact
     -> nginx-pending
     -> nginx-applied
     -> smoke-passed
+    -> systemd-activation-pending (initial install only)
+    -> systemd-activated (initial install only)
     -> activation-committed
 ```
 
@@ -46,6 +49,56 @@ acquire only the release lock. No path acquires these locks in the reverse
 order, so deploy cannot deadlock with a retained-load, maintenance or recovery
 operation. Recovery passes the inherited release-lock file descriptor through
 rollback and runtime restore and keeps it held for the final Nginx/readiness checks.
+
+## Installation topology
+
+Preflight is explicit about pointer topology. A clean first install has no
+`current` or `previous` pointer and performs only layout, lock, shared-runtime
+and candidate checks; it never invokes an old-release runtime. Once the staged
+operation receipt exists, the wrapper captures the exact inactive and disabled
+state of the seven platform-owned application units/timers into that same
+receipt before any first-install systemd mutation. The receipt is the
+authority for first-install activation and every abort/recovery retry. A
+current-only install validates `current` and deliberately permits no
+`previous`; it requires a complete API/worker/web/timer snapshot, permits no
+first-install systemd receipt, and uses the immutable transaction helper to
+restore that snapshot before cleanup. An upgrade requires both canonical
+pointers and uses the full runtime/systemd snapshot contract. A previous
+pointer without current, or any pointer/symlink identity mismatch, is
+rejected. Rollback remains a separate two-pointer operation.
+
+### Initial-install systemd boundary
+
+The initial install keeps unit-file preparation separate from persistent
+activation. During `activation-pending`, the installer runs with
+`PLATFORM_ENABLE_SYSTEMD_UNITS=0`; services are restarted and readiness/smoke
+checks run while the receipt remains durable. After smoke, the wrapper records
+`systemd-activation-pending`, restores the captured baseline, and runs the
+installer with `PLATFORM_ENABLE_SYSTEMD_UNITS=1`. It then verifies all seven
+units are enabled, the three services and four timers are active, and both
+readiness endpoints pass before recording `systemd-activated`.
+
+Every restore/installer/live-QA-reconcile/enable/restart/readiness/verify
+sequence is bounded by one 120-second operation deadline, with each
+individual systemctl/installer/reconcile call capped at 30 seconds. A timeout or non-zero result leaves the candidate
+and receipt retained. Failures after `systemd-activated` or
+`activation-committed` first restore and verify the captured baseline, then
+rewind to `systemd-activation-pending` so the next resume does not require
+units that recovery has already stopped. A stale or incomplete legacy
+`.release-systemd-state.json` alongside an initial transaction is rejected
+before cleanup; only the transaction-bound `systemd_state_before` snapshot is
+accepted.
+
+Recovery provenance is a three-way identity chain. The security
+checkout/source SHA is **A**; the immutable producer workflow code SHA is
+**B**; and the completed publisher workflow code SHA is **C**. The producer
+and publisher are separate `workflow_run` jobs: the publisher accepts only the
+supplied completed producer run/attempt and exact producer job/artifact, never
+a latest-by-SHA match. Manual abort/recover inputs carry the exact security,
+producer and publisher run/attempt pairs. Attestation verifies **B**, while the
+bundle manifest/evidence independently bind **A**, producer **P**, and
+publisher **C**. A branch advance or rerun therefore fails closed unless the
+operator selects its exact identity.
 
 Before stopping a writer or invoking the installer, the wrapper atomically
 writes `shared/.release-operation.json` in the `quiesce-pending` phase. It
@@ -71,11 +124,45 @@ pre-quiesce transaction is sufficient to restore the old runtime and remove a
 partial candidate, or remains retained for explicit abort when any identity,
 pointer, restart or readiness check fails.
 
+Pointer promotion is durable in two steps: after `previous` is switched the
+transaction records `previous-switched`; after `current` is switched it
+records `current-switched`, then `pointers-switched` and
+`activation-pending`. A crash between either symlink update is therefore
+recovered from the phase-specific topology rather than inferred from the live
+links. In the narrow interval before `current-switched` is persisted,
+`previous-switched` authorizes exactly either the previous-only pair or the
+fully promoted pair; the immutable validator rejects every other combination.
+Mutable systemd calls are individually bounded so a wedged manager leaves this
+durable phase available for retry.
+
+The immutable recovery wrapper has one deliberately narrow operation-less
+exception for this boundary: an exact version-1 `install` receipt in
+`quiesce-pending`, with complete active/inactive API/worker/web/timer state,
+unchanged pointer identities, no populated candidate path and no systemd
+receipt. New version-2 receipts additionally carry the exact enabled/disabled
+state; version 1 has no enabled fields and never infers them. An empty,
+canonical root-owned candidate directory is also safe to remove. It restores
+that recorded service/timer snapshot through the generation's transaction
+helper, then performs `abort-quiesce`. A malformed receipt, an unexpected
+phase, an occupied or replaced candidate, or any partial snapshot remains
+retained before
+the first systemd call. This pre-promotion branch is not the legacy
+`recovery-restored` cleanup bridge.
+
+For a no-current, operation-less pre-promotion topology, a complete
+all-inactive snapshot is accepted only as compatibility evidence: version 2
+must also be all-disabled, while version 1 has no enablement fields. That
+specific bridge is a filesystem-only no-op and never calls `systemctl`. It is
+distinct from a staged operation-ID first install, whose durable
+`systemd_state_before` snapshot is required for activation and recovery.
+
 Rollback uses the same receipt discipline after switching pointers:
 
 ```text
 pointer/venv switch
     -> rollback-runtime-pending
+    -> filesystem-restored-runtime-pending
+    -> immutable runtime/systemd restore
     -> restart-pending
     -> services-restarted
     -> smoke-passed
@@ -92,20 +179,25 @@ starts a timer implicitly.
 Before the rollback pointer switch, the tool creates the separate root-owned
 `shared/.release-systemd-state.json` receipt. It contains the exact active and
 enablement state of the closed platform-owned service/timer set and the
-pre-rollback release identities. Recovery validates this receipt before any
-systemd action, restores enablement without `--now`, then restores active state
-only for the recorded units. Unsupported or malformed state is fail-closed;
-the receipt remains available when installation, restart, smoke or recovery is
-interrupted and is removed only after the rollback transaction completes.
+pre-rollback release identities. Both receipts carry one immutable operation ID;
+the systemd receipt also carries digest manifests for the helpers of both
+rollback targets, including the runtime installer and recovery orchestrator.
+Recovery validates IDs, paths, inode identities and the manifest for the
+explicit target before any helper or systemd action, restores enablement
+without `--now`, then restores active state only for the recorded units.
+Unsupported or malformed state is fail-closed. Completion is two-phase:
+`complete --retain-receipt`, systemd clear, then final `complete`; a crash
+after clear leaves a retryable transaction and no guessed service transition.
 
 Before a rollback pointer switch, the rollback tool refreshes the root-owned
 `shared/.release-recovery/` bundle and installs a small compatibility shim as
-the previous release's `tools/platform_release_rollback.sh`. If the rollback
-process crashes after `current` has switched, a new invocation through the old
-`current` therefore delegates to the shared bundle rather than the old
-release's transaction code. The application files and runtime tools of the
-previous release remain unchanged; only its rollback entrypoint is replaced by
-the recovery handoff needed for this cross-release boundary.
+the previous release's `tools/platform_release_rollback.sh`. That shim is a
+normal rollback handoff only. Operation-ID recovery is entered through the
+exact verified content-addressed generation and its immutable
+`platform_recover_pending.sh` wrapper; it never selects `current/tools` or the
+shim as control code. The application files and runtime tools of the previous
+release remain unchanged; only its rollback entrypoint is replaced by the
+compatibility handoff needed for the normal cross-release boundary.
 
 ## Failure behavior
 
@@ -140,17 +232,45 @@ the recovery handoff needed for this cross-release boundary.
   failure. Do not delete the state file, downgrade Alembic, or run a second
   unrelated install. Resume first; rollback remains a code/runtime operation
   and never reverses database migrations automatically.
+- A clean first-install failure in `activation-pending` or any later phase
+  retains the candidate and operation receipt. The failure handler restores
+  and verifies the receipt-bound seven-unit baseline before returning. A
+  failure after a durable activation marker rewinds the marker to
+  `systemd-activation-pending`; retry is therefore idempotent and never
+  assumes that stopped units are still active. Abort at `staged` or
+  `recovery-restored` proves the exact baseline before completing filesystem
+  cleanup. If that proof, its timeout budget, or the receipt pair fails, no
+  candidate or receipt is removed.
 - `nginx-pending` is an explicit uncertainty boundary. If the process stops
   after Nginx has been mutated but before `nginx-applied`, abort recovery first
   restores the recorded pointers/venv and then reinstalls the previous
   release's units and Nginx configuration before restart/readiness/smoke.
 - A rollback runtime failure retains `rollback-runtime-pending` (or its later
-  phase). Recovery either completes the already committed restart-pending
-  rollback or restores the exact pre-rollback pointers, venv, units and Nginx
-  while both the rollback transaction and the systemd-state receipt remain
-  durable. Recovery is invoked through the shared bundle, including when
-  `current` already resolves to the previous release. A missing, stale or
-  malformed systemd-state receipt never authorizes an enable/start operation.
+  phase). Recovery first durably restores the filesystem and venv, recording
+  `filesystem-restored-runtime-pending` before invoking any runtime or systemd
+  helper. A retry at that marker replays the bound runtime/systemd restore and
+  only then advances to `recovery-restored` and the two-phase receipt cleanup.
+  Recovery either completes the already committed restart-pending rollback or
+  restores the exact pre-rollback pointers, venv, units and Nginx while both
+  the rollback transaction and the systemd-state receipt remain durable.
+  Recovery is invoked through the shared bundle, including when `current`
+  already resolves to the previous release. A missing, stale or malformed
+  systemd-state receipt never authorizes an enable/start operation.
+- An operation-ID first install with both pointers absent is recovered only
+  with its transaction-bound `systemd_state_before` snapshot; immutable
+  recovery restores and verifies that baseline before candidate/receipt
+  cleanup. A stale separate `.release-systemd-state.json`, missing snapshot,
+  or incomplete pair fails closed. The operation-less pre-promotion bridge is
+  the separate systemd-free compatibility path described above. A current-only
+  receipt must instead carry the complete pre-quiesce service/timer snapshot;
+  immutable recovery restores it before candidate and receipt cleanup, with a
+  durable retry marker if restoration is interrupted.
+- A legacy v2 install receipt in `recovery-restored` has no operation ID and is
+  not upgraded in place. Only the immutable recovery-bootstrap bridge may
+  consume it, and only when the systemd receipt is absent, the candidate is
+  inactive and the peer is absent; that path performs transaction cleanup only
+  and never executes retained release helpers. The normal release-recover
+  workflow rejects it and directs the operator to that bridge.
 - `activation-committed` is resumable and idempotently calls final receipt
   completion. A crash after activation commit therefore cannot report success
   while leaving the receipt to block the next install.
@@ -160,8 +280,9 @@ already quiesced services. It still requires the confirmation flag for a
 single guarded operator command, but no migration authorization is applied to
 that phase. A SIGKILL before promotion is represented by
 `.release-operation.json` with `phase=quiesce-pending`; `--abort-retained`
-consumes that receipt, restores its exact service state and removes a partial
-candidate. Missing or malformed
+consumes that receipt, restores its exact service state and removes only an
+empty, canonical candidate directory. A populated or replaced candidate is
+retained with the receipt. Missing or malformed
 service-state data is never interpreted as “all active”; recovery stops before
 any service start and retains the receipt.
 
@@ -202,7 +323,9 @@ Actions after reviewing the receipt:
 gh workflow run platform-production-release-recover.yml \
   --repo StrayForest/old_sparky \
   --ref dev \
-  -f confirmation=RECOVER-PENDING-RELEASE
+  -f confirmation=RECOVER-PENDING-RELEASE \
+  -f security_run_id=<exact-security-run-id> \
+  -f security_run_attempt=<exact-security-run-attempt>
 ```
 
 The recovery restores the exact pre-operation release/runtime and verifies
@@ -212,27 +335,26 @@ database compatibility review and explicit abort/resume decision.
 
 When the receipt is in `migration-applied` or a later phase and the reviewed
 database evidence confirms that the migration was not reversed, use the
-explicit retained-release abort workflow:
+immutable recovery-bootstrap abort workflow described in the runbook. The
+older release-abort workflow is compatibility-only: it accepts only a legacy
+operation-less v2 `install`/`recovery-restored` receipt with no systemd receipt
+and performs receipt cleanup through the installed immutable generation. It
+never invokes a retained release deploy/runtime helper.
 
 ```bash
 gh workflow run platform-production-release-abort.yml \
   --repo StrayForest/old_sparky \
   --ref dev \
-  -f confirmation=ABORT-RETAINED-RELEASE-MIGRATION-NOT-REVERSED
+  -f confirmation=ABORT-LEGACY-RELEASE \
+  -f generation_sha=<installed-recovery-generation-sha256>
 ```
 
-This restores the exact pre-operation release/runtime, restarts and verifies
-only services recorded active before quiesce, leaves intentionally inactive
-units stopped, and never downgrades Alembic.
-
-The abort workflow independently validates the v2 receipt (or the exact
-pre-quiesce receipt schema) and the release identity before selecting the
-transaction/deploy tools. It then verifies that recovery consumed the receipt,
-restored both pointers, and left API, worker, web, and the Cloudflare timer in
-the exact durable active/inactive states recorded before quiesce. Readiness is
-required only for units recorded active; a missing, stale, legacy, or
-identity-mismatched receipt/tool fails closed and remains available for
-operator recovery.
+The legacy bridge performs receipt-owned candidate/venv cleanup only through
+the installed immutable generation. It does not restore runtime or Nginx,
+restart or verify services, invoke a retained release helper, or downgrade
+Alembic. It accepts only an operation-less v2 `install`/`recovery-restored`
+receipt with no systemd receipt and leaves malformed, mismatched, or
+operation-ID receipts retained for the immutable recovery-bootstrap workflow.
 
 The deploy gate also requires a read-only Cloudflare/Nginx/UFW range-parity
 proof and a direct-origin negative test. The current closure evidence for the

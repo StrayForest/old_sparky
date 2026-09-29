@@ -531,14 +531,33 @@ jobs:
     environment: production
     outputs:
       host_tools_sha: ${{ needs.build-host-tools.outputs.host_tools_sha }}
+      host_tools_artifact_id: ${{ steps.host-tools-handoff.outputs.artifact_id }}
+      host_tools_artifact_name: ${{ steps.host-tools-handoff.outputs.artifact_name }}
+      host_tools_artifact_size: ${{ steps.host-tools-handoff.outputs.artifact_size }}
+      host_tools_artifact_digest: ${{ steps.host-tools-handoff.outputs.artifact_digest }}
+      host_tools_bundle_sha256: ${{ steps.host-tools-handoff.outputs.bundle_sha256 }}
+      host_tools_manifest_sha256: ${{ steps.host-tools-handoff.outputs.manifest_sha256 }}
+      host_tools_capabilities_sha256: ${{ steps.host-tools-handoff.outputs.capabilities_sha256 }}
+      host_tools_files_contract_sha256: ${{ steps.host-tools-handoff.outputs.files_contract_sha256 }}
+      host_tools_modes_contract_sha256: ${{ steps.host-tools-handoff.outputs.modes_contract_sha256 }}
+      host_tools_signer_workflow: ${{ steps.host-tools-handoff.outputs.signer_workflow }}
+      host_tools_source_ref: ${{ steps.host-tools-handoff.outputs.source_ref }}
+      host_tools_source_digest: ${{ steps.host-tools-handoff.outputs.source_digest }}
+      host_tools_attestation_run_id: ${{ steps.host-tools-handoff.outputs.attestation_run_id }}
+      host_tools_attestation_run_attempt: ${{ steps.host-tools-handoff.outputs.attestation_run_attempt }}
+      host_tools_attestation_job_id: ${{ steps.host-tools-handoff.outputs.attestation_job_id }}
+      host_tools_handoff_artifact_id: ${{ steps.publish-host-tools-handoff.outputs.artifact-id }}
+      host_tools_handoff_artifact_digest: ${{ steps.publish-host-tools-handoff.outputs.artifact-digest }}
     permissions:
       actions: read
+      attestations: read
       contents: read
     env:
       TARGET_SHA: ${{ github.sha }}
       HOST_TOOLS_SHA: ${{ needs.build-host-tools.outputs.host_tools_sha }}
       HOST_TOOLS_ARTIFACT_ID: ${{ needs.build-host-tools.outputs.artifact_id }}
       HOST_TOOLS_ARTIFACT_DIGEST: ${{ needs.build-host-tools.outputs.artifact_digest }}
+      HOST_TOOLS_ARTIFACT_NAME: platform-host-tools-bundle-${{ github.run_id }}-${{ github.run_attempt }}
       HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ needs.build-host-tools.outputs.host_tools_sha }}/platform_workflow_remote_dispatch.py
     steps:
       - name: Download and verify exact host-tools artifact
@@ -546,6 +565,178 @@ jobs:
         with:
           artifact-ids: ${{ env.HOST_TOOLS_ARTIFACT_ID }}
           path: ${{ runner.temp }}/host-tools-download
+
+      - name: Rebind outer artifact and attest exact inner bundle before extraction
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$HOST_TOOLS_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          outer_digest="${HOST_TOOLS_ARTIFACT_DIGEST#sha256:}"
+          [[ "$outer_digest" =~ ^[0-9a-f]{64}$ ]]
+          metadata_path="$RUNNER_TEMP/host-tools-final-artifact-metadata.json"
+          outer_path="$RUNNER_TEMP/host-tools-final-artifact.zip"
+          curl --fail-with-body --silent --show-error --location --max-filesize 524288 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}" \
+            --output "$metadata_path"
+          /usr/bin/python3 - "$metadata_path" "$HOST_TOOLS_ARTIFACT_ID" "$HOST_TOOLS_ARTIFACT_NAME" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" "sha256:${outer_digest}" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          path, artifact_id, artifact_name, run_id, attempt, source_sha, digest = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          workflow_run = payload.get("workflow_run")
+          if (
+              type(payload.get("id")) is not int
+              or payload.get("id") != int(artifact_id)
+              or payload.get("name") != artifact_name
+              or payload.get("expired") is not False
+              or type(payload.get("size_in_bytes")) is not int
+              or payload.get("size_in_bytes") <= 0
+              or payload.get("digest") != digest
+              or not isinstance(workflow_run, dict)
+              or workflow_run.get("id") != int(run_id)
+              or workflow_run.get("head_sha") != source_sha
+          ):
+              raise SystemExit("host-tools outer artifact API binding is invalid")
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+              raise SystemExit("host-tools outer artifact digest is invalid")
+          PY
+          curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip" \
+            --output "$outer_path"
+          printf '%s  %s\n' "$outer_digest" "$outer_path" | sha256sum -c - >/dev/null 2>/dev/null
+          /usr/bin/python3 - "$outer_path" "$RUNNER_TEMP/host-tools-download" "sha256:${outer_digest}" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+          import sys
+          import zipfile
+
+          archive_path, output_path, expected_digest = map(Path, sys.argv[1:])
+          expected_digest = str(expected_digest)
+          allowed = {
+              "platform-host-tools-bundle.zip",
+              "contract/source_sha",
+              "contract/toolset_version",
+              "contract/manifest.sha256",
+              "contract/capabilities.sha256",
+              "contract/files.sha256",
+              "contract/files.modes",
+          }
+          before = archive_path.lstat()
+          if (
+              stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode)
+              or before.st_nlink != 1 or before.st_size > 8 * 1024 * 1024
+          ):
+              raise SystemExit("host-tools outer artifact metadata is unsafe")
+          descriptor = os.open(archive_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+          stream = None
+          try:
+              opened = os.fstat(descriptor)
+              if (opened.st_dev, opened.st_ino, opened.st_size) != (before.st_dev, before.st_ino, before.st_size):
+                  raise SystemExit("host-tools outer artifact changed before read")
+              stream = os.fdopen(descriptor, "rb", closefd=False)
+              members = {}
+              with zipfile.ZipFile(stream, "r", allowZip64=False) as archive:
+                  total = 0
+                  for info in archive.infolist():
+                      name = info.filename
+                      if name == "contract/" and info.is_dir():
+                          continue
+                      mode = (info.external_attr >> 16) & 0o170000
+                      if name not in allowed or info.is_dir() or mode not in {0, stat.S_IFREG}:
+                          raise SystemExit("host-tools outer artifact member set is invalid")
+                      if name in members or info.file_size > 4 * 1024 * 1024 or total + info.file_size > 8 * 1024 * 1024:
+                          raise SystemExit("host-tools outer artifact member bound is invalid")
+                      data = archive.read(info)
+                      if len(data) != info.file_size:
+                          raise SystemExit("host-tools outer artifact member changed")
+                      members[name] = data
+                      total += len(data)
+              if set(members) != allowed:
+                  raise SystemExit("host-tools outer artifact inventory is incomplete")
+              os.lseek(descriptor, 0, os.SEEK_SET)
+              digest = hashlib.sha256()
+              size = 0
+              while size <= 8 * 1024 * 1024:
+                  chunk = os.read(descriptor, 1024 * 1024)
+                  if not chunk:
+                      break
+                  digest.update(chunk)
+                  size += len(chunk)
+              after = os.fstat(descriptor)
+              if (
+                  size != after.st_size
+                  or digest.hexdigest() != expected_digest.removeprefix("sha256:")
+                  or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                  != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+              ):
+                  raise SystemExit("host-tools outer artifact changed during read")
+          finally:
+              if stream is not None:
+                  stream.close()
+              try:
+                  os.close(descriptor)
+              except OSError:
+                  pass
+          output = Path(output_path)
+          staging = output.with_name(output.name + ".verified")
+          if staging.exists() or staging.is_symlink():
+              raise SystemExit("host-tools verified staging path already exists")
+          staging.mkdir(mode=0o700)
+          try:
+              (staging / "contract").mkdir(mode=0o700)
+              for name, data in members.items():
+                  destination = staging / name
+                  descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  try:
+                      view = memoryview(data)
+                      while view:
+                          written = os.write(descriptor, view)
+                          if written <= 0:
+                              raise SystemExit("host-tools verified member write failed")
+                          view = view[written:]
+                      os.fchmod(descriptor, 0o600)
+                  finally:
+                      os.close(descriptor)
+              if output.exists() or output.is_symlink():
+                  if output.is_symlink() or not output.is_dir():
+                      raise SystemExit("host-tools download path is unsafe")
+                  shutil.rmtree(output)
+              os.replace(staging, output)
+          except BaseException:
+              if staging.exists() and not staging.is_symlink():
+                  shutil.rmtree(staging)
+              raise
+          PY
+          bundle_path="$RUNNER_TEMP/host-tools-download/platform-host-tools-bundle.zip"
+          attestation_json="$RUNNER_TEMP/host-tools-attestation.json"
+          gh attestation verify "$bundle_path" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml \
+            --source-ref refs/heads/dev \
+            --source-digest "$TARGET_SHA" \
+            --format json > "$attestation_json"
+          test -s "$attestation_json"
 
       - name: Validate host-tools artifact envelope and bundle
         shell: bash
@@ -713,13 +904,17 @@ jobs:
           generation="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA"
           # Every call through this array is read-only; keep runner-side
           # sidecars on the runner instead of allowing SSH to consume stdin.
-          remote=(ssh -n -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$ssh_dir/config" -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
-          test "$("${remote[@]}" /usr/bin/id -u | tr -d '\r\n')" = 0
+          remote=(ssh -n -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$ssh_dir/config" -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          run_remote_readonly() {
+            /usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s \
+              "${remote[@]}" "$@"
+          }
+          test "$(run_remote_readonly /usr/bin/id -u | tr -d '\r\n')" = 0
           [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$generation" = "/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA" ]]
-          "${remote[@]}" /usr/bin/test -d "$generation"
-          "${remote[@]}" /usr/bin/test ! -L "$generation"
-          test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
+          run_remote_readonly /usr/bin/test -d "$generation"
+          run_remote_readonly /usr/bin/test ! -L "$generation"
+          test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
           contract_dir="$RUNNER_TEMP/host-tools-download/contract"
           expected_payload_count="$(wc -l < "$contract_dir/files.sha256" | tr -d ' ')"
           expected_mode_payload_count="$(wc -l < "$contract_dir/files.modes" | tr -d ' ')"
@@ -730,29 +925,29 @@ jobs:
             [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]
             [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$|^manifest\.json$ ]]
             remote_path="$generation/$expected_path"
-            "${remote[@]}" /usr/bin/test -f "$remote_path"
-            "${remote[@]}" /usr/bin/test ! -L "$remote_path"
+            run_remote_readonly /usr/bin/test -f "$remote_path"
+            run_remote_readonly /usr/bin/test ! -L "$remote_path"
             case "$expected_path" in
               capabilities.txt|manifest.json) expected_mode=444 ;;
               *) expected_mode=555 ;;
             esac
-            test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_path")" = "regular file:0:0:1:$expected_mode"
-            remote_digest="$("${remote[@]}" /usr/bin/sha256sum -- "$remote_path")"
+            test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_path")" = "regular file:0:0:1:$expected_mode"
+            remote_digest="$(run_remote_readonly /usr/bin/sha256sum -- "$remote_path")"
             test "${remote_digest%% *}" = "$expected_hash"
             digest_count=$((digest_count + 1))
           done < "$contract_dir/files.sha256"
           test "$digest_count" -eq "$expected_payload_count"
           IFS= read -r expected_manifest_hash < "$contract_dir/manifest.sha256"
           IFS= read -r expected_capabilities_hash < "$contract_dir/capabilities.sha256"
-          test "$("${remote[@]}" /usr/bin/sha256sum -- "$generation/manifest.json")" = "$expected_manifest_hash  $generation/manifest.json"
-          test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/manifest.json")" = "regular file:0:0:1:444"
-          test "$("${remote[@]}" /usr/bin/sha256sum -- "$generation/capabilities.txt")" = "$expected_capabilities_hash  $generation/capabilities.txt"
-          test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/capabilities.txt")" = "regular file:0:0:1:444"
+          test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/manifest.json")" = "$expected_manifest_hash  $generation/manifest.json"
+          test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/manifest.json")" = "regular file:0:0:1:444"
+          test "$(run_remote_readonly /usr/bin/sha256sum -- "$generation/capabilities.txt")" = "$expected_capabilities_hash  $generation/capabilities.txt"
+          test "$(run_remote_readonly /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/capabilities.txt")" = "regular file:0:0:1:444"
           declare -A expected_entries=([capabilities.txt]=1 [manifest.json]=1)
           mode_count=0
           while read -r expected_mode expected_path; do
             remote_path="$generation/$expected_path"
-            remote_mode="$("${remote[@]}" /usr/bin/stat -c '%a' -- "$remote_path")"
+            remote_mode="$(run_remote_readonly /usr/bin/stat -c '%a' -- "$remote_path")"
             test "$remote_mode" = "$expected_mode"
             expected_entries["$expected_path"]=1
             mode_count=$((mode_count + 1))
@@ -766,7 +961,7 @@ jobs:
           # NUL-delimited find output is base64-wrapped before it crosses the
           # SSH boundary.  This preserves dotfiles and makes newline/control
           # names observable instead of allowing line-oriented ambiguity.
-          "${remote[@]}" /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -print0 \
+          run_remote_readonly /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -print0 \
             | /usr/bin/base64 -w 0 > "$inventory_encoded"
           test "$(stat -c '%F:%h' -- "$inventory_encoded")" = "regular file:1"
           test "$(stat -c '%s' -- "$inventory_encoded")" -le 16384
@@ -787,6 +982,153 @@ jobs:
           test "${#expected_entries[@]}" -eq 0
           printf '%s\n' "HOST_TOOLS_GENERATION=$generation" >> "$GITHUB_ENV"
           printf '%s\n' "HOST_TOOLS_SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Create closed host-tools handoff after final verification
+        id: host-tools-handoff
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bundle_path="$RUNNER_TEMP/host-tools-download/platform-host-tools-bundle.zip"
+          contract_dir="$RUNNER_TEMP/host-tools-download/contract"
+          inner_root="$RUNNER_TEMP/platform-host-tools-inner/platform-host-tools"
+          attestation_json="$RUNNER_TEMP/host-tools-attestation.json"
+          jobs_json="$RUNNER_TEMP/host-tools-build-jobs.json"
+          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
+            --output "$jobs_json"
+          build_job_id="$(/usr/bin/python3 - "$jobs_json" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("jobs")
+          if not isinstance(rows, list):
+              raise SystemExit("host-tools workflow jobs response is malformed")
+          run_id, attempt, source = int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+          matches = [
+              row for row in rows
+              if isinstance(row, dict)
+              and type(row.get("id")) is int
+              and row.get("name") == "Build deterministic host-tools bundle in CI"
+              and row.get("run_id") == run_id
+              and row.get("run_attempt") == attempt
+              and row.get("status") == "completed"
+              and row.get("conclusion") == "success"
+              and row.get("head_sha") == source
+          ]
+          if len(matches) != 1:
+              raise SystemExit("exact successful host-tools build job is missing")
+          print(matches[0]["id"])
+          PY
+          )"
+          bundle_sha256="$(sha256sum "$bundle_path" | awk '{print $1}')"
+          outer_digest="${HOST_TOOLS_ARTIFACT_DIGEST#sha256:}"
+          [[ "$outer_digest" =~ ^[0-9a-f]{64}$ ]]
+          artifact_size="$(/usr/bin/python3 - "$RUNNER_TEMP/host-tools-final-artifact-metadata.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("size_in_bytes")
+          if type(value) is not int or value <= 0 or value > 8 * 1024 * 1024:
+              raise SystemExit("host-tools artifact size is invalid")
+          print(value)
+          PY
+          )"
+          IFS= read -r manifest_sha256 < "$contract_dir/manifest.sha256"
+          IFS= read -r capabilities_sha256 < "$contract_dir/capabilities.sha256"
+          files_contract_sha256="$(sha256sum "$contract_dir/files.sha256" | awk '{print $1}')"
+          modes_contract_sha256="$(sha256sum "$contract_dir/files.modes" | awk '{print $1}')"
+          /usr/bin/python3 - "$attestation_json" "$bundle_sha256" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" "$HOST_TOOLS_ARTIFACT_NAME" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          values = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_bundle, run_id, attempt, source, artifact_name = sys.argv[2:]
+          if not isinstance(values, list) or not values:
+              raise SystemExit("host-tools attestation JSON is not a non-empty array")
+          build = "https://github.com/StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev"
+          repo = "https://github.com/StrayForest/old_sparky"
+          runner = f"https://github.com/StrayForest/old_sparky/actions/runs/{run_id}/attempts/{attempt}"
+          for item in values:
+              if not isinstance(item, dict):
+                  continue
+              result = item.get("verificationResult")
+              signature = result.get("signature") if isinstance(result, dict) else None
+              certificate = signature.get("certificate") if isinstance(signature, dict) else None
+              extensions = certificate.get("extensions") if isinstance(certificate, dict) else None
+              statement = result.get("statement") if isinstance(result, dict) else None
+              if not isinstance(extensions, dict) or not isinstance(statement, dict):
+                  continue
+              if (
+                  extensions.get("issuer") != "https://token.actions.githubusercontent.com"
+                  or extensions.get("sourceRepositoryURI") != repo
+                  or extensions.get("sourceRepositoryRef") != "refs/heads/dev"
+                  or extensions.get("sourceRepositoryDigest") != source
+                  or extensions.get("buildConfigURI") != build
+                  or extensions.get("buildSignerURI") != build
+                  or extensions.get("runInvocationURI") != runner
+              ):
+                  continue
+              subjects = statement.get("subject")
+              if not isinstance(subjects, list) or len(subjects) != 1 or not isinstance(subjects[0], dict):
+                  continue
+              digest = subjects[0].get("digest")
+              if isinstance(digest, dict) and set(digest) == {"sha256"} and digest.get("sha256") == expected_bundle:
+                  break
+          else:
+              raise SystemExit("host-tools attestation certificate/source/run/subject policy failed")
+          PY
+          handoff="$RUNNER_TEMP/platform-host-tools-handoff.json"
+          /usr/bin/python3 -I -B "$inner_root/platform_workflow_input_guard.py" host-tools \
+            --output "$handoff" \
+            --target-sha "$TARGET_SHA" \
+            --host-tools-sha "$HOST_TOOLS_SHA" \
+            --artifact-id "$HOST_TOOLS_ARTIFACT_ID" \
+            --artifact-name "$HOST_TOOLS_ARTIFACT_NAME" \
+            --artifact-size "$artifact_size" \
+            --artifact-digest "$outer_digest" \
+            --bundle-sha256 "$bundle_sha256" \
+            --manifest-sha256 "$manifest_sha256" \
+            --capabilities-sha256 "$capabilities_sha256" \
+            --files-contract-sha256 "$files_contract_sha256" \
+            --modes-contract-sha256 "$modes_contract_sha256" \
+            --signer-workflow "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml" \
+            --source-ref refs/heads/dev \
+            --source-digest "$TARGET_SHA" \
+            --attestation-run-id "$GITHUB_RUN_ID" \
+            --attestation-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --attestation-job-id "$build_job_id"
+          test "$(stat -c '%F:%u:%h:%a' -- "$handoff")" = "regular file:0:1:600"
+          /usr/bin/python3 -I -B "$inner_root/platform_workflow_input_guard.py" host-tools \
+            --input "$handoff" >/dev/null
+          /usr/bin/python3 - "$handoff" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          with Path(sys.argv[2]).open("a", encoding="ascii") as output:
+              for key in (
+                  "artifact_id", "artifact_name", "artifact_size", "artifact_digest",
+                  "bundle_sha256", "manifest_sha256", "capabilities_sha256",
+                  "files_contract_sha256", "modes_contract_sha256", "signer_workflow",
+                  "source_ref", "source_digest", "attestation_run_id",
+                  "attestation_run_attempt", "attestation_job_id",
+              ):
+                  output.write(f"{key}={payload[key]}\n")
+          PY
+
+      - name: Publish closed host-tools handoff
+        id: publish-host-tools-handoff
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-host-tools-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-host-tools-handoff.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Probe immutable host dispatcher capabilities
         shell: bash
@@ -811,7 +1153,7 @@ jobs:
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/config")" = "regular file:1:600"
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/known_hosts")" = "regular file:1:600"
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
-          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
           expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"
           expected_bytes="$(printf '%s\n' "$expected_output" | wc -c | tr -d '[:space:]')"
@@ -868,6 +1210,11 @@ jobs:
         run: |
           set -euo pipefail
           rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip" \
+            "$RUNNER_TEMP/host-tools-final-artifact.zip" \
+            "$RUNNER_TEMP/host-tools-final-artifact-metadata.json" \
+            "$RUNNER_TEMP/host-tools-attestation.json" \
+            "$RUNNER_TEMP/host-tools-build-jobs.json" \
+            "$RUNNER_TEMP/platform-host-tools-handoff.json" \
             "$RUNNER_TEMP/platform-host-capabilities-output"
           rm -f -- "$RUNNER_TEMP/host-tools-remote-entries.b64" "$RUNNER_TEMP/host-tools-remote-entries" \
             "$RUNNER_TEMP/platform-host-tools-expected-members" "$RUNNER_TEMP/platform-host-tools-actual-members"
@@ -1379,14 +1726,21 @@ jobs:
           umask 077
           : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
           set +e
-          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+          timeout --foreground 300s ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
             -F "$PREFLIGHT_SSH_DIR/config" -i "$PREFLIGHT_SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" \
             production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
-          grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) ' "$remote_log" | tail -n 1 || true
+          public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed))? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
+          if [[ -z "$public_line" ]]; then
+            public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
+            printf '%s\n' "$public_line"
+            (( remote_status != 0 )) && exit "$remote_status"
+            exit 1
+          fi
+          printf '%s\n' "$public_line"
           rm -f -- "$remote_log" "$remote_error"
           exit "$remote_status"
 
@@ -1429,6 +1783,7 @@ jobs:
     environment: production
     permissions:
       actions: read
+      attestations: read
       contents: read
       statuses: write
     env:
@@ -1445,12 +1800,35 @@ jobs:
       HOST_TOOLS_SHA: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}
       HOST_TOOLS_GENERATION: /opt/oldsparky/platform/shared/host-tools/${{ needs.host-capability-preflight.outputs.host_tools_sha }}
       HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ needs.host-capability-preflight.outputs.host_tools_sha }}/platform_workflow_remote_dispatch.py
+      HOST_TOOLS_ARTIFACT_ID: ${{ needs.host-capability-preflight.outputs.host_tools_artifact_id }}
+      HOST_TOOLS_ARTIFACT_NAME: ${{ needs.host-capability-preflight.outputs.host_tools_artifact_name }}
+      HOST_TOOLS_ARTIFACT_SIZE: ${{ needs.host-capability-preflight.outputs.host_tools_artifact_size }}
+      HOST_TOOLS_ARTIFACT_DIGEST: ${{ needs.host-capability-preflight.outputs.host_tools_artifact_digest }}
+      HOST_TOOLS_BUNDLE_SHA256: ${{ needs.host-capability-preflight.outputs.host_tools_bundle_sha256 }}
+      HOST_TOOLS_MANIFEST_SHA256: ${{ needs.host-capability-preflight.outputs.host_tools_manifest_sha256 }}
+      HOST_TOOLS_CAPABILITIES_SHA256: ${{ needs.host-capability-preflight.outputs.host_tools_capabilities_sha256 }}
+      HOST_TOOLS_FILES_CONTRACT_SHA256: ${{ needs.host-capability-preflight.outputs.host_tools_files_contract_sha256 }}
+      HOST_TOOLS_MODES_CONTRACT_SHA256: ${{ needs.host-capability-preflight.outputs.host_tools_modes_contract_sha256 }}
+      HOST_TOOLS_SIGNER_WORKFLOW: ${{ needs.host-capability-preflight.outputs.host_tools_signer_workflow }}
+      HOST_TOOLS_SOURCE_REF: ${{ needs.host-capability-preflight.outputs.host_tools_source_ref }}
+      HOST_TOOLS_SOURCE_DIGEST: ${{ needs.host-capability-preflight.outputs.host_tools_source_digest }}
+      HOST_TOOLS_ATTESTATION_RUN_ID: ${{ needs.host-capability-preflight.outputs.host_tools_attestation_run_id }}
+      HOST_TOOLS_ATTESTATION_RUN_ATTEMPT: ${{ needs.host-capability-preflight.outputs.host_tools_attestation_run_attempt }}
+      HOST_TOOLS_ATTESTATION_JOB_ID: ${{ needs.host-capability-preflight.outputs.host_tools_attestation_job_id }}
+      HOST_TOOLS_HANDOFF_ARTIFACT_ID: ${{ needs.host-capability-preflight.outputs.host_tools_handoff_artifact_id }}
+      HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST: ${{ needs.host-capability-preflight.outputs.host_tools_handoff_artifact_digest }}
     steps:
       - name: Download closed deployment handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: platform-production-deploy-input-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/deploy-input
+
+      - name: Download closed host-tools handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          artifact-ids: ${{ env.HOST_TOOLS_HANDOFF_ARTIFACT_ID }}
+          path: ${{ runner.temp }}/host-tools-handoff
 
       - name: Validate production deployment inputs
         shell: bash
@@ -1785,7 +2163,485 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
-          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" true >/dev/null
+          timeout --foreground --signal=TERM --kill-after=5s 30s \
+            ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" true >/dev/null
+
+      - name: Revalidate host-tools contract before production side effects
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          input_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          handoff_dir="$RUNNER_TEMP/host-tools-handoff"
+          handoff_path="$handoff_dir/platform-host-tools-handoff.json"
+          test -f "$input_path" && test ! -L "$input_path"
+          test -f "$handoff_path" && test ! -L "$handoff_path"
+          [[ "$HOST_TOOLS_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$HOST_TOOLS_HANDOFF_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HOST_TOOLS_ARTIFACT_SIZE" =~ ^[1-9][0-9]*$ ]]
+          [[ "$HOST_TOOLS_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$HOST_TOOLS_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$HOST_TOOLS_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$HOST_TOOLS_CAPABILITIES_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$HOST_TOOLS_FILES_CONTRACT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$HOST_TOOLS_MODES_CONTRACT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$HOST_TOOLS_SOURCE_DIGEST" = "$TARGET_SHA" ]]
+          [[ "$HOST_TOOLS_SOURCE_REF" = refs/heads/dev ]]
+          [[ "$HOST_TOOLS_ATTESTATION_RUN_ID" = "$GITHUB_RUN_ID" ]]
+          [[ "$HOST_TOOLS_ATTESTATION_RUN_ATTEMPT" = "$GITHUB_RUN_ATTEMPT" ]]
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          attempt_metadata="$RUNNER_TEMP/host-tools-production-attempt.json"
+          curl --fail-with-body --silent --show-error --location --max-filesize 524288 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --output "$attempt_metadata"
+          /usr/bin/python3 - "$attempt_metadata" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" "$GITHUB_REPOSITORY" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path, run_id, attempt, target_sha, repository = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="ascii"))
+          repo = payload.get("repository")
+          if (
+              not isinstance(payload, dict)
+              or type(payload.get("id")) is not int
+              or payload.get("id") != int(run_id)
+              or type(payload.get("run_attempt")) is not int
+              or payload.get("run_attempt") != int(attempt)
+              or payload.get("head_sha") != target_sha
+              or payload.get("head_branch") != "dev"
+              or payload.get("event") != "workflow_dispatch"
+              or not isinstance(repo, dict)
+              or repo.get("full_name") != repository
+          ):
+              raise SystemExit("host-tools production workflow attempt is not exact")
+          PY
+          handoff_metadata="$RUNNER_TEMP/host-tools-handoff-metadata.json"
+          handoff_zip="$RUNNER_TEMP/host-tools-handoff.zip"
+          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_HANDOFF_ARTIFACT_ID}" \
+            --output "$handoff_metadata"
+          /usr/bin/python3 - "$handoff_metadata" "$HOST_TOOLS_HANDOFF_ARTIFACT_ID" "$HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          path, artifact_id, artifact_digest, run_id, attempt, target_sha = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          run = payload.get("workflow_run")
+          if (
+              type(payload.get("id")) is not int
+              or payload.get("id") != int(artifact_id)
+              or payload.get("name") != f"platform-host-tools-handoff-{run_id}-{attempt}"
+              or payload.get("expired") is not False
+              or payload.get("digest") != artifact_digest
+              or not isinstance(run, dict)
+              or run.get("id") != int(run_id)
+              or (
+                  "run_attempt" in run
+                  and (
+                      type(run.get("run_attempt")) is not int
+                      or run.get("run_attempt") != int(attempt)
+                  )
+              )
+              or run.get("head_sha") != target_sha
+              or run.get("head_branch") != "dev"
+              or re.fullmatch(r"sha256:[0-9a-f]{64}", str(artifact_digest)) is None
+          ):
+              raise SystemExit("host-tools handoff artifact is not bound to this exact run")
+          PY
+          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_HANDOFF_ARTIFACT_ID}/zip" \
+            --output "$handoff_zip"
+          printf '%s  %s\n' "${HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST#sha256:}" "$handoff_zip" | sha256sum -c - >/dev/null 2>/dev/null
+          /usr/bin/python3 - "$handoff_zip" "$handoff_path" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          import zipfile
+
+          archive_path, output_path = map(Path, sys.argv[1:])
+          before = archive_path.lstat()
+          if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_nlink != 1:
+              raise SystemExit("host-tools handoff archive is unsafe")
+          descriptor = os.open(archive_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+          stream = None
+          try:
+              opened = os.fstat(descriptor)
+              if (opened.st_dev, opened.st_ino, opened.st_size) != (before.st_dev, before.st_ino, before.st_size):
+                  raise SystemExit("host-tools handoff archive changed before read")
+              stream = os.fdopen(descriptor, "rb", closefd=False)
+              with zipfile.ZipFile(stream, "r", allowZip64=False) as archive:
+                  entries = [item for item in archive.infolist() if not item.is_dir()]
+                  if len(entries) != 1 or entries[0].filename != "platform-host-tools-handoff.json":
+                      raise SystemExit("host-tools handoff archive inventory is invalid")
+                  info = entries[0]
+                  mode = (info.external_attr >> 16) & 0o170000
+                  if mode not in {0, stat.S_IFREG} or info.file_size > 64 * 1024:
+                      raise SystemExit("host-tools handoff archive member is invalid")
+                  data = archive.read(info)
+                  if len(data) != info.file_size:
+                      raise SystemExit("host-tools handoff member changed")
+              after = os.fstat(descriptor)
+              if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
+                  raise SystemExit("host-tools handoff archive changed during read")
+          finally:
+              if stream is not None:
+                  stream.close()
+              try:
+                  os.close(descriptor)
+              except OSError:
+                  pass
+          output = Path(output_path)
+          output.parent.mkdir(mode=0o700, exist_ok=True)
+          temporary = output.with_name(output.name + ".verified")
+          fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          try:
+              os.write(fd, data)
+              os.fchmod(fd, 0o600)
+          finally:
+              os.close(fd)
+          os.replace(temporary, output)
+          PY
+          test "$(stat -c '%F:%h:%a' -- "$handoff_path")" = "regular file:1:600"
+
+          outer_metadata="$RUNNER_TEMP/host-tools-production-metadata.json"
+          outer_zip="$RUNNER_TEMP/host-tools-production.zip"
+          outer_dir="$RUNNER_TEMP/host-tools-production-envelope"
+          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}" \
+            --output "$outer_metadata"
+          /usr/bin/python3 - "$outer_metadata" "$HOST_TOOLS_ARTIFACT_ID" "$HOST_TOOLS_ARTIFACT_NAME" "$HOST_TOOLS_ARTIFACT_SIZE" "$HOST_TOOLS_ARTIFACT_DIGEST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          path, artifact_id, name, size, digest, run_id, attempt, target_sha = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          run = payload.get("workflow_run")
+          if (
+              type(payload.get("id")) is not int
+              or payload.get("id") != int(artifact_id)
+              or payload.get("name") != name
+              or payload.get("size_in_bytes") != int(size)
+              or payload.get("expired") is not False
+              or payload.get("digest") != f"sha256:{digest}"
+              or not isinstance(run, dict)
+              or run.get("id") != int(run_id)
+              or run.get("head_sha") != target_sha
+              or run.get("head_branch") != "dev"
+              or (
+                  "run_attempt" in run
+                  and (
+                      type(run.get("run_attempt")) is not int
+                      or run.get("run_attempt") != int(attempt)
+                  )
+              )
+              or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+          ):
+              raise SystemExit("host-tools outer artifact is not bound to the exact build")
+          PY
+          curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip" \
+            --output "$outer_zip"
+          printf '%s  %s\n' "$HOST_TOOLS_ARTIFACT_DIGEST" "$outer_zip" | sha256sum -c - >/dev/null 2>/dev/null
+          /usr/bin/python3 - "$outer_zip" "$outer_dir" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          import zipfile
+
+          archive_path, output_path = map(Path, sys.argv[1:])
+          allowed = {
+              "platform-host-tools-bundle.zip",
+              "contract/source_sha",
+              "contract/toolset_version",
+              "contract/manifest.sha256",
+              "contract/capabilities.sha256",
+              "contract/files.sha256",
+              "contract/files.modes",
+          }
+          before = archive_path.lstat()
+          if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_nlink != 1:
+              raise SystemExit("host-tools outer archive is unsafe")
+          descriptor = os.open(archive_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+          stream = None
+          try:
+              opened = os.fstat(descriptor)
+              if (opened.st_dev, opened.st_ino, opened.st_size) != (before.st_dev, before.st_ino, before.st_size):
+                  raise SystemExit("host-tools outer archive changed before read")
+              stream = os.fdopen(descriptor, "rb", closefd=False)
+              with zipfile.ZipFile(stream, "r", allowZip64=False) as archive:
+                  members = {}
+                  for info in archive.infolist():
+                      if info.filename == "contract/" and info.is_dir():
+                          continue
+                      mode = (info.external_attr >> 16) & 0o170000
+                      if info.filename not in allowed or info.is_dir() or mode not in {0, stat.S_IFREG} or info.filename in members or info.file_size > 4 * 1024 * 1024:
+                          raise SystemExit("host-tools outer archive inventory is invalid")
+                      data = archive.read(info)
+                      if len(data) != info.file_size:
+                          raise SystemExit("host-tools outer archive member changed")
+                      members[info.filename] = data
+              if set(members) != allowed:
+                  raise SystemExit("host-tools outer archive is incomplete")
+              after = os.fstat(descriptor)
+              if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
+                  raise SystemExit("host-tools outer archive changed during read")
+          finally:
+              if stream is not None:
+                  stream.close()
+              try:
+                  os.close(descriptor)
+              except OSError:
+                  pass
+          output = Path(output_path)
+          if output.exists() or output.is_symlink():
+              raise SystemExit("host-tools outer staging path already exists")
+          output.mkdir(mode=0o700)
+          try:
+              (output / "contract").mkdir(mode=0o700)
+              for name, data in members.items():
+                  destination = output / name
+                  fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  try:
+                      os.write(fd, data)
+                      os.fchmod(fd, 0o600)
+                  finally:
+                      os.close(fd)
+          except BaseException:
+              import shutil
+              shutil.rmtree(output)
+              raise
+          PY
+          bundle_path="$outer_dir/platform-host-tools-bundle.zip"
+          attestation_path="$RUNNER_TEMP/host-tools-production-attestation.json"
+          gh attestation verify "$bundle_path" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$HOST_TOOLS_SIGNER_WORKFLOW" \
+            --source-ref "$HOST_TOOLS_SOURCE_REF" \
+            --source-digest "$TARGET_SHA" \
+            --format json > "$attestation_path"
+          test -s "$attestation_path"
+          jobs_path="$RUNNER_TEMP/host-tools-production-jobs.json"
+          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
+            --output "$jobs_path"
+          /usr/bin/python3 - "$input_path" "$handoff_path" "$attestation_path" "$jobs_path" "$bundle_path" "$outer_dir" "$TARGET_SHA" "$HOST_TOOLS_SHA" "$HOST_TOOLS_ARTIFACT_ID" "$HOST_TOOLS_ARTIFACT_NAME" "$HOST_TOOLS_ARTIFACT_SIZE" "$HOST_TOOLS_ARTIFACT_DIGEST" "$HOST_TOOLS_BUNDLE_SHA256" "$HOST_TOOLS_MANIFEST_SHA256" "$HOST_TOOLS_CAPABILITIES_SHA256" "$HOST_TOOLS_FILES_CONTRACT_SHA256" "$HOST_TOOLS_MODES_CONTRACT_SHA256" "$HOST_TOOLS_SIGNER_WORKFLOW" "$HOST_TOOLS_SOURCE_REF" "$HOST_TOOLS_ATTESTATION_RUN_ID" "$HOST_TOOLS_ATTESTATION_RUN_ATTEMPT" "$HOST_TOOLS_ATTESTATION_JOB_ID" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+          import zipfile
+
+          (
+              input_path, handoff_path, attestation_path, jobs_path, bundle_path, outer_dir,
+              target_sha, host_tools_sha, artifact_id, artifact_name, artifact_size, artifact_digest,
+              bundle_sha, manifest_sha, capabilities_sha, files_contract_sha, modes_contract_sha,
+              signer_workflow, source_ref, attestation_run_id, attestation_attempt, attestation_job_id,
+          ) = sys.argv[1:]
+          handoff = json.loads(Path(handoff_path).read_text(encoding="ascii"))
+          expected_handoff = {
+              "schema", "target_sha", "host_tools_sha", "artifact_id", "artifact_name", "artifact_size",
+              "artifact_digest", "bundle_sha256", "manifest_sha256", "capabilities_sha256",
+              "files_contract_sha256", "modes_contract_sha256", "signer_workflow", "source_ref",
+              "source_digest", "attestation_run_id", "attestation_run_attempt", "attestation_job_id",
+          }
+          if set(handoff) != expected_handoff:
+              raise SystemExit("host-tools handoff schema is not closed")
+          expected_values = {
+              "schema": "1", "target_sha": target_sha, "host_tools_sha": host_tools_sha,
+              "artifact_id": artifact_id, "artifact_name": artifact_name, "artifact_size": artifact_size,
+              "artifact_digest": artifact_digest, "bundle_sha256": bundle_sha,
+              "manifest_sha256": manifest_sha, "capabilities_sha256": capabilities_sha,
+              "files_contract_sha256": files_contract_sha, "modes_contract_sha256": modes_contract_sha,
+              "signer_workflow": signer_workflow, "source_ref": source_ref, "source_digest": target_sha,
+              "attestation_run_id": attestation_run_id, "attestation_run_attempt": attestation_attempt,
+              "attestation_job_id": attestation_job_id,
+          }
+          if handoff != expected_values:
+              raise SystemExit("host-tools handoff does not match final environment binding")
+          if re.fullmatch(r"platform-host-tools-bundle-([1-9][0-9]{0,31})-([1-9][0-9]{0,31})", artifact_name) is None:
+              raise SystemExit("host-tools artifact name is malformed")
+          if artifact_name.rsplit("-", 2)[-2:] != [attestation_run_id, attestation_attempt]:
+              raise SystemExit("host-tools artifact name is not attempt-bound")
+          rows = json.loads(Path(jobs_path).read_text(encoding="utf-8")).get("jobs")
+          if not isinstance(rows, list):
+              raise SystemExit("host-tools jobs response is malformed")
+          jobs = [
+              row for row in rows
+              if isinstance(row, dict)
+              and type(row.get("id")) is int
+              and row.get("id") == int(attestation_job_id)
+              and row.get("name") == "Build deterministic host-tools bundle in CI"
+              and row.get("run_id") == int(attestation_run_id)
+              and row.get("run_attempt") == int(attestation_attempt)
+              and row.get("status") == "completed"
+              and row.get("conclusion") == "success"
+              and row.get("head_sha") == target_sha
+          ]
+          if len(jobs) != 1:
+              raise SystemExit("host-tools attestation job identity is not exact")
+          attestations = json.loads(Path(attestation_path).read_text(encoding="utf-8"))
+          if not isinstance(attestations, list) or not attestations:
+              raise SystemExit("host-tools attestation response is empty")
+          build_uri = "https://github.com/StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev"
+          repository_uri = "https://github.com/StrayForest/old_sparky"
+          invocation_uri = f"https://github.com/StrayForest/old_sparky/actions/runs/{attestation_run_id}/attempts/{attestation_attempt}"
+          attestation_ok = False
+          for item in attestations:
+              if not isinstance(item, dict):
+                  continue
+              result = item.get("verificationResult")
+              signature = result.get("signature") if isinstance(result, dict) else None
+              certificate = signature.get("certificate") if isinstance(signature, dict) else None
+              extensions = certificate.get("extensions") if isinstance(certificate, dict) else None
+              statement = result.get("statement") if isinstance(result, dict) else None
+              if not isinstance(extensions, dict) or not isinstance(statement, dict):
+                  continue
+              if (
+                  extensions.get("issuer") != "https://token.actions.githubusercontent.com"
+                  or extensions.get("sourceRepositoryURI") != repository_uri
+                  or extensions.get("sourceRepositoryRef") != source_ref
+                  or extensions.get("sourceRepositoryDigest") != target_sha
+                  or extensions.get("buildConfigURI") != build_uri
+                  or extensions.get("buildSignerURI") != build_uri
+                  or extensions.get("runInvocationURI") != invocation_uri
+              ):
+                  continue
+              subjects = statement.get("subject")
+              if not isinstance(subjects, list) or len(subjects) != 1 or not isinstance(subjects[0], dict):
+                  continue
+              digest = subjects[0].get("digest")
+              if isinstance(digest, dict) and set(digest) == {"sha256"} and digest.get("sha256") == bundle_sha:
+                  attestation_ok = True
+                  break
+          if not attestation_ok:
+              raise SystemExit("host-tools attestation certificate/source/run/subject policy failed")
+
+          expected_files = {
+              "platform_workflow_remote_dispatch.py", "platform_workflow_input_guard.py",
+              "platform_prepare_artifact_dir.py", "platform_production_deploy_supervisor.sh",
+              "platform_release_lock.sh", "platform_release_preflight.sh",
+              "platform_validate_release_artifact.py", "platform_safe_env_exec.py",
+              "platform_render_service_envs.py", "platform_validate_edge_policy.py",
+              "platform_update_cloudflare_ips.py", "platform_configure_shared_env.py",
+              "platform_storage_evidence_summary.py", "capabilities.txt",
+          }
+          outer = Path(outer_dir)
+          if hashlib.sha256((outer / "platform-host-tools-bundle.zip").read_bytes()).hexdigest() != bundle_sha:
+              raise SystemExit("host-tools inner bundle digest changed")
+          if (outer / "contract/source_sha").read_text(encoding="ascii").strip() != host_tools_sha:
+              raise SystemExit("host-tools source contract mismatch")
+          if (outer / "contract/toolset_version").read_text(encoding="ascii").strip() != "production-host-tools-v2":
+              raise SystemExit("host-tools toolset contract mismatch")
+          manifest_contract = (outer / "contract/manifest.sha256").read_text(encoding="ascii").strip()
+          capabilities_contract = (outer / "contract/capabilities.sha256").read_text(encoding="ascii").strip()
+          if manifest_contract != manifest_sha or capabilities_contract != capabilities_sha:
+              raise SystemExit("host-tools manifest contract mismatch")
+          if hashlib.sha256((outer / "contract/files.sha256").read_bytes()).hexdigest() != files_contract_sha:
+              raise SystemExit("host-tools files contract digest mismatch")
+          if hashlib.sha256((outer / "contract/files.modes").read_bytes()).hexdigest() != modes_contract_sha:
+              raise SystemExit("host-tools modes contract digest mismatch")
+          with zipfile.ZipFile(outer / "platform-host-tools-bundle.zip", "r", allowZip64=False) as archive:
+              members = {}
+              for info in archive.infolist():
+                  mode = (info.external_attr >> 16) & 0o170000
+                  if info.is_dir() or mode not in {0, stat.S_IFREG} or info.filename in members:
+                      raise SystemExit("host-tools inner bundle member is invalid")
+                  members[info.filename] = archive.read(info)
+          manifest_member = "platform-host-tools/manifest.json"
+          expected_members = {f"platform-host-tools/{name}" for name in expected_files} | {manifest_member}
+          if set(members) != expected_members:
+              raise SystemExit("host-tools inner bundle inventory is invalid")
+          manifest = json.loads(members[manifest_member].decode("utf-8"))
+          records = manifest.get("files") if isinstance(manifest, dict) else None
+          if manifest.get("schema") != 1 or manifest.get("source_sha") != host_tools_sha or manifest.get("generation") != host_tools_sha or not isinstance(records, list):
+              raise SystemExit("host-tools manifest identity is invalid")
+          by_path = {}
+          for record in records:
+              if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"} or record.get("path") in by_path:
+                  raise SystemExit("host-tools manifest records are invalid")
+              by_path[record["path"]] = record
+          if set(by_path) != expected_files:
+              raise SystemExit("host-tools manifest inventory is invalid")
+          for name, record in by_path.items():
+              expected_mode = 0o444 if name == "capabilities.txt" else 0o555
+              data = members[f"platform-host-tools/{name}"]
+              if record.get("mode") != expected_mode or hashlib.sha256(data).hexdigest() != record.get("sha256"):
+                  raise SystemExit("host-tools manifest member digest or mode mismatch")
+          contract_records = {}
+          for line in (outer / "contract/files.sha256").read_text(encoding="ascii").splitlines():
+              digest, name = line.split("  ", 1)
+              if name in contract_records:
+                  raise SystemExit("host-tools files contract duplicates a member")
+              contract_records[name] = digest
+          if contract_records != {name: record["sha256"] for name, record in by_path.items()}:
+              raise SystemExit("host-tools files contract does not match manifest")
+          mode_records = {}
+          for line in (outer / "contract/files.modes").read_text(encoding="ascii").splitlines():
+              mode, name = line.split()
+              if name in mode_records:
+                  raise SystemExit("host-tools modes contract duplicates a member")
+              mode_records[name] = int(mode, 8)
+          if mode_records != {name: record["mode"] for name, record in by_path.items()}:
+              raise SystemExit("host-tools modes contract does not match manifest")
+          base = json.loads(Path(input_path).read_text(encoding="ascii"))
+          legacy_keys = {
+              "schema", "mode", "runtime_profile", "release_slug", "target_sha",
+              "artifact_remote_dir", "classifier_run_id", "classifier_run_attempt", "web_compression",
+          }
+          if set(base) != legacy_keys or base.get("schema") not in (1, "1") or base.get("mode") != "deploy" or base.get("target_sha") != target_sha:
+              raise SystemExit("deployment handoff cannot be upgraded safely")
+          base["schema"] = "2"
+          base["host_tools"] = handoff
+          temporary = Path(input_path).with_name(Path(input_path).name + ".host-tools-verified")
+          fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          try:
+              data = (json.dumps(base, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+              os.write(fd, data)
+              os.fchmod(fd, 0o600)
+          finally:
+              os.close(fd)
+          os.replace(temporary, input_path)
+          PY
+          test "$(stat -c '%F:%h:%a' -- "$input_path")" = "regular file:1:600"
+          expected_remote="HOST_TOOLS_CONTRACT source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA manifest_sha256=$HOST_TOOLS_MANIFEST_SHA256 capabilities_sha256=$HOST_TOOLS_CAPABILITIES_SHA256"
+          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          run_remote_readonly() {
+            /usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s \
+              "${remote[@]}" "$@"
+          }
+          run_remote_readonly /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-contract \
+            "$HOST_TOOLS_SHA" "$HOST_TOOLS_MANIFEST_SHA256" "$HOST_TOOLS_CAPABILITIES_SHA256" \
+            | /usr/bin/head -c 512 | cmp -s <(printf '%s\n' "$expected_remote")
 
       - name: Upload verified CI artifact
         shell: bash
@@ -1804,11 +2660,11 @@ jobs:
             test "$dev_sha" = "$TARGET_SHA" || { echo "Refusing production side effects: dev moved from $TARGET_SHA to $dev_sha." >&2; exit 1; }
           }
           require_current_dev_head
-          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+          timeout --foreground 300s ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-prepare-artifact < "$input_path"
-          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_ARTIFACT" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
-          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_PROVENANCE" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
-          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_CHECKSUM" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          timeout --foreground 300s scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_ARTIFACT" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          timeout --foreground 300s scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_PROVENANCE" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          timeout --foreground 300s scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_CHECKSUM" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
 
       - name: Run production preflight or deployment
         shell: bash
@@ -1826,12 +2682,17 @@ jobs:
           remote_error="$RUNNER_TEMP/platform-production-deploy-remote-error.log"
           umask 077; : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
           set +e
-          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+          timeout --foreground 900s ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
           public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed))? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
-          [[ -n "$public_line" ]] || public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
+          if [[ -z "$public_line" ]]; then
+            public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
+            printf '%s\n' "$public_line"
+            (( remote_status != 0 )) && exit "$remote_status"
+            exit 1
+          fi
           printf '%s\n' "$public_line"
           exit "$remote_status"
 
@@ -1843,7 +2704,12 @@ jobs:
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/platform-production-deploy-ssh"
           test "$ssh_dir" = "$RUNNER_TEMP/platform-production-deploy-ssh"
-          rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$RUNNER_TEMP/platform-production-deploy-remote.log" "$RUNNER_TEMP/platform-production-deploy-remote-error.log" "$RUNNER_TEMP/platform-release-artifact.zip"
+          rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$RUNNER_TEMP/platform-production-deploy-remote.log" "$RUNNER_TEMP/platform-production-deploy-remote-error.log" "$RUNNER_TEMP/platform-release-artifact.zip" \
+            "$RUNNER_TEMP/host-tools-production-attempt.json" \
+            "$RUNNER_TEMP/host-tools-handoff-metadata.json" "$RUNNER_TEMP/host-tools-handoff.zip" \
+            "$RUNNER_TEMP/host-tools-production-metadata.json" "$RUNNER_TEMP/host-tools-production.zip" \
+            "$RUNNER_TEMP/host-tools-production-attestation.json" "$RUNNER_TEMP/host-tools-production-jobs.json"
+          rm -rf -- "$RUNNER_TEMP/host-tools-production-envelope" "$RUNNER_TEMP/host-tools-handoff"
           if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
             test -d "$ssh_dir" && test ! -L "$ssh_dir"
             rm -f -- \

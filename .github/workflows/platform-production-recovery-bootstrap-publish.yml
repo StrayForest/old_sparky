@@ -1,0 +1,285 @@
+name: Platform production recovery bootstrap publish
+
+on:
+  workflow_run:
+    workflows: [Platform production recovery bootstrap build]
+    types: [completed]
+
+# This completed-run publisher has no production credentials.  It validates
+# the exact producer P/B and security A chain, then publishes only closed,
+# non-deployable evidence.  The bundle remains a producer artifact; consumers
+# explicitly validate both runs and the bundle digest.
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: platform-production-recovery-bootstrap-publish-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish retained-release recovery bootstrap evidence
+    if: >-
+      github.ref == 'refs/heads/dev' &&
+      github.event.workflow_run.status == 'completed' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'workflow_run' &&
+      github.event.workflow_run.head_branch == 'dev' &&
+      github.event.workflow_run.head_repository.full_name == 'StrayForest/old_sparky' &&
+      github.event.workflow_run.name == 'Platform production recovery bootstrap build' &&
+      github.event.workflow_run.path == '.github/workflows/platform-production-recovery-bootstrap-build.yml'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      REPOSITORY: StrayForest/old_sparky
+      PRODUCER_RUN_ID: ${{ github.event.workflow_run.id }}
+      PRODUCER_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      PUBLISHER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      PUBLISHER_RUN_ID: ${{ github.run_id }}
+      PUBLISHER_RUN_ATTEMPT: ${{ github.run_attempt }}
+      PRODUCER_WORKFLOW: Platform production recovery bootstrap build
+      PRODUCER_WORKFLOW_PATH: .github/workflows/platform-production-recovery-bootstrap-build.yml
+      PUBLISHER_WORKFLOW: Platform production recovery bootstrap publish
+      PUBLISHER_WORKFLOW_PATH: .github/workflows/platform-production-recovery-bootstrap-publish.yml
+      SECURITY_WORKFLOW: Platform security and build
+      SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
+      SECURITY_JOB: Verification contract
+    steps:
+      - name: Checkout exact trusted publisher source C
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: StrayForest/old_sparky
+          ref: ${{ env.PUBLISHER_WORKFLOW_SHA }}
+          fetch-depth: 1
+          path: trusted-source
+          persist-credentials: false
+
+      - name: Fetch exact producer and publisher attempt metadata
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$PRODUCER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$PRODUCER_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          metadata="$RUNNER_TEMP/platform-recovery-publisher"
+          install -d -m 700 "$metadata"
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          gh_header=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$PRODUCER_RUN_ID/attempts/$PRODUCER_RUN_ATTEMPT" --output "$metadata/producer-run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$PRODUCER_RUN_ID/attempts/$PRODUCER_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/producer-jobs.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$PRODUCER_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/producer-artifacts.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$PUBLISHER_RUN_ID/attempts/$PUBLISHER_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/publisher-jobs.json"
+          /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publisher-select --metadata "$metadata" --github-output "$GITHUB_OUTPUT" --repository "$REPOSITORY" --producer-run-id "$PRODUCER_RUN_ID" --producer-run-attempt "$PRODUCER_RUN_ATTEMPT" --producer-workflow "$PRODUCER_WORKFLOW" --producer-workflow-path "$PRODUCER_WORKFLOW_PATH"
+          /usr/bin/python3 -I -B - "$metadata/publisher-jobs.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          rows = payload.get("jobs") if isinstance(payload, dict) else None
+          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 100 or payload["total_count"] != len(rows):
+              raise SystemExit("publisher jobs response is incomplete")
+          expected = "Publish retained-release recovery bootstrap evidence"
+          matches = [row for row in rows if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") > 0 and row.get("name") == expected and row.get("run_id") == int(os.environ["PUBLISHER_RUN_ID"]) and row.get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"]) and row.get("head_sha") == os.environ["PUBLISHER_WORKFLOW_SHA"] and row.get("status") == "in_progress" and row.get("conclusion") is None]
+          if len(matches) != 1:
+              raise SystemExit("exact publisher job identity is missing")
+          with Path(sys.argv[2]).open("a", encoding="ascii") as stream:
+              stream.write(f"publisher_job_id={matches[0]['id']}\n")
+          PY
+
+      - name: Validate API-derived provenance before bundle use
+        id: provenance_pre
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.select.outputs.source_sha }}
+          SECURITY_RUN_ID: ${{ steps.select.outputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ steps.select.outputs.security_run_attempt }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/platform-recovery-publisher"
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          gh_header=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT" --output "$metadata/security-run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/security-jobs.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/security-artifacts.json"
+          /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publisher-validate --metadata "$metadata" --provenance-output "$metadata/provenance-pre.json" --github-output "$GITHUB_OUTPUT" --repository "$REPOSITORY" --producer-run-id "$PRODUCER_RUN_ID" --producer-run-attempt "$PRODUCER_RUN_ATTEMPT" --producer-workflow "$PRODUCER_WORKFLOW" --producer-workflow-path "$PRODUCER_WORKFLOW_PATH" --security-workflow "$SECURITY_WORKFLOW" --security-workflow-path "$SECURITY_WORKFLOW_PATH" --security-job "$SECURITY_JOB" --publisher-workflow-sha "$PUBLISHER_WORKFLOW_SHA" --publisher-run-id "$PUBLISHER_RUN_ID" --publisher-run-attempt "$PUBLISHER_RUN_ATTEMPT" --publisher-job-id "${{ steps.select.outputs.publisher_job_id }}" --github-ref "$GITHUB_REF"
+
+      - name: Download and validate the exact producer bundle
+        id: bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_NAME: ${{ steps.select.outputs.bundle_name }}
+          BUNDLE_ARTIFACT_ID: ${{ steps.select.outputs.bundle_artifact_id }}
+          SOURCE_SHA: ${{ steps.select.outputs.source_sha }}
+          PRODUCER_WORKFLOW_SHA: ${{ steps.select.outputs.producer_workflow_sha }}
+          BUNDLE_ARTIFACT_SHA256: ${{ steps.select.outputs.bundle_artifact_sha256 }}
+          PROVENANCE_PATH: ${{ steps.provenance_pre.outputs.provenance }}
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/platform-recovery-publisher-artifact"
+          install -d -m 700 "$artifact_dir"
+          cleanup() { rm -rf -- "$artifact_dir"; }
+          trap cleanup EXIT
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' "$api/actions/artifacts/$BUNDLE_ARTIFACT_ID/zip" --output "$artifact_dir/producer-artifact.zip"
+          bundle_sha="$(/usr/bin/python3 -I - "$artifact_dir/producer-artifact.zip" "$BUNDLE_NAME" <<'PY'
+          import hashlib
+          import stat
+          import sys
+          import zipfile
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              infos = archive.infolist()
+              if len(infos) != 1 or infos[0].filename != sys.argv[2]:
+                  raise SystemExit("producer artifact archive is not exact")
+              info = infos[0]
+              mode = (info.external_attr >> 16) & 0o177777
+              if info.create_system != 3 or info.is_dir() or not stat.S_ISREG(mode) or stat.S_IMODE(mode) & 0o022:
+                  raise SystemExit("producer bundle member metadata is unsafe")
+              data = archive.read(info)
+              if len(data) != info.file_size:
+                  raise SystemExit("producer bundle member is truncated")
+          print(hashlib.sha256(data).hexdigest())
+          PY
+          )"
+          /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publish-bundle --archive "$artifact_dir/producer-artifact.zip" --output "$artifact_dir/bundle.zip" --expected-name "$BUNDLE_NAME" --expected-sha "$bundle_sha" --artifact-sha256 "$BUNDLE_ARTIFACT_SHA256"
+          /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py validate --bundle "$artifact_dir/bundle.zip" --source-sha "$SOURCE_SHA" --provenance "$PROVENANCE_PATH"
+          /usr/bin/python3 -I - "$artifact_dir/bundle.zip" "$SOURCE_SHA" "$PRODUCER_WORKFLOW_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          import zipfile
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              manifest = json.loads(archive.read("platform-recovery-bootstrap/manifest.json"))
+          provenance = manifest.get("provenance") if isinstance(manifest, dict) else None
+          if not isinstance(provenance, dict) or provenance.get("source_sha") != sys.argv[2] or provenance.get("recovery_workflow_sha") != sys.argv[3] or provenance.get("deployable") is not False:
+              raise SystemExit("bundle A/B provenance is not exact")
+          print(f"bundle_sha={__import__('hashlib').sha256(Path(sys.argv[1]).read_bytes()).hexdigest()}")
+          PY
+          echo "bundle_sha=$bundle_sha" >> "$GITHUB_OUTPUT"
+          cp -- "$artifact_dir/bundle.zip" "$RUNNER_TEMP/$BUNDLE_NAME"
+
+      - name: Validate exact security A and publisher C provenance
+        id: provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.select.outputs.source_sha }}
+          SECURITY_RUN_ID: ${{ steps.select.outputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ steps.select.outputs.security_run_attempt }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/platform-recovery-publisher"
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          gh_header=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT" --output "$metadata/security-run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/security-jobs.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/security-artifacts.json"
+          /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publisher-validate --metadata "$metadata" --provenance-output "$metadata/provenance.json" --github-output "$GITHUB_OUTPUT" --repository "$REPOSITORY" --producer-run-id "$PRODUCER_RUN_ID" --producer-run-attempt "$PRODUCER_RUN_ATTEMPT" --producer-workflow "$PRODUCER_WORKFLOW" --producer-workflow-path "$PRODUCER_WORKFLOW_PATH" --security-workflow "$SECURITY_WORKFLOW" --security-workflow-path "$SECURITY_WORKFLOW_PATH" --security-job "$SECURITY_JOB" --publisher-workflow-sha "$PUBLISHER_WORKFLOW_SHA" --publisher-run-id "$PUBLISHER_RUN_ID" --publisher-run-attempt "$PUBLISHER_RUN_ATTEMPT" --publisher-job-id "${{ steps.select.outputs.publisher_job_id }}" --github-ref "$GITHUB_REF"
+
+      - name: Name exact publisher C outer bundle
+        id: publisher_bundle_name
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.provenance.outputs.source_sha }}
+          SECURITY_RUN_ID: ${{ steps.provenance.outputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ steps.provenance.outputs.security_run_attempt }}
+          PRODUCER_RUN_ID: ${{ steps.provenance.outputs.producer_run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ steps.provenance.outputs.producer_run_attempt }}
+        run: |
+          set -euo pipefail
+          publisher_bundle_name="platform-recovery-bootstrap-publisher-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}-${PRODUCER_RUN_ID}-${PRODUCER_RUN_ATTEMPT}-${PUBLISHER_RUN_ID}-${PUBLISHER_RUN_ATTEMPT}.zip"
+          printf 'publisher_bundle_name=%s\n' "$publisher_bundle_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact C outer bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ steps.publisher_bundle_name.outputs.publisher_bundle_name }}
+          path: ${{ runner.temp }}/${{ steps.select.outputs.bundle_name }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fetch exact C bundle artifact metadata
+        id: publisher_bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHER_BUNDLE_NAME: ${{ steps.publisher_bundle_name.outputs.publisher_bundle_name }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/platform-recovery-publisher"
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/runs/$PUBLISHER_RUN_ID/artifacts?per_page=100&page=1" \
+            --output "$metadata/publisher-artifacts.json"
+          /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publisher-artifact \
+            --metadata "$metadata/publisher-artifacts.json" \
+            --artifact-name "$PUBLISHER_BUNDLE_NAME" \
+            --publisher-run-id "$PUBLISHER_RUN_ID" \
+            --publisher-run-attempt "$PUBLISHER_RUN_ATTEMPT" \
+            --publisher-workflow-sha "$PUBLISHER_WORKFLOW_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Build closed publisher evidence after C upload
+        id: evidence
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.provenance.outputs.source_sha }}
+          SECURITY_RUN_ID: ${{ steps.provenance.outputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ steps.provenance.outputs.security_run_attempt }}
+          PRODUCER_RUN_ID: ${{ steps.provenance.outputs.producer_run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ steps.provenance.outputs.producer_run_attempt }}
+          PRODUCER_JOB_ID: ${{ steps.provenance.outputs.producer_job_id }}
+          PUBLISHER_JOB_ID: ${{ steps.select.outputs.publisher_job_id }}
+          BUNDLE_NAME: ${{ steps.select.outputs.bundle_name }}
+          BUNDLE_SHA: ${{ steps.bundle.outputs.bundle_sha }}
+          BUNDLE_ARTIFACT_SHA256: ${{ steps.provenance.outputs.bundle_artifact_sha256 }}
+          PUBLISHER_BUNDLE_NAME: ${{ steps.publisher_bundle.outputs.publisher_bundle_name }}
+          PUBLISHER_BUNDLE_ARTIFACT_ID: ${{ steps.publisher_bundle.outputs.publisher_bundle_artifact_id }}
+          PUBLISHER_BUNDLE_ARTIFACT_SHA256: ${{ steps.publisher_bundle.outputs.publisher_bundle_artifact_sha256 }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/platform-recovery-publisher"
+          evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}-${PRODUCER_RUN_ID}-${PRODUCER_RUN_ATTEMPT}-${PUBLISHER_RUN_ID}-${PUBLISHER_RUN_ATTEMPT}.json"
+          /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publish-evidence \
+            --provenance "$metadata/provenance.json" --evidence "$RUNNER_TEMP/$evidence_name" \
+            --github-output "$GITHUB_OUTPUT" --bundle-name "$BUNDLE_NAME" --bundle-sha "$BUNDLE_SHA" \
+            --bundle-artifact-sha256 "$BUNDLE_ARTIFACT_SHA256" --recovery-run-id "$PRODUCER_RUN_ID" \
+            --recovery-run-attempt "$PRODUCER_RUN_ATTEMPT" --recovery-job-id "$PRODUCER_JOB_ID" \
+            --publisher-workflow-sha "$PUBLISHER_WORKFLOW_SHA" --publisher-run-id "$PUBLISHER_RUN_ID" \
+            --publisher-run-attempt "$PUBLISHER_RUN_ATTEMPT" --publisher-job-id "$PUBLISHER_JOB_ID" \
+            --publisher-bundle-name "$PUBLISHER_BUNDLE_NAME" \
+            --publisher-bundle-artifact-id "$PUBLISHER_BUNDLE_ARTIFACT_ID" \
+            --publisher-bundle-artifact-sha256 "$PUBLISHER_BUNDLE_ARTIFACT_SHA256"
+
+      - name: Upload closed recovery evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ steps.evidence.outputs.evidence_name }}
+          path: ${{ runner.temp }}/${{ steps.evidence.outputs.evidence_name }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Write non-deployable publisher summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Retained-release recovery bootstrap publisher"
+            echo "- Bundle source A: `${{ steps.provenance.outputs.source_sha }}`"
+            echo "- Producer workflow SHA B: `${{ steps.provenance.outputs.producer_workflow_sha }}`"
+            echo "- Publisher workflow SHA C: `$PUBLISHER_WORKFLOW_SHA`"
+            echo "- Producer run: `$PRODUCER_RUN_ID` attempt `$PRODUCER_RUN_ATTEMPT`"
+            echo "- Publisher run: `$PUBLISHER_RUN_ID` attempt `$PUBLISHER_RUN_ATTEMPT`"
+            echo "- Evidence: `${{ steps.evidence.outputs.evidence_name }}`"
+            echo "- deployable: `false` (no provisioning/deployment authority)"
+          } >> "$GITHUB_STEP_SUMMARY"

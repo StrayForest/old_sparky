@@ -528,6 +528,23 @@ the exact run ID.
 
 ## Contract self-test
 
+The immutable recovery-bootstrap contract is owned by the privileged contour
+(`tests.test_platform_recovery_bootstrap`). Its tests cover deterministic
+closed bundles, source/archive path and type rejection, exact manifest and
+provenance schemas, content-addressed atomic installation, receipt identity
+and migration-uncertainty guards, missing-candidate and generation-byte
+provenance boundaries, two-phase receipt cleanup retries, and the manual
+workflow's secret/SSH ordering. `tests.test_platform_release_systemd_state`
+adds real subprocess coverage for operation-ID/path/inode mismatch,
+helper-manifest tamper-before-systemd, and rollback-target retry binding;
+`tests.test_platform_release_recovery_boundaries` covers rollback/recovery
+subprocess fault boundaries. The recovery-bootstrap contract also executes the
+attestation policy fixture with wrong source/ref/run-attempt/job/subject
+variants, including a recovery-job/evidence/API pairing mutation, and covers
+the exact legacy-v2 no-systemd cleanup bridge. The
+workflow is evidence-only and non-deployable; live execution remains an
+explicit operator recovery action.
+
 The `docs` gate checks document shape, repository-local links and project skill
 frontmatter/interface metadata. `verification-contract` checks registry/CI
 membership, workflow gate names, classifier route ownership and artifact

@@ -33,6 +33,10 @@ WEB_RUNTIME_CACHE_RELATIVE = pathlib.Path(
     "apps/platform_web/.next/standalone/.next/cache"
 )
 WEB_RUNTIME_USER = "oldsparky-web"
+SYSTEMCTL_TIMEOUT_SECONDS = 30.0
+RUNUSER_TIMEOUT_SECONDS = 30.0
+DATABASE_CONNECT_TIMEOUT_SECONDS = 30.0
+DATABASE_COMMAND_TIMEOUT_SECONDS = 30.0
 
 EXPECTED_CSP_POLICY_TEMPLATE = (
     "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; "
@@ -152,12 +156,20 @@ def load_env(path: pathlib.Path) -> dict[str, str]:
 
 
 def check_service_active(service: str) -> dict[str, object]:
-    result = subprocess.run(
-        ["systemctl", "is-active", service],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", service],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {
+            "name": f"service:{service}",
+            "ok": False,
+            "detail": "systemctl probe failed or timed out",
+        }
     status = result.stdout.strip() or result.stderr.strip() or "unknown"
     return {"name": f"service:{service}", "ok": result.returncode == 0 and status == "active", "detail": status}
 
@@ -208,10 +220,11 @@ def check_web_runtime_cache(
             capture_output=True,
             text=True,
             check=False,
+            timeout=RUNUSER_TIMEOUT_SECONDS,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         user_write = None
-        errors.append("runuser is unavailable for the web service probe")
+        errors.append("runuser is unavailable or timed out for the web service probe")
     if user_write is not None and user_write.returncode != 0:
         errors.append("web service account cannot write cache directory")
 
@@ -227,10 +240,11 @@ def check_web_runtime_cache(
             capture_output=True,
             text=True,
             check=False,
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         systemd_paths = None
-        errors.append("systemctl is unavailable for the web sandbox probe")
+        errors.append("systemctl is unavailable or timed out for the web sandbox probe")
     allowlisted_paths: set[str] = set()
     if systemd_paths is not None and systemd_paths.returncode == 0:
         for line in systemd_paths.stdout.splitlines():
@@ -304,6 +318,7 @@ def check_release_layout(app_dir: pathlib.Path) -> list[dict[str, object]]:
 
 async def check_db(database_url: str) -> dict[str, object]:
     connection = None
+    result: dict[str, object]
     try:
         url = make_url(database_url)
         connection = await asyncpg.connect(
@@ -314,14 +329,34 @@ async def check_db(database_url: str) -> dict[str, object]:
             database=(url.database or "").lstrip("/"),
             ssl=False,
             statement_cache_size=0,
+            timeout=DATABASE_CONNECT_TIMEOUT_SECONDS,
+            command_timeout=DATABASE_COMMAND_TIMEOUT_SECONDS,
+            server_settings={
+                "application_name": "oldsparky-deploy-smoke",
+                "statement_timeout": f"{DATABASE_COMMAND_TIMEOUT_SECONDS * 1000:g}ms",
+                "lock_timeout": f"{DATABASE_COMMAND_TIMEOUT_SECONDS * 1000:g}ms",
+            },
         )
-        value = await connection.fetchval("SELECT 1")
-        return {"name": "database_select_1", "ok": int(value) == 1, "detail": "SELECT 1"}
+        value = await connection.fetchval(
+            "SELECT 1",
+            timeout=DATABASE_COMMAND_TIMEOUT_SECONDS,
+        )
+        result = {"name": "database_select_1", "ok": int(value) == 1, "detail": "SELECT 1"}
     except Exception as exc:  # pragma: no cover - exercised on live runtime
-        return {"name": "database_select_1", "ok": False, "detail": str(exc)}
+        result = {"name": "database_select_1", "ok": False, "detail": str(exc)}
     finally:
         if connection is not None:
-            await connection.close()
+            try:
+                await asyncio.wait_for(
+                    connection.close(), timeout=DATABASE_COMMAND_TIMEOUT_SECONDS
+                )
+            except Exception as exc:  # pragma: no cover - exercised on live runtime
+                result = {
+                    "name": "database_select_1",
+                    "ok": False,
+                    "detail": f"connection_close_{type(exc).__name__}",
+                }
+    return result
 
 
 async def check_http_json(

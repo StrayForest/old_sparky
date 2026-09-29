@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import contextlib
+import ast
 import io
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 from tests import platform_test_lock_support as lock_support
 
@@ -25,6 +29,7 @@ import platform_safe_env_exec as safe_env  # noqa: E402
 from tools import platform_nginx_error_summary  # noqa: E402
 from tools import platform_media_migration_diagnostics_summary  # noqa: E402
 from tools import platform_web_runtime_diagnostics_summary  # noqa: E402
+from tools import platform_install_nginx  # noqa: E402
 
 
 class SafeEnvironmentTests(unittest.TestCase):
@@ -102,8 +107,114 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("platform_release_lock.sh", alembic)
         self.assertIn("migration-pending", alembic)
         stop_at = alembic.index("systemctl stop deadlock-api deadlock-worker deadlock-web")
-        exec_at = alembic.index('exec "$PLATFORM_PYTHON_BIN" -m alembic')
+        exec_at = alembic.index('"$PLATFORM_PYTHON_BIN" -m alembic')
         self.assertLess(stop_at, exec_at)
+        self.assertIn('SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"', alembic)
+        self.assertIn('30s "$SYSTEMCTL_BIN"', alembic)
+        self.assertIn('[[ "$status" -eq 3 && "$output" == "inactive" ]]', alembic)
+        self.assertIn('if ! read_inactive_state "$service"', alembic)
+        self.assertIn('stat -c \'%F:%u:%g:%h:%a\'', alembic)
+        self.assertIn("systemctl path metadata is unsafe", alembic)
+        self.assertIn('ALEMBIC_TIMEOUT_BIN="/usr/bin/timeout"', alembic)
+        self.assertIn('"${ALEMBIC_OPERATION_TIMEOUT_SECONDS}s"', alembic)
+
+    def test_production_alembic_stop_and_state_failures_are_before_python(self) -> None:
+        alembic = self.read_tool("platform_run_alembic.sh")
+        stop = alembic.index("run_systemctl stop deadlock-api deadlock-worker deadlock-web")
+        inactive = alembic.index("read_inactive_state", stop)
+        python = alembic.index('"$PLATFORM_PYTHON_BIN" -m alembic')
+        self.assertLess(stop, inactive)
+        self.assertLess(inactive, python)
+        self.assertIn('[[ "$status" -eq 3 && "$output" == "inactive" ]]', alembic)
+        self.assertIn('SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"', alembic)
+        self.assertIn('"$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s', alembic)
+        self.assertIn('ALEMBIC_TIMEOUT_BIN="/usr/bin/timeout"', alembic)
+        self.assertIn('"${ALEMBIC_OPERATION_TIMEOUT_SECONDS}s"', alembic)
+        # rc=1/124 from stop and rc=1/4/124 or non-canonical output from
+        # is-active all remain failures; none may reach Alembic.
+        self.assertIn("run_systemctl stop", alembic)
+        self.assertNotIn("\n  systemctl stop deadlock-api deadlock-worker deadlock-web", alembic)
+
+    def test_current_only_preflight_rejects_stale_systemd_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Path(temporary) / "platform-app"
+            release = app / "releases" / "current-release"
+            shared = app / "shared"
+            release.mkdir(parents=True)
+            shared.mkdir()
+            (app / "current").symlink_to(release)
+            (shared / ".release-systemd-state.json").write_text("stale\n", encoding="ascii")
+            marker = Path(temporary) / "preflight-failure.txt"
+            preflight = Path(temporary) / "platform_release_preflight.sh"
+            source = (TOOLS_DIR / "platform_release_preflight.sh").read_text(encoding="utf-8")
+            self.assertIn("fail() {\n  exit 1\n}", source)
+            preflight.write_text(
+                source.replace(
+                    "fail() {\n  exit 1\n}",
+                    f"fail() {{\n  printf '%s\\n' \"$*\" > {str(marker)!r}\n  exit 1\n}}",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            preflight.chmod(0o755)
+            result = subprocess.run(
+                [
+                    str(preflight),
+                    "--app-dir",
+                    str(app),
+                    "--allow-no-previous",
+                ],
+                env={**os.environ, "PLATFORM_APP_DIR": str(app)},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                marker.read_text(encoding="utf-8").strip(),
+                "--allow-no-previous requires no systemd receipt.",
+            )
+
+    def test_preflight_bad_current_pointer_emits_canonical_failure(self) -> None:
+        source = (TOOLS_DIR / "platform_release_preflight.sh").read_text(
+            encoding="utf-8"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for kind in ("regular", "symlink-to-regular"):
+                with self.subTest(kind=kind):
+                    app = root / kind / "platform-app"
+                    app.mkdir(parents=True)
+                    (app / "shared").mkdir()
+                    if kind == "regular":
+                        (app / "current").write_text("not a pointer\n", encoding="ascii")
+                    else:
+                        target = app / "not-a-release"
+                        target.write_text("not a release\n", encoding="ascii")
+                        (app / "current").symlink_to(target)
+                    preflight = app / "platform_release_preflight.sh"
+                    preflight.write_text(source, encoding="utf-8")
+                    preflight.chmod(0o755)
+                    result = subprocess.run(
+                        [
+                            str(preflight),
+                            "--app-dir",
+                            str(app),
+                            "--allow-no-previous",
+                        ],
+                        env={**os.environ, "PLATFORM_APP_DIR": str(app)},
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 127)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "RELEASE_PREFLIGHT schema=1 status=failed class=preflight",
+                        result.stderr,
+                    )
 
     def test_production_alembic_rejects_adversarial_commands_before_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -221,64 +332,25 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         recover_workflow = (
             WORKFLOW_DIR / "platform-production-release-recover.yml"
         ).read_text(encoding="utf-8")
-        recover_lock = recover_workflow.index(
-            'lock_helper="$runtime/current/tools/platform_release_lock.sh"'
-        )
-        recover_supervisor = recover_workflow.index(
-            '"$lock_helper" --run /bin/bash -s <<\'LOCKED\'', recover_lock
-        )
-        retain_recovery = recover_workflow.index(
-            'recover \\\n            --retain --state "$state"', recover_supervisor
-        )
-        restore_runtime = recover_workflow.index(
-            'PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$restore"', retain_recovery
-        )
-        verify_runtime = recover_workflow.index(
-            'verify --state "$systemd_state"', restore_runtime
-        )
-        nginx_check = recover_workflow.index("nginx -t", verify_runtime)
-        api_health_check = recover_workflow.index(
-            "http://127.0.0.1:8010/api/v1/health/ready", nginx_check
-        )
-        web_health_check = recover_workflow.index(
-            "http://127.0.0.1:3000/", nginx_check
-        )
-        clear_systemd_receipt = recover_workflow.index(
-            'clear --state "$systemd_state"', web_health_check
-        )
-        complete_recovery = recover_workflow.index(
-            'complete-recovery \\\n            --state "$state"', verify_runtime
-        )
-        self.assertLess(recover_lock, recover_supervisor)
-        self.assertLess(recover_supervisor, retain_recovery)
-        self.assertLess(retain_recovery, restore_runtime)
-        self.assertLess(restore_runtime, verify_runtime)
-        self.assertLess(verify_runtime, nginx_check)
-        self.assertLess(nginx_check, api_health_check)
-        self.assertLess(nginx_check, web_health_check)
-        self.assertLess(api_health_check, complete_recovery)
-        self.assertLess(web_health_check, complete_recovery)
-        self.assertLess(clear_systemd_receipt, complete_recovery)
-        self.assertLess(verify_runtime, complete_recovery)
-        self.assertIn("platform_release_lock_supervisor_holds", recover_workflow)
-        self.assertIn("PLATFORM_ENABLE_SYSTEMD_UNITS=0", recover_workflow)
-        self.assertIn('test ! -e "$systemd_state"', recover_workflow)
-        self.assertNotIn("recover-pending", recover_workflow)
-        self.assertNotIn("--recover-pending", recover_workflow)
+        self.assertIn("Transfer exact attested recovery bundle", recover_workflow)
+        self.assertIn('"$bootstrap_tool" install', recover_workflow)
+        self.assertIn("--capability recover_pending", recover_workflow)
+        self.assertIn("generation_name=\"$bundle_sha\"", recover_workflow)
+        self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover_workflow)
+        self.assertIn("platform_recover_pending.sh", recover_workflow)
+        self.assertIn("validate-generation", recover_workflow)
+        self.assertIn("set +e", recover_workflow)
+        self.assertNotIn("$runtime/current/tools", recover_workflow)
+        self.assertNotIn("platform_release_rollback.sh", recover_workflow)
         self.assertNotIn("exec 9<", recover_workflow)
         self.assertNotIn("flock -n 9", recover_workflow)
         self.assertNotIn("PLATFORM_RELEASE_LOCK_FD=9", recover_workflow)
-        self.assertIn("STATE_VERSION = 2", abort_workflow)
-        self.assertIn("QUIESCE_STATE_VERSION = 1", abort_workflow)
-        self.assertIn("status-quiesce", abort_workflow)
-        self.assertIn('"service_state_before"', abort_workflow)
-        self.assertIn('"timer_active_before"', abort_workflow)
-        self.assertIn("trusted_transaction", abort_workflow)
-        self.assertIn("trusted_release", abort_workflow)
-        self.assertIn("assert_unit_state", abort_workflow)
-        self.assertIn('expected_timer', abort_workflow)
-        self.assertIn("preserved inactive", abort_workflow)
-        self.assertIn("test ! -e \"$state\"", abort_workflow)
+        self.assertIn("ABORT-LEGACY-RELEASE", abort_workflow)
+        self.assertIn("platform_recovery_bootstrap.py", abort_workflow)
+        self.assertIn("abort_retained_only", abort_workflow)
+        self.assertIn("legacy bridge accepts one exact v2 receipt schema", abort_workflow)
+        self.assertIn("current_before", abort_workflow)
+        self.assertNotIn("platform_release_deploy", abort_workflow)
         self.assertNotIn(
             'systemctl restart deadlock-api deadlock-worker deadlock-web',
             abort_workflow,
@@ -438,6 +510,206 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("platform_release_lock_exec.sh", unit)
         self.assertIn("platform_update_cloudflare_ips.py --apply --reload", unit)
 
+    def test_cloudflare_refresh_has_bounded_validation_and_service_timeout(self) -> None:
+        updater = self.read_tool("platform_update_cloudflare_ips.py")
+        self.assertIn("FETCH_TIMEOUT_MAX_SECONDS = 30.0", updater)
+        self.assertIn("SUBPROCESS_TIMEOUT_SECONDS = 30.0", updater)
+        self.assertIn("MAX_SUBPROCESS_CALLS = 4", updater)
+        self.assertIn("OPERATION_BUDGET_SECONDS", updater)
+        self.assertIn("SERVICE_TIMEOUT_SECONDS", updater)
+        self.assertIn("timeout=timeout", updater)
+        self.assertIn('SYSTEMCTL_BIN = "/usr/bin/systemctl"', updater)
+        unit = (SYSTEMD_DIR / "deadlock-cloudflare-ips.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("TimeoutStartSec=210s", unit)
+
+    def test_active_path_subprocesses_and_deploy_marker_are_bounded(self) -> None:
+        smoke = self.read_tool("platform_deploy_smoke_impl.py")
+        self.assertIn("SYSTEMCTL_TIMEOUT_SECONDS = 30.0", smoke)
+        self.assertIn("RUNUSER_TIMEOUT_SECONDS = 30.0", smoke)
+        self.assertIn("timeout=SYSTEMCTL_TIMEOUT_SECONDS", smoke)
+        self.assertIn("timeout=RUNUSER_TIMEOUT_SECONDS", smoke)
+        self.assertIn("DATABASE_CONNECT_TIMEOUT_SECONDS = 30.0", smoke)
+        self.assertIn("DATABASE_COMMAND_TIMEOUT_SECONDS = 30.0", smoke)
+        self.assertIn("timeout=DATABASE_COMMAND_TIMEOUT_SECONDS", smoke)
+        self.assertIn("await asyncio.wait_for", smoke)
+        self.assertIn("connection.close()", smoke)
+        edge = self.read_tool("platform_validate_edge_policy.py")
+        self.assertIn("UFW_COMMAND_TIMEOUT_SECONDS = 30.0", edge)
+        self.assertIn("timeout=UFW_COMMAND_TIMEOUT_SECONDS", edge)
+        recovery = self.read_tool("platform_recovery_bootstrap.py")
+        self.assertIn("RECOVERY_SUBPROCESS_TIMEOUT_SECONDS = 120.0", recovery)
+        self.assertIn("start_new_session=True", recovery)
+        self.assertIn("os.killpg", recovery)
+        dispatcher = self.read_tool("platform_workflow_remote_dispatch.py")
+        for value in (
+            "DEPLOY_OPERATION_TIMEOUT_SECONDS = 900.0",
+            "CLEANUP_OPERATION_TIMEOUT_SECONDS = 300.0",
+            "ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS = 120.0",
+            "LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 300.0",
+            "LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0",
+            "start_new_session=True",
+            "os.killpg",
+            "timeout_seconds=ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS",
+        ):
+            self.assertIn(value, dispatcher)
+        health = self.read_tool("platform_health_monitor.py")
+        self.assertIn("HEALTH_OPERATION_BUDGET_SECONDS", health)
+        self.assertIn(
+            "HEALTH_SERVICE_TIMEOUT_SECONDS = HEALTH_OPERATION_BUDGET_SECONDS + 35.0",
+            health,
+        )
+        workflow = (WORKFLOW_DIR / "platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("timeout --foreground 300s ssh", workflow)
+        self.assertIn("timeout --foreground 300s scp", workflow)
+        self.assertIn("timeout --foreground 900s ssh", workflow)
+        self.assertIn("ServerAliveInterval=15", workflow)
+        self.assertIn("ServerAliveCountMax=3", workflow)
+        self.assertIn("/usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s", workflow)
+        self.assertIn("timeout --foreground --signal=TERM --kill-after=5s 30s", workflow)
+        self.assertIn("if [[ -z \"$public_line\" ]]; then", workflow)
+        self.assertIn(
+            "exit 1\n          fi\n          printf '%s\\n' \"$public_line\"",
+            workflow,
+        )
+        for recovery_workflow in (
+            WORKFLOW_DIR / "platform-production-recovery-bootstrap-abort.yml",
+            WORKFLOW_DIR / "platform-production-release-recover.yml",
+        ):
+            recovery_source = recovery_workflow.read_text(encoding="utf-8")
+            self.assertIn("timeout --foreground 300s ssh", recovery_source)
+            self.assertIn("timeout --foreground 300s scp", recovery_source)
+
+        alembic = self.read_tool("platform_run_alembic.sh")
+        self.assertIn("PLATFORM_ALEMBIC_OPERATION_GUARDED", alembic)
+        self.assertIn('"${ALEMBIC_OPERATION_TIMEOUT_SECONDS}s"', alembic)
+        recovery_db = self.read_tool("platform_tournament_list_read_model_recovery.py")
+        for value in (
+            "RECOVERY_DB_CONNECT_TIMEOUT_SECONDS = 30.0",
+            "RECOVERY_DB_COMMAND_TIMEOUT_SECONDS = 30.0",
+            '"statement_timeout": RECOVERY_DB_STATEMENT_TIMEOUT_MS',
+            '"lock_timeout": RECOVERY_DB_LOCK_TIMEOUT_MS',
+        ):
+            self.assertIn(value, recovery_db)
+        preflight = self.read_tool("platform_release_preflight.sh")
+        self.assertIn('DB_OPERATION_TIMEOUT_SECONDS="30"', preflight)
+        self.assertIn("PLATFORM_DB_STATEMENT_TIMEOUT_MS=\"30000\"", preflight)
+        self.assertIn('"${DB_OPERATION_TIMEOUT_SECONDS}s"', preflight)
+        alembic_env = (PLATFORM_ROOT / "alembic/env.py").read_text(encoding="utf-8")
+        for value in (
+            "ALEMBIC_DB_CONNECT_TIMEOUT_SECONDS = 30.0",
+            "ALEMBIC_DB_COMMAND_TIMEOUT_SECONDS = 30.0",
+            "ALEMBIC_DB_STATEMENT_TIMEOUT_MS = 30_000",
+            "ALEMBIC_DB_LOCK_TIMEOUT_MS = 30_000",
+            '"statement_timeout": _bounded_milliseconds(',
+            '"lock_timeout": _bounded_milliseconds(',
+            "connect_args=alembic_asyncpg_connect_args()",
+        ):
+            self.assertIn(value, alembic_env)
+        self.assertIn("ALEMBIC_DB_TIMEOUT_MAX_SECONDS = 30.0", alembic_env)
+        self.assertIn("ALEMBIC_DB_TIMEOUT_MAX_MS = 30_000", alembic_env)
+        tree = ast.parse(alembic_env)
+        timeout_functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_bounded_seconds", "_bounded_milliseconds"}
+        ]
+        namespace = {
+            "os": os,
+            "math": __import__("math"),
+            "ALEMBIC_DB_TIMEOUT_MAX_SECONDS": 30.0,
+            "ALEMBIC_DB_TIMEOUT_MAX_MS": 30_000,
+        }
+        exec(compile(ast.Module(body=timeout_functions, type_ignores=[]), str(PLATFORM_ROOT / "alembic/env.py"), "exec"), namespace)
+        with mock.patch.dict(os.environ, {"PLATFORM_ALEMBIC_DB_CONNECT_TIMEOUT_SECONDS": "30.001"}, clear=True):
+            with self.assertRaises(RuntimeError):
+                namespace["_bounded_seconds"](
+                    "PLATFORM_ALEMBIC_DB_CONNECT_TIMEOUT_SECONDS", default=30.0
+                )
+        with mock.patch.dict(os.environ, {"PLATFORM_ALEMBIC_DB_CONNECT_TIMEOUT_SECONDS": "30"}, clear=True):
+            self.assertEqual(
+                namespace["_bounded_seconds"](
+                    "PLATFORM_ALEMBIC_DB_CONNECT_TIMEOUT_SECONDS", default=30.0
+                ),
+                30.0,
+            )
+        with mock.patch.dict(os.environ, {"PLATFORM_ALEMBIC_DB_STATEMENT_TIMEOUT_MS": "30001"}, clear=True):
+            with self.assertRaises(RuntimeError):
+                namespace["_bounded_milliseconds"](
+                    "PLATFORM_ALEMBIC_DB_STATEMENT_TIMEOUT_MS", default=30_000
+                )
+        with mock.patch.dict(os.environ, {"PLATFORM_ALEMBIC_DB_STATEMENT_TIMEOUT_MS": "30000"}, clear=True):
+            self.assertEqual(
+                namespace["_bounded_milliseconds"](
+                    "PLATFORM_ALEMBIC_DB_STATEMENT_TIMEOUT_MS", default=30_000
+                ),
+                "30000ms",
+            )
+
+    def test_production_supervisor_nginx_validation_is_bounded_and_absolute(self) -> None:
+        supervisor = self.read_tool("platform_production_deploy_supervisor.sh")
+        self.assertIn('NGINX_BIN="/usr/sbin/nginx"', supervisor)
+        self.assertIn('NGINX_TIMEOUT_BIN="/usr/bin/timeout"', supervisor)
+        self.assertIn('"${NGINX_CONFIG_TIMEOUT_SECONDS}s"', supervisor)
+        self.assertIn("run_nginx_config_test", supervisor)
+        self.assertNotIn("nginx -t >/dev/null", supervisor)
+
+    def test_production_supervisor_systemctl_calls_are_bounded_and_strict(self) -> None:
+        supervisor = self.read_tool("platform_production_deploy_supervisor.sh")
+        self.assertIn('SYSTEMCTL_BIN="/usr/bin/systemctl"', supervisor)
+        self.assertIn('SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"', supervisor)
+        self.assertIn('"${SYSTEMCTL_TIMEOUT_SECONDS}s" "$SYSTEMCTL_BIN"', supervisor)
+        self.assertIn("service_is_active", supervisor)
+        self.assertIn("0:active", supervisor)
+        self.assertIn("3:inactive", supervisor)
+        self.assertNotRegex(supervisor, r"(?m)^\s+systemctl\s+(restart|is-active|show)\b")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_systemctl = root / "systemctl"
+            fake_systemctl.write_text(
+                "#!/usr/bin/env bash\n"
+                "sleep 5\n",
+                encoding="ascii",
+            )
+            fake_systemctl.chmod(0o755)
+            start = supervisor.index("run_systemctl()")
+            end = supervisor.index("\n}\n", start) + 3
+            active_start = supervisor.index("service_is_active()")
+            active_end = supervisor.index("\n}\n", active_start) + 3
+            probe = (
+                "set -u\n"
+                f'SYSTEMCTL_BIN={str(fake_systemctl)!r}\n'
+                'SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"\n'
+                "SYSTEMCTL_TIMEOUT_SECONDS=0.1\n"
+                f"{supervisor[start:end]}\n"
+                f"{supervisor[active_start:active_end]}\n"
+                "service_is_active deadlock-api\n"
+                "printf '%s\\n' \"$?\"\n"
+            )
+            result = subprocess.run(
+                ["bash", "-c", probe],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "4")
+
+    def test_platform_logging_systemctl_calls_are_bounded_and_strict(self) -> None:
+        logging = self.read_tool("platform_install_logging.sh")
+        self.assertIn('SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"', logging)
+        self.assertIn('"${SYSTEMCTL_TIMEOUT_SECONDS}s" "$SYSTEMCTL_BIN"', logging)
+        self.assertIn("reload_if_active", logging)
+        self.assertIn("0:active", logging)
+        self.assertIn("3:inactive", logging)
+        self.assertNotRegex(logging, r"(?m)^\s+systemctl\s+(is-active|try-reload-or-restart)\b")
+
     def test_runtime_node_is_exactly_pinned(self) -> None:
         web_unit = (SYSTEMD_DIR / "deadlock-web.service").read_text(
             encoding="utf-8"
@@ -454,7 +726,509 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         installer = self.read_tool("platform_install_systemd_units.sh")
         self.assertIn("RETIRED_UNITS", installer)
         self.assertIn('rm -f -- "$unit_path"', installer)
-        self.assertIn("systemctl disable", installer)
+        self.assertIn("run_systemctl disable", installer)
+        self.assertIn("read_active_state", installer)
+        self.assertIn("read_enabled_state", installer)
+        self.assertIn("0:active", installer)
+        self.assertIn("3:inactive", installer)
+        self.assertIn("0:enabled", installer)
+        self.assertIn("1:disabled", installer)
+        self.assertIn("schema=2", installer)
+        self.assertIn("phase=cleanup-pending", installer)
+        self.assertIn("RETIRED_SOURCE_DIGEST", installer)
+        self.assertIn("RETIRED_BACKUP_IDENTITY", installer)
+        self.assertIn("retired_sync_path", installer)
+        self.assertIn("os.fsync", installer)
+        self.assertIn("retired_reject_orphans", installer)
+        self.assertIn("retired_validate_backup_entries", installer)
+        self.assertIn("retired_cleanup_pending", installer)
+        self.assertIn("retired_reconcile_status_temps", installer)
+        self.assertIn("RETIRED_PHASE_INTENDED", installer)
+        self.assertIn("RETIRED_DURABLE_PHASE", installer)
+        self.assertIn("RETIRED_PHASE_WRITE_FAILED", installer)
+        self.assertIn("phase-status-write", installer)
+        self.assertIn("phase-status-fsync", installer)
+        mutation_start = installer.index(
+            'if [[ "${RETIRED_ACTIVE_BEFORE[$unit_name]}" == "active" ]]'
+        )
+        self.assertLess(installer.index("prepare_retired_transaction"), mutation_start)
+        self.assertLess(installer.index("write_retired_rollback_status"), mutation_start)
+        self.assertNotIn("is-active --quiet", installer)
+        self.assertNotIn("is-enabled --quiet", installer)
+
+    def test_systemd_installer_retired_cleanup_is_bounded_and_transactional(self) -> None:
+        installer_source = self.read_tool("platform_install_systemd_units.sh")
+        # Keep the production guard tied to /etc/systemd/system; this isolated
+        # subprocess replaces only that literal so the fake destination can
+        # exercise the same cleanup transaction without widening production
+        # path authority.
+        installer_source = installer_source.replace(
+            'if [[ "$SYSTEMD_DEST_DIR" == "/etc/systemd/system" && "$ENABLE_SYSTEMD_UNITS" == "1" ]]; then',
+            'if [[ "$ENABLE_SYSTEMD_UNITS" == "1" ]]; then',
+            1,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / "platform" / "tools"
+            units = root / "platform" / "deploy" / "systemd"
+            destination = root / "etc" / "systemd" / "system"
+            app_dir = root / "app"
+            tools.mkdir(parents=True)
+            units.mkdir(parents=True)
+            destination.mkdir(parents=True)
+            app_dir.mkdir()
+            timeout_wrapper = root / "timeout-wrapper"
+            timeout_wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -u\n"
+                "log=${FAKE_TIMEOUT_LOG:-}\n"
+                "args=(\"$@\")\n"
+                "if [[ \"${FAKE_STOP_TIMEOUT:-0}\" == 1 || \"${FAKE_DISABLE_TIMEOUT:-0}\" == 1 ]]; then\n"
+                "  args[2]=\"${FAKE_TEST_TIMEOUT_SECONDS:-1}s\"\n"
+                "fi\n"
+                "if [[ -n \"$log\" ]]; then\n"
+                "  { printf 'start command='; printf '%q ' \"${args[@]}\"; printf '\\n'; } >> \"$log\"\n"
+                "fi\n"
+                "/usr/bin/timeout \"${args[@]}\"\n"
+                "status=$?\n"
+                "if [[ -n \"$log\" ]]; then\n"
+                "  { printf 'exit=%s command=' \"$status\"; printf '%q ' \"${args[@]}\"; printf '\\n'; } >> \"$log\"\n"
+                "fi\n"
+                "exit \"$status\"\n",
+                encoding="ascii",
+            )
+            timeout_wrapper.chmod(0o755)
+            installer_source = installer_source.replace(
+                'SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"',
+                f'SYSTEMCTL_TIMEOUT_BIN="{timeout_wrapper}"',
+                1,
+            )
+            installer = tools / "platform_install_systemd_units.sh"
+            installer.write_text(installer_source, encoding="utf-8")
+            installer.chmod(0o755)
+            for unit in SYSTEMD_DIR.glob("deadlock-*.service"):
+                shutil.copy2(unit, units / unit.name)
+            for unit in SYSTEMD_DIR.glob("deadlock-*.timer"):
+                shutil.copy2(unit, units / unit.name)
+            for name in ("platform_install_logging.sh", "platform_prepare_service_user.sh"):
+                stub = tools / name
+                stub.write_text("#!/usr/bin/env bash\nset -eu\nexit 0\n", encoding="ascii")
+                stub.chmod(0o755)
+            fake_systemctl = root / "systemctl"
+            reload_count = root / "daemon-reload-count"
+            fake_systemctl.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                "action=${1:-}\n"
+                "printf '%s\\n' \"$action\" >> \"${FAKE_SYSTEMCTL_LOG}\"\n"
+                "case \"$action\" in\n"
+                "  is-active)\n"
+                "    if [[ -n \"${FAKE_ACTIVE_RC:-}\" ]]; then printf '%s\\n' inactive; exit \"$FAKE_ACTIVE_RC\"; fi\n"
+                "    state=inactive; test ! -e \"$FAKE_ACTIVE_STATE\" || state=$(cat \"$FAKE_ACTIVE_STATE\"); printf '%s\\n' \"$state\"; [[ \"$state\" == active ]] && exit 0 || exit 3\n"
+                "    ;;\n"
+                "  is-enabled)\n"
+                "    if [[ -n \"${FAKE_ENABLED_RC:-}\" ]]; then printf '%s\\n' disabled; exit \"$FAKE_ENABLED_RC\"; fi\n"
+                "    state=disabled; test ! -e \"$FAKE_ENABLED_STATE\" || state=$(cat \"$FAKE_ENABLED_STATE\"); printf '%s\\n' \"$state\"; [[ \"$state\" == enabled ]] && exit 0 || exit 1\n"
+                "    ;;\n"
+                "  daemon-reload) count=0; test ! -e \"$FAKE_RELOAD_COUNT\" || count=$(cat \"$FAKE_RELOAD_COUNT\"); count=$((count + 1)); printf '%s' \"$count\" > \"$FAKE_RELOAD_COUNT\"; if [[ \"${FAKE_PAUSE_RELOAD_COUNT:-0}\" == \"$count\" ]]; then touch \"$FAKE_PAUSE_MARKER\"; sleep 5; fi; test \"$count\" != \"${FAKE_FAIL_RELOAD_AT:-0}\" ;;\n"
+                "  stop)\n"
+                "    [[ \"${FAKE_STOP_TIMEOUT:-0}\" != 1 ]] || sleep 5\n"
+                "    [[ \"${FAKE_STOP_RC:-0}\" -eq 0 ]] || exit \"$FAKE_STOP_RC\"\n"
+                "    [[ \"${FAKE_PAUSE_BEFORE_ACTION:-}\" != stop ]] || { touch \"$FAKE_PAUSE_MARKER\"; sleep 5; }\n"
+                "    printf '%s' inactive > \"$FAKE_ACTIVE_STATE\"; if [[ \"${FAKE_PAUSE_ACTION:-}\" == stop ]]; then touch \"$FAKE_PAUSE_MARKER\"; sleep 5; fi; exit 0\n"
+                "    ;;\n"
+                "  disable)\n"
+                "    [[ \"${FAKE_DISABLE_TIMEOUT:-0}\" != 1 ]] || sleep 5\n"
+                "    [[ \"${FAKE_DISABLE_RC:-0}\" -eq 0 ]] || exit \"$FAKE_DISABLE_RC\"\n"
+                "    printf '%s' disabled > \"$FAKE_ENABLED_STATE\"; if [[ \"${FAKE_PAUSE_ACTION:-}\" == disable ]]; then touch \"$FAKE_PAUSE_MARKER\"; sleep 5; fi; exit 0\n"
+                "    ;;\n"
+                "  start) [[ \"${FAKE_RESTORE_FAIL_ACTION:-}\" != start || -e \"${FAKE_RESTORE_FAIL_MARKER:-/nonexistent}\" ]] || { touch \"$FAKE_RESTORE_FAIL_MARKER\"; exit 4; }; printf '%s' active > \"$FAKE_ACTIVE_STATE\"; exit 0 ;;\n"
+                "  enable) [[ \"${FAKE_RESTORE_FAIL_ACTION:-}\" != enable || -e \"${FAKE_RESTORE_FAIL_MARKER:-/nonexistent}\" ]] || { touch \"$FAKE_RESTORE_FAIL_MARKER\"; exit 4; }; printf '%s' enabled > \"$FAKE_ENABLED_STATE\"; exit 0 ;;\n"
+                "  restart) exit 0 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n",
+                encoding="ascii",
+            )
+            fake_systemctl.chmod(0o755)
+
+            def run_case(
+                *, reset_state: bool = True, create_retired: bool = True,
+                kill_point: str | None = None, **overrides: str
+            ) -> tuple[subprocess.CompletedProcess[str], Path]:
+                retired = destination / "deadlock-retired.service"
+                if create_retired:
+                    retired.write_text("[Unit]\nDescription=retired\n", encoding="ascii")
+                    retired.chmod(0o644)
+                environment = {
+                    **os.environ,
+                    "PLATFORM_SYSTEMD_DIR": str(destination),
+                    "PLATFORM_APP_DIR": str(app_dir),
+                    "PLATFORM_SYSTEMCTL_BIN": str(fake_systemctl),
+                    "PLATFORM_ENABLE_SYSTEMD_UNITS": "1",
+                    "FAKE_RELOAD_COUNT": str(reload_count),
+                    "FAKE_ACTIVE_STATE": str(root / "active-state"),
+                    "FAKE_ENABLED_STATE": str(root / "enabled-state"),
+                    "FAKE_SYSTEMCTL_LOG": str(root / "systemctl.log"),
+                    "FAKE_TIMEOUT_LOG": str(root / "timeout.log"),
+                    **overrides,
+                }
+                pause_marker = root / "pause-marker"
+                pause_marker.unlink(missing_ok=True)
+                if kill_point == "record":
+                    environment["FAKE_PAUSE_BEFORE_ACTION"] = "stop"
+                    environment["FAKE_PAUSE_MARKER"] = str(pause_marker)
+                elif kill_point in {"stop", "disable"}:
+                    environment["FAKE_PAUSE_ACTION"] = kill_point
+                    environment["FAKE_PAUSE_MARKER"] = str(pause_marker)
+                elif kill_point == "remove":
+                    environment["FAKE_PAUSE_RELOAD_COUNT"] = "2"
+                    environment["FAKE_PAUSE_MARKER"] = str(pause_marker)
+                elif kill_point == "new-reload":
+                    environment["FAKE_PAUSE_RELOAD_COUNT"] = "1"
+                    environment["FAKE_PAUSE_MARKER"] = str(pause_marker)
+                elif kill_point in {
+                    "cleanup-phase-record",
+                    "backup-unlink",
+                    "backup-rmdir",
+                    "status-clear",
+                    "status-temp-write",
+                    "status-temp-rename",
+                    "restore-temp-write",
+                    "restore-temp-rename",
+                }:
+                    environment["PLATFORM_TEST_RETIRED_PAUSE_POINT"] = kill_point
+                    environment["PLATFORM_TEST_RETIRED_PAUSE_MARKER"] = str(pause_marker)
+                if reset_state:
+                    reload_count.unlink(missing_ok=True)
+                    for state_path in (
+                        Path(environment["FAKE_ACTIVE_STATE"]),
+                        Path(environment["FAKE_ENABLED_STATE"]),
+                        Path(environment["FAKE_SYSTEMCTL_LOG"]),
+                    ):
+                        state_path.unlink(missing_ok=True)
+                    if "FAKE_INITIAL_ACTIVE" in overrides:
+                        Path(environment["FAKE_ACTIVE_STATE"]).write_text(
+                            overrides["FAKE_INITIAL_ACTIVE"], encoding="ascii"
+                        )
+                    if "FAKE_INITIAL_ENABLED" in overrides:
+                        Path(environment["FAKE_ENABLED_STATE"]).write_text(
+                            overrides["FAKE_INITIAL_ENABLED"], encoding="ascii"
+                        )
+                if kill_point is None:
+                    result = subprocess.run(
+                        [str(installer)],
+                        cwd=root,
+                        env=environment,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        timeout=20,
+                    )
+                else:
+                    process = subprocess.Popen(
+                        [str(installer)],
+                        cwd=root,
+                        env=environment,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        start_new_session=True,
+                    )
+
+                    def kill_process_group() -> None:
+                        # The installer, timeout wrapper and fake systemctl
+                        # share this session.  Kill only that exact group so
+                        # a deliberately interrupted transaction cannot leak
+                        # a sleeping child into the retry.
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+
+                    def reap_killed_process() -> tuple[str, str]:
+                        try:
+                            return process.communicate(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            kill_process_group()
+                            return process.communicate(timeout=10)
+
+                    deadline = time.monotonic() + 10
+                    while not pause_marker.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    if not pause_marker.exists():
+                        kill_process_group()
+                        stdout, stderr = reap_killed_process()
+                        self.fail(f"installer did not reach kill point {kill_point}: {stderr}")
+                    kill_process_group()
+                    stdout, stderr = reap_killed_process()
+                    result = subprocess.CompletedProcess(
+                        [str(installer)], -9, stdout, stderr
+                    )
+                return result, retired
+
+            for variable, value in (
+                ("FAKE_ACTIVE_RC", "4"),
+                ("FAKE_ACTIVE_RC", "124"),
+                ("FAKE_ENABLED_RC", "4"),
+                ("FAKE_ENABLED_RC", "124"),
+            ):
+                with self.subTest(variable=variable, value=value):
+                    result, retired = run_case(**{variable: value})
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(retired.exists(), result.stderr)
+
+            result, retired = run_case(
+                FAKE_FAIL_RELOAD_AT="1",
+                FAKE_INITIAL_ACTIVE="active",
+                FAKE_INITIAL_ENABLED="enabled",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(retired.exists(), result.stderr)
+            self.assertEqual((root / "active-state").read_text(encoding="ascii"), "active")
+            self.assertEqual((root / "enabled-state").read_text(encoding="ascii"), "enabled")
+
+            result, retired = run_case(
+                FAKE_FAIL_RELOAD_AT="2",
+                FAKE_INITIAL_ACTIVE="active",
+                FAKE_INITIAL_ENABLED="enabled",
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(retired.exists(), result.stderr)
+            self.assertEqual((root / "active-state").read_text(encoding="ascii"), "active")
+            self.assertEqual((root / "enabled-state").read_text(encoding="ascii"), "enabled")
+
+            result, retired = run_case(
+                FAKE_INITIAL_ACTIVE="active", FAKE_INITIAL_ENABLED="enabled"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(retired.exists(), result.stderr)
+            log = (root / "systemctl.log").read_text(encoding="ascii").splitlines()
+            self.assertIn("stop", log)
+            self.assertIn("disable", log)
+            self.assertGreaterEqual(log.count("is-active"), 2)
+            self.assertGreaterEqual(log.count("is-enabled"), 2)
+
+            for failure in (
+                {"FAKE_INITIAL_ACTIVE": "active", "FAKE_STOP_RC": "4"},
+                {"FAKE_INITIAL_ACTIVE": "active", "FAKE_STOP_TIMEOUT": "1"},
+                {"FAKE_INITIAL_ENABLED": "enabled", "FAKE_DISABLE_RC": "4"},
+                {"FAKE_INITIAL_ENABLED": "enabled", "FAKE_DISABLE_TIMEOUT": "1"},
+            ):
+                with self.subTest(retired_failure=failure):
+                    result, retired = run_case(**failure)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(retired.exists(), result.stderr)
+
+            result, retired = run_case()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(retired.exists(), result.stderr)
+            durable_status = destination / ".oldsparky-retired-rollback-status"
+
+            # A phase receipt is only authoritative after its replacement has
+            # been atomically renamed and fsynced.  Inject failure on each
+            # side of that boundary: the EXIT rollback must restore the
+            # retired file and exact active/enabled states, and must retain
+            # the active receipt plus backup for a retry.
+            for phase_failure in ("phase-status-write", "phase-status-fsync"):
+                with self.subTest(phase_failure=phase_failure):
+                    phase_failure_marker = root / f"{phase_failure}.marker"
+                    phase_failure_marker.unlink(missing_ok=True)
+                    result, retired = run_case(
+                        FAKE_INITIAL_ACTIVE="active",
+                        FAKE_INITIAL_ENABLED="enabled",
+                        PLATFORM_TEST_RETIRED_FAIL_POINT=phase_failure,
+                        PLATFORM_TEST_RETIRED_FAIL_MARKER=str(phase_failure_marker),
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(retired.exists(), result.stderr)
+                    self.assertTrue(durable_status.exists(), result.stderr)
+                    self.assertIn(
+                        "phase=active\n",
+                        durable_status.read_text(encoding="ascii"),
+                    )
+                    self.assertTrue(
+                        list(destination.glob(".oldsparky-retired.*")),
+                        result.stderr,
+                    )
+                    self.assertEqual(
+                        (root / "active-state").read_text(encoding="ascii"),
+                        "active",
+                    )
+                    self.assertEqual(
+                        (root / "enabled-state").read_text(encoding="ascii"),
+                        "enabled",
+                    )
+                    retry, retired = run_case(
+                        reset_state=False,
+                        create_retired=False,
+                    )
+                    self.assertEqual(retry.returncode, 0, retry.stderr)
+                    self.assertFalse(retired.exists(), retry.stderr)
+                    self.assertFalse(durable_status.exists(), retry.stderr)
+                    self.assertFalse(
+                        list(destination.glob(".oldsparky-retired.*")),
+                        retry.stderr,
+                    )
+
+            rollback_marker = root / "retired-rollback-failed"
+            result, retired = run_case(
+                FAKE_FAIL_RELOAD_AT="1",
+                FAKE_INITIAL_ACTIVE="active",
+                FAKE_INITIAL_ENABLED="enabled",
+                FAKE_RESTORE_FAIL_ACTION="start",
+                FAKE_RESTORE_FAIL_MARKER=str(rollback_marker),
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(retired.exists(), result.stderr)
+            self.assertTrue(durable_status.exists(), result.stderr)
+            result, retired = run_case(
+                reset_state=False,
+                create_retired=False,
+                FAKE_FAIL_RELOAD_AT="0",
+                FAKE_RESTORE_FAIL_ACTION="start",
+                FAKE_RESTORE_FAIL_MARKER=str(rollback_marker),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(retired.exists(), result.stderr)
+            self.assertFalse(durable_status.exists(), result.stderr)
+
+            # A SIGKILL is deliberately injected at every durable transaction
+            # boundary.  Retry must use the exact record/backup to restore the
+            # retired file and both systemd states before beginning a fresh
+            # install; no EXIT trap is available to help the killed process.
+            for kill_point in ("record", "stop", "disable", "remove", "new-reload"):
+                with self.subTest(kill_point=kill_point):
+                    result, retired = run_case(
+                        kill_point=kill_point,
+                        FAKE_INITIAL_ACTIVE="active",
+                        FAKE_INITIAL_ENABLED="enabled",
+                    )
+                    self.assertEqual(result.returncode, -9, result.stderr)
+                    self.assertTrue(durable_status.exists(), result.stderr)
+                    retry, retired = run_case(
+                        reset_state=False,
+                        create_retired=False,
+                    )
+                    self.assertEqual(retry.returncode, 0, retry.stderr)
+                    self.assertFalse(retired.exists(), retry.stderr)
+                    self.assertFalse(durable_status.exists(), retry.stderr)
+
+            for kill_point in (
+                "cleanup-phase-record",
+                "backup-unlink",
+                "backup-rmdir",
+                "status-clear",
+                "status-temp-write",
+                "status-temp-rename",
+            ):
+                with self.subTest(cleanup_kill_point=kill_point):
+                    result, retired = run_case(
+                        kill_point=kill_point,
+                        FAKE_INITIAL_ACTIVE="active",
+                        FAKE_INITIAL_ENABLED="enabled",
+                    )
+                    self.assertEqual(result.returncode, -9, result.stderr)
+                    retry, retired = run_case(
+                        reset_state=False,
+                        create_retired=False,
+                    )
+                    self.assertEqual(retry.returncode, 0, retry.stderr)
+                    self.assertFalse(retired.exists(), retry.stderr)
+                    self.assertFalse(durable_status.exists(), retry.stderr)
+
+            for kill_point in ("restore-temp-write", "restore-temp-rename"):
+                with self.subTest(restore_kill_point=kill_point):
+                    result, retired = run_case(
+                        kill_point=kill_point,
+                        FAKE_FAIL_RELOAD_AT="1",
+                        FAKE_INITIAL_ACTIVE="active",
+                        FAKE_INITIAL_ENABLED="enabled",
+                    )
+                    self.assertEqual(result.returncode, -9, result.stderr)
+                    self.assertTrue(durable_status.exists(), result.stderr)
+                    retry, retired = run_case(
+                        reset_state=False,
+                        create_retired=False,
+                    )
+                    self.assertEqual(retry.returncode, 0, retry.stderr)
+                    self.assertFalse(retired.exists(), retry.stderr)
+                    self.assertFalse(durable_status.exists(), retry.stderr)
+
+            timeout_log = (root / "timeout.log").read_text(encoding="ascii")
+            timeout_lines = timeout_log.splitlines()
+            self.assertTrue(
+                any(line.startswith("start command=") for line in timeout_lines),
+                timeout_log,
+            )
+            self.assertTrue(
+                any(
+                    line.startswith("exit=0 command=") and "30s" in line
+                    for line in timeout_lines
+                ),
+                timeout_log,
+            )
+            self.assertTrue(
+                any(
+                    line.startswith("exit=124 command=") and "1s" in line
+                    for line in timeout_lines
+                ),
+                timeout_log,
+            )
+
+    def test_release_systemctl_mutations_use_trusted_bounded_wrapper(self) -> None:
+        for name in (
+            "platform_install_systemd_units.sh",
+            "platform_release_restore_runtime.sh",
+            "platform_recover_pending.sh",
+        ):
+            text = self.read_tool(name)
+            with self.subTest(tool=name):
+                self.assertIn('SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"', text)
+                self.assertIn(
+                    '"$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s',
+                    text,
+                )
+                self.assertIn("run_systemctl", text)
+        recovery = self.read_tool("platform_recover_pending.sh")
+        self.assertIn("inactive:3:inactive", recovery)
+        self.assertNotIn("inactive) ! run_systemctl", recovery)
+
+    def test_nginx_reload_uses_bounded_timeout_and_fails_closed(self) -> None:
+        source = self.read_tool("platform_install_nginx.py")
+        self.assertIn("SYSTEMCTL_RELOAD_TIMEOUT_SECONDS = 30.0", source)
+        self.assertIn("NGINX_CONFIG_TIMEOUT_SECONDS = 30.0", source)
+        self.assertEqual(source.count("timeout=OPENSSL_TIMEOUT_SECONDS"), 4)
+        self.assertEqual(source.count("timeout=NGINX_CONFIG_TIMEOUT_SECONDS"), 2)
+        self.assertEqual(source.count("timeout=SYSTEMCTL_RELOAD_TIMEOUT_SECONDS"), 2)
+        captured: dict[str, object] = {}
+
+        def timed_out(command: list[str], **kwargs: object) -> object:
+            captured["command"] = command
+            captured.update(kwargs)
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with mock.patch.object(platform_install_nginx.subprocess, "run", side_effect=timed_out):
+            with self.assertRaisesRegex(RuntimeError, "Command timed out safely after 30s"):
+                platform_install_nginx.run_checked(
+                    ["systemctl", "reload", "nginx.service"],
+                    timeout=platform_install_nginx.SYSTEMCTL_RELOAD_TIMEOUT_SECONDS,
+                )
+        self.assertEqual(captured["command"], ["systemctl", "reload", "nginx.service"])
+        self.assertEqual(captured["timeout"], 30.0)
+
+    def test_recovery_nginx_config_checks_are_bounded_and_fail_closed(self) -> None:
+        for name in ("platform_recover_pending.sh", "platform_release_restore_runtime.sh"):
+            source = self.read_tool(name)
+            with self.subTest(tool=name):
+                self.assertIn('NGINX_TIMEOUT_BIN="/usr/bin/timeout"', source)
+                self.assertIn('NGINX_CONFIG_TIMEOUT_SECONDS=30', source)
+                self.assertIn("run_nginx_config_test", source)
+                self.assertIn('"${NGINX_CONFIG_TIMEOUT_SECONDS}s"', source)
 
     def test_production_logging_avoids_duplicate_access_and_worker_info_streams(self) -> None:
         api_runner = self.read_tool("platform_run_api.sh")
@@ -759,7 +1533,11 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         for name in workflow_names:
             workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
             self.assertIn(expected_fingerprint, workflow, name)
-            self.assertIn("StrictHostKeyChecking yes", workflow, name)
+            self.assertTrue(
+                "StrictHostKeyChecking yes" in workflow
+                or "StrictHostKeyChecking=yes" in workflow,
+                name,
+            )
             self.assertIn("ssh-keygen -lf", workflow, name)
             self.assertNotIn(
                 'ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts',

@@ -14,6 +14,7 @@ import zipfile
 
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
 from tests import platform_test_lock_support as lock_support
+from tools import platform_release_systemd_state
 from tools import platform_validate_release_artifact
 from tools import platform_validate_wheelhouse
 
@@ -26,10 +27,29 @@ RUNTIME_RESTORE_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_re
 RECOVERY_SHIM_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_recovery_shim.sh"
 TRANSACTION_STATE_NAME = ".release-operation.json"
 BUILT_AT = "20260811T120000Z"
+RELEASE_HELPER_NAMES = (
+    "platform_install_systemd_units.sh",
+    "platform_install_nginx.py",
+    "platform_deploy_smoke.py",
+    "platform_live_qa_runtime_install.py",
+    "platform_install_logging.sh",
+    "platform_prepare_service_user.sh",
+    "platform_render_service_envs.py",
+    "platform_deploy_smoke_impl.py",
+    "platform_safe_env_exec.py",
+    "platform_release_restore_runtime.sh",
+    "platform_release_systemd_state.py",
+    "platform_release_transaction.py",
+    "platform_release_lock.sh",
+)
 
 
 class PlatformReleaseVenvRollbackTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.assertEqual(
+            tuple(f"tools/{name}" for name in RELEASE_HELPER_NAMES),
+            platform_release_systemd_state.HELPER_RELATIVE_PATHS,
+        )
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self._release_lock = None
@@ -571,6 +591,67 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 self.assertFalse(any(self.shared_dir.glob(".venv-install-*")))
                 self.assertFalse((self.shared_dir / TRANSACTION_STATE_NAME).exists())
 
+    def test_first_install_interruption_uses_install_recovery_fallback(self) -> None:
+        artifact = self.build_artifact("first-install", pip_result="new")
+        injected = self.write_injected_script(
+            INSTALL_SCRIPT,
+            "platform_release_install_first_bootstrap.sh",
+            "    /usr/bin/python3 -I \"$TRANSACTION_TOOL\" rename \\\n"
+            "      --state \"$TRANSACTION_STATE\" \\\n"
+            "      --mode activate-created\n",
+            '/bin/kill -KILL "$$" # test first-install interruption\n',
+        )
+
+        result = self.run_script(
+            injected,
+            str(artifact),
+            str(self.app_dir),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        state = self.shared_dir / TRANSACTION_STATE_NAME
+        self.assertTrue(state.is_file())
+        record = json.loads(state.read_text(encoding="ascii"))
+        self.assertEqual(record["operation"], "install")
+        self.assertEqual(len(record["operation_id"]), 32)
+        self.assertIsNone(record["current_before"])
+        self.assertIsNone(record["previous_before"])
+        self.assertTrue((self.shared_dir / "venv").is_dir())
+
+        systemd_state = self.shared_dir / ".release-systemd-state.json"
+        systemd_state.write_text("unexpected\n", encoding="ascii")
+        systemd_state.chmod(0o600)
+        blocked = self.run_script(
+            ROLLBACK_SCRIPT,
+            "--recover-pending",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertTrue(state.exists())
+        self.assertTrue((self.shared_dir / "venv").is_dir())
+        systemd_state.unlink()
+
+        recovered = self.run_script(
+            ROLLBACK_SCRIPT,
+            "--recover-pending",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(os.path.lexists(self.app_dir / "current"))
+        self.assertFalse(os.path.lexists(self.app_dir / "previous"))
+        self.assertFalse((self.shared_dir / "venv").exists())
+        self.assertFalse(state.exists())
+        self.assertFalse(
+            (self.releases_dir / f"first-install-{BUILT_AT}").exists()
+        )
+        self.assertFalse(any(self.shared_dir.glob(".venv-install-*")))
+
     def test_rollback_interruptions_restore_exact_original_state(self) -> None:
         current_release, previous_release, snapshot = self.prepare_rollback_fixture()
         cases = (
@@ -877,12 +958,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         release.mkdir()
         tools = release / "tools"
         tools.mkdir()
-        for tool_name in (
-            "platform_install_systemd_units.sh",
-            "platform_install_nginx.py",
-            "platform_deploy_smoke.py",
-            "platform_live_qa_runtime_install.py",
-        ):
+        for tool_name in RELEASE_HELPER_NAMES:
             tool = tools / tool_name
             tool.write_text("#!/usr/bin/env sh\nexit 0\n")
             tool.chmod(0o755)
@@ -918,6 +994,11 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             helper.parent.mkdir(parents=True, exist_ok=True)
             helper.write_text("# aggregate-only runtime helper fixture\n")
         self.add_liveqa_runtime(release)
+        for tool_name in RELEASE_HELPER_NAMES:
+            helper = release / "tools" / tool_name
+            helper.parent.mkdir(parents=True, exist_ok=True)
+            helper.write_text("#!/usr/bin/env sh\nexit 0\n")
+            helper.chmod(0o755)
         runtime_installer = release / "tools" / "platform_live_qa_runtime_install.py"
         runtime_installer.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n")
         runtime_installer.chmod(0o755)

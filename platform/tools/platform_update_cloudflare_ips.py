@@ -16,6 +16,14 @@ import urllib.request
 IPV4_URL = "https://www.cloudflare.com/ips-v4"
 IPV6_URL = "https://www.cloudflare.com/ips-v6"
 DEFAULT_OUTPUT = Path("/etc/nginx/cloudflare-real-ip.conf")
+FETCH_TIMEOUT_MAX_SECONDS = 30.0
+SUBPROCESS_TIMEOUT_SECONDS = 30.0
+MAX_SUBPROCESS_CALLS = 4
+OPERATION_BUDGET_SECONDS = (
+    2 * FETCH_TIMEOUT_MAX_SECONDS + MAX_SUBPROCESS_CALLS * SUBPROCESS_TIMEOUT_SECONDS
+)
+SERVICE_TIMEOUT_SECONDS = OPERATION_BUDGET_SECONDS + 30.0
+SYSTEMCTL_BIN = "/usr/bin/systemctl"
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,8 +83,19 @@ def render_config(
     return "\n".join(lines) + "\n"
 
 
-def run_checked(command: list[str]) -> None:
-    subprocess.run(command, check=True, text=True, capture_output=True)
+def run_checked(command: list[str], *, timeout: float = SUBPROCESS_TIMEOUT_SECONDS) -> None:
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"bounded command timed out after {timeout:g}s: {command[0]}"
+        ) from exc
 
 
 def _atomic_write(output: Path, content: str) -> None:
@@ -106,8 +125,11 @@ def install_candidate(output: Path, content: str, nginx_bin: str, reload_nginx: 
     previous = output.read_text(encoding="utf-8") if output.exists() else None
     if previous == content:
         if reload_nginx:
-            run_checked([nginx_bin, "-t"])
-            run_checked(["systemctl", "reload", "nginx.service"])
+            run_checked([nginx_bin, "-t"], timeout=SUBPROCESS_TIMEOUT_SECONDS)
+            run_checked(
+                [SYSTEMCTL_BIN, "reload", "nginx.service"],
+                timeout=SUBPROCESS_TIMEOUT_SECONDS,
+            )
         return False
 
     if output.is_absolute() and not str(output).startswith("/tmp/") and os.geteuid() != 0:
@@ -118,9 +140,12 @@ def install_candidate(output: Path, content: str, nginx_bin: str, reload_nginx: 
         shutil.copy2(output, backup)
     _atomic_write(output, content)
     try:
-        run_checked([nginx_bin, "-t"])
+        run_checked([nginx_bin, "-t"], timeout=SUBPROCESS_TIMEOUT_SECONDS)
         if reload_nginx:
-            run_checked(["systemctl", "reload", "nginx.service"])
+            run_checked(
+                [SYSTEMCTL_BIN, "reload", "nginx.service"],
+                timeout=SUBPROCESS_TIMEOUT_SECONDS,
+            )
         return True
     except Exception as install_error:
         rollback_errors: list[str] = []
@@ -132,12 +157,15 @@ def install_candidate(output: Path, content: str, nginx_bin: str, reload_nginx: 
         except Exception as exc:  # pragma: no cover - catastrophic filesystem failure
             rollback_errors.append(f"restore include: {exc}")
         try:
-            run_checked([nginx_bin, "-t"])
+            run_checked([nginx_bin, "-t"], timeout=SUBPROCESS_TIMEOUT_SECONDS)
         except Exception as exc:  # pragma: no cover - live rollback failure
             rollback_errors.append(f"validate restored nginx: {exc}")
         if reload_nginx:
             try:
-                run_checked(["systemctl", "reload", "nginx.service"])
+                run_checked(
+                    [SYSTEMCTL_BIN, "reload", "nginx.service"],
+                    timeout=SUBPROCESS_TIMEOUT_SECONDS,
+                )
             except Exception as exc:  # pragma: no cover - live rollback failure
                 rollback_errors.append(f"reload restored nginx: {exc}")
         if rollback_errors:
@@ -152,8 +180,11 @@ def main() -> int:
     args = parse_args()
     if args.reload and not args.apply:
         raise ValueError("--reload requires --apply.")
-    if args.timeout <= 0 or args.timeout > 60:
-        raise ValueError("--timeout must be greater than zero and at most 60 seconds.")
+    if args.timeout <= 0 or args.timeout > FETCH_TIMEOUT_MAX_SECONDS:
+        raise ValueError(
+            "--timeout must be greater than zero and at most "
+            f"{FETCH_TIMEOUT_MAX_SECONDS:g} seconds."
+        )
 
     ipv4 = parse_ranges(fetch_text(IPV4_URL, args.timeout), 4)
     ipv6 = parse_ranges(fetch_text(IPV6_URL, args.timeout), 6)

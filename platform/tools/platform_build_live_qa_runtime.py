@@ -34,6 +34,7 @@ def _validate_import_directory(path: Path) -> None:
         canonical != path
         or stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_nlink < 2
         or metadata.st_mode & 0o7000
         or stat.S_IMODE(metadata.st_mode) & 0o022
         or (
@@ -264,6 +265,7 @@ def _copy_tree(source: Path, destination: Path) -> None:
             if (
                 directory_metadata.st_uid != 0
                 or directory_metadata.st_gid != 0
+                or directory_metadata.st_nlink < 2
                 or directory_metadata.st_mode & 0o7000
                 or stat.S_IMODE(directory_metadata.st_mode) & 0o022
             ):
@@ -295,6 +297,7 @@ def _validate_browser_directory(path: Path) -> os.stat_result:
         or stat.S_ISLNK(metadata.st_mode)
         or metadata.st_uid != 0
         or metadata.st_gid != 0
+        or metadata.st_nlink < 2
         or metadata.st_mode & 0o7000
         or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
@@ -655,6 +658,7 @@ def _tree_digest(root: Path) -> tuple[str, dict[str, str]]:
             if (
                 metadata.st_uid != 0
                 or metadata.st_gid != 0
+                or metadata.st_nlink < 2
                 or metadata.st_mode & 0o7000
                 or stat.S_IMODE(metadata.st_mode) & 0o022
             ):

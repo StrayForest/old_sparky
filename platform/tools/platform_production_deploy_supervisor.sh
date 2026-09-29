@@ -10,13 +10,19 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 # for nested non-isolated helpers as well, so no Python child writes into the
 # root-owned immutable generation.
 export PYTHONDONTWRITEBYTECODE=1
+NGINX_BIN="/usr/sbin/nginx"
+NGINX_TIMEOUT_BIN="/usr/bin/timeout"
+NGINX_CONFIG_TIMEOUT_SECONDS=30
+SYSTEMCTL_BIN="/usr/bin/systemctl"
+SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"
+SYSTEMCTL_TIMEOUT_SECONDS=30
 
 invalid_input() {
   printf '%s\n' 'ERROR: deployment input is invalid' >&2
   exit 2
 }
 
-if (( $# != 5 )); then
+if (( $# != 5 && $# != 8 )); then
   invalid_input
 fi
 target_sha="$1"
@@ -24,6 +30,14 @@ release_slug="$2"
 deploy_mode="$3"
 artifact_dir="$4"
 runtime_profile="$5"
+host_tools_sha=""
+host_manifest_sha=""
+host_capabilities_sha=""
+if (( $# == 8 )); then
+  host_tools_sha="$6"
+  host_manifest_sha="$7"
+  host_capabilities_sha="$8"
+fi
 
 runtime=/opt/oldsparky/platform
 current="$runtime/current"
@@ -46,6 +60,30 @@ set_failure_context() {
   failure_reason="$3"
 }
 
+run_nginx_config_test() {
+  "$NGINX_TIMEOUT_BIN" --foreground --signal=TERM --kill-after=5s \
+    "${NGINX_CONFIG_TIMEOUT_SECONDS}s" "$NGINX_BIN" -t
+}
+
+run_systemctl() {
+  "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s \
+    "${SYSTEMCTL_TIMEOUT_SECONDS}s" "$SYSTEMCTL_BIN" "$@"
+}
+
+service_is_active() {
+  local service="$1" output status
+  if output="$(run_systemctl is-active "$service" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status:$output" in
+    0:active) return 0 ;;
+    3:inactive) return 3 ;;
+    *) return 4 ;;
+  esac
+}
+
 fail() {
   # Failure detail remains private machine state. The runner only
   # accepts the fixed, token-only RELEASE_DEPLOY line below.
@@ -53,6 +91,16 @@ fail() {
   printf 'RELEASE_DEPLOY schema=1 status=failed class=%s phase=%s reason=%s release_slug=%s source_sha=%s\n' \
     "$failure_class" "$failure_phase" "$failure_reason" "$release_slug" "$target_sha"
   exit 1
+}
+
+validate_systemctl_binary() {
+  [[ -f "$SYSTEMCTL_BIN" && ! -L "$SYSTEMCTL_BIN" ]] \
+    || fail "trusted systemctl binary is unavailable"
+  [[ "$(/usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$SYSTEMCTL_BIN" 2>/dev/null)" \
+    == "regular file:0:0:1:755" ]] \
+    || fail "trusted systemctl binary metadata is unsafe"
+  [[ "$(/usr/bin/readlink -f -- "$SYSTEMCTL_BIN" 2>/dev/null)" == "$SYSTEMCTL_BIN" ]] \
+    || fail "trusted systemctl binary resolves through a link"
 }
 
 artifact_identity_snapshot() {
@@ -132,15 +180,17 @@ case "$runtime_profile" in
   *) invalid_input ;;
 esac
 
+validate_systemctl_binary
+
 if [[ -e "$artifact_dir" || -L "$artifact_dir" ]]; then
   artifact_identity_before_lock="$(artifact_identity_snapshot "$artifact_dir" 2>/dev/null || true)"
   [[ -n "$artifact_identity_before_lock" ]] || invalid_input
 fi
 
 restart_web_and_wait() {
-  systemctl restart deadlock-web
+  run_systemctl restart deadlock-web || return 1
   for _ in $(seq 1 30); do
-    if systemctl is-active --quiet deadlock-web \
+    if service_is_active deadlock-web \
       && curl --fail --silent --show-error --max-time 2 \
         http://127.0.0.1:3000/ >/dev/null; then
       return 0
@@ -151,9 +201,9 @@ restart_web_and_wait() {
 }
 
 restart_api_and_wait() {
-  systemctl restart deadlock-api || return 1
+  run_systemctl restart deadlock-api || return 1
   for _ in $(seq 1 30); do
-    if systemctl is-active --quiet deadlock-api \
+    if service_is_active deadlock-api \
       && curl --fail --silent --show-error --max-time 2 \
         http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
       return 0
@@ -196,6 +246,96 @@ for host_helper in \
   platform_configure_shared_env.py; do
   require_host_helper "$host_tools_dir/$host_helper"
 done
+
+if (( $# == 8 )); then
+  [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]] || invalid_input
+  [[ "$host_manifest_sha" =~ ^[0-9a-f]{64}$ ]] || invalid_input
+  [[ "$host_capabilities_sha" =~ ^[0-9a-f]{64}$ ]] || invalid_input
+  [[ "$host_tools_dir" == "/opt/oldsparky/platform/shared/host-tools/$host_tools_sha" ]] || invalid_input
+  /usr/bin/python3.12 -I -B - "$host_tools_dir" "$host_tools_sha" "$host_manifest_sha" "$host_capabilities_sha" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+root, expected_generation, expected_manifest, expected_capabilities = sys.argv[1:]
+root = Path(root)
+expected_generation = str(expected_generation)
+expected_manifest = str(expected_manifest)
+expected_capabilities = str(expected_capabilities)
+expected_files = {
+    "platform_workflow_remote_dispatch.py",
+    "platform_workflow_input_guard.py",
+    "platform_prepare_artifact_dir.py",
+    "platform_production_deploy_supervisor.sh",
+    "platform_release_lock.sh",
+    "platform_release_preflight.sh",
+    "platform_validate_release_artifact.py",
+    "platform_safe_env_exec.py",
+    "platform_render_service_envs.py",
+    "platform_validate_edge_policy.py",
+    "platform_update_cloudflare_ips.py",
+    "platform_configure_shared_env.py",
+    "platform_storage_evidence_summary.py",
+    "capabilities.txt",
+}
+if set(path.name for path in root.iterdir()) != expected_files | {"manifest.json"}:
+    raise SystemExit(1)
+def read_stable(path, mode):
+    before = os.lstat(path)
+    if (
+        not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != 0 or before.st_gid != 0 or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != mode or before.st_size > 512 * 1024
+    ):
+        raise SystemExit(1)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(fd)
+        data = bytearray()
+        while len(data) <= 512 * 1024:
+            chunk = os.read(fd, min(1024 * 1024, 512 * 1024 + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        final = os.fstat(fd)
+        if (
+            len(data) != final.st_size or opened.st_ino != final.st_ino
+            or opened.st_dev != final.st_dev or opened.st_mode != final.st_mode
+            or opened.st_mtime_ns != final.st_mtime_ns or opened.st_ctime_ns != final.st_ctime_ns
+        ):
+            raise SystemExit(1)
+        return bytes(data)
+    finally:
+        os.close(fd)
+manifest_bytes = read_stable(root / "manifest.json", 0o444)
+capabilities_bytes = read_stable(root / "capabilities.txt", 0o444)
+if hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest:
+    raise SystemExit(1)
+if hashlib.sha256(capabilities_bytes).hexdigest() != expected_capabilities:
+    raise SystemExit(1)
+manifest = json.loads(manifest_bytes.decode("utf-8"))
+if (
+    manifest.get("schema") != 1
+    or manifest.get("source_sha") != expected_generation
+    or manifest.get("generation") != expected_generation
+    or not isinstance(manifest.get("files"), list)
+):
+    raise SystemExit(1)
+records = {record.get("path"): record for record in manifest["files"] if isinstance(record, dict)}
+if set(records) != expected_files:
+    raise SystemExit(1)
+for name, record in records.items():
+    mode = 0o444 if name == "capabilities.txt" else 0o555
+    data = capabilities_bytes if name == "capabilities.txt" else read_stable(root / name, mode)
+    if set(record) != {"path", "sha256", "mode"} or record["mode"] != mode:
+        raise SystemExit(1)
+    if hashlib.sha256(data).hexdigest() != record["sha256"]:
+        raise SystemExit(1)
+PY
+fi
 
 set_failure_context preflight preflight lock
 # Lock order is release -> retained-load.  Both locks use the shared pathname
@@ -242,19 +382,44 @@ trap cleanup EXIT
 
 set_failure_context preflight preflight environment
 test "$(id -u)" -eq 0 || fail "deployment user must be root"
-test -L "$current" || fail "current release symlink is missing"
-test -L "$runtime/previous" || fail "previous release symlink is missing"
-set_failure_context preflight preflight service_state
-for service in deadlock-api deadlock-worker deadlock-web; do
-  systemctl is-active --quiet "$service" || fail "$service is not active before deployment"
-done
+initial_install=0
+current_only_install=0
+if [[ -L "$current" ]]; then
+  if [[ -L "$runtime/previous" ]]; then
+    :
+  elif [[ ! -e "$runtime/previous" ]]; then
+    current_only_install=1
+  else
+    fail "previous release pointer is unsafe"
+  fi
+elif [[ ! -e "$current" ]]; then
+  [[ ! -e "$runtime/previous" && ! -L "$runtime/previous" ]] \
+    || fail "first install cannot have a previous release"
+  initial_install=1
+else
+  fail "current release pointer is unsafe"
+fi
 
-set_failure_context preflight preflight nginx_config
-nginx -t >/dev/null
+if (( initial_install == 0 )); then
+  set_failure_context preflight preflight service_state
+  for service in deadlock-api deadlock-worker deadlock-web; do
+    service_is_active "$service" || fail "$service is not active before deployment"
+  done
+
+  set_failure_context preflight preflight nginx_config
+  run_nginx_config_test >/dev/null 2>&1 \
+    || fail "Nginx configuration validation failed or timed out"
+fi
 
 set_failure_context preflight preflight preflight_failed
+preflight_previous_flag=(--require-previous)
+if (( initial_install == 1 )); then
+  preflight_previous_flag=(--allow-initial-install)
+elif (( current_only_install == 1 )); then
+  preflight_previous_flag=(--allow-no-previous)
+fi
 "$host_tools_dir/platform_release_preflight.sh" \
-  --require-previous \
+  "${preflight_previous_flag[@]}" \
   --require-verified-backup \
   --require-edge-parity \
   --backup-max-age-hours 24 >/dev/null 2>/dev/null
@@ -397,7 +562,7 @@ fi
 set_failure_context preflight preflight preflight_failed
 "$host_tools_dir/platform_release_preflight.sh" \
   --app-dir "$runtime" \
-  --require-previous \
+  "${preflight_previous_flag[@]}" \
   --require-verified-backup \
   --require-edge-parity \
   --backup-max-age-hours 24 >/dev/null 2>/dev/null
@@ -443,7 +608,7 @@ if (( candidate_status != 0 )); then
     emit_candidate_disk logs /var/log
     for service in deadlock-api deadlock-worker deadlock-web; do
       local service_output
-      service_output="$(systemctl show "$service" \
+      service_output="$(run_systemctl show "$service" \
         --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec \
         --no-pager 2>/dev/null)" \
         || return 1
@@ -489,10 +654,10 @@ case "$runtime_profile" in
       --only PLATFORM_SSR_PERF_LOG_ENABLED \
       --only PLATFORM_SSR_PERF_SAMPLE_RATE \
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-    systemctl restart deadlock-api
+    run_systemctl restart deadlock-api
     api_ready=false
     for _ in $(seq 1 30); do
-      if systemctl is-active --quiet deadlock-api \
+      if service_is_active deadlock-api \
         && curl --fail --silent --show-error --max-time 2 \
           http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
         api_ready=true
@@ -537,10 +702,10 @@ case "$runtime_profile" in
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
       "${ready_vote_profile_args[@]}"
-    systemctl restart deadlock-api
+    run_systemctl restart deadlock-api
     api_ready=false
     for _ in $(seq 1 30); do
-      if systemctl is-active --quiet deadlock-api \
+      if service_is_active deadlock-api \
         && curl --fail --silent --show-error --max-time 2 \
           http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
         api_ready=true
@@ -580,10 +745,10 @@ case "$runtime_profile" in
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
         "${restore_ready_vote_profile_args[@]}"
-      systemctl restart deadlock-api
+      run_systemctl restart deadlock-api
       api_ready=false
       for _ in $(seq 1 30); do
-        if systemctl is-active --quiet deadlock-api \
+        if service_is_active deadlock-api \
           && curl --fail --silent --show-error --max-time 2 \
             http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
           api_ready=true
@@ -616,10 +781,10 @@ case "$runtime_profile" in
       --only PLATFORM_SSR_PERF_LOG_ENABLED \
       --only PLATFORM_SSR_PERF_SAMPLE_RATE \
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-    systemctl restart deadlock-api
+    run_systemctl restart deadlock-api
     api_ready=false
     for _ in $(seq 1 30); do
-      if systemctl is-active --quiet deadlock-api \
+      if service_is_active deadlock-api \
         && curl --fail --silent --show-error --max-time 2 \
           http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
         api_ready=true
@@ -641,10 +806,10 @@ case "$runtime_profile" in
         --only PLATFORM_SSR_PERF_LOG_ENABLED \
         --only PLATFORM_SSR_PERF_SAMPLE_RATE \
         --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-      systemctl restart deadlock-api
+      run_systemctl restart deadlock-api
       api_ready=false
       for _ in $(seq 1 30); do
-        if systemctl is-active --quiet deadlock-api \
+        if service_is_active deadlock-api \
           && curl --fail --silent --show-error --max-time 2 \
             http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
           api_ready=true
@@ -690,10 +855,10 @@ case "$runtime_profile" in
         || fail "web SSR diagnostic API health check failed; baseline restore failed"
       fail "web SSR diagnostic API health check failed; baseline restored"
     fi
-    systemctl restart deadlock-web
+    run_systemctl restart deadlock-web
     web_ready=false
     for _ in $(seq 1 30); do
-      if systemctl is-active --quiet deadlock-web \
+      if service_is_active deadlock-web \
         && curl --fail --silent --show-error --max-time 2 \
           http://127.0.0.1:3000/ >/dev/null; then
         web_ready=true
@@ -709,10 +874,10 @@ case "$runtime_profile" in
         "${web_ssr_profile_args[@]}"
       restart_api_and_wait \
         || fail "web SSR diagnostic profile health check failed; API baseline restore failed"
-      systemctl restart deadlock-web
+      run_systemctl restart deadlock-web
       web_ready=false
       for _ in $(seq 1 30); do
-        if systemctl is-active --quiet deadlock-web \
+        if service_is_active deadlock-web \
           && curl --fail --silent --show-error --max-time 2 \
             http://127.0.0.1:3000/ >/dev/null; then
           web_ready=true
@@ -770,10 +935,10 @@ case "$runtime_profile" in
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
       "${candidate_profile_args[@]}"
-    systemctl restart deadlock-api
+    run_systemctl restart deadlock-api
     api_ready=false
     for _ in $(seq 1 30); do
-      if systemctl is-active --quiet deadlock-api \
+      if service_is_active deadlock-api \
         && curl --fail --silent --show-error --max-time 2 \
           http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
         api_ready=true
@@ -787,10 +952,10 @@ case "$runtime_profile" in
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
         "${candidate_profile_args[@]}"
-      systemctl restart deadlock-api
+      run_systemctl restart deadlock-api
       api_ready=false
       for _ in $(seq 1 30); do
-        if systemctl is-active --quiet deadlock-api \
+        if service_is_active deadlock-api \
           && curl --fail --silent --show-error --max-time 2 \
             http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
           api_ready=true
@@ -815,10 +980,10 @@ case "$runtime_profile" in
       --only PLATFORM_LOG_LEVEL \
       --only PLATFORM_PERF_LOG_ENABLED \
       --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-    systemctl restart deadlock-api
+    run_systemctl restart deadlock-api
     api_ready=false
     for _ in $(seq 1 30); do
-      if systemctl is-active --quiet deadlock-api \
+      if service_is_active deadlock-api \
         && curl --fail --silent --show-error --max-time 2 \
           http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
         api_ready=true
@@ -838,10 +1003,10 @@ case "$runtime_profile" in
         --only PLATFORM_LOG_LEVEL \
         --only PLATFORM_PERF_LOG_ENABLED \
         --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-      systemctl restart deadlock-api
+      run_systemctl restart deadlock-api
       api_ready=false
       for _ in $(seq 1 30); do
-        if systemctl is-active --quiet deadlock-api \
+        if service_is_active deadlock-api \
           && curl --fail --silent --show-error --max-time 2 \
             http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
           api_ready=true
@@ -866,10 +1031,10 @@ case "$runtime_profile" in
       --only PLATFORM_LOG_LEVEL \
       --only PLATFORM_PERF_LOG_ENABLED \
       --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-    systemctl restart deadlock-api
+    run_systemctl restart deadlock-api
     api_ready=false
     for _ in $(seq 1 30); do
-      if systemctl is-active --quiet deadlock-api \
+      if service_is_active deadlock-api \
         && curl --fail --silent --show-error --max-time 2 \
           http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
         api_ready=true
@@ -889,10 +1054,10 @@ case "$runtime_profile" in
         --only PLATFORM_LOG_LEVEL \
         --only PLATFORM_PERF_LOG_ENABLED \
         --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-      systemctl restart deadlock-api
+      run_systemctl restart deadlock-api
       api_ready=false
       for _ in $(seq 1 30); do
-        if systemctl is-active --quiet deadlock-api \
+        if service_is_active deadlock-api \
           && curl --fail --silent --show-error --max-time 2 \
             http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
           api_ready=true
