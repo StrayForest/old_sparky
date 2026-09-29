@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -766,10 +767,6 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             'if [[ "$ENABLE_SYSTEMD_UNITS" == "1" ]]; then',
             1,
         )
-        installer_source = installer_source.replace(
-            '"$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s "$SYSTEMCTL_BIN"',
-            '"$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 0.1s "$SYSTEMCTL_BIN"',
-        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             tools = root / "platform" / "tools"
@@ -780,6 +777,32 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             units.mkdir(parents=True)
             destination.mkdir(parents=True)
             app_dir.mkdir()
+            timeout_wrapper = root / "timeout-wrapper"
+            timeout_wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -u\n"
+                "log=${FAKE_TIMEOUT_LOG:-}\n"
+                "args=(\"$@\")\n"
+                "if [[ \"${FAKE_STOP_TIMEOUT:-0}\" == 1 || \"${FAKE_DISABLE_TIMEOUT:-0}\" == 1 ]]; then\n"
+                "  args[2]=\"${FAKE_TEST_TIMEOUT_SECONDS:-1}s\"\n"
+                "fi\n"
+                "if [[ -n \"$log\" ]]; then\n"
+                "  { printf 'start command='; printf '%q ' \"${args[@]}\"; printf '\\n'; } >> \"$log\"\n"
+                "fi\n"
+                "/usr/bin/timeout \"${args[@]}\"\n"
+                "status=$?\n"
+                "if [[ -n \"$log\" ]]; then\n"
+                "  { printf 'exit=%s command=' \"$status\"; printf '%q ' \"${args[@]}\"; printf '\\n'; } >> \"$log\"\n"
+                "fi\n"
+                "exit \"$status\"\n",
+                encoding="ascii",
+            )
+            timeout_wrapper.chmod(0o755)
+            installer_source = installer_source.replace(
+                'SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"',
+                f'SYSTEMCTL_TIMEOUT_BIN="{timeout_wrapper}"',
+                1,
+            )
             installer = tools / "platform_install_systemd_units.sh"
             installer.write_text(installer_source, encoding="utf-8")
             installer.chmod(0o755)
@@ -846,6 +869,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     "FAKE_ACTIVE_STATE": str(root / "active-state"),
                     "FAKE_ENABLED_STATE": str(root / "enabled-state"),
                     "FAKE_SYSTEMCTL_LOG": str(root / "systemctl.log"),
+                    "FAKE_TIMEOUT_LOG": str(root / "timeout.log"),
                     **overrides,
                 }
                 pause_marker = root / "pause-marker"
@@ -909,16 +933,39 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                         text=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
+                        start_new_session=True,
                     )
+
+                    def kill_process_group() -> None:
+                        # The installer, timeout wrapper and fake systemctl
+                        # share this session.  Kill only that exact group so
+                        # a deliberately interrupted transaction cannot leak
+                        # a sleeping child into the retry.
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+
+                    def reap_killed_process() -> tuple[str, str]:
+                        try:
+                            return process.communicate(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            kill_process_group()
+                            return process.communicate(timeout=10)
+
                     deadline = time.monotonic() + 10
                     while not pause_marker.exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
                     if not pause_marker.exists():
-                        process.kill()
-                        stdout, stderr = process.communicate(timeout=10)
+                        kill_process_group()
+                        stdout, stderr = reap_killed_process()
                         self.fail(f"installer did not reach kill point {kill_point}: {stderr}")
-                    process.kill()
-                    stdout, stderr = process.communicate(timeout=10)
+                    kill_process_group()
+                    stdout, stderr = reap_killed_process()
                     result = subprocess.CompletedProcess(
                         [str(installer)], -9, stdout, stderr
                     )
@@ -1111,6 +1158,27 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                     self.assertEqual(retry.returncode, 0, retry.stderr)
                     self.assertFalse(retired.exists(), retry.stderr)
                     self.assertFalse(durable_status.exists(), retry.stderr)
+
+            timeout_log = (root / "timeout.log").read_text(encoding="ascii")
+            timeout_lines = timeout_log.splitlines()
+            self.assertTrue(
+                any(line.startswith("start command=") for line in timeout_lines),
+                timeout_log,
+            )
+            self.assertTrue(
+                any(
+                    line.startswith("exit=0 command=") and "30s" in line
+                    for line in timeout_lines
+                ),
+                timeout_log,
+            )
+            self.assertTrue(
+                any(
+                    line.startswith("exit=124 command=") and "1s" in line
+                    for line in timeout_lines
+                ),
+                timeout_log,
+            )
 
     def test_release_systemctl_mutations_use_trusted_bounded_wrapper(self) -> None:
         for name in (
