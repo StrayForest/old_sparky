@@ -2691,7 +2691,7 @@ def summarize_ssr_observability(
     web_journal_lines: list[str],
     nginx_records: list[dict[str, Any]],
     api_journal_lines: list[str] | None = None,
-    timeout_diagnostic_ids: set[str] | None = None,
+    timeout_diagnostic_ids: tuple[str, ...] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Join sampled SSR/stream stages with Nginx and API timings.
 
@@ -3038,6 +3038,7 @@ def summarize_ssr_observability(
             api_rows = api_perf_by_cf_ray.get(cf_ray, [])
         timeout_diagnostic_rows.append(
             {
+                "diagnostic_id": diagnostic_id,
                 "route_class": safe_route_class(record.get("uri") or "", page=True),
                 "method": safe_method(record.get("method")),
                 "status": safe_status(record.get("status")),
@@ -3072,6 +3073,16 @@ def summarize_ssr_observability(
                 },
             }
         )
+
+    if timeout_diagnostic_ids is not None:
+        expected_ids = sorted(timeout_diagnostic_ids)
+        observed_ids = [str(row["diagnostic_id"]) for row in timeout_diagnostic_rows]
+        if (
+            len(observed_ids) != len(set(observed_ids))
+            or sorted(observed_ids) != expected_ids
+        ):
+            raise ValueError("timeout diagnostic origin rows do not exactly correlate")
+        timeout_diagnostic_rows.sort(key=lambda row: str(row["diagnostic_id"]))
 
     event_loop_details = [
         {

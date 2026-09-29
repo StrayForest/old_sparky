@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Join bounded client timeout evidence with bounded origin observations.
 
-This tool is diagnostic-only.  It never makes requests, changes runtime state,
-or treats a missing layer record as proof that the layer was healthy.  The
-client report is the complete timeout population; the origin report contains
-only the bounded rows selected for the same diagnostic window.  Correlation
-identifiers are intentionally not required or emitted.  Rows are paired by
-their bounded observation order and all public fields pass through the same
-closed route/status/error schema used by the load producers.
+This tool is diagnostic-only.  It never makes requests or changes runtime
+state.  The client report is the complete timeout population and the origin
+report must contain exactly the same bounded diagnostic IDs.  Rows are paired
+by the validated ID, never by an assumed observation order or by truncating a
+missing origin row.
 """
 
 from __future__ import annotations
@@ -17,6 +15,7 @@ from collections import Counter
 import json
 from pathlib import Path
 import re
+import sys
 from typing import Any
 
 try:
@@ -51,6 +50,7 @@ NGINX_TIMEOUT_POLICY = {
     "source": "canonical_nginx_timeout_policy",
 }
 PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]{1,4}$")
+DIAGNOSTIC_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
 def load_object(path: Path) -> dict[str, Any]:
@@ -126,6 +126,9 @@ def _safe_client_timeout_row(row: Any) -> dict[str, Any] | None:
     error_class = safe_error_class(raw_error, status=row.get("status"))
     if error_class != "timeout":
         return None
+    diagnostic_id = row.get("diagnostic_id")
+    if not isinstance(diagnostic_id, str) or DIAGNOSTIC_ID_RE.fullmatch(diagnostic_id) is None:
+        raise ValueError("client timeout row is missing a safe diagnostic id")
     raw_route_class = row.get("route_class")
     route_class = (
         raw_route_class
@@ -133,6 +136,7 @@ def _safe_client_timeout_row(row: Any) -> dict[str, Any] | None:
         else safe_route_class(row.get("path"))
     )
     output: dict[str, Any] = {
+        "diagnostic_id": diagnostic_id,
         "phase": safe_phase(row.get("phase")),
         "method": safe_method(row.get("method")),
         "route_class": route_class,
@@ -153,6 +157,9 @@ def _safe_client_timeout_row(row: Any) -> dict[str, Any] | None:
 def _safe_origin_timeout_row(row: Any) -> dict[str, Any] | None:
     if not isinstance(row, dict):
         return None
+    diagnostic_id = row.get("diagnostic_id")
+    if not isinstance(diagnostic_id, str) or DIAGNOSTIC_ID_RE.fullmatch(diagnostic_id) is None:
+        raise ValueError("origin timeout row is missing a safe diagnostic id")
     next_row = row.get("next") if isinstance(row.get("next"), dict) else {}
     ssr_row = row.get("ssr") if isinstance(row.get("ssr"), dict) else {}
     api_row = row.get("api") if isinstance(row.get("api"), dict) else {}
@@ -163,6 +170,7 @@ def _safe_origin_timeout_row(row: Any) -> dict[str, Any] | None:
         else safe_route_class(row.get("uri"), page=True)
     )
     output: dict[str, Any] = {
+        "diagnostic_id": diagnostic_id,
         "route_class": route_class,
         "method": safe_method(row.get("method")),
         "status": safe_status(row.get("status")),
@@ -207,22 +215,40 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
     client_summary = client.get("overall") or client.get("raw_http") or {}
     if not isinstance(client_summary, dict):
         client_summary = {}
-    client_rows = [
-        sanitized
-        for row in client_summary.get("timeout_diagnostics") or []
-        if (sanitized := _safe_client_timeout_row(row)) is not None
-    ]
+    raw_client_rows = client_summary.get("timeout_diagnostics") or []
+    if not isinstance(raw_client_rows, list):
+        raise ValueError("client timeout diagnostics must be a list")
+    client_rows: list[dict[str, Any]] = []
+    for row in raw_client_rows:
+        sanitized = _safe_client_timeout_row(row)
+        if sanitized is None:
+            raise ValueError("client timeout diagnostics contain a non-timeout row")
+        client_rows.append(sanitized)
     server_section = server.get("server_ssr_observability") or {}
     if not isinstance(server_section, dict):
         server_section = {}
     server_timeout_section = server_section.get("timeout_diagnostics") or {}
     if not isinstance(server_timeout_section, dict):
         server_timeout_section = {}
-    origin_rows = [
-        sanitized
-        for row in server_timeout_section.get("rows") or []
-        if (sanitized := _safe_origin_timeout_row(row)) is not None
-    ]
+    raw_origin_rows = server_timeout_section.get("rows") or []
+    if not isinstance(raw_origin_rows, list):
+        raise ValueError("origin timeout diagnostics must be a list")
+    origin_rows: list[dict[str, Any]] = []
+    for row in raw_origin_rows:
+        sanitized = _safe_origin_timeout_row(row)
+        if sanitized is None:
+            raise ValueError("origin timeout diagnostics contain an invalid row")
+        origin_rows.append(sanitized)
+    client_ids = [row["diagnostic_id"] for row in client_rows]
+    origin_ids = [row["diagnostic_id"] for row in origin_rows]
+    if (
+        len(client_ids) != len(set(client_ids))
+        or len(origin_ids) != len(set(origin_ids))
+        or sorted(client_ids) != sorted(origin_ids)
+    ):
+        raise ValueError("client and origin timeout diagnostics do not exactly correlate")
+    client_rows.sort(key=lambda row: str(row["diagnostic_id"]))
+    origin_rows.sort(key=lambda row: str(row["diagnostic_id"]))
     system = server.get("system") or {}
     event_loop = server_section.get("event_loop") or {}
 
@@ -236,11 +262,7 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
     origin_started_after_timeout = 0
     origin_start_timing_ambiguous = 0
     origin_completed_before_timeout = 0
-    # No request/diagnostic/correlation identifier is persisted.  Pair only
-    # bounded rows by observation order; an absent origin row remains explicit
-    # and cannot be interpreted as a successful origin response.
-    for index, client_row in enumerate(client_rows):
-        origin_row = origin_rows[index] if index < len(origin_rows) else None
+    for index, (client_row, origin_row) in enumerate(zip(client_rows, origin_rows, strict=True)):
         next_row = origin_row.get("next") if origin_row else {}
         api_row = origin_row.get("api") if origin_row else {}
         classification, reason_class = classify_timeout(
@@ -250,8 +272,7 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
             origin_completed_before_client_timeout=False,
         )
         classifications[classification] += 1
-        if origin_row is not None:
-            nginx_matches += 1
+        nginx_matches += 1
         if next_row.get("accepted") is True:
             next_matches += 1
         if api_row.get("call_completed_observed") is True:
@@ -261,6 +282,7 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
         joined_rows.append(
             {
                 "observation_index": index,
+                "diagnostic_id": client_row["diagnostic_id"],
                 "client": client_row,
                 "classification": classification,
                 "classification_reason_class": reason_class,
@@ -323,7 +345,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    report = join_reports(load_object(args.client_report), load_object(args.server_observability))
+    try:
+        report = join_reports(load_object(args.client_report), load_object(args.server_observability))
+    except ValueError as exc:
+        print(f"timeout diagnostics correlation failed: {exc}", file=sys.stderr)
+        return 2
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(report["summary"], ensure_ascii=False))

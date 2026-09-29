@@ -1017,7 +1017,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
         observer = (root / "tools" / "platform_external_load_observer.py").read_text(
             encoding="utf-8"
         )
-        workflow = (root.parent / ".github" / "workflows" / "platform-production-external-load.yml").read_text(
+        workflow = (root.parent / ".github" / "workflows" / "platform-production-external-load-trusted.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn("re.fullmatch(r\"preprod[0-9]{12}[0-9a-f]{4}\", marker)", supervisor)
@@ -1037,7 +1037,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
 
     def test_external_workflow_requires_and_binds_observer_before_evaluation(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        workflow = (root.parent / ".github" / "workflows" / "platform-production-external-load.yml").read_text(
+        workflow = (root.parent / ".github" / "workflows" / "platform-production-external-load-trusted.yml").read_text(
             encoding="utf-8"
         )
 

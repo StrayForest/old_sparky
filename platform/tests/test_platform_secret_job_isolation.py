@@ -27,6 +27,10 @@ def _workflow(name: str) -> str:
     return (WORKFLOW_ROOT / name).read_text(encoding="utf-8")
 
 
+def _external_trusted_workflow() -> str:
+    return _workflow("platform-production-external-load-trusted.yml")
+
+
 class ProductionSecretJobIsolationTests(unittest.TestCase):
     def test_deploy_dag_places_build_and_production_consumers_on_distinct_jobs(self) -> None:
         source = _workflow("platform-production-deploy.yml")
@@ -54,16 +58,16 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertNotIn("id-token: write", jobs["production"])
 
     def test_external_load_dag_propagates_setup_and_cleanup_barriers(self) -> None:
-        source = _workflow("platform-production-external-load.yml")
+        source = _external_trusted_workflow()
         jobs = _job_blocks(source)
         self.assertIn("if: ${{ always() }}", jobs["validate-external-inputs"])
-        self.assertIn("needs: validate-external-inputs", jobs["fixture-setup"])
+        self.assertIn("      - resolve-trusted-runner\n      - validate-external-inputs", jobs["fixture-setup"])
         self.assertIn("environment: production", jobs["fixture-setup"])
         self.assertIn("manifest_ready:", jobs["fixture-setup"])
-        self.assertIn("needs:\n      - validate-external-inputs\n      - fixture-setup", jobs["load-client"])
+        self.assertIn("needs:\n      - validate-caller-identity\n      - resolve-trusted-runner\n      - validate-external-inputs\n      - fixture-setup", jobs["load-client"])
         self.assertIn("actions/checkout@", jobs["load-client"])
         self.assertNotRegex(jobs["load-client"], r"secrets\.PROD_SSH_")
-        self.assertIn("needs:\n      - validate-external-inputs\n      - fixture-setup\n      - load-client", jobs["fixture-finalize"])
+        self.assertIn("needs:\n      - validate-caller-identity\n      - resolve-trusted-runner\n      - validate-external-inputs\n      - fixture-setup\n      - load-client", jobs["fixture-finalize"])
         self.assertIn("if: ${{ always()", jobs["fixture-finalize"])
         self.assertIn("if: ${{ always()", jobs["evaluate-load"])
         self.assertIn("needs.fixture-finalize.outputs.cleanup_status", jobs["evaluate-load"])
@@ -97,12 +101,20 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         )
         for workflow_name in (
             "platform-production-deploy.yml",
-            "platform-production-external-load.yml",
+            "platform-production-external-load-trusted.yml",
             "platform-live-launch.yml",
         ):
             jobs = _job_blocks(_workflow(workflow_name))
             for job_name, body in jobs.items():
                 if any(marker in body for marker in candidate_markers):
+                    if workflow_name == "platform-production-external-load-trusted.yml" and job_name in {
+                        "fixture-setup",
+                        "fixture-finalize",
+                    }:
+                        # These jobs execute only the pinned T load runner;
+                        # their SSH ownership is intentional and candidate E
+                        # is never checked out or imported.
+                        continue
                     self.assertNotRegex(
                         body,
                         r"(?:secrets\.PROD_SSH_|PROD_SSH_(?:HOST|USER|KEY):)",
@@ -112,7 +124,7 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
     def test_secret_jobs_are_fresh_fixed_dispatch_boundaries(self) -> None:
         for workflow_name in (
             "platform-production-deploy.yml",
-            "platform-production-external-load.yml",
+            "platform-production-external-load-trusted.yml",
             "platform-live-launch.yml",
         ):
             jobs = _job_blocks(_workflow(workflow_name))
@@ -131,13 +143,24 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
                     self.assertNotIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
                     self.assertNotIn("platform_host_tools_bundle.py", body, f"{workflow_name}:{job_name}")
                     self.assertNotIn("ref: ${{ env.TARGET_SHA }}", body, f"{workflow_name}:{job_name}")
+                elif workflow_name == "platform-production-external-load-trusted.yml" and job_name in {
+                    "fixture-setup",
+                    "fixture-finalize",
+                }:
+                    self.assertIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
+                    self.assertIn("ref: ${{ env.TRUSTED_RUNNER_SHA }}", body, f"{workflow_name}:{job_name}")
+                    self.assertIn("persist-credentials: false", body, f"{workflow_name}:{job_name}")
                 else:
                     self.assertNotIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
-                self.assertNotRegex(
-                    body,
-                    r"platform_(?:build_release|load|live_launch_report)\.py|platform_build_release\.sh",
-                    f"candidate executable in {workflow_name}:{job_name}",
-                )
+                if not (
+                    workflow_name == "platform-production-external-load-trusted.yml"
+                    and job_name in {"fixture-setup", "fixture-finalize"}
+                ):
+                    self.assertNotRegex(
+                        body,
+                        r"platform_(?:build_release|load|live_launch_report)\.py|platform_build_release\.sh",
+                        f"candidate executable in {workflow_name}:{job_name}",
+                    )
                 self.assertIn("environment: production", body, f"{workflow_name}:{job_name}")
                 self.assertIn("platform_workflow_remote_dispatch.py", body)
                 self.assertNotIn("bash -s --", body, f"{workflow_name}:{job_name}")
@@ -148,7 +171,7 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertIn("start_new_session=True", dispatcher)
         self.assertIn("close_fds=True", dispatcher)
         self.assertIn('stdin=subprocess.DEVNULL', dispatcher)
-        external = _workflow("platform-production-external-load.yml")
+        external = _external_trusted_workflow()
         self.assertIn("external-fixture < \"$input_path\"", external)
         self.assertNotIn("external-fixture < \"$input_path\" &", external)
         self.assertNotIn("ssh \"$PROD_SSH_USER@$PROD_SSH_HOST\" bash", external)
@@ -182,7 +205,7 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
 
     def test_secret_consumers_revalidate_closed_handoffs_and_exact_sha(self) -> None:
         deploy = _workflow("platform-production-deploy.yml")
-        external = _workflow("platform-production-external-load.yml")
+        external = _external_trusted_workflow()
         live = _workflow("platform-live-launch.yml")
         for source in (deploy, external, live):
             self.assertIn("exact target SHA", source)

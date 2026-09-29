@@ -12,6 +12,8 @@ import shlex
 import sys
 from typing import Iterable
 
+import yaml
+
 try:
     from tools.platform_test_catalog import (
         BACKEND_CONTOURS,
@@ -91,6 +93,12 @@ WEB_HERMETIC_RUNNER = PLATFORM_ROOT / "tools" / "platform_web_hermetic.sh"
 TEST_RUNNER = PLATFORM_ROOT / "tools" / "platform_test_runner.py"
 LEGACY_MANIFEST = PLATFORM_ROOT / "tests" / "test-suite-manifest.json"
 EXTERNAL_LOAD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-external-load.yml"
+TRUSTED_EXTERNAL_LOAD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-external-load-trusted.yml"
+EXTERNAL_LOAD_RECOVERY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-external-load-recovery.yml"
+RETAINED_CLEANUP_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-retained-load-cleanup.yml"
+TRUSTED_RETAINED_CLEANUP_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-retained-load-cleanup-trusted.yml"
+RETAINED_ABORT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-retained-load-abort.yml"
+TRUSTED_RETAINED_ABORT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-retained-load-abort-trusted.yml"
 CLASSIFIER_TOOL = PLATFORM_ROOT / "tools" / "platform_ci_classifier.py"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-deploy.yml"
@@ -122,6 +130,10 @@ GOVERNANCE_TABLE_ID_RE = re.compile(r"^\|\s*`([^`]+)`\s*\|")
 # ``actions`` organization.  Keep this allowlist explicit so a new remote
 # action cannot be introduced alongside a pinned but unreviewed fork.
 ALLOWED_ACTION_OWNERS = frozenset({"actions"})
+# Reusable workflows are deliberately different from actions: the public
+# entrypoints must call the repository's own T-owned workflow at an immutable
+# SHA, while still remaining outside the third-party action owner allowlist.
+ALLOWED_REUSABLE_WORKFLOW_REPOSITORIES = frozenset({"StrayForest/old_sparky"})
 _ACTION_USE_RE = re.compile(
     r"^\s*(?:-\s*)?uses:\s*(?P<value>[^\s#]+)",
 )
@@ -133,6 +145,41 @@ _FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SETUP_PYTHON_USE_RE = re.compile(
     r"^\s*(?:-\s+)?uses:\s*actions/setup-python@",
     re.MULTILINE,
+)
+
+PUBLIC_EXTERNAL_LOAD_INPUTS = {
+    "confirmation": {"required": True, "type": "string"},
+    "control_email": {"required": True, "type": "string"},
+    "profile_id": {"required": True, "default": "ready-vote-slo-v2", "type": "string"},
+    "timeout_diagnostics": {"required": False, "default": False, "type": "boolean"},
+}
+TRUSTED_EXTERNAL_LOAD_INPUTS = {
+    **PUBLIC_EXTERNAL_LOAD_INPUTS,
+    "target_sha": {"required": True, "type": "string"},
+    "source_run_id": {"required": True, "type": "string"},
+    "source_run_attempt": {"required": True, "type": "string"},
+}
+RETAINED_CLEANUP_INPUTS = {
+    "confirmation": {"required": True, "type": "string"},
+    "load_run_id": {"required": True, "type": "string"},
+    "target_sha": {"required": True, "type": "string"},
+    "control_email": {"required": True, "type": "string"},
+}
+RETAINED_ABORT_INPUTS = {
+    "confirmation": {"required": True, "type": "string"},
+    "load_run_id": {"required": True, "type": "string"},
+    "target_sha": {"required": True, "type": "string"},
+}
+TRUSTED_EXTERNAL_CLOSURE = (
+    ".github/workflows/platform-production-external-load-trusted.yml",
+    "platform/tools/platform_external_load_provenance.py",
+    "platform/tools/platform_workflow_input_guard.py",
+    "platform/tools/platform_load.py",
+    "platform/tools/platform_external_load.py",
+    "platform/tools/platform_load_acceptance.py",
+    "platform/tools/platform_http_transport.py",
+    "platform/tools/platform_evidence_sanitizer.py",
+    "platform/tools/platform_timeout_diagnostics.py",
 )
 
 
@@ -190,7 +237,14 @@ def action_pin_issues(
                 )
                 continue
             owner = remote.group("owner")
-            if owner not in ALLOWED_ACTION_OWNERS:
+            repository_identity = f"{owner}/{remote.group('repository')}"
+            path_value = remote.group("path") or ""
+            is_approved_reusable_workflow = (
+                repository_identity in ALLOWED_REUSABLE_WORKFLOW_REPOSITORIES
+                and path_value.startswith(".github/workflows/")
+                and path_value.rsplit("/", 1)[-1].endswith((".yml", ".yaml"))
+            )
+            if owner not in ALLOWED_ACTION_OWNERS and not is_approved_reusable_workflow:
                 issues.append(
                     f"{location}: action owner {owner!r} is not approved; "
                     f"allowed owners: {', '.join(sorted(ALLOWED_ACTION_OWNERS))}"
@@ -1663,6 +1717,533 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
     return issues
 
 
+def _parse_workflow_document(
+    source: str,
+    *,
+    label: str,
+    issues: list[str],
+) -> dict[str, object] | None:
+    """Parse a workflow for semantic boundary checks without string gates."""
+
+    try:
+        document = yaml.safe_load(source)
+    except yaml.YAMLError as exc:
+        issues.append(f"{label} is not valid YAML: {exc}")
+        return None
+    if not isinstance(document, dict):
+        issues.append(f"{label} must contain a YAML mapping")
+        return None
+    return document
+
+
+def _workflow_event(document: dict[str, object]) -> object:
+    # PyYAML's YAML 1.1 resolver reads the key ``on`` as True.
+    return document.get("on", document.get(True))
+
+
+def _validate_workflow_inputs(
+    inputs: object,
+    expected: dict[str, dict[str, object]],
+    *,
+    label: str,
+    issues: list[str],
+) -> None:
+    if not isinstance(inputs, dict):
+        issues.append(f"{label} must declare a mapping of inputs")
+        return
+    if set(inputs) != set(expected):
+        issues.append(
+            f"{label} input names drift: expected {sorted(expected)}, got {sorted(inputs)}"
+        )
+    allowed_fields = {"description", "required", "default", "type"}
+    for name, specification in expected.items():
+        actual = inputs.get(name)
+        if not isinstance(actual, dict):
+            issues.append(f"{label} input {name!r} must be a mapping")
+            continue
+        unknown = set(actual) - allowed_fields
+        if unknown:
+            issues.append(
+                f"{label} input {name!r} has unallowlisted fields: {sorted(unknown)}"
+            )
+        for field, value in specification.items():
+            if actual.get(field) != value:
+                issues.append(
+                    f"{label} input {name!r} field {field!r} must be {value!r}"
+                )
+
+
+def _external_load_workflow_issues(
+    public_source: str,
+    trusted_source: str,
+    profiles: dict[str, dict[str, object]] | None,
+) -> list[str]:
+    """Validate the public E/T boundary and the T-owned implementation."""
+
+    issues: list[str] = []
+    public = _parse_workflow_document(
+        public_source,
+        label="public external-load workflow",
+        issues=issues,
+    )
+    trusted = _parse_workflow_document(
+        trusted_source,
+        label="trusted external-load workflow",
+        issues=issues,
+    )
+    if public is None or trusted is None:
+        return issues
+
+    public_event = _workflow_event(public)
+    if not isinstance(public_event, dict) or set(public_event) != {"workflow_dispatch"}:
+        issues.append("public external-load workflow must expose only workflow_dispatch")
+    else:
+        dispatch = public_event.get("workflow_dispatch")
+        if not isinstance(dispatch, dict):
+            issues.append("public external-load workflow_dispatch must be a mapping")
+        else:
+            _validate_workflow_inputs(
+                dispatch.get("inputs"),
+                PUBLIC_EXTERNAL_LOAD_INPUTS,
+                label="public external-load workflow",
+                issues=issues,
+            )
+
+    if public.get("permissions") != {"contents": "read"}:
+        issues.append("public external-load workflow must have contents: read only")
+    public_jobs = public.get("jobs")
+    if not isinstance(public_jobs, dict) or set(public_jobs) != {"trusted-external-load"}:
+        issues.append("public external-load workflow must contain only the trusted call job")
+        public_job: dict[str, object] = {}
+    else:
+        candidate_job = public_jobs.get("trusted-external-load")
+        public_job = candidate_job if isinstance(candidate_job, dict) else {}
+        if not public_job:
+            issues.append("public external-load trusted call job must be a mapping")
+
+    expected_trusted_ref = re.compile(
+        r"^StrayForest/old_sparky/\.github/workflows/"
+        r"platform-production-external-load-trusted\.yml@[0-9a-f]{40}$"
+    )
+    uses = public_job.get("uses")
+    if not isinstance(uses, str) or expected_trusted_ref.fullmatch(uses) is None:
+        issues.append(
+            "public external-load workflow must call the same-repository trusted workflow at a full SHA"
+        )
+    expected_with = {
+        "confirmation": "${{ inputs.confirmation }}",
+        "control_email": "${{ inputs.control_email }}",
+        "profile_id": "${{ inputs.profile_id }}",
+        "timeout_diagnostics": "${{ inputs.timeout_diagnostics }}",
+        "target_sha": "${{ github.sha }}",
+        "source_run_id": "${{ github.run_id }}",
+        "source_run_attempt": "${{ github.run_attempt }}",
+    }
+    actual_with = public_job.get("with")
+    if not isinstance(actual_with, dict) or set(actual_with) != set(expected_with):
+        issues.append("public external-load trusted call inputs are not the exact approved set")
+    elif any(actual_with[key] != value for key, value in expected_with.items()):
+        issues.append("public external-load trusted call inputs are not source-bound")
+    forbidden_public_job_keys = {
+        "runs-on",
+        "run",
+        "secrets",
+        "environment",
+        "steps",
+    }
+    forbidden = sorted(forbidden_public_job_keys.intersection(public_job))
+    if forbidden:
+        issues.append(
+            "public external-load workflow must remain data-only; forbidden job keys: "
+            + ", ".join(forbidden)
+        )
+
+    trusted_event = _workflow_event(trusted)
+    if not isinstance(trusted_event, dict) or set(trusted_event) != {"workflow_call"}:
+        issues.append("trusted external-load workflow must expose only workflow_call")
+    else:
+        call = trusted_event.get("workflow_call")
+        if not isinstance(call, dict):
+            issues.append("trusted external-load workflow_call must be a mapping")
+        else:
+            _validate_workflow_inputs(
+                call.get("inputs"),
+                TRUSTED_EXTERNAL_LOAD_INPUTS,
+                label="trusted external-load workflow",
+                issues=issues,
+            )
+
+    if trusted.get("permissions") != {"contents": "read"}:
+        issues.append("trusted external-load workflow must default to contents: read only")
+    trusted_jobs = trusted.get("jobs")
+    expected_jobs = {
+        "validate-caller-identity",
+        "resolve-trusted-runner",
+        "validate-external-inputs",
+        "fixture-setup",
+        "load-client",
+        "fixture-finalize",
+        "evaluate-load",
+    }
+    if not isinstance(trusted_jobs, dict) or set(trusted_jobs) != expected_jobs:
+        issues.append("trusted external-load workflow jobs drift from the approved closure")
+        trusted_jobs = {}
+    for job_name, job in trusted_jobs.items():
+        if not isinstance(job, dict):
+            issues.append(f"trusted external-load job {job_name!r} must be a mapping")
+            continue
+        if job.get("runs-on") != "ubuntu-latest":
+            issues.append(f"trusted external-load job {job_name!r} must use the GitHub runner")
+        permissions = job.get("permissions")
+        if not isinstance(permissions, dict) or any(
+            value != "read" for value in permissions.values()
+        ):
+            issues.append(f"trusted external-load job {job_name!r} permissions must be read-only")
+    identity_job = trusted_jobs.get("validate-caller-identity")
+    identity_block = _workflow_job_block(
+        trusted_source,
+        "validate-caller-identity",
+    )
+    if not isinstance(identity_job, dict):
+        issues.append("trusted external-load workflow must validate its public caller before authority")
+    else:
+        if "environment" in identity_job or "secrets" in identity_job:
+            issues.append("trusted external-load caller identity gate must not access production secrets/environment")
+        if "steps" not in identity_job or not isinstance(identity_job.get("steps"), list):
+            issues.append("trusted external-load caller identity gate must own its non-secret verification steps")
+    for marker in (
+        "EXPECTED_WORKFLOW_PATH: .github/workflows/platform-production-external-load.yml",
+        "CALLER_WORKFLOW_REF",
+        'CALLER_WORKFLOW_REF" == "$EXPECTED_REPOSITORY/$EXPECTED_WORKFLOW_PATH@$EXPECTED_DEFAULT_REF"',
+        'CALLER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$',
+        "commits/$CALLER_WORKFLOW_SHA",
+        "branches/dev",
+        'payload.get("protected") is not True',
+        'CALLER_EVENT_NAME" == "workflow_dispatch"',
+        'CALLER_REF" == "$EXPECTED_DEFAULT_REF"',
+        'CALLER_REF_PROTECTED" == "true"',
+        "actions/runs/$CALLER_RUN_ID",
+        'payload.get("path") != workflow_path',
+        'payload.get("head_branch") != "dev"',
+        "actions/workflows/$workflow_id",
+        'payload.get("default_branch") != "dev"',
+    ):
+        if marker not in identity_block:
+            issues.append(f"trusted external-load caller identity gate is missing {marker}")
+    for job_name, job in trusted_jobs.items():
+        if job_name == "validate-caller-identity" or not isinstance(job, dict):
+            continue
+        block = _workflow_job_block(trusted_source, job_name)
+        if "needs.validate-caller-identity" not in block:
+            issues.append(f"trusted external-load job {job_name!r} must depend on caller identity")
+        if "needs.validate-caller-identity.outputs.caller_identity_validated == 'true'" not in block:
+            issues.append(f"trusted external-load job {job_name!r} must gate on caller identity output")
+    for job_name in ("resolve-trusted-runner", "fixture-setup", "fixture-finalize"):
+        job = trusted_jobs.get(job_name)
+        if isinstance(job, dict) and job.get("environment") != "production":
+            issues.append(f"trusted external-load job {job_name!r} must own production environment")
+
+    evaluator = trusted_jobs.get("evaluate-load")
+    evaluator_steps = evaluator.get("steps") if isinstance(evaluator, dict) else None
+    if not isinstance(evaluator_steps, list):
+        issues.append("trusted external-load evaluator must declare steps")
+    else:
+        metadata_step = next(
+            (step for step in evaluator_steps if isinstance(step, dict) and step.get("id") == "download-run-metadata"),
+            None,
+        )
+        artifact_step = next(
+            (step for step in evaluator_steps if isinstance(step, dict) and step.get("id") == "verify-evaluator-artifacts"),
+            None,
+        )
+        if not isinstance(metadata_step, dict):
+            issues.append("trusted external-load evaluator must download source run metadata in a named step")
+        else:
+            if metadata_step.get("if") != "${{ always() }}":
+                issues.append("trusted external-load metadata download must run before artifact verification")
+            run = metadata_step.get("run")
+            if not isinstance(run, str) or "--max-filesize 1048576" not in run or "install -m 600 /dev/null" not in run or "stat -c '%a'" not in run:
+                issues.append("trusted external-load metadata download must be bounded and mode-600")
+        if not isinstance(artifact_step, dict):
+            issues.append("trusted external-load evaluator must verify artifacts in a named step")
+        else:
+            artifact_env = artifact_step.get("env")
+            if not isinstance(artifact_env, dict) or artifact_env.get("RUN_METADATA_PATH") != "${{ steps.download-run-metadata.outputs.run_metadata_path }}":
+                issues.append("trusted external-load artifact verifier must receive the explicit run metadata path")
+            run = artifact_step.get("run")
+            if not isinstance(run, str) or "run_metadata_path_status" not in run or '--run-metadata "$run_metadata_path"' not in run:
+                issues.append("trusted external-load artifact verifier must reject missing metadata and pass its explicit path")
+
+    if "platform_load.py run" not in trusted_source or "platform_load.py evaluate" not in trusted_source:
+        issues.append("trusted external-load workflow must own the platform_load runner and evaluator")
+    for secret_name in ("secrets.PROD_SSH_HOST", "secrets.PROD_SSH_USER", "secrets.PROD_SSH_KEY"):
+        if secret_name not in trusted_source:
+            issues.append(f"trusted external-load workflow is missing protected secret {secret_name}")
+    for path in TRUSTED_EXTERNAL_CLOSURE:
+        if path not in trusted_source:
+            issues.append(f"trusted external-load workflow closure is missing {path}")
+
+    profile_match = re.search(
+        r'case\s+"\$PROFILE_ID"\s+in\s*\n\s*'
+        r'(?P<choices>[a-z0-9-]+(?:\|[a-z0-9-]+)*)\s*\)\s*;;',
+        trusted_source,
+    )
+    trusted_profile_ids = (
+        set(profile_match.group("choices").split("|")) if profile_match else set()
+    )
+    if profile_match is None:
+        issues.append("trusted external-load workflow must contain a closed profile allowlist")
+    canonical_profile_ids = {
+        profile_id
+        for profile_id, profile in (profiles or {}).items()
+        if (
+            profile.get("execution", {}).get("generator") == "GitHub-hosted external runner"
+            and profile.get("portfolio", {}).get("status") == "active"
+            and profile.get("portfolio", {}).get("class") in {"default", "diagnostic"}
+        )
+    }
+    if profiles is not None and trusted_profile_ids != canonical_profile_ids:
+        issues.append("trusted external-load profile allowlist drifts from canonical active profiles")
+    return issues
+
+
+def _identity_gate_issues(
+    source: str,
+    document: dict[str, object],
+    *,
+    label: str,
+    identity_job_name: str,
+    production_job_names: tuple[str, ...],
+    expected_workflow_path: str,
+    expected_workflow_name: str,
+    identity_output: str,
+    recovery: bool = False,
+) -> list[str]:
+    """Check that non-secret identity proof gates every privileged job.
+
+    This intentionally combines parsed job structure with a small set of
+    required shell/API semantics.  A source-only marker test could accept a
+    dead string in a comment while still allowing an environment job to run.
+    """
+
+    issues: list[str] = []
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return [f"{label} must declare jobs before identity validation"]
+    identity = jobs.get(identity_job_name)
+    identity_block = _workflow_job_block(source, identity_job_name)
+    if not isinstance(identity, dict):
+        issues.append(f"{label} is missing the non-secret {identity_job_name} gate")
+        return issues
+    if "environment" in identity or "secrets" in identity:
+        issues.append(f"{label} identity gate must not request an environment or secrets")
+    if identity.get("runs-on") != "ubuntu-latest":
+        issues.append(f"{label} identity gate must use the GitHub-hosted runner")
+    permissions = identity.get("permissions")
+    if not isinstance(permissions, dict) or any(value != "read" for value in permissions.values()):
+        issues.append(f"{label} identity gate permissions must be read-only")
+    if not isinstance(identity.get("steps"), list) or not identity.get("steps"):
+        issues.append(f"{label} identity gate must own executable verification steps")
+    markers = (
+        f"EXPECTED_WORKFLOW_PATH: {expected_workflow_path}",
+        f"EXPECTED_WORKFLOW_NAME: {expected_workflow_name}",
+        "CALLER_WORKFLOW_REF" if not recovery else "EXPECTED_REPOSITORY",
+        'CALLER_EVENT_NAME" == "workflow_dispatch"' if not recovery else 'payload.get("event") != "workflow_dispatch"',
+        'payload.get("path") != workflow_path' if not recovery else f'payload.get("path") != workflow_path',
+        'payload.get("name") != workflow_name' if not recovery else f'payload.get("name") != workflow_name',
+        'payload.get("head_branch") != "dev"',
+        'payload.get("default_branch") != "dev"',
+        'payload.get("protected") is not True',
+        "branches/dev",
+        "actions/workflows/$workflow_id",
+        "actions/runs/$CALLER_RUN_ID" if not recovery else "actions/runs/$SOURCE_RUN_ID",
+        "size_in_bytes" if recovery else "CALLER_WORKFLOW_SHA",
+    )
+    for marker in markers:
+        if marker not in identity_block:
+            issues.append(f"{label} identity gate is missing {marker}")
+    if not recovery:
+        for marker in (
+            'CALLER_WORKFLOW_REF" == "$EXPECTED_REPOSITORY/$EXPECTED_WORKFLOW_PATH@$EXPECTED_DEFAULT_REF"',
+            'CALLER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$',
+            "commits/$CALLER_WORKFLOW_SHA",
+            'CALLER_REF_PROTECTED" == "true"',
+        ):
+            if marker not in identity_block:
+                issues.append(f"{label} identity gate is missing {marker}")
+    else:
+        for marker in (
+            'artifact_id = row.get("id")',
+            'print(f"artifact_name={expected}")',
+            'print(f"artifact_digest={digest}")',
+            'print(f"artifact_size={size}")',
+            're.fullmatch(r"sha256:[0-9a-f]{64}", digest)',
+        ):
+            if marker not in identity_block:
+                issues.append(f"{label} recovery identity is missing {marker}")
+    for job_name in production_job_names:
+        job = jobs.get(job_name)
+        block = _workflow_job_block(source, job_name)
+        if not isinstance(job, dict):
+            issues.append(f"{label} is missing privileged job {job_name}")
+            continue
+        if job.get("environment") != "production":
+            issues.append(f"{label} privileged job {job_name} must own production environment")
+        if identity_job_name not in str(job.get("needs")):
+            issues.append(f"{label} privileged job {job_name} must depend on {identity_job_name}")
+        if f"needs.{identity_job_name}.outputs.{identity_output} == 'true'" not in block:
+            issues.append(f"{label} privileged job {job_name} must gate on identity output")
+    return issues
+
+
+def _retained_workflow_issues(
+    public_source: str,
+    trusted_source: str,
+    *,
+    kind: str,
+    inputs: dict[str, dict[str, object]],
+) -> list[str]:
+    """Validate retained cleanup/abort public and trusted boundaries."""
+
+    issues: list[str] = []
+    public_label = f"public retained-{kind} workflow"
+    trusted_label = f"trusted retained-{kind} workflow"
+    public = _parse_workflow_document(public_source, label=public_label, issues=issues)
+    trusted = _parse_workflow_document(trusted_source, label=trusted_label, issues=issues)
+    if public is None or trusted is None:
+        return issues
+    public_event = _workflow_event(public)
+    if not isinstance(public_event, dict) or set(public_event) != {"workflow_dispatch"}:
+        issues.append(f"{public_label} must expose only workflow_dispatch")
+    else:
+        dispatch = public_event.get("workflow_dispatch")
+        if not isinstance(dispatch, dict):
+            issues.append(f"{public_label} workflow_dispatch must be a mapping")
+        else:
+            _validate_workflow_inputs(dispatch.get("inputs"), inputs, label=public_label, issues=issues)
+    if public.get("permissions") != {"contents": "read"}:
+        issues.append(f"{public_label} must have contents: read only")
+    public_jobs = public.get("jobs")
+    job_name = "cleanup" if kind == "cleanup" else "abort"
+    trusted_name = f"platform-production-retained-load-{kind}-trusted.yml"
+    expected_path = f".github/workflows/platform-production-retained-load-{kind}.yml"
+    expected_ref = re.compile(
+        rf"^StrayForest/old_sparky/\.github/workflows/{re.escape(trusted_name)}@[0-9a-f]{{40}}$"
+    )
+    if not isinstance(public_jobs, dict) or set(public_jobs) != {job_name}:
+        issues.append(f"{public_label} must contain only its trusted call job")
+        public_job: dict[str, object] = {}
+    else:
+        public_job = public_jobs.get(job_name) if isinstance(public_jobs.get(job_name), dict) else {}
+    if not isinstance(public_job, dict) or expected_ref.fullmatch(str(public_job.get("uses", ""))) is None:
+        issues.append(f"{public_label} must call its same-repository trusted workflow at a full SHA")
+    expected_with = {name: f"${{{{ inputs.{name} }}}}" for name in inputs}
+    actual_with = public_job.get("with")
+    if not isinstance(actual_with, dict) or actual_with != expected_with:
+        issues.append(f"{public_label} trusted call inputs are not the exact source-bound set")
+    forbidden = {"runs-on", "run", "secrets", "environment", "steps"}.intersection(public_job)
+    if forbidden or "secrets" in public_source:
+        issues.append(f"{public_label} must remain a pure data-only wrapper")
+
+    trusted_event = _workflow_event(trusted)
+    if not isinstance(trusted_event, dict) or set(trusted_event) != {"workflow_call"}:
+        issues.append(f"{trusted_label} must expose only workflow_call")
+    else:
+        call = trusted_event.get("workflow_call")
+        if not isinstance(call, dict):
+            issues.append(f"{trusted_label} workflow_call must be a mapping")
+        else:
+            _validate_workflow_inputs(call.get("inputs"), inputs, label=trusted_label, issues=issues)
+    if trusted.get("permissions") != {"contents": "read"}:
+        issues.append(f"{trusted_label} must default to contents: read only")
+    trusted_jobs = trusted.get("jobs")
+    expected_jobs = {"validate-caller-identity", job_name}
+    if not isinstance(trusted_jobs, dict) or set(trusted_jobs) != expected_jobs:
+        issues.append(f"{trusted_label} jobs must contain only identity and {job_name}")
+        trusted_jobs = {}
+    issues.extend(
+        _identity_gate_issues(
+            trusted_source,
+            trusted,
+            label=trusted_label,
+            identity_job_name="validate-caller-identity",
+            production_job_names=(job_name,),
+            expected_workflow_path=expected_path,
+            expected_workflow_name=f"Platform production retained load {kind}",
+            identity_output="caller_identity_validated",
+        )
+    )
+    for marker in (
+        "head -c 1048576",
+        "stat -c '%s'",
+        "local_size",
+        "-o ConnectTimeout=10",
+        "-o ServerAliveInterval=15",
+        "-o ServerAliveCountMax=3",
+    ):
+        if marker not in trusted_source:
+            issues.append(f"{trusted_label} is missing bounded transfer marker {marker}")
+    if "secrets.PROD_SSH_HOST" not in trusted_source or "secrets.PROD_SSH_KEY" not in trusted_source:
+        issues.append(f"{trusted_label} must own the production SSH secrets")
+    return issues
+
+
+def _external_load_recovery_workflow_issues(source: str) -> list[str]:
+    """Validate the independent hard-cancellation recovery workflow."""
+
+    issues: list[str] = []
+    document = _parse_workflow_document(
+        source,
+        label="external-load recovery workflow",
+        issues=issues,
+    )
+    if document is None:
+        return issues
+    event = _workflow_event(document)
+    if not isinstance(event, dict) or set(event) != {"workflow_run"}:
+        issues.append("external-load recovery workflow must expose only workflow_run")
+    else:
+        trigger = event.get("workflow_run")
+        if not isinstance(trigger, dict) or trigger.get("workflows") != ["Platform production external load"] or trigger.get("types") != ["completed"]:
+            issues.append("external-load recovery workflow trigger must be the exact completed external-load run")
+    if document.get("permissions") != {"actions": "read", "contents": "read"}:
+        issues.append("external-load recovery workflow must have actions/contents read-only permissions")
+    jobs = document.get("jobs")
+    expected_jobs = {"validate-trigger-identity", "resolve-trusted-runner", "recover"}
+    if not isinstance(jobs, dict) or set(jobs) != expected_jobs:
+        issues.append("external-load recovery workflow jobs drift from the approved closure")
+        jobs = {}
+    issues.extend(
+        _identity_gate_issues(
+            source,
+            document,
+            label="external-load recovery workflow",
+            identity_job_name="validate-trigger-identity",
+            production_job_names=("resolve-trusted-runner", "recover"),
+            expected_workflow_path=".github/workflows/platform-production-external-load.yml",
+            expected_workflow_name="Platform production external load",
+            identity_output="trigger_validated",
+            recovery=True,
+        )
+    )
+    for marker in (
+        "artifact_id",
+        "artifact_name",
+        "artifact_digest",
+        "artifact_size",
+        "size_in_bytes",
+        "re.fullmatch(r\"sha256:[0-9a-f]{64}\", digest)",
+        "bounded_receiver",
+        "max-filesize 67108864",
+        "PurePosixPath",
+        "trap cleanup_local EXIT INT TERM HUP",
+        "external-cleanup-exports",
+    ):
+        if marker not in source:
+            issues.append(f"external-load recovery workflow is missing bounded exact-artifact marker {marker}")
+    return issues
+
+
 def collect_issues() -> list[str]:
     issues: list[str] = []
 
@@ -2031,32 +2612,54 @@ def collect_issues() -> list[str]:
         if len(profiles) < 4:
             issues.append("canonical load profile registry must contain the four baseline profiles")
 
-    external_text = EXTERNAL_LOAD_WORKFLOW.read_text(encoding="utf-8")
-    if "runs-on: ubuntu-latest" not in external_text:
-        issues.append("external load workflow must use an external GitHub runner")
-    if "platform_load.py" not in external_text:
-        issues.append("external load workflow must dispatch platform_load.py")
-    profile_options_match = re.search(
-        r"profile_id:\n(?P<options>.*?)(?:\n\npermissions:)",
-        external_text,
-        re.DOTALL,
-    )
-    profile_options = (
-        set(re.findall(r"^\s+-\s+([a-z0-9-]+-v[0-9]+)\s*$", profile_options_match.group("options"), re.MULTILINE))
-        if profile_options_match
-        else set()
-    )
-    external_profile_ids = {
-        profile_id
-        for profile_id, profile in (profiles.items() if "profiles" in locals() else [])
-        if (
-            profile.get("execution", {}).get("generator") == "GitHub-hosted external runner"
-            and profile.get("portfolio", {}).get("status") == "active"
-            and profile.get("portfolio", {}).get("class") in {"default", "diagnostic"}
+    try:
+        external_text = EXTERNAL_LOAD_WORKFLOW.read_text(encoding="utf-8")
+        trusted_external_text = TRUSTED_EXTERNAL_LOAD_WORKFLOW.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        issues.append(f"external-load workflow boundary is unreadable: {exc}")
+    else:
+        issues.extend(
+            _external_load_workflow_issues(
+                external_text,
+                trusted_external_text,
+                profiles if "profiles" in locals() else None,
+            )
         )
-    }
-    if "profiles" in locals() and profile_options != external_profile_ids:
-        issues.append("external load workflow profile choices drift from canonical profiles")
+    retained_specs = (
+        (
+            RETAINED_CLEANUP_WORKFLOW,
+            TRUSTED_RETAINED_CLEANUP_WORKFLOW,
+            "cleanup",
+            RETAINED_CLEANUP_INPUTS,
+        ),
+        (
+            RETAINED_ABORT_WORKFLOW,
+            TRUSTED_RETAINED_ABORT_WORKFLOW,
+            "abort",
+            RETAINED_ABORT_INPUTS,
+        ),
+    )
+    for public_path, trusted_path, kind, inputs in retained_specs:
+        try:
+            public_text = public_path.read_text(encoding="utf-8")
+            trusted_text = trusted_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            issues.append(f"retained {kind} workflow boundary is unreadable: {exc}")
+        else:
+            issues.extend(
+                _retained_workflow_issues(
+                    public_text,
+                    trusted_text,
+                    kind=kind,
+                    inputs=inputs,
+                )
+            )
+    try:
+        recovery_text = EXTERNAL_LOAD_RECOVERY_WORKFLOW.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        issues.append(f"external-load recovery workflow is unreadable: {exc}")
+    else:
+        issues.extend(_external_load_recovery_workflow_issues(recovery_text))
     supervisor = (PLATFORM_ROOT / "tools" / "platform_production_external_fixture_qa.sh").read_text(encoding="utf-8")
     if "measured HTTP generator runs on the" not in supervisor:
         issues.append("origin fixture supervisor must document that measurement stays external")

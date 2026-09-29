@@ -328,7 +328,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                         "method": "GET",
                         "status": 504,
                         "uri": "/tournaments/private-slug?invite=INVITE-CODE",
-                        "timeout_diagnostic_id": "tdiag-secret",
+                        "timeout_diagnostic_id": "tdiag-123-00001",
                         "request_id": "request-secret",
                         "cf_ray": "ray-secret",
                         "request_completion": "timeout",
@@ -338,18 +338,18 @@ class EvidencePrivacyTests(unittest.TestCase):
                     }
                 ],
                 [],
-                timeout_diagnostic_ids={"tdiag-secret"},
+                timeout_diagnostic_ids={"tdiag-123-00001"},
             )
         )
         for value in FORBIDDEN_VALUES + (
             "private-slug",
             "INVITE-CODE",
-            "tdiag-secret",
             "request-secret",
             "ray-secret",
         ):
             self.assertNotIn(value.lower(), ssr_output.lower())
         self.assertIn('"route_class": "tournament_page"', ssr_output)
+        self.assertIn('"diagnostic_id": "tdiag-123-00001"', ssr_output)
 
     def test_cli_summary_exposes_only_control_preservation_boolean(self) -> None:
         report = {
@@ -622,7 +622,7 @@ class EvidencePrivacyTests(unittest.TestCase):
         # source contract free of private binding/runner values as well.
         workflow = (
             Path(__file__).resolve().parents[2]
-            / ".github/workflows/platform-production-external-load.yml"
+            / ".github/workflows/platform-production-external-load-trusted.yml"
         ).read_text(encoding="utf-8")
         self.assertNotIn("payload.get('source_git_sha')", workflow)
         self.assertNotIn("payload.get('load_contract')", workflow)

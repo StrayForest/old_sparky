@@ -1,0 +1,505 @@
+name: Platform production external-load cancellation recovery
+
+# T-owned safety net for a hard-cancelled public dispatch.  A cancelled
+# caller can never run its normal finalizer, so this workflow is deliberately
+# independent of the caller's jobs and only consumes the already-created,
+# data-only input artifact from that exact run.  It never checks out E.
+on:
+  workflow_run:
+    workflows:
+      - Platform production external load
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: platform-production-external-load-recovery-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  # This is intentionally a non-secret identity gate.  A workflow_run event
+  # carries user-controlled-looking fields, so the production environment is
+  # not even requested until the GitHub API proves that the completed run was
+  # this repository's protected dev dispatch workflow.
+  validate-trigger-identity:
+    name: Validate exact triggering workflow identity
+    if: >-
+      github.event.workflow_run.conclusion == 'cancelled' ||
+      github.event.workflow_run.conclusion == 'timed_out' ||
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      trigger_validated: ${{ steps.identity.outputs.trigger_validated }}
+      artifact_id: ${{ steps.identity.outputs.artifact_id }}
+      artifact_name: ${{ steps.identity.outputs.artifact_name }}
+      artifact_digest: ${{ steps.identity.outputs.artifact_digest }}
+      artifact_size: ${{ steps.identity.outputs.artifact_size }}
+      workflow_id: ${{ steps.identity.outputs.workflow_id }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXPECTED_REPOSITORY: StrayForest/old_sparky
+      EXPECTED_WORKFLOW_PATH: .github/workflows/platform-production-external-load.yml
+      EXPECTED_WORKFLOW_NAME: Platform production external load
+      EXPECTED_DEFAULT_REF: refs/heads/dev
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Verify protected workflow-run and exact input artifact
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "$EXPECTED_REPOSITORY" ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          run_metadata="$RUNNER_TEMP/recovery-source-run.json"
+          workflow_metadata="$RUNNER_TEMP/recovery-source-workflow.json"
+          branch_metadata="$RUNNER_TEMP/recovery-source-branch.json"
+          repository_metadata="$RUNNER_TEMP/recovery-repository.json"
+          artifacts_metadata="$RUNNER_TEMP/recovery-artifacts.json"
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+            "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY/actions/runs/$SOURCE_RUN_ID" \
+            --output "$run_metadata"
+          /usr/bin/python3 - "$run_metadata" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$TARGET_SHA" "$EXPECTED_REPOSITORY" "$EXPECTED_WORKFLOW_PATH" "$EXPECTED_WORKFLOW_NAME" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          path, run_id, attempt, target_sha, repository, workflow_path, workflow_name = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict):
+              raise SystemExit("trigger run API response is not an object")
+          if payload.get("id") != int(run_id) or payload.get("run_attempt") != int(attempt):
+              raise SystemExit("trigger run identity does not match event")
+          if payload.get("head_sha") != target_sha or payload.get("head_branch") != "dev":
+              raise SystemExit("trigger run is not the protected dev source")
+          if payload.get("event") != "workflow_dispatch" or payload.get("path") != workflow_path or payload.get("name") != workflow_name:
+              raise SystemExit("trigger run is not the exact dispatch workflow")
+          for key in ("repository", "head_repository"):
+              value = payload.get(key)
+              if not isinstance(value, dict) or value.get("full_name") != repository:
+                  raise SystemExit("trigger run repository identity is not exact")
+          workflow_id = payload.get("workflow_id")
+          if isinstance(workflow_id, bool) or not isinstance(workflow_id, int) or not 1 <= workflow_id <= 2**63 - 1:
+              raise SystemExit("trigger workflow id is malformed")
+          print(workflow_id)
+          PY
+          workflow_id="$(/usr/bin/python3 - "$run_metadata" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1], encoding="utf-8"))["workflow_id"])
+          PY
+          )"
+          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+            "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY/actions/workflows/$workflow_id" \
+            --output "$workflow_metadata"
+          /usr/bin/python3 - "$workflow_metadata" "$EXPECTED_WORKFLOW_PATH" "$EXPECTED_WORKFLOW_NAME" <<'PY'
+          import json, sys
+          from pathlib import Path
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or payload.get("path") != sys.argv[2] or payload.get("name") != sys.argv[3] or payload.get("state") != "active":
+              raise SystemExit("trigger workflow id/path is not the reviewed workflow")
+          PY
+          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+            "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY" --output "$repository_metadata"
+          /usr/bin/python3 - "$repository_metadata" <<'PY'
+          import json, sys
+          from pathlib import Path
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or payload.get("default_branch") != "dev":
+              raise SystemExit("repository default branch is not the protected dev ref")
+          PY
+          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+            "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY/branches/dev" \
+            --output "$branch_metadata"
+          /usr/bin/python3 - "$branch_metadata" "$TARGET_SHA" <<'PY'
+          import json, sys
+          from pathlib import Path
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          commit = payload.get("commit") if isinstance(payload, dict) else None
+          if (
+              not isinstance(payload, dict)
+              or payload.get("name") != "dev"
+              or payload.get("protected") is not True
+              or not isinstance(commit, dict)
+              or commit.get("sha") != sys.argv[2]
+          ):
+              raise SystemExit("trigger ref is not the protected dev commit")
+          PY
+          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+            "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
+            --output "$artifacts_metadata"
+          /usr/bin/python3 - "$artifacts_metadata" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          path, run_id, attempt = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          expected = f"platform-production-external-load-input-{run_id}-{attempt}"
+          rows = payload.get("artifacts") if isinstance(payload, dict) else None
+          if not isinstance(rows, list):
+              raise SystemExit("trigger artifact list is malformed")
+          matches = [row for row in rows if isinstance(row, dict) and row.get("name") == expected]
+          if len(matches) != 1:
+              raise SystemExit("exact recovery input artifact is missing or duplicated")
+          row = matches[0]
+          artifact_id = row.get("id")
+          size = row.get("size_in_bytes")
+          digest = row.get("digest")
+          if isinstance(artifact_id, bool) or not isinstance(artifact_id, int) or artifact_id <= 0:
+              raise SystemExit("recovery artifact id is malformed")
+          if row.get("expired") is not False or isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 64 * 1024 * 1024:
+              raise SystemExit("recovery artifact is expired or outside its size bound")
+          if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+              raise SystemExit("recovery artifact digest is malformed")
+          print("trigger_validated=true")
+          print(f"artifact_id={artifact_id}")
+          print(f"artifact_name={expected}")
+          print(f"artifact_digest={digest}")
+          print(f"artifact_size={size}")
+          PY
+          # The artifact parser above deliberately emits only data fields;
+          # write the already validated workflow id separately without
+          # allowing a candidate value to cross the boundary.
+          printf 'workflow_id=%s\n' "$workflow_id" >> "$GITHUB_OUTPUT"
+
+  resolve-trusted-runner:
+    name: Resolve recovery trusted runner
+    needs: validate-trigger-identity
+    if: >-
+      needs.validate-trigger-identity.result == 'success' &&
+      needs.validate-trigger-identity.outputs.trigger_validated == 'true' &&
+      (github.event.workflow_run.conclusion == 'cancelled' ||
+       github.event.workflow_run.conclusion == 'timed_out' ||
+       github.event.workflow_run.conclusion == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    outputs:
+      trusted_runner_sha: ${{ steps.resolve.outputs.trusted_runner_sha }}
+      trusted_runner_attested: ${{ steps.attest.outputs.trusted_runner_attested }}
+    steps:
+      - name: Validate protected trusted SHA
+        id: resolve
+        shell: bash
+        env:
+          TRUSTED_RUNNER_SHA: ${{ vars.PLATFORM_EXTERNAL_LOAD_TRUSTED_SHA }}
+        run: |
+          set -euo pipefail
+          [[ "$TRUSTED_RUNNER_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "The protected production environment must provide an immutable trusted runner SHA." >&2
+            exit 1
+          }
+          printf 'trusted_runner_sha=%s\n' "$TRUSTED_RUNNER_SHA" >> "$GITHUB_OUTPUT"
+      - name: Checkout attested trusted source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.resolve.outputs.trusted_runner_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: ${{ runner.temp }}/trusted-recovery-runner
+      - name: Attest recovery closure against protected dev
+        id: attest
+        shell: bash
+        env:
+          TRUSTED_RUNNER_SHA: ${{ steps.resolve.outputs.trusted_runner_sha }}
+        run: |
+          set -euo pipefail
+          trusted_root="$RUNNER_TEMP/trusted-recovery-runner"
+          test "$(git -C "$trusted_root" rev-parse HEAD)" = "$TRUSTED_RUNNER_SHA"
+          test "$(git -C "$trusted_root" ls-remote --exit-code origin refs/heads/dev | awk 'NR == 1 {print $1}')" = "$TRUSTED_RUNNER_SHA"
+          while IFS= read -r path; do
+            test -f "$trusted_root/$path" && test ! -L "$trusted_root/$path"
+            git -C "$trusted_root" ls-files --error-unmatch -- "$path" >/dev/null
+          done <<'EOF'
+          .github/workflows/platform-production-external-load-recovery.yml
+          platform/tools/platform_external_load_provenance.py
+          platform/tools/platform_workflow_input_guard.py
+          platform/tools/platform_workflow_remote_dispatch.py
+          platform/tools/platform_external_load.py
+          platform/tools/platform_http_transport.py
+          platform/tools/platform_evidence_sanitizer.py
+          platform/tools/platform_timeout_diagnostics.py
+          platform/tools/platform_bounded_receiver.py
+          EOF
+          printf 'trusted_runner_attested=true\n' >> "$GITHUB_OUTPUT"
+
+  recover:
+    name: Recover exact cancelled external fixture
+    needs:
+      - validate-trigger-identity
+      - resolve-trusted-runner
+    if: >-
+      always() &&
+      needs.validate-trigger-identity.result == 'success' &&
+      needs.validate-trigger-identity.outputs.trigger_validated == 'true' &&
+      (github.event.workflow_run.conclusion == 'cancelled' ||
+       github.event.workflow_run.conclusion == 'timed_out' ||
+       github.event.workflow_run.conclusion == 'failure') &&
+      needs.resolve-trusted-runner.result == 'success' &&
+      needs.resolve-trusted-runner.outputs.trusted_runner_sha != '' &&
+      needs.resolve-trusted-runner.outputs.trusted_runner_attested == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+    env:
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+      TRUSTED_RUNNER_SHA: ${{ needs.resolve-trusted-runner.outputs.trusted_runner_sha }}
+      INPUT_ARTIFACT_ID: ${{ needs.validate-trigger-identity.outputs.artifact_id }}
+      INPUT_ARTIFACT_NAME: ${{ needs.validate-trigger-identity.outputs.artifact_name }}
+      INPUT_ARTIFACT_DIGEST: ${{ needs.validate-trigger-identity.outputs.artifact_digest }}
+      INPUT_ARTIFACT_SIZE: ${{ needs.validate-trigger-identity.outputs.artifact_size }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download exact data-only input handoff by attested artifact identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$INPUT_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$INPUT_ARTIFACT_NAME" == "platform-production-external-load-input-$SOURCE_RUN_ID-$SOURCE_RUN_ATTEMPT" ]]
+          [[ "$INPUT_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$INPUT_ARTIFACT_SIZE" =~ ^[1-9][0-9]*$ ]] && (( INPUT_ARTIFACT_SIZE <= 67108864 ))
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          mkdir -p -m 700 "$RUNNER_TEMP/external-recovery-input"
+          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+            "${api_headers[@]}" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID" \
+            --output "$RUNNER_TEMP/external-recovery-artifact-metadata.json"
+          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --location --max-filesize 67108864 \
+            "${api_headers[@]}" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID/zip" \
+            --output "$RUNNER_TEMP/external-recovery-input.zip"
+          test "$(stat -c '%s' "$RUNNER_TEMP/external-recovery-input.zip")" -le "$INPUT_ARTIFACT_SIZE"
+          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+            "${api_headers[@]}" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" \
+            --output "$RUNNER_TEMP/external-recovery-run-metadata.json"
+
+      - name: Checkout trusted recovery helpers
+        if: ${{ needs.validate-trigger-identity.result == 'success' && needs.validate-trigger-identity.outputs.trigger_validated == 'true' && needs.resolve-trusted-runner.result == 'success' && needs.resolve-trusted-runner.outputs.trusted_runner_sha != '' && needs.resolve-trusted-runner.outputs.trusted_runner_attested == 'true' }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TRUSTED_RUNNER_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: ${{ runner.temp }}/trusted-recovery-runner
+
+      - name: Validate and safely extract the exact handoff archive
+        if: ${{ needs.validate-trigger-identity.result == 'success' && needs.validate-trigger-identity.outputs.trigger_validated == 'true' && needs.resolve-trusted-runner.result == 'success' && needs.resolve-trusted-runner.outputs.trusted_runner_sha != '' && needs.resolve-trusted-runner.outputs.trusted_runner_attested == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_root="$RUNNER_TEMP/trusted-recovery-runner"
+          metadata="$RUNNER_TEMP/external-recovery-artifact-metadata.json"
+          archive="$RUNNER_TEMP/external-recovery-input.zip"
+          run_metadata="$RUNNER_TEMP/external-recovery-run-metadata.json"
+          digest="${INPUT_ARTIFACT_DIGEST#sha256:}"
+          /usr/bin/python3 "$trusted_root/platform/tools/platform_external_load_provenance.py" artifact \
+            --metadata "$metadata" --archive "$archive" \
+            --artifact-id "$INPUT_ARTIFACT_ID" --artifact-name "$INPUT_ARTIFACT_NAME" \
+            --run-id "$SOURCE_RUN_ID" --run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --target-sha "$TARGET_SHA" --digest "$digest" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-metadata "$run_metadata" \
+            --workflow-file ".github/workflows/platform-production-external-load.yml"
+          /usr/bin/python3 - "$archive" "$RUNNER_TEMP/external-recovery-input" <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+          import stat
+          import sys
+          import zipfile
+
+          archive_path, destination_name = sys.argv[1:]
+          destination = Path(destination_name)
+          destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+          allowed = {
+              "platform-production-external-load-input.json",
+              "platform-production-external-load-profile-contract.json",
+          }
+          with zipfile.ZipFile(archive_path, "r") as source:
+              infos = source.infolist()
+              if {info.filename for info in infos} != allowed or len(infos) != len(allowed):
+                  raise SystemExit("recovery archive member set is not exact")
+              for info in infos:
+                  name = info.filename
+                  path = PurePosixPath(name)
+                  mode = (info.external_attr >> 16) & 0o170000
+                  if path.name != name or path.is_absolute() or "\\" in name or ".." in path.parts or stat.S_ISLNK(mode) or stat.S_ISDIR(mode):
+                      raise SystemExit("recovery archive contains an unsafe member")
+                  target = destination / name
+                  if target.exists() or target.is_symlink():
+                      raise SystemExit("recovery destination already exists")
+                  descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                  total = 0
+                  try:
+                      with source.open(info, "r") as reader:
+                          while True:
+                              chunk = reader.read(64 * 1024)
+                              if not chunk:
+                                  break
+                              total += len(chunk)
+                              if total > 64 * 1024 * 1024:
+                                  raise SystemExit("recovery member exceeds extraction bound")
+                              os.write(descriptor, chunk)
+                      os.fchmod(descriptor, 0o600)
+                  finally:
+                      os.close(descriptor)
+          for name in allowed:
+              target = destination / name
+              if target.is_symlink() or not target.is_file() or (target.stat().st_mode & 0o077):
+                  raise SystemExit("recovery handoff extraction is not mode 0600")
+          PY
+
+      - name: Validate exact handoff before credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_root="$RUNNER_TEMP/trusted-recovery-runner"
+          handoff_dir="$RUNNER_TEMP/external-recovery-input"
+          input_path="$handoff_dir/platform-production-external-load-input.json"
+          contract_path="$handoff_dir/platform-production-external-load-profile-contract.json"
+          test -f "$input_path" && test ! -L "$input_path"
+          test -f "$contract_path" && test ! -L "$contract_path"
+          /usr/bin/python3 - "$trusted_root" "$input_path" "$contract_path" "$TARGET_SHA" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$GITHUB_REPOSITORY" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          trusted_root, input_name, contract_name, target_sha, run_id, run_attempt, repository = sys.argv[1:]
+          sys.path.insert(0, str(Path(trusted_root) / "platform" / "tools"))
+          from platform_external_load_provenance import validate_profile_contract
+          from platform_workflow_input_guard import load_payload, validate_cleanup_payload
+
+          payload = load_payload(Path(input_name), mode="external")
+          if payload["target_sha"] != target_sha or payload["run_id"] != run_id:
+              raise SystemExit("recovery input is not bound to the triggering run")
+          contract = json.loads(Path(contract_name).read_text(encoding="utf-8"))
+          profile_id = contract.get("profile_id")
+          trusted_profile = json.loads((Path(trusted_root) / "platform" / "performance" / "profiles" / f"{profile_id}.json").read_text(encoding="utf-8"))
+          validate_profile_contract(
+              contract,
+              profile_id=profile_id,
+              source_sha=target_sha,
+              trusted_runner_sha=os.environ["TRUSTED_RUNNER_SHA"],
+              run_id=run_id,
+              run_attempt=run_attempt,
+              trusted_profile=trusted_profile,
+          )
+          cleanup = validate_cleanup_payload({
+              "schema": 1,
+              "target_sha": target_sha,
+              "control_email": payload["control_email"],
+              "load_run_id": run_id,
+              "cleanup_run_id": os.environ["GITHUB_RUN_ID"],
+          })
+          destination = Path(os.environ["RUNNER_TEMP"]) / "external-recovery-cleanup.json"
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          try:
+              os.write(descriptor, (json.dumps(cleanup, sort_keys=True, separators=(",", ":")) + "\n").encode())
+          finally:
+              os.close(descriptor)
+          if destination.stat().st_mode & 0o777 != 0o600:
+              raise SystemExit("recovery cleanup handoff is not mode 0600")
+          print("recovery handoff accepted")
+          PY
+
+      - name: Cleanup exact fixture after hard cancellation
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -u
+          set -o pipefail
+          umask 077
+          ssh_dir="$RUNNER_TEMP/external-recovery-ssh"
+          input_path="$RUNNER_TEMP/external-recovery-cleanup.json"
+          ssh_output="$RUNNER_TEMP/external-recovery-ssh-output"
+          remote_pid=""
+          cleanup_result=1
+          cleanup_exports_result=1
+          cleanup_complete=0
+          bounded_receiver() {
+            local destination="$1" max_bytes="$2"
+            /usr/bin/python3 "$RUNNER_TEMP/trusted-recovery-runner/platform/tools/platform_bounded_receiver.py" "$destination" "$max_bytes"
+          }
+          cleanup_local() {
+            local interrupted=$?
+            trap - EXIT INT TERM HUP
+            if [[ -n "$remote_pid" ]] && kill -0 "$remote_pid" 2>/dev/null; then
+              kill -TERM -- "-$remote_pid" 2>/dev/null || kill -TERM "$remote_pid" 2>/dev/null || true
+              wait "$remote_pid" 2>/dev/null || true
+            fi
+            if [[ "$cleanup_complete" != 1 && -s "$input_path" && -s "$ssh_dir/config" && -s "$ssh_dir/id_ed25519" && -n "${PROD_SSH_USER:-}" && -n "${PROD_SSH_HOST:-}" ]]; then
+              timeout --foreground 20s ssh -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 -i "$ssh_dir/id_ed25519" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST" /usr/bin/python3.12 -I -B /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+                external-cleanup-exports < "$input_path" 2>&1 | bounded_receiver "$ssh_output" 1048576 || interrupted=1
+            fi
+            rm -f -- "$ssh_output" "$input_path" "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/config"
+            rmdir -- "$ssh_dir" 2>/dev/null || [[ ! -e "$ssh_dir" ]] || interrupted=1
+            test ! -e "$input_path" && test ! -e "$ssh_dir/id_ed25519" && test ! -e "$ssh_dir" || interrupted=1
+            return "$interrupted"
+          }
+          trap cleanup_local EXIT INT TERM HUP
+          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}" || exit 1
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" 2>/dev/null | head -c 65536 > "$ssh_scan" || exit 1
+          awk -v host="$PROD_SSH_HOST" 'NR == 1 && NF == 3 && $1 == host && $2 == "ssh-ed25519" { valid=1; next } { invalid=1 } END { exit !(NR == 1 && valid == 1 && !invalid) }' "$ssh_scan" || exit 1
+          test "$(ssh-keygen -lf "$ssh_scan" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" || exit 1
+          mv -- "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          timeout --foreground 30s ssh -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -i "$ssh_dir/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" /usr/bin/python3.12 -I -B /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+            external-cleanup < "$input_path" 2>&1 | bounded_receiver "$ssh_output" 1048576 &
+          remote_pid=$!
+          wait "$remote_pid"
+          cleanup_result=$?
+          remote_pid=""
+          timeout --foreground 20s ssh -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 -i "$ssh_dir/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" /usr/bin/python3.12 -I -B /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+            external-cleanup-exports < "$input_path" 2>&1 | bounded_receiver "$ssh_output" 1048576
+          cleanup_exports_result=$?
+          rm -f -- "$ssh_output"
+          cleanup_complete=1
+          echo "cleanup_result=$cleanup_result" >> "$GITHUB_OUTPUT"
+          echo "cleanup_exports_result=$cleanup_exports_result" >> "$GITHUB_OUTPUT"
+          test "$cleanup_result" = 0 && test "$cleanup_exports_result" = 0
+
+      - name: Fail if recovery cleanup was not verified
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.cleanup.outputs.cleanup_result }}" = "0" \
+            || { echo "Recovery remote fixture cleanup failed." >&2; exit 1; }
+          test "${{ steps.cleanup.outputs.cleanup_exports_result }}" = "0" \
+            || { echo "Recovery private export cleanup failed." >&2; exit 1; }

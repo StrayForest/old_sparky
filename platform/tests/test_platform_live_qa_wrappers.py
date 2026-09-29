@@ -103,7 +103,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         workflow_modes = (
             (source, ("live-launch",)),
             (
-                (REPO_ROOT / ".github/workflows/platform-production-external-load.yml")
+                (REPO_ROOT / ".github/workflows/platform-production-external-load-trusted.yml")
                 .read_text(encoding="utf-8"),
                 (
                     "external-fixture",
@@ -113,7 +113,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 ),
             ),
             (
-                (REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml")
+                (REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup-trusted.yml")
                 .read_text(encoding="utf-8"),
                 ("retained-cleanup", "retained-cleanup-exports"),
             ),
@@ -127,7 +127,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         cleanup_source = workflow_modes[2][0]
         deploy_source = workflow_modes[3][0]
         self.assertLess(
-            external_source.index("platform_workflow_input_guard.py external"),
+            external_source.index('platform_workflow_input_guard.py" external'),
             external_source.index('printf \'%s\\n\' "$PROD_SSH_KEY"'),
         )
         self.assertLess(
@@ -877,10 +877,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
     def test_cleanup_workflows_project_public_artifacts_before_private_deletion(self) -> None:
         external = (
-            REPO_ROOT / ".github/workflows/platform-production-external-load.yml"
+            REPO_ROOT / ".github/workflows/platform-production-external-load-trusted.yml"
         ).read_text(encoding="utf-8")
         retained = (
-            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml"
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup-trusted.yml"
         ).read_text(encoding="utf-8")
         for source, dispatch in (
             (external, "external-cleanup-exports"),
