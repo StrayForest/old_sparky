@@ -1602,8 +1602,8 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
         # an immutable/root-owned generation under a tight file-size limit.
         invocation_sources = (
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml",
-            REPO_ROOT / ".github/workflows/platform-production-external-load.yml",
-            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml",
+            REPO_ROOT / ".github/workflows/platform-production-external-load-trusted.yml",
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup-trusted.yml",
             REPO_ROOT / ".github/workflows/platform-live-launch.yml",
             TOOLS_ROOT / "platform_live_user_qa_trusted.sh",
             TOOLS_ROOT / "platform_live_launch_trusted.sh",

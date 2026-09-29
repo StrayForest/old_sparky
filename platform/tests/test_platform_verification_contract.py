@@ -57,7 +57,19 @@ from tools.platform_verification_lock import (
 )
 from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
+    EXTERNAL_LOAD_WORKFLOW,
+    EXTERNAL_LOAD_RECOVERY_WORKFLOW,
     SECURITY_WORKFLOW,
+    TRUSTED_EXTERNAL_LOAD_WORKFLOW,
+    RETAINED_ABORT_WORKFLOW,
+    RETAINED_CLEANUP_WORKFLOW,
+    TRUSTED_RETAINED_ABORT_WORKFLOW,
+    TRUSTED_RETAINED_CLEANUP_WORKFLOW,
+    _external_load_workflow_issues,
+    _external_load_recovery_workflow_issues,
+    _retained_workflow_issues,
+    RETAINED_ABORT_INPUTS,
+    RETAINED_CLEANUP_INPUTS,
     action_pin_issues,
     collect_issues,
     _ci_dependency_issues,
@@ -899,6 +911,25 @@ except lock.VerificationLockError as exc:
             self.assertEqual(len(action_issues), 2)
             self.assertTrue(any("40-character commit SHA" in item for item in action_issues))
             self.assertTrue(any("owner 'unapproved'" in item for item in action_issues))
+            reusable_workflow = Path(directory) / "reusable.yml"
+            reusable_workflow.write_text(
+                "jobs:\n"
+                "  trusted:\n"
+                "    uses: StrayForest/old_sparky/.github/workflows/trusted.yml@"
+                + "c" * 40
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(action_pin_issues([reusable_workflow]), [])
+            reusable_workflow.write_text(
+                "jobs:\n"
+                "  trusted:\n"
+                "    uses: StrayForest/old_sparky/.github/actions/trusted@"
+                + "c" * 40
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(action_pin_issues([reusable_workflow]))
         self.assertEqual(collect_issues(), [])
         synthetic_setup_job = SECURITY_WORKFLOW.read_text(encoding="utf-8") + """
   synthetic-python:
@@ -918,6 +949,7 @@ except lock.VerificationLockError as exc:
                 for issue in dependency_issues
             )
         )
+
         with tempfile.TemporaryDirectory() as directory:
             component_dir = Path(directory)
             _write_backend_component_fixture(component_dir)
@@ -985,6 +1017,196 @@ except lock.VerificationLockError as exc:
                     summary_path.write_text(json.dumps(summary), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     verify_backend_components(component_dir)
+
+    def test_external_load_boundary_rejects_public_execution_surface(self) -> None:
+        public = EXTERNAL_LOAD_WORKFLOW.read_text(encoding="utf-8")
+        trusted = TRUSTED_EXTERNAL_LOAD_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(
+            _external_load_workflow_issues(public, trusted, load_profiles()),
+            [],
+        )
+        mutations = {
+            "runs-on": public.replace(
+                "    uses: StrayForest/old_sparky/",
+                "    runs-on: ubuntu-latest\n    uses: StrayForest/old_sparky/",
+                1,
+            ),
+            "run": public.replace(
+                "    uses: StrayForest/old_sparky/",
+                "    run: echo forbidden\n    uses: StrayForest/old_sparky/",
+                1,
+            ),
+            "secrets": public.replace(
+                "    uses: StrayForest/old_sparky/",
+                "    secrets: inherit\n    uses: StrayForest/old_sparky/",
+                1,
+            ),
+            "environment": public.replace(
+                "    uses: StrayForest/old_sparky/",
+                "    environment: production\n    uses: StrayForest/old_sparky/",
+                1,
+            ),
+            "checkout": public.replace(
+                "    uses: StrayForest/old_sparky/",
+                "    steps:\n      - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    uses: StrayForest/old_sparky/",
+                1,
+            ),
+        }
+        for marker, mutated in mutations.items():
+            with self.subTest(marker=marker):
+                issues = _external_load_workflow_issues(mutated, trusted, load_profiles())
+                self.assertTrue(any("data-only" in issue for issue in issues), issues)
+
+    def test_external_load_boundary_rejects_input_and_trusted_profile_drift(self) -> None:
+        public = EXTERNAL_LOAD_WORKFLOW.read_text(encoding="utf-8")
+        trusted = TRUSTED_EXTERNAL_LOAD_WORKFLOW.read_text(encoding="utf-8")
+        extra_input = public.replace(
+            "      timeout_diagnostics:\n",
+            "      unexpected:\n"
+            "        required: false\n"
+            "        type: string\n"
+            "      timeout_diagnostics:\n",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "input names drift" in issue
+                for issue in _external_load_workflow_issues(
+                    extra_input, trusted, load_profiles()
+                )
+            )
+        )
+        stale_profile = trusted.replace(
+            "ready-vote-slo-v2|ready-vote-spike-v1",
+            "retired-profile-v1|ready-vote-spike-v1",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "profile allowlist" in issue
+                for issue in _external_load_workflow_issues(
+                    public, stale_profile, load_profiles()
+                )
+            )
+        )
+        missing_runner = trusted.replace("platform_load.py run", "candidate.py run", 1)
+        self.assertTrue(
+            any(
+                "platform_load runner" in issue
+                for issue in _external_load_workflow_issues(
+                    public, missing_runner, load_profiles()
+                )
+            )
+        )
+        wrong_workflow_ref = trusted.replace(
+            'CALLER_WORKFLOW_REF" == "$EXPECTED_REPOSITORY/$EXPECTED_WORKFLOW_PATH@$EXPECTED_DEFAULT_REF"',
+            'CALLER_WORKFLOW_REF" == "$EXPECTED_REPOSITORY/$EXPECTED_WORKFLOW_PATH@$CALLER_WORKFLOW_SHA"',
+            1,
+        )
+        self.assertTrue(
+            any(
+                "CALLER_WORKFLOW_REF" in issue
+                for issue in _external_load_workflow_issues(
+                    public, wrong_workflow_ref, load_profiles()
+                )
+            )
+        )
+        wrong_workflow_sha = trusted.replace(
+            'CALLER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$',
+            'CALLER_WORKFLOW_SHA" =~ ^[0-9a-f]{39}$',
+            1,
+        )
+        self.assertTrue(
+            any(
+                "CALLER_WORKFLOW_SHA" in issue
+                for issue in _external_load_workflow_issues(
+                    public, wrong_workflow_sha, load_profiles()
+                )
+            )
+        )
+        missing_metadata_assignment = trusted.replace(
+            "RUN_METADATA_PATH: ${{ steps.download-run-metadata.outputs.run_metadata_path }}",
+            "RUN_METADATA_PATH: ${{ steps.missing-run-metadata.outputs.run_metadata_path }}",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "explicit run metadata path" in issue
+                for issue in _external_load_workflow_issues(
+                    public, missing_metadata_assignment, load_profiles()
+                )
+            )
+        )
+
+        recovery = EXTERNAL_LOAD_RECOVERY_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(_external_load_recovery_workflow_issues(recovery), [])
+        missing_recovery_bound = recovery.replace("bounded_receiver", "unsafe_stream_sink")
+        self.assertTrue(
+            any(
+                "bounded exact-artifact marker bounded_receiver" in issue
+                for issue in _external_load_recovery_workflow_issues(missing_recovery_bound)
+            )
+        )
+        missing_recovery_host_key_retry = recovery.replace(
+            "known_hosts.scan.1",
+            "known_hosts.scan.missing",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "bounded exact-artifact marker known_hosts.scan.1" in issue
+                for issue in _external_load_recovery_workflow_issues(
+                    missing_recovery_host_key_retry
+                )
+            )
+        )
+        for public_path, trusted_path, kind, inputs in (
+            (RETAINED_CLEANUP_WORKFLOW, TRUSTED_RETAINED_CLEANUP_WORKFLOW, "cleanup", RETAINED_CLEANUP_INPUTS),
+            (RETAINED_ABORT_WORKFLOW, TRUSTED_RETAINED_ABORT_WORKFLOW, "abort", RETAINED_ABORT_INPUTS),
+        ):
+            retained_public = public_path.read_text(encoding="utf-8")
+            retained_trusted = trusted_path.read_text(encoding="utf-8")
+            self.assertEqual(
+                _retained_workflow_issues(
+                    retained_public,
+                    retained_trusted,
+                    kind=kind,
+                    inputs=inputs,
+                ),
+                [],
+            )
+            impure_public = retained_public.replace(
+                "    uses: StrayForest/old_sparky/",
+                "    run: echo forbidden\n    uses: StrayForest/old_sparky/",
+                1,
+            )
+            self.assertTrue(
+                any(
+                    "pure data-only wrapper" in issue
+                    for issue in _retained_workflow_issues(
+                        impure_public,
+                        retained_trusted,
+                        kind=kind,
+                        inputs=inputs,
+                    )
+                )
+            )
+            ungated_trusted = retained_trusted.replace(
+                "needs.validate-caller-identity.outputs.caller_identity_validated == 'true'",
+                "needs.other.outputs.caller_identity_validated == 'true'",
+                1,
+            )
+            self.assertTrue(
+                any(
+                    "must gate on identity output" in issue
+                    for issue in _retained_workflow_issues(
+                        retained_public,
+                        ungated_trusted,
+                        kind=kind,
+                        inputs=inputs,
+                    )
+                )
+            )
 
     def test_load_profiles_are_unique_and_have_stable_digests(self) -> None:
         profiles = load_profiles()

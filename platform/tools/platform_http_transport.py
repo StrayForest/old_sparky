@@ -28,6 +28,11 @@ SAFE_RESPONSE_HEADERS = frozenset(
         "retry-after",
     }
 )
+# Keep a small prefix for protocol diagnostics while never retaining a whole
+# page response in every RequestResult.  The transport still drains at most
+# max_response_bytes + 1 so an oversized response is rejected deterministically.
+RESPONSE_CAPTURE_LIMIT = 64 * 1024
+RESPONSE_READ_CHUNK_SIZE = 64 * 1024
 PHASE_TIMING_KEYS = (
     "dns_ms",
     "tcp_connect_ms",
@@ -46,6 +51,8 @@ class TransportResponse:
     reason: str
     headers: dict[str, str]
     body: bytes
+    response_bytes: int
+    body_complete: bool
     http_version: str
     connection_reused: bool
     timing: dict[str, Any]
@@ -208,12 +215,21 @@ class HTTP11KeepAliveClient:
             headers_finished = time.perf_counter()
             timing["edge_wait_ms"] = (headers_finished - write_finished) * 1_000
             timing["ttfb_ms"] = (headers_finished - started) * 1_000
-            body = response.read(self._max_response_bytes + 1)
+            response_bytes = 0
+            captured = bytearray()
+            while response_bytes <= self._max_response_bytes:
+                remaining = self._max_response_bytes + 1 - response_bytes
+                chunk = response.read(min(RESPONSE_READ_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                response_bytes += len(chunk)
+                if len(captured) < RESPONSE_CAPTURE_LIMIT:
+                    captured.extend(chunk[: RESPONSE_CAPTURE_LIMIT - len(captured)])
             body_finished = time.perf_counter()
             timing["body_receive_ms"] = (body_finished - headers_finished) * 1_000
             timing["total_ms"] = (body_finished - started) * 1_000
             timing["http_version"] = self._http_version(response)
-            if len(body) > self._max_response_bytes:
+            if response_bytes > self._max_response_bytes:
                 raise ValueError("HTTP transport response exceeded its size limit")
 
             safe_headers = {
@@ -231,7 +247,9 @@ class HTTP11KeepAliveClient:
                 status=int(response.status),
                 reason=str(response.reason),
                 headers=safe_headers,
-                body=body,
+                body=bytes(captured),
+                response_bytes=response_bytes,
+                body_complete=response_bytes <= self._max_response_bytes,
                 http_version=str(timing["http_version"]),
                 connection_reused=reused,
                 timing=timing,

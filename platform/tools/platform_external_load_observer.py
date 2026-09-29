@@ -14,6 +14,7 @@ from pathlib import Path
 import pwd
 import re
 import signal
+import sys
 import time
 from pstats import Stats
 from typing import Callable
@@ -458,20 +459,37 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_timeout_diagnostic_ids(path: Path | None) -> set[str] | None:
+def load_timeout_diagnostic_ids(path: Path | None) -> tuple[str, ...] | None:
+    """Load the closed, ordered timeout-id handoff without fail-open parsing.
+
+    The ID list is a correlation contract, not an optional hint.  Returning a
+    stable tuple preserves the producer's canonical order and lets the origin
+    evidence validator reject duplicates or an unexpected request population.
+    """
     if path is None:
         return None
     try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1 * 1024 * 1024:
+            raise ValueError("timeout diagnostic id handoff is unsafe")
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return set()
-    if not isinstance(payload, list) or len(payload) > 20_000:
-        return set()
-    return {
-        value
-        for value in payload
-        if isinstance(value, str) and TIMEOUT_DIAGNOSTIC_ID_RE.fullmatch(value)
-    }
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("timeout diagnostic id handoff is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {"schema", "target_sha", "run_id", "ids"}:
+        raise ValueError("timeout diagnostic id handoff schema is invalid")
+    if payload.get("schema") != 1:
+        raise ValueError("timeout diagnostic id handoff version is invalid")
+    if not isinstance(payload.get("target_sha"), str) or re.fullmatch(r"[0-9a-f]{40}", payload["target_sha"]) is None:
+        raise ValueError("timeout diagnostic id handoff target is invalid")
+    if not isinstance(payload.get("run_id"), str) or re.fullmatch(r"[1-9][0-9]{0,31}", payload["run_id"]) is None:
+        raise ValueError("timeout diagnostic id handoff run is invalid")
+    ids = payload.get("ids")
+    if not isinstance(ids, list) or len(ids) > 20_000:
+        raise ValueError("timeout diagnostic id handoff population is invalid")
+    if any(not isinstance(value, str) or TIMEOUT_DIAGNOSTIC_ID_RE.fullmatch(value) is None for value in ids):
+        raise ValueError("timeout diagnostic id handoff contains an invalid id")
+    if ids != sorted(ids) or len(set(ids)) != len(ids):
+        raise ValueError("timeout diagnostic id handoff is not canonical")
+    return tuple(ids)
 
 
 def profile_artifact_snapshot(output_dir: Path | None) -> dict[str, tuple[int, int, int, int]]:
@@ -1158,7 +1176,11 @@ async def async_main() -> int:
         with_timestamps=True,
     )
     nginx_access_records = collect_nginx_access_records(started_at, finished_at)
-    timeout_diagnostic_ids = load_timeout_diagnostic_ids(args.diagnostic_id_file)
+    try:
+        timeout_diagnostic_ids = load_timeout_diagnostic_ids(args.diagnostic_id_file)
+    except ValueError as exc:
+        print(f"timeout diagnostic handoff rejected: {exc}", file=sys.stderr)
+        return 2
 
     system_summary = sampler.summary()
     system_summary["timeline"] = [
@@ -1194,6 +1216,16 @@ async def async_main() -> int:
     ]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        server_ssr_observability = summarize_ssr_observability(
+            web_journal_lines,
+            nginx_access_records,
+            request_perf_lines,
+            timeout_diagnostic_ids=timeout_diagnostic_ids,
+        )
+    except ValueError as exc:
+        print(f"timeout diagnostic origin correlation failed: {exc}", file=sys.stderr)
+        return 2
     payload = {
         "schema": 1,
         "binding": {
@@ -1222,12 +1254,7 @@ async def async_main() -> int:
             request_perf_lines,
             tournament_slug=None,
         ),
-        "server_ssr_observability": summarize_ssr_observability(
-            web_journal_lines,
-            nginx_access_records,
-            request_perf_lines,
-            timeout_diagnostic_ids=timeout_diagnostic_ids,
-        ),
+        "server_ssr_observability": server_ssr_observability,
         "cpu_profile": {
             **cpu_profile_summary(
                 profile_dir,

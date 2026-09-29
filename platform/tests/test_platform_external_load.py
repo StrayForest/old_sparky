@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import tempfile
+import tracemalloc
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from tools.platform_external_load import (
     _ready_vote_action,
     _annotate_timing,
     _request,
+    _read_bounded_response,
     load_manifest,
     run_load,
     spread_offsets,
@@ -278,6 +280,28 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(result.cf_error_origin, "origin")
         self.assertEqual(result.retry_after, "60")
         self.assertEqual(len(result.cf_error_type or ""), 128)
+
+    def test_response_body_capture_is_bounded_for_large_repeated_responses(self) -> None:
+        class LargeResponse:
+            def __init__(self) -> None:
+                self.remaining = 2 * 1024 * 1024 + 1
+
+            def read(self, size: int) -> bytes:
+                count = min(size, self.remaining)
+                self.remaining -= count
+                return b"x" * count
+
+        tracemalloc.start()
+        try:
+            for _ in range(24):
+                total, captured, complete = _read_bounded_response(LargeResponse())
+                self.assertEqual(total, 2 * 1024 * 1024 + 1)
+                self.assertEqual(len(captured), 64 * 1024)
+                self.assertFalse(complete)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 2 * 1024 * 1024)
 
     def test_diagnostic_request_carries_id_and_monotonic_timestamps_on_timeout(self) -> None:
         user = VirtualUser("user-00000001", "qa-tournament", "s" * 64, "c" * 64)

@@ -1489,7 +1489,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("steps.create_fixture.outcome == 'success'", profile_fixture)
         self.assertIn("if: ${{ always() }}", profile_fixture)
         retained_abort = (
-            WORKFLOW_DIR / "platform-production-retained-load-abort.yml"
+            WORKFLOW_DIR / "platform-production-retained-load-abort-trusted.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("trap 'rm -f -- \"$raw_log\"' EXIT", retained_abort)
 
@@ -1528,7 +1528,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn('description\\":\\"Production deployment and live smoke passed', deploy[marker_at:])
 
     def test_all_production_ssh_workflows_pin_host_identity(self) -> None:
-        workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-as12-proof.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml', 'platform-production-external-load.yml', 'platform-production-release-abort.yml', 'platform-production-retained-load-cleanup.yml', 'platform-production-retained-load-abort.yml', 'platform-production-storage-diagnostics.yml', 'platform-production-web-runtime-diagnostics.yml')
+        workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-as12-proof.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml', 'platform-production-external-load-trusted.yml', 'platform-production-external-load-recovery.yml', 'platform-production-release-abort.yml', 'platform-production-retained-load-cleanup-trusted.yml', 'platform-production-retained-load-abort-trusted.yml', 'platform-production-storage-diagnostics.yml', 'platform-production-web-runtime-diagnostics.yml')
         expected_fingerprint = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
         for name in workflow_names:
             workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")

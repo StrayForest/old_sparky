@@ -17,6 +17,8 @@ import textwrap
 import unittest
 import zipfile
 
+import yaml
+
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
 from tests.test_platform_validate_release_artifact import (
     ArchiveBuilder as ReleaseArtifactFixtureBuilder,
@@ -2132,8 +2134,11 @@ cleanup
         self.assertFalse(
             retired_production_workflow.exists()
         )
-        workflow = (
+        entry_workflow = (
             REPO_ROOT / ".github/workflows/platform-production-external-load.yml"
+        ).read_text()
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-external-load-trusted.yml"
         ).read_text()
         external_client = (
             REPO_ROOT / "platform/tools/platform_external_load.py"
@@ -2151,7 +2156,9 @@ cleanup
             REPO_ROOT / "platform/tools/platform_workflow_remote_dispatch.py"
         ).read_text()
 
-        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("workflow_dispatch:", entry_workflow)
+        self.assertIn("uses: StrayForest/old_sparky/.github/workflows/platform-production-external-load-trusted.yml@", entry_workflow)
+        self.assertIn("workflow_call:", workflow)
         self.assertIn("RUN-PRODUCTION-EXTERNAL-LOAD", workflow)
         self.assertIn("external-vote", workflow)
         self.assertIn("platform_load.py", workflow)
@@ -2181,11 +2188,11 @@ cleanup
         self.assertIn("ControlMaster auto", workflow)
         self.assertIn("ControlPersist 15m", workflow)
         self.assertIn(
-            'control_path="/tmp/old-sparky-external-load-ssh-setup-$GITHUB_RUN_ID"',
+            'control_path="/tmp/old-sparky-external-load-ssh-setup-$SOURCE_RUN_ID"',
             workflow,
         )
         self.assertIn(
-            'control_path="/tmp/old-sparky-external-load-ssh-finalize-$GITHUB_RUN_ID"',
+            'control_path="/tmp/old-sparky-external-load-ssh-finalize-$SOURCE_RUN_ID"',
             workflow,
         )
         self.assertIn("ControlPath %s", workflow)
@@ -2411,7 +2418,7 @@ cleanup
         self,
     ) -> None:
         workflow = (
-            REPO_ROOT / ".github/workflows/platform-production-external-load.yml"
+            REPO_ROOT / ".github/workflows/platform-production-external-load-trusted.yml"
         ).read_text()
 
         # Candidate checkout/evaluation jobs are fresh and secret-free. SSH is
@@ -2433,35 +2440,17 @@ cleanup
             self.assertIn("environment: production", job, job_name)
             self.assertIn("secrets.PROD_SSH_KEY", job, job_name)
 
-        checkout_start = workflow.index("      - name: Checkout reviewed load client")
-        checkout_end = workflow.index("      - name:", checkout_start + 1)
-        checkout = workflow[checkout_start:checkout_end]
-        self.assertIn("persist-credentials: false", checkout)
-        self.assertNotIn("persist-credentials: true", checkout)
-
-        client_step_names = (
-            "Validate explicit external production load",
-            "Run checked-out external HTTP load client",
-            "Evaluate checked-out load report",
-        )
-        for name in client_step_names:
-            step_start = workflow.index(f"      - name: {name}")
-            next_step = workflow.find("\n      - name:", step_start + 1)
-            step = workflow[step_start:] if next_step == -1 else workflow[step_start:next_step]
-            self.assertNotIn("PROD_SSH_HOST:", step, name)
-            self.assertNotIn("PROD_SSH_USER:", step, name)
-            self.assertNotIn("PROD_SSH_KEY:", step, name)
-            self.assertNotIn("SSH_DIR=", step, name)
-            self.assertNotIn("SSH_CONTROL_PATH=", step, name)
-            if name != "Evaluate checked-out load report":
-                self.assertIn("run_checked_out_client", step, name)
-                self.assertIn("env -i", step, name)
-                self.assertIn("SOURCE_GIT_SHA=", step, name)
-                self.assertIn('GITHUB_RUN_ID="$GITHUB_RUN_ID"', step, name)
-            self.assertNotIn("SSH_AUTH_SOCK", step, name)
-            self.assertNotIn("id_ed25519", step, name)
-            self.assertNotIn("ssh_dir", step, name)
-            self.assertNotIn("control_path", step, name)
+        # E is never checked out: candidate input is fetched as one profile
+        # JSON and every executable checkout is the attested T runner.
+        self.assertNotIn("Checkout reviewed load client", workflow)
+        self.assertNotIn("ref: ${{ env.TARGET_SHA }}", workflow)
+        for job_name in ("validate-external-inputs", "load-client", "evaluate-load"):
+            job = workflow_job(workflow, job_name)
+            self.assertIn("actions/checkout@", job, job_name)
+            self.assertIn("persist-credentials: false", job, job_name)
+            self.assertNotRegex(job, r"PROD_SSH_(?:HOST|USER|KEY):", job_name)
+            self.assertNotIn("SSH_AUTH_SOCK", job, job_name)
+            self.assertNotIn("id_ed25519", job, job_name)
 
         for name in (
             "Prepare external fixture with ephemeral SSH",
@@ -2478,9 +2467,17 @@ cleanup
         self.assertIn("- name: Remove fixture-setup SSH material", workflow)
         self.assertIn("- name: Remove finalizer SSH material", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
-        self.assertIn(
-            "needs:\n      - validate-external-inputs\n      - fixture-setup\n      - load-client",
-            workflow,
+        workflow_document = yaml.safe_load(workflow)
+        self.assertEqual(
+            set(workflow_document["jobs"]["evaluate-load"]["needs"]),
+            {
+                "validate-caller-identity",
+                "resolve-trusted-runner",
+                "validate-external-inputs",
+                "fixture-setup",
+                "fixture-finalize",
+                "load-client",
+            },
         )
         self.assertIn("steps.fixture-setup.outputs.setup_status", workflow)
         self.assertIn("steps.external-finalize.outputs.remote_status", workflow)

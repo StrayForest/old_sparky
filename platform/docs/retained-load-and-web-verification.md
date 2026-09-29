@@ -2,7 +2,7 @@
 
 - Status: Active reference and operator how-to
 - Owner: Performance and web verification owners
-- Last reviewed: 2026-09-19
+- Last reviewed: 2026-09-29
 
 This document owns the detailed retained-load cleanup, hermetic web verification,
 external-load workflow barrier and evidence-projection contracts. The
@@ -41,21 +41,34 @@ accepts individual IPv4/IPv6 addresses only, never a CIDR or wildcard.
 
 ## External-load workflow and evidence
 
+The public external-load dispatch is a data-only entry point pinned to the
+T-owned reusable workflow. The candidate commit contributes only one bounded
+profile JSON fetched by the Contents API at its exact SHA; executable helpers,
+production permissions and secret-bearing jobs come from the attested protected
+default commit. The protected `workflow_run` recovery workflow consumes only
+the triggering run's exact input artifact after cancellation, timeout or
+failure, and performs the same identity and mode-0600 handoff checks before
+cleanup. A profile's trusted execution budget supplies the fixture job timeout;
+operators must not add a second timeout or bypass the profile contract.
+
 The workflow is fail-closed across separate runners; finalization, exact cleanup
 and SSH removal use `always()`, but any failed row below keeps the run failed:
 
 | Boundary | Passing value |
 | --- | --- |
-| dispatch, setup and load-client jobs | job result `success`; setup `setup_status=0` |
+| dispatch, setup and load-client jobs | job result `success`; setup `setup_status=0`, closed manifest validation `0`, credential cleanup `0` |
 | measured load | authoritative `load_status=0`; report present |
 | remote/finalization | `remote_status=0`, `observer_ready=1`, `finalize_status=0` |
-| cleanup/export cleanup | `cleanup_status=0`, `cleanup_exports_status=0` |
-| handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
-| evaluation/projection | `evaluation_status=0`, `sanitizer_status=0` |
+| cleanup/export cleanup | `cleanup_status=0`, `cleanup_exports_status=0`, diagnostic-ID correlation `0` |
+| handoffs/artifacts/SSH | exact SHA/run/attempt/digest/size/repository/workflow; cleanup statuses `0` |
+| evaluation/projection/provenance | `evaluation_status=0`, `sanitizer_status=0`, closed final provenance `0` |
 
 The evidence artifact is published only after every row passes; missing or
-mismatched artifacts and remote, projection, sanitizer or cleanup failures
-cannot be hidden by the evaluator.
+mismatched artifacts and remote, projection, sanitizer, provenance or cleanup
+failures cannot be hidden by the evaluator. The non-secret provenance record
+binds the candidate source, trusted workflow and runner, profile ID/version/
+digest, triggering run and attempt, and every published artifact's exact ID,
+name, digest, byte size, repository and workflow path.
 
 Load/QA evidence is a fixed, privacy-bounded set: route classes/templates,
 numeric timings/counts/statuses and allowlisted error/backend/wait classes. It

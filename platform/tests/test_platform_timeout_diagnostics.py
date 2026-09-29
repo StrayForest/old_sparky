@@ -4,7 +4,7 @@ from tools.platform_timeout_diagnostics import join_reports
 
 
 class TimeoutDiagnosticsTests(unittest.TestCase):
-    def test_join_keeps_bounded_origin_metrics_without_correlator_values(self) -> None:
+    def test_join_keeps_bounded_origin_metrics_with_safe_id_correlation(self) -> None:
         report = join_reports(
             {
                 "source_git_sha": "a" * 40,
@@ -12,7 +12,7 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
                 "overall": {
                     "timeout_diagnostics": [
                         {
-                            "diagnostic_id": "secret-correlator",
+                            "diagnostic_id": "tdiag-123-00001",
                             "error_kind": "TimeoutError",
                             "method": "GET",
                             "path": "/tournaments/private-slug/workspace?invite=secret",
@@ -26,7 +26,7 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
                     "timeout_diagnostics": {
                         "rows": [
                             {
-                                "diagnostic_id": "secret-correlator",
+                                "diagnostic_id": "tdiag-123-00001",
                                 "method": "GET",
                                 "uri": "/tournaments/private-slug/workspace?token=secret",
                                 "route_class": "tournament_workspace",
@@ -58,11 +58,10 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
         self.assertEqual(row["origin"]["route_class"], "tournament_workspace")
         self.assertEqual(row["origin"]["next"]["request_time_ms"], 30_000.0)
         serialized = str(report)
-        self.assertNotIn("secret-correlator", serialized)
+        self.assertIn("tdiag-123-00001", serialized)
         self.assertNotIn("private-slug", serialized)
         self.assertNotIn("invite=secret", serialized)
         self.assertNotIn("secret-stage", serialized)
-        self.assertNotIn("diagnostic_id", serialized)
         self.assertNotIn("request_id", serialized)
         self.assertNotIn("path", row["client"])
         self.assertNotIn("uri", row["origin"])
@@ -76,7 +75,7 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
                 "overall": {
                     "timeout_diagnostics": [
                         {
-                            "diagnostic_id": "secret-correlator",
+                            "diagnostic_id": "tdiag-123-00001",
                             "error_kind": "TimeoutError",
                             "phase": "write_burst",
                             "method": "POST",
@@ -90,7 +89,7 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
                     "timeout_diagnostics": {
                         "rows": [
                             {
-                                "diagnostic_id": "secret-correlator",
+                                "diagnostic_id": "tdiag-123-00001",
                                 "route_class": "ready_vote",
                                 "method": "POST",
                                 "status": 504,
@@ -118,8 +117,9 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
         self.assertIsNone(report["rows"][0]["estimated_origin_request_start_delta_ms"])
         self.assertFalse(report["rows"][0]["origin_request_started_after_client_timeout"])
 
-    def test_join_keeps_missing_origin_as_unresolved_edge_or_client(self) -> None:
-        report = join_reports(
+    def test_join_fails_when_origin_row_is_missing(self) -> None:
+        with self.assertRaises(ValueError):
+            join_reports(
             {
                 "source_git_sha": "a" * 40,
                 "load_contract": {"profile_id": "authenticated-page-load-v1"},
@@ -148,12 +148,28 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(report["summary"]["client_timeout_errors"], 1)
-        self.assertEqual(
-            report["summary"]["classifications"],
-            {"before_origin_observed": 1},
-        )
-        self.assertIsNone(report["rows"][0]["origin"])
+
+    def test_join_fails_for_duplicate_or_unexpected_origin_ids(self) -> None:
+        client = {
+            "overall": {
+                "timeout_diagnostics": [
+                    {"diagnostic_id": "tdiag-123-00001", "error_kind": "TimeoutError"},
+                    {"diagnostic_id": "tdiag-123-00002", "error_kind": "TimeoutError"},
+                ]
+            }
+        }
+        origin = {
+            "server_ssr_observability": {
+                "timeout_diagnostics": {
+                    "rows": [
+                        {"diagnostic_id": "tdiag-123-00001"},
+                        {"diagnostic_id": "tdiag-123-00001"},
+                    ]
+                }
+            }
+        }
+        with self.assertRaises(ValueError):
+            join_reports(client, origin)
 
 
 if __name__ == "__main__":

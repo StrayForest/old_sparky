@@ -74,6 +74,11 @@ MAX_USERS = 20_000
 MAX_TOURNAMENTS = 64
 MAX_CONCURRENCY = 512
 RESPONSE_BODY_LIMIT = 2 * 1024 * 1024
+# Response bodies are drained only to the bounded transport limit.  The load
+# contract needs a few tiny control fields (overload/retry/changed/state); it
+# must never retain an arbitrary JSON document once a request completes.
+RESPONSE_CONTROL_CAPTURE_LIMIT = 64 * 1024
+RESPONSE_READ_CHUNK_SIZE = 64 * 1024
 ERROR_SAMPLE_LIMIT = 25
 DIAGNOSTIC_HEADER_LIMIT = 128
 MAX_MEASUREMENT = 1_000_000_000_000.0
@@ -162,6 +167,74 @@ class LogicalRequestResult:
     @property
     def retry_count(self) -> int:
         return max(0, len(self.attempts) - 1)
+
+
+def _read_bounded_response(stream: Any) -> tuple[int, bytes, bool]:
+    """Drain at most the response limit while retaining only control bytes.
+
+    ``urllib`` and the keep-alive transport both expose file-like response
+    objects.  Reading into one large ``bytes`` value for every request made a
+    20k-user run retain gigabytes of HTML/JSON until the phase was summarized.
+    Keep an exact bounded byte count and a small prefix for allowlisted control
+    fields; discard the rest immediately.
+    """
+
+    total = 0
+    captured = bytearray()
+    while total <= RESPONSE_BODY_LIMIT:
+        remaining = RESPONSE_BODY_LIMIT + 1 - total
+        chunk = stream.read(min(RESPONSE_READ_CHUNK_SIZE, remaining))
+        if not chunk:
+            break
+        total += len(chunk)
+        if len(captured) < RESPONSE_CONTROL_CAPTURE_LIMIT:
+            captured.extend(chunk[: RESPONSE_CONTROL_CAPTURE_LIMIT - len(captured)])
+        if total > RESPONSE_BODY_LIMIT:
+            break
+    return total, bytes(captured), total <= RESPONSE_BODY_LIMIT
+
+
+def _allowlisted_response_control(raw_body: bytes, *, complete: bool) -> dict[str, Any] | None:
+    """Extract only fields used by the load state machine.
+
+    A response may be arbitrarily large or contain private data.  It is safe
+    to parse only a complete small JSON document and project the four control
+    values needed for retries/state checks; no response body is retained.
+    """
+
+    if not complete or len(raw_body) > RESPONSE_CONTROL_CAPTURE_LIMIT:
+        return None
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    control: dict[str, Any] = {}
+    if isinstance(payload.get("code"), str) and len(payload["code"]) <= 128:
+        control["code"] = payload["code"]
+    if type(payload.get("retryable")) is bool:
+        control["retryable"] = payload["retryable"]
+    retry_after_ms = payload.get("retry_after_ms")
+    if (
+        isinstance(retry_after_ms, (int, float))
+        and not isinstance(retry_after_ms, bool)
+        and math.isfinite(float(retry_after_ms))
+        and 0 <= float(retry_after_ms) <= MAX_MEASUREMENT
+    ):
+        control["retry_after_ms"] = retry_after_ms
+    if type(payload.get("changed")) is bool:
+        control["changed"] = payload["changed"]
+    active_round = payload.get("active_round")
+    if isinstance(active_round, dict):
+        ready_count = active_round.get("ready_count")
+        if (
+            isinstance(ready_count, int)
+            and not isinstance(ready_count, bool)
+            and 0 <= ready_count <= MAX_USERS
+        ):
+            control["active_round"] = {"ready_count": ready_count}
+    return control or None
 
 
 def percentile(values: list[float], percent: float) -> float | None:
@@ -722,33 +795,23 @@ def _request(
             cf_ray = response.headers.get("cf-ray", "")[:128] or None
             cf_error_type, cf_error_origin, retry_after = diagnostic_headers(response.headers)
             response_etag = response.headers.get("etag", "")[:512] or None
-            first_chunk = response.read(1)
+            response_bytes, captured_body, body_complete = _read_bounded_response(response)
             time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
-            raw_body = first_chunk + response.read(
-                max(0, RESPONSE_BODY_LIMIT - len(first_chunk))
+            response_json = _allowlisted_response_control(
+                captured_body,
+                complete=body_complete,
             )
-            response_bytes = len(raw_body)
-            if raw_body:
-                try:
-                    response_json = json.loads(raw_body.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    response_json = None
     except HTTPError as exc:
         status = int(exc.code)
         cf_ray = exc.headers.get("cf-ray", "")[:128] or None
         cf_error_type, cf_error_origin, retry_after = diagnostic_headers(exc.headers)
-        first_chunk = exc.read(1)
+        response_bytes, captured_body, body_complete = _read_bounded_response(exc)
         time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
-        with_error_body = first_chunk + exc.read(
-            max(0, RESPONSE_BODY_LIMIT - len(first_chunk))
-        )
-        response_bytes = len(with_error_body)
         error_kind = "http_error"
-        if with_error_body:
-            try:
-                response_json = json.loads(with_error_body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                response_json = None
+        response_json = _allowlisted_response_control(
+            captured_body,
+            complete=body_complete,
+        )
     except (URLError, TimeoutError, OSError) as exc:
         exception_at_utc = datetime.now(UTC).isoformat()
         error_kind = type(exc).__name__
@@ -887,7 +950,7 @@ def _page_request_http11_keepalive(
             status=status,
             elapsed_ms=float(response.timing.get("total_ms") or 0.0),
             ok=status == 200,
-            response_bytes=len(response.body),
+            response_bytes=response.response_bytes,
             time_to_first_byte_ms=(
                 float(response.timing["ttfb_ms"])
                 if isinstance(response.timing.get("ttfb_ms"), (int, float))
@@ -1152,6 +1215,7 @@ def summarize_results(
             if result.diagnostic_id and kind == "timeout":
                 timeout_diagnostics.append(
                     {
+                        "diagnostic_id": result.diagnostic_id,
                         "phase": safe_phase(result.phase),
                         "method": safe_method(result.method),
                         "route_class": safe_route_class(result.path),
@@ -1172,6 +1236,7 @@ def summarize_results(
             and type(result.response_json.get("changed")) is bool
         ):
             changed[str(result.response_json["changed"])] += 1
+    timeout_diagnostics.sort(key=lambda row: str(row.get("diagnostic_id") or ""))
     return {
         "scope": "full_population",
         "requests": len(results),
