@@ -244,6 +244,12 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         health_service = (
             REPO_ROOT / "platform/deploy/systemd/deadlock-health-monitor.service"
         ).read_text()
+        health_monitor = (
+            REPO_ROOT / "platform/tools/platform_health_monitor.py"
+        ).read_text()
+        self.assertIn("HEALTH_OPERATION_BUDGET_SECONDS", health_monitor)
+        self.assertIn("HEALTH_SERVICE_TIMEOUT_SECONDS = HEALTH_OPERATION_BUDGET_SECONDS + 35.0", health_monitor)
+        self.assertIn("TimeoutStartSec=90s", health_service)
         self.assertEqual(
             [line for line in health_service.splitlines() if line.startswith("ExecStart=")],
             [

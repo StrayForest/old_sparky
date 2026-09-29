@@ -50,6 +50,10 @@ from python_packages.platform_infra.config import (
 PARTIAL_REVISION = "20260901_0050"
 APPLIED_REVISION = "20260901_0051"
 ADVISORY_LOCK_KEY = 202609010051
+RECOVERY_DB_CONNECT_TIMEOUT_SECONDS = 30.0
+RECOVERY_DB_COMMAND_TIMEOUT_SECONDS = 30.0
+RECOVERY_DB_STATEMENT_TIMEOUT_MS = "30000ms"
+RECOVERY_DB_LOCK_TIMEOUT_MS = "30000ms"
 
 
 class RecoveryError(RuntimeError):
@@ -1009,7 +1013,19 @@ async def recover_partial_0051(engine: AsyncEngine) -> bool:
 async def _main_async() -> None:
     settings = get_settings()
     validate_platform_settings(settings)
-    engine = create_async_engine(settings.platform_database_url, pool_pre_ping=True)
+    engine = create_async_engine(
+        settings.platform_database_url,
+        pool_pre_ping=True,
+        connect_args={
+            "timeout": RECOVERY_DB_CONNECT_TIMEOUT_SECONDS,
+            "command_timeout": RECOVERY_DB_COMMAND_TIMEOUT_SECONDS,
+            "server_settings": {
+                "application_name": "oldsparky-migration-recovery",
+                "statement_timeout": RECOVERY_DB_STATEMENT_TIMEOUT_MS,
+                "lock_timeout": RECOVERY_DB_LOCK_TIMEOUT_MS,
+            },
+        },
+    )
     try:
         repaired = await recover_partial_0051(engine)
     finally:

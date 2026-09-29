@@ -82,6 +82,65 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
             ):
                 self.assertEqual(db.postgres_application_name(), expected)
 
+    def test_engine_accepts_explicit_bounded_database_operation_timeouts(self) -> None:
+        previous_engine = db._engine
+        previous_engine_loop = db._engine_loop
+        previous_session_factory = db._session_factory
+        db._engine = None
+        db._engine_loop = None
+        db._session_factory = None
+        settings = Mock(
+            platform_database_url="postgresql+asyncpg://platform_user@127.0.0.1/platformdb",
+            # This test covers engine timeout wiring, not the independent
+            # production host/media/secret policy.  Use the development
+            # validation profile so a lightweight Mock cannot accidentally
+            # satisfy (or bypass) the production network-boundary contract.
+            platform_environment="development",
+            platform_db_schema="platform",
+            platform_load_test_source_ips="",
+            platform_api_workers=2,
+            platform_db_pool_size=3,
+            platform_db_max_overflow=1,
+            platform_db_pool_timeout_seconds=5,
+            platform_db_pool_recycle_seconds=1800,
+            platform_db_pool_pre_ping=True,
+            platform_worker_concurrency=2,
+            platform_worker_db_pool_size=2,
+            platform_worker_db_max_overflow=0,
+            platform_db_connection_budget=20,
+        )
+        engine = Mock()
+        engine.sync_engine = sentinel.sync_engine
+        try:
+            with (
+                patch.object(db, "get_settings", return_value=settings),
+                patch.dict(
+                    os.environ,
+                    {
+                        "PLATFORM_DB_CONNECT_TIMEOUT_SECONDS": "30",
+                        "PLATFORM_DB_COMMAND_TIMEOUT_SECONDS": "31",
+                        "PLATFORM_DB_STATEMENT_TIMEOUT_MS": "30000",
+                        "PLATFORM_DB_LOCK_TIMEOUT_MS": "30000",
+                    },
+                    clear=False,
+                ),
+                patch.object(db, "create_async_engine", return_value=engine) as create_engine,
+                patch.object(db, "async_sessionmaker"),
+                patch.object(db, "install_sqlalchemy_query_metrics"),
+            ):
+                self.assertIs(db.engine(), engine)
+            connect_args = create_engine.call_args.kwargs["connect_args"]
+            self.assertEqual(connect_args["timeout"], 30.0)
+            self.assertEqual(connect_args["command_timeout"], 31.0)
+            self.assertEqual(
+                connect_args["server_settings"]["statement_timeout"], "30000ms"
+            )
+            self.assertEqual(connect_args["server_settings"]["lock_timeout"], "30000ms")
+        finally:
+            db._engine = previous_engine
+            db._engine_loop = previous_engine_loop
+            db._session_factory = previous_session_factory
+
 
 class PlatformDatabaseLifecycleTests(PlatformIsolatedAsyncioTestCase):
     async def test_dispose_rejects_engine_created_on_another_event_loop(self) -> None:

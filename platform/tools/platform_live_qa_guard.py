@@ -193,12 +193,14 @@ def _release_operation_lock(app_dir: Path) -> Iterator[Path]:
         resolved_app != app_dir
         or stat.S_ISLNK(app_metadata.st_mode)
         or not stat.S_ISDIR(app_metadata.st_mode)
+        or app_metadata.st_nlink < 2
         or app_metadata.st_uid != 0
         or app_metadata.st_gid != 0
         or stat.S_IMODE(app_metadata.st_mode) & 0o022
         or resolved_shared != shared
         or stat.S_ISLNK(shared_metadata.st_mode)
         or not stat.S_ISDIR(shared_metadata.st_mode)
+        or shared_metadata.st_nlink < 2
         or shared_metadata.st_uid != 0
         or shared_metadata.st_gid != 0
         or stat.S_IMODE(shared_metadata.st_mode) & 0o022
@@ -359,6 +361,7 @@ def _validate_root_secret_parent(path: Path) -> None:
         if (
             resolved != directory
             or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_nlink < 2
             or metadata.st_uid != 0
             or stat.S_IMODE(metadata.st_mode) & 0o022
             or (
@@ -595,6 +598,7 @@ def _assert_root_controlled_path(path: Path, *, directory: bool) -> None:
         resolved != path
         or not expected_kind
         or metadata.st_uid != 0
+        or (metadata.st_nlink < 2 if directory else metadata.st_nlink != 1)
         or stat.S_IMODE(metadata.st_mode) & 0o022
         or (not directory and metadata.st_mode & (stat.S_ISUID | stat.S_ISGID))
         or (not directory and metadata.st_nlink != 1)
@@ -727,11 +731,13 @@ def _validate_installed_payload_root(
         pointer_target = TRUSTED_ACTIVE_POINTER.resolve(strict=True)
         if (
             not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_nlink < 2
             or root_metadata.st_uid != 0
             or root_metadata.st_gid != 0
             or root_metadata.st_mode & 0o7000
             or stat.S_IMODE(root_metadata.st_mode) != 0o700
             or not stat.S_ISDIR(releases_metadata.st_mode)
+            or releases_metadata.st_nlink < 2
             or releases_metadata.st_uid != 0
             or releases_metadata.st_gid != 0
             or releases_metadata.st_mode & 0o7000
@@ -816,6 +822,7 @@ def _validate_installed_payload_root(
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != 0
+        or metadata.st_nlink < 2
         or metadata.st_gid != 0
         or metadata.st_mode & 0o7000
         or stat.S_IMODE(metadata.st_mode) != 0o555
@@ -835,6 +842,7 @@ def _validate_installed_payload_root(
             if (
                 item.st_uid != 0
                 or item.st_gid != 0
+                or item.st_nlink < 2
                 or item.st_mode & 0o7000
                 or stat.S_IMODE(item.st_mode) != 0o555
             ):
@@ -1197,6 +1205,7 @@ def _liveqa_cgroup_process_ids() -> tuple[int, ...]:
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != 0
+        or metadata.st_nlink < 2
         or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
         raise GuardError("live QA cgroup metadata is unsafe")
@@ -1944,6 +1953,7 @@ def _validate_cache_tree_permissions(
     root_metadata = root.lstat()
     if (
         not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_nlink < 2
         or root_metadata.st_uid != 0
         or root_metadata.st_gid != 0
         or root_metadata.st_mode & 0o7000
@@ -1970,6 +1980,8 @@ def _validate_cache_tree_permissions(
                 raise GuardError("runtime cache symlink escapes its tree") from exc
         elif stat.S_ISDIR(metadata.st_mode):
             if (
+                metadata.st_nlink < 2
+                or
                 metadata.st_mode & 0o7000
                 or stat.S_IMODE(metadata.st_mode) != 0o555
             ):
@@ -2595,6 +2607,7 @@ def _validate_runtime_cache_root(root: Path) -> None:
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != 0
+        or metadata.st_nlink < 2
         or metadata.st_gid != 0
         or stat.S_IMODE(metadata.st_mode) != 0o755
         or resolved != root
@@ -2618,6 +2631,7 @@ def _validate_runtime_retention_entry(
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != 0
+        or metadata.st_nlink < 2
         or metadata.st_gid != 0
         or stat.S_IMODE(metadata.st_mode) != 0o555
         or metadata.st_dev != root.lstat().st_dev
@@ -2701,6 +2715,7 @@ def _validate_runtime_tombstone(
         or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != 0
         or metadata.st_gid != 0
+        or metadata.st_nlink < 2
         or stat.S_IMODE(metadata.st_mode) not in {0o555, 0o700}
         or metadata.st_dev != root.lstat().st_dev
         or resolved != path
@@ -2722,7 +2737,7 @@ def _validate_runtime_tombstone(
             if not _relative_link_stays_within(path, target, link):
                 raise GuardError("runtime cache tombstone symlink is unsafe")
         elif stat.S_ISDIR(target_metadata.st_mode):
-            if stat.S_IMODE(target_metadata.st_mode) not in {0o555, 0o700}:
+            if target_metadata.st_nlink < 2 or stat.S_IMODE(target_metadata.st_mode) not in {0o555, 0o700}:
                 raise GuardError("runtime cache tombstone directory mode is unsafe")
         elif stat.S_ISREG(target_metadata.st_mode):
             relative = target.relative_to(path)

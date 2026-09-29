@@ -688,9 +688,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
 
         prepare = '"$ROOT_DIR/tools/platform_prepare_service_user.sh"'
         self.assertIn(prepare, systemd_installer)
+        prepare_index = systemd_installer.index(prepare)
+        daemon_reload_index = systemd_installer.index(
+            "\nrun_systemctl daemon-reload\n", prepare_index
+        )
         self.assertLess(
-            systemd_installer.index(prepare),
-            systemd_installer.index("systemctl daemon-reload"),
+            prepare_index,
+            daemon_reload_index,
         )
         self.assertIn(
             "Install units and prepare release-specific writable paths",
@@ -1468,42 +1472,29 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         recover = (
             REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
         ).read_text()
-        recover_lock = recover.index(
-            'lock_helper="$runtime/current/tools/platform_release_lock.sh"'
+        recover_provenance = recover.index(
+            "Validate exact security and recovery provenance before SSH"
         )
-        recover_supervisor = recover.index(
-            '"$lock_helper" --run /bin/bash -s <<\'LOCKED\'', recover_lock
+        recover_transfer = recover.index("Transfer exact attested recovery bundle")
+        recover_install = recover.index('"$bootstrap_tool" install', recover_transfer)
+        recover_validate = recover.index("validate-generation", recover_install)
+        recover_wrapper = recover.index(
+            '"$trusted_generation/platform_recover_pending.sh"', recover_validate
         )
-        recover_retained = recover.index(
-            'recover \\\n            --retain --state "$state"',
-            recover_supervisor,
-        )
-        recover_restore = recover.index('PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$restore"', recover_retained)
-        recover_complete = recover.index(
-            'complete-recovery \\\n            --state "$state"',
-            recover_restore,
-        )
-        recover_health = recover.index('nginx -t', recover_restore)
-        recover_verify = recover.index('verify --state "$systemd_state"', recover_restore)
-        self.assertLess(recover_lock, recover_retained)
-        self.assertLess(recover_retained, recover_restore)
-        self.assertLess(recover_verify, recover_health)
-        self.assertLess(recover_health, recover_complete)
-        self.assertLess(recover_supervisor, recover_retained)
+        self.assertLess(recover_provenance, recover_transfer)
+        self.assertLess(recover_transfer, recover_install)
+        self.assertLess(recover_install, recover_validate)
+        self.assertLess(recover_validate, recover_wrapper)
         self.assertNotIn("exec 9<", recover)
         self.assertNotIn("flock -n 9", recover)
         self.assertNotIn("PLATFORM_RELEASE_LOCK_FD=9", recover)
-        self.assertIn("Retained release transaction disappeared during recovery", recover)
-        self.assertNotIn('"$rollback" --recover-pending', recover)
-        self.assertIn("capture-transaction", recover)
-        self.assertIn('systemd_state="$runtime/shared/.release-systemd-state.json"', recover)
-        self.assertIn('--systemd-state "$systemd_state"', recover)
-        self.assertIn('PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$restore"', recover)
-        self.assertIn('clear --state "$systemd_state"', recover)
-        self.assertIn('complete-recovery', recover)
-        self.assertIn("Recovered current release does not match retained receipt", recover)
-        self.assertIn("Retained active state is invalid", recover)
-        self.assertNotIn('for service in deadlock-api deadlock-worker deadlock-web; do', recover)
+        self.assertIn("--capability recover_pending", recover)
+        self.assertIn('generation_name="$bundle_sha"', recover)
+        self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover)
+        self.assertIn("platform_recover_pending.sh", recover)
+        self.assertIn("cleanup_remote_upload", recover)
+        self.assertNotIn("$runtime/current/tools", recover)
+        self.assertNotIn("platform_release_rollback.sh", recover)
 
     def test_supervisor_provenance_consumer_matches_canonical_ci_schema(self) -> None:
         """Execute the supervisor consumer against the CI-produced provenance.

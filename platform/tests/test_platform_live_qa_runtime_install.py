@@ -244,6 +244,92 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         ):
                             runtime._read_manifest()
 
+    def test_cleanup_staging_accepts_real_nested_directories(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            payload_root = root / "releases"
+            payload_root.mkdir(mode=0o755)
+            stage = payload_root / f".{('a' * 40)}.install-{('b' * 32)}"
+            nested = stage / "runtime" / "browsers" / "chromium"
+            nested.mkdir(mode=0o700, parents=True)
+            (nested / "node").write_bytes(b"nested-runtime")
+            for directory in (stage, stage / "runtime", stage / "runtime" / "browsers", nested):
+                os.chmod(directory, 0o700)
+            os.chmod(nested / "node", 0o600)
+
+            with mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root):
+                self.assertEqual(runtime._cleanup_staging(apply=True), 1)
+            self.assertFalse(stage.exists())
+
+    def test_cleanup_staging_rejects_real_nested_hardlinks(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            payload_root = root / "releases"
+            payload_root.mkdir(mode=0o755)
+            stage = payload_root / f".{('c' * 40)}.install-{('d' * 32)}"
+            nested = stage / "runtime" / "browsers"
+            nested.mkdir(mode=0o700, parents=True)
+            source = nested / "node"
+            source.write_bytes(b"hard-linked")
+            os.link(source, nested / "node-alias")
+            for directory in (stage, stage / "runtime", nested):
+                os.chmod(directory, 0o700)
+            os.chmod(source, 0o600)
+            os.chmod(nested / "node-alias", 0o600)
+
+            with mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root):
+                with self.assertRaisesRegex(
+                    runtime.InstallerError,
+                    "link count is unsafe",
+                ):
+                    runtime._cleanup_staging(apply=True)
+            self.assertTrue(stage.exists())
+
+    @staticmethod
+    def _make_retention_entry(root: Path, source_sha: str, mtime: int, *, hardlink: bool = False) -> Path:
+        entry = root / source_sha
+        nested = entry / "runtime" / "browsers"
+        nested.mkdir(mode=0o555, parents=True)
+        source = nested / "node"
+        source.write_bytes(b"retained-runtime")
+        os.chmod(source, 0o444)
+        if hardlink:
+            os.link(source, nested / "node-alias")
+            os.chmod(nested / "node-alias", 0o444)
+        for directory in (entry, entry / "runtime", nested):
+            os.chmod(directory, 0o555)
+        os.utime(entry, (mtime, mtime))
+        return entry
+
+    def test_retention_accepts_real_nested_directories(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            payload_root = root / "releases"
+            payload_root.mkdir(mode=0o755)
+            old = self._make_retention_entry(payload_root, "e" * 40, 1)
+            newest = self._make_retention_entry(payload_root, "f" * 40, 2)
+
+            with mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root):
+                self.assertEqual(runtime._retention(root / "app", apply=True), 1)
+            self.assertFalse(old.exists())
+            self.assertTrue(newest.exists())
+
+    def test_retention_rejects_real_nested_hardlinks(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            payload_root = root / "releases"
+            payload_root.mkdir(mode=0o755)
+            old = self._make_retention_entry(payload_root, "1" * 40, 1, hardlink=True)
+            self._make_retention_entry(payload_root, "2" * 40, 2)
+
+            with mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root):
+                with self.assertRaisesRegex(
+                    runtime.InstallerError,
+                    "link count is unsafe",
+                ):
+                    runtime._retention(root / "app", apply=True)
+            self.assertTrue(old.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

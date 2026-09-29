@@ -17,6 +17,11 @@ EXPECTED_CSP_MODE="enforce"
 EDGE_ORIGIN="https://127.0.0.1"
 EDGE_HOST="old-sparky.com"
 PUBLIC_EDGE_ORIGIN="https://old-sparky.com"
+SYSTEMCTL_BIN="/usr/bin/systemctl"
+SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"
+SYSTEMD_CALL_TIMEOUT_SECONDS=30
+SYSTEMD_OPERATION_TIMEOUT_SECONDS=120
+SYSTEMD_OPERATION_DEADLINE_NS=""
 ORIGINAL_ARGS=("$@")
 
 public_status() {
@@ -170,16 +175,51 @@ QUIESCE_STATE="$TRANSACTION_STATE"
 SHARED_VENV="$SHARED_DIR/venv"
 WRITERS_QUIESCED=0
 SERVICE_STATE_CAPTURED=0
+SERVICE_ENABLEMENT_CAPTURED=0
 DEADLOCK_API_STATE=""
 DEADLOCK_WORKER_STATE=""
 DEADLOCK_WEB_STATE=""
 CLOUDFLARE_TIMER_STATE=""
+CLOUDFLARE_TIMER_ENABLED=""
+DEADLOCK_API_ENABLED=""
+DEADLOCK_WORKER_ENABLED=""
+DEADLOCK_WEB_ENABLED=""
 CANDIDATE_HINT=""
 EXIT_RECOVERY_RUNNING=0
+INITIAL_INSTALL=0
+CURRENT_ONLY_INSTALL=0
 
 if [[ ! -d "$APP_DIR" || -L "$APP_DIR" || ! -d "$SHARED_DIR" || -L "$SHARED_DIR" ]]; then
   public_status failed layout >&2
   exit 1
+fi
+
+read_pointer_target() {
+  local pointer="$1"
+  if [[ -L "$pointer" ]]; then
+    readlink -f "$pointer" 2>/dev/null || return 1
+  elif [[ -e "$pointer" ]]; then
+    return 1
+  else
+    printf '%s\n' ""
+  fi
+}
+
+INITIAL_CURRENT_TARGET="$(read_pointer_target "$APP_DIR/current")" || {
+  public_status failed layout >&2
+  exit 1
+}
+INITIAL_PREVIOUS_TARGET="$(read_pointer_target "$APP_DIR/previous")" || {
+  public_status failed layout >&2
+  exit 1
+}
+if [[ -z "$INITIAL_CURRENT_TARGET" && -n "$INITIAL_PREVIOUS_TARGET" ]]; then
+  public_status failed layout >&2
+  exit 1
+elif [[ -z "$INITIAL_CURRENT_TARGET" && -z "$INITIAL_PREVIOUS_TARGET" ]]; then
+  INITIAL_INSTALL=1
+elif [[ -n "$INITIAL_CURRENT_TARGET" && -z "$INITIAL_PREVIOUS_TARGET" ]]; then
+  CURRENT_ONLY_INSTALL=1
 fi
 
 transaction_exists() {
@@ -217,6 +257,16 @@ transaction_phase() {
   transaction_json | json_field phase
 }
 
+set_initial_install_from_transaction() {
+  local operation current_before
+  operation="$(printf '%s' "$TRANSACTION_JSON" | json_field operation)"
+  current_before="$(printf '%s' "$TRANSACTION_JSON" | json_field current_before)"
+  if [[ "$operation" == "install" && -z "$current_before" ]]; then
+    INITIAL_INSTALL=1
+    CURRENT_ONLY_INSTALL=0
+  fi
+}
+
 quiesce_json() {
   /usr/bin/python3 -I "$TRANSACTION_TOOL" status-quiesce \
     --state "$QUIESCE_STATE" --json 2>/dev/null
@@ -244,10 +294,120 @@ run_candidate() {
   (cd "$CANDIDATE" && "$@") >/dev/null 2>/dev/null
 }
 
+systemd_now_ns() {
+  local now
+  now="$(date +%s%N 2>/dev/null)" || return 1
+  [[ "$now" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$now"
+}
+
+systemd_operation_begin() {
+  local now
+  now="$(systemd_now_ns)" || return 1
+  SYSTEMD_OPERATION_DEADLINE_NS=$((now + SYSTEMD_OPERATION_TIMEOUT_SECONDS * 1000000000))
+}
+
+systemd_operation_reset() {
+  SYSTEMD_OPERATION_DEADLINE_NS=""
+  systemd_operation_begin
+}
+
+systemd_operation_end() {
+  SYSTEMD_OPERATION_DEADLINE_NS=""
+}
+
+systemd_call_timeout() {
+  local call_limit="${1:-$SYSTEMD_CALL_TIMEOUT_SECONDS}"
+  local now remaining budget seconds millis
+  [[ "$call_limit" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "$SYSTEMD_OPERATION_DEADLINE_NS" ]] || {
+    printf '%ss\n' "$call_limit"
+    return 0
+  }
+  now="$(systemd_now_ns)" || return 1
+  remaining=$((SYSTEMD_OPERATION_DEADLINE_NS - now))
+  (( remaining > 0 )) || return 1
+  budget=$((call_limit * 1000000000))
+  (( remaining < budget )) && budget=$remaining
+  seconds=$((budget / 1000000000))
+  millis=$(((budget % 1000000000 + 999999) / 1000000))
+  if (( millis >= 1000 )); then
+    seconds=$((seconds + 1))
+    millis=0
+  fi
+  printf '%d.%03ds\n' "$seconds" "$millis"
+}
+
+run_bounded_command() {
+  local call_limit="$1"
+  shift
+  local timeout_value
+  timeout_value="$(systemd_call_timeout "$call_limit")" || return 1
+  "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s \
+    "$timeout_value" "$@"
+}
+
+run_systemd_bounded() {
+  run_bounded_command "$SYSTEMD_CALL_TIMEOUT_SECONDS" "$@"
+}
+
+run_initial_systemd_transaction() {
+  run_systemd_bounded /usr/bin/python3 -I "$TRANSACTION_TOOL" "$@" \
+    >/dev/null 2>/dev/null
+}
+
+run_initial_systemd_candidate() {
+  candidate_env
+  run_systemd_bounded /bin/bash -c \
+    'cd -- "$1" && shift && exec "$@"' _ "$CANDIDATE" "$@" \
+    >/dev/null 2>/dev/null
+}
+
+run_live_qa_reconcile() {
+  run_systemd_bounded "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+    reconcile --app-dir "$APP_DIR" >/dev/null 2>/dev/null
+}
+
+wait_for_activation_readiness() {
+  local attempt
+  for attempt in {1..30}; do
+    if run_bounded_command 5 /usr/bin/curl --fail --silent --show-error --max-time 5 \
+      http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null \
+      && run_bounded_command 5 /usr/bin/curl --fail --silent --show-error --max-time 5 \
+      http://127.0.0.1:3000/ >/dev/null 2>/dev/null; then
+      return 0
+    fi
+    if [[ "$attempt" -eq 30 ]]; then
+      return 1
+    fi
+    run_bounded_command 1 /bin/sleep 1 >/dev/null 2>/dev/null || return 1
+  done
+}
+
 release_preflight() {
+  local previous_flag=(--require-previous)
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    previous_flag=(--allow-initial-install)
+  elif [[ "$CURRENT_ONLY_INSTALL" -eq 1 ]]; then
+    previous_flag=(--allow-no-previous)
+  fi
+  if transaction_path_present; then
+    local transaction_previous transaction_current
+    transaction_previous="$(transaction_json | json_field previous_before)"
+    transaction_current="$(transaction_json | json_field current_before)"
+    if [[ -z "$transaction_previous" ]]; then
+      if [[ -z "$transaction_current" ]]; then
+        previous_flag=(--allow-initial-install)
+      else
+        previous_flag=(--allow-no-previous)
+      fi
+    else
+      previous_flag=(--require-previous)
+    fi
+  fi
   "$TOOLS_DIR/platform_release_preflight.sh" \
     --app-dir "$APP_DIR" \
-    --require-previous \
+    "${previous_flag[@]}" \
     --require-verified-backup \
     --require-edge-parity \
     --backup-max-age-hours 24
@@ -274,17 +434,47 @@ restore_previous_runtime() {
     --public-edge-origin "$PUBLIC_EDGE_ORIGIN" >/dev/null 2>/dev/null
 }
 
+# Keep every mutable release-side systemd operation bounded.  Recovery never
+# relies on a shell's inherited timeout or on systemd returning promptly; a
+# wedged manager must leave the durable receipt in place for retry. During the
+# clean-install activation boundary, SYSTEMD_OPERATION_DEADLINE_NS bounds the
+# complete reconcile/restore/installer/enable/readiness/verify sequence, while
+# each individual systemd, installer, probe or wait call is explicitly capped.
+run_systemctl() {
+  run_systemd_bounded "$SYSTEMCTL_BIN" "$@"
+}
+
 read_unit_state() {
   local unit="$1"
   local state status
   state=""
-  if state="$(/usr/bin/systemctl is-active "$unit" 2>/dev/null)"; then
+  if state="$(run_systemctl is-active "$unit" 2>/dev/null)"; then
     status=0
   else
     status="$?"
   fi
   case "$state:$status" in
-    active:0|inactive:*)
+    active:0|inactive:3)
+      printf '%s\n' "$state"
+      ;;
+    *)
+      public_status failed service_state >&2
+      return 1
+      ;;
+  esac
+}
+
+read_unit_enabled() {
+  local unit="$1"
+  local state status
+  state=""
+  if state="$(run_systemctl is-enabled "$unit" 2>/dev/null)"; then
+    status=0
+  else
+    status="$?"
+  fi
+  case "$state:$status" in
+    enabled:0|disabled:1)
       printf '%s\n' "$state"
       ;;
     *)
@@ -305,34 +495,196 @@ require_unit_state() {
   fi
 }
 
+require_unit_enabled() {
+  local unit="$1"
+  local actual
+  actual="$(read_unit_enabled "$unit")" || return 1
+  if [[ "$actual" != "enabled" ]]; then
+    public_status failed service_state >&2
+    return 1
+  fi
+}
+
+capture_initial_systemd_baseline() {
+  [[ "$INITIAL_INSTALL" -eq 1 ]] || return 0
+  local owns_deadline=0 status
+  if [[ -z "$SYSTEMD_OPERATION_DEADLINE_NS" ]]; then
+    systemd_operation_begin || return 1
+    owns_deadline=1
+  fi
+  if run_initial_systemd_transaction capture-initial-systemd \
+    --state "$TRANSACTION_STATE" \
+    --systemctl "$SYSTEMCTL_BIN"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$owns_deadline" -eq 1 ]]; then
+    systemd_operation_end
+  fi
+  return "$status"
+}
+
+restore_initial_systemd_baseline() {
+  [[ "$INITIAL_INSTALL" -eq 1 ]] || return 0
+  local owns_deadline=0 status
+  if [[ -z "$SYSTEMD_OPERATION_DEADLINE_NS" ]]; then
+    systemd_operation_begin || return 1
+    owns_deadline=1
+  fi
+  if run_initial_systemd_transaction restore-initial-systemd \
+    --state "$TRANSACTION_STATE" \
+    --systemctl "$SYSTEMCTL_BIN"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$owns_deadline" -eq 1 ]]; then
+    systemd_operation_end
+  fi
+  return "$status"
+}
+
+verify_initial_systemd_baseline() {
+  [[ "$INITIAL_INSTALL" -eq 1 ]] || return 0
+  local owns_deadline=0 status
+  if [[ -z "$SYSTEMD_OPERATION_DEADLINE_NS" ]]; then
+    systemd_operation_begin || return 1
+    owns_deadline=1
+  fi
+  if run_initial_systemd_transaction verify-initial-systemd \
+    --state "$TRANSACTION_STATE" \
+    --systemctl "$SYSTEMCTL_BIN"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$owns_deadline" -eq 1 ]]; then
+    systemd_operation_end
+  fi
+  return "$status"
+}
+
+validate_initial_systemd_receipt() {
+  [[ "$INITIAL_INSTALL" -eq 1 ]] || return 0
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-initial-systemd \
+    --state "$TRANSACTION_STATE" \
+    --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
+}
+
+verify_initial_systemd_activation() {
+  [[ "$INITIAL_INSTALL" -eq 1 ]] || return 0
+  local owns_deadline=0 status
+  if [[ -z "$SYSTEMD_OPERATION_DEADLINE_NS" ]]; then
+    systemd_operation_begin || return 1
+    owns_deadline=1
+  fi
+  if run_initial_systemd_transaction verify-initial-systemd-activated \
+    --state "$TRANSACTION_STATE" \
+    --systemctl "$SYSTEMCTL_BIN"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$owns_deadline" -eq 1 ]]; then
+    systemd_operation_end
+  fi
+  return "$status"
+}
+
+restore_initial_systemd_with_fresh_deadline() {
+  systemd_operation_reset || return 1
+  local status=0
+  restore_initial_systemd_baseline || status=$?
+  systemd_operation_end
+  return "$status"
+}
+
+verify_initial_systemd_with_fresh_deadline() {
+  systemd_operation_reset || return 1
+  local status=0
+  verify_initial_systemd_baseline || status=$?
+  systemd_operation_end
+  return "$status"
+}
+
+rewind_initial_systemd_phase_for_retry() {
+  [[ "$INITIAL_INSTALL" -eq 1 ]] || return 0
+  local retained_phase
+  retained_phase="$(transaction_json | json_field phase)"
+  case "$retained_phase" in
+    systemd-activated|activation-committed)
+      set_phase "$retained_phase" systemd-activation-pending
+      ;;
+  esac
+}
+
 capture_pre_migration_service_state() {
   if [[ "$SERVICE_STATE_CAPTURED" -eq 1 ]]; then
     return 0
   fi
-  DEADLOCK_API_STATE="$(read_unit_state deadlock-api)" || return 1
-  DEADLOCK_WORKER_STATE="$(read_unit_state deadlock-worker)" || return 1
-  DEADLOCK_WEB_STATE="$(read_unit_state deadlock-web)" || return 1
-  CLOUDFLARE_TIMER_STATE="$(read_unit_state deadlock-cloudflare-ips.timer)" || return 1
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    DEADLOCK_API_STATE="inactive"
+    DEADLOCK_WORKER_STATE="inactive"
+    DEADLOCK_WEB_STATE="inactive"
+    CLOUDFLARE_TIMER_STATE="inactive"
+    DEADLOCK_API_ENABLED="disabled"
+    DEADLOCK_WORKER_ENABLED="disabled"
+    DEADLOCK_WEB_ENABLED="disabled"
+    CLOUDFLARE_TIMER_ENABLED="disabled"
+  else
+    DEADLOCK_API_STATE="$(read_unit_state deadlock-api)" || return 1
+    DEADLOCK_WORKER_STATE="$(read_unit_state deadlock-worker)" || return 1
+    DEADLOCK_WEB_STATE="$(read_unit_state deadlock-web)" || return 1
+    CLOUDFLARE_TIMER_STATE="$(read_unit_state deadlock-cloudflare-ips.timer)" || return 1
+    DEADLOCK_API_ENABLED="$(read_unit_enabled deadlock-api)" || return 1
+    DEADLOCK_WORKER_ENABLED="$(read_unit_enabled deadlock-worker)" || return 1
+    DEADLOCK_WEB_ENABLED="$(read_unit_enabled deadlock-web)" || return 1
+    CLOUDFLARE_TIMER_ENABLED="$(read_unit_enabled deadlock-cloudflare-ips.timer)" || return 1
+  fi
   SERVICE_STATE_CAPTURED=1
 }
 
 load_service_state_from_json() {
   local state_json="$1"
+  local allow_legacy="${2:-0}"
   local -a recorded_service_fields
   readarray -t recorded_service_fields < <(
     printf '%s' "$state_json" | /usr/bin/python3 -I -c '
 import json
 import sys
 
+allow_legacy = sys.argv[1] == "1"
 record = json.load(sys.stdin)
 service_state = record.get("service_state_before")
 quiesced = record.get("quiesced_services")
 timer_state = record.get("timer_active_before")
+service_enabled = record.get("service_enabled_before")
+timer_enabled = record.get("timer_enabled_before")
+if allow_legacy and service_enabled is None and timer_enabled is None:
+    if (
+        not isinstance(service_state, dict)
+        or set(service_state) != {"deadlock-api", "deadlock-worker", "deadlock-web"}
+        or quiesced != ["deadlock-api", "deadlock-worker", "deadlock-web"]
+        or type(timer_state) is not bool
+    ):
+        raise SystemExit("legacy recorded pre-migration service state is unavailable")
+    for unit in ("deadlock-api", "deadlock-worker", "deadlock-web"):
+        value = service_state[unit]
+        if type(value) is not str or value not in {"active", "inactive"}:
+            raise SystemExit("legacy recorded pre-migration service state is invalid")
+        print(value)
+    print("active" if timer_state else "inactive")
+    raise SystemExit(0)
 if (
     not isinstance(service_state, dict)
     or set(service_state) != {"deadlock-api", "deadlock-worker", "deadlock-web"}
     or quiesced != ["deadlock-api", "deadlock-worker", "deadlock-web"]
     or type(timer_state) is not bool
+    or not isinstance(service_enabled, dict)
+    or set(service_enabled) != {"deadlock-api", "deadlock-worker", "deadlock-web"}
+    or any(type(value) is not str or value not in {"enabled", "disabled"} for value in service_enabled.values())
+    or timer_enabled not in {"enabled", "disabled"}
 ):
     raise SystemExit("recorded pre-migration service state is unavailable")
 for unit in ("deadlock-api", "deadlock-worker", "deadlock-web"):
@@ -341,16 +693,35 @@ for unit in ("deadlock-api", "deadlock-worker", "deadlock-web"):
         raise SystemExit("recorded pre-migration service state is invalid")
     print(value)
 print("active" if timer_state else "inactive")
-' 2>/dev/null
+for unit in ("deadlock-api", "deadlock-worker", "deadlock-web"):
+    print(service_enabled[unit])
+print(timer_enabled)
+' "$allow_legacy" 2>/dev/null
   )
-  if [[ "${#recorded_service_fields[@]}" -ne 4 ]]; then
+  if [[ "$allow_legacy" == "1" && "${#recorded_service_fields[@]}" -eq 4 ]]; then
+    DEADLOCK_API_STATE="${recorded_service_fields[0]}"
+    DEADLOCK_WORKER_STATE="${recorded_service_fields[1]}"
+    DEADLOCK_WEB_STATE="${recorded_service_fields[2]}"
+    CLOUDFLARE_TIMER_STATE="${recorded_service_fields[3]}"
+    DEADLOCK_API_ENABLED=""
+    DEADLOCK_WORKER_ENABLED=""
+    DEADLOCK_WEB_ENABLED=""
+    CLOUDFLARE_TIMER_ENABLED=""
+    SERVICE_ENABLEMENT_CAPTURED=0
+  elif [[ "${#recorded_service_fields[@]}" -ne 8 ]]; then
     public_status failed service_state >&2
     return 1
+  else
+    DEADLOCK_API_STATE="${recorded_service_fields[0]}"
+    DEADLOCK_WORKER_STATE="${recorded_service_fields[1]}"
+    DEADLOCK_WEB_STATE="${recorded_service_fields[2]}"
+    CLOUDFLARE_TIMER_STATE="${recorded_service_fields[3]}"
+    DEADLOCK_API_ENABLED="${recorded_service_fields[4]}"
+    DEADLOCK_WORKER_ENABLED="${recorded_service_fields[5]}"
+    DEADLOCK_WEB_ENABLED="${recorded_service_fields[6]}"
+    CLOUDFLARE_TIMER_ENABLED="${recorded_service_fields[7]}"
+    SERVICE_ENABLEMENT_CAPTURED=1
   fi
-  DEADLOCK_API_STATE="${recorded_service_fields[0]}"
-  DEADLOCK_WORKER_STATE="${recorded_service_fields[1]}"
-  DEADLOCK_WEB_STATE="${recorded_service_fields[2]}"
-  CLOUDFLARE_TIMER_STATE="${recorded_service_fields[3]}"
   SERVICE_STATE_CAPTURED=1
 }
 
@@ -359,7 +730,7 @@ load_recorded_service_state() {
 }
 
 load_quiesce_service_state() {
-  load_service_state_from_json "$(quiesce_json)"
+  load_service_state_from_json "$(quiesce_json)" 1
 }
 
 prepare_quiesce_receipt() {
@@ -379,7 +750,11 @@ prepare_quiesce_receipt() {
     --service-state "deadlock-api=$DEADLOCK_API_STATE" \
     --service-state "deadlock-worker=$DEADLOCK_WORKER_STATE" \
     --service-state "deadlock-web=$DEADLOCK_WEB_STATE" \
-    --timer-active-before "$CLOUDFLARE_TIMER_STATE" >/dev/null 2>/dev/null
+    --timer-active-before "$CLOUDFLARE_TIMER_STATE" \
+    --service-enabled "deadlock-api=$DEADLOCK_API_ENABLED" \
+    --service-enabled "deadlock-worker=$DEADLOCK_WORKER_ENABLED" \
+    --service-enabled "deadlock-web=$DEADLOCK_WEB_ENABLED" \
+    --timer-enabled-before "$CLOUDFLARE_TIMER_ENABLED" >/dev/null 2>/dev/null
 }
 
 verify_quiesce_receipt() {
@@ -392,6 +767,10 @@ clear_quiesce_receipt() {
     /usr/bin/python3 -I "$TRANSACTION_TOOL" clear-quiesce \
       --state "$QUIESCE_STATE" >/dev/null 2>/dev/null
   fi
+  # A retained transaction is normally completed before this helper is
+  # called, so the shared receipt may already be gone.  Absence is the
+  # successful post-cleanup state, not a recovery failure.
+  return 0
 }
 
 restart_recorded_services() {
@@ -401,24 +780,41 @@ restart_recorded_services() {
   }
   local service expected
   for service in deadlock-api deadlock-worker deadlock-web; do
+    local enabled_expected
     case "$service" in
-      deadlock-api) expected="$DEADLOCK_API_STATE" ;;
-      deadlock-worker) expected="$DEADLOCK_WORKER_STATE" ;;
-      deadlock-web) expected="$DEADLOCK_WEB_STATE" ;;
+      deadlock-api) expected="$DEADLOCK_API_STATE"; enabled_expected="$DEADLOCK_API_ENABLED" ;;
+      deadlock-worker) expected="$DEADLOCK_WORKER_STATE"; enabled_expected="$DEADLOCK_WORKER_ENABLED" ;;
+      deadlock-web) expected="$DEADLOCK_WEB_STATE"; enabled_expected="$DEADLOCK_WEB_ENABLED" ;;
     esac
+    if [[ "$SERVICE_ENABLEMENT_CAPTURED" -eq 1 ]]; then
+      if [[ "$enabled_expected" == "enabled" ]]; then
+        run_systemctl enable "$service" >/dev/null 2>/dev/null || return 1
+      else
+        run_systemctl disable "$service" >/dev/null 2>/dev/null || return 1
+      fi
+      [[ "$(read_unit_enabled "$service")" == "$enabled_expected" ]] || return 1
+    fi
     if [[ "$expected" == "active" ]]; then
-      /usr/bin/systemctl restart "$service" >/dev/null 2>/dev/null || return 1
+      run_systemctl restart "$service" >/dev/null 2>/dev/null || return 1
       require_unit_state "$service" active || return 1
     else
-      /usr/bin/systemctl stop "$service" >/dev/null 2>/dev/null || return 1
+      run_systemctl stop "$service" >/dev/null 2>/dev/null || return 1
       require_unit_state "$service" inactive || return 1
     fi
   done
+  if [[ "$SERVICE_ENABLEMENT_CAPTURED" -eq 1 ]]; then
+    if [[ "$CLOUDFLARE_TIMER_ENABLED" == "enabled" ]]; then
+      run_systemctl enable deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null || return 1
+    else
+      run_systemctl disable deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null || return 1
+    fi
+    [[ "$(read_unit_enabled deadlock-cloudflare-ips.timer)" == "$CLOUDFLARE_TIMER_ENABLED" ]] || return 1
+  fi
   if [[ "$CLOUDFLARE_TIMER_STATE" == "active" ]]; then
-    /usr/bin/systemctl start deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null || return 1
+    run_systemctl start deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null || return 1
     require_unit_state deadlock-cloudflare-ips.timer active || return 1
   else
-    /usr/bin/systemctl stop deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null || return 1
+    run_systemctl stop deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null || return 1
     require_unit_state deadlock-cloudflare-ips.timer inactive || return 1
   fi
 }
@@ -450,8 +846,8 @@ verify_recorded_service_readiness() {
 }
 
 restore_recorded_services() {
-  restart_recorded_services
-  verify_recorded_service_readiness
+  restart_recorded_services || return 1
+  verify_recorded_service_readiness || return 1
 }
 
 acquire_release_lock() {
@@ -494,7 +890,10 @@ quiesce_runtime_writers() {
   # The durable receipt is now on disk. Every subsequent stop/stage operation
   # therefore has an explicit service state to recover, including SIGKILL.
   WRITERS_QUIESCED=1
-  /usr/bin/systemctl stop deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    return 0
+  fi
+  run_systemctl stop deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null
   for attempt in {1..60}; do
     cloudflare_service_state="$(read_unit_state deadlock-cloudflare-ips.service)"
     if [[ "$cloudflare_service_state" == "inactive" ]]; then
@@ -506,7 +905,7 @@ quiesce_runtime_writers() {
     fi
     sleep 1
   done
-  /usr/bin/systemctl stop deadlock-api deadlock-worker deadlock-web >/dev/null 2>/dev/null
+  run_systemctl stop deadlock-api deadlock-worker deadlock-web >/dev/null 2>/dev/null
   for service in deadlock-api deadlock-worker deadlock-web; do
     if ! require_unit_state "$service" inactive; then
       public_status failed quiesce >&2
@@ -542,8 +941,15 @@ original_current_from_quiesce() {
 restore_snapshot_runtime() {
   local original_current="$1"
   if [[ -z "$original_current" ]]; then
-    public_status failed recovery >&2
-    return 1
+    # A clean first install has no prior release and therefore no safe old
+    # helper/runtime/systemd authority. Recovery is limited to the durable
+    # transaction and pointer topology; never infer or start host services.
+    [[ ! -e "$APP_DIR/shared/.release-systemd-state.json" \
+      && ! -L "$APP_DIR/shared/.release-systemd-state.json" ]] || {
+      public_status failed recovery >&2
+      return 1
+    }
+    return 0
   fi
   restore_previous_runtime "$original_current"
   restore_recorded_services
@@ -553,7 +959,7 @@ recover_failure_transaction() {
   local retained_phase="$1"
   case "$retained_phase" in
     prepared|venv-transitioned|snapshot-placed|current-switched|previous-switched|\
-    pointers-switched|staged|recovery-authorized|recovery-restored)
+    pointers-switched|staged|recovery-authorized|recovery-restored|filesystem-restored-services-pending)
       ;;
     *)
       public_status failed recovery >&2
@@ -561,52 +967,97 @@ recover_failure_transaction() {
       ;;
   esac
 
-  if quiesce_receipt_exists; then
-    load_quiesce_service_state
+  local transaction_operation original_current original_previous
+  transaction_operation="$(transaction_json | json_field operation)"
+  original_current="$(transaction_json | json_field current_before)"
+  original_previous="$(transaction_json | json_field previous_before)"
+  # A first install has no prior service authority and must remain a
+  # filesystem-only recovery.  Current-only and two-pointer installs must
+  # carry the complete active/enabled snapshot before any restore/cleanup.
+  if [[ -n "$original_current" ]]; then
+    if quiesce_receipt_exists; then
+      load_quiesce_service_state || return 1
+    else
+      load_recorded_service_state || return 1
+    fi
   else
-    load_recorded_service_state
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-service-snapshot \
+      --state "$TRANSACTION_STATE" --require optional >/dev/null 2>/dev/null || return 1
+  fi
+  if [[ "$transaction_operation" == "install" && -n "$original_current" && -z "$original_previous" ]]; then
+    if [[ "$retained_phase" != "recovery-restored" && "$retained_phase" != "filesystem-restored-services-pending" ]]; then
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+        --retain --service-pending --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+    fi
+    if [[ "$(transaction_json | json_field phase)" == "filesystem-restored-services-pending" ]]; then
+      restore_recorded_services || return 1
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+        --state "$TRANSACTION_STATE" \
+        --expected filesystem-restored-services-pending \
+        --phase recovery-restored >/dev/null 2>/dev/null || return 1
+    fi
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+    clear_quiesce_receipt || return 1
+    return 0
   fi
   if [[ "$retained_phase" != "recovery-restored" ]]; then
     /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
       --retain \
-      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
+      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
   fi
   /usr/bin/python3 -I "$TRANSACTION_TOOL" verify-original \
-    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
-  restore_snapshot_runtime "$(original_current_from_transaction)"
+    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+  restore_snapshot_runtime "$(original_current_from_transaction)" || return 1
   /usr/bin/python3 -I "$TRANSACTION_TOOL" verify-original \
-    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
+    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
   if [[ "$retained_phase" != "recovery-restored" ]]; then
     /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
-      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
+      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
   fi
-  clear_quiesce_receipt
+  clear_quiesce_receipt || return 1
 }
 
 recover_failure_uncertain_transaction() {
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    # A clean install has no prior runtime to restore. Its transaction-bound
+    # systemd snapshot is the only authority, and it must be restored before
+    # leaving the candidate/receipt retained for an explicit retry or abort.
+    systemd_operation_reset || return 1
+    local restore_status=0
+    restore_initial_systemd_baseline || restore_status=$?
+    # Recovery has stopped/disabled the units.  A post-activation marker would
+    # make the next run require the state we just restored, so rewind the
+    # durable phase before returning the failed deployment.
+    if [[ "$restore_status" -eq 0 ]]; then
+      rewind_initial_systemd_phase_for_retry || restore_status=$?
+    fi
+    systemd_operation_end
+    return "$restore_status"
+  fi
   if quiesce_receipt_exists; then
-    load_quiesce_service_state
-    verify_quiesce_receipt
-    restore_snapshot_runtime "$(original_current_from_quiesce)"
-    verify_quiesce_receipt
+    load_quiesce_service_state || return 1
+    verify_quiesce_receipt || return 1
+    restore_snapshot_runtime "$(original_current_from_quiesce)" || return 1
+    verify_quiesce_receipt || return 1
   else
-    load_recorded_service_state
+    load_recorded_service_state || return 1
     /usr/bin/python3 -I "$TRANSACTION_TOOL" verify-original \
-      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
-    restore_snapshot_runtime "$(original_current_from_transaction)"
+      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+    restore_snapshot_runtime "$(original_current_from_transaction)" || return 1
     /usr/bin/python3 -I "$TRANSACTION_TOOL" verify-original \
-      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
+      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
   fi
   return 0
 }
 
 recover_failure_quiesce_only() {
-  load_quiesce_service_state
-  verify_quiesce_receipt
-  restore_snapshot_runtime "$(original_current_from_quiesce)"
-  verify_quiesce_receipt
+  load_quiesce_service_state || return 1
+  verify_quiesce_receipt || return 1
+  restore_snapshot_runtime "$(original_current_from_quiesce)" || return 1
+  verify_quiesce_receipt || return 1
   /usr/bin/python3 -I "$TRANSACTION_TOOL" abort-quiesce \
-    --state "$QUIESCE_STATE" >/dev/null 2>/dev/null
+    --state "$QUIESCE_STATE" >/dev/null 2>/dev/null || return 1
 }
 
 recover_after_failure() {
@@ -635,7 +1086,11 @@ recover_after_failure() {
       return 1
     fi
     retained_phase="$(transaction_phase)"
-    if [[ "$retained_phase" =~ ^(migration-pending|migration-failed|migration-applied)$ ]]; then
+    TRANSACTION_JSON="$(transaction_json)"
+    set_initial_install_from_transaction
+    if [[ "$INITIAL_INSTALL" -eq 1 && "$retained_phase" =~ ^(migration-pending|migration-failed|migration-applied|activation-pending|services-restarted|nginx-pending|nginx-applied|smoke-passed|systemd-activation-pending|systemd-activated|activation-committed|recovery-authorized)$ ]]; then
+      recover_failure_uncertain_transaction
+    elif [[ "$retained_phase" =~ ^(migration-pending|migration-failed|migration-applied)$ ]]; then
       recover_failure_uncertain_transaction
     else
       recover_failure_transaction "$retained_phase"
@@ -679,26 +1134,163 @@ abort_retained_release() {
     prepared|venv-transitioned|snapshot-placed|current-switched|previous-switched|\
     pointers-switched|staged|migration-pending|migration-failed|migration-applied|activation-pending|\
     services-restarted|nginx-pending|nginx-applied|smoke-passed|\
-    activation-committed|recovery-authorized|recovery-restored)
+    systemd-activation-pending|systemd-activated|activation-committed|\
+    recovery-authorized|recovery-restored|filesystem-restored-services-pending)
       ;;
     *)
       public_status failed recovery >&2
       return 1
       ;;
   esac
-  local original_current
+  local original_current original_previous phase_topology_ok candidate_from_receipt
   # Validate the immutable pre-migration snapshot before changing pointers or
   # the venv. An absent/invalid snapshot must not even enter filesystem
   # recovery, because there is no safe service state to restore afterward.
   TRANSACTION_JSON="$(transaction_json)"
-  if quiesce_receipt_exists; then
-    load_quiesce_service_state
-  else
-    load_recorded_service_state
-  fi
+  set_initial_install_from_transaction
   original_current="$(printf '%s' "$TRANSACTION_JSON" | json_field current_before)"
+  original_previous="$(printf '%s' "$TRANSACTION_JSON" | json_field previous_before)"
+  if [[ "$(printf '%s' "$TRANSACTION_JSON" | json_field operation)" == "install" \
+    && -z "$original_previous" ]]; then
+    # Install receipts without a previous release (including clean
+    # first-install and current-only hosts) have no rollback target. Only the
+    # transaction's own pointer/venv cleanup is authorized. Clean first
+    # installs additionally restore the transaction-bound systemd baseline
+    # before the candidate is removed.
+    if [[ -n "$original_current" ]]; then
+      phase_topology_ok=0
+      case "$retained_phase" in
+        prepared|venv-transitioned|snapshot-placed|staged|migration-pending|\
+        migration-failed|migration-applied|recovery-restored)
+          [[ -L "$APP_DIR/current" && "$(readlink -f "$APP_DIR/current")" == "$original_current" \
+            && ! -e "$APP_DIR/previous" && ! -L "$APP_DIR/previous" ]] && phase_topology_ok=1
+          ;;
+        previous-switched)
+          candidate_from_receipt="$(printf '%s' "$TRANSACTION_JSON" | json_field candidate_release)"
+          if [[ -L "$APP_DIR/current" && "$(readlink -f "$APP_DIR/current")" == "$original_current" \
+            && -L "$APP_DIR/previous" && "$(readlink -f "$APP_DIR/previous")" == "$original_current" ]]; then
+            phase_topology_ok=1
+          elif [[ -L "$APP_DIR/current" && "$(readlink -f "$APP_DIR/current")" == "$candidate_from_receipt" \
+            && -L "$APP_DIR/previous" && "$(readlink -f "$APP_DIR/previous")" == "$original_current" ]]; then
+            # The marker is persisted before the second pointer update. A
+            # kill after that update but before current-switched is still an
+            # exact transaction-owned topology and is recovered identically.
+            phase_topology_ok=1
+          fi
+          ;;
+        pointers-switched|current-switched)
+          candidate_from_receipt="$(printf '%s' "$TRANSACTION_JSON" | json_field candidate_release)"
+          [[ -L "$APP_DIR/current" && "$(readlink -f "$APP_DIR/current")" == "$candidate_from_receipt" \
+            && -L "$APP_DIR/previous" && "$(readlink -f "$APP_DIR/previous")" == "$original_current" ]] && phase_topology_ok=1
+          ;;
+        filesystem-restored-services-pending)
+          [[ -L "$APP_DIR/current" && "$(readlink -f "$APP_DIR/current")" == "$original_current" \
+            && ! -e "$APP_DIR/previous" && ! -L "$APP_DIR/previous" ]] && phase_topology_ok=1
+          ;;
+      esac
+      [[ "$phase_topology_ok" -eq 1 ]] || {
+        public_status failed recovery >&2
+        return 1
+      }
+    else
+      phase_topology_ok=0
+      case "$retained_phase" in
+        prepared|venv-transitioned|snapshot-placed|staged|migration-pending|\
+        migration-failed|migration-applied|recovery-restored)
+          [[ ! -e "$APP_DIR/current" && ! -L "$APP_DIR/current" ]] && phase_topology_ok=1
+          ;;
+        pointers-switched|current-switched|activation-pending|services-restarted|\
+        nginx-pending|nginx-applied|smoke-passed|systemd-activation-pending|\
+        systemd-activated|activation-committed|recovery-authorized|\
+        filesystem-restored-services-pending)
+          candidate_from_receipt="$(printf '%s' "$TRANSACTION_JSON" | json_field candidate_release)"
+          [[ -L "$APP_DIR/current" && "$(readlink -f "$APP_DIR/current")" == "$candidate_from_receipt" ]] && phase_topology_ok=1
+          ;;
+      esac
+      [[ "$phase_topology_ok" -eq 1 ]] || {
+        public_status failed recovery >&2
+        return 1
+      }
+    fi
+    if [[ -z "$original_current" || "$retained_phase" =~ ^(prepared|venv-transitioned|snapshot-placed|recovery-restored)$ ]]; then
+      [[ ! -e "$APP_DIR/previous" && ! -L "$APP_DIR/previous" ]] || {
+        public_status failed recovery >&2
+        return 1
+      }
+    fi
+    [[ ! -e "$APP_DIR/shared/.release-systemd-state.json" \
+      && ! -L "$APP_DIR/shared/.release-systemd-state.json" ]] || {
+      public_status failed recovery >&2
+      return 1
+    }
+    if [[ -z "$original_current" ]]; then
+      case "$retained_phase" in
+        staged|recovery-restored)
+          # These phases have no migration uncertainty, but a clean-install
+          # receipt still owns the exact initial systemd topology. Prove it
+          # immediately before candidate/receipt cleanup.
+          verify_initial_systemd_with_fresh_deadline || return 1
+          ;;
+        migration-pending|migration-failed|migration-applied|activation-pending|\
+        services-restarted|nginx-pending|nginx-applied|smoke-passed|\
+        systemd-activation-pending|systemd-activated|activation-committed)
+          # Restore and verify the receipt-bound baseline before writing the
+          # recovery-authorized marker.  If this process dies here, the old
+          # uncertain phase remains and the next abort retries restoration.
+          restore_initial_systemd_with_fresh_deadline || return 1
+          /usr/bin/python3 -I "$TRANSACTION_TOOL" authorize-recovery \
+            --state "$TRANSACTION_STATE" \
+            --confirm MIGRATION_NOT_REVERSED >/dev/null 2>/dev/null || return 1
+          ;;
+        recovery-authorized)
+          # An earlier abort may have durably authorized recovery and then
+          # died before filesystem cleanup.  Never skip the systemd proof.
+          verify_initial_systemd_with_fresh_deadline || return 1
+          ;;
+      esac
+    else
+      case "$retained_phase" in
+        migration-pending|migration-failed|migration-applied|activation-pending|\
+        services-restarted|nginx-pending|nginx-applied|smoke-passed|\
+        systemd-activation-pending|systemd-activated|activation-committed)
+          public_status failed recovery >&2
+          return 1
+          ;;
+      esac
+    fi
+    if [[ -n "$original_current" ]]; then
+      load_recorded_service_state || return 1
+      case "$retained_phase" in
+        recovery-restored)
+          ;;
+        filesystem-restored-services-pending)
+          ;;
+        *)
+          /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+            --retain --service-pending --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+          ;;
+      esac
+      if [[ "$(transaction_json | json_field phase)" == "filesystem-restored-services-pending" ]]; then
+        restore_recorded_services || return 1
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+          --state "$TRANSACTION_STATE" \
+          --expected filesystem-restored-services-pending \
+          --phase recovery-restored >/dev/null 2>/dev/null || return 1
+      fi
+    else
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-service-snapshot \
+        --state "$TRANSACTION_STATE" --require optional >/dev/null 2>/dev/null || return 1
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+        --retain --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+    fi
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+    clear_quiesce_receipt || return 1
+    public_status passed abort >&2
+    return 0
+  fi
   if [[ -z "$original_current" ]]; then
-    original_current="$(printf '%s' "$TRANSACTION_JSON" | json_field previous_before)"
+    original_current="$original_previous"
   fi
   case "$retained_phase" in
     migration-pending|migration-failed|migration-applied|activation-pending|\
@@ -721,7 +1313,7 @@ abort_retained_release() {
   esac
   /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
     --retain \
-    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
+    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
 
   # The transaction tool has restored and identity-checked the original
   # pointers/venv. Restore unit files and Nginx without an unconditional
@@ -734,29 +1326,33 @@ abort_retained_release() {
     return 1
   fi
   /usr/bin/python3 -I "$TRANSACTION_TOOL" verify-original \
-    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
-  restore_previous_runtime "$original_current"
+    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+  # Load the immutable snapshot before restoring the runtime.  The retained
+  # transaction is the only authority for the exact enabled/active states;
+  # do not let the abort path reach systemd with an empty in-memory snapshot.
+  load_recorded_service_state || return 1
+  restore_previous_runtime "$original_current" || return 1
   # The pointer check above protects the first recovery step; repeat it after
   # restoring units/Nginx so a concurrent pointer drift cannot authorize a
   # service start. The transaction tool also rechecks the recorded venv
   # identities at this boundary.
   /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
     --retain \
-    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
-  restore_recorded_services
+    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+  restore_recorded_services || return 1
   /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
-    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
-  clear_quiesce_receipt
+    --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || return 1
+  clear_quiesce_receipt || return 1
   public_status passed abort >&2
 }
 
 abort_quiesce_receipt() {
-  load_quiesce_service_state
-  verify_quiesce_receipt
-  restore_snapshot_runtime "$(original_current_from_quiesce)"
-  verify_quiesce_receipt
+  load_quiesce_service_state || return 1
+  verify_quiesce_receipt || return 1
+  restore_snapshot_runtime "$(original_current_from_quiesce)" || return 1
+  verify_quiesce_receipt || return 1
   /usr/bin/python3 -I "$TRANSACTION_TOOL" abort-quiesce \
-    --state "$QUIESCE_STATE" >/dev/null 2>/dev/null
+    --state "$QUIESCE_STATE" >/dev/null 2>/dev/null || return 1
   public_status passed abort >&2
 }
 
@@ -831,6 +1427,21 @@ fi
 CANDIDATE="$(printf '%s' "$TRANSACTION_JSON" | json_field candidate_release)"
 CANDIDATE_HINT="$CANDIDATE"
 CURRENT_BEFORE="$(printf '%s' "$TRANSACTION_JSON" | json_field current_before)"
+# The live current pointer may already point at the candidate after a crash
+# between promotion and activation. Re-derive the immutable topology from the
+# transaction rather than from that mutable pointer.
+set_initial_install_from_transaction
+if [[ "$INITIAL_INSTALL" -eq 1 && "$(printf '%s' "$TRANSACTION_JSON" | json_field phase)" == "staged" ]]; then
+  capture_initial_systemd_baseline || {
+    public_status failed systemd >&2
+    exit 1
+  }
+elif [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+  validate_initial_systemd_receipt || {
+    public_status failed systemd >&2
+    exit 1
+  }
+fi
 if [[ -z "$CANDIDATE" || ! -d "$CANDIDATE" || -L "$CANDIDATE" ]]; then
   public_status failed artifact >&2
   exit 1
@@ -897,8 +1508,9 @@ case "$phase" in
     set_phase migration-pending migration-applied
     phase=migration-applied
     ;;
-  migration-applied|activation-pending|services-restarted|nginx-pending|\
-  nginx-applied|smoke-passed|activation-committed)
+  migration-applied|previous-switched|current-switched|pointers-switched|\
+  activation-pending|services-restarted|nginx-pending|nginx-applied|\
+  smoke-passed|systemd-activation-pending|systemd-activated|activation-committed)
     ;;
   *)
     public_status failed transaction >&2
@@ -907,60 +1519,100 @@ case "$phase" in
 esac
 
 phase="$(transaction_phase)"
-if [[ "$phase" == "migration-applied" || "$phase" == "activation-pending" ]]; then
-  if [[ -n "$CURRENT_BEFORE" ]]; then
+case "$phase" in
+  migration-applied)
+    if [[ -n "$CURRENT_BEFORE" ]]; then
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" switch-pointer \
+        --state "$TRANSACTION_STATE" --name previous --target "$CURRENT_BEFORE" \
+        >/dev/null 2>/dev/null || exit 1
+      # This marker is written between the two independent pointer updates.
+      # A retry can therefore distinguish a previous-only move from a fully
+      # promoted pair without guessing from the live filesystem.
+      set_phase migration-applied previous-switched || exit 1
+      phase=previous-switched
+    else
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" switch-pointer \
+        --state "$TRANSACTION_STATE" --name current --target "$CANDIDATE" \
+        >/dev/null 2>/dev/null || exit 1
+      set_phase migration-applied current-switched || exit 1
+      phase=current-switched
+    fi
+    ;;
+esac
+case "$phase" in
+  previous-switched)
     /usr/bin/python3 -I "$TRANSACTION_TOOL" switch-pointer \
-      --state "$TRANSACTION_STATE" --name previous --target "$CURRENT_BEFORE" \
-      >/dev/null 2>/dev/null
-  fi
-  /usr/bin/python3 -I "$TRANSACTION_TOOL" switch-pointer \
-    --state "$TRANSACTION_STATE" --name current --target "$CANDIDATE" \
-    >/dev/null 2>/dev/null
-  if [[ "$phase" == "migration-applied" ]]; then
-    set_phase migration-applied activation-pending
-  fi
-  phase=activation-pending
-fi
+      --state "$TRANSACTION_STATE" --name current --target "$CANDIDATE" \
+      >/dev/null 2>/dev/null || exit 1
+    set_phase previous-switched current-switched || exit 1
+    phase=current-switched
+    ;;
+esac
+case "$phase" in
+  current-switched)
+    set_phase current-switched pointers-switched || exit 1
+    phase=pointers-switched
+    ;;
+esac
+case "$phase" in
+  pointers-switched)
+    set_phase pointers-switched activation-pending || exit 1
+    phase=activation-pending
+    ;;
+esac
 
 if [[ "$phase" == "activation-pending" ]]; then
   # The trusted live-QA payload is part of activation identity. Reconcile it
   # while the canonical release lock is still held, before any post-activation
   # readiness or smoke work can observe the new current release.
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    systemd_operation_reset || {
+      public_status failed systemd >&2
+      exit 1
+    }
+  fi
   LIVE_QA_RUNTIME_INSTALLER="$CANDIDATE/tools/platform_live_qa_runtime_install.py"
   if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
     public_status failed liveqa_runtime >&2
     exit 1
   fi
-  "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-    reconcile --app-dir "$APP_DIR" >/dev/null 2>/dev/null
-  # Install units without implicitly starting timers. The recorded snapshot
-  # decides which timer is allowed to start below; app units are restarted
-  # explicitly after installation.
-  PLATFORM_ENABLE_SYSTEMD_UNITS=0 run_candidate tools/platform_install_systemd_units.sh
-  /usr/bin/systemctl restart deadlock-api deadlock-worker deadlock-web \
+  run_live_qa_reconcile || {
+    public_status failed liveqa_runtime >&2
+    exit 1
+  }
+  # Unit files are prepared without mutating enablement or activation. A
+  # clean first install performs its persistent activation only after smoke
+  # has passed and the durable systemd-activation-pending phase is recorded.
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    PLATFORM_ENABLE_SYSTEMD_UNITS=0 run_initial_systemd_candidate \
+      tools/platform_install_systemd_units.sh
+  else
+    PLATFORM_ENABLE_SYSTEMD_UNITS=0 run_candidate tools/platform_install_systemd_units.sh
+  fi
+  run_systemctl restart deadlock-api deadlock-worker deadlock-web \
     >/dev/null 2>/dev/null
   for service in deadlock-api deadlock-worker deadlock-web; do
-    /usr/bin/systemctl is-active --quiet "$service" >/dev/null 2>/dev/null
-  done
-  for attempt in {1..30}; do
-    if /usr/bin/curl --fail --silent --show-error --max-time 5 \
-      http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null \
-      && /usr/bin/curl --fail --silent --show-error --max-time 5 \
-      http://127.0.0.1:3000/ >/dev/null 2>/dev/null; then
-      break
-    fi
-    if [[ "$attempt" -eq 30 ]]; then
-      public_status failed readiness >&2
+    require_unit_state "$service" active || {
+      public_status failed service_state >&2
       exit 1
-    fi
-    sleep 1
+    }
   done
+  wait_for_activation_readiness || {
+    public_status failed readiness >&2
+    exit 1
+  }
   if [[ "$CLOUDFLARE_TIMER_STATE" == "active" ]]; then
-    /usr/bin/systemctl start deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null
-    /usr/bin/systemctl is-active --quiet deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null
+    run_systemctl start deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null
+    require_unit_state deadlock-cloudflare-ips.timer active || {
+      public_status failed service_state >&2
+      exit 1
+    }
   fi
   WRITERS_QUIESCED=0
   set_phase activation-pending services-restarted
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    systemd_operation_end
+  fi
   phase=services-restarted
 fi
 
@@ -1008,11 +1660,91 @@ if [[ "$phase" == "nginx-applied" ]]; then
 fi
 
 if [[ "$phase" == "smoke-passed" ]]; then
-  set_phase smoke-passed activation-committed
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    set_phase smoke-passed systemd-activation-pending
+    phase=systemd-activation-pending
+  else
+    set_phase smoke-passed activation-committed
+    phase=activation-committed
+  fi
+fi
+
+if [[ "$phase" == "systemd-activation-pending" ]]; then
+  # The receipt was captured and fsynced before migration/pointer activation.
+  # Return to that exact baseline before enabling anything so a retry after a
+  # partial activation is deterministic and never accumulates enablement.
+  systemd_operation_reset || {
+    public_status failed systemd >&2
+    exit 1
+  }
+  restore_initial_systemd_baseline || {
+    public_status failed systemd >&2
+    exit 1
+  }
+  PLATFORM_ENABLE_SYSTEMD_UNITS=1 run_initial_systemd_candidate \
+    tools/platform_install_systemd_units.sh
+  run_systemctl restart deadlock-api deadlock-worker deadlock-web \
+    >/dev/null 2>/dev/null || {
+    public_status failed service_state >&2
+    exit 1
+  }
+  for service in deadlock-api deadlock-worker deadlock-web; do
+    require_unit_state "$service" active || {
+      public_status failed service_state >&2
+      exit 1
+    }
+    require_unit_enabled "$service" || {
+      public_status failed service_state >&2
+      exit 1
+    }
+  done
+  for timer in \
+    deadlock-maintenance.timer \
+    deadlock-logrotate.timer \
+    deadlock-cloudflare-ips.timer \
+    deadlock-health-monitor.timer; do
+    require_unit_enabled "$timer" || {
+      public_status failed service_state >&2
+      exit 1
+    }
+    require_unit_state "$timer" active || {
+      public_status failed service_state >&2
+      exit 1
+    }
+  done
+  wait_for_activation_readiness || {
+    public_status failed readiness >&2
+    exit 1
+  }
+  set_phase systemd-activation-pending systemd-activated
+  systemd_operation_end
+  phase=systemd-activated
+fi
+
+if [[ "$phase" == "systemd-activated" ]]; then
+  systemd_operation_reset || {
+    public_status failed systemd >&2
+    exit 1
+  }
+  verify_initial_systemd_activation || {
+    public_status failed systemd >&2
+    exit 1
+  }
+  systemd_operation_end
+  set_phase systemd-activated activation-committed
   phase=activation-committed
 fi
 
 if [[ "$phase" == "activation-committed" ]]; then
+  systemd_operation_reset || {
+    public_status failed systemd >&2
+    exit 1
+  }
+  verify_initial_systemd_activation || {
+    public_status failed systemd >&2
+    exit 1
+  }
+  systemd_operation_end
   clear_quiesce_receipt
   /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
 

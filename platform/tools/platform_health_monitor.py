@@ -56,6 +56,15 @@ except ImportError:  # Direct execution from the tools directory.
 
 
 DEFAULT_SERVICES = ("deadlock-api", "deadlock-worker", "deadlock-web", "nginx")
+SERVICE_CHECK_TIMEOUT_SECONDS = 10.0
+CERTIFICATE_CHECK_TIMEOUT_SECONDS = 10.0
+API_CHECK_TIMEOUT_SECONDS = 5.0
+HEALTH_OPERATION_BUDGET_SECONDS = (
+    len(DEFAULT_SERVICES) * SERVICE_CHECK_TIMEOUT_SECONDS
+    + API_CHECK_TIMEOUT_SECONDS
+    + CERTIFICATE_CHECK_TIMEOUT_SECONDS
+)
+HEALTH_SERVICE_TIMEOUT_SECONDS = HEALTH_OPERATION_BUDGET_SECONDS + 35.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,17 +106,32 @@ def parse_args() -> argparse.Namespace:
         or not 0 < args.disk_max_used_percent <= 100
     ):
         parser.error("--disk-max-used-percent must be within (0, 100]")
+    if (
+        not math.isfinite(args.http_timeout)
+        or args.http_timeout <= 0
+        or args.http_timeout > API_CHECK_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            f"--http-timeout must be within (0, {API_CHECK_TIMEOUT_SECONDS:g}]"
+        )
     return args
 
 
 def check_service(name: str) -> Check:
-    result = subprocess.run(
-        ["systemctl", "is-active", name],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    )
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", name],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=SERVICE_CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check(
+            name=f"service:{name}",
+            ok=False,
+            detail={"state": "unavailable", "error": type(exc).__name__},
+        )
     state = (result.stdout.strip() or result.stderr.strip() or "unknown")[:80]
     return Check(name=f"service:{name}", ok=result.returncode == 0 and state == "active", detail={"state": state})
 
@@ -244,7 +268,7 @@ def check_certificate(path: Path, *, min_days: int) -> Check:
             capture_output=True,
             text=True,
             check=False,
-            timeout=10,
+            timeout=CERTIFICATE_CHECK_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return Check("certificate", False, {"error": type(exc).__name__})

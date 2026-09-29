@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, AsyncGenerator
 from contextlib import asynccontextmanager
 from hashlib import sha256
 import logging
+import math
 import os
 from time import perf_counter
 
@@ -95,6 +96,32 @@ def postgres_application_name() -> str:
     return _POSTGRES_APPLICATION_NAMES.get(service, "oldsparky-api")
 
 
+def _optional_database_timeout(name: str) -> float | None:
+    """Parse an opt-in bounded asyncpg timeout from the trusted environment."""
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive finite number") from exc
+    if not 0 < value <= 600 or not math.isfinite(value):
+        raise RuntimeError(f"{name} must be between 0 and 600 seconds")
+    return value
+
+
+def _optional_database_timeout_ms(name: str) -> str | None:
+    """Parse an opt-in PostgreSQL session timeout in milliseconds."""
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    if not raw.isdigit() or not 1 <= int(raw) <= 600_000:
+        raise RuntimeError(f"{name} must be an integer between 1 and 600000")
+    return f"{int(raw)}ms"
+
+
 def engine() -> AsyncEngine:
     global _engine, _engine_loop, _session_factory
 
@@ -133,6 +160,32 @@ def engine() -> AsyncEngine:
             if is_worker
             else settings.platform_db_pool_recycle_seconds
         )
+        connect_args: dict[str, object] = {
+            "server_settings": {
+                "application_name": postgres_application_name(),
+            }
+        }
+        connect_timeout = _optional_database_timeout(
+            "PLATFORM_DB_CONNECT_TIMEOUT_SECONDS"
+        )
+        command_timeout = _optional_database_timeout(
+            "PLATFORM_DB_COMMAND_TIMEOUT_SECONDS"
+        )
+        statement_timeout = _optional_database_timeout_ms(
+            "PLATFORM_DB_STATEMENT_TIMEOUT_MS"
+        )
+        lock_timeout = _optional_database_timeout_ms("PLATFORM_DB_LOCK_TIMEOUT_MS")
+        if connect_timeout is not None:
+            connect_args["timeout"] = connect_timeout
+        if command_timeout is not None:
+            connect_args["command_timeout"] = command_timeout
+        server_settings = connect_args["server_settings"]
+        assert isinstance(server_settings, dict)
+        if statement_timeout is not None:
+            server_settings["statement_timeout"] = statement_timeout
+        if lock_timeout is not None:
+            server_settings["lock_timeout"] = lock_timeout
+
         _engine = create_async_engine(
             settings.platform_database_url,
             future=True,
@@ -141,11 +194,7 @@ def engine() -> AsyncEngine:
             max_overflow=max_overflow,
             pool_timeout=pool_timeout,
             pool_recycle=pool_recycle,
-            connect_args={
-                "server_settings": {
-                    "application_name": postgres_application_name(),
-                }
-            },
+            connect_args=connect_args,
         )
         try:
             _engine_loop = asyncio.get_running_loop()

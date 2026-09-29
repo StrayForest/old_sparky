@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import unittest
 
+from tools import platform_release_systemd_state
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER = REPO_ROOT / "platform/tools/platform_release_systemd_state.py"
@@ -32,10 +34,29 @@ STATIC_UNITS = {
     "deadlock-cloudflare-ips.service",
     "deadlock-health-monitor.service",
 }
+HELPER_PATHS = (
+    "platform_install_systemd_units.sh",
+    "platform_install_nginx.py",
+    "platform_deploy_smoke.py",
+    "platform_live_qa_runtime_install.py",
+    "platform_install_logging.sh",
+    "platform_prepare_service_user.sh",
+    "platform_render_service_envs.py",
+    "platform_deploy_smoke_impl.py",
+    "platform_safe_env_exec.py",
+    "platform_release_restore_runtime.sh",
+    "platform_release_systemd_state.py",
+    "platform_release_transaction.py",
+    "platform_release_lock.sh",
+)
 
 
 class PlatformReleaseSystemdStateTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.assertEqual(
+            tuple(f"tools/{name}" for name in HELPER_PATHS),
+            platform_release_systemd_state.HELPER_RELATIVE_PATHS,
+        )
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.app = self.root / "platform-app"
@@ -49,6 +70,13 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
         self.current.mkdir()
         self.previous.mkdir()
         self.candidate.mkdir()
+        for release in (self.current, self.previous, self.candidate):
+            tools = release / "tools"
+            tools.mkdir()
+            for name in HELPER_PATHS:
+                helper = tools / name
+                helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="ascii")
+                helper.chmod(0o755)
         self.state_path = self.root / "systemd-state.json"
         self.enabled_path = self.root / "systemd-enabled.json"
         self.log_path = self.root / "systemctl.log"
@@ -115,11 +143,15 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             "if action == 'is-active':\n"
             "    value = state.get(unit, 'inactive')\n"
             "    print(value)\n"
+            "    forced_unit = os.getenv('PLATFORM_TEST_ACTIVE_RC_UNIT')\n"
+            "    forced_rc = os.getenv('PLATFORM_TEST_ACTIVE_RC')\n"
+            "    if forced_unit == unit and forced_rc is not None:\n"
+            "        raise SystemExit(int(forced_rc))\n"
             "    raise SystemExit(0 if value == 'active' else 3)\n"
             "if action == 'is-enabled':\n"
             "    value = enabled.get(unit, 'static')\n"
             "    print(value)\n"
-            "    raise SystemExit(0 if value == 'enabled' else 1)\n"
+            "    raise SystemExit(0 if value in {'enabled', 'static'} else 1)\n"
             "if action in {'enable', 'disable'}:\n"
             "    if os.getenv('PLATFORM_TEST_FAIL_ACTION') == action and not fail_marker.exists():\n"
             "        fail_marker.write_text('failed')\n"
@@ -170,7 +202,31 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             str(self.current),
             "--previous-before",
             str(self.previous),
+            "--operation-id",
+            "a" * 32,
         )
+
+    def test_capture_rejects_inactive_timer_with_rc4(self) -> None:
+        result = self.run_helper(
+            "capture",
+            "--state",
+            str(self.receipt),
+            "--app-dir",
+            str(self.app),
+            "--current-before",
+            str(self.current),
+            "--previous-before",
+            str(self.previous),
+            "--operation-id",
+            "a" * 32,
+            env={
+                "PLATFORM_TEST_ACTIVE_RC_UNIT": "deadlock-cloudflare-ips.timer",
+                "PLATFORM_TEST_ACTIVE_RC": "4",
+            },
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.receipt.exists())
 
     def write_install_transaction(self) -> Path:
         def identity(path: Path) -> dict[str, int]:
@@ -179,6 +235,7 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
 
         transaction = self.shared / ".release-operation.json"
         record = {
+            "operation_id": "b" * 32,
             "version": 2,
             "operation": "install",
             "phase": "activation-pending",
@@ -201,12 +258,18 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
                 "deadlock-worker": "active",
                 "deadlock-web": "inactive",
             },
+            "service_enabled_before": {
+                "deadlock-api": "disabled",
+                "deadlock-worker": "enabled",
+                "deadlock-web": "disabled",
+            },
             "quiesced_services": [
                 "deadlock-api",
                 "deadlock-worker",
                 "deadlock-web",
             ],
             "timer_active_before": True,
+            "timer_enabled_before": "enabled",
         }
         transaction.write_text(json.dumps(record, sort_keys=True) + "\n")
         transaction.chmod(0o600)
@@ -220,9 +283,126 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             str(self.receipt),
             "--transaction",
             str(transaction),
+            "--require-helper-manifest",
             "--app-dir",
             str(self.app),
         )
+
+    def test_initial_systemd_snapshot_rejects_empty_pointer_strings(self) -> None:
+        transaction = self.write_install_transaction()
+        record = json.loads(transaction.read_text(encoding="utf-8"))
+        record["current_before"] = ""
+        record["previous_before"] = ""
+        record["current_before_identity"] = None
+        record["previous_before_identity"] = None
+        record["systemd_state_before"] = {
+            unit: {"active": "inactive", "enabled": "disabled"}
+            for unit in platform_release_systemd_state.INITIAL_SYSTEMD_UNITS
+        }
+        transaction.write_text(json.dumps(record, sort_keys=True) + "\n")
+        transaction.chmod(0o600)
+        result = self.run_helper(
+            "capture-transaction",
+            "--state",
+            str(self.receipt),
+            "--transaction",
+            str(transaction),
+            "--require-helper-manifest",
+            "--app-dir",
+            str(self.app),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(self.log_path.read_text(), "")
+
+    def test_mismatched_valid_transaction_cannot_touch_systemd_or_clear_receipt(self) -> None:
+        transaction = self.write_install_transaction()
+        self.run_helper(
+            "capture-transaction",
+            "--state",
+            str(self.receipt),
+            "--transaction",
+            str(transaction),
+            "--require-helper-manifest",
+            "--app-dir",
+            str(self.app),
+        )
+        mismatched = self.shared / ".release-operation-mismatched.json"
+        mismatched_record = json.loads(transaction.read_text())
+        mismatched_record["current_before"], mismatched_record["previous_before"] = (
+            mismatched_record["previous_before"],
+            mismatched_record["current_before"],
+        )
+        mismatched_record["current_before_identity"], mismatched_record[
+            "previous_before_identity"
+        ] = (
+            mismatched_record["previous_before_identity"],
+            mismatched_record["current_before_identity"],
+        )
+        mismatched.write_text(json.dumps(mismatched_record, sort_keys=True) + "\n")
+        mismatched.chmod(0o600)
+
+        mismatched_id = self.shared / ".release-operation-mismatched-id.json"
+        mismatched_id_record = json.loads(transaction.read_text())
+        mismatched_id_record["operation_id"] = "c" * 32
+        mismatched_id.write_text(
+            json.dumps(mismatched_id_record, sort_keys=True) + "\n"
+        )
+        mismatched_id.chmod(0o600)
+
+        receipt_before = self.receipt.read_bytes()
+        active_before = self.state_path.read_bytes()
+        enabled_before = self.enabled_path.read_bytes()
+        self.log_path.write_text("")
+
+        for command in ("validate", "restore", "clear"):
+            for transaction_path in (mismatched, mismatched_id):
+                result = self.run_helper(
+                    command,
+                    "--state",
+                    str(self.receipt),
+                    "--transaction",
+                    str(transaction_path),
+                    "--app-dir",
+                    str(self.app),
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0, command)
+                self.assertEqual(self.receipt.read_bytes(), receipt_before, command)
+                self.assertEqual(self.state_path.read_bytes(), active_before, command)
+                self.assertEqual(self.enabled_path.read_bytes(), enabled_before, command)
+                self.assertEqual(self.log_path.read_text(), "", command)
+
+    def test_tampered_release_helper_fails_before_systemd_side_effect(self) -> None:
+        transaction = self.write_install_transaction()
+        self.run_helper(
+            "capture-transaction",
+            "--state",
+            str(self.receipt),
+            "--transaction",
+            str(transaction),
+            "--require-helper-manifest",
+            "--app-dir",
+            str(self.app),
+        )
+        helper = self.current / "tools/platform_install_nginx.py"
+        helper.write_text("tampered\n", encoding="ascii")
+        receipt_before = self.receipt.read_bytes()
+        result = self.run_helper(
+            "validate",
+            "--state",
+            str(self.receipt),
+            "--transaction",
+            str(transaction),
+            "--require-helper-manifest",
+            "--app-dir",
+            str(self.app),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.receipt.read_bytes(), receipt_before)
+        self.assertEqual(self.log_path.read_text(), "")
 
     def test_transaction_receipt_retry_restores_mixed_runtime_without_enabling_units(self) -> None:
         """The recovery receipt is the sole authority for both state dimensions."""
@@ -234,6 +414,7 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             str(self.receipt),
             "--transaction",
             str(transaction),
+            "--require-helper-manifest",
             "--app-dir",
             str(self.app),
         )
@@ -367,12 +548,99 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             str(self.current),
             "--previous-before",
             str(self.previous),
+            "--operation-id",
+            "a" * 32,
             check=False,
         )
 
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.receipt.exists())
         self.assertEqual(self.log_path.read_text(), "")
+
+    def test_systemctl_metadata_and_status_mismatch_fail_before_receipt(self) -> None:
+        unsafe_link = self.root / "systemctl-link"
+        unsafe_link.symlink_to(self.fake_systemctl)
+        result = self.run_helper(
+            "capture",
+            "--state",
+            str(self.receipt),
+            "--app-dir",
+            str(self.app),
+            "--current-before",
+            str(self.current),
+            "--previous-before",
+            str(self.previous),
+            "--operation-id",
+            "a" * 32,
+            "--systemctl",
+            str(unsafe_link),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(self.log_path.read_text(), "")
+
+        self.fake_systemctl.chmod(0o775)
+        result = self.run_helper(
+            "capture",
+            "--state",
+            str(self.receipt),
+            "--app-dir",
+            str(self.app),
+            "--current-before",
+            str(self.current),
+            "--previous-before",
+            str(self.previous),
+            "--operation-id",
+            "a" * 32,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.receipt.exists())
+
+    def test_systemctl_active_and_enabled_rc_pairs_are_closed(self) -> None:
+        for index, (needle, replacement) in enumerate(
+            (
+                (
+                    "raise SystemExit(0 if value == 'active' else 3)",
+                    "raise SystemExit(3)",
+                ),
+                (
+                    "raise SystemExit(0 if value in {'enabled', 'static'} else 1)",
+                    "raise SystemExit(1)",
+                ),
+                (
+                    "raise SystemExit(0 if value in {'enabled', 'static'} else 1)",
+                    "raise SystemExit(3)",
+                ),
+            )
+        ):
+            if index:
+                self.tearDown()
+                self.setUp()
+            source = self.fake_systemctl.read_text(encoding="utf-8")
+            self.assertIn(needle, source)
+            self.fake_systemctl.write_text(
+                source.replace(needle, replacement, 1), encoding="utf-8"
+            )
+            self.fake_systemctl.chmod(0o755)
+            result = self.run_helper(
+                "capture",
+                "--state",
+                str(self.receipt),
+                "--app-dir",
+                str(self.app),
+                "--current-before",
+                str(self.current),
+                "--previous-before",
+                str(self.previous),
+                "--operation-id",
+                "a" * 32,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.receipt.exists())
+            self.assertEqual(self.log_path.read_text(), "")
 
     def test_installer_or_enable_failure_retains_receipt_and_retry_is_idempotent(self) -> None:
         self.capture()

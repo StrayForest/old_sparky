@@ -58,6 +58,69 @@ PAGE_RE = re.compile(r"page-([1-9][0-9]{0,2})\.json\Z")
 EXPECTED_NAME_RE = re.compile(
     r"platform-ci-route-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}\Z"
 )
+RECOVERY_BOOTSTRAP_FILES = frozenset(
+    {
+        ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+        ".github/workflows/platform-production-deploy.yml",
+        ".github/workflows/platform-production-release-abort.yml",
+        ".github/workflows/platform-production-release-recover.yml",
+        ".github/workflows/platform-production-autodeploy.yml",
+        "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_tournament_list_read_model_recovery.py",
+        "platform/alembic/env.py",
+        "platform/tools/platform_abort_retained_only.sh",
+        "platform/tools/platform_release_lock.sh",
+        "platform/tools/platform_release_deploy.sh",
+        "platform/tools/platform_release_preflight.sh",
+        "platform/tools/platform_install_systemd_units.sh",
+        "platform/tools/platform_install_logging.sh",
+        "platform/tools/platform_install_nginx.py",
+        "platform/tools/platform_release_restore_runtime.sh",
+        "platform/tools/platform_production_deploy_supervisor.sh",
+        "platform/tools/platform_update_cloudflare_ips.py",
+        "platform/tools/platform_deploy_smoke_impl.py",
+        "platform/tools/platform_validate_edge_policy.py",
+        "platform/tools/platform_health_monitor.py",
+        "platform/tools/platform_release_rollback.sh",
+        "platform/tools/platform_release_systemd_state.py",
+        "platform/tools/platform_recover_pending.sh",
+        "platform/tools/platform_release_transaction.py",
+        "platform/tools/platform_run_alembic.sh",
+        "platform/tools/platform_live_qa_guard.py",
+        "platform/tools/platform_live_qa_runtime_install.py",
+        "platform/tools/platform_build_live_qa_runtime.py",
+        "platform/tests/test_platform_recovery_bootstrap.py",
+        "platform/tests/test_platform_db.py",
+        "platform/tests/test_platform_release_audit_hardening.py",
+        "platform/tests/test_platform_release_build_contract.py",
+        "platform/tests/test_platform_release_recovery_boundaries.py",
+        "platform/tests/test_platform_storage_maintenance.py",
+        "platform/tests/test_platform_release_systemd_state.py",
+        "platform/tests/test_platform_release_venv_rollback.py",
+        "platform/tests/test_platform_live_qa_guard.py",
+        "platform/tests/test_platform_live_qa_runtime_install.py",
+        "platform/tests/test_platform_live_qa_wrappers.py",
+        "platform/tests/test_platform_ssh_host_key_scan.py",
+        "platform/tests/test_platform_release_build_diagnostics.py",
+        "platform/tests/test_platform_ci_classifier.py",
+        "platform/tools/platform_ci_classifier.py",
+        "platform/tools/platform_production_classifier_artifact.py",
+        "platform/tools/platform_verify_contract.py",
+        "platform/tools/platform_test_catalog.py",
+        "platform/tools/platform_workflow_input_guard.py",
+        "platform/tools/platform_workflow_remote_dispatch.py",
+        "platform/tests/test_platform_host_tools_bundle.py",
+        "platform/tests/test_platform_cloudflare_ips.py",
+        "platform/python_packages/platform_infra/db.py",
+        "platform/tests/test_platform_install_nginx.py",
+        "platform/contracts/host_tools_pin.json",
+        "platform/deploy/systemd/deadlock-cloudflare-ips.service",
+        "platform/deploy/systemd/deadlock-health-monitor.service",
+    }
+)
+DOCS_PREFIX = "platform/docs/"
 ALLOWED_REASONS = frozenset(
     {
         "metadata",
@@ -369,6 +432,17 @@ def _manifest_digest(manifest: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _is_recovery_bootstrap_only(files: Sequence[object]) -> bool:
+    return bool(
+        any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
+        and all(
+            path in RECOVERY_BOOTSTRAP_FILES
+            or (isinstance(path, str) and path.startswith(DOCS_PREFIX))
+            for path in files
+        )
+    )
+
+
 def validate_manifest(archive: Path, *, target_sha: str) -> None:
     if SHA_RE.fullmatch(target_sha) is None:
         raise _fail("provenance")
@@ -410,16 +484,22 @@ def validate_manifest(archive: Path, *, target_sha: str) -> None:
         raise _fail("manifest")
     if type(manifest.get("runtime_sensitive")) is not bool:
         raise _fail("manifest")
-    if type(manifest.get("deployable")) is not bool or manifest["deployable"] is not True:
-        raise _fail("manifest")
-    if type(manifest.get("fallback")) is not bool or manifest["fallback"] is not False:
-        raise _fail("manifest")
-    if not _bounded_ascii(manifest.get("reason"), maximum=512):
-        raise _fail("manifest")
     files = manifest.get("files")
     if not isinstance(files, list) or len(files) > 10_000 or any(
         not _bounded_ascii(value, maximum=512) for value in files
     ):
+        raise _fail("manifest")
+    recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
+    if type(manifest.get("deployable")) is not bool:
+        raise _fail("manifest")
+    if recovery_bootstrap_only:
+        if manifest["deployable"] is not False:
+            raise _fail("manifest")
+    elif manifest["deployable"] is not True:
+        raise _fail("manifest")
+    if type(manifest.get("fallback")) is not bool or manifest["fallback"] is not False:
+        raise _fail("manifest")
+    if not _bounded_ascii(manifest.get("reason"), maximum=512):
         raise _fail("manifest")
     digest = manifest.get("digest")
     if not isinstance(digest, str) or DIGEST_RE.fullmatch(digest) is None:

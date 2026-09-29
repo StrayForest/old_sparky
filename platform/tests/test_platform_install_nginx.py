@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,17 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PlatformInstallNginxTests(unittest.TestCase):
+    def test_openssl_checks_are_bounded_and_systemctl_path_is_absolute(self) -> None:
+        self.assertEqual(MODULE.SYSTEMCTL_BIN, "/usr/bin/systemctl")
+        self.assertEqual(MODULE.OPENSSL_TIMEOUT_SECONDS, 30.0)
+
+        def timed_out(command: list[str], **kwargs: object) -> None:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with mock.patch.object(MODULE.subprocess, "run", side_effect=timed_out):
+            with self.assertRaisesRegex(RuntimeError, "timed out safely"):
+                MODULE.run_captured(["openssl", "version"])
+
     def _validate_vhost_text(self, vhost_text: str) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             candidate = Path(temporary_dir) / "candidate.conf"
@@ -295,7 +307,9 @@ class PlatformInstallNginxTests(unittest.TestCase):
             self.assertEqual(available.read_bytes(), source.read_bytes())
             self.assertEqual(snippet_destination.read_bytes(), snippet_source.read_bytes())
             self.assertEqual(enabled.readlink(), available)
-            run_checked.assert_called_once_with(["nginx", "-t"])
+            run_checked.assert_called_once_with(
+                ["nginx", "-t"], timeout=MODULE.NGINX_CONFIG_TIMEOUT_SECONDS
+            )
 
 if __name__ == "__main__":
     unittest.main()

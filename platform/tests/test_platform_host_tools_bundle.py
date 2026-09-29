@@ -175,6 +175,13 @@ class HostToolsBundleTests(unittest.TestCase):
             tuple(f"platform/tools/{name}" for name in bundle.HOST_TOOL_FILES),
         )
 
+    def test_host_tools_provisioning_adr_matches_enforced_generation_pin(self) -> None:
+        adr = (
+            REPO_ROOT / "platform/docs/adr/production-host-tools-provisioning.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(PIN_SHA, adr)
+        self.assertNotIn("25c67089fdfca99f58d801cc529bb0e987f5ecf8", adr)
+
     def test_repository_pin_rejects_circular_generation_and_repository_tampering(self) -> None:
         with self.assertRaises(pin.HostToolsPinError):
             pin.resolve_pin(

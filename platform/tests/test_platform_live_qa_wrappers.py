@@ -12,7 +12,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tools import platform_workflow_input_guard, platform_workflow_remote_dispatch
 from tools.platform_workflow_input_guard import (
@@ -22,6 +22,7 @@ from tools.platform_workflow_input_guard import (
     validate_deployment_payload,
     validate_external_payload,
     validate_live_payload,
+    validate_host_tools_payload,
     validate_bounded_integer,
     validate_run_id,
     validate_target_sha,
@@ -51,6 +52,45 @@ BROWSER_WRAPPERS = WRAPPERS[1:3]
 
 
 class LiveQaWrapperContractTests(unittest.TestCase):
+    def test_host_tools_handoff_is_closed_and_binds_contract(self) -> None:
+        valid = {
+            "schema": 1,
+            "target_sha": "a" * 40,
+            "host_tools_sha": "b" * 40,
+            "artifact_id": "123456",
+            "artifact_name": "platform-host-tools-bundle-123456-2",
+            "artifact_size": "4096",
+            "artifact_digest": "c" * 64,
+            "bundle_sha256": "d" * 64,
+            "manifest_sha256": "e" * 64,
+            "capabilities_sha256": "f" * 64,
+            "files_contract_sha256": "0" * 64,
+            "modes_contract_sha256": "1" * 64,
+            "signer_workflow": platform_workflow_input_guard.HOST_TOOLS_SIGNER_WORKFLOW,
+            "source_ref": "refs/heads/dev",
+            "source_digest": "a" * 40,
+            "attestation_run_id": "123456",
+            "attestation_run_attempt": "2",
+            "attestation_job_id": "654321",
+        }
+        self.assertEqual(
+            validate_host_tools_payload(valid),
+            {**{key: str(value) for key, value in valid.items()}, "schema": "1"},
+        )
+        for field, value in (
+            ("artifact_digest", "not-a-digest"),
+            ("bundle_sha256", "0" * 63),
+            ("artifact_name", "platform-host-tools-bundle-123456-0"),
+            ("artifact_name", "platform-host-tools-bundle-654321-2"),
+            ("source_digest", "b" * 40),
+            ("signer_workflow", "wrong/repository/workflow.yml"),
+            ("artifact_size", "0"),
+            ("attestation_job_id", None),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(WorkflowInputError):
+                    validate_host_tools_payload({**valid, field: value})
+
     def test_live_launch_workflow_delegates_to_server_supervisor(self) -> None:
         source = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(
             encoding="utf-8"
@@ -298,20 +338,20 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 BytesIO((json.dumps(valid_live) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
+            child = Mock(pid=1234)
+            child.wait.return_value = 0
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_ROOT", root), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_LAUNCH", helper), \
                 patch.object(
-                    platform_workflow_remote_dispatch.subprocess,
-                    "run",
-                    return_value=type("Result", (), {"returncode": 0})(),
-                ) as run:
+                    platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child
+                ) as popen:
                 self.assertEqual(
                     platform_workflow_remote_dispatch.main(["live-launch"]),
                     0,
                 )
             self.assertEqual(
-                run.call_args.args[0],
+                popen.call_args.args[0],
                 [
                     "/usr/bin/sudo",
                     "-n",
@@ -323,6 +363,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     valid_live["target_sha"],
                 ],
             )
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
         # The local handoff is an atomic private file, not a shell fragment or
         # an Actions artifact.
@@ -382,10 +423,6 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         # table-driven contracts so adding another confirmation/SHA surface
         # does not create a second test identity in the catalog.
         confirmation_cases = (
-            (
-                "platform-production-release-abort.yml",
-                "ABORT-RETAINED-RELEASE-MIGRATION-NOT-REVERSED",
-            ),
             ("platform-production-release-recover.yml", "RECOVER-PENDING-RELEASE"),
             ("platform-production-service-recovery.yml", "RECOVER-DEADLOCK-WEB"),
             (
@@ -400,6 +437,18 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "platform-production-web-runtime-diagnostics.yml",
         )
         workflow_dir = REPO_ROOT / ".github/workflows"
+        legacy_abort = (workflow_dir / "platform-production-release-abort.yml").read_text(
+            encoding="utf-8"
+        )
+        legacy_secret_position = legacy_abort.index("secrets.PROD_SSH")
+        self.assertIn(
+            'test "$RECOVERY_CONFIRMATION" = "ABORT-LEGACY-RELEASE"',
+            legacy_abort[:legacy_secret_position],
+        )
+        self.assertIn(
+            'test "$GITHUB_REF" = "refs/heads/dev"',
+            legacy_abort[:legacy_secret_position],
+        )
         for filename, expected in confirmation_cases:
             source = (workflow_dir / filename).read_text(encoding="utf-8")
             with self.subTest(workflow=filename, input="confirmation"):
@@ -556,6 +605,35 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "classifier_run_attempt": "2",
             "web_compression": "enabled",
         }
+        host_tools = {
+            "schema": 1,
+            "target_sha": "a" * 40,
+            "host_tools_sha": "b" * 40,
+            "artifact_id": "123456",
+            "artifact_name": "platform-host-tools-bundle-123456-2",
+            "artifact_size": "4096",
+            "artifact_digest": "c" * 64,
+            "bundle_sha256": "d" * 64,
+            "manifest_sha256": "e" * 64,
+            "capabilities_sha256": "f" * 64,
+            "files_contract_sha256": "0" * 64,
+            "modes_contract_sha256": "1" * 64,
+            "signer_workflow": platform_workflow_input_guard.HOST_TOOLS_SIGNER_WORKFLOW,
+            "source_ref": "refs/heads/dev",
+            "source_digest": "a" * 40,
+            "attestation_run_id": "123456",
+            "attestation_run_attempt": "2",
+            "attestation_job_id": "654321",
+        }
+        valid_deploy = {**valid, "schema": 2, "host_tools": host_tools}
+        for invalid_payload in (
+            {**valid, "schema": 2},
+            {**valid_deploy, "schema": 1},
+            {**valid_deploy, "schema": 3},
+        ):
+            with self.subTest(schema_payload=invalid_payload):
+                with self.assertRaises(WorkflowInputError):
+                    validate_deployment_payload(invalid_payload)
         invalid_values = {
             "mode": (
                 "x; touch /tmp/pwn #",
@@ -646,30 +724,49 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "remote workflow input is invalid\n")
         self.assertNotIn("$(id)", stderr.getvalue())
 
+        # A deploy handoff without the final immutable host-tools contract is
+        # rejected before either privileged dispatcher command is reached.
+        stdin = TextIOWrapper(
+            BytesIO((json.dumps(valid) + "\n").encode("utf-8")),
+            encoding="utf-8",
+        )
+        stderr = StringIO()
+        with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
+            patch.object(platform_workflow_remote_dispatch, "_trusted_generation", return_value=True), \
+            patch.object(platform_workflow_remote_dispatch.subprocess, "run") as run, \
+            redirect_stderr(stderr):
+            self.assertEqual(
+                platform_workflow_remote_dispatch.main(["production-deploy"]),
+                2,
+            )
+        run.assert_not_called()
+        self.assertEqual(stderr.getvalue(), "remote workflow input is invalid\n")
+
         with tempfile.TemporaryDirectory() as directory:
             tools_root = Path(directory)
             helper = tools_root / "platform_production_deploy_supervisor.sh"
             helper.write_text("#!/bin/sh\n", encoding="utf-8")
             helper.chmod(0o555)
             stdin = TextIOWrapper(
-                BytesIO((json.dumps(valid) + "\n").encode("utf-8")),
+                BytesIO((json.dumps(valid_deploy) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
+            child = Mock(pid=1235)
+            child.wait.return_value = 0
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_root), \
                 patch.object(platform_workflow_remote_dispatch, "DEPLOY_HELPER", helper), \
                 patch.object(platform_workflow_remote_dispatch, "_trusted_generation", return_value=True), \
+                patch.object(platform_workflow_remote_dispatch, "_verify_host_tools_contract", return_value=True), \
                 patch.object(
-                    platform_workflow_remote_dispatch.subprocess,
-                    "run",
-                    return_value=type("Result", (), {"returncode": 0})(),
-                ) as run:
+                    platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child
+                ) as popen:
                 self.assertEqual(
                     platform_workflow_remote_dispatch.main(["production-deploy"]),
                     0,
                 )
             self.assertEqual(
-                run.call_args.args[0],
+                popen.call_args.args[0],
                 [
                     "/usr/bin/sudo",
                     "-n",
@@ -680,6 +777,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     valid["mode"],
                     valid["artifact_remote_dir"],
                     valid["runtime_profile"],
+                    host_tools["host_tools_sha"],
+                    host_tools["manifest_sha256"],
+                    host_tools["capabilities_sha256"],
                 ],
             )
 
@@ -689,25 +789,26 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             helper.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             helper.chmod(0o555)
             stdin = TextIOWrapper(
-                BytesIO((json.dumps(valid) + "\n").encode("utf-8")),
+                BytesIO((json.dumps(valid_deploy) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
+            child = Mock(pid=1236)
+            child.wait.return_value = 0
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_root), \
                 patch.object(platform_workflow_remote_dispatch, "ARTIFACT_DIR_HELPER", helper), \
                 patch.object(platform_workflow_remote_dispatch, "_trusted_generation", return_value=True), \
+                patch.object(platform_workflow_remote_dispatch, "_verify_host_tools_contract", return_value=True), \
                 patch.object(platform_workflow_remote_dispatch.sys, "executable", "/usr/bin/python3.12"), \
                 patch.object(
-                    platform_workflow_remote_dispatch.subprocess,
-                    "run",
-                    return_value=type("Result", (), {"returncode": 0})(),
-                ) as run:
+                    platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child
+                ) as popen:
                 self.assertEqual(
                     platform_workflow_remote_dispatch.main(["production-prepare-artifact"]),
                     0,
                 )
             self.assertEqual(
-                run.call_args.args[0],
+                popen.call_args.args[0],
                 [
                     "/usr/bin/sudo",
                     "-n",
@@ -719,6 +820,27 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     valid["artifact_remote_dir"],
                 ],
             )
+
+    def test_bounded_dispatch_child_terminates_process_group_on_timeout(self) -> None:
+        child = Mock(pid=9876)
+        child.wait.side_effect = [
+            subprocess.TimeoutExpired(["helper"], 1),
+            None,
+        ]
+        with (
+            patch.object(
+                platform_workflow_remote_dispatch.subprocess,
+                "Popen",
+                return_value=child,
+            ) as popen,
+            patch.object(platform_workflow_remote_dispatch.os, "killpg") as killpg,
+        ):
+            result = platform_workflow_remote_dispatch._run_bounded_child(
+                ["helper"], timeout_seconds=1
+            )
+        self.assertEqual(result, 124)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        killpg.assert_called_once_with(9876, platform_workflow_remote_dispatch.signal.SIGTERM)
 
     def test_cleanup_export_inventory_is_closed_and_idempotent(self) -> None:
         def build_root(prefix: str, run_id: str, names: tuple[str, ...]) -> Path:

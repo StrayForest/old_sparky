@@ -141,9 +141,9 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                     else standard_blocks
                 )
                 target.append(block)
-        self.assertEqual(workflow_count, 21)
-        self.assertEqual(site_count, 24)
-        self.assertEqual(len(standard_blocks), 23)
+        self.assertEqual(workflow_count, 22)
+        self.assertEqual(site_count, 25)
+        self.assertEqual(len(standard_blocks), 24)
         self.assertEqual(len(set(standard_blocks)), 2)
         self.assertEqual(
             sum("head -c 65536" in block for block in standard_blocks),

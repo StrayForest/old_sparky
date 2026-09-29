@@ -19,6 +19,7 @@ from tools.platform_ci_classifier import (
     DOCS_ONLY_GATE_IDS,
     FULL_GATE_IDS,
     OUT_OF_SCOPE_GATE_IDS,
+    RECOVERY_BOOTSTRAP_REASON,
     RUNTIME_SENSITIVE_FILES,
     ClassifierError,
     SECURITY_WORKFLOW_NAME,
@@ -307,7 +308,6 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "platform/apps/platform_api/app/main.py",
             "platform/tools/platform_build_release.sh",
             "platform/alembic/versions/20260927_candidate.py",
-            ".github/workflows/platform-production-deploy.yml",
         )
         for path in paths:
             with self.subTest(path=path):
@@ -330,6 +330,18 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 self.assertTrue(push["deployable"])
                 self.assertFalse(push["fallback"])
                 validate_manifest(push, expected_target_sha=self.TARGET_SHA, require_deployable=True)
+
+        recovery_only = classify(
+            [".github/workflows/platform-production-deploy.yml"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(recovery_only["class"], "full")
+        self.assertFalse(recovery_only["deployable"])
+        self.assertFalse(recovery_only["fallback"])
+        self.assertEqual(recovery_only["reason"], RECOVERY_BOOTSTRAP_REASON)
+        validate_manifest(recovery_only, expected_target_sha=self.TARGET_SHA)
 
         mixed = classify(
             [
