@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-29
 
 ## Local verified backup
 
@@ -12,15 +12,18 @@ manifest, restores into a new temporary database, validates tables,
 extensions/Alembic and drops the drill database. Daily maintenance retains 14
 verified copies.
 
-Create a release backup:
+The low-level create/restore drill is invoked by storage maintenance; do not
+run its mutating mode directly on the production host because it does not
+acquire the host-wide operation locks. Create a production backup through the
+lock-aware backup-only mode:
 
 ```bash
 cd /opt/oldsparky/platform/current
 /opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_backup_restore_drill.py \
-  --env-file /opt/oldsparky/platform/shared/.env.platform \
-  --output-dir /opt/oldsparky/platform/shared/backups \
-  --keep 14
+  tools/platform_storage_maintenance.py \
+  --app-dir /opt/oldsparky/platform \
+  --backup-keep 14 --backup-max-age-hours 24 \
+  --backup-only --apply --json
 ```
 
 For a reviewed `dev` release, an operator may run the same guarded backup
@@ -33,8 +36,10 @@ gh workflow run platform-production-backup.yml \
 ```
 
 Wait for the `Platform production backup` workflow to pass before observing
-or repeating the automatic production deployment. It serializes with the
-production deploy concurrency group and does not bypass the release preflight.
+or repeating the automatic production deployment. It invokes the same
+lock-aware backup-only mode and acquires locks in the fixed order
+release -> retained-load -> build -> live-QA. It performs no retention
+deletion, and a failed backup exits before any pruning path.
 
 Check freshness without restoring production:
 

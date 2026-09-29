@@ -5,11 +5,15 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
+import textwrap
 import unittest
 from unittest import mock
 
+from tests import platform_test_lock_support as lock_support
 from tools import platform_storage_maintenance as maintenance
 from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
 from tools.platform_storage_maintenance import (
@@ -66,6 +70,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             source_release_dir=self.release_dir,
             web_artifact_dir=web_dir,
             backup_keep=14,
+            backup_max_age_hours=24.0,
             release_keep=0,
             test_artifact_max_age_days=7,
             screenshot_max_age_days=30,
@@ -76,6 +81,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             maximum_used_percent=100.0,
             skip_backup=True,
             apply=True,
+            backup_only=False,
         )
 
     def test_artifact_plan_keeps_five_and_protects_rollback(self) -> None:
@@ -201,6 +207,278 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         self.assertEqual(args.minimum_free_gib, 5.0)
         self.assertEqual(args.maximum_used_percent, 85.0)
+        self.assertEqual(args.backup_max_age_hours, 24.0)
+        self.assertFalse(args.backup_only)
+
+    def test_backup_only_cli_is_apply_only_and_cannot_skip_backup(self) -> None:
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            ["platform_storage_maintenance.py", "--backup-only"],
+        ):
+            with self.assertRaises(SystemExit):
+                maintenance.parse_args()
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--backup-only",
+                "--apply",
+                "--skip-backup",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                maintenance.parse_args()
+
+    def test_backup_command_verifies_freshness_before_returning(self) -> None:
+        create_result = {
+            "ok": True,
+            "size_bytes": 123,
+            "duration_seconds": 4.5,
+            "restore_verified": True,
+            "alembic_revision_verified": True,
+            "sha256": "a" * 64,
+            "restored_table_count": 12,
+            "removed": [],
+        }
+        check_result = {
+            "ok": True,
+            "restore_verified": True,
+            "age_hours": 0.25,
+        }
+        with mock.patch.object(
+            maintenance.subprocess,
+            "run",
+            side_effect=(
+                subprocess.CompletedProcess([], 0, json.dumps(create_result), ""),
+                subprocess.CompletedProcess([], 0, json.dumps(check_result), ""),
+            ),
+        ) as run:
+            result = maintenance.run_backup(
+                self.root / "runtime" / "platform",
+                keep=14,
+                max_age_hours=24.0,
+            )
+
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("--check-latest", run.call_args_list[1].args[0])
+        self.assertIn("24.0", run.call_args_list[1].args[0])
+        self.assertTrue(result["restore_verified"])
+        self.assertTrue(result["alembic_revision_verified"])
+        self.assertTrue(result["checksum_present"])
+        self.assertEqual(result["age_hours"], 0.25)
+
+    def test_backup_failure_prevents_retention_deletion(self) -> None:
+        app_dir = self.root / "runtime" / "platform"
+        (app_dir / "shared").mkdir(parents=True)
+        current = self.add_runtime_release(app_dir, "release-current")
+        previous = self.add_runtime_release(app_dir, "release-previous")
+        candidate = self.add_runtime_release(app_dir, "release-old")
+        (app_dir / "current").symlink_to(current)
+        (app_dir / "previous").symlink_to(previous)
+        args = self.maintenance_args(app_dir)
+        args.skip_backup = False
+
+        with mock.patch.object(
+            maintenance,
+            "run_backup",
+            side_effect=RuntimeError("backup failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "backup failed"):
+                maintenance._plan_and_maybe_apply(
+                    args,
+                    app_dir=app_dir,
+                    source_release_dir=self.release_dir,
+                )
+
+        self.assertTrue(candidate.exists())
+
+    def _assert_backup_lock_contention_in_subprocess(
+        self,
+        *,
+        release_lock_path: Path,
+        retained_load_lock_path: Path,
+        source_release_dir: Path,
+        expected_message: str,
+        marker: Path,
+        app_dir: Path,
+    ) -> None:
+        child = textwrap.dedent(
+            """
+            import sys
+            from pathlib import Path
+            from types import SimpleNamespace
+
+            sys.path.insert(0, sys.argv[1])
+            from tools import platform_release_retention as retention
+            from tools import platform_storage_maintenance as maintenance
+
+            retention.RELEASE_LOCK_PATH = Path(sys.argv[2])
+            retention.RETAINED_LOAD_LOCK_PATH = Path(sys.argv[3])
+            args = SimpleNamespace(source_release_dir=Path(sys.argv[4]))
+            marker = Path(sys.argv[5])
+            app_dir = Path(sys.argv[6])
+
+            def fake_backup(*_args, **_kwargs):
+                marker.write_text("called", encoding="utf-8")
+                return {}
+
+            maintenance.run_backup = fake_backup
+            try:
+                with maintenance.maintenance_lock_scope(args, app_dir=app_dir):
+                    maintenance.run_backup(app_dir, keep=14)
+            except RuntimeError as exc:
+                if sys.argv[7] not in str(exc):
+                    print(str(exc))
+                    raise SystemExit(2)
+            else:
+                raise SystemExit(3)
+            if marker.exists():
+                raise SystemExit(4)
+            """
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child,
+                str(REPO_ROOT / "platform"),
+                str(release_lock_path),
+                str(retained_load_lock_path),
+                str(source_release_dir),
+                str(marker),
+                str(app_dir),
+                expected_message,
+            ],
+            cwd=REPO_ROOT / "platform",
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout={result.stdout!r} stderr={result.stderr!r}",
+        )
+        self.assertFalse(marker.exists())
+
+    def test_backup_lock_contention_fails_closed_in_subprocess(self) -> None:
+        app_dir = self.root / "runtime" / "platform"
+        (app_dir / "shared").mkdir(parents=True)
+        release_lock = lock_support.create_test_lock("backup-release")
+        retained_load_lock = lock_support.create_test_lock("backup-retained")
+        try:
+            release_lock.acquire(nonblocking=True)
+            self._assert_backup_lock_contention_in_subprocess(
+                release_lock_path=release_lock.path,
+                retained_load_lock_path=retained_load_lock.path,
+                source_release_dir=self.root / "missing-source-releases",
+                expected_message="holds the platform release lock",
+                marker=self.root / "release-marker",
+                app_dir=app_dir,
+            )
+            release_lock.release()
+
+            retained_load_lock.acquire(nonblocking=True)
+            self._assert_backup_lock_contention_in_subprocess(
+                release_lock_path=release_lock.path,
+                retained_load_lock_path=retained_load_lock.path,
+                source_release_dir=self.root / "missing-source-releases",
+                expected_message="holds the retained-load lock",
+                marker=self.root / "retained-marker",
+                app_dir=app_dir,
+            )
+            retained_load_lock.release()
+        finally:
+            release_lock.cleanup()
+            retained_load_lock.cleanup()
+
+    def test_backup_build_lock_contention_fails_closed_in_subprocess(self) -> None:
+        app_dir = self.root / "runtime" / "platform"
+        (app_dir / "shared").mkdir(parents=True)
+        source_release_dir = self.root / "source-releases"
+        source_release_dir.mkdir(mode=0o700)
+        source_release_dir.chmod(0o700)
+        release_lock = lock_support.create_test_lock("backup-build-release")
+        retained_load_lock = lock_support.create_test_lock("backup-build-retained")
+        descriptor = os.open(source_release_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._assert_backup_lock_contention_in_subprocess(
+                release_lock_path=release_lock.path,
+                retained_load_lock_path=retained_load_lock.path,
+                source_release_dir=source_release_dir,
+                expected_message="holds the platform release build output lock",
+                marker=self.root / "build-marker",
+                app_dir=app_dir,
+            )
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            release_lock.cleanup()
+            retained_load_lock.cleanup()
+
+    def test_backup_only_success_never_applies_retention(self) -> None:
+        app_dir = self.root / "runtime" / "platform"
+        (app_dir / "shared").mkdir(parents=True)
+        current = self.add_runtime_release(app_dir, "release-current")
+        previous = self.add_runtime_release(app_dir, "release-previous")
+        candidate = self.add_runtime_release(app_dir, "release-old")
+        (app_dir / "current").symlink_to(current)
+        (app_dir / "previous").symlink_to(previous)
+        web_candidate = self.root / "web" / "test-results-old"
+        web_candidate.mkdir(parents=True)
+        args = self.maintenance_args(app_dir)
+        args.skip_backup = False
+        args.backup_only = True
+        events: list[str] = []
+
+        @maintenance.contextmanager
+        def tracked_scope(*_args: object, **_kwargs: object):
+            events.append("locks-enter")
+            yield self.release_dir
+            events.append("locks-exit")
+
+        live_qa_plan = maintenance.live_qa_guard.RuntimeCacheRetentionPlan(
+            protected=(),
+            retained=(),
+            candidates=(),
+            tombstones=(),
+        )
+        with (
+            mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
+            mock.patch.object(
+                maintenance,
+                "run_backup",
+                return_value={
+                    "size_bytes": 123,
+                    "duration_seconds": 1.0,
+                    "restore_verified": True,
+                    "alembic_revision_verified": True,
+                    "checksum_present": True,
+                    "restored_table_count": 3,
+                    "age_hours": 0.1,
+                    "removed_count": 0,
+                },
+            ) as run_backup,
+            mock.patch.object(
+                maintenance.live_qa_guard,
+                "prune_runtime_cache_release_lock_held",
+                return_value=live_qa_plan,
+            ),
+        ):
+            report = run_maintenance(args)
+
+        self.assertEqual(report["mode"], "backup-only")
+        self.assertTrue(report["backup"]["restore_verified"])
+        self.assertEqual(events, ["locks-enter", "locks-exit"])
+        run_backup.assert_called_once()
+        self.assertTrue(candidate.exists())
+        self.assertTrue(web_candidate.exists())
+        self.assertEqual(report["production_releases"]["deleted_count"], 0)
+        self.assertEqual(report["source_release_artifacts"]["deleted_count"], 0)
+        self.assertEqual(report["live_qa_runtime_caches"]["deleted_count"], 0)
 
     def test_disk_snapshot_uses_available_free_for_conservative_percent(self) -> None:
         snapshot = snapshot_from_usage(
@@ -339,6 +617,46 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             REPO_ROOT / "platform/tools/platform_release_install.sh"
         ).read_text()
         self.assertIn('chmod 0600 "$SHARED_ENV_FILE"', release_install)
+
+    def test_manual_backup_uses_lock_aware_backup_only_workflow(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-backup.yml"
+        ).read_text()
+        self.assertIn("platform_storage_maintenance.py", workflow)
+        self.assertIn("--backup-only", workflow)
+        self.assertIn("--backup-max-age-hours 24", workflow)
+        self.assertIn("--backup-keep 14", workflow)
+        self.assertIn("--apply", workflow)
+        self.assertNotIn("platform_backup_restore_drill.py", workflow)
+        self.assertNotIn("--check-latest", workflow)
+        self.assertIn('report.get("mode") != "backup-only"', workflow)
+        self.assertIn('backup.get("restore_verified") is not True', workflow)
+        self.assertIn('backup.get("checksum_present") is not True', workflow)
+
+        maintenance_source = (
+            REPO_ROOT / "platform/tools/platform_storage_maintenance.py"
+        ).read_text()
+        lock_scope_start = maintenance_source.index("def maintenance_lock_scope")
+        lock_scope = maintenance_source[lock_scope_start : maintenance_source.index(
+            "def _plan_and_maybe_apply", lock_scope_start
+        )]
+        self.assertLess(
+            lock_scope.index("release_operation_lock"),
+            lock_scope.index("exclusive_retained_load_lock"),
+        )
+        self.assertLess(
+            lock_scope.index("exclusive_retained_load_lock"),
+            lock_scope.index("source_release_lock"),
+        )
+        backup_only_start = maintenance_source.index(
+            "if getattr(args, \"backup_only\", False)"
+        )
+        backup_only = maintenance_source[backup_only_start : maintenance_source.index(
+            "else:", backup_only_start
+        )]
+        self.assertIn("run_backup(", backup_only)
+        self.assertIn("apply=False", backup_only)
+        self.assertNotIn("_plan_and_maybe_apply(", backup_only)
 
     def test_apply_lock_order_and_live_qa_report_are_rollback_safe(self) -> None:
         app_dir = self.root / "runtime" / "platform"

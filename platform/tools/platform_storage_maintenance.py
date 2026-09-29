@@ -126,6 +126,7 @@ def parse_args() -> argparse.Namespace:
         "--web-artifact-dir", type=Path, default=DEFAULT_WEB_ARTIFACT_DIR
     )
     parser.add_argument("--backup-keep", type=int, default=14)
+    parser.add_argument("--backup-max-age-hours", type=float, default=24.0)
     parser.add_argument("--release-keep", type=int, default=5)
     parser.add_argument("--test-artifact-max-age-days", type=int, default=7)
     parser.add_argument("--screenshot-max-age-days", type=int, default=30)
@@ -139,6 +140,14 @@ def parse_args() -> argparse.Namespace:
         "--maximum-used-percent", type=float, default=DEFAULT_MAX_USED_PERCENT
     )
     parser.add_argument("--skip-backup", action="store_true")
+    parser.add_argument(
+        "--backup-only",
+        action="store_true",
+        help=(
+            "Create and verify only the production backup under the canonical "
+            "release, retained-load, build and live-QA lock order."
+        ),
+    )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
@@ -154,6 +163,15 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must not be negative")
     if args.backup_keep < 1:
         parser.error("--backup-keep must be at least 1")
+    if (
+        not math.isfinite(args.backup_max_age_hours)
+        or args.backup_max_age_hours <= 0
+    ):
+        parser.error("--backup-max-age-hours must be finite and positive")
+    if args.backup_only and args.skip_backup:
+        parser.error("--backup-only cannot be combined with --skip-backup")
+    if args.backup_only and not args.apply:
+        parser.error("--backup-only requires --apply")
     if args.report_keep < 1:
         parser.error("--report-keep must be at least 1")
     if not 1 <= args.live_qa_runtime_keep <= 100:
@@ -415,10 +433,25 @@ def disk_snapshot(path: Path) -> dict[str, int | float]:
     return disk_snapshot_for_path(path).as_dict()
 
 
-def run_backup(app_dir: Path, *, keep: int) -> dict[str, Any]:
+def _run_backup_command(command: list[str]) -> dict[str, Any]:
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Platform backup returned invalid JSON output.") from exc
+    if completed.returncode != 0 or not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError("Platform backup failed.")
+    return result
+
+
+def run_backup(
+    app_dir: Path, *, keep: int, max_age_hours: float = 24.0
+) -> dict[str, Any]:
+    if not math.isfinite(max_age_hours) or max_age_hours <= 0:
+        raise ValueError("backup max age must be finite and positive")
     script = Path(__file__).with_name("platform_backup_restore_drill.py")
     shared_dir = app_dir / "shared"
-    command = [
+    create_command = [
         sys.executable,
         str(script),
         "--env-file",
@@ -429,13 +462,23 @@ def run_backup(app_dir: Path, *, keep: int) -> dict[str, Any]:
         str(keep),
         "--json",
     ]
-    completed = subprocess.run(command, check=False, capture_output=True, text=True)
-    try:
-        result = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Platform backup returned invalid JSON output.") from exc
-    if completed.returncode != 0 or not result.get("ok"):
-        raise RuntimeError("Platform backup failed.")
+    result = _run_backup_command(create_command)
+    check_result = _run_backup_command(
+        [
+            sys.executable,
+            str(script),
+            "--env-file",
+            str(shared_dir / ".env.platform"),
+            "--output-dir",
+            str(shared_dir / "backups"),
+            "--check-latest",
+            "--max-age-hours",
+            str(max_age_hours),
+            "--json",
+        ]
+    )
+    if result.get("restore_verified") is not True or check_result.get("restore_verified") is not True:
+        raise RuntimeError("Platform backup was not restore-verified.")
     return {
         "size_bytes": result.get("size_bytes")
         if isinstance(result.get("size_bytes"), int)
@@ -448,10 +491,17 @@ def run_backup(app_dir: Path, *, keep: int) -> dict[str, Any]:
         and result.get("duration_seconds") >= 0
         else None,
         "restore_verified": result.get("restore_verified") is True,
+        "alembic_revision_verified": result.get("alembic_revision_verified") is True,
+        "checksum_present": isinstance(result.get("sha256"), str),
         "restored_table_count": result.get("restored_table_count")
         if isinstance(result.get("restored_table_count"), int)
         and not isinstance(result.get("restored_table_count"), bool)
         and result.get("restored_table_count") >= 0
+        else None,
+        "age_hours": check_result.get("age_hours")
+        if isinstance(check_result.get("age_hours"), (int, float))
+        and not isinstance(check_result.get("age_hours"), bool)
+        and check_result.get("age_hours") >= 0
         else None,
         "removed_count": len(result.get("removed") or []),
     }
@@ -493,6 +543,20 @@ def source_release_lock(path: Path) -> Iterator[Path | None]:
         path, label="platform release build output"
     ) as resolved:
         yield resolved
+
+
+@contextmanager
+def maintenance_lock_scope(
+    args: argparse.Namespace, *, app_dir: Path
+) -> Iterator[Path | None]:
+    """Hold maintenance locks in the only supported global order."""
+
+    # Keep this order aligned with deploy/build/live-QA tooling:
+    # release -> retained-load -> build -> live-QA.
+    with release_operation_lock(app_dir):
+        with exclusive_retained_load_lock():
+            with source_release_lock(args.source_release_dir) as source_release_dir:
+                yield source_release_dir
 
 
 def _plan_and_maybe_apply(
@@ -550,7 +614,11 @@ def _plan_and_maybe_apply(
         if not args.skip_backup:
             backup = {
                 "status": "completed",
-                **run_backup(app_dir, keep=args.backup_keep),
+                **run_backup(
+                    app_dir,
+                    keep=args.backup_keep,
+                    max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
+                ),
             }
         apply_release_plan(production_plan, app_dir=app_dir)
         if source_release_dir is not None:
@@ -594,28 +662,59 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
         # build-output lock, then live-QA machine lock. Install/rollback take
         # only the first; deploy takes the first two; builds take only the
         # third; standalone live-QA retention takes first then the fourth.
-        with release_operation_lock(app_dir):
-            with exclusive_retained_load_lock():
-                with source_release_lock(
-                    args.source_release_dir
-                ) as source_release_dir:
-                    maintenance_result = _plan_and_maybe_apply(
+        with maintenance_lock_scope(args, app_dir=app_dir) as source_release_dir:
+            if getattr(args, "backup_only", False):
+                # Do not construct or apply any retention plan in this mode.
+                # A backup failure therefore exits before any deletion path.
+                maintenance_result = (
+                    RetentionPlan((), (), ()),
+                    ArtifactRetentionPlan((), (), ()),
+                    (),
+                    (),
+                    (),
+                    {
+                        "status": "completed",
+                        **run_backup(
+                            app_dir,
+                            keep=args.backup_keep,
+                            max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
+                        ),
+                    },
+                    {
+                        "failed_builds": 0,
+                        "browser_test_artifacts": 0,
+                        "preprod_screenshots": 0,
+                    },
+                )
+                live_qa_guard.prune_runtime_cache_release_lock_held(
+                    apply=False,
+                    keep=args.live_qa_runtime_keep,
+                    root=getattr(
                         args,
+                        "live_qa_runtime_root",
+                        live_qa_guard.RUNNER_CACHE_ROOT,
+                    ),
+                    app_dir=app_dir,
+                )
+                live_qa_plan = live_qa_guard.RuntimeCacheRetentionPlan((), (), (), ())
+            else:
+                maintenance_result = _plan_and_maybe_apply(
+                    args,
+                    app_dir=app_dir,
+                    source_release_dir=source_release_dir,
+                )
+                live_qa_plan = (
+                    live_qa_guard.prune_runtime_cache_release_lock_held(
+                        apply=True,
+                        keep=args.live_qa_runtime_keep,
+                        root=getattr(
+                            args,
+                            "live_qa_runtime_root",
+                            live_qa_guard.RUNNER_CACHE_ROOT,
+                        ),
                         app_dir=app_dir,
-                        source_release_dir=source_release_dir,
                     )
-                    live_qa_plan = (
-                        live_qa_guard.prune_runtime_cache_release_lock_held(
-                            apply=True,
-                            keep=args.live_qa_runtime_keep,
-                            root=getattr(
-                                args,
-                                "live_qa_runtime_root",
-                                live_qa_guard.RUNNER_CACHE_ROOT,
-                            ),
-                            app_dir=app_dir,
-                        )
-                    )
+                )
     else:
         source_release_dir = (
             args.source_release_dir if args.source_release_dir.exists() else None
@@ -658,7 +757,11 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
     completed_at = datetime.now(UTC)
     return {
         "ok": storage_ok,
-        "mode": "apply" if args.apply else "dry-run",
+        "mode": (
+            "backup-only"
+            if getattr(args, "backup_only", False)
+            else "apply" if args.apply else "dry-run"
+        ),
         "started_at_utc": started_at.isoformat().replace("+00:00", "Z"),
         "completed_at_utc": completed_at.isoformat().replace("+00:00", "Z"),
         "duration_seconds": round((completed_at - started_at).total_seconds(), 3),
@@ -686,6 +789,7 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
         "limits": {
             "minimum_free_bytes": minimum_free_bytes,
             "maximum_used_percent": args.maximum_used_percent,
+            "backup_max_age_hours": getattr(args, "backup_max_age_hours", 24.0),
             "live_qa_runtime_keep": args.live_qa_runtime_keep,
         },
     }

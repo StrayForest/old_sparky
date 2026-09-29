@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import hashlib
 import importlib.util
@@ -175,6 +176,71 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertFalse(failed_dump.exists())
             self.assertFalse(failed_metadata.exists())
             self.assertEqual(len(removed), 2)
+
+    def test_restore_failure_does_not_prune_existing_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            old_dump = output_dir / "platformdb-old.dump"
+            old_metadata = old_dump.with_suffix(".json")
+            old_dump.write_bytes(b"old-backup")
+            old_metadata.write_text(
+                json.dumps(
+                    {
+                        "dump_file": old_dump.name,
+                        "restore_verified": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                env_file=str(output_dir / ".env.platform"),
+                output_dir=str(output_dir),
+                keep=1,
+                admin_database_url=None,
+                dump_only=False,
+            )
+
+            def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                if command[0] == "pg_dump":
+                    dump_path = pathlib.Path(command[command.index("--file") + 1])
+                    dump_path.write_bytes(b"new-backup")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                if command[0] == "pg_restore":
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                raise RuntimeError("restore failed")
+
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    {
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
+                        )
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "load_env",
+                    return_value={
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
+                        )
+                    },
+                ),
+                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_command",
+                    side_effect=fake_run_command,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "restore verification failed"):
+                    backup_drill.create_backup(args)
+
+            self.assertTrue(old_dump.exists())
+            self.assertTrue(old_metadata.exists())
+            self.assertGreaterEqual(len(tuple(output_dir.glob("platformdb-*.dump"))), 2)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-09-11
+- Last reviewed: 2026-09-29
 
 ## Runtime checks
 
@@ -91,12 +91,11 @@ structured application records aligned with the
 The practical rule is to retain actionable, structured events and never log
 secrets, following the [AWS logging best practices](https://docs.aws.amazon.com/prescriptive-guidance/latest/logging-monitoring-for-application-owners/logging-best-practices.html).
 
-Apply mode holds locks in the fixed order: platform release operation, source
-build output, then live-QA machine lock. This keeps release pointers stable
-through deletion and avoids deadlocks with install, rollback, build and browser
-workflows. The systemd unit retains its single storage-maintenance command, so
-rolling `current` back never invokes a guard subcommand missing from that
-release.
+Apply mode holds locks in the fixed order: platform release operation,
+retained-load, source build output, then live-QA machine lock; this keeps
+release pointers stable through backup/deletion and avoids deadlocks with
+install, rollback, build, retained-load and browser workflows. Backup-only
+uses the same order but performs no retention deletion.
 
 Retention intentionally does not recompute each multi-gigabyte tree's content
 digest. Destructive eligibility instead requires the exact 40-hex name,
