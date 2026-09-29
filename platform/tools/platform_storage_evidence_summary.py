@@ -363,6 +363,8 @@ def summarize_backup(raw: str, *, phase: str) -> dict[str, object]:
 
 
 def _section_summary(section: Any) -> dict[str, object]:
+    """Project producer counts, retaining list lengths only for legacy output."""
+
     if not isinstance(section, dict):
         section = {}
 
@@ -386,7 +388,7 @@ def _section_summary(section: Any) -> dict[str, object]:
 
 
 def _live_qa_section_summary(section: Any) -> dict[str, object]:
-    """Project the live-QA producer's tombstone semantics without bytes."""
+    """Project live-QA producer counts and tombstones without fabricated bytes."""
 
     if not isinstance(section, dict):
         section = {}
