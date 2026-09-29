@@ -52,8 +52,31 @@ RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 UTC_STATUS_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
+GITHUB_RUN_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$"
+)
 STATUS_MAX_AGE = timedelta(days=30)
 STATUS_MAX_FUTURE_SKEW = timedelta(0)
+
+# GitHub currently exposes these lifecycle values for workflow runs.  Keep the
+# accepted set closed: a new/unknown API value must not be treated as pending
+# or successful until this source contract is reviewed.
+DEPLOYMENT_PENDING_STATUSES = frozenset(
+    {"queued", "requested", "waiting", "pending", "in_progress"}
+)
+DEPLOYMENT_TERMINAL_CONCLUSIONS = frozenset(
+    {
+        "action_required",
+        "cancelled",
+        "failure",
+        "neutral",
+        "skipped",
+        "stale",
+        "startup_failure",
+        "timed_out",
+        "success",
+    }
+)
 
 
 class ProvenanceError(ValueError):
@@ -203,7 +226,7 @@ def canonical_attempt_url(
     return f"{base}/attempts/{expected_attempt}"
 
 
-def validate_workflow_run(
+def validate_workflow_run_identity(
     workflow: Mapping[str, Any],
     run: Mapping[str, Any],
     *,
@@ -216,7 +239,13 @@ def validate_workflow_run(
     expected_name: str,
     server_url: str = GITHUB_SERVER_URL,
 ) -> str:
-    """Validate workflow metadata and return its exact attempt URL."""
+    """Validate immutable workflow identity and return its attempt URL.
+
+    This deliberately does not inspect ``status`` or ``conclusion``.  The
+    auto-deploy dispatcher uses it while a downstream run is still queued or
+    in progress; terminal state is classified separately by
+    :func:`classify_deployment_run`.
+    """
 
     workflow_id = _positive_int(workflow.get("id"), "workflow id")
     if workflow.get("path") != expected_path:
@@ -245,8 +274,6 @@ def validate_workflow_run(
         "event": expected_event,
         "head_branch": expected_branch,
         "head_sha": expected_target_sha,
-        "status": "completed",
-        "conclusion": "success",
     }
     for field, value in expected.items():
         if run.get(field) != value:
@@ -256,6 +283,239 @@ def validate_workflow_run(
         expected_run_id=expected_run_id,
         expected_attempt=expected_attempt,
         server_url=server_url,
+    )
+
+
+def validate_workflow_run(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    expected_event: str,
+    expected_branch: str,
+    expected_path: str,
+    expected_name: str,
+    server_url: str = GITHUB_SERVER_URL,
+) -> str:
+    """Validate workflow metadata and a completed successful run."""
+
+    attempt_url = validate_workflow_run_identity(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=expected_target_sha,
+        expected_event=expected_event,
+        expected_branch=expected_branch,
+        expected_path=expected_path,
+        expected_name=expected_name,
+        server_url=server_url,
+    )
+    expected = {"status": "completed", "conclusion": "success"}
+    for field, value in expected.items():
+        if run.get(field) != value:
+            raise _fail(f"run {field} is not the expected value")
+    return attempt_url
+
+
+def classify_deployment_run(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    server_url: str = GITHUB_SERVER_URL,
+) -> str:
+    """Classify one exact production-deploy run without guessing its state.
+
+    The return value is one of ``pending``, ``success`` or
+    ``terminal:<conclusion>``.  Unknown status/conclusion values and every
+    identity mismatch raise :class:`ProvenanceError`, so a caller cannot turn
+    an API schema change, rerun or wrong workflow into a green dispatch.
+    """
+
+    validate_workflow_run_identity(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=expected_target_sha,
+        expected_event="workflow_dispatch",
+        expected_branch="dev",
+        expected_path=DEPLOY_WORKFLOW_PATH,
+        expected_name=DEPLOY_WORKFLOW_NAME,
+        server_url=server_url,
+    )
+    status = run.get("status")
+    conclusion = run.get("conclusion")
+    if not isinstance(status, str):
+        raise _fail("deployment run status is unknown")
+    if status in DEPLOYMENT_PENDING_STATUSES:
+        if conclusion is not None:
+            raise _fail("pending deployment run has a terminal conclusion")
+        return "pending"
+    if status != "completed":
+        raise _fail("deployment run status is unknown")
+    if (
+        not isinstance(conclusion, str)
+        or conclusion not in DEPLOYMENT_TERMINAL_CONCLUSIONS
+    ):
+        raise _fail("deployment run conclusion is unknown")
+    if conclusion == "success":
+        return "success"
+    return f"terminal:{conclusion}"
+
+
+def _parse_run_timestamp(value: object, field: str) -> datetime:
+    """Parse the bounded timestamp used to separate pre/post-dispatch runs."""
+
+    if not isinstance(value, str) or GITHUB_RUN_TIMESTAMP_RE.fullmatch(value) is None:
+        raise _fail(f"{field} is malformed")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise _fail(f"{field} is not a valid UTC instant") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise _fail(f"{field} is not timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def deployment_run_rows(
+    payload: object,
+    *,
+    expected_target_sha: str,
+    expected_workflow_id: int,
+) -> list[Mapping[str, Any]]:
+    """Validate a complete bounded workflow-run listing response.
+
+    GitHub's workflow-run listing is only a discovery hint.  Every row is
+    checked for the exact dispatch identity before a caller can compare it to
+    a pre-dispatch snapshot.  The selected run is still fetched by ID and
+    passed through :func:`classify_deployment_run`.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise _fail("deployment run listing is malformed")
+    total_count = payload.get("total_count")
+    rows = payload.get("workflow_runs")
+    if (
+        isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or total_count < 0
+        or total_count > 100_000
+        or not isinstance(rows, list)
+        or len(rows) > 100
+        or len(rows) > total_count
+    ):
+        raise _fail("deployment run listing count is malformed")
+    if (
+        not isinstance(expected_target_sha, str)
+        or SHA_RE.fullmatch(expected_target_sha) is None
+    ):
+        raise _fail("target SHA is not canonical")
+    _run_id(expected_workflow_id, "expected workflow id")
+    seen_ids: set[int] = set()
+    validated: list[Mapping[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise _fail("deployment run row is malformed")
+        run_id = _run_id(row.get("id"), "deployment run id")
+        if run_id in seen_ids:
+            raise _fail("deployment run row id is ambiguous")
+        seen_ids.add(run_id)
+        attempt = _run_id(row.get("run_attempt"), "deployment run attempt")
+        if (
+            type(row.get("workflow_id")) is not int
+            or row.get("workflow_id") != expected_workflow_id
+        ):
+            raise _fail("deployment run workflow is not canonical")
+        if row.get("name") != DEPLOY_WORKFLOW_NAME:
+            raise _fail("deployment run name is not canonical")
+        path = row.get("path")
+        if (
+            not isinstance(path, str)
+            or not path.startswith(f"{DEPLOY_WORKFLOW_PATH}@")
+        ):
+            raise _fail("deployment run path is not canonical")
+        if row.get("event") != "workflow_dispatch":
+            raise _fail("deployment run event is not canonical")
+        if row.get("head_branch") != "dev":
+            raise _fail("deployment run branch is not canonical")
+        if row.get("head_sha") != expected_target_sha:
+            raise _fail("deployment run SHA is not canonical")
+        validate_repository_identity(row)
+        status = row.get("status")
+        conclusion = row.get("conclusion")
+        if (
+            not isinstance(status, str)
+            or status not in DEPLOYMENT_PENDING_STATUSES
+            and status != "completed"
+        ):
+            raise _fail("deployment run status is unknown")
+        if status == "completed":
+            if (
+                not isinstance(conclusion, str)
+                or conclusion not in DEPLOYMENT_TERMINAL_CONCLUSIONS
+            ):
+                raise _fail("deployment run conclusion is unknown")
+        elif conclusion is not None:
+            raise _fail("pending deployment run has a terminal conclusion")
+        _parse_run_timestamp(row.get("created_at"), "deployment run created_at")
+        # Keep the explicit local reads above: they make malformed values fail
+        # closed even when a caller only needs the identity tuple.
+        _ = attempt
+        validated.append(row)
+    return validated
+
+
+def select_new_deployment_run(
+    payload: object,
+    *,
+    prior_run_ids: Sequence[int] | set[int],
+    dispatch_started_at: datetime,
+    expected_target_sha: str,
+    expected_workflow_id: int,
+) -> tuple[int, int] | None:
+    """Select exactly one run created after the one-time dispatch boundary.
+
+    ``None`` means the GitHub list has not observed the dispatch yet.  More
+    than one new exact run is an ambiguity (for example, an operator started a
+    manual run concurrently), never a reason to choose the newest row.
+    """
+
+    if (
+        not isinstance(dispatch_started_at, datetime)
+        or dispatch_started_at.tzinfo is None
+        or dispatch_started_at.utcoffset() is None
+    ):
+        raise _fail("dispatch timestamp is not timezone-aware")
+    dispatch_started_at = dispatch_started_at.astimezone(timezone.utc)
+    prior: set[int] = set()
+    for value in prior_run_ids:
+        prior.add(_run_id(value, "prior deployment run id"))
+    rows = deployment_run_rows(
+        payload,
+        expected_target_sha=expected_target_sha,
+        expected_workflow_id=expected_workflow_id,
+    )
+    candidates = [
+        row
+        for row in rows
+        if _run_id(row.get("id"), "deployment run id") not in prior
+        and _parse_run_timestamp(row.get("created_at"), "deployment run created_at")
+        >= dispatch_started_at
+    ]
+    if len(candidates) > 1:
+        raise _fail("new downstream deployment run is ambiguous")
+    if not candidates:
+        return None
+    selected = candidates[0]
+    return (
+        _run_id(selected.get("id"), "deployment run id"),
+        _run_id(selected.get("run_attempt"), "deployment run attempt"),
     )
 
 

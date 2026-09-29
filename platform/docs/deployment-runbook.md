@@ -52,7 +52,19 @@ to `dev`. The chain is:
    reports `platform-production-deploy=success` only when the matching
    successful deploy attempt has its exact bot-authored marker.
 4. When those checks pass, the auto-deploy workflow dispatches
-   `Platform production deploy` with `mode=deploy` on `dev`.
+   `Platform production deploy` with `mode=deploy` on `dev`. The dispatch step
+   snapshots exact-SHA `workflow_dispatch` runs before the POST and then polls
+   the bounded workflow-run listing until one and only one new run appears.
+   It re-reads that run by ID and attempt, requiring the canonical repository,
+   workflow, event, branch and SHA. A pre-existing run, a manual concurrent
+   run, a changed attempt, an API/rate-limit error, an ambiguous candidate or
+   a run that remains invisible past the hard poll deadline fails the
+   auto-deploy workflow; it never silently retries or reruns the deployment.
+   Only a terminal `success` conclusion completes auto-deploy. `failure`,
+   `cancelled`, `timed_out`, `action_required`, `stale` and every other
+   non-success terminal conclusion fail it. A valid non-deployable classifier
+   route remains the successful no-op described above and does not enter this
+   polling step.
 5. A secret-free prerequisite independently downloads and validates the exact
    classifier artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately

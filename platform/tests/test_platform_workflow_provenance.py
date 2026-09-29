@@ -17,8 +17,11 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     DEPLOY_STATUS_CONTEXT,
     ProvenanceError,
     _payload_rows,
+    classify_deployment_run,
+    deployment_run_rows,
     deployment_snapshot_digest,
     latest_context_status,
+    select_new_deployment_run,
     validate_deployment_event,
     validate_deployment_marker,
 )
@@ -40,6 +43,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             "id": run_id,
             "workflow_id": 77,
             "name": DEPLOY_WORKFLOW_NAME,
+            "path": f"{DEPLOY_WORKFLOW_PATH}@dev",
             "run_attempt": attempt,
             "event": "workflow_dispatch",
             "head_branch": "dev",
@@ -78,6 +82,54 @@ class WorkflowProvenanceTests(unittest.TestCase):
         ]
         return workflow, run, jobs, statuses
 
+    def _listing_row(
+        self,
+        *,
+        run_id: int = 1234,
+        attempt: int = 1,
+        created_at: str = "2026-09-19T10:00:01Z",
+        status: str = "queued",
+        conclusion: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "id": run_id,
+            "workflow_id": 77,
+            "name": DEPLOY_WORKFLOW_NAME,
+            "path": f"{DEPLOY_WORKFLOW_PATH}@dev",
+            "run_attempt": attempt,
+            "event": "workflow_dispatch",
+            "head_branch": "dev",
+            "head_sha": self.SHA,
+            "status": status,
+            "conclusion": conclusion,
+            "created_at": created_at,
+            "repository": {
+                "full_name": "StrayForest/old_sparky",
+                "name": "old_sparky",
+                "owner": {"login": "StrayForest"},
+            },
+        }
+
+    def _downstream_run(
+        self,
+        *,
+        status: str = "queued",
+        conclusion: str | None = None,
+        run_id: int = 1234,
+        attempt: int = 1,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        workflow, run, _jobs, _statuses = self._payload()
+        run = copy.deepcopy(run)
+        run.update(
+            {
+                "id": run_id,
+                "run_attempt": attempt,
+                "status": status,
+                "conclusion": conclusion,
+            }
+        )
+        return workflow, run
+
     def test_exact_deploy_attempt_is_accepted(self) -> None:
         workflow, run, jobs, statuses = self._payload()
         self.assertEqual(
@@ -104,6 +156,219 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_target_sha=self.SHA,
                 expected_run_url=f"{run['html_url']}/wrong",
             )
+
+    def test_downstream_run_discovery_handles_visibility_race_and_exact_snapshot(self) -> None:
+        dispatch_at = datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc)
+        empty = {"total_count": 0, "workflow_runs": []}
+        self.assertIsNone(
+            select_new_deployment_run(
+                empty,
+                prior_run_ids=set(),
+                dispatch_started_at=dispatch_at,
+                expected_target_sha=self.SHA,
+                expected_workflow_id=77,
+            )
+        )
+        visible = {
+            "total_count": 1,
+            "workflow_runs": [self._listing_row()],
+        }
+        self.assertEqual(
+            select_new_deployment_run(
+                visible,
+                prior_run_ids=set(),
+                dispatch_started_at=dispatch_at,
+                expected_target_sha=self.SHA,
+                expected_workflow_id=77,
+            ),
+            (1234, 1),
+        )
+        # A run in the pre-dispatch snapshot is not selected again, even when
+        # it is a manual concurrent run on the same SHA.
+        self.assertIsNone(
+            select_new_deployment_run(
+                visible,
+                prior_run_ids={1234},
+                dispatch_started_at=dispatch_at,
+                expected_target_sha=self.SHA,
+                expected_workflow_id=77,
+            )
+        )
+
+    def test_downstream_run_discovery_rejects_duplicate_or_stale_candidates(self) -> None:
+        dispatch_at = datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc)
+        duplicate = {
+            "total_count": 2,
+            "workflow_runs": [
+                self._listing_row(run_id=1234),
+                self._listing_row(run_id=1235, created_at="2026-09-19T10:00:02Z"),
+            ],
+        }
+        with self.assertRaisesRegex(ProvenanceError, "ambiguous"):
+            select_new_deployment_run(
+                duplicate,
+                prior_run_ids=set(),
+                dispatch_started_at=dispatch_at,
+                expected_target_sha=self.SHA,
+                expected_workflow_id=77,
+            )
+        before_dispatch = {
+            "total_count": 1,
+            "workflow_runs": [
+                self._listing_row(created_at="2026-09-19T09:59:59Z")
+            ],
+        }
+        self.assertIsNone(
+            select_new_deployment_run(
+                before_dispatch,
+                prior_run_ids=set(),
+                dispatch_started_at=dispatch_at,
+                expected_target_sha=self.SHA,
+                expected_workflow_id=77,
+            )
+        )
+
+    def test_downstream_listing_rejects_wrong_sha_event_workflow_repository_and_api_shape(self) -> None:
+        dispatch_at = datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc)
+        mutations = {
+            "sha": {"head_sha": "b" * 40},
+            "event": {"event": "push"},
+            "branch": {"head_branch": "main"},
+            "workflow": {"workflow_id": 78},
+            "name": {"name": "Other workflow"},
+            "path": {"path": ".github/workflows/other.yml@dev"},
+            "repository": {"repository": {"full_name": "attacker/repo"}},
+            "rate-limit-shaped": {"message": "API rate limit exceeded"},
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                row = self._listing_row()
+                row.update(mutation)
+                payload = (
+                    mutation
+                    if label == "rate-limit-shaped"
+                    else {"total_count": 1, "workflow_runs": [row]}
+                )
+                with self.assertRaises(ProvenanceError):
+                    select_new_deployment_run(
+                        payload,
+                        prior_run_ids=set(),
+                        dispatch_started_at=dispatch_at,
+                        expected_target_sha=self.SHA,
+                        expected_workflow_id=77,
+                    )
+        with self.assertRaises(ProvenanceError):
+            deployment_run_rows(
+                {"total_count": 1, "workflow_runs": None},
+                expected_target_sha=self.SHA,
+                expected_workflow_id=77,
+            )
+        with self.assertRaises(ProvenanceError):
+            deployment_run_rows(
+                {"total_count": True, "workflow_runs": [self._listing_row()]},
+                expected_target_sha=self.SHA,
+                expected_workflow_id=77,
+            )
+
+    def test_downstream_terminal_conclusions_and_attempt_mutations_fail_closed(self) -> None:
+        workflow, run = self._downstream_run(status="in_progress")
+        for status in ("queued", "requested", "waiting", "pending", "in_progress"):
+            with self.subTest(status=status):
+                candidate = copy.deepcopy(run)
+                candidate["status"] = status
+                candidate["conclusion"] = None
+                self.assertEqual(
+                    classify_deployment_run(
+                        workflow,
+                        candidate,
+                        expected_run_id=1234,
+                        expected_attempt=1,
+                        expected_target_sha=self.SHA,
+                    ),
+                    "pending",
+                )
+        for conclusion in (
+            "failure",
+            "cancelled",
+            "timed_out",
+            "action_required",
+            "stale",
+            "neutral",
+            "skipped",
+            "startup_failure",
+        ):
+            with self.subTest(conclusion=conclusion):
+                candidate = copy.deepcopy(run)
+                candidate["status"] = "completed"
+                candidate["conclusion"] = conclusion
+                self.assertEqual(
+                    classify_deployment_run(
+                        workflow,
+                        candidate,
+                        expected_run_id=1234,
+                        expected_attempt=1,
+                        expected_target_sha=self.SHA,
+                    ),
+                    f"terminal:{conclusion}",
+                )
+        successful = copy.deepcopy(run)
+        successful["status"] = "completed"
+        successful["conclusion"] = "success"
+        self.assertEqual(
+            classify_deployment_run(
+                workflow,
+                successful,
+                expected_run_id=1234,
+                expected_attempt=1,
+                expected_target_sha=self.SHA,
+            ),
+            "success",
+        )
+        for mutation in (
+            {"run_attempt": 2},
+            {"workflow_id": 77.0},
+            {"status": "completed", "conclusion": "mystery"},
+            {"status": []},
+            {"status": "unknown", "conclusion": None},
+            {"status": "in_progress", "conclusion": "cancelled"},
+        ):
+            with self.subTest(mutation=mutation):
+                candidate = copy.deepcopy(run)
+                candidate.update(mutation)
+                with self.assertRaises(ProvenanceError):
+                    classify_deployment_run(
+                        workflow,
+                        candidate,
+                        expected_run_id=1234,
+                        expected_attempt=1,
+                        expected_target_sha=self.SHA,
+                    )
+
+    def test_auto_deploy_downstream_contract_is_bounded_and_no_retry(self) -> None:
+        source = (WORKFLOW_DIR / "platform-production-autodeploy.yml").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            'DOWNSTREAM_MAX_POLLS: "60"',
+            'DOWNSTREAM_POLL_SECONDS: "10"',
+            'DOWNSTREAM_TIMEOUT_SECONDS: "600"',
+            "for ((poll=1; poll<=DOWNSTREAM_MAX_POLLS; poll++))",
+            '--connect-timeout 10 --max-time "$max_time" --max-filesize 4194304',
+            "select_new_deployment_run",
+            "classify_deployment_run",
+            "result=timeout",
+            "result=ambiguous",
+            "no rerun is attempted",
+            "terminal:cancelled",
+            "terminal:timed_out",
+            "terminal:action_required",
+            "terminal:stale",
+            "steps.downstream.outputs.result",
+        ):
+            self.assertIn(marker, source)
+        self.assertNotIn("--retry", source)
+        self.assertIn("if: ${{ steps.gate.outputs.deploy == 'true' }}", source)
+        self.assertIn('echo "deploy=false" >> "$GITHUB_OUTPUT"', source)
 
     def test_old_attempt_cannot_authorize_mutation(self) -> None:
         workflow, run, jobs, statuses = self._payload()

@@ -566,7 +566,7 @@ jobs:
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml" \
             --output "$deployment_dir/workflow.json"
           fetch_deployment_runs() {
-            local output_path="$1" page=1 count page_path
+            local output_path="$1" page=1 count page_path total_count
             local pages_dir="$deployment_dir/run-pages"
             install -d -m 700 "$pages_dir"
             while :; do
@@ -599,7 +599,8 @@ jobs:
           print(len(rows))
           PY
               )"
-              if (( count < 100 )); then
+              total_count="$(<"$pages_dir/total")"
+              if (( count < 100 || page * 100 >= total_count )); then
                 break
               fi
               ((page += 1))
@@ -764,37 +765,192 @@ jobs:
           echo "deploy=true" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch production deployment
+        id: downstream
         if: ${{ steps.gate.outputs.deploy == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          DOWNSTREAM_MAX_POLLS: "60"
+          DOWNSTREAM_POLL_SECONDS: "10"
+          DOWNSTREAM_TIMEOUT_SECONDS: "600"
         run: |
           set -euo pipefail
 
-          branch_json="$(
-            curl --fail-with-body --silent --show-error \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev"
-          )"
-          dev_sha="$(
-            printf '%s' "$branch_json" | /usr/bin/python3 -c '
+          # The exact-SHA run is dispatched once, then correlated by the
+          # canonical dependency-free provenance helper below.
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          downstream_dir="$(mktemp -d "$RUNNER_TEMP/platform-downstream-deploy.XXXXXX")"
+          trap 'rm -rf -- "$downstream_dir"' EXIT
+          api_get() {
+            local url="$1" output_path="$2" max_time="${3:-30}"
+            curl --fail --silent --show-error \
+              --connect-timeout 10 --max-time "$max_time" --max-filesize 4194304 \
+              "${api_headers[@]}" "$url" --output "$output_path"
+          }
+
+          api_get \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml" \
+            "$downstream_dir/workflow.json"
+          workflow_id="$(/usr/bin/python3 - "$downstream_dir/workflow.json" <<'PY'
           import json
+          from pathlib import Path
           import sys
-          print(json.load(sys.stdin)["commit"]["sha"])
-          '
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              not isinstance(payload, dict)
+              or type(payload.get("id")) is not int
+              or payload["id"] <= 0
+              or payload.get("path") != ".github/workflows/platform-production-deploy.yml"
+              or payload.get("name") != "Platform production deploy"
+          ):
+              raise SystemExit("downstream workflow identity rejected")
+          print(payload["id"])
+          PY
+          )"
+
+          fetch_deployment_runs() {
+            local output_path="$1" deadline_epoch="${2:-}" page=1 count page_path total_count
+            local pages_dir="$output_path.pages"
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              request_timeout=30
+              if [[ -n "$deadline_epoch" ]]; then
+                now_epoch="$(date +%s)"
+                remaining="$((deadline_epoch - now_epoch))"
+                (( remaining > 0 )) || {
+                  echo "Downstream production deployment hard timeout reached during API polling." >&2
+                  return 1
+                }
+                (( remaining < request_timeout )) && request_timeout="$remaining"
+              fi
+              api_get \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/runs?event=workflow_dispatch&branch=dev&head_sha=${TARGET_SHA}&per_page=100&page=${page}" \
+                "$page_path" "$request_timeout"
+              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              not isinstance(payload, dict)
+              or isinstance(payload.get("total_count"), bool)
+              or type(payload.get("total_count")) is not int
+              or not 0 <= payload["total_count"] <= 100000
+          ):
+              raise SystemExit("downstream run pagination count rejected")
+          rows = payload.get("workflow_runs")
+          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("downstream run pagination rows rejected")
+          marker = Path(sys.argv[2])
+          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
+              raise SystemExit("downstream run total changed during pagination")
+          marker.write_text(str(payload["total_count"]), encoding="ascii")
+          print(len(rows))
+          PY
+              )"
+              total_count="$(<"$pages_dir/total")"
+              if (( count < 100 || page * 100 >= total_count )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 10 )) || {
+                echo "downstream run pagination exceeded its bound" >&2
+                return 1
+              }
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path = map(Path, sys.argv[1:])
+          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
+          rows = []
+          seen = set()
+          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              page_rows = payload.get("workflow_runs") if isinstance(payload, dict) else None
+              if not isinstance(page_rows, list):
+                  raise SystemExit("downstream run page rows rejected")
+              for row in page_rows:
+                  run_id = row.get("id") if isinstance(row, dict) else None
+                  if type(run_id) is not int or run_id <= 0 or run_id in seen:
+                      raise SystemExit("downstream run IDs are duplicate or malformed")
+                  seen.add(run_id)
+                  rows.append(row)
+          if len(rows) != expected_total:
+              raise SystemExit("downstream run pagination is incomplete")
+          Path(output_path).write_text(
+              json.dumps({"total_count": expected_total, "workflow_runs": rows}, sort_keys=True, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+          }
+
+          fetch_deployment_runs "$downstream_dir/runs-before.json"
+          /usr/bin/python3 - "$downstream_dir/runs-before.json" "$workflow_id" "$TARGET_SHA" "$downstream_dir/prior-run-ids" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, "platform/tools")
+          from platform_workflow_provenance import deployment_run_rows
+
+          payload_path, workflow_id, target_sha, output_path = sys.argv[1:]
+          try:
+              rows = deployment_run_rows(
+                  json.loads(Path(payload_path).read_text(encoding="utf-8")),
+                  expected_target_sha=target_sha,
+                  expected_workflow_id=int(workflow_id),
+              )
+          except Exception as exc:
+              raise SystemExit("downstream run provenance rejected") from exc
+          Path(output_path).write_text(
+              "".join(f"{row['id']}\n" for row in rows),
+              encoding="ascii",
+          )
+          PY
+          if [[ -s "$downstream_dir/prior-run-ids" ]]; then
+            echo "An exact-SHA production deploy run already exists; refusing a duplicate dispatch." >&2
+            echo "result=existing-run" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          branch_json="$downstream_dir/branch.json"
+          api_get \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev" \
+            "$branch_json"
+          dev_sha="$(/usr/bin/python3 - "$branch_json" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          sha = payload.get("commit", {}).get("sha") if isinstance(payload, dict) else None
+          if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("dev branch identity rejected")
+          print(sha)
+          PY
           )"
           test "$dev_sha" = "$TARGET_SHA" || {
-            echo "Refusing stale dispatch: dev moved from $TARGET_SHA to $dev_sha." >&2
+            echo "Refusing stale dispatch: dev moved from $TARGET_SHA." >&2
+            echo "result=stale" >> "$GITHUB_OUTPUT"
             exit 1
           }
 
-          curl --fail-with-body --silent --show-error \
+          dispatch_started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
             --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches" \
             --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" <<'PY'
           import json
@@ -814,11 +970,138 @@ jobs:
           PY
             )"
 
+          selected_id=""
+          selected_attempt=""
+          deadline_epoch="$(( $(date +%s) + DOWNSTREAM_TIMEOUT_SECONDS ))"
+          for ((poll=1; poll<=DOWNSTREAM_MAX_POLLS; poll++)); do
+            now_epoch="$(date +%s)"
+            if (( now_epoch >= deadline_epoch )); then
+              echo "Downstream production deployment did not become terminal before the hard timeout." >&2
+              echo "result=timeout" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            runs_path="$downstream_dir/runs-${poll}.json"
+            fetch_deployment_runs "$runs_path" "$deadline_epoch"
+            candidate="$(/usr/bin/python3 - "$runs_path" "$downstream_dir/prior-run-ids" "$workflow_id" "$TARGET_SHA" "$dispatch_started_at" <<'PY'
+          import json
+          import datetime
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, "platform/tools")
+          from platform_workflow_provenance import select_new_deployment_run
+
+          runs_path, prior_path, workflow_id, target_sha, started_at = sys.argv[1:]
+          try:
+              prior_ids = {
+                  int(line)
+                  for line in Path(prior_path).read_text(encoding="ascii").splitlines()
+                  if line
+              }
+              parsed_started_at = datetime.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+              selected = select_new_deployment_run(
+                  json.loads(Path(runs_path).read_text(encoding="utf-8")),
+                  prior_run_ids=prior_ids,
+                  dispatch_started_at=parsed_started_at,
+                  expected_target_sha=target_sha,
+                  expected_workflow_id=int(workflow_id),
+              )
+          except Exception as exc:
+              raise SystemExit("downstream run correlation rejected") from exc
+          if selected is not None:
+              print(f"{selected[0]}\t{selected[1]}")
+          PY
+            )"
+            if [[ -n "$candidate" ]]; then
+              IFS=$'\t' read -r candidate_id candidate_attempt <<< "$candidate"
+              if [[ -z "$selected_id" ]]; then
+                selected_id="$candidate_id"
+                selected_attempt="$candidate_attempt"
+              elif [[ "$candidate_id" != "$selected_id" || "$candidate_attempt" != "$selected_attempt" ]]; then
+                echo "Downstream production deployment identity changed during polling." >&2
+                echo "result=ambiguous" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+              run_path="$downstream_dir/run-${selected_id}-${selected_attempt}.json"
+              remaining="$((deadline_epoch - $(date +%s)))"
+              (( remaining > 0 )) || {
+                echo "Downstream production deployment hard timeout reached before run read." >&2
+                echo "result=timeout" >> "$GITHUB_OUTPUT"
+                exit 1
+              }
+              request_timeout=30
+              (( remaining < request_timeout )) && request_timeout="$remaining"
+              api_get \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${selected_id}" \
+                "$run_path" "$request_timeout"
+              state="$(/usr/bin/python3 - "$downstream_dir/workflow.json" "$run_path" "$selected_id" "$selected_attempt" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, "platform/tools")
+          from platform_workflow_provenance import classify_deployment_run
+
+          workflow_path, run_path, run_id, attempt, target_sha = sys.argv[1:]
+          try:
+              workflow = json.loads(Path(workflow_path).read_text(encoding="utf-8"))
+              run = json.loads(Path(run_path).read_text(encoding="utf-8"))
+              state = classify_deployment_run(
+                  workflow,
+                  run,
+                  expected_run_id=int(run_id),
+                  expected_attempt=int(attempt),
+                  expected_target_sha=target_sha,
+              )
+          except Exception as exc:
+              raise SystemExit("downstream run provenance rejected") from exc
+          print(state)
+          PY
+              )"
+              case "$state" in
+                pending)
+                  ;;
+                success)
+                  echo "result=success" >> "$GITHUB_OUTPUT"
+                  echo "downstream_run_id=$selected_id" >> "$GITHUB_OUTPUT"
+                  echo "downstream_run_attempt=$selected_attempt" >> "$GITHUB_OUTPUT"
+                  echo "downstream_run_url=https://github.com/StrayForest/old_sparky/actions/runs/$selected_id/attempts/$selected_attempt" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+                terminal:action_required|terminal:cancelled|terminal:failure|terminal:neutral|terminal:skipped|terminal:stale|terminal:startup_failure|terminal:timed_out)
+                  conclusion="${state#terminal:}"
+                  echo "Downstream production deployment ended with conclusion $conclusion; no rerun is attempted." >&2
+                  echo "result=$conclusion" >> "$GITHUB_OUTPUT"
+                  echo "downstream_run_id=$selected_id" >> "$GITHUB_OUTPUT"
+                  echo "downstream_run_attempt=$selected_attempt" >> "$GITHUB_OUTPUT"
+                  exit 1
+                  ;;
+                *)
+                  echo "Downstream production deployment returned an unrecognized state." >&2
+                  echo "result=invalid" >> "$GITHUB_OUTPUT"
+                  exit 1
+                  ;;
+              esac
+            fi
+            now_epoch="$(date +%s)"
+            if (( poll < DOWNSTREAM_MAX_POLLS && now_epoch < deadline_epoch )); then
+              remaining="$((deadline_epoch - now_epoch))"
+              sleep_for="$DOWNSTREAM_POLL_SECONDS"
+              (( sleep_for > remaining )) && sleep_for="$remaining"
+              sleep "$sleep_for"
+            fi
+          done
+          echo "Downstream production deployment did not become visible and terminal within the bounded poll window." >&2
+          echo "result=timeout" >> "$GITHUB_OUTPUT"
+          exit 1
+
       - name: Auto-deploy summary
         if: ${{ always() }}
         shell: bash
         env:
           SHOULD_DEPLOY: ${{ steps.gate.outputs.deploy }}
+          DOWNSTREAM_RESULT: ${{ steps.downstream.outputs.result }}
+          DOWNSTREAM_RUN_URL: ${{ steps.downstream.outputs.downstream_run_url }}
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_REASON: ${{ steps.route.outputs.route_reason }}
@@ -829,9 +1112,14 @@ jobs:
             echo "- Tested commit: \`$TARGET_SHA\`"
             echo "- Security/build run: $SOURCE_RUN_URL"
             echo "- Classifier route: \`$ROUTE_CLASS\` ($ROUTE_REASON)"
-            if [[ "$SHOULD_DEPLOY" == "true" ]]; then
-              echo "- Result: production deployment dispatched"
-            else
+            if [[ "$SHOULD_DEPLOY" != "true" ]]; then
               echo "- Result: no deployment required"
+            elif [[ "$DOWNSTREAM_RESULT" == "success" ]]; then
+              echo "- Result: production deployment completed successfully"
+              echo "- Production deploy run: $DOWNSTREAM_RUN_URL"
+            elif [[ -n "$DOWNSTREAM_RESULT" ]]; then
+              echo "- Result: downstream production deployment failed (`$DOWNSTREAM_RESULT`)"
+            else
+              echo "- Result: downstream production deployment did not complete"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
