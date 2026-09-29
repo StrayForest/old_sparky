@@ -1842,11 +1842,6 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             workflow.index("- name: Upload storage diagnostic evidence"),
         )
         self.assertIn('rmdir -- "$projector_dir"', workflow)
-
-    def test_storage_diagnostics_upload_is_gated_after_private_cleanup(self) -> None:
-        workflow = (
-            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
-        ).read_text(encoding="utf-8")
         sanitize_start = workflow.index(
             "- name: Sanitize storage diagnostic evidence"
         )
@@ -1870,13 +1865,6 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         sanitize = workflow[sanitize_start:cleanup_start]
         self.assertIn("projector_status=1", sanitize)
         self.assertIn("exit 1", sanitize)
-
-    def test_storage_diagnostics_lock_probe_preserves_lock_metadata(self) -> None:
-        if os.geteuid() != 0:
-            self.skipTest("the production lock contract requires a root-owned file")
-        workflow = (
-            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
-        ).read_text(encoding="utf-8")
         probe_start = workflow.index(
             "          import errno", workflow.index("lock_state=")
         )

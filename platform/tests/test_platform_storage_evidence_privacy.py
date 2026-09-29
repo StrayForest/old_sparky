@@ -517,7 +517,6 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(report["categories"]["production_releases"]["reclaimable_bytes"], 8192)
         self.assertEqual(report["transient_reclaimable_bytes"]["failed_builds"], 1024)
 
-    def test_retention_summary_accepts_actual_maintenance_json_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             app_dir = root / "app"
@@ -602,7 +601,6 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
                 projected["categories"]["live_qa_runtime"],
             )
 
-    def test_live_qa_retention_missing_tombstone_count_rejects_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             report_path = root / "report"
