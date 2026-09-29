@@ -10,14 +10,18 @@ const desktopOnlySpecs = [
   "password-manager-auth-form.spec.ts",
   "password-reset-autofill.spec.ts",
   "ready-check-timer.spec.ts",
-  "tournament-list-concurrency.spec.ts"
+  "tournament-list-concurrency.spec.ts",
+  "tournament-registration-race.spec.ts"
 ];
 const sharedIgnoredSpecs = [
   "frontend-audit-regressions.spec.ts",
   "live-launch.spec.ts",
   "live-user-journey.spec.ts",
+  "origin-validator-contract.spec.ts",
   "tournament-participant-progressive.spec.ts"
 ];
+const requestOnlySpecs = ["public-discovery-documents.spec.ts"];
+const hermeticTimingReporter = "./tests/support/hermetic-timing-reporter.mjs";
 const standaloneWebServerCommand = [
   preparedBuildDir
     ? `rm -rf .next/standalone && cp -a "${preparedBuildDir}/standalone" .next/standalone`
@@ -45,8 +49,12 @@ export default defineConfig({
   // Deterministic CI must expose failures instead of retrying them silently.
   retries: 0,
   reporter: process.env.CI
-    ? [["list"], ["html", { outputFolder: "playwright-report", open: "never" }]]
-    : [["list"]],
+    ? [
+      ["list"],
+      ["html", { outputFolder: "playwright-report", open: "never" }],
+      [hermeticTimingReporter]
+    ]
+    : [["list"], [hermeticTimingReporter]],
   use: {
     baseURL: process.env.PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:3100",
     trace: "retain-on-failure",
@@ -84,24 +92,30 @@ export default defineConfig({
   projects: [
     {
       name: "desktop",
+      testIgnore: [...sharedIgnoredSpecs, ...requestOnlySpecs],
       use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 1000 } }
     },
     {
       name: "wide-1300",
-      testIgnore: [...sharedIgnoredSpecs, ...desktopOnlySpecs],
+      testIgnore: [...sharedIgnoredSpecs, ...desktopOnlySpecs, ...requestOnlySpecs],
       use: { ...devices["Desktop Chrome"], viewport: { width: 1300, height: 900 } }
     },
     {
       name: "tablet-820",
-      testIgnore: [...sharedIgnoredSpecs, ...desktopOnlySpecs],
+      testIgnore: [...sharedIgnoredSpecs, ...desktopOnlySpecs, ...requestOnlySpecs],
       use: { ...devices["Desktop Chrome"], viewport: { width: 820, height: 1100 } }
     },
     {
       // This is a Chromium device emulation profile, not a real Android
       // Autofill / Google Password Manager environment.
       name: "mobile-layout",
-      testIgnore: [...sharedIgnoredSpecs, ...desktopOnlySpecs],
+      testIgnore: [...sharedIgnoredSpecs, ...desktopOnlySpecs, ...requestOnlySpecs],
       use: { ...devices["Pixel 5"] }
+    },
+    {
+      name: "request-contract",
+      testMatch: requestOnlySpecs,
+      use: { baseURL: process.env.PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:3100" }
     }
   ]
 });
