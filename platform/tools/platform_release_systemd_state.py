@@ -86,8 +86,10 @@ TRANSACTION_KEYS: Final = frozenset(
         "candidate_identity",
         "remove_env_on_recovery",
         "service_state_before",
+        "service_enabled_before",
         "quiesced_services",
         "timer_active_before",
+        "timer_enabled_before",
     }
 )
 TRANSACTION_SERVICE_UNITS: Final = (
@@ -115,6 +117,29 @@ HELPER_RELATIVE_PATHS: Final = (
 
 class StateError(RuntimeError):
     """The systemd receipt or an operation on it cannot be trusted."""
+
+
+def _validate_systemctl_path(value: str) -> str:
+    if not isinstance(value, str) or not value.startswith("/") or "\x00" in value or "\n" in value:
+        raise StateError("systemctl path is invalid")
+    path = Path(value)
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise StateError("systemctl path is unavailable") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not stat.S_IMODE(metadata.st_mode) & 0o111
+        or resolved != path
+    ):
+        raise StateError("systemctl path metadata is unsafe")
+    return value
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -296,7 +321,7 @@ def _read_active(unit: str) -> str:
     if value not in ACTIVE_STATES:
         raise StateError("owned unit active state is unsupported")
     if (value == "active" and status != 0) or (
-        value == "inactive" and status == 0
+        value == "inactive" and status != 3
     ):
         raise StateError("owned unit active state/status mismatch")
     return value
@@ -306,12 +331,12 @@ def _read_enabled(unit: str) -> str:
     status, value = _run_systemctl("is-enabled", unit)
     if value not in ENABLED_STATES:
         raise StateError("owned unit enabled state is unsupported")
-    # systemctl is-enabled returns zero for enabled and non-zero for disabled
-    # and static.  Do not infer a state from the exit code alone: the text is
-    # the authoritative state and both dimensions are retained in the receipt.
-    if value == "enabled" and status != 0:
+    # Keep the systemctl contract closed.  ``disabled`` is the one normal
+    # state whose query returns rc=1; static units are successful rc=0.  Do
+    # not accept arbitrary non-zero statuses as a disabled/static result.
+    if value in {"enabled", "static"} and status != 0:
         raise StateError("owned unit enabled state/status mismatch")
-    if value != "enabled" and status == 0:
+    if value == "disabled" and status != 1:
         raise StateError("owned unit enabled state/status mismatch")
     return value
 
@@ -502,7 +527,9 @@ def _read_transaction(
     }
     expected_service_order = [unit.removesuffix(".service") for unit in TRANSACTION_SERVICE_UNITS]
     timer_active_before = record.get("timer_active_before")
-    if service_state is None and record.get("quiesced_services") is None and timer_active_before is None:
+    service_enabled = record.get("service_enabled_before")
+    timer_enabled_before = record.get("timer_enabled_before")
+    if service_state is None and service_enabled is None and record.get("quiesced_services") is None and timer_active_before is None and timer_enabled_before is None:
         active_overrides: dict[str, str] = {}
     else:
         if (
@@ -515,6 +542,10 @@ def _read_transaction(
             )
             or record.get("quiesced_services") != expected_service_order
             or type(timer_active_before) is not bool
+            or not isinstance(service_enabled, dict)
+            or set(service_enabled) != expected_service_names
+            or any(type(value) is not str or value not in {"enabled", "disabled"} for value in service_enabled.values())
+            or timer_enabled_before not in {"enabled", "disabled"}
         ):
             raise StateError("release transaction service state is invalid")
         typed_service_state = cast(dict[str, str], service_state)
@@ -873,9 +904,7 @@ def main() -> int:
     args = _parser().parse_args()
     try:
         global SYSTEMCTL_PATH
-        if not isinstance(args.systemctl, str) or not args.systemctl.startswith("/"):
-            raise StateError("systemctl path is invalid")
-        SYSTEMCTL_PATH = args.systemctl
+        SYSTEMCTL_PATH = _validate_systemctl_path(args.systemctl)
         if args.command == "capture":
             capture(
                 args.state,

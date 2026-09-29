@@ -74,6 +74,30 @@ if [[ "$REQUIRE_PREVIOUS" -eq 1 && "$ALLOW_NO_PREVIOUS" -eq 1 ]]; then
   exit 1
 fi
 
+PUBLIC_RELEASE_SLUG="unavailable"
+PUBLIC_SOURCE_SHA="unavailable"
+PUBLIC_RESULT_STATUS="passed"
+
+public_status() {
+  local status="$1"
+  printf 'RELEASE_PREFLIGHT schema=1 status=%s class=preflight release_slug=%s source_sha=%s\n' \
+    "$status" "$PUBLIC_RELEASE_SLUG" "$PUBLIC_SOURCE_SHA"
+}
+
+fail() {
+  exit 1
+}
+
+on_exit() {
+  local exit_status="$?"
+  trap - EXIT
+  if [[ "$exit_status" -ne 0 ]]; then
+    public_status failed >&2
+  fi
+  exit "$exit_status"
+}
+trap on_exit EXIT
+
 CURRENT_TARGET=""
 PREVIOUS_TARGET=""
 if [[ -L "$APP_DIR/current" ]]; then
@@ -90,14 +114,6 @@ SHARED_DIR="$APP_DIR/shared"
 ENV_FILE="$SHARED_DIR/.env.platform"
 PYTHON_BIN="$SHARED_DIR/venv/bin/python"
 NODE_BIN="${PLATFORM_NODE_BIN:-$SHARED_DIR/node-v26.3.1/bin/node}"
-PUBLIC_RELEASE_SLUG="unavailable"
-PUBLIC_SOURCE_SHA="unavailable"
-PUBLIC_RESULT_STATUS="passed"
-
-fail() {
-  exit 1
-}
-
 if [[ -n "$CURRENT_TARGET" && -d "$CURRENT_TARGET" ]]; then
   candidate_slug="$(basename "$CURRENT_TARGET")"
   if [[ "$candidate_slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]]; then
@@ -122,22 +138,6 @@ PY
     [[ -n "$candidate_sha" ]] && PUBLIC_SOURCE_SHA="$candidate_sha"
   fi
 fi
-
-public_status() {
-  local status="$1"
-  printf 'RELEASE_PREFLIGHT schema=1 status=%s class=preflight release_slug=%s source_sha=%s\n' \
-    "$status" "$PUBLIC_RELEASE_SLUG" "$PUBLIC_SOURCE_SHA"
-}
-
-on_exit() {
-  local exit_status="$?"
-  trap - EXIT
-  if [[ "$exit_status" -ne 0 ]]; then
-    public_status failed >&2
-  fi
-  exit "$exit_status"
-}
-trap on_exit EXIT
 
 pass() {
   return 0

@@ -18,7 +18,9 @@ live-QA reconciliation helper used during retained recovery.
 from __future__ import annotations
 
 import argparse
+import binascii
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -45,9 +47,16 @@ JOB_RE = re.compile(r"^[A-Za-z0-9_. -]{1,128}$")
 MAX_FILE_BYTES = 768 * 1024
 MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_MEMBER_BYTES = 8 * 1024 * 1024
+# The producer archive is a one-member upload-artifact ZIP.  Keep the
+# decompression policy closed: upload-artifact currently uses DEFLATED, while
+# STORED remains accepted for deterministic fixtures and older producers.
+# A member may not expand by more than this bounded factor, even when its
+# uncompressed size is below MAX_ARCHIVE_BYTES.
+MAX_MEMBER_COMPRESSION_RATIO = 100
 MAX_FILES = 32
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_PROVENANCE_BYTES = 64 * 1024
+MAX_PUBLISH_PAGE_ROWS = 100
 EXECUTABLE_MODE = 0o555
 DATA_MODE = 0o444
 
@@ -281,6 +290,7 @@ def _provenance_schema(payload: object) -> dict[str, object]:
         "job",
         "run_id",
         "run_attempt",
+        "recovery_workflow_sha",
         "source_sha",
         "artifact_name",
         "artifact_sha256",
@@ -293,6 +303,7 @@ def _provenance_schema(payload: object) -> dict[str, object]:
     job = payload.get("job")
     run_id = payload.get("run_id")
     run_attempt = payload.get("run_attempt")
+    recovery_workflow_sha = payload.get("recovery_workflow_sha")
     source_sha = payload.get("source_sha")
     artifact_name = payload.get("artifact_name")
     artifact_sha256 = payload.get("artifact_sha256")
@@ -306,6 +317,8 @@ def _provenance_schema(payload: object) -> dict[str, object]:
         raise RecoveryBootstrapError("recovery run provenance is invalid")
     if not isinstance(run_attempt, str) or ATTEMPT_RE.fullmatch(run_attempt) is None:
         raise RecoveryBootstrapError("recovery attempt provenance is invalid")
+    if not isinstance(recovery_workflow_sha, str) or SOURCE_SHA_RE.fullmatch(recovery_workflow_sha) is None:
+        raise RecoveryBootstrapError("recovery workflow provenance SHA is invalid")
     if not isinstance(source_sha, str) or SOURCE_SHA_RE.fullmatch(source_sha) is None:
         raise RecoveryBootstrapError("recovery source provenance is invalid")
     if (
@@ -340,6 +353,776 @@ def _read_bounded_json(
         return json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
     except (UnicodeError, json.JSONDecodeError, RecoveryBootstrapError) as exc:
         raise RecoveryBootstrapError(f"{label} is invalid") from exc
+
+
+def _read_publish_json(path: Path, *, label: str) -> object:
+    """Read one bounded GitHub API response without a pathname TOCTOU."""
+
+    try:
+        raw = _read_stable_file(
+            path,
+            maximum=MAX_ARCHIVE_BYTES,
+            label=label,
+            allowed_modes={0o400, 0o440, 0o444, 0o600, 0o640, 0o644},
+        )
+        return json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError, RecoveryBootstrapError) as exc:
+        if isinstance(exc, RecoveryBootstrapError):
+            raise
+        raise RecoveryBootstrapError(f"{label} is invalid") from exc
+
+
+def _publish_id(value: object, *, label: str) -> int:
+    if type(value) is int:
+        candidate = str(value)
+    elif isinstance(value, str):
+        candidate = value
+    else:
+        candidate = ""
+    if RUN_ID_RE.fullmatch(candidate) is None:
+        raise RecoveryBootstrapError(f"{label} is invalid")
+    return int(candidate)
+
+
+def _publish_string(value: object, *, pattern: re.Pattern[str], label: str) -> str:
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        raise RecoveryBootstrapError(f"{label} is invalid")
+    return value
+
+
+def _publish_rows(payload: object, *, key: str, label: str) -> list[object]:
+    if not isinstance(payload, dict) or not isinstance(payload.get(key), list):
+        raise RecoveryBootstrapError(f"{label} response is malformed")
+    total_count = payload.get("total_count")
+    rows = payload[key]
+    if (
+        type(total_count) is not int
+        or total_count < 0
+        or total_count != len(rows)
+        or total_count > MAX_PUBLISH_PAGE_ROWS
+    ):
+        raise RecoveryBootstrapError(f"{label} response is not a complete page")
+    return rows
+
+
+def _publish_job_match(
+    rows: list[object],
+    *,
+    name: str,
+    run_id: int,
+    run_attempt: int,
+    expected_head_sha: str,
+    label: str,
+) -> dict[str, object]:
+    matches = [
+        row
+        for row in rows
+        if (
+            isinstance(row, dict)
+            and type(row.get("id")) is int
+            and row.get("id") > 0
+            and row.get("name") == name
+            and row.get("run_id") == run_id
+            and row.get("run_attempt") == run_attempt
+            and row.get("status") == "completed"
+            and row.get("conclusion") == "success"
+            and row.get("head_sha") == expected_head_sha
+        )
+    ]
+    if len(matches) != 1:
+        raise RecoveryBootstrapError(f"exact successful {label} job is missing")
+    return matches[0]
+
+
+def _publish_route_artifact(
+    rows: list[object],
+    *,
+    repository: str,
+    run_id: int,
+    run_attempt: int,
+    source_sha: str,
+) -> dict[str, object]:
+    artifact_name = f"platform-ci-route-{run_id}-{run_attempt}"
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("name") == artifact_name
+        and row.get("expired") is False
+    ]
+    if len(matches) != 1:
+        raise RecoveryBootstrapError("exact security route artifact is missing")
+    artifact = matches[0]
+    if type(artifact.get("id")) is not int or artifact.get("id") <= 0:
+        raise RecoveryBootstrapError("security route artifact id is invalid")
+    workflow_run = artifact.get("workflow_run")
+    if (
+        not isinstance(workflow_run, dict)
+        or workflow_run.get("id") != run_id
+        or workflow_run.get("head_sha") != source_sha
+        or (
+            "run_attempt" in workflow_run
+            and workflow_run.get("run_attempt") != run_attempt
+        )
+        or (
+            "repository" in workflow_run
+            and (workflow_run.get("repository") or {}).get("full_name") != repository
+        )
+    ):
+        raise RecoveryBootstrapError("security artifact provenance is not exact")
+    digest = artifact.get("digest")
+    if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise RecoveryBootstrapError("security artifact digest is invalid")
+    return artifact
+
+
+def validate_publish_metadata(
+    metadata: Path,
+    *,
+    repository: str,
+    source_sha: str,
+    security_run_id: str,
+    security_run_attempt: str,
+    security_workflow: str,
+    security_workflow_path: str,
+    security_job: str,
+    recovery_run_id: str,
+    recovery_run_attempt: str,
+    recovery_workflow_sha: str,
+    recovery_job: str,
+    github_ref: str,
+) -> dict[str, object]:
+    """Validate the completed security run and completed bundle producer.
+
+    This is intentionally independent of GitHub's event payload.  The
+    workflow_run event is only a routing hint; every security/job/artifact
+    identity used for publication is re-read from the exact attempt API
+    responses and bound into the closed provenance object.
+    """
+
+    if github_ref != "refs/heads/dev":
+        raise RecoveryBootstrapError("recovery publication ref is invalid")
+    repository = _publish_string(repository, pattern=REPOSITORY_RE, label="repository")
+    source_sha = _publish_string(source_sha, pattern=SOURCE_SHA_RE, label="source SHA")
+    security_run = _publish_id(security_run_id, label="security run id")
+    security_attempt = _publish_id(security_run_attempt, label="security run attempt")
+    recovery_run = _publish_id(recovery_run_id, label="recovery run id")
+    recovery_attempt = _publish_id(recovery_run_attempt, label="recovery run attempt")
+    recovery_workflow_sha = _publish_string(
+        recovery_workflow_sha, pattern=SOURCE_SHA_RE, label="recovery workflow SHA"
+    )
+    security_workflow = _publish_string(
+        security_workflow, pattern=WORKFLOW_RE, label="security workflow"
+    )
+    security_workflow_path = _publish_string(
+        security_workflow_path,
+        pattern=re.compile(r"^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$"),
+        label="security workflow path",
+    )
+    security_job = _publish_string(security_job, pattern=JOB_RE, label="security job")
+    recovery_job = _publish_string(recovery_job, pattern=JOB_RE, label="recovery job")
+    run = _read_publish_json(metadata / "run.json", label="security run")
+    jobs = _read_publish_json(metadata / "jobs.json", label="security jobs")
+    artifacts = _read_publish_json(metadata / "artifacts.json", label="security artifacts")
+    recovery_jobs = _read_publish_json(
+        metadata / "recovery-jobs.json", label="recovery producer jobs"
+    )
+    recovery_run_metadata = _read_publish_json(
+        metadata / "recovery-run.json", label="recovery producer run"
+    )
+    if not isinstance(run, dict) or any(
+        (
+            run.get("id") != security_run,
+            run.get("run_attempt") != security_attempt,
+            run.get("head_sha") != source_sha,
+            run.get("head_branch") != "dev",
+            run.get("event") != "push",
+            run.get("status") != "completed",
+            run.get("conclusion") != "success",
+            run.get("name") != security_workflow,
+            run.get("path") != security_workflow_path,
+            (run.get("repository") or {}).get("full_name") != repository,
+        )
+    ):
+        raise RecoveryBootstrapError("security run provenance is not exact")
+    security_job_row = _publish_job_match(
+        _publish_rows(jobs, key="jobs", label="security jobs"),
+        name=security_job,
+        run_id=security_run,
+        run_attempt=security_attempt,
+        expected_head_sha=source_sha,
+        label="security verification",
+    )
+    route_artifact = _publish_route_artifact(
+        _publish_rows(artifacts, key="artifacts", label="security artifacts"),
+        repository=repository,
+        run_id=security_run,
+        run_attempt=security_attempt,
+        source_sha=source_sha,
+    )
+    if not isinstance(recovery_run_metadata, dict) or any(
+        (
+            recovery_run_metadata.get("id") != recovery_run,
+            recovery_run_metadata.get("run_attempt") != recovery_attempt,
+            recovery_run_metadata.get("head_sha") != recovery_workflow_sha,
+            recovery_run_metadata.get("head_branch") != "dev",
+            recovery_run_metadata.get("event") != "workflow_run",
+            recovery_run_metadata.get("status") != "completed",
+            recovery_run_metadata.get("conclusion") != "success",
+            recovery_run_metadata.get("name") != "Platform production recovery bootstrap build",
+            recovery_run_metadata.get("path") != ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            (recovery_run_metadata.get("repository") or {}).get("full_name") != repository,
+        )
+    ):
+        raise RecoveryBootstrapError("recovery producer run provenance is not exact")
+    producer_job = _publish_job_match(
+        _publish_rows(recovery_jobs, key="jobs", label="recovery producer jobs"),
+        name=recovery_job,
+        run_id=recovery_run,
+        run_attempt=recovery_attempt,
+        expected_head_sha=recovery_workflow_sha,
+        label="recovery producer",
+    )
+    provenance = {
+        "repository": repository,
+        "workflow": security_workflow,
+        "job": security_job,
+        "run_id": str(security_run),
+        "run_attempt": str(security_attempt),
+        "recovery_workflow_sha": recovery_workflow_sha,
+        "source_sha": source_sha,
+        "artifact_name": f"platform-ci-route-{security_run}-{security_attempt}",
+        "artifact_sha256": str(route_artifact["digest"])[len("sha256:") :],
+        "deployable": False,
+    }
+    _provenance_schema(provenance)
+    return {
+        "provenance": provenance,
+        "security_job_id": security_job_row["id"],
+        "route_artifact_id": route_artifact["id"],
+        "recovery_job_id": producer_job["id"],
+    }
+
+
+def validate_publish_artifact_metadata(
+    metadata: Path,
+    *,
+    expected_name: str,
+    expected_run_id: str,
+    expected_run_attempt: str,
+    expected_source_sha: str,
+    expected_workflow_sha: str,
+) -> int:
+    """Select exactly one non-expired bundle artifact from one exact attempt."""
+
+    expected_run = _publish_id(expected_run_id, label="recovery run id")
+    expected_attempt = _publish_id(expected_run_attempt, label="recovery run attempt")
+    expected_source_sha = _publish_string(
+        expected_source_sha, pattern=SOURCE_SHA_RE, label="source SHA"
+    )
+    expected_workflow_sha = _publish_string(
+        expected_workflow_sha, pattern=SOURCE_SHA_RE, label="recovery workflow SHA"
+    )
+    expected_name = _publish_string(
+        expected_name,
+        pattern=re.compile(
+            rf"platform-recovery-bootstrap-{expected_source_sha}-[1-9][0-9]{{0,31}}-[1-9][0-9]{{0,31}}-{expected_run_id}-{expected_run_attempt}\.zip"
+        ),
+        label="recovery artifact name",
+    )
+    rows = _publish_rows(
+        _read_publish_json(metadata, label="recovery artifacts"),
+        key="artifacts",
+        label="recovery artifacts",
+    )
+    matches = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("name") != expected_name:
+            continue
+        if row.get("expired") is not False or type(row.get("id")) is not int:
+            continue
+        workflow_run = row.get("workflow_run")
+        if (
+            not isinstance(workflow_run, dict)
+            or workflow_run.get("id") != expected_run
+            or workflow_run.get("head_sha") != expected_workflow_sha
+            or (
+                "run_attempt" in workflow_run
+                and workflow_run.get("run_attempt") != expected_attempt
+            )
+        ):
+            continue
+        matches.append(row)
+    if len(matches) != 1:
+        raise RecoveryBootstrapError("exact recovery bundle artifact is missing")
+    return _publish_id(matches[0]["id"], label="recovery bundle artifact id")
+
+
+def _publisher_producer_run(
+    run: object,
+    *,
+    repository: str,
+    run_id: int,
+    run_attempt: int,
+    workflow: str,
+    workflow_path: str,
+) -> str:
+    """Validate the completed producer identity used by the publisher.
+
+    A ``workflow_run`` event is only a routing hint.  Re-reading this exact
+    run/attempt is what prevents an in-progress run, a rerun, or a branch
+    movement from being silently replaced by a latest-by-SHA lookup.
+    """
+
+    if not isinstance(run, dict) or any(
+        (
+            run.get("id") != run_id,
+            run.get("run_attempt") != run_attempt,
+            run.get("status") != "completed",
+            run.get("conclusion") != "success",
+            run.get("event") != "workflow_run",
+            run.get("head_branch") != "dev",
+            run.get("name") != workflow,
+            run.get("path") != workflow_path,
+            (run.get("repository") or {}).get("full_name") != repository,
+        )
+    ):
+        raise RecoveryBootstrapError("recovery producer run provenance is not exact")
+    return _publish_string(
+        run.get("head_sha"), pattern=SOURCE_SHA_RE, label="recovery producer workflow SHA"
+    )
+
+
+def _publisher_bundle_candidate(
+    rows: list[object],
+    *,
+    repository: str,
+    run_id: int,
+    run_attempt: int,
+    producer_workflow_sha: str,
+) -> tuple[dict[str, object], dict[str, str]]:
+    pattern = re.compile(
+        rf"^platform-recovery-bootstrap-([0-9a-f]{{40,64}})-([1-9][0-9]{{0,31}})-"
+        rf"([1-9][0-9]{{0,31}})-{run_id}-{run_attempt}\.zip$"
+    )
+    matches: list[tuple[dict[str, object], re.Match[str]]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("expired") is not False:
+            continue
+        if type(row.get("id")) is not int or row["id"] <= 0:
+            continue
+        parsed = pattern.fullmatch(str(row.get("name", "")))
+        workflow_run = row.get("workflow_run")
+        digest = row.get("digest")
+        if (
+            parsed is None
+            or not isinstance(workflow_run, dict)
+            or workflow_run.get("id") != run_id
+            or workflow_run.get("head_sha") != producer_workflow_sha
+            or (
+                "run_attempt" in workflow_run
+                and workflow_run.get("run_attempt") != run_attempt
+            )
+            or (
+                "repository" in workflow_run
+                and (workflow_run.get("repository") or {}).get("full_name") != repository
+            )
+            or not isinstance(digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+        ):
+            continue
+        matches.append((row, parsed))
+    if len(matches) != 1:
+        raise RecoveryBootstrapError("exact recovery producer bundle artifact is missing")
+    row, parsed = matches[0]
+    source_sha, security_run_id, security_attempt = parsed.groups()
+    return row, {
+        "bundle_name": str(row["name"]),
+        "source_sha": source_sha,
+        "security_run_id": security_run_id,
+        "security_run_attempt": security_attempt,
+        "artifact_sha256": str(row["digest"])[len("sha256:") :],
+    }
+
+
+def select_publisher_bundle_metadata(
+    metadata: Path,
+    *,
+    repository: str,
+    producer_run_id: str,
+    producer_run_attempt: str,
+    producer_workflow: str,
+    producer_workflow_path: str,
+) -> dict[str, object]:
+    """Select the one exact producer bundle before any security API lookup."""
+
+    repository = _publish_string(repository, pattern=REPOSITORY_RE, label="repository")
+    run_id = _publish_id(producer_run_id, label="producer run id")
+    attempt = _publish_id(producer_run_attempt, label="producer run attempt")
+    workflow = _publish_string(producer_workflow, pattern=WORKFLOW_RE, label="producer workflow")
+    workflow_path = _publish_string(
+        producer_workflow_path,
+        pattern=re.compile(r"^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$"),
+        label="producer workflow path",
+    )
+    run = _read_publish_json(metadata / "producer-run.json", label="producer run")
+    producer_sha = _publisher_producer_run(
+        run,
+        repository=repository,
+        run_id=run_id,
+        run_attempt=attempt,
+        workflow=workflow,
+        workflow_path=workflow_path,
+    )
+    jobs = _publish_rows(
+        _read_publish_json(metadata / "producer-jobs.json", label="producer jobs"),
+        key="jobs",
+        label="producer jobs",
+    )
+    producer_job_name = "Build retained-release recovery bootstrap evidence"
+    producer_job = _publish_job_match(
+        jobs,
+        name=producer_job_name,
+        run_id=run_id,
+        run_attempt=attempt,
+        expected_head_sha=producer_sha,
+        label="recovery producer",
+    )
+    artifacts = _publish_rows(
+        _read_publish_json(metadata / "producer-artifacts.json", label="producer artifacts"),
+        key="artifacts",
+        label="producer artifacts",
+    )
+    artifact, fields = _publisher_bundle_candidate(
+        artifacts,
+        repository=repository,
+        run_id=run_id,
+        run_attempt=attempt,
+        producer_workflow_sha=producer_sha,
+    )
+    result = {
+        "producer_workflow_sha": producer_sha,
+        "producer_job_id": producer_job["id"],
+        "bundle_artifact_id": artifact["id"],
+        **fields,
+    }
+    result["bundle_artifact_sha256"] = result["artifact_sha256"]
+    return result
+
+
+def validate_publisher_metadata(
+    metadata: Path,
+    *,
+    repository: str,
+    producer_run_id: str,
+    producer_run_attempt: str,
+    producer_workflow: str,
+    producer_workflow_path: str,
+    security_workflow: str,
+    security_workflow_path: str,
+    security_job: str,
+    publisher_workflow_sha: str,
+    publisher_run_id: str,
+    publisher_run_attempt: str,
+    publisher_job_id: str,
+    github_ref: str,
+) -> dict[str, object]:
+    """Validate a completed producer and its exact security provenance.
+
+    The publisher owns no production secrets.  It proves the producer run is
+    complete, selects its exact bundle, then independently revalidates the
+    security run/attempt and route artifact encoded in the closed bundle name.
+    ``publisher_workflow_sha`` is C and is kept separate from producer B and
+    security/bundle source A.
+    """
+
+    if github_ref != "refs/heads/dev":
+        raise RecoveryBootstrapError("recovery publisher ref is invalid")
+    repository = _publish_string(repository, pattern=REPOSITORY_RE, label="repository")
+    publisher_sha = _publish_string(
+        publisher_workflow_sha, pattern=SOURCE_SHA_RE, label="publisher workflow SHA"
+    )
+    publisher_run = _publish_id(publisher_run_id, label="publisher run id")
+    publisher_attempt = _publish_id(publisher_run_attempt, label="publisher run attempt")
+    publisher_job = _publish_id(publisher_job_id, label="publisher job id")
+    selected = select_publisher_bundle_metadata(
+        metadata,
+        repository=repository,
+        producer_run_id=producer_run_id,
+        producer_run_attempt=producer_run_attempt,
+        producer_workflow=producer_workflow,
+        producer_workflow_path=producer_workflow_path,
+    )
+    source_sha = str(selected["source_sha"])
+    security_run_id = str(selected["security_run_id"])
+    security_attempt = str(selected["security_run_attempt"])
+    run = _read_publish_json(metadata / "security-run.json", label="security run")
+    jobs = _read_publish_json(metadata / "security-jobs.json", label="security jobs")
+    artifacts = _read_publish_json(metadata / "security-artifacts.json", label="security artifacts")
+    security_run = _publish_id(security_run_id, label="security run id")
+    security_attempt_int = _publish_id(security_attempt, label="security run attempt")
+    if not isinstance(run, dict) or any(
+        (
+            run.get("id") != security_run,
+            run.get("run_attempt") != security_attempt_int,
+            run.get("head_sha") != source_sha,
+            run.get("head_branch") != "dev",
+            run.get("event") != "push",
+            run.get("status") != "completed",
+            run.get("conclusion") != "success",
+            run.get("name") != security_workflow,
+            run.get("path") != security_workflow_path,
+            (run.get("repository") or {}).get("full_name") != repository,
+        )
+    ):
+        raise RecoveryBootstrapError("security run provenance is not exact")
+    security_job_row = _publish_job_match(
+        _publish_rows(jobs, key="jobs", label="security jobs"),
+        name=security_job,
+        run_id=security_run,
+        run_attempt=security_attempt_int,
+        expected_head_sha=source_sha,
+        label="security verification",
+    )
+    route = _publish_route_artifact(
+        _publish_rows(artifacts, key="artifacts", label="security artifacts"),
+        repository=repository,
+        run_id=security_run,
+        run_attempt=security_attempt_int,
+        source_sha=source_sha,
+    )
+    provenance = {
+        "repository": repository,
+        "workflow": security_workflow,
+        "job": security_job,
+        "run_id": str(security_run),
+        "run_attempt": str(security_attempt_int),
+        "recovery_workflow_sha": str(selected["producer_workflow_sha"]),
+        "source_sha": source_sha,
+        "artifact_name": f"platform-ci-route-{security_run}-{security_attempt_int}",
+        "artifact_sha256": str(route["digest"])[len("sha256:") :],
+        "deployable": False,
+    }
+    _provenance_schema(provenance)
+    return {
+        "provenance": provenance,
+        "source_sha": source_sha,
+        "security_run_id": str(security_run),
+        "security_run_attempt": str(security_attempt_int),
+        "security_job_id": security_job_row["id"],
+        "route_artifact_id": route["id"],
+        "producer_run_id": str(_publish_id(producer_run_id, label="producer run id")),
+        "producer_run_attempt": str(_publish_id(producer_run_attempt, label="producer run attempt")),
+        "producer_workflow_sha": selected["producer_workflow_sha"],
+        "producer_job_id": selected["producer_job_id"],
+        "bundle_name": selected["bundle_name"],
+        "bundle_artifact_id": selected["bundle_artifact_id"],
+        "bundle_artifact_sha256": selected["artifact_sha256"],
+        "publisher_workflow_sha": publisher_sha,
+        "publisher_run_id": str(publisher_run),
+        "publisher_run_attempt": str(publisher_attempt),
+        "publisher_job_id": str(publisher_job),
+    }
+
+
+def extract_publish_bundle(
+    archive: Path,
+    output: Path,
+    *,
+    expected_name: str,
+    expected_sha: str,
+    expected_archive_sha: str | None = None,
+) -> None:
+    """Extract one exact bundle member and bind its bytes to the API digest."""
+
+    expected_sha = _publish_string(expected_sha, pattern=HEX64_RE, label="bundle SHA")
+    expected_name = _publish_string(
+        expected_name,
+        pattern=re.compile(r"^platform-recovery-bootstrap-[0-9a-f]{40,64}-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}\.zip$"),
+        label="bundle artifact member",
+    )
+    raw = _read_stable_file(
+        archive,
+        maximum=MAX_ARCHIVE_BYTES,
+        label="recovery bundle artifact archive",
+        allowed_modes={0o400, 0o440, 0o444, 0o600, 0o640, 0o644},
+    )
+    if expected_archive_sha is not None:
+        expected_archive_sha = _publish_string(
+            expected_archive_sha,
+            pattern=HEX64_RE,
+            label="producer artifact SHA",
+        )
+        if _sha256(raw) != expected_archive_sha:
+            raise RecoveryBootstrapError("producer artifact digest is invalid")
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw), mode="r", allowZip64=False) as package:
+            infos = package.infolist()
+            matches = [item for item in infos if item.filename == expected_name]
+            if len(infos) != 1 or len(matches) != 1:
+                raise RecoveryBootstrapError("recovery bundle artifact member is not exact")
+            item = matches[0]
+            mode = (item.external_attr >> 16) & 0o177777
+            compressed_size = item.compress_size
+            uncompressed_size = item.file_size
+            if compressed_size < 0 or compressed_size > MAX_ARCHIVE_BYTES:
+                raise RecoveryBootstrapError("recovery bundle artifact member is too large")
+            if uncompressed_size < 0 or uncompressed_size > MAX_ARCHIVE_BYTES:
+                raise RecoveryBootstrapError("recovery bundle artifact member is too large")
+            if compressed_size == 0:
+                ratio_ok = uncompressed_size == 0
+            else:
+                ratio_ok = (
+                    uncompressed_size
+                    <= compressed_size * MAX_MEMBER_COMPRESSION_RATIO
+                )
+            if (
+                item.create_system != 3
+                or item.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+                or item.is_dir()
+                or not stat.S_ISREG(mode)
+                or item.flag_bits & 0x1
+                or not ratio_ok
+            ):
+                raise RecoveryBootstrapError("recovery bundle artifact member is unsafe")
+            bundle = package.read(item)
+            if len(bundle) != uncompressed_size:
+                raise RecoveryBootstrapError("recovery bundle artifact member size is invalid")
+            # zipfile validates CRC while reading; repeat the check against
+            # the bytes obtained from that same in-memory archive so a
+            # malformed header cannot be treated as a trusted bundle.
+            if (binascii.crc32(bundle) & 0xFFFFFFFF) != item.CRC:
+                raise RecoveryBootstrapError("recovery bundle artifact member CRC is invalid")
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        if isinstance(exc, RecoveryBootstrapError):
+            raise
+        raise RecoveryBootstrapError("recovery bundle artifact archive is invalid") from exc
+    if _sha256(bundle) != expected_sha:
+        raise RecoveryBootstrapError("recovery bundle digest is invalid")
+    if output.exists() or output.is_symlink():
+        raise RecoveryBootstrapError("recovery bundle output already exists")
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    if temporary.exists() or temporary.is_symlink():
+        raise RecoveryBootstrapError("recovery bundle output staging path exists")
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(bundle)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    except OSError as exc:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise RecoveryBootstrapError("recovery bundle output could not be written") from exc
+
+
+def build_publish_evidence(
+    provenance: dict[str, object],
+    *,
+    bundle_name: str,
+    bundle_sha: str,
+    bundle_artifact_sha256: str | None = None,
+    recovery_run_id: str,
+    recovery_run_attempt: str,
+    recovery_job_id: str,
+    publisher_workflow_sha: str | None = None,
+    publisher_run_id: str | None = None,
+    publisher_run_attempt: str | None = None,
+    publisher_job_id: str | None = None,
+) -> dict[str, object]:
+    """Build the closed, non-deployable recovery evidence payload."""
+
+    provenance = _provenance_schema(provenance)
+    if provenance["artifact_name"] != (
+        f"platform-ci-route-{provenance['run_id']}-{provenance['run_attempt']}"
+    ):
+        raise RecoveryBootstrapError("recovery route artifact provenance is invalid")
+    bundle_sha = _publish_string(bundle_sha, pattern=HEX64_RE, label="bundle SHA")
+    recovery_run = _publish_id(recovery_run_id, label="recovery run id")
+    recovery_attempt = _publish_id(recovery_run_attempt, label="recovery run attempt")
+    recovery_job = _publish_id(recovery_job_id, label="recovery job id")
+    bundle_name = _publish_string(
+        bundle_name,
+        pattern=re.compile(
+            rf"platform-recovery-bootstrap-{provenance['source_sha']}-{provenance['run_id']}-{provenance['run_attempt']}-{recovery_run_id}-{recovery_run_attempt}\.zip"
+        ),
+        label="bundle name",
+    )
+    legacy_publisher = all(
+        value is None
+        for value in (
+            publisher_workflow_sha,
+            publisher_run_id,
+            publisher_run_attempt,
+            publisher_job_id,
+        )
+    )
+    if legacy_publisher and bundle_artifact_sha256 is not None:
+        raise RecoveryBootstrapError("legacy publisher evidence cannot carry artifact metadata")
+    if not legacy_publisher and bundle_artifact_sha256 is None:
+        raise RecoveryBootstrapError("publisher artifact digest is missing")
+    if bundle_artifact_sha256 is not None:
+        bundle_artifact_sha256 = _publish_string(
+            bundle_artifact_sha256,
+            pattern=HEX64_RE,
+            label="producer artifact SHA",
+        )
+    if not legacy_publisher and any(
+        value is None
+        for value in (
+            publisher_workflow_sha,
+            publisher_run_id,
+            publisher_run_attempt,
+            publisher_job_id,
+        )
+    ):
+        raise RecoveryBootstrapError("publisher evidence identity is incomplete")
+    payload: dict[str, object] = {
+        "schema": 1 if legacy_publisher else 2,
+        "capability": "recovery_bootstrap",
+        "capabilities": [CAPABILITY, RECOVER_PENDING_CAPABILITY],
+        "deployable": False,
+        "bundle_name": bundle_name,
+        "bundle_sha256": bundle_sha,
+        "recovery_run_id": str(recovery_run),
+        "recovery_run_attempt": str(recovery_attempt),
+        "recovery_job_id": str(recovery_job),
+        "provenance": provenance,
+    }
+    if not legacy_publisher:
+        payload["bundle_artifact_sha256"] = bundle_artifact_sha256
+    if not legacy_publisher:
+        payload.update(
+            {
+                "publisher_workflow_sha": _publish_string(
+                    str(publisher_workflow_sha),
+                    pattern=SOURCE_SHA_RE,
+                    label="publisher workflow SHA",
+                ),
+                "publisher_run_id": str(
+                    _publish_id(str(publisher_run_id), label="publisher run id")
+                ),
+                "publisher_run_attempt": str(
+                    _publish_id(str(publisher_run_attempt), label="publisher run attempt")
+                ),
+                "publisher_job_id": str(
+                    _publish_id(str(publisher_job_id), label="publisher job id")
+                ),
+            }
+        )
+    return payload
 
 
 def _manifest(
@@ -920,9 +1703,15 @@ def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Pat
         "version", "operation", "phase", "app_dir", "current_before", "previous_before", "candidate_release",
         "shared_venv", "peer", "snapshot", "transition", "shared_before", "peer_before", "current_before_identity",
         "previous_before_identity", "candidate_identity", "remove_env_on_recovery", "service_state_before",
-        "quiesced_services", "timer_active_before",
+        "service_enabled_before", "quiesced_services", "timer_active_before",
+        "timer_enabled_before",
     }
-    legacy_expected = expected - {"operation_id"}
+    # Operation-less receipts are the narrowly supported pre-operation v2
+    # bridge. They predate enabled-state capture and may only be consumed by
+    # the cleanup-only path; a mixed legacy/v2 schema is not supported.
+    legacy_expected = expected - {
+        "operation_id", "service_enabled_before", "timer_enabled_before"
+    }
     legacy = set(receipt) == legacy_expected
     if (
         (set(receipt) != expected and not legacy)
@@ -956,6 +1745,18 @@ def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Pat
         raise RecoveryBootstrapError("release receipt quiesced services are invalid")
     if type(receipt.get("timer_active_before")) is not bool:
         raise RecoveryBootstrapError("release receipt timer state is invalid")
+    if not legacy:
+        service_enabled = receipt.get("service_enabled_before")
+        if (
+            not isinstance(service_enabled, dict)
+            or set(service_enabled) != {"deadlock-api", "deadlock-worker", "deadlock-web"}
+            or any(
+                type(value) is not str or value not in {"enabled", "disabled"}
+                for value in service_enabled.values()
+            )
+            or receipt.get("timer_enabled_before") not in {"enabled", "disabled"}
+        ):
+            raise RecoveryBootstrapError("release receipt enabled state is invalid")
     current_before = _receipt_release_path(
         receipt.get("current_before"), app_dir=app_dir, label="current identity"
     )
@@ -1182,6 +1983,75 @@ def _parser() -> argparse.ArgumentParser:
     abort = commands.add_parser("abort_retained_only")
     abort.add_argument("--app-dir", type=Path, required=True)
     abort.add_argument("--generation", type=Path)
+    publish_validate = commands.add_parser("publish-validate")
+    publish_validate.add_argument("--metadata", type=Path, required=True)
+    publish_validate.add_argument("--provenance-output", type=Path, required=True)
+    publish_validate.add_argument("--github-output", type=Path, required=True)
+    publish_validate.add_argument("--repository", required=True)
+    publish_validate.add_argument("--source-sha", required=True)
+    publish_validate.add_argument("--security-run-id", required=True)
+    publish_validate.add_argument("--security-run-attempt", required=True)
+    publish_validate.add_argument("--security-workflow", required=True)
+    publish_validate.add_argument("--security-workflow-path", required=True)
+    publish_validate.add_argument("--security-job", required=True)
+    publish_validate.add_argument("--recovery-run-id", required=True)
+    publish_validate.add_argument("--recovery-run-attempt", required=True)
+    publish_validate.add_argument("--recovery-workflow-sha", required=True)
+    publish_validate.add_argument("--recovery-job", required=True)
+    publish_validate.add_argument("--github-ref", required=True)
+    publisher_select = commands.add_parser("publisher-select")
+    publisher_select.add_argument("--metadata", type=Path, required=True)
+    publisher_select.add_argument("--github-output", type=Path, required=True)
+    publisher_select.add_argument("--repository", required=True)
+    publisher_select.add_argument("--producer-run-id", required=True)
+    publisher_select.add_argument("--producer-run-attempt", required=True)
+    publisher_select.add_argument("--producer-workflow", required=True)
+    publisher_select.add_argument("--producer-workflow-path", required=True)
+    publisher_validate = commands.add_parser("publisher-validate")
+    publisher_validate.add_argument("--metadata", type=Path, required=True)
+    publisher_validate.add_argument("--provenance-output", type=Path, required=True)
+    publisher_validate.add_argument("--github-output", type=Path, required=True)
+    publisher_validate.add_argument("--repository", required=True)
+    publisher_validate.add_argument("--producer-run-id", required=True)
+    publisher_validate.add_argument("--producer-run-attempt", required=True)
+    publisher_validate.add_argument("--producer-workflow", required=True)
+    publisher_validate.add_argument("--producer-workflow-path", required=True)
+    publisher_validate.add_argument("--security-workflow", required=True)
+    publisher_validate.add_argument("--security-workflow-path", required=True)
+    publisher_validate.add_argument("--security-job", required=True)
+    publisher_validate.add_argument("--publisher-workflow-sha", required=True)
+    publisher_validate.add_argument("--publisher-run-id", required=True)
+    publisher_validate.add_argument("--publisher-run-attempt", required=True)
+    publisher_validate.add_argument("--publisher-job-id", required=True)
+    publisher_validate.add_argument("--github-ref", required=True)
+    publish_artifact = commands.add_parser("publish-artifact-id")
+    publish_artifact.add_argument("--metadata", type=Path, required=True)
+    publish_artifact.add_argument("--artifact-id-output", type=Path, required=True)
+    publish_artifact.add_argument("--artifact-name", required=True)
+    publish_artifact.add_argument("--recovery-run-id", required=True)
+    publish_artifact.add_argument("--recovery-run-attempt", required=True)
+    publish_artifact.add_argument("--source-sha", required=True)
+    publish_artifact.add_argument("--recovery-workflow-sha", required=True)
+    publish_bundle = commands.add_parser("publish-bundle")
+    publish_bundle.add_argument("--archive", type=Path, required=True)
+    publish_bundle.add_argument("--output", type=Path, required=True)
+    publish_bundle.add_argument("--expected-name", required=True)
+    publish_bundle.add_argument("--expected-sha", required=True)
+    publish_bundle.add_argument("--artifact-sha256")
+    publish_evidence = commands.add_parser("publish-evidence")
+    publish_evidence.add_argument("--provenance", type=Path, required=True)
+    publish_evidence.add_argument("--evidence", type=Path, required=True)
+    publish_evidence.add_argument("--github-output", type=Path, required=True)
+    publish_evidence.add_argument("--bundle-name", required=True)
+    publish_evidence.add_argument("--bundle-sha", required=True)
+    publish_evidence.add_argument("--bundle-artifact-sha256")
+    publish_evidence.add_argument("--recovery-run-id", required=True)
+    publish_evidence.add_argument("--recovery-run-attempt", required=True)
+    publish_evidence.add_argument("--recovery-job-id", required=True)
+    publish_evidence.add_argument("--publisher-workflow-sha")
+    publish_evidence.add_argument("--publisher-run-id")
+    publish_evidence.add_argument("--publisher-run-attempt")
+    publish_evidence.add_argument("--publisher-job-id")
     return parser
 
 
@@ -1223,6 +2093,155 @@ def main(argv: list[str] | None = None) -> int:
             generation = args.generation or Path(__file__).resolve().parent
             abort_retained_only(app_dir=args.app_dir, generation=generation)
             print("RECOVERY_BOOTSTRAP schema=1 status=complete capability=abort_retained_only deployable=false")
+        elif args.command == "publish-validate":
+            result = validate_publish_metadata(
+                args.metadata,
+                repository=args.repository,
+                source_sha=args.source_sha,
+                security_run_id=args.security_run_id,
+                security_run_attempt=args.security_run_attempt,
+                security_workflow=args.security_workflow,
+                security_workflow_path=args.security_workflow_path,
+                security_job=args.security_job,
+                recovery_run_id=args.recovery_run_id,
+                recovery_run_attempt=args.recovery_run_attempt,
+                recovery_workflow_sha=args.recovery_workflow_sha,
+                recovery_job=args.recovery_job,
+                github_ref=args.github_ref,
+            )
+            provenance = result["provenance"]
+            provenance_path = args.provenance_output
+            if provenance_path.exists() or provenance_path.is_symlink():
+                raise RecoveryBootstrapError("recovery provenance output already exists")
+            provenance_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            provenance_path.write_bytes(_canonical_json(provenance))
+            provenance_path.chmod(0o600)
+            with args.github_output.open("a", encoding="ascii") as stream:
+                stream.write(f"provenance={provenance_path}\n")
+                stream.write(f"artifact_name={provenance['artifact_name']}\n")
+                stream.write(f"artifact_id={result['route_artifact_id']}\n")
+                stream.write(f"artifact_sha256={provenance['artifact_sha256']}\n")
+                stream.write(f"recovery_job_id={result['recovery_job_id']}\n")
+        elif args.command == "publisher-select":
+            result = select_publisher_bundle_metadata(
+                args.metadata,
+                repository=args.repository,
+                producer_run_id=args.producer_run_id,
+                producer_run_attempt=args.producer_run_attempt,
+                producer_workflow=args.producer_workflow,
+                producer_workflow_path=args.producer_workflow_path,
+            )
+            with args.github_output.open("a", encoding="ascii") as stream:
+                for key in (
+                    "producer_workflow_sha",
+                    "producer_job_id",
+                    "bundle_artifact_id",
+                    "bundle_name",
+                    "source_sha",
+                    "security_run_id",
+                    "security_run_attempt",
+                    "bundle_artifact_sha256",
+                ):
+                    if key in result:
+                        stream.write(f"{key}={result[key]}\n")
+        elif args.command == "publisher-validate":
+            result = validate_publisher_metadata(
+                args.metadata,
+                repository=args.repository,
+                producer_run_id=args.producer_run_id,
+                producer_run_attempt=args.producer_run_attempt,
+                producer_workflow=args.producer_workflow,
+                producer_workflow_path=args.producer_workflow_path,
+                security_workflow=args.security_workflow,
+                security_workflow_path=args.security_workflow_path,
+                security_job=args.security_job,
+                publisher_workflow_sha=args.publisher_workflow_sha,
+                publisher_run_id=args.publisher_run_id,
+                publisher_run_attempt=args.publisher_run_attempt,
+                publisher_job_id=args.publisher_job_id,
+                github_ref=args.github_ref,
+            )
+            provenance = result["provenance"]
+            if not isinstance(provenance, dict):
+                raise RecoveryBootstrapError("publisher provenance is invalid")
+            if args.provenance_output.exists() or args.provenance_output.is_symlink():
+                raise RecoveryBootstrapError("publisher provenance output already exists")
+            args.provenance_output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            args.provenance_output.write_bytes(_canonical_json(provenance))
+            args.provenance_output.chmod(0o600)
+            with args.github_output.open("a", encoding="ascii") as stream:
+                for key in (
+                    "source_sha",
+                    "security_run_id",
+                    "security_run_attempt",
+                    "security_job_id",
+                    "producer_run_id",
+                    "producer_run_attempt",
+                    "producer_workflow_sha",
+                    "producer_job_id",
+                    "bundle_name",
+                    "bundle_artifact_id",
+                    "bundle_artifact_sha256",
+                    "publisher_workflow_sha",
+                    "publisher_run_id",
+                    "publisher_run_attempt",
+                    "publisher_job_id",
+                ):
+                    stream.write(f"{key}={result[key]}\n")
+                stream.write(f"route_digest={provenance['artifact_sha256']}\n")
+                stream.write(f"provenance={args.provenance_output}\n")
+        elif args.command == "publish-artifact-id":
+            artifact_id = validate_publish_artifact_metadata(
+                args.metadata,
+                expected_name=args.artifact_name,
+                expected_run_id=args.recovery_run_id,
+                expected_run_attempt=args.recovery_run_attempt,
+                expected_source_sha=args.source_sha,
+                expected_workflow_sha=args.recovery_workflow_sha,
+            )
+            if args.artifact_id_output.exists() or args.artifact_id_output.is_symlink():
+                raise RecoveryBootstrapError("recovery artifact id output already exists")
+            args.artifact_id_output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            args.artifact_id_output.write_text(f"{artifact_id}\n", encoding="ascii")
+            args.artifact_id_output.chmod(0o600)
+        elif args.command == "publish-bundle":
+            extract_publish_bundle(
+                args.archive,
+                args.output,
+                expected_name=args.expected_name,
+                expected_sha=args.expected_sha,
+                expected_archive_sha=args.artifact_sha256,
+            )
+        elif args.command == "publish-evidence":
+            value = _read_bounded_json(
+                args.provenance,
+                maximum=MAX_PROVENANCE_BYTES,
+                label="recovery provenance",
+            )
+            if not isinstance(value, dict):
+                raise RecoveryBootstrapError("recovery provenance is invalid")
+            payload = build_publish_evidence(
+                value,
+                bundle_name=args.bundle_name,
+                bundle_sha=args.bundle_sha,
+                bundle_artifact_sha256=args.bundle_artifact_sha256,
+                recovery_run_id=args.recovery_run_id,
+                recovery_run_attempt=args.recovery_run_attempt,
+                recovery_job_id=args.recovery_job_id,
+                publisher_workflow_sha=args.publisher_workflow_sha,
+                publisher_run_id=args.publisher_run_id,
+                publisher_run_attempt=args.publisher_run_attempt,
+                publisher_job_id=args.publisher_job_id,
+            )
+            if args.evidence.exists() or args.evidence.is_symlink():
+                raise RecoveryBootstrapError("recovery evidence output already exists")
+            args.evidence.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            args.evidence.write_bytes(_canonical_json(payload))
+            args.evidence.chmod(0o600)
+            evidence_name = args.evidence.name
+            with args.github_output.open("a", encoding="ascii") as stream:
+                stream.write(f"evidence_name={evidence_name}\n")
+                stream.write(f"evidence_sha={_sha256(args.evidence.read_bytes())}\n")
         else:  # pragma: no cover - argparse enforces commands
             raise RecoveryBootstrapError("unknown recovery command")
         return 0

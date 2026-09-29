@@ -36,6 +36,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         ".github/workflows/platform-production-deploy.yml",
         ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
         ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
         ".github/workflows/platform-production-release-abort.yml",
         ".github/workflows/platform-production-release-recover.yml",
         "platform/docs/README.md",
@@ -58,6 +59,8 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tests/test_platform_ssh_host_key_scan.py",
         "platform/tools/platform_abort_retained_only.sh",
         "platform/tools/platform_build_live_qa_runtime.py",
+        "platform/tools/platform_install_nginx.py",
+        "platform/tools/platform_install_systemd_units.sh",
         "platform/tools/platform_ci_classifier.py",
         "platform/tools/platform_live_qa_guard.py",
         "platform/tools/platform_live_qa_runtime_install.py",
@@ -79,10 +82,11 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/contracts/host_tools_pin.json",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 45
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 48
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "6197915b4fad322aa21b32c3e015346eabb4c5261d9c8307c108246362a84449"
+    "885ce490391702b231d49e046c2406f5dd9f6778542363d022cdca7782aa9614"
 )
+RECOVERY_BOOTSTRAP_PR_BASE = "475d2679"
 
 # These two paths are deliberately present in the recovery route allowlist for
 # compatibility with the retained-release boundary, but were not changed by
@@ -106,6 +110,45 @@ RECOVERY_BOOTSTRAP_PATCH_DOCS = frozenset(
     }
 )
 
+# This is the exact topology/recovery patch delta reviewed independently from
+# the complete 47-file merge-base fixture above.  Keep it separate: the
+# classifier must make both the full PR and this smaller simulated dev push a
+# non-deployable full route with no fallback.
+RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
+    {
+        ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+        ".github/workflows/platform-production-release-recover.yml",
+        ".github/workflows/platform-production-autodeploy.yml",
+        "platform/docs/adr/recovery-bootstrap-retained-abort.md",
+        "platform/docs/deployment-runbook.md",
+        "platform/docs/release-state-machine.md",
+        "platform/tests/test_platform_recovery_bootstrap.py",
+        "platform/tests/test_platform_release_audit_hardening.py",
+        "platform/tests/test_platform_release_recovery_boundaries.py",
+        "platform/tests/test_platform_release_systemd_state.py",
+        "platform/tools/platform_ci_classifier.py",
+        "platform/tools/platform_production_classifier_artifact.py",
+        "platform/tools/platform_recover_pending.sh",
+        "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_install_nginx.py",
+        "platform/tools/platform_install_systemd_units.sh",
+        "platform/tools/platform_release_deploy.sh",
+        "platform/tools/platform_release_preflight.sh",
+        "platform/tools/platform_release_rollback.sh",
+        "platform/tools/platform_release_restore_runtime.sh",
+        "platform/tools/platform_release_systemd_state.py",
+        "platform/tools/platform_release_transaction.py",
+        "platform/tools/platform_test_catalog.py",
+    }
+)
+RECOVERY_BOOTSTRAP_CURRENT_DELTA_BASE = "d335f0dc"
+RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT = 25
+RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST = (
+    "af97e6c6abc60d0646eb2c9844694cea8753221628256f59bed40fa0a75054a1"
+)
+
 
 def provenance() -> dict[str, object]:
     return {
@@ -114,6 +157,7 @@ def provenance() -> dict[str, object]:
         "job": "Verification contract",
         "run_id": "12345",
         "run_attempt": "2",
+        "recovery_workflow_sha": "c" * 40,
         "source_sha": SOURCE_SHA,
         "artifact_name": "platform-ci-route-12345-2",
         "artifact_sha256": "b" * 64,
@@ -372,24 +416,71 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
 
     def test_build_workflow_is_trusted_default_branch_secret_free_and_non_deployable(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-build.yml").read_text(encoding="utf-8")
+        publisher = (REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-publish.yml").read_text(encoding="utf-8")
         self.assertIn("github.event.workflow_run.head_branch == 'dev'", workflow)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
-        self.assertIn('"deployable":False', workflow)
-        self.assertIn(
-            'evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}-${RECOVERY_BUILD_RUN_ID}-${RECOVERY_BUILD_RUN_ATTEMPT}.json"',
-            workflow,
-        )
-        self.assertIn(
-            'evidence="$RUNNER_TEMP/$evidence_name"',
-            workflow,
-        )
-        self.assertIn(
-            'path: ${{ runner.temp }}/${{ steps.bundle.outputs.evidence_name }}',
-            workflow,
-        )
+        self.assertIn('"deployable": False', workflow)
+        self.assertNotIn("needs: build", workflow)
+        self.assertNotIn("Upload closed recovery evidence", workflow)
+        self.assertIn("workflow_run", publisher)
+        self.assertIn("publisher-validate", publisher)
+        self.assertIn("Upload closed recovery evidence", publisher)
+        self.assertIn("PRODUCER_RUN_ID", publisher)
+        self.assertIn("PUBLISHER_WORKFLOW_SHA", publisher)
+        self.assertIn('row.get("status") == "in_progress"', publisher)
+        self.assertIn('row.get("conclusion") is None', publisher)
+        self.assertIn('--artifact-sha256 "$BUNDLE_ARTIFACT_SHA256"', publisher)
+        self.assertIn('--provenance "$PROVENANCE_PATH"', publisher)
+        self.assertIn('GH_TOKEN: ${{ github.token }}', publisher)
+        self.assertIn("recovery producer", (TOOLS / "platform_recovery_bootstrap.py").read_text(encoding="utf-8"))
         self.assertIn("actions: read", workflow)
         self.assertNotIn("PROD_SSH_KEY", workflow)
         self.assertNotIn("secrets.", workflow)
+        self.assertNotIn("secrets.", publisher)
+
+    def test_build_workflow_completed_trigger_gate_and_producer_handoff(self) -> None:
+        workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-recovery-bootstrap-build.yml"
+        ).read_text(encoding="utf-8")
+        gate_start = workflow.index("    if: >-", workflow.index("  build:"))
+        gate_end = workflow.index("    runs-on:", gate_start)
+        gate = workflow[gate_start:gate_end]
+        eligible = {
+            "ref": "refs/heads/dev",
+            "conclusion": "success",
+            "event": "push",
+            "head_branch": "dev",
+            "repository": "StrayForest/old_sparky",
+            "name": "Platform security and build",
+            "path": ".github/workflows/platform-security.yml",
+        }
+        ineligible = dict(eligible, conclusion="failure")
+
+        def accepted(event: dict[str, str]) -> bool:
+            return (
+                event["ref"] == "refs/heads/dev"
+                and event["conclusion"] == "success"
+                and event["event"] == "push"
+                and event["head_branch"] == "dev"
+                and event["repository"] == "StrayForest/old_sparky"
+                and event["name"] == "Platform security and build"
+                and event["path"] == ".github/workflows/platform-security.yml"
+            )
+
+        self.assertTrue(accepted(eligible))
+        self.assertFalse(accepted(ineligible))
+        for condition in (
+            "github.event.workflow_run.conclusion == 'success'",
+            "github.event.workflow_run.event == 'push'",
+            "github.event.workflow_run.head_branch == 'dev'",
+            "github.event.workflow_run.head_repository.full_name == 'StrayForest/old_sparky'",
+            "github.event.workflow_run.name == 'Platform security and build'",
+            "github.event.workflow_run.path == '.github/workflows/platform-security.yml'",
+        ):
+            self.assertIn(condition, gate)
+        self.assertIn("status\") == \"completed\"", workflow)
+        self.assertIn("conclusion\") == \"success\"", workflow)
 
     def test_manual_abort_validates_artifacts_before_secrets_and_uses_bundle_only(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-abort.yml").read_text(encoding="utf-8")
@@ -398,7 +489,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertLess(evidence, secrets)
         self.assertIn("gh attestation verify", workflow)
         self.assertIn("--source-ref refs/heads/dev", workflow)
-        self.assertIn("--source-digest \"$SOURCE_SHA\"", workflow)
+        self.assertIn("--source-digest \"$RECOVERY_WORKFLOW_SHA\"", workflow)
         self.assertIn("recovery_job_id", workflow)
         self.assertIn("RECOVERY_BUILD_JOB_ID", workflow)
         self.assertIn("attempt jobs API response", workflow)
@@ -452,13 +543,21 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("platform_recover_pending.sh", release_recover)
         self.assertIn("security_run_id", release_recover)
         self.assertIn("security_run_attempt", release_recover)
+        for provenance_field in (
+            "recovery_workflow_sha",
+            "publisher_run_id",
+            "publisher_run_attempt",
+            "publisher_workflow_sha",
+            "publisher_job_id",
+        ):
+            self.assertIn(provenance_field, release_recover)
         self.assertIn("cleanup_remote_upload", release_recover)
         self.assertIn("trap cleanup_remote_upload EXIT", release_recover)
         self.assertIn("timeout --foreground 10s ssh", release_recover)
         self.assertIn('rm -f -- "$stage/bundle.zip" || true', release_recover)
         self.assertNotIn("$runtime/current/tools", release_recover)
         self.assertIn(
-            "evidence_name=platform-recovery-bootstrap-evidence-{sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{run_id}-{attempt}.json",
+            "evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}-{os.environ['PUBLISHER_RUN_ID']}-{os.environ['PUBLISHER_RUN_ATTEMPT']}.json",
             workflow,
         )
         self.assertNotIn(
@@ -814,6 +913,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         policy_end = workflow.index("\n          PY", policy_start)
         policy = textwrap.dedent(workflow[policy_start:policy_end])
         source_sha = "a" * 40
+        recovery_workflow_sha = "c" * 40
         bundle_digest = "b" * 64
         run_id = "12345"
         attempt = "2"
@@ -826,7 +926,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             "issuer": "https://token.actions.githubusercontent.com",
             "sourceRepositoryURI": "https://github.com/StrayForest/old_sparky",
             "sourceRepositoryRef": "refs/heads/dev",
-            "sourceRepositoryDigest": source_sha,
+            "sourceRepositoryDigest": recovery_workflow_sha,
             "buildConfigURI": build_uri,
             "buildSignerURI": build_uri,
             "runInvocationURI": (
@@ -854,7 +954,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             def run_policy() -> subprocess.CompletedProcess[str]:
                 attestation.write_text(json.dumps(payload), encoding="utf-8")
                 env = os.environ.copy()
-                env["SOURCE_SHA"] = source_sha
+                env["RECOVERY_WORKFLOW_SHA"] = recovery_workflow_sha
                 return subprocess.run(
                     [
                         sys.executable,
@@ -871,6 +971,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     capture_output=True,
                     env=env,
                     check=False,
+                    timeout=120,
                 )
 
             self.assertEqual(run_policy().returncode, 0)
@@ -878,7 +979,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 ("issuer", "https://token.actions.githubusercontent.com.invalid"),
                 ("sourceRepositoryURI", "https://github.com/other/repo"),
                 ("sourceRepositoryRef", "refs/heads/main"),
-                ("sourceRepositoryDigest", "c" * 40),
+                ("sourceRepositoryDigest", "d" * 40),
                 ("buildConfigURI", build_uri.replace("refs/heads/dev", "refs/heads/main")),
                 ("buildSignerURI", "https://github.com/other/repo/.github/workflows/wrong.yml@refs/heads/dev"),
                 (
@@ -905,232 +1006,832 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 self.assertNotEqual(run_policy().returncode, 0)
             finally:
                 subject["sha256"] = bundle_digest
+    def test_publish_validation_is_closed_and_behaviourally_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / "metadata"
+            metadata.mkdir()
+            source_sha = SOURCE_SHA
+            security_run_id = "12345"
+            security_attempt = "2"
+            recovery_run_id = "67890"
+            recovery_attempt = "3"
+            recovery_workflow_sha = "c" * 40
+            security_job_name = "Verification contract"
+            recovery_job_name = "Build retained-release recovery bootstrap evidence"
+            repository = "StrayForest/old_sparky"
+            route_digest = "b" * 64
 
-            jobs_marker = '"$metadata/recovery-jobs.json" "$GITHUB_OUTPUT" "$recovery_run_id" "$recovery_run_attempt" "$source_sha" <<\'PY\''
-            jobs_heredoc = workflow.index(jobs_marker)
-            jobs_start = workflow.index("\n", jobs_heredoc) + 1
-            jobs_end = workflow.index("\n          PY", jobs_start)
-            jobs_policy = textwrap.dedent(workflow[jobs_start:jobs_end])
-            jobs = root / "jobs.json"
-            output = root / "output"
-            jobs.write_text(
-                json.dumps(
-                    {
-                        "jobs": [
-                            {
-                                "id": 42,
-                                "name": "Build retained-release recovery bootstrap evidence",
-                                "conclusion": "success",
-                                "run_id": 12345,
-                                "run_attempt": 2,
-                                "status": "completed",
-                                "head_sha": SOURCE_SHA,
-                            }
-                        ]
-                    }
-                ),
-                encoding="utf-8",
-            )
-            env = os.environ.copy()
-            env["RECOVERY_BUILD_JOB"] = "Build retained-release recovery bootstrap evidence"
-            valid_jobs = subprocess.run(
-                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2", SOURCE_SHA],
-                input=jobs_policy,
-                text=True,
-                capture_output=True,
-                env=env,
-                check=False,
-            )
-            self.assertEqual(valid_jobs.returncode, 0, valid_jobs.stderr)
-            jobs.write_text(
-                json.dumps(
-                    {
-                        "jobs": [
-                            {
-                                "id": 42,
-                                "name": "Build retained-release recovery bootstrap evidence",
-                                "conclusion": "success",
-                                "run_id": 12345,
-                                "run_attempt": 2,
-                                "status": "completed",
-                                "head_sha": SOURCE_SHA,
+            valid = {
+                "run.json": {
+                    "id": int(security_run_id),
+                    "run_attempt": int(security_attempt),
+                    "head_sha": source_sha,
+                    "head_branch": "dev",
+                    "event": "push",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "name": "Platform security and build",
+                    "path": ".github/workflows/platform-security.yml",
+                    "repository": {"full_name": repository},
+                },
+                "jobs.json": {
+                    "total_count": 1,
+                    "jobs": [
+                        {
+                            "id": 11,
+                            "name": security_job_name,
+                            "run_id": int(security_run_id),
+                            "run_attempt": int(security_attempt),
+                            "status": "completed",
+                            "conclusion": "success",
+                            "head_sha": source_sha,
+                        }
+                    ],
+                },
+                "artifacts.json": {
+                    "total_count": 1,
+                    "artifacts": [
+                        {
+                            "id": 22,
+                            "name": f"platform-ci-route-{security_run_id}-{security_attempt}",
+                            "expired": False,
+                            "digest": f"sha256:{route_digest}",
+                            "workflow_run": {
+                                "id": int(security_run_id),
+                                "head_sha": source_sha,
+                                "repository": {"full_name": repository},
                             },
-                            {
-                                "id": 43,
-                                "name": "Build retained-release recovery bootstrap evidence",
-                                "conclusion": "success",
-                                "run_id": 12345,
-                                "run_attempt": 2,
-                                "status": "completed",
-                                "head_sha": SOURCE_SHA,
-                            },
-                        ]
-                    }
-                ),
-                encoding="utf-8",
-            )
-            duplicate_jobs = subprocess.run(
-                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2", SOURCE_SHA],
-                input=jobs_policy,
-                text=True,
-                capture_output=True,
-                env=env,
-                check=False,
-            )
-            self.assertNotEqual(duplicate_jobs.returncode, 0)
-            jobs.write_text(
-                json.dumps(
-                    {
-                        "jobs": [
-                            {
-                                "id": 42,
-                                "name": "Build retained-release recovery bootstrap evidence",
-                                "conclusion": "failure",
-                                "run_id": 12345,
-                                "run_attempt": 2,
-                                "status": "completed",
-                                "head_sha": SOURCE_SHA,
-                            }
-                        ]
-                    }
-                ),
-                encoding="utf-8",
-            )
-            invalid_jobs = subprocess.run(
-                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2", SOURCE_SHA],
-                input=jobs_policy,
-                text=True,
-                capture_output=True,
-                env=env,
-                check=False,
-            )
-            self.assertNotEqual(invalid_jobs.returncode, 0)
-            for field, bad_value in (
-                ("id", None),
-                ("run_id", 54321),
-                ("run_attempt", 3),
-            ):
-                with self.subTest(recovery_job_field=field):
-                    valid_row = {
-                        "id": 42,
-                        "name": "Build retained-release recovery bootstrap evidence",
-                        "conclusion": "success",
-                        "run_id": 12345,
-                        "run_attempt": 2,
-                        "status": "completed",
-                        "head_sha": SOURCE_SHA,
-                    }
-                    valid_row[field] = bad_value
-                    jobs.write_text(json.dumps({"jobs": [valid_row]}), encoding="utf-8")
-                    malformed_identity = subprocess.run(
-                        [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2", SOURCE_SHA],
-                        input=jobs_policy,
-                        text=True,
-                        capture_output=True,
-                        env=env,
-                        check=False,
-                    )
-                    self.assertNotEqual(malformed_identity.returncode, 0)
-
-            evidence_marker = '"$artifact_dir" "$GITHUB_OUTPUT" "$EVIDENCE_NAME" "$BUNDLE_NAME" <<\'PY\''
-            evidence_heredoc = workflow.index(evidence_marker)
-            evidence_start = workflow.index("\n", evidence_heredoc) + 1
-            evidence_end = workflow.index("\n          PY", evidence_start)
-            evidence_policy = textwrap.dedent(workflow[evidence_start:evidence_end])
-            bundle_name = "platform-recovery-bootstrap-test.zip"
-            evidence_name = "platform-recovery-bootstrap-evidence-test.json"
-            bundle_bytes = b"immutable bundle fixture\n"
-            expected_bundle_sha = hashlib.sha256(bundle_bytes).hexdigest()
-            evidence_payload = {
-                "schema": 1,
-                "capability": "recovery_bootstrap",
-                "capabilities": ["abort_retained_only", "recover_pending"],
-                "deployable": False,
-                "bundle_name": bundle_name,
-                "bundle_sha256": expected_bundle_sha,
-                "recovery_run_id": "12345",
-                "recovery_run_attempt": "2",
-                "recovery_job_id": "42",
-                "provenance": {
-                    "repository": "StrayForest/old_sparky",
-                    "workflow": "Platform security and build",
-                    "job": "Verification contract",
-                    "run_id": "12345",
-                    "run_attempt": "2",
-                    "source_sha": SOURCE_SHA,
-                    "artifact_name": "platform-ci-route-12345-2",
-                    "artifact_sha256": "b" * 64,
-                    "deployable": False,
+                        }
+                    ],
+                },
+                "recovery-jobs.json": {
+                    "total_count": 1,
+                    "jobs": [
+                        {
+                            "id": 33,
+                            "name": recovery_job_name,
+                            "run_id": int(recovery_run_id),
+                            "run_attempt": int(recovery_attempt),
+                            "status": "completed",
+                            "conclusion": "success",
+                            "head_sha": recovery_workflow_sha,
+                        }
+                    ],
+                },
+                "recovery-run.json": {
+                    "id": int(recovery_run_id),
+                    "run_attempt": int(recovery_attempt),
+                    "head_sha": recovery_workflow_sha,
+                    "head_branch": "dev",
+                    "event": "workflow_run",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "name": "Platform production recovery bootstrap build",
+                    "path": ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+                    "repository": {"full_name": repository},
                 },
             }
 
-            def write_artifacts(case_root: Path, payload: dict[str, object]) -> None:
-                def archive(path: Path, name: str, data: bytes) -> None:
-                    info = zipfile.ZipInfo(name)
-                    info.create_system = 3
-                    info.external_attr = (stat.S_IFREG | 0o600) << 16
-                    with zipfile.ZipFile(path, "w") as archive_file:
-                        archive_file.writestr(info, data)
+            def write_fixture(value: dict[str, object]) -> None:
+                for name, payload in value.items():
+                    (metadata / name).write_text(
+                        json.dumps(payload, sort_keys=True),
+                        encoding="ascii",
+                    )
 
-                archive(case_root / "evidence.zip", evidence_name, json.dumps(payload).encode("ascii"))
-                archive(case_root / "bundle.zip", bundle_name, bundle_bytes)
+            def validate(
+                value: dict[str, object] | None = None,
+                *,
+                github_ref: str = "refs/heads/dev",
+                selected_recovery_run_id: str = recovery_run_id,
+                selected_recovery_attempt: str = recovery_attempt,
+                selected_recovery_workflow_sha: str = recovery_workflow_sha,
+            ) -> dict[str, object]:
+                write_fixture(value or valid)
+                return recovery.validate_publish_metadata(
+                    metadata,
+                    repository=repository,
+                    source_sha=source_sha,
+                    security_run_id=security_run_id,
+                    security_run_attempt=security_attempt,
+                    security_workflow="Platform security and build",
+                    security_workflow_path=".github/workflows/platform-security.yml",
+                    security_job=security_job_name,
+                    recovery_run_id=selected_recovery_run_id,
+                    recovery_run_attempt=selected_recovery_attempt,
+                    recovery_workflow_sha=selected_recovery_workflow_sha,
+                    recovery_job=recovery_job_name,
+                    github_ref=github_ref,
+                )
 
-            def run_evidence(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
-                case_root = root / f"evidence-case-{len(list(root.glob('evidence-case-*')))}"
-                case_root.mkdir()
-                write_artifacts(case_root, payload)
-                case_output = case_root / "output"
-                policy_env = os.environ.copy()
-                policy_env.update(
+            result = validate()
+            self.assertEqual(result["route_artifact_id"], 22)
+            self.assertEqual(result["recovery_job_id"], 33)
+            provenance_value = result["provenance"]
+            self.assertEqual(provenance_value["artifact_sha256"], route_digest)
+            self.assertFalse(provenance_value["deployable"])
+
+            # Two completed producer runs may legitimately publish the same
+            # security source SHA (for example after a recovery workflow
+            # rerun).  The operator's exact run/attempt selection must choose
+            # the matching producer, never the latest/unique SHA match.
+            rerun = json.loads(json.dumps(valid))
+            rerun["recovery-run.json"].update(
+                {"id": 67891, "run_attempt": 4}
+            )
+            rerun["recovery-jobs.json"]["jobs"][0].update(
+                {"run_id": 67891, "run_attempt": 4}
+            )
+            self.assertEqual(
+                validate(
+                    rerun,
+                    selected_recovery_run_id="67891",
+                    selected_recovery_attempt="4",
+                )["recovery_job_id"],
+                33,
+            )
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                validate(rerun)
+
+            def rejected(
+                label: str,
+                mutation,
+                *,
+                github_ref: str = "refs/heads/dev",
+            ) -> None:
+                with self.subTest(rejection=label):
+                    value = json.loads(json.dumps(valid))
+                    mutation(value)
+                    with self.assertRaises(recovery.RecoveryBootstrapError):
+                        validate(value, github_ref=github_ref)
+
+            rejected("duplicate producer job", lambda value: value["recovery-jobs.json"]["jobs"].append(dict(value["recovery-jobs.json"]["jobs"][0])))
+            rejected("duplicate security job", lambda value: value["jobs.json"]["jobs"].append(dict(value["jobs.json"]["jobs"][0])))
+            rejected("duplicate route artifact", lambda value: value["artifacts.json"]["artifacts"].append(dict(value["artifacts.json"]["artifacts"][0])))
+            rejected("over-100 security jobs page", lambda value: value["jobs.json"].__setitem__("total_count", 101))
+            rejected("over-100 security artifact page", lambda value: value["artifacts.json"].__setitem__("total_count", 101))
+            for bad_id in (0, "22"):
+                rejected(
+                    f"route artifact id {bad_id!r}",
+                    lambda value, bad_id=bad_id: value["artifacts.json"]["artifacts"][0].__setitem__("id", bad_id),
+                )
+            for field, bad_value in (
+                ("id", 54321),
+                ("run_attempt", 4),
+                ("head_sha", "d" * 40),
+                ("head_branch", "main"),
+                ("event", "push"),
+                ("status", "in_progress"),
+                ("conclusion", "failure"),
+                ("name", "Other recovery workflow"),
+                ("path", ".github/workflows/other.yml"),
+            ):
+                rejected(
+                    f"producer run {field}",
+                    lambda value, field=field, bad_value=bad_value: value["recovery-run.json"].__setitem__(field, bad_value),
+                )
+            for field, bad_value in (
+                ("run_id", 54321),
+                ("run_attempt", 4),
+                ("name", "Other producer"),
+                ("head_sha", "d" * 40),
+                ("status", "in_progress"),
+                ("conclusion", "failure"),
+            ):
+                rejected(
+                    f"producer {field}",
+                    lambda value, field=field, bad_value=bad_value: value["recovery-jobs.json"]["jobs"][0].__setitem__(field, bad_value),
+                )
+            for label, mutation in (
+                (
+                    "run id",
+                    lambda value: value["artifacts.json"]["artifacts"][0]["workflow_run"].__setitem__("id", 54321),
+                ),
+                (
+                    "source SHA",
+                    lambda value: value["artifacts.json"]["artifacts"][0]["workflow_run"].__setitem__("head_sha", "c" * 40),
+                ),
+                (
+                    "run attempt",
+                    lambda value: value["artifacts.json"]["artifacts"][0]["workflow_run"].__setitem__("run_attempt", 4),
+                ),
+                (
+                    "name",
+                    lambda value: value["artifacts.json"]["artifacts"][0].__setitem__("name", "platform-ci-route-wrong"),
+                ),
+                (
+                    "digest",
+                    lambda value: value["artifacts.json"]["artifacts"][0].__setitem__("digest", "sha256:not-a-digest"),
+                ),
+            ):
+                rejected(f"route artifact {label}", mutation)
+            rejected(
+                "expired route artifact",
+                lambda value: value["artifacts.json"]["artifacts"][0].__setitem__("expired", True),
+            )
+            rejected(
+                "missing route artifact",
+                lambda value: value["artifacts.json"].__setitem__("artifacts", []),
+            )
+            rejected("wrong event", lambda value: value["run.json"].__setitem__("event", "pull_request"))
+            rejected("wrong ref", lambda value: value, github_ref="refs/heads/main")
+
+            bundle_name = (
+                f"platform-recovery-bootstrap-{source_sha}-{security_run_id}-"
+                f"{security_attempt}-{recovery_run_id}-{recovery_attempt}.zip"
+            )
+            bundle_bytes = b"immutable bundle fixture\n"
+            bundle_sha = hashlib.sha256(bundle_bytes).hexdigest()
+            bundle_metadata = root / "bundle-artifacts.json"
+            bundle_metadata.write_text(
+                json.dumps(
                     {
-                        "RECOVERY_RUN_ID": "12345",
-                        "RECOVERY_RUN_ATTEMPT": "2",
-                        "RECOVERY_BUILD_JOB_ID": "42",
-                        "SECURITY_RUN_ID": "12345",
-                        "SECURITY_RUN_ATTEMPT": "2",
-                        "SOURCE_SHA": SOURCE_SHA,
-                        "ROUTE_DIGEST": "b" * 64,
+                        "total_count": 1,
+                        "artifacts": [
+                            {
+                                "id": 44,
+                                "name": bundle_name,
+                                "expired": False,
+                                "workflow_run": {
+                                    "id": int(recovery_run_id),
+                                    "head_sha": recovery_workflow_sha,
+                                },
+                            }
+                        ],
                     }
+                ),
+                encoding="ascii",
+            )
+            self.assertEqual(
+                recovery.validate_publish_artifact_metadata(
+                    bundle_metadata,
+                    expected_name=bundle_name,
+                    expected_run_id=recovery_run_id,
+                    expected_run_attempt=recovery_attempt,
+                    expected_source_sha=source_sha,
+                    expected_workflow_sha=recovery_workflow_sha,
+                ),
+                44,
+            )
+            wrong_attempt = json.loads(bundle_metadata.read_text(encoding="ascii"))
+            wrong_attempt["artifacts"][0]["workflow_run"]["run_attempt"] = 4
+            bundle_metadata.write_text(json.dumps(wrong_attempt), encoding="ascii")
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.validate_publish_artifact_metadata(
+                    bundle_metadata,
+                    expected_name=bundle_name,
+                    expected_run_id=recovery_run_id,
+                    expected_run_attempt=recovery_attempt,
+                    expected_source_sha=source_sha,
+                    expected_workflow_sha=recovery_workflow_sha,
                 )
-                return subprocess.run(
-                    [
-                        sys.executable,
-                        "-I",
-                        "-B",
-                        "-",
-                        str(case_root),
-                        str(case_output),
-                        evidence_name,
-                        bundle_name,
-                    ],
-                    input=evidence_policy,
-                    text=True,
-                    capture_output=True,
-                    env=policy_env,
-                    check=False,
+            duplicate_artifact = {
+                "artifacts": [
+                    {
+                        "id": 44,
+                        "name": bundle_name,
+                        "expired": False,
+                        "workflow_run": {
+                            "id": int(recovery_run_id),
+                            "head_sha": source_sha,
+                        },
+                    },
+                    {
+                        "id": 45,
+                        "name": bundle_name,
+                        "expired": False,
+                        "workflow_run": {
+                            "id": int(recovery_run_id),
+                            "head_sha": source_sha,
+                        },
+                    },
+                ]
+            }
+            bundle_metadata.write_text(json.dumps(duplicate_artifact), encoding="ascii")
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.validate_publish_artifact_metadata(
+                    bundle_metadata,
+                    expected_name=bundle_name,
+                    expected_run_id=recovery_run_id,
+                    expected_run_attempt=recovery_attempt,
+                    expected_source_sha=source_sha,
+                    expected_workflow_sha=recovery_workflow_sha,
+                )
+            bundle_metadata.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "id": 44,
+                                "name": bundle_name,
+                                "expired": True,
+                                "workflow_run": {
+                                    "id": int(recovery_run_id),
+                                    "head_sha": source_sha,
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="ascii",
+            )
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.validate_publish_artifact_metadata(
+                    bundle_metadata,
+                    expected_name=bundle_name,
+                    expected_run_id=recovery_run_id,
+                    expected_run_attempt=recovery_attempt,
+                    expected_source_sha=source_sha,
+                    expected_workflow_sha=recovery_workflow_sha,
                 )
 
-            self.assertEqual(run_evidence(evidence_payload).returncode, 0)
-            evidence_payload["recovery_job_id"] = "43"
-            mismatched_evidence = run_evidence(evidence_payload)
-            self.assertNotEqual(mismatched_evidence.returncode, 0)
+            artifact_zip = root / "artifact.zip"
+            info = zipfile.ZipInfo(bundle_name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            with zipfile.ZipFile(artifact_zip, "w") as archive:
+                archive.writestr(info, bundle_bytes)
+            artifact_archive_sha = hashlib.sha256(artifact_zip.read_bytes()).hexdigest()
+            extracted = root / "bundle.zip"
+            recovery.extract_publish_bundle(
+                artifact_zip,
+                extracted,
+                expected_name=bundle_name,
+                expected_sha=bundle_sha,
+                expected_archive_sha=artifact_archive_sha,
+            )
+            self.assertEqual(extracted.read_bytes(), bundle_bytes)
+
+            # upload-artifact@v6 uses a deflated ZIP by default.  Keep the
+            # outer archive policy closed while accepting that real producer
+            # format, and bind the extracted bytes to the same expected
+            # digest as the stored fixture above.
+            def write_member(path: Path, payload: bytes, compression: int) -> None:
+                member = zipfile.ZipInfo(bundle_name)
+                member.create_system = 3
+                member.external_attr = (stat.S_IFREG | 0o600) << 16
+                with zipfile.ZipFile(
+                    path,
+                    "w",
+                    compression=compression,
+                    allowZip64=False,
+                ) as archive:
+                    archive.writestr(member, payload, compress_type=compression)
+
+            def mutate_zip_headers(
+                source: Path,
+                destination: Path,
+                *,
+                encrypted: bool = False,
+                corrupt_crc: bool = False,
+            ) -> None:
+                raw = bytearray(source.read_bytes())
+                cursor = 0
+                while True:
+                    local = raw.find(b"PK\x03\x04", cursor)
+                    central = raw.find(b"PK\x01\x02", cursor)
+                    positions = [position for position in (local, central) if position >= 0]
+                    if not positions:
+                        break
+                    position = min(positions)
+                    if position == local:
+                        if encrypted:
+                            flags = int.from_bytes(raw[position + 6 : position + 8], "little")
+                            raw[position + 6 : position + 8] = (flags | 0x1).to_bytes(2, "little")
+                        if corrupt_crc:
+                            crc = int.from_bytes(raw[position + 14 : position + 18], "little")
+                            raw[position + 14 : position + 18] = (crc ^ 0x1).to_bytes(4, "little")
+                    else:
+                        if encrypted:
+                            flags = int.from_bytes(raw[position + 8 : position + 10], "little")
+                            raw[position + 8 : position + 10] = (flags | 0x1).to_bytes(2, "little")
+                        if corrupt_crc:
+                            crc = int.from_bytes(raw[position + 16 : position + 20], "little")
+                            raw[position + 16 : position + 20] = (crc ^ 0x1).to_bytes(4, "little")
+                    cursor = position + 4
+                destination.write_bytes(raw)
+
+            deflated_archive = root / "artifact-deflated.zip"
+            write_member(deflated_archive, bundle_bytes, zipfile.ZIP_DEFLATED)
+            deflated_extracted = root / "bundle-deflated.zip"
+            recovery.extract_publish_bundle(
+                deflated_archive,
+                deflated_extracted,
+                expected_name=bundle_name,
+                expected_sha=bundle_sha,
+                expected_archive_sha=hashlib.sha256(
+                    deflated_archive.read_bytes()
+                ).hexdigest(),
+            )
+            self.assertEqual(deflated_extracted.read_bytes(), bundle_bytes)
+
+            encrypted_archive = root / "artifact-encrypted.zip"
+            mutate_zip_headers(deflated_archive, encrypted_archive, encrypted=True)
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.extract_publish_bundle(
+                    encrypted_archive,
+                    root / "bundle-encrypted.zip",
+                    expected_name=bundle_name,
+                    expected_sha=bundle_sha,
+                )
+
+            corrupt_crc_archive = root / "artifact-corrupt-crc.zip"
+            mutate_zip_headers(deflated_archive, corrupt_crc_archive, corrupt_crc=True)
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.extract_publish_bundle(
+                    corrupt_crc_archive,
+                    root / "bundle-corrupt-crc.zip",
+                    expected_name=bundle_name,
+                    expected_sha=bundle_sha,
+                )
+
+            unsafe_path_archive = root / "artifact-unsafe-path.zip"
+            unsafe_info = zipfile.ZipInfo("../escape.zip")
+            unsafe_info.create_system = 3
+            unsafe_info.external_attr = (stat.S_IFREG | 0o600) << 16
+            with zipfile.ZipFile(unsafe_path_archive, "w", allowZip64=False) as archive:
+                archive.writestr(unsafe_info, bundle_bytes)
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.extract_publish_bundle(
+                    unsafe_path_archive,
+                    root / "bundle-unsafe-path.zip",
+                    expected_name=bundle_name,
+                    expected_sha=bundle_sha,
+                )
+
+            replacement_archive = root / "artifact-replacement.zip"
+            shutil.copy2(deflated_archive, replacement_archive)
+            race_archive = root / "artifact-race.zip"
+            shutil.copy2(deflated_archive, race_archive)
+            original_open = recovery.os.open
+
+            def replace_archive_before_open(path, flags, *arguments):
+                if Path(path) == race_archive:
+                    race_archive.unlink()
+                    race_archive.symlink_to(replacement_archive)
+                return original_open(path, flags, *arguments)
+
+            with mock.patch.object(recovery.os, "open", side_effect=replace_archive_before_open):
+                with self.assertRaises(recovery.RecoveryBootstrapError):
+                    recovery.extract_publish_bundle(
+                        race_archive,
+                        root / "bundle-race.zip",
+                        expected_name=bundle_name,
+                        expected_sha=bundle_sha,
+                    )
+
+            unsupported_archive = root / "artifact-unsupported.zip"
+            write_member(unsupported_archive, bundle_bytes, zipfile.ZIP_LZMA)
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.extract_publish_bundle(
+                    unsupported_archive,
+                    root / "bundle-unsupported.zip",
+                    expected_name=bundle_name,
+                    expected_sha=bundle_sha,
+                )
+
+            ratio_archive = root / "artifact-ratio.zip"
+            ratio_payload = b"A" * (recovery.MAX_MEMBER_COMPRESSION_RATIO * 2_000)
+            ratio_sha = hashlib.sha256(ratio_payload).hexdigest()
+            write_member(ratio_archive, ratio_payload, zipfile.ZIP_DEFLATED)
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.extract_publish_bundle(
+                    ratio_archive,
+                    root / "bundle-ratio.zip",
+                    expected_name=bundle_name,
+                    expected_sha=ratio_sha,
+                )
+
+            oversize_archive = root / "artifact-oversize.zip"
+            oversize_payload = b"B" * (recovery.MAX_ARCHIVE_BYTES + 1)
+            oversize_sha = hashlib.sha256(oversize_payload).hexdigest()
+            write_member(oversize_archive, oversize_payload, zipfile.ZIP_DEFLATED)
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.extract_publish_bundle(
+                    oversize_archive,
+                    root / "bundle-oversize.zip",
+                    expected_name=bundle_name,
+                    expected_sha=oversize_sha,
+                )
+
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.extract_publish_bundle(
+                    artifact_zip,
+                    root / "wrong-bundle.zip",
+                    expected_name=bundle_name,
+                    expected_sha="c" * 64,
+                )
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.extract_publish_bundle(
+                    artifact_zip,
+                    root / "wrong-artifact-digest.zip",
+                    expected_name=bundle_name,
+                    expected_sha=bundle_sha,
+                    expected_archive_sha="d" * 64,
+                )
+
+            evidence = recovery.build_publish_evidence(
+                provenance_value,
+                bundle_name=bundle_name,
+                bundle_sha=bundle_sha,
+                recovery_run_id=recovery_run_id,
+                recovery_run_attempt=recovery_attempt,
+                recovery_job_id="33",
+            )
+            self.assertEqual(
+                set(evidence),
+                {
+                    "schema",
+                    "capability",
+                    "capabilities",
+                    "deployable",
+                    "bundle_name",
+                    "bundle_sha256",
+                    "recovery_run_id",
+                    "recovery_run_attempt",
+                    "recovery_job_id",
+                    "provenance",
+                },
+            )
+            self.assertFalse(evidence["deployable"])
+            publisher_evidence = recovery.build_publish_evidence(
+                provenance_value,
+                bundle_name=bundle_name,
+                bundle_sha=bundle_sha,
+                bundle_artifact_sha256=artifact_archive_sha,
+                recovery_run_id=recovery_run_id,
+                recovery_run_attempt=recovery_attempt,
+                recovery_job_id="33",
+                publisher_workflow_sha="c" * 40,
+                publisher_run_id="44",
+                publisher_run_attempt="1",
+                publisher_job_id="55",
+            )
+            self.assertEqual(publisher_evidence["schema"], 2)
+            self.assertEqual(
+                publisher_evidence["bundle_artifact_sha256"], artifact_archive_sha
+            )
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.build_publish_evidence(
+                    provenance_value,
+                    bundle_name=bundle_name,
+                    bundle_sha=bundle_sha,
+                    recovery_run_id=recovery_run_id,
+                    recovery_run_attempt=recovery_attempt,
+                    recovery_job_id="0",
+                )
 
     def test_provenance_workflows_have_closed_exact_job_identity_predicates(self) -> None:
         workflow_paths = (
             REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-build.yml",
             REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
             REPO_ROOT / ".github/workflows/platform-production-release-recover.yml",
+            REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
         )
         for path in workflow_paths:
             text_value = path.read_text(encoding="utf-8")
             with self.subTest(workflow=path.name):
                 self.assertIn('type(row.get("id")) is int', text_value)
+                self.assertIn('row.get("id") > 0', text_value)
                 self.assertIn('row.get("run_id") ==', text_value)
                 self.assertIn('row.get("run_attempt") ==', text_value)
+
+    def test_publisher_self_job_predicate_is_exact_and_in_progress_only(self) -> None:
+        text_value = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-recovery-bootstrap-publish.yml"
+        ).read_text(encoding="utf-8")
+        for predicate in (
+            'type(row.get("id")) is int',
+            'row.get("id") > 0',
+            'row.get("run_id") == int(os.environ["PUBLISHER_RUN_ID"])',
+            'row.get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"])',
+            'row.get("head_sha") == os.environ["PUBLISHER_WORKFLOW_SHA"]',
+            'row.get("status") == "in_progress"',
+            'row.get("conclusion") is None',
+        ):
+            with self.subTest(predicate=predicate):
+                self.assertIn(predicate, text_value)
+        self.assertIn("github.event.workflow_run.status == 'completed'", text_value)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", text_value)
+
+    def test_completed_publisher_event_identity_is_exact_and_rerun_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory)
+            repository = "StrayForest/old_sparky"
+            source_sha = "a" * 40
+            producer_sha = "b" * 40
+            publisher_sha = "c" * 40
+            route_digest = "d" * 64
+            bundle_digest = "e" * 64
+            producer_id, producer_attempt = 200, 3
+            security_id, security_attempt = 100, 2
+
+            def fixture(producer_run: int, producer_try: int) -> dict[str, object]:
+                bundle_name = (
+                    f"platform-recovery-bootstrap-{source_sha}-{security_id}-"
+                    f"{security_attempt}-{producer_run}-{producer_try}.zip"
+                )
+                return {
+                    "producer-run.json": {
+                        "id": producer_run,
+                        "run_attempt": producer_try,
+                        "head_sha": producer_sha,
+                        "head_branch": "dev",
+                        "event": "workflow_run",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "name": "Platform production recovery bootstrap build",
+                        "path": ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+                        "repository": {"full_name": repository},
+                    },
+                    "producer-jobs.json": {
+                        "total_count": 1,
+                        "jobs": [{
+                            "id": producer_run + 1,
+                            "name": "Build retained-release recovery bootstrap evidence",
+                            "run_id": producer_run,
+                            "run_attempt": producer_try,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "head_sha": producer_sha,
+                        }],
+                    },
+                    "producer-artifacts.json": {
+                        "total_count": 1,
+                        "artifacts": [{
+                            "id": producer_run + 2,
+                            "name": bundle_name,
+                            "expired": False,
+                            "digest": f"sha256:{bundle_digest}",
+                            "workflow_run": {
+                                "id": producer_run,
+                                "run_attempt": producer_try,
+                                "head_sha": producer_sha,
+                                "repository": {"full_name": repository},
+                            },
+                        }],
+                    },
+                    "security-run.json": {
+                        "id": security_id,
+                        "run_attempt": security_attempt,
+                        "head_sha": source_sha,
+                        "head_branch": "dev",
+                        "event": "push",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "name": "Platform security and build",
+                        "path": ".github/workflows/platform-security.yml",
+                        "repository": {"full_name": repository},
+                    },
+                    "security-jobs.json": {
+                        "total_count": 1,
+                        "jobs": [{
+                            "id": 110,
+                            "name": "Verification contract",
+                            "run_id": security_id,
+                            "run_attempt": security_attempt,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "head_sha": source_sha,
+                        }],
+                    },
+                    "security-artifacts.json": {
+                        "total_count": 1,
+                        "artifacts": [{
+                            "id": 120,
+                            "name": f"platform-ci-route-{security_id}-{security_attempt}",
+                            "expired": False,
+                            "digest": f"sha256:{route_digest}",
+                            "workflow_run": {
+                                "id": security_id,
+                                "run_attempt": security_attempt,
+                                "head_sha": source_sha,
+                                "repository": {"full_name": repository},
+                            },
+                        }],
+                    },
+                }
+
+            def write(value: dict[str, object]) -> None:
+                for name, payload in value.items():
+                    (metadata / name).write_text(json.dumps(payload), encoding="ascii")
+
+            value = fixture(producer_id, producer_attempt)
+            write(value)
+            selected = recovery.select_publisher_bundle_metadata(
+                metadata,
+                repository=repository,
+                producer_run_id=str(producer_id),
+                producer_run_attempt=str(producer_attempt),
+                producer_workflow="Platform production recovery bootstrap build",
+                producer_workflow_path=".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            )
+            self.assertEqual(selected["producer_job_id"], producer_id + 1)
+            self.assertEqual(selected["bundle_artifact_id"], producer_id + 2)
+            over_100 = json.loads(json.dumps(value))
+            producer_jobs = over_100["producer-jobs.json"]["jobs"]
+            producer_jobs.extend(
+                {
+                    "id": producer_id + 100 + index,
+                    "name": "unrelated producer job",
+                    "run_id": producer_id,
+                    "run_attempt": producer_attempt,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "head_sha": producer_sha,
+                }
+                for index in range(100)
+            )
+            over_100["producer-jobs.json"]["total_count"] = 101
+            write(over_100)
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.select_publisher_bundle_metadata(
+                    metadata,
+                    repository=repository,
+                    producer_run_id=str(producer_id),
+                    producer_run_attempt=str(producer_attempt),
+                    producer_workflow="Platform production recovery bootstrap build",
+                    producer_workflow_path=".github/workflows/platform-production-recovery-bootstrap-build.yml",
+                )
+            write(value)
+            result = recovery.validate_publisher_metadata(
+                metadata,
+                repository=repository,
+                producer_run_id=str(producer_id),
+                producer_run_attempt=str(producer_attempt),
+                producer_workflow="Platform production recovery bootstrap build",
+                producer_workflow_path=".github/workflows/platform-production-recovery-bootstrap-build.yml",
+                security_workflow="Platform security and build",
+                security_workflow_path=".github/workflows/platform-security.yml",
+                security_job="Verification contract",
+                publisher_workflow_sha=publisher_sha,
+                publisher_run_id="300",
+                publisher_run_attempt="1",
+                publisher_job_id="301",
+                github_ref="refs/heads/dev",
+            )
+            self.assertEqual(result["publisher_workflow_sha"], publisher_sha)
+            self.assertEqual(result["producer_workflow_sha"], producer_sha)
+
+            for field, bad_value in (
+                ("status", "in_progress"),
+                ("event", "push"),
+                ("head_sha", source_sha),
+                ("conclusion", "failure"),
+            ):
+                mutated = json.loads(json.dumps(value))
+                mutated["producer-run.json"][field] = bad_value
+                write(mutated)
+                with self.subTest(field=field), self.assertRaises(recovery.RecoveryBootstrapError):
+                    recovery.select_publisher_bundle_metadata(
+                        metadata,
+                        repository=repository,
+                        producer_run_id=str(producer_id),
+                        producer_run_attempt=str(producer_attempt),
+                        producer_workflow="Platform production recovery bootstrap build",
+                        producer_workflow_path=".github/workflows/platform-production-recovery-bootstrap-build.yml",
+                    )
+            rerun = fixture(201, 4)
+            write(rerun)
+            rerun_result = recovery.validate_publisher_metadata(
+                metadata,
+                repository=repository,
+                producer_run_id="201",
+                producer_run_attempt="4",
+                producer_workflow="Platform production recovery bootstrap build",
+                producer_workflow_path=".github/workflows/platform-production-recovery-bootstrap-build.yml",
+                security_workflow="Platform security and build",
+                security_workflow_path=".github/workflows/platform-security.yml",
+                security_job="Verification contract",
+                publisher_workflow_sha=publisher_sha,
+                publisher_run_id="302",
+                publisher_run_attempt="2",
+                publisher_job_id="303",
+                github_ref="refs/heads/dev",
+            )
+            self.assertEqual(rerun_result["producer_run_id"], "201")
+            self.assertEqual(rerun_result["producer_run_attempt"], "4")
 
     def test_recovery_bootstrap_route_is_non_deployable_and_mixed_runtime_is_deployable(self) -> None:
         sys.path.insert(0, str(TOOLS))
         from tools import platform_ci_classifier as classifier
+
+        def actual_changed_paths(base: str) -> tuple[str, ...]:
+            tracked = subprocess.check_output(
+                ["git", "diff", "--name-only", base, "--"],
+                cwd=REPO_ROOT,
+                text=True,
+                timeout=10,
+            ).splitlines()
+            untracked = subprocess.check_output(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                cwd=REPO_ROOT,
+                text=True,
+                timeout=10,
+            ).splitlines()
+            return tuple(sorted(set(tracked) | set(untracked)))
 
         patch_file_digest = hashlib.sha256(
             "\n".join(sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)).encode()
@@ -1140,6 +1841,39 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT,
         )
         self.assertEqual(patch_file_digest, RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST)
+        actual_pr_paths = actual_changed_paths(RECOVERY_BOOTSTRAP_PR_BASE)
+        self.assertEqual(
+            actual_pr_paths,
+            tuple(sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)),
+            "full PR fixture must match the exact checked-out PR diff",
+        )
+        self.assertEqual(len(actual_pr_paths), RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT)
+        self.assertEqual(
+            hashlib.sha256("\n".join(actual_pr_paths).encode()).hexdigest(),
+            RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST,
+        )
+        delta_file_digest = hashlib.sha256(
+            "\n".join(sorted(RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)).encode()
+        ).hexdigest()
+        self.assertEqual(
+            len(RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES),
+            RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT,
+        )
+        self.assertEqual(
+            delta_file_digest,
+            RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST,
+        )
+        actual_delta_paths = actual_changed_paths(RECOVERY_BOOTSTRAP_CURRENT_DELTA_BASE)
+        self.assertEqual(
+            actual_delta_paths,
+            tuple(sorted(RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)),
+            "current-delta fixture must match the exact checked-out diff",
+        )
+        self.assertEqual(len(actual_delta_paths), RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_COUNT)
+        self.assertEqual(
+            hashlib.sha256("\n".join(actual_delta_paths).encode()).hexdigest(),
+            RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST,
+        )
         paths = sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)
         for event, branch in (
             ("pull_request", "feature/recovery-bootstrap"),
@@ -1153,6 +1887,24 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     branch=branch,
                 )
                 self.assertEqual(set(manifest["files"]), RECOVERY_BOOTSTRAP_PATCH_FILES)
+                self.assertEqual(manifest["class"], "full")
+                self.assertFalse(manifest["deployable"])
+                self.assertFalse(manifest["fallback"])
+                classifier.validate_manifest(manifest, expected_target_sha="a" * 40)
+
+        delta_paths = sorted(RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)
+        for event, branch in (
+            ("pull_request", "feature/recovery-bootstrap-delta"),
+            ("push", "dev"),
+        ):
+            with self.subTest(delta_event=event):
+                manifest = classifier.classify(
+                    delta_paths,
+                    event=event,
+                    target_sha="a" * 40,
+                    branch=branch,
+                )
+                self.assertEqual(set(manifest["files"]), RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)
                 self.assertEqual(manifest["class"], "full")
                 self.assertFalse(manifest["deployable"])
                 self.assertFalse(manifest["fallback"])
@@ -1189,9 +1941,25 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             canonical - RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES
         ) | RECOVERY_BOOTSTRAP_PATCH_DOCS
         self.assertEqual(derived_patch_files, RECOVERY_BOOTSTRAP_PATCH_FILES)
-        self.assertEqual(canonical, self._set_assignment(classifier_source, "RECOVERY_BOOTSTRAP_FILES"))
-        self.assertEqual(canonical, self._set_assignment(artifact_source, "RECOVERY_BOOTSTRAP_FILES"))
-        self.assertEqual(canonical, self._workflow_recovery_set(auto_deploy_source))
+        classifier_files = self._set_assignment(
+            classifier_source, "RECOVERY_BOOTSTRAP_FILES"
+        )
+        artifact_files = self._set_assignment(
+            artifact_source, "RECOVERY_BOOTSTRAP_FILES"
+        )
+        workflow_files = self._workflow_recovery_set(auto_deploy_source)
+        self.assertEqual(canonical, classifier_files)
+        self.assertEqual(canonical, artifact_files)
+        self.assertEqual(canonical, workflow_files)
+        for representation in (
+            canonical,
+            classifier_files,
+            artifact_files,
+            workflow_files,
+        ):
+            self.assertIn(
+                "platform/tools/platform_recovery_bootstrap.py", representation
+            )
 
 
 if __name__ == "__main__":

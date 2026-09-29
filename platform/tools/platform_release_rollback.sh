@@ -403,9 +403,71 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
       public_status failed systemd_state >&2
       exit 1
     fi
+    original_current="$(transaction_json | json_field current_before)"
+    original_previous="$(transaction_json | json_field previous_before)"
     trap '' HUP INT TERM
-    /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
-      --state "$TRANSACTION_STATE"
+    if [[ -n "$original_current" && -z "$original_previous" ]]; then
+      # A deploy-owned current-only receipt must carry a complete service
+      # snapshot before it can enter the service-pending recovery protocol.
+      # The low-level installer can, however, be interrupted before promotion
+      # (including the previous-pointer rename) before deploy has captured any
+      # service state.  That narrow pre-pointer window is filesystem-only and
+      # may recover without invoking systemd; every later current-only phase
+      # remains fail-closed when the snapshot is absent or partial.
+      snapshot_mode=""
+      if /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-service-snapshot \
+        --state "$TRANSACTION_STATE" --require present; then
+        snapshot_mode=present
+      elif /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-service-snapshot \
+        --state "$TRANSACTION_STATE" --require absent; then
+        snapshot_mode=absent
+      else
+        public_status failed transaction >&2
+        exit 1
+      fi
+      if [[ "$snapshot_mode" == "absent" ]]; then
+        case "$PENDING_PHASE" in
+          prepared|venv-transitioned|snapshot-placed|current-switched|previous-switched|staged)
+            /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+              --retain --state "$TRANSACTION_STATE"
+            /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+              --state "$TRANSACTION_STATE"
+            ;;
+          *)
+            public_status failed transaction >&2
+            exit 1
+            ;;
+        esac
+      else
+        case "$PENDING_PHASE" in
+          recovery-restored)
+            ;;
+          filesystem-restored-services-pending)
+            ;;
+          prepared|venv-transitioned|snapshot-placed|current-switched|previous-switched|pointers-switched|staged|recovery-authorized)
+            /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+              --retain --service-pending --state "$TRANSACTION_STATE"
+            ;;
+          *)
+            public_status failed transaction >&2
+            exit 1
+            ;;
+        esac
+        if [[ "$(transaction_json | json_field phase)" == "filesystem-restored-services-pending" ]]; then
+          /usr/bin/python3 -I "$TRANSACTION_TOOL" restore-services \
+            --state "$TRANSACTION_STATE" --systemctl "$SYSTEMCTL_BIN"
+          /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+            --state "$TRANSACTION_STATE" \
+            --expected filesystem-restored-services-pending \
+            --phase recovery-restored
+        fi
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+          --state "$TRANSACTION_STATE"
+      fi
+    else
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+        --state "$TRANSACTION_STATE"
+    fi
     trap - HUP INT TERM
     public_status passed recovery
   else

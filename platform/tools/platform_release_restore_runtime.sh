@@ -17,6 +17,7 @@ PUBLIC_EDGE_ORIGIN="https://old-sparky.com"
 SYSTEMD_STATE=""
 TRANSACTION_STATE=""
 SYSTEMCTL_BIN="/usr/bin/systemctl"
+SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"
 LIVE_QA_RUNTIME_INSTALLER=""
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
@@ -266,12 +267,19 @@ prepare_runtime_private() {
   # to enable/start for a first activation, so every rollback/recovery call
   # must override that default explicitly before it can touch systemd.
   export PLATFORM_ENABLE_SYSTEMD_UNITS=0
+  export PLATFORM_SYSTEMCTL_BIN="$SYSTEMCTL_BIN"
   PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"
   set +e
   PLATFORM_APP_DIR="$APP_DIR" "$SHARED_VENV/bin/python" \
     "$NGINX_TOOL" --apply --reload --json
   nginx_status="$?"
   set -e
+}
+
+# Keep all direct systemctl calls bounded just like the immutable systemd
+# receipt helper.  A hung manager must retain the caller's recovery receipt.
+run_systemctl() {
+  "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s "$SYSTEMCTL_BIN" "$@"
 }
 
 restore_systemd_enabled_state() {
@@ -305,7 +313,7 @@ if [[ "$PREPARE_RUNTIME" -eq 1 ]]; then
     # that restored disk state before returning failure so active Nginx cannot
     # remain divergent from the recovery contour.
     /usr/sbin/nginx -t >/dev/null 2>/dev/null
-    /usr/bin/systemctl reload nginx.service >/dev/null 2>/dev/null
+    run_systemctl reload nginx.service >/dev/null 2>/dev/null
     exit "$nginx_status"
   fi
   # --prepare-only must never start an inactive unit.  It may repair the
@@ -318,16 +326,16 @@ if [[ "$RUN_RESTART" -eq 1 && "$RESTART_AFTER" -eq 1 ]]; then
   if [[ -n "$SYSTEMD_STATE" ]]; then
     restore_systemd_state
   else
-    /usr/bin/systemctl restart deadlock-api deadlock-worker deadlock-web >/dev/null 2>/dev/null
+    run_systemctl restart deadlock-api deadlock-worker deadlock-web >/dev/null 2>/dev/null
     for service in deadlock-api deadlock-worker deadlock-web; do
-      /usr/bin/systemctl is-active --quiet "$service" >/dev/null 2>/dev/null
+      run_systemctl is-active --quiet "$service" >/dev/null 2>/dev/null
     done
   fi
-  if /usr/bin/systemctl is-active --quiet deadlock-api >/dev/null 2>/dev/null; then
+  if run_systemctl is-active --quiet deadlock-api >/dev/null 2>/dev/null; then
     /usr/bin/curl --fail --silent --show-error --max-time 10 \
       http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null
   fi
-  if /usr/bin/systemctl is-active --quiet deadlock-web >/dev/null 2>/dev/null; then
+  if run_systemctl is-active --quiet deadlock-web >/dev/null 2>/dev/null; then
     /usr/bin/curl --fail --silent --show-error --max-time 10 \
       http://127.0.0.1:3000/ >/dev/null 2>/dev/null
   fi

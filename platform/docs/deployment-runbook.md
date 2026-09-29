@@ -384,18 +384,23 @@ systemd-paired receipt remains retained.
 
 Use the manual **Platform production recovery bootstrap abort** workflow only
 after reviewing the retained receipt and confirming that the migration was
-not reversed. Supply the exact successful `Platform security and build` run
-ID and attempt, then type `ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY`. The
-workflow validates the default-branch run, route artifact, closed evidence,
+not reversed. Supply the exact successful security run ID/attempt, the exact
+completed recovery-build producer run ID/attempt, and the exact completed
+publisher run ID/attempt; then type `ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY`.
+The workflow validates those exact attempts, route artifact, schema-2 evidence,
 bundle digest and build attestation before it reads `PROD_SSH_*` secrets or
-opens SSH. Attestation verification pins `refs/heads/dev`, the exact source
-digest, recovery run attempt and successful build job; the downloaded bundle is
-re-hashed and re-stat'ed immediately before transfer. It transfers no source
-checkout to the host. GitHub's certificate `runInvocationURI` is scoped to the
-run and attempt, not an individual job; the workflow therefore binds the
-numeric job ID selected from that exact attempt's jobs API into the closed
-evidence artifact and rejects any evidence/API pairing drift before accepting
-the attestation.
+opens SSH. The bundle source SHA **A**, producer workflow SHA **B**, and
+publisher workflow SHA **C** are separate bindings: attestation uses **B**,
+while the evidence and bundle name bind **A**, **P**, and **C**. A rerun is
+selected only by its supplied ID and attempt; a latest-by-SHA match is never
+accepted. The downloaded bundle is re-hashed and re-stat'ed immediately before
+transfer; publisher evidence also carries the producer artifact API digest,
+which is checked before the publisher extracts the bundle member. It transfers
+no source checkout to the host. GitHub's certificate
+`runInvocationURI` is scoped to the run and attempt, not an individual job; the
+workflow therefore binds the numeric producer and publisher job IDs selected
+from their exact attempt jobs APIs into the closed evidence artifact and
+rejects any evidence/API pairing drift before accepting the attestation.
 
 The host installs the verified bundle as one immutable generation and invokes
 only its fixed `platform_abort_retained_only.sh` entrypoint for this workflow.
@@ -418,8 +423,15 @@ security run/attempt and recovery build run/attempt/job evidence. If that
 content address or capability is unavailable, recovery fails closed; it never
 scans for a latest or sole generation and never resolves helpers from a missing
 current release. This path accepts only a new operation-ID receipt whose
-current and previous identities are both absent (or the deliberate
-current-only topology), and it requires no systemd receipt.
+current and previous identities are both absent, requires no systemd receipt,
+and performs zero systemd calls, even when a complete inactive snapshot is
+present. The deliberate current-only topology also
+requires no systemd receipt, but its immutable receipt must contain the
+complete pre-quiesce API/worker/web/timer snapshot; recovery restores those
+exact states before cleanup and retries from a durable
+`filesystem-restored-services-pending` phase after an interruption. Partial or
+missing current-only snapshots remain
+retained before any systemd call.
 
 ## Smoke
 

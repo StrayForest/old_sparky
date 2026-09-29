@@ -11,6 +11,22 @@ on:
         description: "Exact attempt for that security run"
         required: true
         type: string
+      recovery_run_id:
+        description: "Exact completed recovery-bootstrap producer run ID"
+        required: true
+        type: string
+      recovery_run_attempt:
+        description: "Exact attempt for that recovery-bootstrap producer run"
+        required: true
+        type: string
+      publisher_run_id:
+        description: "Exact completed recovery-bootstrap publisher run ID"
+        required: true
+        type: string
+      publisher_run_attempt:
+        description: "Exact attempt for that recovery-bootstrap publisher run"
+        required: true
+        type: string
       confirmation:
         description: "Type ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY"
         required: true
@@ -38,11 +54,17 @@ jobs:
       REPOSITORY: StrayForest/old_sparky
       SECURITY_RUN_ID: ${{ inputs.security_run_id }}
       SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
+      RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+      RECOVERY_RUN_ATTEMPT: ${{ inputs.recovery_run_attempt }}
+      PUBLISHER_RUN_ID: ${{ inputs.publisher_run_id }}
+      PUBLISHER_RUN_ATTEMPT: ${{ inputs.publisher_run_attempt }}
       ABORT_CONFIRMATION: ${{ inputs.confirmation }}
       SECURITY_WORKFLOW: Platform security and build
       SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
       SECURITY_JOB: Verification contract
       RECOVERY_BUILD_JOB: Build retained-release recovery bootstrap evidence
+      PUBLISHER_WORKFLOW: Platform production recovery bootstrap publish
+      PUBLISHER_WORKFLOW_PATH: .github/workflows/platform-production-recovery-bootstrap-publish.yml
     steps:
       - name: Validate exact recovery request before secrets or SSH
         shell: bash
@@ -52,6 +74,10 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/dev"
           [[ "$SECURITY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$SECURITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$RECOVERY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$RECOVERY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$PUBLISHER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$PUBLISHER_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
           test "$ABORT_CONFIRMATION" = "ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY"
 
       - name: Validate exact successful security run, route artifact and evidence
@@ -64,17 +90,17 @@ jobs:
           metadata="$RUNNER_TEMP/platform-recovery-bootstrap-evidence"
           install -d -m 700 "$metadata"
           api="$GITHUB_API_URL/repos/$REPOSITORY"
-          curl --fail-with-body --silent --show-error \
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "$api/actions/runs/$SECURITY_RUN_ID" --output "$metadata/run.json"
-          curl --fail-with-body --silent --show-error \
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100" --output "$metadata/jobs.json"
-          curl --fail-with-body --silent --show-error \
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
@@ -88,11 +114,11 @@ jobs:
           PY
           )"
           [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
-          curl --fail-with-body --silent --show-error \
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "$api/actions/workflows/platform-production-recovery-bootstrap-build.yml/runs?head_sha=$source_sha&event=workflow_run&status=success&per_page=100" --output "$metadata/recovery-runs.json"
+            "$api/actions/runs/$RECOVERY_RUN_ID/attempts/$RECOVERY_RUN_ATTEMPT" --output "$metadata/recovery-run.json"
           /usr/bin/python3 -I -B - "$metadata" "$GITHUB_OUTPUT" <<'PY'
           import json
           import os
@@ -109,7 +135,7 @@ jobs:
           run = json.loads((root / "run.json").read_text(encoding="utf-8"))
           jobs = json.loads((root / "jobs.json").read_text(encoding="utf-8"))
           artifacts = json.loads((root / "artifacts.json").read_text(encoding="utf-8"))
-          recovery_runs = json.loads((root / "recovery-runs.json").read_text(encoding="utf-8"))
+          recovery_run = json.loads((root / "recovery-run.json").read_text(encoding="utf-8"))
           source_sha = run.get("head_sha")
           if not (
               run.get("id") == run_id
@@ -124,11 +150,14 @@ jobs:
           ):
               raise SystemExit("security run provenance is not exact")
           rows = jobs.get("jobs")
+          if not isinstance(rows, list) or type(jobs.get("total_count")) is not int or jobs["total_count"] != len(rows):
+              raise SystemExit("security jobs response is incomplete")
           security_matches = [
               row for row in rows or []
               if (
                   isinstance(row, dict)
                   and type(row.get("id")) is int
+                  and row.get("id") > 0
                   and row.get("name") == os.environ["SECURITY_JOB"]
                   and row.get("run_id") == run_id
                   and row.get("run_attempt") == attempt
@@ -140,82 +169,51 @@ jobs:
           if not isinstance(rows, list) or len(security_matches) != 1:
               raise SystemExit("exact successful security verification job is missing")
           artifact_rows = artifacts.get("artifacts")
-          if not isinstance(artifact_rows, list):
-              raise SystemExit("security artifacts response is malformed")
-          route_matches = [row for row in artifact_rows if isinstance(row, dict) and row.get("name") == f"platform-ci-route-{run_id}-{attempt}" and row.get("expired") is False and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == run_id and row["workflow_run"].get("head_sha") == run.get("head_sha")]
+          if not isinstance(artifact_rows, list) or type(artifacts.get("total_count")) is not int or artifacts["total_count"] != len(artifact_rows):
+              raise SystemExit("security artifacts response is incomplete")
+          route_matches = [row for row in artifact_rows if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") > 0 and row.get("name") == f"platform-ci-route-{run_id}-{attempt}" and row.get("expired") is False and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == run_id and row["workflow_run"].get("head_sha") == run.get("head_sha")]
           if len(route_matches) != 1:
               raise SystemExit("exact security route artifact is missing")
           route = route_matches[0]
-          recovery_rows = recovery_runs.get("workflow_runs")
-          if not isinstance(recovery_rows, list):
-              raise SystemExit("recovery workflow response is malformed")
-          recovery_matches = [row for row in recovery_rows if isinstance(row, dict) and row.get("name") == "Platform production recovery bootstrap build" and row.get("path") == ".github/workflows/platform-production-recovery-bootstrap-build.yml" and row.get("head_sha") == source_sha and row.get("head_branch") == "dev" and row.get("event") == "workflow_run" and row.get("status") == "completed" and row.get("conclusion") == "success" and (row.get("repository") or {}).get("full_name") == repository]
-          if len(recovery_matches) != 1 or type(recovery_matches[0].get("id")) is not int:
-              raise SystemExit("exact successful recovery-bootstrap build run is missing")
-          recovery_run = recovery_matches[0]
+          if not (
+              recovery_run.get("id") == int(os.environ["RECOVERY_RUN_ID"])
+              and recovery_run.get("run_attempt") == int(os.environ["RECOVERY_RUN_ATTEMPT"])
+              and recovery_run.get("name") == "Platform production recovery bootstrap build"
+              and recovery_run.get("path") == ".github/workflows/platform-production-recovery-bootstrap-build.yml"
+              and recovery_run.get("head_branch") == "dev"
+              and recovery_run.get("event") == "workflow_run"
+              and recovery_run.get("status") == "completed"
+              and recovery_run.get("conclusion") == "success"
+              and (recovery_run.get("repository") or {}).get("full_name") == repository
+              and isinstance(recovery_run.get("head_sha"), str)
+              and re.fullmatch(r"[0-9a-f]{40,64}", recovery_run["head_sha"])
+          ):
+              raise SystemExit("exact recovery-bootstrap producer run is missing or invalid")
           if not isinstance(route.get("digest"), str) or re.fullmatch(r"sha256:[0-9a-f]{64}", route["digest"]) is None:
               raise SystemExit("route artifact digest is invalid")
           with output.open("a", encoding="ascii") as stream:
               stream.write(f"source_sha={source_sha}\n")
-              stream.write(f"recovery_run_id={recovery_run.get('id')}\n")
+              stream.write(f"recovery_run_id={recovery_run['id']}\n")
+              stream.write(f"recovery_run_attempt={recovery_run['run_attempt']}\n")
+              stream.write(f"recovery_workflow_sha={recovery_run['head_sha']}\n")
               stream.write(f"route_digest={route['digest'].removeprefix('sha256:')}\n")
+              stream.write(f"bundle_name=platform-recovery-bootstrap-{source_sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}.zip\n")
+              stream.write(f"evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{recovery_run['id']}-{recovery_run['run_attempt']}-{os.environ['PUBLISHER_RUN_ID']}-{os.environ['PUBLISHER_RUN_ATTEMPT']}.json\n")
           # Evidence and bundle are downloaded by the next step; the host is
           # not contacted and no production secret has been read yet.
           _ = route
           PY
           recovery_run_id="$(awk -F= '$1 == "recovery_run_id" {print $2}' "$GITHUB_OUTPUT")"
           [[ "$recovery_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
-          curl --fail-with-body --silent --show-error \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "$api/actions/runs/$recovery_run_id" --output "$metadata/recovery-run.json"
-          /usr/bin/python3 -I -B - "$metadata/recovery-run.json" "$GITHUB_OUTPUT" "$recovery_run_id" <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          import re
-          import sys
-
-          run = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected_id = int(sys.argv[3])
-          if not isinstance(run.get("run_attempt"), int) or run["run_attempt"] < 1:
-              raise SystemExit("recovery build run attempt is unavailable")
-          if (
-              run.get("id") != expected_id
-              or run.get("name") != "Platform production recovery bootstrap build"
-              or run.get("path") != ".github/workflows/platform-production-recovery-bootstrap-build.yml"
-              or run.get("event") != "workflow_run"
-              or run.get("status") != "completed"
-              or run.get("conclusion") != "success"
-              or run.get("head_branch") != "dev"
-              or (run.get("repository") or {}).get("full_name") != "StrayForest/old_sparky"
-          ):
-              raise SystemExit("recovery build run provenance is not exact")
-          # The source SHA is carried by the selected run and is checked again
-          # against the security run before names are accepted.
-          security = json.loads(Path(Path(sys.argv[1]).parent / "run.json").read_text(encoding="utf-8"))
-          if run.get("head_sha") != security.get("head_sha"):
-              raise SystemExit("recovery build source SHA changed")
-          run_id = run["id"]
-          attempt = run["run_attempt"]
-          sha = run["head_sha"]
-          if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
-              raise SystemExit("recovery build source SHA is invalid")
-          output = Path(sys.argv[2])
-          with output.open("a", encoding="ascii") as stream:
-              stream.write(f"recovery_run_attempt={attempt}\n")
-              stream.write(f"bundle_name=platform-recovery-bootstrap-{sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{run_id}-{attempt}.zip\n")
-              stream.write(f"evidence_name=platform-recovery-bootstrap-evidence-{sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{run_id}-{attempt}.json\n")
-          PY
           recovery_run_attempt="$(awk -F= '$1 == "recovery_run_attempt" {print $2}' "$GITHUB_OUTPUT")"
           [[ "$recovery_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
-          curl --fail-with-body --silent --show-error \
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "$api/actions/runs/$recovery_run_id/attempts/$recovery_run_attempt/jobs?per_page=100" --output "$metadata/recovery-jobs.json"
-          /usr/bin/python3 -I -B - "$metadata/recovery-jobs.json" "$GITHUB_OUTPUT" "$recovery_run_id" "$recovery_run_attempt" "$source_sha" <<'PY'
+          recovery_workflow_sha="$(awk -F= '$1 == "recovery_workflow_sha" {print $2}' "$GITHUB_OUTPUT")"
+          /usr/bin/python3 -I -B - "$metadata/recovery-jobs.json" "$GITHUB_OUTPUT" "$recovery_run_id" "$recovery_run_attempt" "$recovery_workflow_sha" <<'PY'
           import json
           import os
           from pathlib import Path
@@ -223,7 +221,7 @@ jobs:
 
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           rows = payload.get("jobs") if isinstance(payload, dict) else None
-          if not isinstance(rows, list):
+          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or payload["total_count"] != len(rows):
               raise SystemExit("recovery build jobs response is malformed")
           expected_run_id = int(sys.argv[3])
           expected_attempt = int(sys.argv[4])
@@ -236,6 +234,7 @@ jobs:
                   and row.get("name") == os.environ["RECOVERY_BUILD_JOB"]
                   and row.get("conclusion") == "success"
                   and type(row.get("id")) is int
+                  and row.get("id") > 0
                   and row.get("run_id") == expected_run_id
                   and row.get("run_attempt") == expected_attempt
                   and row.get("status") == "completed"
@@ -246,6 +245,73 @@ jobs:
               raise SystemExit("exact successful recovery build job is missing")
           with Path(sys.argv[2]).open("a", encoding="ascii") as stream:
               stream.write(f"recovery_job_id={matches[0]['id']}\n")
+          PY
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/runs/$PUBLISHER_RUN_ID/attempts/$PUBLISHER_RUN_ATTEMPT" --output "$metadata/publisher-run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/runs/$PUBLISHER_RUN_ID/attempts/$PUBLISHER_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/publisher-jobs.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
+            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$api/actions/runs/$PUBLISHER_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/publisher-artifacts.json"
+          /usr/bin/python3 -I -B - "$metadata" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          root = Path(sys.argv[1])
+          output = Path(sys.argv[2])
+          publisher = json.loads((root / "publisher-run.json").read_text(encoding="ascii"))
+          publisher_sha = publisher.get("head_sha")
+          if not (publisher.get("id") == int(os.environ["PUBLISHER_RUN_ID"])
+                  and publisher.get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"])
+                  and publisher.get("name") == os.environ["PUBLISHER_WORKFLOW"]
+                  and publisher.get("path") == os.environ["PUBLISHER_WORKFLOW_PATH"]
+                  and publisher.get("event") == "workflow_run"
+                  and publisher.get("head_branch") == "dev"
+                  and publisher.get("status") == "completed"
+                  and publisher.get("conclusion") == "success"
+                  and (publisher.get("repository") or {}).get("full_name") == os.environ["REPOSITORY"]
+                  and isinstance(publisher_sha, str) and re.fullmatch(r"[0-9a-f]{40,64}", publisher_sha)):
+              raise SystemExit("exact publisher run is missing or invalid")
+          jobs = json.loads((root / "publisher-jobs.json").read_text(encoding="ascii"))
+          rows = jobs.get("jobs") if isinstance(jobs, dict) else None
+          if not isinstance(rows, list) or jobs.get("total_count") != len(rows):
+              raise SystemExit("publisher jobs response is incomplete")
+          matches = [row for row in rows if isinstance(row, dict) and type(row.get("id")) is int and row.get("id") > 0
+                     and row.get("name") == "Publish retained-release recovery bootstrap evidence"
+                     and row.get("run_id") == int(os.environ["PUBLISHER_RUN_ID"])
+                     and row.get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"])
+                     and row.get("status") == "completed" and row.get("conclusion") == "success"
+                     and row.get("head_sha") == publisher_sha]
+          if len(matches) != 1:
+              raise SystemExit("exact successful publisher job is missing")
+          artifacts = json.loads((root / "publisher-artifacts.json").read_text(encoding="ascii"))
+          artifact_rows = artifacts.get("artifacts") if isinstance(artifacts, dict) else None
+          if not isinstance(artifact_rows, list) or artifacts.get("total_count") != len(artifact_rows):
+              raise SystemExit("publisher artifacts response is incomplete")
+          names = {
+              "bundle": next(line.split("=", 1)[1] for line in output.read_text(encoding="ascii").splitlines() if line.startswith("bundle_name=")),
+              "evidence": next(line.split("=", 1)[1] for line in output.read_text(encoding="ascii").splitlines() if line.startswith("evidence_name=")),
+          }
+          ids = {}
+          for kind, name in names.items():
+              found = [row for row in artifact_rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(os.environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == publisher_sha and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(os.environ["PUBLISHER_RUN_ATTEMPT"]))]
+              if len(found) != 1:
+                  raise SystemExit(f"exact publisher {kind} artifact is missing")
+              ids[kind] = found[0]["id"]
+          with output.open("a", encoding="ascii") as stream:
+              stream.write(f"publisher_run_id={os.environ['PUBLISHER_RUN_ID']}\n")
+              stream.write(f"publisher_run_attempt={os.environ['PUBLISHER_RUN_ATTEMPT']}\n")
+              stream.write(f"publisher_workflow_sha={publisher_sha}\n")
+              stream.write(f"publisher_job_id={matches[0]['id']}\n")
+              stream.write(f"publisher_bundle_artifact_id={ids['bundle']}\n")
+              stream.write(f"publisher_evidence_artifact_id={ids['evidence']}\n")
           PY
 
       - name: Download, verify and attest the exact immutable bundle
@@ -258,29 +324,36 @@ jobs:
           BUNDLE_NAME: ${{ steps.evidence.outputs.bundle_name }}
           EVIDENCE_NAME: ${{ steps.evidence.outputs.evidence_name }}
           SOURCE_SHA: ${{ steps.evidence.outputs.source_sha }}
+          RECOVERY_WORKFLOW_SHA: ${{ steps.evidence.outputs.recovery_workflow_sha }}
           ROUTE_DIGEST: ${{ steps.evidence.outputs.route_digest }}
           RECOVERY_BUILD_JOB_ID: ${{ steps.evidence.outputs.recovery_job_id }}
+          PUBLISHER_RUN_ID: ${{ steps.evidence.outputs.publisher_run_id }}
+          PUBLISHER_RUN_ATTEMPT: ${{ steps.evidence.outputs.publisher_run_attempt }}
+          PUBLISHER_WORKFLOW_SHA: ${{ steps.evidence.outputs.publisher_workflow_sha }}
+          PUBLISHER_JOB_ID: ${{ steps.evidence.outputs.publisher_job_id }}
         run: |
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/platform-recovery-bootstrap-artifacts"
           install -d -m 700 "$artifact_dir"
           [[ "$RECOVERY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$PUBLISHER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           api="$GITHUB_API_URL/repos/$REPOSITORY"
-          curl --fail-with-body --silent --show-error \
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "$api/actions/runs/$RECOVERY_RUN_ID/artifacts?per_page=100&page=1" --output "$artifact_dir/artifacts.json"
+            "$api/actions/runs/$PUBLISHER_RUN_ID/artifacts?per_page=100&page=1" --output "$artifact_dir/artifacts.json"
           /usr/bin/python3 -I -B - "$artifact_dir/artifacts.json" "$BUNDLE_NAME" "$EVIDENCE_NAME" "$artifact_dir" "$GITHUB_OUTPUT" <<'PY'
           import json, sys
           from pathlib import Path
           root = Path(sys.argv[4])
-          rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("artifacts")
-          if not isinstance(rows, list):
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          rows = payload.get("artifacts") if isinstance(payload, dict) else None
+          if not isinstance(rows, list) or type(payload.get("total_count")) is not int or payload["total_count"] != len(rows):
               raise SystemExit("recovery artifacts response is malformed")
           def select(name):
-              matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(__import__("os").environ["RECOVERY_RUN_ID"]) and row["workflow_run"].get("head_sha") == __import__("os").environ["SOURCE_SHA"] and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(__import__("os").environ["RECOVERY_RUN_ATTEMPT"]))]
-              if len(matches) != 1 or not isinstance(matches[0].get("id"), int):
+              matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row.get("id") > 0 and isinstance(row.get("workflow_run"), dict) and row["workflow_run"].get("id") == int(__import__("os").environ["PUBLISHER_RUN_ID"]) and row["workflow_run"].get("head_sha") == __import__("os").environ["PUBLISHER_WORKFLOW_SHA"] and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == int(__import__("os").environ["PUBLISHER_RUN_ATTEMPT"]))]
+              if len(matches) != 1:
                   raise SystemExit("required recovery artifact is missing")
               return matches[0]["id"]
           (root / "bundle_id").write_text(str(select(sys.argv[2])), encoding="ascii")
@@ -291,7 +364,7 @@ jobs:
           for pair in "evidence:$evidence_id" "bundle:$bundle_id"; do
             kind="${pair%%:*}"; id="${pair#*:}"
             [[ "$id" =~ ^[1-9][0-9]{0,31}$ ]]
-            curl --fail-with-body --silent --show-error --location \
+            curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
@@ -365,14 +438,19 @@ jobs:
           evidence = one(root / "evidence.zip", evidence_name)
           bundle = one(root / "bundle.zip", bundle_name)
           payload = json.loads(evidence.read_text(encoding="ascii"))
-          if set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance"} or payload.get("schema") != 1 or payload.get("capability") != "recovery_bootstrap" or payload.get("capabilities") != ["abort_retained_only", "recover_pending"] or payload.get("deployable") is not False:
+          if set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "bundle_artifact_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance", "publisher_workflow_sha", "publisher_run_id", "publisher_run_attempt", "publisher_job_id"} or payload.get("schema") != 2 or payload.get("capability") != "recovery_bootstrap" or payload.get("capabilities") != ["abort_retained_only", "recover_pending"] or payload.get("deployable") is not False:
               raise SystemExit("recovery evidence schema is not closed")
-          if not isinstance(payload.get("bundle_name"), str) or payload["bundle_name"] != bundle.name or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_sha256"))):
+          if not isinstance(payload.get("bundle_name"), str) or payload["bundle_name"] != bundle.name or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_sha256"))) or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_artifact_sha256"))):
               raise SystemExit("recovery evidence bundle identity is invalid")
           if payload.get("recovery_run_id") != __import__("os").environ["RECOVERY_RUN_ID"] or payload.get("recovery_run_attempt") != __import__("os").environ["RECOVERY_RUN_ATTEMPT"]:
               raise SystemExit("recovery evidence run identity is invalid")
           if payload.get("recovery_job_id") != __import__("os").environ["RECOVERY_BUILD_JOB_ID"]:
               raise SystemExit("recovery evidence job identity is invalid")
+          if (payload.get("publisher_run_id") != __import__("os").environ["PUBLISHER_RUN_ID"]
+              or payload.get("publisher_run_attempt") != __import__("os").environ["PUBLISHER_RUN_ATTEMPT"]
+              or payload.get("publisher_job_id") != __import__("os").environ["PUBLISHER_JOB_ID"]
+              or payload.get("publisher_workflow_sha") != __import__("os").environ["PUBLISHER_WORKFLOW_SHA"]):
+              raise SystemExit("publisher evidence identity is invalid")
           provenance = payload.get("provenance")
           expected_provenance = {
               "repository": "StrayForest/old_sparky",
@@ -380,6 +458,7 @@ jobs:
               "job": "Verification contract",
               "run_id": __import__("os").environ["SECURITY_RUN_ID"],
               "run_attempt": __import__("os").environ["SECURITY_RUN_ATTEMPT"],
+              "recovery_workflow_sha": __import__("os").environ["RECOVERY_WORKFLOW_SHA"],
               "source_sha": __import__("os").environ["SOURCE_SHA"],
               "artifact_name": f"platform-ci-route-{__import__('os').environ['SECURITY_RUN_ID']}-{__import__('os').environ['SECURITY_RUN_ATTEMPT']}",
               "artifact_sha256": __import__("os").environ["ROUTE_DIGEST"],
@@ -392,6 +471,7 @@ jobs:
           with output.open("a", encoding="ascii") as stream:
               stream.write(f"bundle={bundle}\n")
               stream.write(f"bundle_sha={payload['bundle_sha256']}\n")
+              stream.write(f"bundle_artifact_sha256={payload['bundle_artifact_sha256']}\n")
           PY
           # GitHub's attestation verifier binds the bundle to the trusted
           # default-branch builder; no host side trust is inferred from it.
@@ -418,7 +498,7 @@ jobs:
             --repo "$REPOSITORY" \
             --signer-workflow StrayForest/old_sparky/.github/workflows/platform-production-recovery-bootstrap-build.yml \
             --source-ref refs/heads/dev \
-            --source-digest "$SOURCE_SHA" \
+            --source-digest "$RECOVERY_WORKFLOW_SHA" \
             --format json >"$attestation_json"
           bundle_stat_after="$(stat -c '%d:%i:%h:%s:%u:%g:%a' "$bundle_path")"
           bundle_digest_after="$(sha256sum "$bundle_path" | awk '{print $1}')"
@@ -459,7 +539,7 @@ jobs:
                   extensions.get("issuer") != "https://token.actions.githubusercontent.com"
                   or extensions.get("sourceRepositoryURI") != expected_repo
                   or extensions.get("sourceRepositoryRef") != "refs/heads/dev"
-                  or extensions.get("sourceRepositoryDigest") != os.environ.get("SOURCE_SHA", "")
+                  or extensions.get("sourceRepositoryDigest") != os.environ.get("RECOVERY_WORKFLOW_SHA", "")
                   or extensions.get("buildConfigURI") != expected_build
                   or extensions.get("buildSignerURI") != expected_build
                   or extensions.get("runInvocationURI") != expected_runner
@@ -525,6 +605,14 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           BUNDLE: ${{ steps.bundle.outputs.bundle }}
           BUNDLE_SHA: ${{ steps.bundle.outputs.bundle_sha }}
+          SOURCE_SHA: ${{ steps.evidence.outputs.source_sha }}
+          SECURITY_RUN_ID: ${{ inputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
+          RECOVERY_RUN_ID: ${{ steps.evidence.outputs.recovery_run_id }}
+          RECOVERY_RUN_ATTEMPT: ${{ steps.evidence.outputs.recovery_run_attempt }}
+          RECOVERY_JOB_ID: ${{ steps.evidence.outputs.recovery_job_id }}
+          RECOVERY_WORKFLOW_SHA: ${{ steps.evidence.outputs.recovery_workflow_sha }}
+          ROUTE_DIGEST: ${{ steps.evidence.outputs.route_digest }}
         run: |
           set -euo pipefail
           remote_stage="$(
@@ -631,12 +719,21 @@ jobs:
           PY
           REMOTE
           scp -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_bundle"
-          ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA'" <<'REMOTE'
+          ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$ROUTE_DIGEST'" <<'REMOTE'
           set -Eeuo pipefail
           umask 077
-          stage="$1"; expected_sha="$2"; bundle="$stage/bundle.zip"; app_dir=/opt/oldsparky/platform
+          stage="$1"; expected_sha="$2"; source_sha="$3"; security_run_id="$4"; security_run_attempt="$5"; recovery_run_id="$6"; recovery_run_attempt="$7"; recovery_job_id="$8"; recovery_workflow_sha="$9"; route_digest="${10}"; bundle="$stage/bundle.zip"; app_dir=/opt/oldsparky/platform
+          test "$#" -eq 10
           [[ "$stage" =~ ^/tmp/oldsparky-recovery-bootstrap\.[A-Za-z0-9]{6}$ ]]
           [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$source_sha" =~ ^[0-9a-f]{40,64}$ ]]
+          [[ "$security_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$security_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$recovery_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$recovery_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$recovery_job_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$recovery_workflow_sha" =~ ^[0-9a-f]{40,64}$ ]]
+          [[ "$route_digest" =~ ^[0-9a-f]{64}$ ]]
           test "$(id -u)" -eq 0
           validate_stage_dir() {
             /usr/bin/python3 -I -B - "$1" <<'PY'
@@ -790,7 +887,33 @@ jobs:
               validate_stage_file "$payload/$name" 444
             fi
           done
-          "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$payload/platform_recovery_bootstrap.py" install --bundle "$bundle" --app-dir "$app_dir" --expected-bundle-sha "$expected_sha"
+          provenance_path="$stage/provenance.json"
+          /usr/bin/python3 -I - "$provenance_path" "$security_run_id" "$security_run_attempt" "$source_sha" "$recovery_workflow_sha" "$route_digest" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          destination = Path(sys.argv[1])
+          payload = {
+              "repository": "StrayForest/old_sparky",
+              "workflow": "Platform security and build",
+              "job": "Verification contract",
+              "run_id": sys.argv[2],
+              "run_attempt": sys.argv[3],
+              "recovery_workflow_sha": sys.argv[5],
+              "source_sha": sys.argv[4],
+              "artifact_name": f"platform-ci-route-{sys.argv[2]}-{sys.argv[3]}",
+              "artifact_sha256": sys.argv[6],
+              "deployable": False,
+          }
+          raw = (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "wb") as stream:
+              stream.write(raw)
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+          "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$payload/platform_recovery_bootstrap.py" install --bundle "$bundle" --app-dir "$app_dir" --expected-bundle-sha "$expected_sha" --source-sha "$source_sha" --provenance "$provenance_path" --capability abort_retained_only
           generation="$app_dir/shared/.release-recovery/generations/$expected_sha"
           test -x "$generation/platform_abort_retained_only.sh"
           exec "$generation/platform_abort_retained_only.sh" --app-dir "$app_dir"

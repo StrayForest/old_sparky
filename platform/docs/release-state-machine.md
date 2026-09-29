@@ -53,11 +53,25 @@ Preflight is explicit about pointer topology. A clean first install has no
 `current` or `previous` pointer and performs only layout, lock, shared-runtime
 and candidate checks; it never invokes an old-release runtime or systemd
 helper. A current-only install validates `current` and deliberately permits no
-`previous`; it uses generic transaction/pointer recovery and requires no
-systemd receipt. An upgrade requires both canonical pointers and uses the full
-runtime/systemd snapshot contract. A previous pointer without current, or any
-pointer/symlink identity mismatch, is rejected. Rollback remains a separate
-two-pointer operation.
+`previous`; it requires a complete API/worker/web/timer snapshot, permits no
+systemd receipt, and uses the immutable transaction helper to restore that
+snapshot before cleanup. A clean first install has no prior current or
+snapshot; if no snapshot is present, it performs no systemd operation, while a
+complete snapshot is validated but not used. An upgrade requires both
+canonical pointers and uses the full runtime/systemd snapshot contract. A
+previous pointer without current, or any pointer/symlink identity mismatch, is
+rejected. Rollback remains a separate two-pointer operation.
+
+Recovery provenance is a three-way identity chain. The security
+checkout/source SHA is **A**; the immutable producer workflow code SHA is
+**B**; and the completed publisher workflow code SHA is **C**. The producer
+and publisher are separate `workflow_run` jobs: the publisher accepts only the
+supplied completed producer run/attempt and exact producer job/artifact, never
+a latest-by-SHA match. Manual abort/recover inputs carry the exact security,
+producer and publisher run/attempt pairs. Attestation verifies **B**, while the
+bundle manifest/evidence independently bind **A**, producer **P**, and
+publisher **C**. A branch advance or rerun therefore fails closed unless the
+operator selects its exact identity.
 
 Before stopping a writer or invoking the installer, the wrapper atomically
 writes `shared/.release-operation.json` in the `quiesce-pending` phase. It
@@ -83,10 +97,23 @@ pre-quiesce transaction is sufficient to restore the old runtime and remove a
 partial candidate, or remains retained for explicit abort when any identity,
 pointer, restart or readiness check fails.
 
+Pointer promotion is durable in two steps: after `previous` is switched the
+transaction records `previous-switched`; after `current` is switched it
+records `current-switched`, then `pointers-switched` and
+`activation-pending`. A crash between either symlink update is therefore
+recovered from the phase-specific topology rather than inferred from the live
+links. In the narrow interval before `current-switched` is persisted,
+`previous-switched` authorizes exactly either the previous-only pair or the
+fully promoted pair; the immutable validator rejects every other combination.
+Mutable systemd calls are individually bounded so a wedged manager leaves this
+durable phase available for retry.
+
 The immutable recovery wrapper has one deliberately narrow operation-less
 exception for this boundary: an exact version-1 `install` receipt in
-`quiesce-pending`, with complete API/worker/web/timer state, unchanged pointer
-identities, no populated candidate path and no systemd receipt. An empty,
+`quiesce-pending`, with complete active/inactive API/worker/web/timer state,
+unchanged pointer identities, no populated candidate path and no systemd
+receipt. New version-2 receipts additionally carry the exact enabled/disabled
+state; version 1 has no enabled fields and never infers them. An empty,
 canonical root-owned candidate directory is also safe to remove. It restores
 that recorded service/timer snapshot through the generation's transaction
 helper, then performs `abort-quiesce`. A malformed receipt, an unexpected
@@ -94,6 +121,11 @@ phase, an occupied or replaced candidate, or any partial snapshot remains
 retained before
 the first systemd call. This pre-promotion branch is not the legacy
 `recovery-restored` cleanup bridge.
+
+For a no-current first-install topology, a complete all-inactive snapshot is
+accepted only as compatibility evidence: version 2 must also be all-disabled,
+while version 1 has no enablement fields. The wrapper treats that receipt as a
+filesystem-only no-op and never calls `systemctl`.
 
 Rollback uses the same receipt discipline after switching pointers:
 
@@ -189,8 +221,11 @@ compatibility handoff needed for the normal cross-release boundary.
 - An interrupted first install with a new operation ID and no systemd receipt
   is recovered by the generic transaction state machine, including the valid
   case where `current_before` and `previous_before` are absent. It never enters
-  rollback-specific recovery; a paired systemd receipt is retained for the
-  operation-aware release-recover path instead.
+  rollback-specific recovery or calls systemd. A current-only receipt must
+  instead carry the complete pre-quiesce service/timer snapshot; immutable
+  recovery restores it before candidate and receipt cleanup, with a durable
+  retry marker if restoration is interrupted. A paired systemd receipt is
+  retained for the operation-aware release-recover path instead.
 - A legacy v2 install receipt in `recovery-restored` has no operation ID and is
   not upgraded in place. Only the immutable recovery-bootstrap bridge may
   consume it, and only when the systemd receipt is absent, the candidate is

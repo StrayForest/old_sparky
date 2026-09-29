@@ -80,15 +80,19 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertFalse((self.app_dir / "previous").exists())
         self.assertFalse(candidate.exists())
 
-    def test_immutable_recovery_wrapper_current_only_avoids_systemd_and_tampered_helpers(
+    def test_immutable_recovery_wrapper_first_install_validates_but_does_not_use_snapshot(
         self,
     ) -> None:
         generation = self.install_recovery_generation()
-        current = self.add_release("current-only-current")
-        (self.app_dir / "current").symlink_to(current)
-        self.add_current_control_helper_bombs(current)
-        candidate = self.create_wrapper_transaction(current, None, "current-only")
-        systemctl, systemctl_log = self.write_failing_systemctl("current-only")
+        candidate = self.create_wrapper_transaction(
+            None,
+            None,
+            "first-install-complete-snapshot",
+            complete_snapshot=True,
+        )
+        systemctl, systemctl_log = self.write_failing_systemctl(
+            "first-install-complete-snapshot"
+        )
 
         result = self.run_script(
             generation / RECOVERY_WRAPPER.name,
@@ -102,11 +106,422 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(systemctl_log.exists())
         self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+
+    def test_operationless_first_install_quiesce_v1_v2_is_systemd_free(self) -> None:
+        """Pre-promotion first-install receipts are validated as no-op cleanup."""
+
+        for version in (2, 1):
+            with self.subTest(version=version):
+                if version == 1:
+                    self.tearDown()
+                    self.setUp()
+                generation = self.install_recovery_generation()
+                candidate = self.releases / f"quiesce-first-install-v{version}"
+                self.run_transaction(
+                    "prepare-quiesce",
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--candidate-release",
+                    str(candidate),
+                    "--service-state",
+                    "deadlock-api=inactive",
+                    "--service-state",
+                    "deadlock-worker=inactive",
+                    "--service-state",
+                    "deadlock-web=inactive",
+                    "--timer-active-before",
+                    "inactive",
+                    "--service-enabled",
+                    "deadlock-api=disabled",
+                    "--service-enabled",
+                    "deadlock-worker=disabled",
+                    "--service-enabled",
+                    "deadlock-web=disabled",
+                    "--timer-enabled-before",
+                    "disabled",
+                )
+                receipt = self.shared / STATE_NAME
+                if version == 1:
+                    record = json.loads(receipt.read_text(encoding="ascii"))
+                    record["version"] = 1
+                    record.pop("service_enabled_before")
+                    record.pop("timer_enabled_before")
+                    receipt.write_text(
+                        json.dumps(record, sort_keys=True) + "\n", encoding="ascii"
+                    )
+                    receipt.chmod(0o600)
+                systemctl, systemctl_log = self.write_failing_systemctl(
+                    f"quiesce-first-install-v{version}"
+                )
+                result = self.run_script(
+                    generation / RECOVERY_WRAPPER.name,
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--systemctl",
+                    str(systemctl),
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(systemctl_log.exists())
+                self.assertFalse(receipt.exists())
+                self.assertFalse(candidate.exists())
+
+    def test_operationless_first_install_quiesce_noninactive_fails_before_systemd(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        candidate = self.releases / "quiesce-first-install-active"
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=inactive",
+            "--timer-active-before",
+            "inactive",
+            "--service-enabled",
+            "deadlock-api=disabled",
+            "--service-enabled",
+            "deadlock-worker=disabled",
+            "--service-enabled",
+            "deadlock-web=disabled",
+            "--timer-enabled-before",
+            "disabled",
+        )
+        systemctl, systemctl_log = self.write_failing_systemctl(
+            "quiesce-first-install-active"
+        )
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(systemctl_log.exists())
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+
+    def test_immutable_recovery_wrapper_current_only_avoids_systemd_and_tampered_helpers(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("current-only-current")
+        (self.app_dir / "current").symlink_to(current)
+        self.add_current_control_helper_bombs(current)
+        candidate = self.create_wrapper_transaction(
+            current,
+            None,
+            "current-only",
+            complete_snapshot=True,
+            service_states={
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+            },
+            timer_active=True,
+        )
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+            }
+        )
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
         self.assertFalse((self.shared / ".release-systemd-state.json").exists())
         self.assertEqual((self.app_dir / "current").resolve(), current)
         self.assertFalse((self.app_dir / "previous").exists())
         self.assertFalse(candidate.exists())
         self.assertFalse((self.root / "current-helper-used").exists())
+        self.assertEqual(
+            json.loads((self.root / "systemd-state.json").read_text()),
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+            },
+        )
+
+    def test_immutable_recovery_wrapper_current_only_accepts_second_pointer_window(
+        self,
+    ) -> None:
+        """A kill after current moves but before its phase marker is recoverable."""
+
+        generation = self.install_recovery_generation()
+        current = self.add_release("current-only-pointer-window-current")
+        (self.app_dir / "current").symlink_to(current)
+        candidate = self.create_wrapper_transaction(
+            current,
+            None,
+            "current-only-pointer-window",
+            complete_snapshot=True,
+            service_states={
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+            },
+            timer_active=True,
+        )
+        # Reproduce the exact durable window: previous has moved, current has
+        # moved, but the transaction still carries previous-switched.
+        self.run_transaction("phase", "--expected", "staged", "--phase", "migration-pending")
+        self.run_transaction(
+            "phase", "--expected", "migration-pending", "--phase", "migration-applied"
+        )
+        self.run_transaction(
+            "phase", "--expected", "migration-applied", "--phase", "previous-switched"
+        )
+        (self.app_dir / "current").unlink()
+        (self.app_dir / "current").symlink_to(candidate)
+        (self.app_dir / "previous").symlink_to(current)
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+            }
+        )
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertFalse((self.app_dir / "previous").exists())
+        self.assertEqual(
+            json.loads((self.root / "systemd-state.json").read_text()),
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+            },
+        )
+
+    def test_immutable_recovery_wrapper_first_install_after_current_switch_is_systemd_free(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        candidate = self.create_wrapper_transaction(
+            None,
+            None,
+            "first-install-pointer-window",
+            complete_snapshot=True,
+        )
+        self.run_transaction("phase", "--expected", "staged", "--phase", "migration-pending")
+        self.run_transaction(
+            "phase", "--expected", "migration-pending", "--phase", "migration-applied"
+        )
+        self.run_transaction(
+            "phase", "--expected", "migration-applied", "--phase", "current-switched"
+        )
+        (self.app_dir / "current").symlink_to(candidate)
+        systemctl, systemctl_log = self.write_failing_systemctl(
+            "first-install-pointer-window"
+        )
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(systemctl_log.exists())
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+        self.assertFalse((self.app_dir / "current").exists())
+        self.assertFalse((self.app_dir / "previous").exists())
+
+    def test_immutable_recovery_wrapper_current_only_rejects_missing_snapshot_before_systemd(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("current-only-missing-snapshot-current")
+        (self.app_dir / "current").symlink_to(current)
+        candidate = self.create_wrapper_transaction(
+            current, None, "current-only-missing-snapshot"
+        )
+        systemctl, systemctl_log = self.write_failing_systemctl(
+            "current-only-missing-snapshot"
+        )
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertTrue(candidate.exists())
+        self.assertFalse(systemctl_log.exists())
+
+    def test_immutable_recovery_wrapper_current_only_rejects_partial_snapshot_before_systemd(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("current-only-partial-snapshot-current")
+        (self.app_dir / "current").symlink_to(current)
+        candidate = self.create_wrapper_transaction(
+            current,
+            None,
+            "current-only-partial-snapshot",
+            complete_snapshot=True,
+            service_states={
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+            },
+            timer_active=True,
+        )
+        state = self.shared / STATE_NAME
+        record = json.loads(state.read_text(encoding="ascii"))
+        del record["service_state_before"]["deadlock-web"]
+        state.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="ascii")
+        state.chmod(0o600)
+        systemctl, systemctl_log = self.write_failing_systemctl(
+            "current-only-partial-snapshot"
+        )
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(state.exists())
+        self.assertTrue(candidate.exists())
+        self.assertFalse(systemctl_log.exists())
+
+    def test_immutable_recovery_wrapper_current_only_replays_after_each_partial_service_restore(
+        self,
+    ) -> None:
+        cases = (
+            ("restart deadlock-api", "deadlock-api", "active"),
+            ("stop deadlock-worker", "deadlock-worker", "inactive"),
+            ("restart deadlock-web", "deadlock-web", "active"),
+            (
+                "start deadlock-cloudflare-ips.timer",
+                "deadlock-cloudflare-ips.timer",
+                "active",
+            ),
+        )
+        for index, (kill_after, unit, expected_after_kill) in enumerate(cases):
+            if index:
+                self.tearDown()
+                self.setUp()
+            with self.subTest(kill_after=kill_after):
+                generation = self.install_recovery_generation()
+                current = self.add_release(f"current-only-retry-{index}-current")
+                (self.app_dir / "current").symlink_to(current)
+                candidate = self.create_wrapper_transaction(
+                    current,
+                    None,
+                    f"current-only-retry-{index}",
+                    complete_snapshot=True,
+                    service_states={
+                        "deadlock-api": "active",
+                        "deadlock-worker": "inactive",
+                        "deadlock-web": "active",
+                    },
+                    timer_active=True,
+                )
+                initial_state = {
+                    "deadlock-api": "inactive",
+                    "deadlock-worker": "inactive",
+                    "deadlock-web": "inactive",
+                    "deadlock-cloudflare-ips.timer": "inactive",
+                }
+                systemctl = self.write_stateful_systemctl(initial_state)
+                first = self.run_script(
+                    generation / RECOVERY_WRAPPER.name,
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--systemctl",
+                    str(systemctl),
+                    env={"PLATFORM_TEST_SYSTEMCTL_KILL_AFTER": kill_after},
+                    check=False,
+                )
+                self.assertNotEqual(first.returncode, 0)
+                self.assertTrue((self.shared / STATE_NAME).exists())
+                self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+                self.assertTrue(candidate.exists())
+                self.assertEqual(
+                    self.state_phase(), "filesystem-restored-services-pending"
+                )
+                partial_state = json.loads(
+                    (self.root / "systemd-state.json").read_text()
+                )
+                self.assertEqual(partial_state[unit], expected_after_kill)
+                self.assertTrue(
+                    (self.shared / STATE_NAME).exists(),
+                    "receipt must survive a crash before service restoration completes",
+                )
+
+                retry = self.run_script(
+                    generation / RECOVERY_WRAPPER.name,
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--systemctl",
+                    str(systemctl),
+                    check=False,
+                )
+                self.assertEqual(retry.returncode, 0, retry.stderr)
+                self.assertFalse((self.shared / STATE_NAME).exists())
+                self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+                self.assertFalse(candidate.exists())
+                self.assertEqual(
+                    json.loads((self.root / "systemd-state.json").read_text()),
+                    {
+                        "deadlock-api": "active",
+                        "deadlock-worker": "inactive",
+                        "deadlock-web": "active",
+                        "deadlock-cloudflare-ips.timer": "active",
+                    },
+                )
 
     def test_immutable_recovery_wrapper_recovers_operationless_quiesce_receipts(
         self,
@@ -234,6 +649,93 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(receipt_path.exists())
         self.assertFalse(systemctl_log.exists())
+
+    def test_quiesce_v1_active_only_receipt_restores_without_enablement(self) -> None:
+        current = self.add_release("quiesce-v1-current")
+        (self.app_dir / "current").symlink_to(current)
+        candidate = self.releases / "quiesce-v1-candidate"
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "active",
+        )
+        receipt = self.shared / STATE_NAME
+        record = json.loads(receipt.read_text(encoding="ascii"))
+        record["version"] = 1
+        record.pop("service_enabled_before")
+        record.pop("timer_enabled_before")
+        receipt.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="ascii")
+        receipt.chmod(0o600)
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "active",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+            }
+        )
+        self.run_transaction("verify-quiesce")
+        self.run_transaction("restore-quiesce", "--systemctl", str(systemctl))
+        self.run_transaction("abort-quiesce")
+        self.assertFalse(receipt.exists())
+        log = (self.root / "systemctl.log").read_text(encoding="ascii")
+        self.assertNotIn("enable ", log)
+        self.assertNotIn("disable ", log)
+
+    def test_quiesce_v1_v2_hybrids_are_rejected(self) -> None:
+        for version, remove_enabled in ((1, False), (2, True)):
+            with self.subTest(version=version):
+                current = self.add_release(f"quiesce-hybrid-{version}-current")
+                (self.app_dir / "current").unlink(missing_ok=True)
+                (self.app_dir / "current").symlink_to(current)
+                candidate = self.releases / f"quiesce-hybrid-{version}-candidate"
+                self.run_transaction(
+                    "prepare-quiesce",
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--candidate-release",
+                    str(candidate),
+                    "--service-state",
+                    "deadlock-api=inactive",
+                    "--service-state",
+                    "deadlock-worker=inactive",
+                    "--service-state",
+                    "deadlock-web=inactive",
+                    "--timer-active-before",
+                    "inactive",
+                )
+                receipt = self.shared / STATE_NAME
+                malformed = json.loads(receipt.read_text(encoding="ascii"))
+                malformed["version"] = version
+                if remove_enabled:
+                    malformed.pop("service_enabled_before")
+                    malformed.pop("timer_enabled_before")
+                receipt.write_text(
+                    json.dumps(malformed, sort_keys=True) + "\n", encoding="ascii"
+                )
+                receipt.chmod(0o600)
+                invalid = self.run_script(
+                    TRANSACTION_TOOL,
+                    "verify-quiesce",
+                    "--state",
+                    str(receipt),
+                    check=False,
+                )
+                self.assertNotEqual(
+                    invalid.returncode,
+                    0,
+                )
+                receipt.unlink(missing_ok=True)
 
     def test_immutable_recovery_wrapper_rejects_unbound_quiesce_receipts_before_systemd(
         self,
@@ -539,6 +1041,78 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual((self.app_dir / "current").resolve(), current)
         self.assertEqual((self.app_dir / "previous").resolve(), previous)
         self.assertFalse(candidate.exists())
+
+    def test_immutable_recovery_wrapper_retains_receipt_on_systemctl_rc4_or_timeout(
+        self,
+    ) -> None:
+        for index, (exit_code, label) in enumerate(((4, "rc4"), (124, "timeout"))):
+            if index:
+                self.tearDown()
+                self.setUp()
+            with self.subTest(exit_code=exit_code):
+                generation = self.install_recovery_generation()
+                current = self.add_release(f"{label}-current")
+                previous = self.add_release(f"{label}-previous")
+                (self.app_dir / "current").symlink_to(current)
+                (self.app_dir / "previous").symlink_to(previous)
+                self.add_bound_release_tools(current)
+                venv = self.shared / "venv"
+                (venv / "bin").mkdir(parents=True)
+                (venv / "bin" / "python").write_text(
+                    "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
+                    encoding="utf-8",
+                )
+                (venv / "bin" / "python").chmod(0o755)
+                (venv / "deps-version").write_text("unchanged\n", encoding="ascii")
+                candidate = self.create_wrapper_transaction(
+                    current, previous, label, complete_snapshot=True
+                )
+                good_systemctl = self.write_stateful_systemctl(
+                    {
+                        "deadlock-api.service": "inactive",
+                        "deadlock-worker.service": "inactive",
+                        "deadlock-web.service": "inactive",
+                    }
+                )
+                receipt = self.shared / ".release-systemd-state.json"
+                self.run_script(
+                    SYSTEMD_STATE_TOOL,
+                    "capture-transaction",
+                    "--state",
+                    str(receipt),
+                    "--transaction",
+                    str(self.shared / STATE_NAME),
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--helper-release",
+                    str(current),
+                    "--require-helper-manifest",
+                    "--systemctl",
+                    str(good_systemctl),
+                )
+                bad_systemctl, systemctl_log = self.write_failing_systemctl(
+                    label, exit_code=exit_code
+                )
+                result = self.run_script(
+                    generation / RECOVERY_WRAPPER.name,
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--systemctl",
+                    str(bad_systemctl),
+                    check=False,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(systemctl_log.exists())
+                self.assertTrue(
+                    receipt.exists(),
+                    f"rc={exit_code} must not clear the systemd receipt",
+                )
+                self.assertTrue(
+                    (self.shared / STATE_NAME).exists(),
+                    f"rc={exit_code} must retain the transaction for an immutable retry",
+                )
+                self.assertTrue(candidate.exists())
 
     def test_immutable_recovery_wrapper_rejects_tampered_generation_before_transaction(
         self,
@@ -1566,6 +2140,67 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                     (self.shared / "venv" / "deps-version").read_text(), "new\n"
                 )
 
+    def test_install_pointer_gap_durably_recovers_before_current_switch(self) -> None:
+        current, previous, candidate = self.prepare_install_state()
+        self.advance_install_state(candidate, current, phase="migration-applied")
+        interrupted = self.copy_deploy_script_with_fault(
+            "deploy-between-pointer-switches-kill.sh",
+            "      phase=previous-switched\n",
+            "      phase=previous-switched\n      /bin/kill -KILL \"$$\"\n",
+            self.write_fake_systemctl(),
+        )
+
+        result = self.run_script(
+            interrupted,
+            "--resume",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state_phase(), "previous-switched")
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), current)
+
+        self.run_transaction("recover", "--retain")
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+        self.run_transaction("complete-recovery")
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+
+    def test_install_pointer_gap_durably_recovers_after_current_switch(self) -> None:
+        """A SIGKILL after the second symlink still retains a recoverable receipt."""
+
+        current, previous, candidate = self.prepare_install_state()
+        self.advance_install_state(candidate, current, phase="migration-applied")
+        interrupted = self.copy_deploy_script_with_fault(
+            "deploy-after-current-pointer-kill.sh",
+            "    set_phase previous-switched current-switched || exit 1\n",
+            '    /bin/kill -KILL "$$"\n'
+            "    set_phase previous-switched current-switched || exit 1\n",
+            self.write_fake_systemctl(),
+        )
+
+        result = self.run_script(
+            interrupted,
+            "--resume",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state_phase(), "previous-switched")
+        self.assertEqual((self.app_dir / "current").resolve(), candidate)
+        self.assertEqual((self.app_dir / "previous").resolve(), current)
+
+        self.run_transaction("recover", "--retain")
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+        self.run_transaction("complete-recovery")
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+
     def test_pointer_switch_crash_recovers_through_old_current_helper(self) -> None:
         current, previous = self.prepare_rollback_state()
         legacy_helper = previous / "tools/platform_release_rollback.sh"
@@ -1801,6 +2436,145 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(systemctl_log.exists())
         self.assertIn("-m alembic upgrade head", fake_python_log.read_text(encoding="utf-8"))
+
+    def test_mutable_first_install_staged_failure_uses_optional_snapshot_policy(self) -> None:
+        """A staged first-install failure cleans only a safe nullable receipt."""
+
+        candidate = self.create_wrapper_transaction(None, None, "mutable-first-install")
+        # create_wrapper_transaction deliberately leaves the initial receipt at
+        # prepared unless it records a snapshot. Advance it to the exact
+        # pre-migration staged boundary with no service snapshot at all.
+        self.run_transaction("phase", "--expected", "prepared", "--phase", "venv-transitioned")
+        self.run_transaction("phase", "--expected", "venv-transitioned", "--phase", "staged")
+        systemctl, systemctl_log = self.write_failing_systemctl("mutable-first-install")
+        artifact = self.root / "mutable-first-install.tar.gz"
+        artifact.write_bytes(b"not reached")
+        failed = self.copy_initial_deploy_with_fault(
+            "deploy-mutable-first-install-failure.sh",
+            systemctl,
+            '  "$INSTALL_TOOL" --stage-only "$ARTIFACT" "$APP_DIR"\n',
+            '  /bin/false\n',
+        )
+
+        result = self.run_script(
+            failed,
+            "--artifact",
+            str(artifact),
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(systemctl_log.exists())
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+
+    def test_mutable_first_install_abort_accepts_only_strict_inactive_snapshot(self) -> None:
+        """Nullable abort cleanup accepts absent or complete inactive state only."""
+
+        for label, mutation in (
+            ("active", lambda record: record["service_state_before"].__setitem__("deadlock-api", "active")),
+            ("enabled", lambda record: record["service_enabled_before"].__setitem__("deadlock-api", "enabled")),
+            ("partial", lambda record: record.pop("timer_enabled_before")),
+        ):
+            with self.subTest(label=label):
+                if label != "active":
+                    self.tearDown()
+                    self.setUp()
+                candidate = self.create_wrapper_transaction(
+                    None,
+                    None,
+                    f"mutable-first-install-{label}",
+                    complete_snapshot=True,
+                )
+                state = self.shared / STATE_NAME
+                record = json.loads(state.read_text(encoding="ascii"))
+                mutation(record)
+                state.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="ascii")
+                state.chmod(0o600)
+                systemctl, systemctl_log = self.write_failing_systemctl(
+                    f"mutable-first-install-abort-{label}"
+                )
+                abort = self.copy_abort_script_with_systemctl(systemctl)
+                result = self.run_script(
+                    abort,
+                    "--abort-retained",
+                    "--confirm-migration-not-reversed",
+                    "--app-dir",
+                    str(self.app_dir),
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(state.exists())
+                self.assertTrue(candidate.exists())
+                self.assertFalse(systemctl_log.exists())
+
+    def test_mutable_abort_retained_staged_nullable_topologies(self) -> None:
+        """The staged map covers current-only cleanup and rejects drift."""
+
+        current = self.add_release("mutable-current-only-staged-current")
+        (self.app_dir / "current").symlink_to(current)
+        self.add_runtime_stubs(current)
+        self.add_fake_venv(self.shared / "venv", marker="mutable-current-only")
+        candidate = self.create_wrapper_transaction(
+            current,
+            None,
+            "mutable-current-only-staged",
+            complete_snapshot=True,
+        )
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+
+        self.tearDown()
+        self.setUp()
+        current = self.add_release("mutable-current-only-staged-invalid-current")
+        (self.app_dir / "current").symlink_to(current)
+        candidate = self.create_wrapper_transaction(
+            current,
+            None,
+            "mutable-current-only-staged-invalid",
+            complete_snapshot=True,
+        )
+        candidate_pointer = self.app_dir / "current"
+        candidate_pointer.unlink()
+        candidate_pointer.symlink_to(candidate)
+        systemctl, systemctl_log = self.write_failing_systemctl(
+            "mutable-current-only-staged-invalid"
+        )
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertTrue(candidate.exists())
+        self.assertFalse(systemctl_log.exists())
 
     def test_sigkill_after_snapshot_leaves_abortable_receipt_without_transaction(
         self,
@@ -2038,6 +2812,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                timeout=120,
             )
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertFalse(child_pid_file.exists(), result.stderr)
@@ -2267,7 +3042,15 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
     def write_fake_systemctl(self) -> Path:
         path = self.root / "systemctl"
-        path.write_text("#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n")
+        path.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "case \"${1:-}\" in\n"
+            "  is-active) printf '%s\\n' active ;;\n"
+            "  is-enabled) printf '%s\\n' enabled ;;\n"
+            "esac\n"
+            "exit 0\n"
+        )
         path.chmod(0o755)
         return path
 
@@ -2278,6 +3061,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "job": "Verification contract",
             "run_id": "12345",
             "run_attempt": "2",
+            "recovery_workflow_sha": "c" * 40,
             "source_sha": "a" * 40,
             "artifact_name": "platform-ci-route-12345-2",
             "artifact_sha256": "b" * 64,
@@ -2315,6 +3099,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         label: str,
         *,
         complete_snapshot: bool = False,
+        service_states: dict[str, str] | None = None,
+        timer_active: bool = False,
     ) -> Path:
         candidate = self.add_release(f"{label}-candidate")
         rollback = candidate / ".rollback"
@@ -2359,6 +3145,18 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "none",
         )
         if complete_snapshot:
+            service_args = [
+                argument
+                for unit, state in (
+                    service_states
+                    or {
+                        "deadlock-api": "inactive",
+                        "deadlock-worker": "inactive",
+                        "deadlock-web": "inactive",
+                    }
+                ).items()
+                for argument in ("--service-state", f"{unit}={state}")
+            ]
             self.run_transaction(
                 "phase", "--expected", "prepared", "--phase", "venv-transitioned"
             )
@@ -2367,14 +3165,18 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             )
             self.run_transaction(
                 "record-services",
-                "--service-state",
-                "deadlock-api=inactive",
-                "--service-state",
-                "deadlock-worker=inactive",
-                "--service-state",
-                "deadlock-web=inactive",
+                *service_args,
                 "--timer-active-before",
-                "inactive",
+                "active" if timer_active else "inactive",
+                *(
+                    option
+                    for unit in ("deadlock-api", "deadlock-worker", "deadlock-web")
+                    for option in ("--service-enabled", f"{unit}=disabled")
+                )
+                if current is None
+                else (),
+                "--timer-enabled-before",
+                "disabled",
             )
         return candidate
 
@@ -2421,14 +3223,16 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                     return
             raise AssertionError(f"unsupported rollback test phase: {phase}")
 
-    def write_failing_systemctl(self, label: str) -> tuple[Path, Path]:
+    def write_failing_systemctl(
+        self, label: str, *, exit_code: int = 99
+    ) -> tuple[Path, Path]:
         log = self.root / f"{label}-systemctl.log"
         path = self.root / f"systemctl-{label}"
         path.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
             f"printf '%s\\n' \"$*\" >> {str(log)!r}\n"
-            "exit 99\n",
+            f"exit {exit_code}\n",
             encoding="utf-8",
         )
         path.chmod(0o755)
@@ -2763,9 +3567,15 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         return json.loads((self.shared / STATE_NAME).read_text())["phase"]
 
     def run_transaction(self, *args: str) -> subprocess.CompletedProcess[str]:
+        normalized = list(args)
+        if normalized and normalized[0] in {"record-services", "prepare-quiesce"}:
+            if "--service-enabled" not in normalized:
+                for unit in ("deadlock-api", "deadlock-worker", "deadlock-web"):
+                    normalized.extend(("--service-enabled", f"{unit}=enabled"))
+                normalized.extend(("--timer-enabled-before", "disabled"))
         return self.run_script(
             TRANSACTION_TOOL,
-            *args,
+            *normalized,
             "--state",
             str(self.shared / STATE_NAME),
         )
@@ -2931,26 +3741,37 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             f"log_path = Path({str(log_path)!r})\n"
             "state = json.loads(state_path.read_text())\n"
             "enabled = json.loads(enabled_path.read_text())\n"
+            "def state_unit(unit):\n"
+            "    if unit in state:\n"
+            "        return unit\n"
+            "    service_unit = unit + '.service'\n"
+            "    return service_unit if service_unit in state else unit\n"
+            "def enabled_unit(unit):\n"
+            "    if unit in enabled:\n"
+            "        return unit\n"
+            "    service_unit = unit + '.service'\n"
+            "    return service_unit if service_unit in enabled else unit\n"
             "argv = sys.argv[1:]\n"
             "action = argv[0] if argv else \"\"\n"
             "units = [value for value in argv[1:] if not value.startswith(\"-\")]\n"
             "if action == \"is-active\":\n"
             "    unit = units[0]\n"
-            "    value = state.get(unit, \"inactive\")\n"
+            "    value = state.get(state_unit(unit), \"inactive\")\n"
             "    if \"--quiet\" not in argv:\n"
             "        print(value)\n"
             "    raise SystemExit(0 if value == \"active\" else 3)\n"
             "if action == \"is-enabled\":\n"
             "    unit = units[0]\n"
-            "    value = enabled.get(unit, \"static\")\n"
+            "    value = enabled.get(enabled_unit(unit), \"static\")\n"
             "    if \"--quiet\" not in argv:\n"
             "        print(value)\n"
-            "    raise SystemExit(0 if value == \"enabled\" else 1)\n"
+            "    raise SystemExit(0 if value in {\"enabled\", \"static\"} else 1)\n"
             "if action in {\"enable\", \"disable\"}:\n"
             "    value = \"enabled\" if action == \"enable\" else \"disabled\"\n"
             "    for unit in units:\n"
-            "        if enabled.get(unit) != \"static\":\n"
-            "            enabled[unit] = value\n"
+            "        key = enabled_unit(unit)\n"
+            "        if enabled.get(key) != \"static\":\n"
+            "            enabled[key] = value\n"
             "        with log_path.open(\"a\", encoding=\"utf-8\") as stream:\n"
             "            stream.write(f\"{action} {unit}\\n\")\n"
             "    enabled_path.write_text(json.dumps(enabled, sort_keys=True))\n"
@@ -2959,11 +3780,14 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "    for unit in units:\n"
                 "        with log_path.open(\"a\", encoding=\"utf-8\") as stream:\n"
                 "            stream.write(f\"{action} {unit}\\n\")\n"
-                "        if action == \"restart\" and unit == \"deadlock-api\" and os.getenv(\"PLATFORM_TEST_SYSTEMCTL_FAIL_RESTART\") == \"1\":\n"
-                "            raise SystemExit(1)\n"
-            "        if unit in state:\n"
-            "            state[unit] = \"inactive\" if action == \"stop\" else \"active\"\n"
+            "        if action == \"restart\" and unit == \"deadlock-api\" and os.getenv(\"PLATFORM_TEST_SYSTEMCTL_FAIL_RESTART\") == \"1\":\n"
+            "            raise SystemExit(1)\n"
+            "        key = state_unit(unit)\n"
+            "        if key in state:\n"
+            "            state[key] = \"inactive\" if action == \"stop\" else \"active\"\n"
             "    state_path.write_text(json.dumps(state, sort_keys=True))\n"
+            "    if os.getenv(\"PLATFORM_TEST_SYSTEMCTL_KILL_AFTER\") == f\"{action} {units[0]}\":\n"
+            "        os.kill(os.getpid(), 9)\n"
             "    raise SystemExit(0)\n"
             "if action in {\"daemon-reload\", \"reload\"}:\n"
             "    raise SystemExit(0)\n"
@@ -3010,6 +3834,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=120,
         )
         if check and result.returncode != 0:
             self.fail(f"{script} failed: {result.returncode}\n{result.stderr}")

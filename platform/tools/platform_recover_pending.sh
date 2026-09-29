@@ -6,6 +6,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ORIGINAL_ARGS=("$@")
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
 SYSTEMCTL_BIN="/usr/bin/systemctl"
+SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
 
@@ -42,12 +43,19 @@ done
   exit 1
 }
 
+# The immutable wrapper still performs final active-state checks directly so
+# that a receipt cannot be cleared on an unverified runtime.  Bound those
+# checks with the same trusted timeout policy as every other systemctl call.
+run_systemctl() {
+  "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s "$SYSTEMCTL_BIN" "$@"
+}
+
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 GENERATION_SHA="$(basename "$TOOLS_DIR")"
 [[ "$GENERATION_SHA" =~ ^[0-9a-f]{64}$ ]] || { public_status failed generation >&2; exit 1; }
 
 validate_generation_helper() {
-  local name="$1" mode="$2" path="$TOOLS_DIR/$1"
+  local mode="$2" path="$TOOLS_DIR/$1"
   test -f "$path" && test ! -L "$path" \
     && test "$(stat -c '%u:%h:%a' "$path" 2>/dev/null)" = "0:1:$mode" \
     || { public_status failed generation >&2; exit 1; }
@@ -133,10 +141,20 @@ original_previous="${transaction_fields[3]:-}"
     /usr/bin/python3 -I "$TRANSACTION_TOOL" verify-quiesce --state "$STATE" \
       >/dev/null 2>/dev/null \
       || { public_status failed transaction >&2; exit 1; }
-    /usr/bin/python3 -I "$TRANSACTION_TOOL" restore-quiesce \
-      --state "$STATE" --systemctl "$SYSTEMCTL_BIN" \
-      >/dev/null 2>/dev/null \
-      || { public_status failed service_state >&2; exit 1; }
+    if [[ -z "$original_current" ]]; then
+      # A first-install pre-promotion receipt is a compatibility no-op only
+      # when its complete snapshot proves every unit inactive/disabled.  The
+      # immutable validator fails closed for partial/active snapshots; no
+      # systemctl command is issued on this topology.
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-quiesce-noop \
+        --state "$STATE" >/dev/null 2>/dev/null \
+        || { public_status failed service_state >&2; exit 1; }
+    else
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" restore-quiesce \
+        --state "$STATE" --systemctl "$SYSTEMCTL_BIN" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed service_state >&2; exit 1; }
+    fi
     /usr/bin/python3 -I "$TRANSACTION_TOOL" abort-quiesce --state "$STATE" \
       >/dev/null 2>/dev/null \
       || { public_status failed transaction >&2; exit 1; }
@@ -388,20 +406,74 @@ if [[ "$pending_operation" == "rollback" ]]; then
 fi
 
 if [[ -z "$original_previous" ]]; then
-  # First-install/current-only recovery never queries systemd or retained
-  # release tools. Only the immutable transaction helper may clean the receipt.
+  # First-install/current-only recovery never queries retained release tools.
+  # A first install has no prior runtime: an absent snapshot (or a complete
+  # inactive one) therefore performs no systemctl operation. Current-only has
+  # a complete immutable snapshot and must restore it before the
+  # transaction/candidate cleanup is authorized.
   [[ ! -e "$SYSTEMD_STATE" && ! -L "$SYSTEMD_STATE" ]] \
     || { public_status failed topology >&2; exit 1; }
-  if [[ -n "$original_current" ]]; then
-    [[ -L "$APP_DIR/current" && "$(readlink -f "$APP_DIR/current")" == "$original_current" ]] \
-      || { public_status failed topology >&2; exit 1; }
-  else
-    [[ ! -e "$APP_DIR/current" && ! -L "$APP_DIR/current" ]] \
-      || { public_status failed topology >&2; exit 1; }
-  fi
-  [[ ! -e "$APP_DIR/previous" && ! -L "$APP_DIR/previous" ]] \
+  # Validate the live pair against the durable phase before any pointer or
+  # service cleanup.  Current-only promotion temporarily uses ``previous``
+  # for the old current release, and a kill after the second symlink can
+  # leave the post-promotion pair while the marker still says
+  # previous-switched.  The immutable transaction helper owns that exact
+  # closed topology matrix; do not guess from nullable original pointers.
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-recovery-pointers \
+    --state "$STATE" >/dev/null 2>/dev/null \
     || { public_status failed topology >&2; exit 1; }
-  /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$STATE" \
+  if [[ -z "$original_current" ]]; then
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-service-snapshot \
+      --state "$STATE" --require optional \
+      >/dev/null 2>/dev/null \
+      || { public_status failed service_state >&2; exit 1; }
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$STATE" \
+      >/dev/null 2>/dev/null \
+      || { public_status failed transaction >&2; exit 1; }
+    test ! -e "$STATE" && test ! -L "$STATE" \
+      || { public_status failed transaction >&2; exit 1; }
+    public_status passed
+    exit 0
+  fi
+
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" validate-service-snapshot \
+    --state "$STATE" --require present \
+    >/dev/null 2>/dev/null \
+    || { public_status failed service_state >&2; exit 1; }
+  case "$transaction_phase" in
+    filesystem-restored-services-pending)
+      ;;
+    recovery-restored)
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      test ! -e "$STATE" && test ! -L "$STATE" \
+        || { public_status failed transaction >&2; exit 1; }
+      public_status passed
+      exit 0
+      ;;
+    prepared|venv-transitioned|snapshot-placed|current-switched|previous-switched|pointers-switched|staged|recovery-authorized)
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+        --retain --service-pending --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      ;;
+    *)
+      public_status failed transaction >&2
+      exit 1
+      ;;
+  esac
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" restore-services \
+    --state "$STATE" --systemctl "$SYSTEMCTL_BIN" \
+    >/dev/null 2>/dev/null \
+    || { public_status failed service_state >&2; exit 1; }
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+    --state "$STATE" \
+    --expected filesystem-restored-services-pending \
+    --phase recovery-restored \
+    >/dev/null 2>/dev/null \
+    || { public_status failed transaction >&2; exit 1; }
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery --state "$STATE" \
     >/dev/null 2>/dev/null \
     || { public_status failed transaction >&2; exit 1; }
   test ! -e "$STATE" && test ! -L "$STATE" \
@@ -423,13 +495,18 @@ import sys
 from pathlib import Path
 record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
 service_state = record.get("service_state_before")
+service_enabled = record.get("service_enabled_before")
 expected = {"deadlock-api", "deadlock-worker", "deadlock-web"}
 if (
     not isinstance(service_state, dict)
     or set(service_state) != expected
     or any(value not in {"active", "inactive"} for value in service_state.values())
+    or not isinstance(service_enabled, dict)
+    or set(service_enabled) != expected
+    or any(value not in {"enabled", "disabled"} for value in service_enabled.values())
     or record.get("quiesced_services") != ["deadlock-api", "deadlock-worker", "deadlock-web"]
     or type(record.get("timer_active_before")) is not bool
+    or record.get("timer_enabled_before") not in {"enabled", "disabled"}
 ):
     raise SystemExit(1)
 PY
@@ -532,8 +609,22 @@ else:
 PY
   } 2>/dev/null)"
   case "$expected_state" in
-    active) "$SYSTEMCTL_BIN" is-active --quiet "$service" >/dev/null 2>/dev/null ;;
-    inactive) ! "$SYSTEMCTL_BIN" is-active --quiet "$service" >/dev/null 2>/dev/null ;;
+    active|inactive)
+      # ``systemctl is-active`` uses rc=0/active and rc=3/inactive.  Capture
+      # the status explicitly: a negated command would turn timeout and every
+      # other failure into success and could authorize receipt cleanup.
+      actual_state=""
+      actual_status=0
+      if actual_state="$(run_systemctl is-active "$service" 2>/dev/null)"; then
+        actual_status=0
+      else
+        actual_status="$?"
+      fi
+      case "$expected_state:$actual_status:$actual_state" in
+        active:0:active|inactive:3:inactive) ;;
+        *) public_status failed systemd_state >&2; exit 1 ;;
+      esac
+      ;;
     *) public_status failed systemd_state >&2; exit 1 ;;
   esac
 done

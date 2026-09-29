@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tests import platform_test_lock_support as lock_support
 
@@ -25,6 +26,7 @@ import platform_safe_env_exec as safe_env  # noqa: E402
 from tools import platform_nginx_error_summary  # noqa: E402
 from tools import platform_media_migration_diagnostics_summary  # noqa: E402
 from tools import platform_web_runtime_diagnostics_summary  # noqa: E402
+from tools import platform_install_nginx  # noqa: E402
 
 
 class SafeEnvironmentTests(unittest.TestCase):
@@ -145,6 +147,46 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 marker.read_text(encoding="utf-8").strip(),
                 "--allow-no-previous requires no systemd receipt.",
             )
+
+    def test_preflight_bad_current_pointer_emits_canonical_failure(self) -> None:
+        source = (TOOLS_DIR / "platform_release_preflight.sh").read_text(
+            encoding="utf-8"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for kind in ("regular", "symlink-to-regular"):
+                with self.subTest(kind=kind):
+                    app = root / kind / "platform-app"
+                    app.mkdir(parents=True)
+                    (app / "shared").mkdir()
+                    if kind == "regular":
+                        (app / "current").write_text("not a pointer\n", encoding="ascii")
+                    else:
+                        target = app / "not-a-release"
+                        target.write_text("not a release\n", encoding="ascii")
+                        (app / "current").symlink_to(target)
+                    preflight = app / "platform_release_preflight.sh"
+                    preflight.write_text(source, encoding="utf-8")
+                    preflight.chmod(0o755)
+                    result = subprocess.run(
+                        [
+                            str(preflight),
+                            "--app-dir",
+                            str(app),
+                            "--allow-no-previous",
+                        ],
+                        env={**os.environ, "PLATFORM_APP_DIR": str(app)},
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 127)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "RELEASE_PREFLIGHT schema=1 status=failed class=preflight",
+                        result.stderr,
+                    )
 
     def test_production_alembic_rejects_adversarial_commands_before_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -456,7 +498,45 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         installer = self.read_tool("platform_install_systemd_units.sh")
         self.assertIn("RETIRED_UNITS", installer)
         self.assertIn('rm -f -- "$unit_path"', installer)
-        self.assertIn("systemctl disable", installer)
+        self.assertIn("run_systemctl disable", installer)
+
+    def test_release_systemctl_mutations_use_trusted_bounded_wrapper(self) -> None:
+        for name in (
+            "platform_install_systemd_units.sh",
+            "platform_release_restore_runtime.sh",
+            "platform_recover_pending.sh",
+        ):
+            text = self.read_tool(name)
+            with self.subTest(tool=name):
+                self.assertIn('SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"', text)
+                self.assertIn(
+                    '"$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s',
+                    text,
+                )
+                self.assertIn("run_systemctl", text)
+        recovery = self.read_tool("platform_recover_pending.sh")
+        self.assertIn("inactive:3:inactive", recovery)
+        self.assertNotIn("inactive) ! run_systemctl", recovery)
+
+    def test_nginx_reload_uses_bounded_timeout_and_fails_closed(self) -> None:
+        source = self.read_tool("platform_install_nginx.py")
+        self.assertIn("SYSTEMCTL_RELOAD_TIMEOUT_SECONDS = 30.0", source)
+        self.assertEqual(source.count("timeout=SYSTEMCTL_RELOAD_TIMEOUT_SECONDS"), 2)
+        captured: dict[str, object] = {}
+
+        def timed_out(command: list[str], **kwargs: object) -> object:
+            captured["command"] = command
+            captured.update(kwargs)
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with mock.patch.object(platform_install_nginx.subprocess, "run", side_effect=timed_out):
+            with self.assertRaisesRegex(RuntimeError, "Command timed out safely after 30s"):
+                platform_install_nginx.run_checked(
+                    ["systemctl", "reload", "nginx.service"],
+                    timeout=platform_install_nginx.SYSTEMCTL_RELOAD_TIMEOUT_SECONDS,
+                )
+        self.assertEqual(captured["command"], ["systemctl", "reload", "nginx.service"])
+        self.assertEqual(captured["timeout"], 30.0)
 
     def test_production_logging_avoids_duplicate_access_and_worker_info_streams(self) -> None:
         api_runner = self.read_tool("platform_run_api.sh")

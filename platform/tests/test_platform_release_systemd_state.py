@@ -143,11 +143,15 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             "if action == 'is-active':\n"
             "    value = state.get(unit, 'inactive')\n"
             "    print(value)\n"
+            "    forced_unit = os.getenv('PLATFORM_TEST_ACTIVE_RC_UNIT')\n"
+            "    forced_rc = os.getenv('PLATFORM_TEST_ACTIVE_RC')\n"
+            "    if forced_unit == unit and forced_rc is not None:\n"
+            "        raise SystemExit(int(forced_rc))\n"
             "    raise SystemExit(0 if value == 'active' else 3)\n"
             "if action == 'is-enabled':\n"
             "    value = enabled.get(unit, 'static')\n"
             "    print(value)\n"
-            "    raise SystemExit(0 if value == 'enabled' else 1)\n"
+            "    raise SystemExit(0 if value in {'enabled', 'static'} else 1)\n"
             "if action in {'enable', 'disable'}:\n"
             "    if os.getenv('PLATFORM_TEST_FAIL_ACTION') == action and not fail_marker.exists():\n"
             "        fail_marker.write_text('failed')\n"
@@ -202,6 +206,28 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             "a" * 32,
         )
 
+    def test_capture_rejects_inactive_timer_with_rc4(self) -> None:
+        result = self.run_helper(
+            "capture",
+            "--state",
+            str(self.receipt),
+            "--app-dir",
+            str(self.app),
+            "--current-before",
+            str(self.current),
+            "--previous-before",
+            str(self.previous),
+            "--operation-id",
+            "a" * 32,
+            env={
+                "PLATFORM_TEST_ACTIVE_RC_UNIT": "deadlock-cloudflare-ips.timer",
+                "PLATFORM_TEST_ACTIVE_RC": "4",
+            },
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.receipt.exists())
+
     def write_install_transaction(self) -> Path:
         def identity(path: Path) -> dict[str, int]:
             metadata = path.stat()
@@ -232,12 +258,18 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
                 "deadlock-worker": "active",
                 "deadlock-web": "inactive",
             },
+            "service_enabled_before": {
+                "deadlock-api": "disabled",
+                "deadlock-worker": "enabled",
+                "deadlock-web": "disabled",
+            },
             "quiesced_services": [
                 "deadlock-api",
                 "deadlock-worker",
                 "deadlock-web",
             ],
             "timer_active_before": True,
+            "timer_enabled_before": "enabled",
         }
         transaction.write_text(json.dumps(record, sort_keys=True) + "\n")
         transaction.chmod(0o600)
@@ -496,6 +528,91 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.receipt.exists())
         self.assertEqual(self.log_path.read_text(), "")
+
+    def test_systemctl_metadata_and_status_mismatch_fail_before_receipt(self) -> None:
+        unsafe_link = self.root / "systemctl-link"
+        unsafe_link.symlink_to(self.fake_systemctl)
+        result = self.run_helper(
+            "capture",
+            "--state",
+            str(self.receipt),
+            "--app-dir",
+            str(self.app),
+            "--current-before",
+            str(self.current),
+            "--previous-before",
+            str(self.previous),
+            "--operation-id",
+            "a" * 32,
+            "--systemctl",
+            str(unsafe_link),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(self.log_path.read_text(), "")
+
+        self.fake_systemctl.chmod(0o775)
+        result = self.run_helper(
+            "capture",
+            "--state",
+            str(self.receipt),
+            "--app-dir",
+            str(self.app),
+            "--current-before",
+            str(self.current),
+            "--previous-before",
+            str(self.previous),
+            "--operation-id",
+            "a" * 32,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.receipt.exists())
+
+    def test_systemctl_active_and_enabled_rc_pairs_are_closed(self) -> None:
+        for index, (needle, replacement) in enumerate(
+            (
+                (
+                    "raise SystemExit(0 if value == 'active' else 3)",
+                    "raise SystemExit(3)",
+                ),
+                (
+                    "raise SystemExit(0 if value in {'enabled', 'static'} else 1)",
+                    "raise SystemExit(1)",
+                ),
+                (
+                    "raise SystemExit(0 if value in {'enabled', 'static'} else 1)",
+                    "raise SystemExit(3)",
+                ),
+            )
+        ):
+            if index:
+                self.tearDown()
+                self.setUp()
+            source = self.fake_systemctl.read_text(encoding="utf-8")
+            self.assertIn(needle, source)
+            self.fake_systemctl.write_text(
+                source.replace(needle, replacement, 1), encoding="utf-8"
+            )
+            self.fake_systemctl.chmod(0o755)
+            result = self.run_helper(
+                "capture",
+                "--state",
+                str(self.receipt),
+                "--app-dir",
+                str(self.app),
+                "--current-before",
+                str(self.current),
+                "--previous-before",
+                str(self.previous),
+                "--operation-id",
+                "a" * 32,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.receipt.exists())
+            self.assertEqual(self.log_path.read_text(), "")
 
     def test_installer_or_enable_failure_retains_receipt_and_retry_is_idempotent(self) -> None:
         self.capture()

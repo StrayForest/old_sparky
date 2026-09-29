@@ -22,7 +22,11 @@ from uuid import uuid4
 STATE_NAME = ".release-operation.json"
 QUIESCE_STATE_NAME = ".release-quiesce.json"
 STATE_VERSION = 2
-QUIESCE_STATE_VERSION = 1
+# Version 1 is the narrow operation-less receipt written before the installer
+# transaction exists.  It predates enabled-state capture and is retained only
+# for exact compatibility; all newly-created receipts are version 2.
+LEGACY_QUIESCE_STATE_VERSION = 1
+QUIESCE_STATE_VERSION = 2
 RENAME_EXCHANGE = 2
 AT_FDCWD = -100
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
@@ -50,6 +54,7 @@ PHASES = {
     "rollback-runtime-pending",
     "rollback-runtime-applied",
     "filesystem-restored-runtime-pending",
+    "filesystem-restored-services-pending",
     "recovery-restored",
 }
 PHASE_TRANSITIONS = {
@@ -62,13 +67,22 @@ PHASE_TRANSITIONS = {
         "current-switched",
     },
     "snapshot-placed": {"previous-switched", "pointers-switched", "staged"},
-    "previous-switched": {"pointers-switched"},
+    "previous-switched": {"current-switched", "pointers-switched"},
     "current-switched": {"pointers-switched"},
-    "pointers-switched": {"restart-pending", "rollback-runtime-pending"},
+    "pointers-switched": {
+        "activation-pending",
+        "restart-pending",
+        "rollback-runtime-pending",
+    },
     "staged": {"migration-pending"},
     "migration-pending": {"migration-failed", "migration-applied", "recovery-authorized"},
     "migration-failed": {"migration-pending", "migration-applied", "recovery-authorized"},
-    "migration-applied": {"activation-pending", "recovery-authorized"},
+    "migration-applied": {
+        "previous-switched",
+        "current-switched",
+        "activation-pending",
+        "recovery-authorized",
+    },
     "activation-pending": {"services-restarted", "recovery-authorized"},
     "services-restarted": {
         "nginx-pending",
@@ -98,6 +112,7 @@ PHASE_TRANSITIONS = {
     },
     "rollback-runtime-applied": {"recovery-authorized"},
     "filesystem-restored-runtime-pending": {"recovery-restored"},
+    "filesystem-restored-services-pending": {"recovery-restored"},
     "recovery-restored": set(),
 }
 MIGRATION_OUTCOME_UNCERTAIN_PHASES = {
@@ -132,10 +147,12 @@ RECORD_KEYS = {
     "candidate_identity",
     "remove_env_on_recovery",
     "service_state_before",
+    "service_enabled_before",
     "quiesced_services",
     "timer_active_before",
+    "timer_enabled_before",
 }
-LEGACY_RECORD_KEYS = RECORD_KEYS - {"operation_id"}
+LEGACY_RECORD_KEYS = RECORD_KEYS - {"operation_id", "service_enabled_before", "timer_enabled_before"}
 QUIESCE_RECORD_KEYS = {
     "version",
     "operation",
@@ -148,8 +165,14 @@ QUIESCE_RECORD_KEYS = {
     "current_before_identity",
     "previous_before_identity",
     "service_state_before",
+    "service_enabled_before",
     "quiesced_services",
     "timer_active_before",
+    "timer_enabled_before",
+}
+LEGACY_QUIESCE_RECORD_KEYS = QUIESCE_RECORD_KEYS - {
+    "service_enabled_before",
+    "timer_enabled_before",
 }
 
 
@@ -159,8 +182,10 @@ class TransactionError(RuntimeError):
 
 def _validate_service_snapshot(record: dict[str, object]) -> None:
     service_state = record.get("service_state_before")
+    service_enabled = record.get("service_enabled_before")
     quiesced_services = record.get("quiesced_services")
     timer_active_before = record.get("timer_active_before")
+    timer_enabled = record.get("timer_enabled_before")
 
     # Rollback transactions do not quiesce the application services. The
     # low-level installer may create an install receipt before the deploy
@@ -168,9 +193,20 @@ def _validate_service_snapshot(record: dict[str, object]) -> None:
     # and abort callers reject that receipt rather than guessing a state.
     if (
         service_state is None
+        and service_enabled is None
         and quiesced_services is None
         and timer_active_before is None
+        and timer_enabled is None
     ):
+        return
+    if (
+        record.get("phase") == "recovery-restored"
+        and service_enabled is None
+        and timer_enabled is None
+    ):
+        # The only retained compatibility window for pre-enabled-state v2
+        # receipts is an already restored, read-only cleanup record.  A live
+        # pending/current-only recovery must carry both dimensions.
         return
     if record.get("operation") != "install":
         raise TransactionError(
@@ -184,15 +220,45 @@ def _validate_service_snapshot(record: dict[str, object]) -> None:
     ):
         raise TransactionError("pre-migration service state is invalid")
     if (
+        not isinstance(service_enabled, dict)
+        or set(service_enabled) != set(SERVICE_UNITS)
+        or any(type(value) is not str or value not in {"enabled", "disabled"} for value in service_enabled.values())
+    ):
+        raise TransactionError("pre-migration enabled service state is invalid")
+    if (
         not isinstance(quiesced_services, list)
-        or len(quiesced_services) != len(SERVICE_UNITS)
-        or any(type(value) is not str for value in quiesced_services)
-        or any(value not in SERVICE_UNITS for value in quiesced_services)
-        or set(quiesced_services) != set(SERVICE_UNITS)
+        or quiesced_services != list(SERVICE_UNITS)
     ):
         raise TransactionError("quiesced service set is invalid")
     if type(timer_active_before) is not bool:
         raise TransactionError("pre-migration timer state is invalid")
+    if timer_enabled not in {"enabled", "disabled"}:
+        raise TransactionError("pre-migration enabled timer state is invalid")
+
+
+def _validate_legacy_quiesce_snapshot(record: dict[str, object]) -> None:
+    """Validate the exact version-1 operation-less snapshot contract.
+
+    Version 1 was written before enabled-state capture existed.  It is safe
+    to use only for restoring active/inactive state; accepting any enabled
+    fields here would make a hybrid receipt ambiguous and could turn an
+    untrusted extra field into restore authority.
+    """
+
+    service_state = record.get("service_state_before")
+    quiesced_services = record.get("quiesced_services")
+    timer_active_before = record.get("timer_active_before")
+    if not isinstance(service_state, dict) or set(service_state) != set(SERVICE_UNITS):
+        raise TransactionError("pre-quiesce service state is invalid")
+    if any(
+        type(value) is not str or value not in {"active", "inactive"}
+        for value in service_state.values()
+    ):
+        raise TransactionError("pre-quiesce service state is invalid")
+    if quiesced_services != list(SERVICE_UNITS):
+        raise TransactionError("pre-quiesce quiesced service set is invalid")
+    if type(timer_active_before) is not bool:
+        raise TransactionError("pre-quiesce timer state is invalid")
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -591,10 +657,14 @@ def _validate_quiesce_record(
     state: Path,
     record: dict[str, object],
 ) -> dict[str, object]:
-    if (
-        set(record) != QUIESCE_RECORD_KEYS
-        or record.get("version") != QUIESCE_STATE_VERSION
-    ):
+    version = record.get("version")
+    if version == QUIESCE_STATE_VERSION:
+        expected_keys = QUIESCE_RECORD_KEYS
+    elif version == LEGACY_QUIESCE_STATE_VERSION:
+        expected_keys = LEGACY_QUIESCE_RECORD_KEYS
+    else:
+        expected_keys = set()
+    if set(record) != expected_keys:
         raise TransactionError("pre-quiesce receipt schema is invalid")
     if record.get("operation") != "install":
         raise TransactionError("pre-quiesce receipt operation is invalid")
@@ -662,18 +732,24 @@ def _validate_quiesce_record(
         elif not _valid_identity(identity) or not _matches(path, identity):
             raise TransactionError(f"{label} identity changed")
 
-    # Reuse the exact install snapshot contract, but do not allow a receipt
-    # that has no service state: this file is the recovery authority before
-    # the low-level installer has created its transaction record.
-    snapshot_record = {
-        "operation": "install",
-        "service_state_before": record.get("service_state_before"),
-        "quiesced_services": record.get("quiesced_services"),
-        "timer_active_before": record.get("timer_active_before"),
-    }
-    _validate_service_snapshot(snapshot_record)
-    if any(value is None for value in snapshot_record.values()):
-        raise TransactionError("pre-quiesce receipt service state is incomplete")
+    if version == LEGACY_QUIESCE_STATE_VERSION:
+        _validate_legacy_quiesce_snapshot(record)
+    else:
+        # Reuse the exact install snapshot contract, but do not allow a
+        # receipt that has no service state: this file is the recovery
+        # authority before the low-level installer has created its transaction
+        # record.
+        snapshot_record = {
+            "operation": "install",
+            "service_state_before": record.get("service_state_before"),
+            "service_enabled_before": record.get("service_enabled_before"),
+            "quiesced_services": record.get("quiesced_services"),
+            "timer_active_before": record.get("timer_active_before"),
+            "timer_enabled_before": record.get("timer_enabled_before"),
+        }
+        _validate_service_snapshot(snapshot_record)
+        if any(value is None for value in snapshot_record.values()):
+            raise TransactionError("pre-quiesce receipt service state is incomplete")
 
     return {
         **record,
@@ -794,8 +870,10 @@ def create_record(
         ),
         "remove_env_on_recovery": remove_env_on_recovery,
         "service_state_before": None,
+        "service_enabled_before": None,
         "quiesced_services": None,
         "timer_active_before": None,
+        "timer_enabled_before": None,
     }
     validated = _validate_record(state, record)
     _write_record(state, _record_for_write(validated), creating=True)
@@ -837,11 +915,31 @@ def _parse_service_snapshot(
     return parsed_states, timer_active_before == "active"
 
 
+def _parse_enabled_snapshot(
+    service_enabled: list[str], timer_enabled_before: str
+) -> tuple[dict[str, str], str]:
+    parsed: dict[str, str] = {}
+    for value in service_enabled:
+        if "=" not in value:
+            raise TransactionError("pre-migration enabled service state entry is invalid")
+        service, enabled_state = value.split("=", 1)
+        if service in parsed or service not in SERVICE_UNITS or enabled_state not in {"enabled", "disabled"}:
+            raise TransactionError("pre-migration enabled service state entry is invalid")
+        parsed[service] = enabled_state
+    if set(parsed) != set(SERVICE_UNITS):
+        raise TransactionError("pre-migration enabled service state is incomplete")
+    if timer_enabled_before not in {"enabled", "disabled"}:
+        raise TransactionError("pre-migration enabled timer state is invalid")
+    return parsed, timer_enabled_before
+
+
 def record_services(
     state: Path,
     *,
     service_states: list[str],
     timer_active_before: str,
+    service_enabled: list[str],
+    timer_enabled_before: str,
 ) -> None:
     record = _load_record(state)
     if record["operation"] != "install" or record["phase"] != "staged":
@@ -851,22 +949,31 @@ def record_services(
     parsed_states, timer_value = _parse_service_snapshot(
         service_states, timer_active_before
     )
+    parsed_enabled, timer_enabled_value = _parse_enabled_snapshot(
+        service_enabled, timer_enabled_before
+    )
 
     existing_states = record["service_state_before"]
     existing_services = record["quiesced_services"]
     existing_timer = record["timer_active_before"]
-    if existing_states is not None or existing_services is not None or existing_timer is not None:
+    existing_enabled = record["service_enabled_before"]
+    existing_timer_enabled = record["timer_enabled_before"]
+    if existing_states is not None or existing_enabled is not None or existing_services is not None or existing_timer is not None or existing_timer_enabled is not None:
         if (
             existing_states != parsed_states
+            or existing_enabled != parsed_enabled
             or existing_services != list(SERVICE_UNITS)
             or existing_timer != timer_value
+            or existing_timer_enabled != timer_enabled_value
         ):
             raise TransactionError("pre-migration service state was already recorded")
         return
 
     record["service_state_before"] = parsed_states
+    record["service_enabled_before"] = parsed_enabled
     record["quiesced_services"] = list(SERVICE_UNITS)
     record["timer_active_before"] = timer_value
+    record["timer_enabled_before"] = timer_enabled_value
     _write_record(state, _record_for_write(record), creating=False)
 
 
@@ -877,6 +984,8 @@ def prepare_quiesce(
     candidate_release: Path,
     service_states: list[str],
     timer_active_before: str,
+    service_enabled: list[str],
+    timer_enabled_before: str,
     candidate_may_exist: bool,
 ) -> None:
     """Persist the pre-stop runtime snapshot before staging can mutate files."""
@@ -893,6 +1002,9 @@ def prepare_quiesce(
         raise TransactionError("pre-quiesce receipt path is invalid")
     parsed_states, timer_value = _parse_service_snapshot(
         service_states, timer_active_before
+    )
+    parsed_enabled, timer_enabled_value = _parse_enabled_snapshot(
+        service_enabled, timer_enabled_before
     )
     shared_env = app_path / "shared" / ".env.platform"
     shared_env_metadata = _optional_safe_private_file(
@@ -930,8 +1042,10 @@ def prepare_quiesce(
             else None
         ),
         "service_state_before": parsed_states,
+        "service_enabled_before": parsed_enabled,
         "quiesced_services": list(SERVICE_UNITS),
         "timer_active_before": timer_value,
+        "timer_enabled_before": timer_enabled_value,
     }
     validated = _validate_quiesce_record(state, record)
     _write_record(state, _quiesce_record_for_write(validated), creating=True)
@@ -1008,8 +1122,10 @@ def promote_quiesce(
         "candidate_identity": _identity(candidate_metadata),
         "remove_env_on_recovery": remove_env_on_recovery,
         "service_state_before": pre["service_state_before"],
+        "service_enabled_before": pre["service_enabled_before"],
         "quiesced_services": pre["quiesced_services"],
         "timer_active_before": pre["timer_active_before"],
+        "timer_enabled_before": pre["timer_enabled_before"],
     }
     validated = _validate_record(state, record)
     _write_record(state, _record_for_write(validated), creating=False)
@@ -1025,10 +1141,76 @@ def verify_quiesce(state: Path) -> None:
         raise TransactionError("pre-quiesce release pointers changed")
 
 
+def validate_quiesce_noop(state: Path) -> None:
+    """Validate the only systemd-free operationless first-install receipt.
+
+    A pre-promotion receipt can exist before the installer has created its
+    operation identity.  When neither pointer existed, the deploy wrapper
+    writes a complete all-inactive/disabled compatibility snapshot; recovery
+    must validate that exact shape and then clean up without querying or
+    mutating systemd.  Active, enabled, partial, or hybrid snapshots are not
+    a no-op and fail closed before cleanup.
+    """
+
+    record = _load_quiesce_record(state)
+    if record["current_before"] is not None or record["previous_before"] is not None:
+        raise TransactionError("pre-quiesce receipt is not first-install topology")
+    service_state = cast(dict[str, str], record["service_state_before"])
+    if any(value != "inactive" for value in service_state.values()):
+        raise TransactionError("first-install quiesce snapshot is active")
+    if record["timer_active_before"] is not False:
+        raise TransactionError("first-install quiesce timer snapshot is active")
+    if record["version"] == QUIESCE_STATE_VERSION:
+        service_enabled = cast(dict[str, str], record["service_enabled_before"])
+        if any(value != "disabled" for value in service_enabled.values()):
+            raise TransactionError("first-install quiesce service is enabled")
+        if record["timer_enabled_before"] != "disabled":
+            raise TransactionError("first-install quiesce timer is enabled")
+
+
 def clear_quiesce(state: Path) -> None:
     _load_quiesce_record(state)
     state.unlink()
     _fsync_directory(state.parent)
+
+
+def validate_service_snapshot(state: Path, *, require: str) -> None:
+    record = _load_record(state)
+    service_state = record.get("service_state_before")
+    service_enabled = record.get("service_enabled_before")
+    quiesced_services = record.get("quiesced_services")
+    timer_active_before = record.get("timer_active_before")
+    timer_enabled = record.get("timer_enabled_before")
+    present = (
+        service_state is not None
+        or service_enabled is not None
+        or quiesced_services is not None
+        or timer_active_before is not None
+        or timer_enabled is not None
+    )
+    if require == "present":
+        if not present:
+            raise TransactionError("pre-migration service state is missing")
+        _validate_service_snapshot(record)
+    elif require == "absent":
+        if present:
+            raise TransactionError("pre-migration service state is unexpected")
+    elif require == "optional":
+        if present:
+            _validate_service_snapshot(record)
+            service_state = cast(dict[str, str], record["service_state_before"])
+            service_enabled = cast(dict[str, str], record["service_enabled_before"])
+            if (
+                any(value != "inactive" for value in service_state.values())
+                or record["timer_active_before"] is not False
+                or any(value != "disabled" for value in service_enabled.values())
+                or record["timer_enabled_before"] != "disabled"
+            ):
+                raise TransactionError(
+                    "first-install service snapshot must be fully inactive and disabled"
+                )
+    else:
+        raise TransactionError("service snapshot requirement is invalid")
 
 
 def abort_quiesce(state: Path) -> None:
@@ -1113,8 +1295,11 @@ def _systemctl_path(value: str) -> str:
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != 0
+        or metadata.st_gid != 0
         or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o022
         or not stat.S_IMODE(metadata.st_mode) & 0o111
+        or path.resolve(strict=True) != path
     ):
         raise TransactionError("systemctl path metadata is unsafe")
     return value
@@ -1134,6 +1319,8 @@ def _run_systemctl(systemctl: str, *arguments: str) -> str:
     except (OSError, subprocess.SubprocessError) as exc:
         raise TransactionError("systemctl operation failed") from exc
     output = result.stdout.strip()
+    if "\n" in output or "\r" in output:
+        raise TransactionError("systemctl operation returned multiple states")
     if result.returncode != 0:
         raise TransactionError("systemctl operation failed")
     return output
@@ -1155,6 +1342,33 @@ def _read_systemctl_state(systemctl: str, unit: str) -> str:
     output = result.stdout.strip()
     if output not in {"active", "inactive"}:
         raise TransactionError("systemctl state query is invalid")
+    if (output == "active" and result.returncode != 0) or (
+        output == "inactive" and result.returncode != 3
+    ):
+        raise TransactionError("systemctl active state/status mismatch")
+    return output
+
+
+def _read_systemctl_enabled(systemctl: str, unit: str) -> str:
+    try:
+        result = subprocess.run(
+            [systemctl, "is-enabled", unit],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TransactionError("systemctl enabled state query failed") from exc
+    output = result.stdout.strip()
+    if output not in {"enabled", "disabled"}:
+        raise TransactionError("systemctl enabled state query is invalid")
+    if (output == "enabled" and result.returncode != 0) or (
+        output == "disabled" and result.returncode != 1
+    ):
+        raise TransactionError("systemctl enabled state/status mismatch")
     return output
 
 
@@ -1173,12 +1387,37 @@ def restore_quiesce(state: Path, *, systemctl: str) -> None:
     candidate = cast(Path, record["candidate_path"])
     _validate_quiesce_candidate_for_abort(candidate)
     service_state = cast(dict[str, str], record["service_state_before"])
-    for unit in SERVICE_UNITS:
-        expected = service_state[unit]
-        _run_systemctl(systemctl, "restart" if expected == "active" else "stop", unit)
-        if _read_systemctl_state(systemctl, unit) != expected:
-            raise TransactionError("quiesced service state was not restored")
+    version = cast(int, record["version"])
+    if version == QUIESCE_STATE_VERSION:
+        service_enabled = cast(dict[str, str], record["service_enabled_before"])
+        for unit in SERVICE_UNITS:
+            enabled_expected = service_enabled[unit]
+            _run_systemctl(systemctl, "enable" if enabled_expected == "enabled" else "disable", unit)
+            if _read_systemctl_enabled(systemctl, unit) != enabled_expected:
+                raise TransactionError("quiesced service enabled state was not restored")
+            expected = service_state[unit]
+            _run_systemctl(systemctl, "restart" if expected == "active" else "stop", unit)
+            if _read_systemctl_state(systemctl, unit) != expected:
+                raise TransactionError("quiesced service state was not restored")
+    else:
+        # Legacy version-1 receipts intentionally lack enabled-state fields.
+        # Restore only their exact active/inactive snapshot; never infer or
+        # mutate enablement from an absent field.
+        for unit in SERVICE_UNITS:
+            expected = service_state[unit]
+            _run_systemctl(systemctl, "restart" if expected == "active" else "stop", unit)
+            if _read_systemctl_state(systemctl, unit) != expected:
+                raise TransactionError("quiesced service state was not restored")
     timer_expected = "active" if record["timer_active_before"] else "inactive"
+    if version == QUIESCE_STATE_VERSION:
+        timer_enabled_expected = cast(str, record["timer_enabled_before"])
+        _run_systemctl(
+            systemctl,
+            "enable" if timer_enabled_expected == "enabled" else "disable",
+            "deadlock-cloudflare-ips.timer",
+        )
+        if _read_systemctl_enabled(systemctl, "deadlock-cloudflare-ips.timer") != timer_enabled_expected:
+            raise TransactionError("quiesced timer enabled state was not restored")
     _run_systemctl(
         systemctl,
         "start" if timer_expected == "active" else "stop",
@@ -1391,27 +1630,82 @@ def _verify_original_pointers(record: dict[str, object]) -> None:
 
 
 def _verify_recovery_pointers(record: dict[str, object]) -> None:
-    """Reject an unrelated pointer pair before restoring a receipt."""
+    """Reject an unrelated or phase-impossible pointer pair before recovery."""
 
     app = cast(Path, record["app"])
     actual = (_read_pointer(app, "current"), _read_pointer(app, "previous"))
     original = (record["current_before_path"], record["previous_before_path"])
+    candidate = cast(Path, record["candidate_path"])
+    release_paths = [
+        path for path in (
+            cast(Path | None, record["current_before_path"]),
+            cast(Path | None, record["previous_before_path"]),
+            candidate,
+        ) if path is not None and _lexists(path)
+    ]
+    devices = {_safe_directory(path, label=f"recovery release {path.name}").st_dev for path in release_paths}
+    if len(devices) > 1:
+        raise TransactionError("release recovery crosses filesystems")
+    phase = cast(str, record["phase"])
     if record["operation"] == "install":
         current_before = cast(Path | None, record["current_before_path"])
         previous_before = cast(Path | None, record["previous_before_path"])
-        candidate = cast(Path, record["candidate_path"])
         desired_previous = current_before if current_before is not None else previous_before
-        allowed = (
-            original,
-            (current_before, current_before),
-            (candidate, desired_previous),
-        )
+        # The installer moves the old current pointer to ``previous`` before
+        # switching ``current`` to the candidate.  During that narrow
+        # previous-switched window the live pair is therefore
+        # (current_before, current_before), not (candidate, ...).  Once the
+        # current pointer has moved, every post-current phase is
+        # (candidate, current_before).  Keeping these pairs phase-aware is
+        # what lets a crash between the two pointer renames be recovered
+        # without accepting an unrelated topology.
+        phase_pairs = {
+            "current-switched": ((candidate, desired_previous),),
+            # The durable marker is written after the previous symlink and
+            # before the current symlink.  A kill in that tiny window leaves
+            # (current_before, current_before); a kill after the second
+            # symlink but before the marker update leaves the post-promotion
+            # pair.  Both are exact transaction-owned states, so permit both
+            # and reject every other topology.
+            "previous-switched": tuple(
+                pair
+                for pair in (
+                    (current_before, current_before),
+                    (candidate, desired_previous),
+                )
+                if pair[0] is not None or pair[1] is not None
+            ),
+            "pointers-switched": ((candidate, desired_previous),),
+            "restart-pending": ((candidate, desired_previous),),
+            "rollback-runtime-pending": ((candidate, desired_previous),),
+            "rollback-runtime-applied": ((candidate, desired_previous),),
+            "recovery-authorized": ((candidate, desired_previous),),
+            "staged": ((candidate, desired_previous),),
+            "migration-pending": ((candidate, desired_previous),),
+            "migration-failed": ((candidate, desired_previous),),
+            "migration-applied": ((candidate, desired_previous),),
+            "activation-pending": ((candidate, desired_previous),),
+            "services-restarted": ((candidate, desired_previous),),
+            "nginx-pending": ((candidate, desired_previous),),
+            "nginx-applied": ((candidate, desired_previous),),
+            "smoke-passed": ((candidate, desired_previous),),
+            "activation-committed": ((candidate, desired_previous),),
+        }
+        allowed = (original, *phase_pairs.get(phase, ()))
     else:
-        allowed = (
-            original,
-            (record["previous_before_path"], record["previous_before_path"]),
-            (record["previous_before_path"], record["current_before_path"]),
-        )
+        rollback_current = cast(Path | None, record["previous_before_path"])
+        rollback_previous = cast(Path | None, record["current_before_path"])
+        phase_pairs = {
+            "current-switched": ((rollback_current, rollback_current),),
+            "previous-switched": ((rollback_current, rollback_previous),),
+            "pointers-switched": ((rollback_current, rollback_previous),),
+            "restart-pending": ((rollback_current, rollback_previous),),
+            "rollback-runtime-pending": ((rollback_current, rollback_previous),),
+            "rollback-runtime-applied": ((rollback_current, rollback_previous),),
+            "services-restarted": ((rollback_current, rollback_previous),),
+            "smoke-passed": ((rollback_current, rollback_previous),),
+        }
+        allowed = (original, *phase_pairs.get(phase, ()))
     if actual not in allowed:
         raise TransactionError("release pointers do not match this transaction")
 
@@ -1542,19 +1836,77 @@ def _cleanup_recovered_install(
         _fsync_directory(state.parent)
 
 
+def restore_services(state: Path, *, systemctl: str) -> None:
+    """Restore a current-only install's exact pre-quiesce service snapshot."""
+
+    systemctl = _systemctl_path(systemctl)
+    record = _load_record(state)
+    if (
+        record["operation"] != "install"
+        or record["phase"] != "filesystem-restored-services-pending"
+        or record["current_before_path"] is None
+        or record["previous_before_path"] is not None
+    ):
+        raise TransactionError("transaction is not ready for service restoration")
+    validate_service_snapshot(state, require="present")
+    _verify_original_pointers(record)
+    _restore_venv(record)
+    service_state = cast(dict[str, str], record["service_state_before"])
+    service_enabled = cast(dict[str, str], record["service_enabled_before"])
+    for unit in SERVICE_UNITS:
+        enabled_expected = service_enabled[unit]
+        _run_systemctl(systemctl, "enable" if enabled_expected == "enabled" else "disable", unit)
+        if _read_systemctl_enabled(systemctl, unit) != enabled_expected:
+            raise TransactionError("pre-migration service enabled state was not restored")
+        expected = service_state[unit]
+        _run_systemctl(systemctl, "restart" if expected == "active" else "stop", unit)
+        if _read_systemctl_state(systemctl, unit) != expected:
+            raise TransactionError("pre-migration service state was not restored")
+    timer_expected = "active" if record["timer_active_before"] else "inactive"
+    timer_enabled_expected = cast(str, record["timer_enabled_before"])
+    _run_systemctl(
+        systemctl,
+        "enable" if timer_enabled_expected == "enabled" else "disable",
+        "deadlock-cloudflare-ips.timer",
+    )
+    if _read_systemctl_enabled(systemctl, "deadlock-cloudflare-ips.timer") != timer_enabled_expected:
+        raise TransactionError("pre-migration timer enabled state was not restored")
+    _run_systemctl(
+        systemctl,
+        "start" if timer_expected == "active" else "stop",
+        "deadlock-cloudflare-ips.timer",
+    )
+    if _read_systemctl_state(systemctl, "deadlock-cloudflare-ips.timer") != timer_expected:
+        raise TransactionError("pre-migration timer state was not restored")
+
+
 def recover(
     state: Path,
     *,
     retain: bool = False,
     runtime_pending: bool = False,
+    service_pending: bool = False,
 ) -> None:
     record = _load_record(state)
+    if runtime_pending and service_pending:
+        raise TransactionError("recovery subphases are mutually exclusive")
     if runtime_pending and (
         not retain or record["operation"] != "rollback"
     ):
         raise TransactionError(
             "runtime-pending recovery requires a retained rollback transaction"
         )
+    if service_pending and (
+        not retain
+        or record["operation"] != "install"
+        or record["current_before_path"] is None
+        or record["previous_before_path"] is not None
+    ):
+        raise TransactionError(
+            "service-pending recovery requires a retained current-only install"
+        )
+    if service_pending:
+        validate_service_snapshot(state, require="present")
     if (
         record["operation"] == "install"
         and record["phase"] in MIGRATION_OUTCOME_UNCERTAIN_PHASES
@@ -1577,6 +1929,10 @@ def recover(
         _verify_original_pointers(record)
         if runtime_pending:
             record["phase"] = "filesystem-restored-runtime-pending"
+            _write_record(state, _record_for_write(record), creating=False)
+            record = _load_record(state)
+        elif service_pending:
+            record["phase"] = "filesystem-restored-services-pending"
             _write_record(state, _record_for_write(record), creating=False)
             record = _load_record(state)
         else:
@@ -1720,6 +2076,12 @@ def _build_parser() -> argparse.ArgumentParser:
     record_services_parser.add_argument(
         "--timer-active-before", required=True, choices=("active", "inactive")
     )
+    record_services_parser.add_argument(
+        "--service-enabled", required=True, action="append"
+    )
+    record_services_parser.add_argument(
+        "--timer-enabled-before", required=True, choices=("enabled", "disabled")
+    )
 
     prepare_quiesce_parser = commands.add_parser("prepare-quiesce")
     prepare_quiesce_parser.add_argument("--state", required=True, type=Path)
@@ -1735,6 +2097,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     prepare_quiesce_parser.add_argument(
         "--timer-active-before", required=True, choices=("active", "inactive")
+    )
+    prepare_quiesce_parser.add_argument(
+        "--service-enabled", required=True, action="append"
+    )
+    prepare_quiesce_parser.add_argument(
+        "--timer-enabled-before", required=True, choices=("enabled", "disabled")
     )
     promote_quiesce_parser = commands.add_parser("promote-quiesce")
     promote_quiesce_parser.add_argument("--state", required=True, type=Path)
@@ -1752,6 +2120,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     verify_quiesce_parser = commands.add_parser("verify-quiesce")
     verify_quiesce_parser.add_argument("--state", required=True, type=Path)
+    validate_quiesce_noop_parser = commands.add_parser("validate-quiesce-noop")
+    validate_quiesce_noop_parser.add_argument("--state", required=True, type=Path)
     clear_quiesce_parser = commands.add_parser("clear-quiesce")
     clear_quiesce_parser.add_argument("--state", required=True, type=Path)
     abort_quiesce_parser = commands.add_parser("abort-quiesce")
@@ -1759,6 +2129,14 @@ def _build_parser() -> argparse.ArgumentParser:
     restore_quiesce_parser = commands.add_parser("restore-quiesce")
     restore_quiesce_parser.add_argument("--state", required=True, type=Path)
     restore_quiesce_parser.add_argument("--systemctl", required=True)
+    validate_service_snapshot_parser = commands.add_parser("validate-service-snapshot")
+    validate_service_snapshot_parser.add_argument("--state", required=True, type=Path)
+    validate_service_snapshot_parser.add_argument(
+        "--require", required=True, choices=("present", "absent", "optional")
+    )
+    restore_services_parser = commands.add_parser("restore-services")
+    restore_services_parser.add_argument("--state", required=True, type=Path)
+    restore_services_parser.add_argument("--systemctl", required=True)
     status_quiesce_parser = commands.add_parser("status-quiesce")
     status_quiesce_parser.add_argument("--state", required=True, type=Path)
     status_quiesce_parser.add_argument("--json", action="store_true", dest="as_json")
@@ -1774,10 +2152,15 @@ def _build_parser() -> argparse.ArgumentParser:
     pointer.add_argument("--state", required=True, type=Path)
     pointer.add_argument("--name", required=True, choices=("current", "previous"))
     pointer.add_argument("--target", default="")
+    validate_recovery_pointers_parser = commands.add_parser(
+        "validate-recovery-pointers"
+    )
+    validate_recovery_pointers_parser.add_argument("--state", required=True, type=Path)
     recover_parser = commands.add_parser("recover")
     recover_parser.add_argument("--state", required=True, type=Path)
     recover_parser.add_argument("--retain", action="store_true")
     recover_parser.add_argument("--runtime-pending", action="store_true")
+    recover_parser.add_argument("--service-pending", action="store_true")
     authorize_parser = commands.add_parser("authorize-recovery")
     authorize_parser.add_argument("--state", required=True, type=Path)
     authorize_parser.add_argument("--confirm", required=True)
@@ -1821,6 +2204,8 @@ def main() -> int:
                 args.state,
                 service_states=args.service_state,
                 timer_active_before=args.timer_active_before,
+                service_enabled=args.service_enabled,
+                timer_enabled_before=args.timer_enabled_before,
             )
         elif args.command == "prepare-quiesce":
             prepare_quiesce(
@@ -1829,6 +2214,8 @@ def main() -> int:
                 candidate_release=args.candidate_release,
                 service_states=args.service_state,
                 timer_active_before=args.timer_active_before,
+                service_enabled=args.service_enabled,
+                timer_enabled_before=args.timer_enabled_before,
                 candidate_may_exist=args.candidate_may_exist,
             )
         elif args.command == "promote-quiesce":
@@ -1843,12 +2230,18 @@ def main() -> int:
             )
         elif args.command == "verify-quiesce":
             verify_quiesce(args.state)
+        elif args.command == "validate-quiesce-noop":
+            validate_quiesce_noop(args.state)
         elif args.command == "clear-quiesce":
             clear_quiesce(args.state)
         elif args.command == "abort-quiesce":
             abort_quiesce(args.state)
         elif args.command == "restore-quiesce":
             restore_quiesce(args.state, systemctl=args.systemctl)
+        elif args.command == "validate-service-snapshot":
+            validate_service_snapshot(args.state, require=args.require)
+        elif args.command == "restore-services":
+            restore_services(args.state, systemctl=args.systemctl)
         elif args.command == "status-quiesce":
             record = _load_quiesce_record(args.state)
             if args.as_json:
@@ -1862,8 +2255,10 @@ def main() -> int:
                             "previous_before": record["previous_before"],
                             "candidate_release": record["candidate_release"],
                             "service_state_before": record["service_state_before"],
+                            "service_enabled_before": record.get("service_enabled_before"),
                             "quiesced_services": record["quiesced_services"],
                             "timer_active_before": record["timer_active_before"],
+                            "timer_enabled_before": record.get("timer_enabled_before"),
                         },
                         sort_keys=True,
                     )
@@ -1876,11 +2271,15 @@ def main() -> int:
             rename_recorded_venv(args.state, mode=args.mode)
         elif args.command == "switch-pointer":
             switch_pointer(args.state, name=args.name, target_value=args.target)
+        elif args.command == "validate-recovery-pointers":
+            record = _load_record(args.state)
+            _verify_recovery_pointers(record)
         elif args.command == "recover":
             recover(
                 args.state,
                 retain=args.retain,
                 runtime_pending=args.runtime_pending,
+                service_pending=args.service_pending,
             )
         elif args.command == "authorize-recovery":
             authorize_recovery(args.state, confirmation=args.confirm)
@@ -1914,12 +2313,18 @@ def main() -> int:
                                 "service_state_before": quiesce_record[
                                     "service_state_before"
                                 ],
+                                "service_enabled_before": quiesce_record.get(
+                                    "service_enabled_before"
+                                ),
                                 "quiesced_services": quiesce_record[
                                     "quiesced_services"
                                 ],
                                 "timer_active_before": quiesce_record[
                                     "timer_active_before"
                                 ],
+                                "timer_enabled_before": quiesce_record.get(
+                                    "timer_enabled_before"
+                                ),
                             },
                             sort_keys=True,
                         )
@@ -1941,8 +2346,10 @@ def main() -> int:
                             "previous_before": record["previous_before"],
                             "candidate_release": record["candidate_release"],
                             "service_state_before": record["service_state_before"],
+                            "service_enabled_before": record["service_enabled_before"],
                             "quiesced_services": record["quiesced_services"],
                             "timer_active_before": record["timer_active_before"],
+                            "timer_enabled_before": record["timer_enabled_before"],
                         },
                         sort_keys=True,
                     )

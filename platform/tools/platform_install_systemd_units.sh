@@ -6,6 +6,16 @@ SYSTEMD_SRC_DIR="$ROOT_DIR/deploy/systemd"
 SYSTEMD_DEST_DIR="${PLATFORM_SYSTEMD_DIR:-/etc/systemd/system}"
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
 ENABLE_SYSTEMD_UNITS="${PLATFORM_ENABLE_SYSTEMD_UNITS:-1}"
+SYSTEMCTL_BIN="${PLATFORM_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"
+
+# Every mutable systemctl call is bounded.  A wedged systemd manager must
+# leave the caller's durable receipt available for retry rather than hanging
+# a release indefinitely.  Tests may inject only the systemctl executable;
+# the timeout implementation remains the trusted host path.
+run_systemctl() {
+  "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s "$SYSTEMCTL_BIN" "$@"
+}
 
 CURRENT_UNITS=(
   deadlock-api.service
@@ -36,11 +46,11 @@ if [[ "$SYSTEMD_DEST_DIR" == "/etc/systemd/system" && "$ENABLE_SYSTEMD_UNITS" ==
     if [[ -n "${EXPECTED_UNIT[$unit_name]:-}" ]]; then
       continue
     fi
-    if systemctl is-active --quiet "$unit_name"; then
-      systemctl stop "$unit_name"
+    if run_systemctl is-active --quiet "$unit_name"; then
+      run_systemctl stop "$unit_name"
     fi
-    if systemctl is-enabled --quiet "$unit_name"; then
-      systemctl disable "$unit_name"
+    if run_systemctl is-enabled --quiet "$unit_name"; then
+      run_systemctl disable "$unit_name"
     fi
     rm -f -- "$unit_path"
     RETIRED_UNITS+=("$unit_name")
@@ -59,11 +69,11 @@ fi
 "$ROOT_DIR/tools/platform_prepare_service_user.sh" \
   --app-dir "$APP_DIR" \
   --apply
-systemctl daemon-reload
+run_systemctl daemon-reload
 
 if [[ "$ENABLE_SYSTEMD_UNITS" == "1" ]]; then
-  systemctl enable deadlock-api.service deadlock-worker.service deadlock-web.service
-  systemctl enable --now \
+  run_systemctl enable deadlock-api.service deadlock-worker.service deadlock-web.service
+  run_systemctl enable --now \
     deadlock-maintenance.timer \
     deadlock-logrotate.timer \
     deadlock-cloudflare-ips.timer \

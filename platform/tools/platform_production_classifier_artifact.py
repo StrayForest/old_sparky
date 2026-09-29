@@ -61,6 +61,7 @@ EXPECTED_NAME_RE = re.compile(
 RECOVERY_BOOTSTRAP_FILES = frozenset(
     {
         ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
         ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
         ".github/workflows/platform-production-deploy.yml",
         ".github/workflows/platform-production-release-abort.yml",
@@ -71,6 +72,8 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_release_lock.sh",
         "platform/tools/platform_release_deploy.sh",
         "platform/tools/platform_release_preflight.sh",
+        "platform/tools/platform_install_systemd_units.sh",
+        "platform/tools/platform_install_nginx.py",
         "platform/tools/platform_release_restore_runtime.sh",
         "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tools/platform_release_rollback.sh",

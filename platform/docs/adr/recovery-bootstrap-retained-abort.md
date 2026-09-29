@@ -15,14 +15,23 @@ Migration uncertainty remains irreversible and must stay fail-closed.
 
 The trusted default-branch security run produces a deterministic,
 non-deployable bundle containing only the closed recovery-helper closure. Its
-manifest binds source SHA, exact security run/attempt, artifact digest, modes
-and member digests. The manual recovery-bootstrap abort workflow validates the
-successful run, route artifact, evidence, bundle digest and attestation before
-reading production secrets or opening SSH. Because the GitHub certificate's
-`runInvocationURI` identifies a run/attempt rather than a job, the exact
-recovery job ID is selected from that attempt's jobs API, emitted by the build
-evidence, and cross-checked as a closed evidence/API pair; it is never inferred
-from or fabricated into the certificate URI.
+manifest binds source SHA **A**, exact security run/attempt, artifact digest,
+modes and member digests. The producer recovery workflow has its own reviewed
+workflow SHA **B**; a separate completed-run publisher has workflow SHA **C**.
+The producer only builds, attests and uploads the bundle. The publisher is
+triggered by that completed producer run, re-reads the exact producer
+run/attempt/job and security run/attempt from the API, and uploads schema-2
+evidence containing both producer and publisher identities. Operators pass all
+three exact run/attempt pairs to recovery or abort; no workflow performs a
+latest-by-SHA or same-run self-publication lookup. Consumers verify the bundle
+attestation against **B**, independently bind bundle source **A**, and
+cross-check publisher **C**, the producer artifact API digest, and job evidence.
+The publisher verifies the downloaded producer artifact ZIP bytes against that
+API digest before extracting its one bundle member. Because the GitHub certificate's
+`runInvocationURI` identifies a run/attempt rather than a job, the exact job ID
+is selected from that attempt's jobs API, emitted by the closed evidence, and
+cross-checked as an evidence/API pair; it is never inferred from or fabricated
+into the certificate URI.
 
 The host installs one root-owned, immutable, content-addressed generation
 under `shared/.release-recovery/generations/<bundle-sha256>`. Its manifest
@@ -43,12 +52,17 @@ immutable control plane. It transfers or reuses the exact attested bundle
 whose SHA is bound to the security-run/recovery-run evidence, installs it
 under that content address, validates its closed manifest and requested
 `recover_pending` capability, and invokes only
-`platform_recover_pending.sh`. For first-install and current-only receipts it
-runs only the generation's lock/transaction helpers and requires no systemd
-receipt; it never sources `current/tools`. Upgrade and rollback use that same
-generation wrapper for the two-pointer systemd contract, while release-specific
-data-plane helpers are accepted only through the systemd manifest bound to the
-recorded release.
+`platform_recover_pending.sh`. A first-install receipt with no prior current
+has no service snapshot and therefore runs only the generation's
+lock/transaction helpers, with zero systemd calls; a complete snapshot, when
+present, is validated but never used to call systemd. A current-only receipt must
+carry a complete API/worker/web/timer snapshot; it has no systemd receipt, but
+the generation restores that exact snapshot before transaction cleanup and
+records a durable `filesystem-restored-services-pending` phase for retry. Neither topology
+sources `current/tools`. Upgrade and rollback use that same generation wrapper
+for the two-pointer systemd contract, while release-specific data-plane
+helpers are accepted only through the systemd manifest bound to the recorded
+release.
 
 For an operation-ID rollback, `platform_recover_pending.sh` owns the complete
 phase matrix inside that generation: pre-runtime phases retain the filesystem
@@ -67,14 +81,21 @@ revalidated before use.
 
 The same wrapper has a narrowly scoped pre-promotion branch for an exact
 operation-less version-1 `install` receipt in `quiesce-pending`. It requires
-complete service/timer state, unchanged current/previous identities, an absent
+complete active/inactive service/timer state, unchanged current/previous identities, an absent
 candidate path or empty safe candidate directory (the legacy receipt has no
-candidate inode binding), and no systemd receipt. It restores the recorded
+candidate inode binding), and no systemd receipt. New version-2 pre-quiesce
+receipts additionally carry and restore the exact enabled/disabled state; a
+version-1 receipt has no enabled fields and never infers them. It restores the recorded
 snapshot through immutable helper
 code and then calls `abort-quiesce`. Unknown keys, other operation-less phases,
 partial state or an occupied candidate fail before any systemd call. This is
 separate from the operation-less `recovery-restored` receipt-owned cleanup
 bridge.
+
+When both pointers were absent before that receipt, the only accepted
+compatibility snapshot is fully inactive and disabled (version 2) or fully
+inactive with no enablement fields (version 1). That proof is a no-op: the
+immutable wrapper consumes the receipt without invoking `systemctl`.
 
 New transaction receipts carry one immutable 32-hex `operation_id`; the
 systemd receipt must carry the same ID and the canonical current/previous
