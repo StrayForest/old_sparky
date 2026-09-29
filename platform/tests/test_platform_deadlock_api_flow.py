@@ -42,12 +42,15 @@ from python_packages.platform_infra.models import (
 )
 from python_packages.platform_infra.security import session_token_digest
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_integration_password import (
+    INTEGRATION_PASSWORD,
+    patch_integration_registration_hash,
+)
 
 
 class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-deadlock-{uuid4().hex[:8]}"
-        self.password = "integration-pass-123"
         self.base_url = "http://testserver"
         self.app = create_app()
         self.clients = AsyncExitStack()
@@ -99,17 +102,18 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         client = await self._new_client()
         email = f"{self.prefix}-{label}@example.com"
         display_name = f"test-{label}"[:15]
-        register_payload = self._assert_status(
-            await client.post(
-                "/api/v1/auth/register",
-                json={
-                    "email": email,
-                    "password": self.password,
-                    "display_name": display_name,
-                },
-            ),
-            201,
-        )
+        with patch_integration_registration_hash():
+            register_payload = self._assert_status(
+                await client.post(
+                    "/api/v1/auth/register",
+                    json={
+                        "email": email,
+                        "password": INTEGRATION_PASSWORD,
+                        "display_name": display_name,
+                    },
+                ),
+                201,
+            )
         self._assert_status(
             await client.put(
                 "/api/v1/profiles/me/deadlock",

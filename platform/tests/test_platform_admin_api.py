@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -31,12 +32,16 @@ from python_packages.platform_infra.models import (
     UserSession,
 )
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_integration_password import (
+    INTEGRATION_PASSWORD,
+    INTEGRATION_PASSWORD_HASH,
+    patch_integration_registration_hash,
+)
 
 
 class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-admin-{uuid4().hex[:8]}"
-        self.password = "integration-pass-123"
         self.base_url = "http://testserver"
         self.app = create_app()
         self.clients = AsyncExitStack()
@@ -72,6 +77,171 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                 await db_session.execute(delete(User).where(User.id.in_(user_ids)))
             await db_session.commit()
 
+    async def test_integration_password_fixture_is_scoped_and_production_valid(self) -> None:
+        """The fixture shortcut never replaces the production hash/verify path."""
+
+        from apps.platform_api.app.api.routes import registration as registration_routes
+        from python_packages.platform_infra import security
+
+        original_registration_hash = registration_routes.hash_password
+        self.assertIs(original_registration_hash, security.hash_password)
+        stale_dispatcher = None
+
+        with self.assertRaises(RuntimeError):
+            with patch_integration_registration_hash():
+                self.assertIsNot(registration_routes.hash_password, security.hash_password)
+                self.assertEqual(
+                    registration_routes.hash_password(INTEGRATION_PASSWORD),
+                    INTEGRATION_PASSWORD_HASH,
+                )
+                with patch_integration_registration_hash():
+                    self.assertEqual(
+                        registration_routes.hash_password(INTEGRATION_PASSWORD),
+                        INTEGRATION_PASSWORD_HASH,
+                    )
+                with self.assertRaises(AssertionError):
+                    registration_routes.hash_password("a-different-password")
+                stale_dispatcher = registration_routes.hash_password
+                raise RuntimeError("exercise fixture dispatcher restoration")
+
+        self.assertIs(registration_routes.hash_password, original_registration_hash)
+        self.assertIs(registration_routes.hash_password, security.hash_password)
+        self.assertIsNotNone(stale_dispatcher)
+        stale_hash = stale_dispatcher(INTEGRATION_PASSWORD)
+        self.assertNotEqual(stale_hash, INTEGRATION_PASSWORD_HASH)
+        self.assertTrue(security.verify_password(INTEGRATION_PASSWORD, stale_hash))
+
+        def external_hash(_password: str) -> str:
+            return "external-test-symbol"
+
+        with self.assertRaisesRegex(RuntimeError, "changed during fixture scope"):
+            with patch_integration_registration_hash():
+                registration_routes.hash_password = external_hash
+        self.assertIs(registration_routes.hash_password, original_registration_hash)
+        self.assertIs(registration_routes.hash_password, security.hash_password)
+        self.assertTrue(
+            security.verify_password(INTEGRATION_PASSWORD, INTEGRATION_PASSWORD_HASH)
+        )
+        self.assertFalse(
+            security.verify_password("wrong-integration-password", INTEGRATION_PASSWORD_HASH)
+        )
+
+        # Keep one real production hash call in this contract so a future
+        # fixture refactor cannot make the test pass with a fake verifier.
+        generated_hash = security.hash_password(INTEGRATION_PASSWORD)
+        self.assertTrue(security.verify_password(INTEGRATION_PASSWORD, generated_hash))
+
+    async def test_integration_password_fixture_rejects_copied_context_worker(self) -> None:
+        """A copied authorization context cannot shortcut a no-loop worker thread."""
+
+        from contextvars import copy_context
+
+        from apps.platform_api.app.api.routes import registration as registration_routes
+        from python_packages.platform_infra import security
+
+        original_registration_hash = registration_routes.hash_password
+
+        with patch.object(
+            security.password_hasher,
+            "hash",
+            wraps=security.password_hasher.hash,
+        ) as production_hash:
+            with patch_integration_registration_hash():
+                fixed_hash = registration_routes.hash_password(INTEGRATION_PASSWORD)
+                copied_context = copy_context()
+                worker_hash = await asyncio.to_thread(
+                    copied_context.run,
+                    registration_routes.hash_password,
+                    INTEGRATION_PASSWORD,
+                )
+            self.assertEqual(production_hash.call_count, 1)
+
+        self.assertEqual(fixed_hash, INTEGRATION_PASSWORD_HASH)
+        self.assertNotEqual(worker_hash, INTEGRATION_PASSWORD_HASH)
+        self.assertTrue(security.verify_password(INTEGRATION_PASSWORD, worker_hash))
+        self.assertIs(registration_routes.hash_password, original_registration_hash)
+
+        def open_without_loop() -> bool:
+            try:
+                with patch_integration_registration_hash():
+                    return False
+            except RuntimeError:
+                return True
+
+        self.assertTrue(await asyncio.to_thread(open_without_loop))
+
+    async def test_integration_password_dispatcher_is_task_local_under_concurrency(self) -> None:
+        """A fixture task cannot shortcut a concurrent foreign registration."""
+
+        from apps.platform_api.app.api.routes import registration as registration_routes
+        from python_packages.platform_infra import security
+
+        dispatcher_ready = asyncio.Event()
+        overlap_ready = asyncio.Event()
+        allow_patched_request = asyncio.Event()
+        release_overlap = asyncio.Event()
+
+        async def patched_request() -> str:
+            with patch_integration_registration_hash():
+                dispatcher_ready.set()
+                await allow_patched_request.wait()
+                return registration_routes.hash_password(INTEGRATION_PASSWORD)
+
+        async def overlapping_fixture_request() -> str:
+            await dispatcher_ready.wait()
+            with patch_integration_registration_hash():
+                overlap_dispatcher = registration_routes.hash_password
+                overlap_ready.set()
+                await release_overlap.wait()
+                self.assertIs(registration_routes.hash_password, overlap_dispatcher)
+                return registration_routes.hash_password(INTEGRATION_PASSWORD)
+
+        async def unpatched_same_password_request() -> str:
+            await dispatcher_ready.wait()
+            await overlap_ready.wait()
+            value = registration_routes.hash_password(INTEGRATION_PASSWORD)
+            allow_patched_request.set()
+            release_overlap.set()
+            return value
+
+        async def unpatched_different_password_request() -> str:
+            await dispatcher_ready.wait()
+            await overlap_ready.wait()
+            return registration_routes.hash_password("concurrent-different-password")
+
+        with patch.object(
+            security.password_hasher,
+            "hash",
+            wraps=security.password_hasher.hash,
+        ) as production_hash:
+            (
+                patched_hash,
+                overlapping_hash,
+                same_password_hash,
+                different_password_hash,
+            ) = await asyncio.gather(
+                patched_request(),
+                overlapping_fixture_request(),
+                unpatched_same_password_request(),
+                unpatched_different_password_request(),
+            )
+
+        self.assertEqual(patched_hash, INTEGRATION_PASSWORD_HASH)
+        self.assertEqual(overlapping_hash, INTEGRATION_PASSWORD_HASH)
+        self.assertNotEqual(same_password_hash, INTEGRATION_PASSWORD_HASH)
+        self.assertNotEqual(different_password_hash, INTEGRATION_PASSWORD_HASH)
+        self.assertEqual(production_hash.call_count, 2)
+        self.assertTrue(
+            security.verify_password(INTEGRATION_PASSWORD, same_password_hash)
+        )
+        self.assertTrue(
+            security.verify_password(
+                "concurrent-different-password",
+                different_password_hash,
+            )
+        )
+        self.assertIs(registration_routes.hash_password, security.hash_password)
+
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
@@ -90,17 +260,18 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
         client = await self._new_client()
         email = f"{self.prefix}-{label}@example.com"
         display_name = f"test-{label}"[:15]
-        payload = self._assert_status(
-            await client.post(
-                "/api/v1/auth/register",
-                json={
-                    "email": email,
-                    "password": self.password,
-                    "display_name": display_name,
-                },
-            ),
-            201,
-        )
+        with patch_integration_registration_hash():
+            payload = self._assert_status(
+                await client.post(
+                    "/api/v1/auth/register",
+                    json={
+                        "email": email,
+                        "password": INTEGRATION_PASSWORD,
+                        "display_name": display_name,
+                    },
+                ),
+                201,
+            )
         return {
             "client": client,
             "user_id": payload["user"]["id"],
