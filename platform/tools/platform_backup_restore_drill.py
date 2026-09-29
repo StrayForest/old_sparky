@@ -497,7 +497,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         removed: list[str] = []
         if restore_verified:
             removed.extend(prune_unverified_backups(output_dir, preserve_metadata=metadata_path))
-        removed.extend(prune_backups(output_dir, keep=args.keep))
+            removed.extend(prune_backups(output_dir, keep=args.keep))
         result = {"ok": restore_error is None, **metadata, "metadata_file": str(metadata_path), "removed": removed}
         if restore_error is not None:
             raise RuntimeError(f"Platform backup was created but restore verification failed: {restore_error}")

@@ -184,6 +184,5 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(report["categories"]["production_releases"]["reclaimable_bytes"], 8192)
         self.assertEqual(report["transient_reclaimable_bytes"]["failed_builds"], 1024)
 
-
 if __name__ == "__main__":
     unittest.main()
