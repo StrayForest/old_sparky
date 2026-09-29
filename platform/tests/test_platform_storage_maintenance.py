@@ -149,6 +149,27 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(metadata.st_uid, 0, path)
             self.assertEqual(stat.S_IMODE(metadata.st_mode), expected_mode, path)
 
+        def metadata_snapshot(path: Path) -> tuple[int, ...]:
+            metadata = path.lstat()
+            return (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+
+        before_metadata = {
+            path: metadata_snapshot(path) for path in fixture_paths
+        }
+        before_links = {
+            path: os.readlink(path)
+            for path in (app_dir / "current", app_dir / "previous")
+        }
+
         completed = subprocess.run(
             [
                 sys.executable,
@@ -161,7 +182,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 str(web_dir),
                 "--live-qa-runtime-root",
                 str(live_qa_root),
-                "--skip-backup",
                 "--minimum-free-gib",
                 "0",
                 "--maximum-used-percent",
@@ -177,6 +197,17 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             completed.returncode,
             0,
             f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
+        self.assertEqual(
+            {path: metadata_snapshot(path) for path in fixture_paths},
+            before_metadata,
+        )
+        self.assertEqual(
+            {
+                path: os.readlink(path)
+                for path in (app_dir / "current", app_dir / "previous")
+            },
+            before_links,
         )
         raw_report = json.loads(completed.stdout)
         self.assertEqual(
