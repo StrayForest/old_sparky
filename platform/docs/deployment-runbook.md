@@ -51,22 +51,43 @@ to `dev`. The chain is:
    object. It then requires `platform-security-build=success` and skips a SHA that already
    reports `platform-production-deploy=success` only when the matching
    successful deploy attempt has its exact bot-authored marker.
-4. When those checks pass, the auto-deploy workflow dispatches
-   `Platform production deploy` with `mode=deploy` on `dev`. The dispatch step
-   snapshots exact-SHA `workflow_dispatch` runs before the POST and then polls
-   the bounded workflow-run listing until one and only one new run appears.
-   It re-reads that run by ID and attempt, requiring the canonical repository,
-   workflow, event, branch and SHA. A pre-existing run, a manual concurrent
-   run, a changed attempt, an API/rate-limit error, an ambiguous candidate or
-   a run that remains invisible past the hard poll deadline fails the
-   auto-deploy workflow; it never silently retries or reruns the deployment.
-   Only a terminal `success` conclusion completes auto-deploy. `failure`,
-   `cancelled`, `timed_out`, `action_required`, `stale` and every other
-   non-success terminal conclusion fail it. A valid non-deployable classifier
-   route remains the successful no-op described above and does not enter this
-   polling step.
-5. A secret-free prerequisite independently downloads and validates the exact
-   classifier artifact before the expensive candidate build is allowed to run.
+4. When those checks pass, the auto-deploy workflow dispatches `Platform production deploy`
+   with `mode=deploy` on `dev`. The dispatch uses
+   the pinned GitHub REST `2022-11-28` contract and
+   [`return_run_details=true`](https://docs.github.com/en/rest/actions/workflows?apiVersion=2022-11-28#create-a-workflow-dispatch-event).
+   A supported `200` response is `{workflow_run_id,run_url,html_url}`; the
+   legacy `204` response has no run identity. Both are handled explicitly. A
+   timeout, lost response, `403`, `429`, `5xx` or malformed `200` is
+   `dispatch_unknown`, never a reason to POST again.
+   Every auto-dispatch carries a deterministic, non-secret `dispatch_key`
+   bound to the caller run ID, caller attempt and target SHA. The child exposes
+   that value in its API-visible run title and validates the caller's exact
+   workflow ID/name/repository, `workflow_run` event, `dev` branch, SHA and
+   active run attempt before production secrets. The parent fully paginates an exact-SHA
+   snapshot before dispatch; it adopts one existing exact-key child,
+   rejects duplicate exact-key candidates, and reconciles an unknown response
+   only by exact key plus workflow ID/name/path (the real
+   `.github/workflows/platform-production-deploy.yml` path, without `@ref`),
+   event, branch, repository and SHA; timestamps and “newest run” ordering are
+   never used.
+   Once known, the exact child attempt URL is recorded immediately; the parent
+   polls that run with a 600-second hard deadline. On parent timeout,
+   cancellation or API failure, it cancels the exact run with `actions:write`
+   (normal cancellation `202`/`409`, then one force-cancel last resort). If no
+   child ID was recovered, the child-side caller lease is fail-closed: the
+   child rechecks that the parent attempt is still `in_progress` immediately
+   before secret-bearing steps, so an accepted-but-untracked deployment cannot
+   proceed after the watcher ends. There is no blind retry.
+   A run-level `success` is insufficient: the parent fetches exact
+   `/actions/runs/{id}/attempts/{attempt}/jobs` pages and requires exactly one
+   `Deploy production` job with the same run/attempt/workflow/branch/SHA and
+   `completed`/`success` state. A successful preflight with a skipped deploy job
+   therefore fails the auto-deploy contour. `failure`, `cancelled`,
+   `timed_out`, `action_required`, `stale` and every other non-success terminal
+   conclusion fail it. A valid non-deployable classifier route remains the
+   successful no-op described above and does not enter this polling step.
+5. A secret-free prerequisite independently downloads and validates the exact classifier
+   artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
    before its first production write, followed by the security/build check and
    immutable artifact consumption. The classifier artifact is treated as
@@ -105,7 +126,6 @@ to `dev`. The chain is:
    `size_in_bytes` to the downloaded archive byte size.
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
-
 ### Non-deployable pull-request host-tools candidate
 
 The default-branch `Platform host-tools candidate` workflow is evidence-only.
@@ -128,7 +148,6 @@ closed-member checks.  The evidence receipt is explicitly non-deployable;
 production workflows do not consume either `platform-host-tools-candidate-*`
 artifact prefix.  If this workflow fails, do not retry with a manual dispatch,
 host access or production release; investigate the exact run and PR state.
-
 The security workflow also has a separate `workflow_run` status finalizer. It
 uses only `statuses: write`, no checkout or secrets, and always overwrites the
 `platform-security-build` context for the completed run's exact `head_sha` and

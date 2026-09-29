@@ -1,5 +1,7 @@
 name: Platform production deploy
 
+run-name: Platform production deploy [${{ inputs.dispatch_key || 'manual' }}]
+
 on:
   workflow_dispatch:
     inputs:
@@ -58,6 +60,21 @@ on:
         required: false
         default: ""
         type: string
+      dispatch_key:
+        description: "Auto-deploy caller-bound dispatch key"
+        required: false
+        default: ""
+        type: string
+      autodeploy_run_id:
+        description: "Exact auto-deploy caller workflow run ID"
+        required: false
+        default: ""
+        type: string
+      autodeploy_run_attempt:
+        description: "Exact auto-deploy caller workflow run attempt"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -77,6 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: read
     env:
       TARGET_SHA: ${{ github.sha }}
@@ -85,6 +103,9 @@ jobs:
       WEB_COMPRESSION: ${{ inputs.web_compression }}
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      DISPATCH_KEY: ${{ inputs.dispatch_key }}
+      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
       RELEASE_SLUG_BASE: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -104,6 +125,11 @@ jobs:
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Deployment requires an exact target SHA." >&2; exit 1; }
           [[ "$CLASSIFIER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Classifier run ID is malformed." >&2; exit 1; }
           [[ "$CLASSIFIER_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Classifier run attempt is malformed." >&2; exit 1; }
+          if [[ -n "$DISPATCH_KEY$AUTODEPLOY_RUN_ID$AUTODEPLOY_RUN_ATTEMPT" ]]; then
+            [[ "$DISPATCH_KEY" =~ ^ad-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]] || { echo "Dispatch key is malformed." >&2; exit 1; }
+            [[ "$AUTODEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Auto-deploy caller run ID is malformed." >&2; exit 1; }
+            [[ "$AUTODEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Auto-deploy caller run attempt is malformed." >&2; exit 1; }
+          fi
 
       - name: Checkout dispatch validator
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -111,6 +137,51 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Validate active auto-deploy caller lease
+        if: ${{ inputs.mode == 'deploy' && inputs.dispatch_key != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$DISPATCH_KEY" && test -n "$AUTODEPLOY_RUN_ID" && test -n "$AUTODEPLOY_RUN_ATTEMPT"
+          caller_dir="$(mktemp -d "$RUNNER_TEMP/platform-autodeploy-caller.XXXXXX")"
+          trap 'rm -rf -- "$caller_dir"' EXIT
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-autodeploy.yml" \
+            --output "$caller_dir/workflow.json"
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${AUTODEPLOY_RUN_ID}" \
+            --output "$caller_dir/run.json"
+          /usr/bin/python3 - "$caller_dir/workflow.json" "$caller_dir/run.json" <<'PY'
+          import json
+          from pathlib import Path
+          import os
+          import sys
+
+          sys.path.insert(0, "platform/tools")
+          from platform_workflow_provenance import validate_autodeploy_caller_run
+
+          workflow = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          run = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          validate_autodeploy_caller_run(
+              workflow,
+              run,
+              expected_run_id=int(os.environ["AUTODEPLOY_RUN_ID"]),
+              expected_attempt=int(os.environ["AUTODEPLOY_RUN_ATTEMPT"]),
+              expected_target_sha=os.environ["TARGET_SHA"],
+              dispatch_key=os.environ["DISPATCH_KEY"],
+          )
+          PY
+          echo "Active auto-deploy caller lease accepted before secret-bearing jobs."
 
       - name: Validate and create closed deployment handoff
         shell: bash
@@ -1794,6 +1865,9 @@ jobs:
       WEB_COMPRESSION: ${{ inputs.web_compression }}
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      DISPATCH_KEY: ${{ inputs.dispatch_key }}
+      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
       PUBLISHED_ARTIFACT_ID: ${{ needs.build-release.outputs.artifact_id }}
       PUBLISHED_ARTIFACT_DIGEST: ${{ needs.build-release.outputs.artifact_digest }}
@@ -2111,6 +2185,51 @@ jobs:
             printf 'RELEASE_CHECKSUM=%s\n' "$release_checksum"
             printf 'RELEASE_PROVENANCE=%s\n' "$release_provenance"
           } >> "$GITHUB_ENV"
+
+      - name: Revalidate active auto-deploy caller lease before production secrets
+        if: ${{ inputs.dispatch_key != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$DISPATCH_KEY" && test -n "$AUTODEPLOY_RUN_ID" && test -n "$AUTODEPLOY_RUN_ATTEMPT"
+          caller_dir="$(mktemp -d "$RUNNER_TEMP/platform-autodeploy-production-lease.XXXXXX")"
+          trap 'rm -rf -- "$caller_dir"' EXIT
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-autodeploy.yml" \
+            --output "$caller_dir/workflow.json"
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${AUTODEPLOY_RUN_ID}" \
+            --output "$caller_dir/run.json"
+          /usr/bin/python3 - "$caller_dir/workflow.json" "$caller_dir/run.json" <<'PY'
+          import json
+          from pathlib import Path
+          import os
+          import sys
+
+          sys.path.insert(0, "platform/tools")
+          from platform_workflow_provenance import validate_autodeploy_caller_run
+
+          workflow = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          run = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          validate_autodeploy_caller_run(
+              workflow,
+              run,
+              expected_run_id=int(os.environ["AUTODEPLOY_RUN_ID"]),
+              expected_attempt=int(os.environ["AUTODEPLOY_RUN_ATTEMPT"]),
+              expected_target_sha=os.environ["TARGET_SHA"],
+              dispatch_key=os.environ["DISPATCH_KEY"],
+          )
+          PY
+          echo "Active auto-deploy caller lease accepted immediately before production secrets."
 
       - name: Validate deployment secrets
         shell: bash

@@ -776,8 +776,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The exact-SHA run is dispatched once, then correlated by the
-          # canonical dependency-free provenance helper below.
+          # The child is dispatched once. Exact correlation is by the
+          # API-visible child run title token, never by wall-clock timestamps.
           api_headers=(
             --header "Authorization: Bearer $GH_TOKEN"
             --header "Accept: application/vnd.github+json"
@@ -785,11 +785,42 @@ jobs:
           )
           downstream_dir="$(mktemp -d "$RUNNER_TEMP/platform-downstream-deploy.XXXXXX")"
           trap 'rm -rf -- "$downstream_dir"' EXIT
-          api_get() {
+          api_status=""
+          api_request() {
             local url="$1" output_path="$2" max_time="${3:-30}"
-            curl --fail --silent --show-error \
+            local status_path="$output_path.http" curl_status
+            set +e
+            curl --silent --show-error \
               --connect-timeout 10 --max-time "$max_time" --max-filesize 4194304 \
-              "${api_headers[@]}" "$url" --output "$output_path"
+              --write-out '%{http_code}' \
+              "${api_headers[@]}" "$url" --output "$output_path" > "$status_path"
+            curl_status="$?"
+            set -e
+            api_status="$(<"$status_path")"
+            rm -f -- "$status_path"
+            if (( curl_status != 0 )); then
+              return 2
+            fi
+            case "$api_status" in
+              200) return 0 ;;
+              202|204) return 43 ;;
+              404) return 44 ;;
+              429|500|502|503|504) return 75 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          api_get() {
+            local request_status
+            if api_request "$@"; then
+              request_status=0
+            else
+              request_status="$?"
+            fi
+            (( request_status == 0 )) || {
+              echo "GitHub API request failed with HTTP ${api_status:-transport-error}." >&2
+              return "$request_status"
+            }
           }
 
           api_get \
@@ -813,6 +844,17 @@ jobs:
           PY
           )"
 
+          dispatch_key="$(/usr/bin/python3 - "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          import sys
+
+          sys.path.insert(0, "platform/tools")
+          from platform_workflow_provenance import expected_dispatch_key
+
+          print(expected_dispatch_key(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]))
+          PY
+          )"
+          [[ "$dispatch_key" =~ ^ad-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]]
+
           fetch_deployment_runs() {
             local output_path="$1" deadline_epoch="${2:-}" page=1 count page_path total_count
             local pages_dir="$output_path.pages"
@@ -825,13 +867,21 @@ jobs:
                 remaining="$((deadline_epoch - now_epoch))"
                 (( remaining > 0 )) || {
                   echo "Downstream production deployment hard timeout reached during API polling." >&2
-                  return 1
+                  return 75
                 }
                 (( remaining < request_timeout )) && request_timeout="$remaining"
               fi
-              api_get \
+              if api_get \
                 "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/runs?event=workflow_dispatch&branch=dev&head_sha=${TARGET_SHA}&per_page=100&page=${page}" \
-                "$page_path" "$request_timeout"
+                "$page_path" "$request_timeout"; then
+                :
+              else
+                request_status="$?"
+                if (( request_status == 44 )); then
+                  request_status=75
+                fi
+                return "$request_status"
+              fi
               count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
           import json
           from pathlib import Path
@@ -894,8 +944,85 @@ jobs:
           PY
           }
 
+          fetch_deployment_jobs() {
+            local run_id="$1" attempt="$2" output_path="$3" deadline_epoch="$4"
+            local pages_dir="$output_path.pages" page=1 count page_path total_count
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              now_epoch="$(date +%s)"
+              remaining="$((deadline_epoch - now_epoch))"
+              (( remaining > 0 )) || return 75
+              request_timeout=30
+              (( remaining < request_timeout )) && request_timeout="$remaining"
+              if api_get \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/attempts/${attempt}/jobs?per_page=100&page=${page}" \
+                "$page_path" "$request_timeout"; then
+                :
+              else
+                request_status="$?"
+                if (( request_status == 44 )); then
+                  request_status=75
+                fi
+                return "$request_status"
+              fi
+              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              not isinstance(payload, dict)
+              or type(payload.get("total_count")) is not int
+              or not 0 <= payload["total_count"] <= 1000
+              or not isinstance(payload.get("jobs"), list)
+              or len(payload["jobs"]) > 100
+              or any(not isinstance(row, dict) for row in payload["jobs"])
+          ):
+              raise SystemExit("deployment job page is malformed")
+          marker = Path(sys.argv[2])
+          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
+              raise SystemExit("deployment job total changed during pagination")
+          marker.write_text(str(payload["total_count"]), encoding="ascii")
+          print(len(payload["jobs"]))
+          PY
+              )"
+              total_count="$(<"$pages_dir/total")"
+              if (( count < 100 || page * 100 >= total_count )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 10 )) || return 1
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path = map(Path, sys.argv[1:])
+          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
+          rows = []
+          seen = set()
+          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              for row in payload["jobs"]:
+                  job_id = row.get("id")
+                  if type(job_id) is not int or job_id <= 0 or job_id in seen:
+                      raise SystemExit("deployment job IDs are duplicate or malformed")
+                  seen.add(job_id)
+                  rows.append(row)
+          if len(rows) != expected_total:
+              raise SystemExit("deployment job pagination is incomplete")
+          Path(output_path).write_text(
+              json.dumps({"total_count": expected_total, "jobs": rows}, sort_keys=True, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+          }
+
           fetch_deployment_runs "$downstream_dir/runs-before.json"
-          /usr/bin/python3 - "$downstream_dir/runs-before.json" "$workflow_id" "$TARGET_SHA" "$downstream_dir/prior-run-ids" <<'PY'
+          /usr/bin/python3 - "$downstream_dir/runs-before.json" "$workflow_id" "$TARGET_SHA" "$dispatch_key" "$downstream_dir/prior-run-ids" <<'PY'
           import json
           from pathlib import Path
           import sys
@@ -903,31 +1030,157 @@ jobs:
           sys.path.insert(0, "platform/tools")
           from platform_workflow_provenance import deployment_run_rows
 
-          payload_path, workflow_id, target_sha, output_path = sys.argv[1:]
+          payload_path, workflow_id, target_sha, token, output_path = sys.argv[1:]
           try:
               rows = deployment_run_rows(
                   json.loads(Path(payload_path).read_text(encoding="utf-8")),
                   expected_target_sha=target_sha,
                   expected_workflow_id=int(workflow_id),
+                  expected_dispatch_key=token,
               )
           except Exception as exc:
               raise SystemExit("downstream run provenance rejected") from exc
           Path(output_path).write_text(
-              "".join(f"{row['id']}\n" for row in rows),
+              "".join(
+                  f"{row['id']}\n"
+                  for row in rows
+                  if row.get("display_title") == f"Platform production deploy [{token}]"
+              ),
               encoding="ascii",
           )
           PY
-          if [[ -s "$downstream_dir/prior-run-ids" ]]; then
-            echo "An exact-SHA production deploy run already exists; refusing a duplicate dispatch." >&2
-            echo "result=existing-run" >> "$GITHUB_OUTPUT"
+          selected_id=""
+          selected_attempt=""
+          selected_url=""
+          child_terminal=0
+          reconciliation_result="none"
+          dispatch_response_state="unknown"
+          record_child() {
+            if [[ -n "$selected_id" && ( "$selected_id" != "$1" || "$selected_attempt" != "$2" ) ]]; then
+              echo "The exact downstream child identity changed during reconciliation." >&2
+              echo "result=ambiguous" >> "$GITHUB_OUTPUT"
+              return 1
+            fi
+            selected_id="$1"
+            selected_attempt="$2"
+            selected_url="$3"
+            echo "downstream_run_id=$selected_id" >> "$GITHUB_OUTPUT"
+            echo "downstream_run_attempt=$selected_attempt" >> "$GITHUB_OUTPUT"
+            echo "downstream_run_url=$selected_url" >> "$GITHUB_OUTPUT"
+          }
+          cancel_child_once() {
+            [[ -n "$selected_id" ]] || return 0
+            (( child_terminal == 0 )) || return 0
+            local cancel_response="$downstream_dir/cancel-response.json"
+            local cancel_http="$downstream_dir/cancel-response.http"
+            local force_response="$downstream_dir/force-cancel-response.json"
+            local force_http="$downstream_dir/force-cancel-response.http"
+            local cancel_curl_status cancel_http_status force_curl_status force_http_status
+            set +e
+            curl --silent --show-error \
+              --connect-timeout 10 --max-time 20 --max-filesize 4194304 \
+              --request POST "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${selected_id}/cancel" \
+              --output "$cancel_response" --write-out '%{http_code}' > "$cancel_http"
+            cancel_curl_status="$?"
+            set -e
+            cancel_http_status="$(<"$cancel_http")"
+            if (( cancel_curl_status == 0 )) && [[ "$cancel_http_status" == "202" ]]; then
+              reconciliation_result="cancel-requested"
+              return 0
+            fi
+            if (( cancel_curl_status == 0 )) && [[ "$cancel_http_status" == "409" ]]; then
+              echo "Normal cancellation reported a conflict for exact downstream run $selected_id attempt $selected_attempt; reconciling its exact state before the force-cancel last resort." >&2
+              local reconcile_response="$downstream_dir/cancel-reconcile-run.json"
+              local reconcile_http="$downstream_dir/cancel-reconcile-run.http"
+              local reconcile_curl_status reconcile_http_status reconcile_terminal
+              set +e
+              curl --silent --show-error \
+                --connect-timeout 10 --max-time 20 --max-filesize 4194304 \
+                --request GET "${api_headers[@]}" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${selected_id}" \
+                --output "$reconcile_response" --write-out '%{http_code}' > "$reconcile_http"
+              reconcile_curl_status="$?"
+              set -e
+              reconcile_http_status="$(<"$reconcile_http")"
+              if (( reconcile_curl_status == 0 )) && [[ "$reconcile_http_status" == "200" ]]; then
+                reconcile_terminal="$(/usr/bin/python3 - "$reconcile_response" "$selected_id" "$selected_attempt" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          run_id, attempt = map(int, sys.argv[2:])
+          if payload.get("id") != run_id or payload.get("run_attempt") != attempt:
+              raise SystemExit("cancel reconciliation identity mismatch")
+          print("1" if payload.get("status") == "completed" else "0")
+          PY
+                )" || reconcile_terminal="0"
+                if [[ "$reconcile_terminal" == "1" ]]; then
+                  child_terminal=1
+                  reconciliation_result="already-terminal"
+                  return 0
+                fi
+              fi
+            else
+              echo "Normal cancellation of exact downstream run $selected_id attempt $selected_attempt failed (HTTP ${cancel_http_status:-transport-error}); trying force-cancel once as the last resort." >&2
+            fi
+            set +e
+            curl --silent --show-error \
+              --connect-timeout 10 --max-time 20 --max-filesize 4194304 \
+              --request POST "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${selected_id}/force-cancel" \
+              --output "$force_response" --write-out '%{http_code}' > "$force_http"
+            force_curl_status="$?"
+            set -e
+            force_http_status="$(<"$force_http")"
+            if (( force_curl_status == 0 )) && [[ "$force_http_status" == "202" ]]; then
+              reconciliation_result="force-cancel-requested"
+            else
+              reconciliation_result="cancel-uncertain"
+              echo "Could not confirm cancellation of exact downstream run $selected_id attempt $selected_attempt (normal HTTP ${cancel_http_status:-transport-error}, force HTTP ${force_http_status:-transport-error}); child lease remains fail-closed." >&2
+            fi
+          }
+          in_exit=0
+          on_exit() {
+            local exit_status="$?"
+            (( in_exit == 0 )) || return "$exit_status"
+            in_exit=1
+            if (( child_terminal == 0 )); then
+              cancel_child_once
+              if [[ "$reconciliation_result" == "cancel-uncertain" ]]; then
+                echo "result=cancel-uncertain" >> "$GITHUB_OUTPUT"
+              fi
+            fi
+            echo "reconciliation=$reconciliation_result" >> "$GITHUB_OUTPUT"
+            rm -rf -- "$downstream_dir"
+            exit "$exit_status"
+          }
+          trap on_exit EXIT INT TERM
+
+          prior_child_count="$(wc -l < "$downstream_dir/prior-run-ids")"
+          [[ "$prior_child_count" =~ ^[0-9]+$ ]] || {
+            echo "Pre-dispatch exact-child snapshot count is malformed." >&2
+            echo "result=invalid" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
+          if (( prior_child_count > 1 )); then
+            echo "Multiple exact dispatch-key children already exist; refusing to choose one." >&2
+            echo "result=ambiguous" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-          branch_json="$downstream_dir/branch.json"
-          api_get \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev" \
-            "$branch_json"
-          dev_sha="$(/usr/bin/python3 - "$branch_json" <<'PY'
+          if (( prior_child_count == 1 )); then
+            IFS= read -r adopted_id < "$downstream_dir/prior-run-ids"
+            record_child "$adopted_id" "1" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${adopted_id}/attempts/1"
+            dispatch_response_state="adopted"
+            echo "Adopted the one pre-existing exact dispatch-key child; no duplicate dispatch was sent."
+          else
+            branch_json="$downstream_dir/branch.json"
+            api_get \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev" \
+              "$branch_json"
+            dev_sha="$(/usr/bin/python3 - "$branch_json" <<'PY'
           import json
           from pathlib import Path
           import re
@@ -939,24 +1192,24 @@ jobs:
               raise SystemExit("dev branch identity rejected")
           print(sha)
           PY
-          )"
-          test "$dev_sha" = "$TARGET_SHA" || {
-            echo "Refusing stale dispatch: dev moved from $TARGET_SHA." >&2
-            echo "result=stale" >> "$GITHUB_OUTPUT"
-            exit 1
-          }
+            )"
+            test "$dev_sha" = "$TARGET_SHA" || {
+              echo "Refusing stale dispatch: dev moved from $TARGET_SHA." >&2
+              echo "result=stale" >> "$GITHUB_OUTPUT"
+              exit 1
+            }
 
-          dispatch_started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          curl --fail --silent --show-error \
-            --connect-timeout 10 --max-time 30 \
-            --request POST \
-            "${api_headers[@]}" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches" \
-            --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" <<'PY'
+            dispatch_body="$downstream_dir/dispatch-body.json"
+            dispatch_response="$downstream_dir/dispatch-response.json"
+            dispatch_http="$downstream_dir/dispatch-response.http"
+            /usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$dispatch_key" > "$dispatch_body" <<'PY'
           import json
           import sys
-          # Keep the reviewed default profile and compression contract explicit:
-          # "runtime_profile":"ready-vote-static-8" and "web_compression":"enabled".
+          # GitHub REST API 2022-11-28 supports return_run_details=true and
+          # returns the exact run ID in a 200 JSON response.  The no-flag
+          # legacy response is 204; both paths remain one dispatch only.
+          # Keep the reviewed defaults explicit: "runtime_profile":"ready-vote-static-8"
+          # and "web_compression":"enabled".
           print(json.dumps({
               "ref": "dev",
               "inputs": {
@@ -965,14 +1218,69 @@ jobs:
                   "web_compression": "enabled",
                   "classifier_run_id": sys.argv[1],
                   "classifier_run_attempt": sys.argv[2],
+                  "dispatch_key": sys.argv[5],
+                  "autodeploy_run_id": sys.argv[3],
+                  "autodeploy_run_attempt": sys.argv[4],
               },
-          }))
+              "return_run_details": True,
+          }, separators=(",", ":")))
           PY
-            )"
+            set +e
+            curl --silent --show-error \
+              --connect-timeout 10 --max-time 30 --max-filesize 4194304 \
+              --request POST \
+              "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches" \
+              --data-binary "@$dispatch_body" --output "$dispatch_response" \
+              --write-out '%{http_code}' > "$dispatch_http"
+            dispatch_curl_status="$?"
+            set -e
+            dispatch_http_status="$(<"$dispatch_http")"
 
-          selected_id=""
-          selected_attempt=""
+            # A 200 response contains an exact run ID and canonical URLs. A
+            # 204, malformed response, HTTP error, or lost connection falls
+            # back to bounded token reconciliation; it never redispatches.
+            if (( dispatch_curl_status == 0 )) && [[ "$dispatch_http_status" == "200" ]]; then
+              dispatch_response_state="returned"
+              dispatch_details="$(/usr/bin/python3 - "$dispatch_response" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, "platform/tools")
+          from platform_workflow_provenance import parse_dispatch_response
+
+          try:
+              run_id, attempt, html_url = parse_dispatch_response(
+                  json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+              )
+          except Exception as exc:
+              raise SystemExit("workflow dispatch response is not trusted") from exc
+          print(f"{run_id}\t{attempt or 1}\t{html_url}")
+          PY
+              )" || dispatch_response_state="dispatch_unknown"
+              if [[ "$dispatch_response_state" == "returned" ]]; then
+                IFS=$'\t' read -r returned_id returned_attempt returned_url <<< "$dispatch_details"
+                record_child "$returned_id" "$returned_attempt" "$returned_url/attempts/$returned_attempt"
+              fi
+            elif (( dispatch_curl_status == 0 )) && [[ "$dispatch_http_status" == "204" ]]; then
+              dispatch_response_state="dispatch_unknown"
+            else
+              dispatch_response_state="dispatch_unknown"
+              echo "Dispatch response was not an authoritative 200 (HTTP ${dispatch_http_status:-transport-error}); reconciling by token without redispatch." >&2
+            fi
+          fi
+          echo "dispatch_response=$dispatch_response_state" >> "$GITHUB_OUTPUT"
+
           deadline_epoch="$(( $(date +%s) + DOWNSTREAM_TIMEOUT_SECONDS ))"
+          sleep_bounded() {
+            local remaining sleep_for
+            remaining="$((deadline_epoch - $(date +%s)))"
+            (( remaining > 0 )) || return 1
+            sleep_for="$DOWNSTREAM_POLL_SECONDS"
+            (( sleep_for > remaining )) && sleep_for="$remaining"
+            sleep "$sleep_for"
+          }
           for ((poll=1; poll<=DOWNSTREAM_MAX_POLLS; poll++)); do
             now_epoch="$(date +%s)"
             if (( now_epoch >= deadline_epoch )); then
@@ -981,47 +1289,62 @@ jobs:
               exit 1
             fi
             runs_path="$downstream_dir/runs-${poll}.json"
-            fetch_deployment_runs "$runs_path" "$deadline_epoch"
-            candidate="$(/usr/bin/python3 - "$runs_path" "$downstream_dir/prior-run-ids" "$workflow_id" "$TARGET_SHA" "$dispatch_started_at" <<'PY'
+            if [[ -z "$selected_id" ]]; then
+              if fetch_deployment_runs "$runs_path" "$deadline_epoch"; then
+                :
+              else
+                poll_status="$?"
+                if (( poll_status == 75 )); then
+                  sleep_bounded || continue
+                  continue
+                fi
+                echo "Downstream run reconciliation API failed; no redispatch will occur." >&2
+                echo "result=api-error" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+            fi
+            candidate=""
+            if [[ -z "$selected_id" ]]; then
+              candidate="$(/usr/bin/python3 - "$runs_path" "$downstream_dir/prior-run-ids" "$workflow_id" "$TARGET_SHA" "$dispatch_key" <<'PY'
           import json
-          import datetime
           from pathlib import Path
           import sys
 
           sys.path.insert(0, "platform/tools")
           from platform_workflow_provenance import select_new_deployment_run
 
-          runs_path, prior_path, workflow_id, target_sha, started_at = sys.argv[1:]
+          runs_path, prior_path, workflow_id, target_sha, token = sys.argv[1:]
           try:
               prior_ids = {
                   int(line)
                   for line in Path(prior_path).read_text(encoding="ascii").splitlines()
                   if line
               }
-              parsed_started_at = datetime.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
               selected = select_new_deployment_run(
                   json.loads(Path(runs_path).read_text(encoding="utf-8")),
                   prior_run_ids=prior_ids,
-                  dispatch_started_at=parsed_started_at,
                   expected_target_sha=target_sha,
                   expected_workflow_id=int(workflow_id),
+                  dispatch_key=token,
               )
           except Exception as exc:
               raise SystemExit("downstream run correlation rejected") from exc
           if selected is not None:
               print(f"{selected[0]}\t{selected[1]}")
           PY
-            )"
+              )"
+            fi
             if [[ -n "$candidate" ]]; then
               IFS=$'\t' read -r candidate_id candidate_attempt <<< "$candidate"
               if [[ -z "$selected_id" ]]; then
-                selected_id="$candidate_id"
-                selected_attempt="$candidate_attempt"
+                record_child "$candidate_id" "$candidate_attempt" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/$candidate_id/attempts/$candidate_attempt"
               elif [[ "$candidate_id" != "$selected_id" || "$candidate_attempt" != "$selected_attempt" ]]; then
                 echo "Downstream production deployment identity changed during polling." >&2
                 echo "result=ambiguous" >> "$GITHUB_OUTPUT"
                 exit 1
               fi
+            fi
+            if [[ -n "$selected_id" ]]; then
               run_path="$downstream_dir/run-${selected_id}-${selected_attempt}.json"
               remaining="$((deadline_epoch - $(date +%s)))"
               (( remaining > 0 )) || {
@@ -1031,10 +1354,21 @@ jobs:
               }
               request_timeout=30
               (( remaining < request_timeout )) && request_timeout="$remaining"
-              api_get \
+              if api_get \
                 "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${selected_id}" \
-                "$run_path" "$request_timeout"
-              state="$(/usr/bin/python3 - "$downstream_dir/workflow.json" "$run_path" "$selected_id" "$selected_attempt" "$TARGET_SHA" <<'PY'
+                "$run_path" "$request_timeout"; then
+                :
+              else
+                run_status="$?"
+                if (( run_status == 44 || run_status == 75 )); then
+                  sleep_bounded || continue
+                  continue
+                fi
+                echo "Exact downstream run API failed; cancellation/reconciliation will not redispatch." >&2
+                echo "result=api-error" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+              state="$(/usr/bin/python3 - "$downstream_dir/workflow.json" "$run_path" "$selected_id" "$selected_attempt" "$TARGET_SHA" "$dispatch_key" <<'PY'
           import json
           from pathlib import Path
           import sys
@@ -1042,7 +1376,7 @@ jobs:
           sys.path.insert(0, "platform/tools")
           from platform_workflow_provenance import classify_deployment_run
 
-          workflow_path, run_path, run_id, attempt, target_sha = sys.argv[1:]
+          workflow_path, run_path, run_id, attempt, target_sha, token = sys.argv[1:]
           try:
               workflow = json.loads(Path(workflow_path).read_text(encoding="utf-8"))
               run = json.loads(Path(run_path).read_text(encoding="utf-8"))
@@ -1052,6 +1386,7 @@ jobs:
                   expected_run_id=int(run_id),
                   expected_attempt=int(attempt),
                   expected_target_sha=target_sha,
+                  dispatch_key=token,
               )
           except Exception as exc:
               raise SystemExit("downstream run provenance rejected") from exc
@@ -1062,18 +1397,59 @@ jobs:
                 pending)
                   ;;
                 success)
+                  # The run is already terminal; job evidence can only
+                  # validate or reject success, never make cancellation
+                  # meaningful.
+                  child_terminal=1
+                  jobs_path="$downstream_dir/jobs-${selected_id}-${selected_attempt}.json"
+                  if fetch_deployment_jobs "$selected_id" "$selected_attempt" "$jobs_path" "$deadline_epoch"; then
+                    :
+                  else
+                    jobs_status="$?"
+                    if (( jobs_status == 75 )); then
+                      sleep_bounded || continue
+                      continue
+                    fi
+                    echo "Exact downstream job API failed or returned malformed pagination; refusing overall-run success." >&2
+                    echo "result=invalid" >> "$GITHUB_OUTPUT"
+                    exit 1
+                  fi
+                  if ! /usr/bin/python3 - "$jobs_path" "$selected_id" "$selected_attempt" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, "platform/tools")
+          from platform_workflow_provenance import deployment_job_rows, validate_deployment_job_success
+
+          path, run_id, attempt, target_sha = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          jobs = deployment_job_rows(
+              payload,
+              expected_run_id=int(run_id),
+              expected_attempt=int(attempt),
+          )
+          validate_deployment_job_success(
+              jobs,
+              expected_run_id=int(run_id),
+              expected_attempt=int(attempt),
+              expected_target_sha=target_sha,
+          )
+          PY
+                  then
+                    echo "Downstream overall success lacked exactly one successful Deploy production job." >&2
+                    child_terminal=1
+                    echo "result=invalid" >> "$GITHUB_OUTPUT"
+                    exit 1
+                  fi
                   echo "result=success" >> "$GITHUB_OUTPUT"
-                  echo "downstream_run_id=$selected_id" >> "$GITHUB_OUTPUT"
-                  echo "downstream_run_attempt=$selected_attempt" >> "$GITHUB_OUTPUT"
-                  echo "downstream_run_url=https://github.com/StrayForest/old_sparky/actions/runs/$selected_id/attempts/$selected_attempt" >> "$GITHUB_OUTPUT"
                   exit 0
                   ;;
                 terminal:action_required|terminal:cancelled|terminal:failure|terminal:neutral|terminal:skipped|terminal:stale|terminal:startup_failure|terminal:timed_out)
                   conclusion="${state#terminal:}"
                   echo "Downstream production deployment ended with conclusion $conclusion; no rerun is attempted." >&2
+                  child_terminal=1
                   echo "result=$conclusion" >> "$GITHUB_OUTPUT"
-                  echo "downstream_run_id=$selected_id" >> "$GITHUB_OUTPUT"
-                  echo "downstream_run_attempt=$selected_attempt" >> "$GITHUB_OUTPUT"
                   exit 1
                   ;;
                 *)
@@ -1102,6 +1478,8 @@ jobs:
           SHOULD_DEPLOY: ${{ steps.gate.outputs.deploy }}
           DOWNSTREAM_RESULT: ${{ steps.downstream.outputs.result }}
           DOWNSTREAM_RUN_URL: ${{ steps.downstream.outputs.downstream_run_url }}
+          DOWNSTREAM_RECONCILIATION: ${{ steps.downstream.outputs.reconciliation }}
+          DISPATCH_RESPONSE: ${{ steps.downstream.outputs.dispatch_response }}
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_REASON: ${{ steps.route.outputs.route_reason }}
@@ -1121,5 +1499,14 @@ jobs:
               echo "- Result: downstream production deployment failed (`$DOWNSTREAM_RESULT`)"
             else
               echo "- Result: downstream production deployment did not complete"
+            fi
+            if [[ "$SHOULD_DEPLOY" == "true" && -n "$DOWNSTREAM_RUN_URL" && "$DOWNSTREAM_RESULT" != "success" ]]; then
+              echo "- Tracked production deploy run: $DOWNSTREAM_RUN_URL"
+            fi
+            if [[ "$SHOULD_DEPLOY" == "true" && -n "$DOWNSTREAM_RECONCILIATION" && "$DOWNSTREAM_RECONCILIATION" != "none" ]]; then
+              echo "- Child reconciliation: \`$DOWNSTREAM_RECONCILIATION\`"
+            fi
+            if [[ "$SHOULD_DEPLOY" == "true" && -n "$DISPATCH_RESPONSE" && "$DISPATCH_RESPONSE" != "returned" ]]; then
+              echo "- Dispatch response: \`$DISPATCH_RESPONSE\` (exact-key reconciliation; no redispatch)"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
