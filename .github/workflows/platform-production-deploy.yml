@@ -1,8 +1,40 @@
 name: Platform production deploy
 
-run-name: Platform production deploy [${{ inputs.dispatch_key || 'manual' }}]
+run-name: Platform production deploy [${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha }}]
 
 on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "Run production preflight only or perform the full immutable deployment"
+        required: true
+        default: deploy
+        type: string
+      runtime_profile:
+        description: "Reviewed runtime capacity profile to apply after deployment"
+        required: true
+        default: ready-vote-static-8
+        type: string
+      web_compression:
+        description: "Build the Next.js artifact with response compression enabled or disabled"
+        required: true
+        default: enabled
+        type: string
+      target_sha:
+        description: "Exact reviewed dev commit to deploy"
+        required: true
+        default: ""
+        type: string
+      classifier_run_id:
+        description: "Exact successful security workflow run supplying the classifier artifact"
+        required: true
+        default: ""
+        type: string
+      classifier_run_attempt:
+        description: "Exact attempt number for the classifier workflow run"
+        required: true
+        default: ""
+        type: string
   workflow_dispatch:
     inputs:
       mode:
@@ -60,21 +92,6 @@ on:
         required: false
         default: ""
         type: string
-      dispatch_key:
-        description: "Auto-deploy caller-bound dispatch key"
-        required: false
-        default: ""
-        type: string
-      autodeploy_run_id:
-        description: "Exact auto-deploy caller workflow run ID"
-        required: false
-        default: ""
-        type: string
-      autodeploy_run_attempt:
-        description: "Exact auto-deploy caller workflow run attempt"
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: read
@@ -97,15 +114,13 @@ jobs:
       actions: read
       contents: read
     env:
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha }}
+      EXPECTED_WORKFLOW_EVENT: ${{ github.event_name == 'workflow_call' && 'workflow_call' || 'workflow_dispatch' }}
       DEPLOY_MODE: ${{ inputs.mode }}
       RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
       WEB_COMPRESSION: ${{ inputs.web_compression }}
-      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
-      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
-      DISPATCH_KEY: ${{ inputs.dispatch_key }}
-      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
-      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+      CLASSIFIER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_id || github.run_id) || inputs.classifier_run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_attempt || github.run_attempt) || inputs.classifier_run_attempt }}
       RELEASE_SLUG_BASE: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -125,11 +140,10 @@ jobs:
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Deployment requires an exact target SHA." >&2; exit 1; }
           [[ "$CLASSIFIER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Classifier run ID is malformed." >&2; exit 1; }
           [[ "$CLASSIFIER_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Classifier run attempt is malformed." >&2; exit 1; }
-          if [[ -n "$DISPATCH_KEY$AUTODEPLOY_RUN_ID$AUTODEPLOY_RUN_ATTEMPT" ]]; then
-            [[ "$DISPATCH_KEY" =~ ^ad-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]] || { echo "Dispatch key is malformed." >&2; exit 1; }
-            [[ "$AUTODEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Auto-deploy caller run ID is malformed." >&2; exit 1; }
-            [[ "$AUTODEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Auto-deploy caller run attempt is malformed." >&2; exit 1; }
-          fi
+          case "$GITHUB_EVENT_NAME" in
+            workflow_call|workflow_dispatch) ;;
+            *) echo "Unsupported deployment event; refusing a green no-op." >&2; exit 1 ;;
+          esac
 
       - name: Checkout dispatch validator
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -137,51 +151,6 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
-
-      - name: Validate active auto-deploy caller lease
-        if: ${{ inputs.mode == 'deploy' && inputs.dispatch_key != '' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test -n "$DISPATCH_KEY" && test -n "$AUTODEPLOY_RUN_ID" && test -n "$AUTODEPLOY_RUN_ATTEMPT"
-          caller_dir="$(mktemp -d "$RUNNER_TEMP/platform-autodeploy-caller.XXXXXX")"
-          trap 'rm -rf -- "$caller_dir"' EXIT
-          api_headers=(
-            --header "Authorization: Bearer $GH_TOKEN"
-            --header "Accept: application/vnd.github+json"
-            --header "X-GitHub-Api-Version: 2022-11-28"
-          )
-          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
-            "${api_headers[@]}" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-autodeploy.yml" \
-            --output "$caller_dir/workflow.json"
-          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
-            "${api_headers[@]}" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${AUTODEPLOY_RUN_ID}" \
-            --output "$caller_dir/run.json"
-          /usr/bin/python3 - "$caller_dir/workflow.json" "$caller_dir/run.json" <<'PY'
-          import json
-          from pathlib import Path
-          import os
-          import sys
-
-          sys.path.insert(0, "platform/tools")
-          from platform_workflow_provenance import validate_autodeploy_caller_run
-
-          workflow = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          run = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-          validate_autodeploy_caller_run(
-              workflow,
-              run,
-              expected_run_id=int(os.environ["AUTODEPLOY_RUN_ID"]),
-              expected_attempt=int(os.environ["AUTODEPLOY_RUN_ATTEMPT"]),
-              expected_target_sha=os.environ["TARGET_SHA"],
-              dispatch_key=os.environ["DISPATCH_KEY"],
-          )
-          PY
-          echo "Active auto-deploy caller lease accepted before secret-bearing jobs."
 
       - name: Validate and create closed deployment handoff
         shell: bash
@@ -231,7 +200,7 @@ jobs:
     needs: validate-dispatch
     if: >-
       needs.validate-dispatch.result == 'success' &&
-      github.event_name == 'workflow_dispatch' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
       inputs.mode == 'deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -239,9 +208,9 @@ jobs:
       actions: read
       contents: read
     env:
-      TARGET_SHA: ${{ github.sha }}
-      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
-      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha }}
+      CLASSIFIER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_id || github.run_id) || inputs.classifier_run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_attempt || github.run_attempt) || inputs.classifier_run_attempt }}
     steps:
       - name: Resolve immutable default-branch classifier source
         id: trusted_classifier_default
@@ -384,7 +353,7 @@ jobs:
     needs: validate-dispatch
     if: >-
       needs.validate-dispatch.result == 'success' &&
-      github.event_name == 'workflow_dispatch' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
       (inputs.mode == 'deploy' || inputs.mode == 'preflight')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -394,7 +363,8 @@ jobs:
       id-token: write
       attestations: write
     env:
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha }}
+      EXPECTED_WORKFLOW_EVENT: ${{ github.event_name == 'workflow_call' && 'workflow_call' || 'workflow_dispatch' }}
     outputs:
       artifact_id: ${{ steps.publish-host-tools.outputs.artifact-id }}
       artifact_digest: ${{ steps.publish-host-tools.outputs.artifact-digest }}
@@ -564,7 +534,7 @@ jobs:
             --source-sha "$TARGET_SHA" \
             --repository "$GITHUB_REPOSITORY" \
             --expected-branch dev \
-            --expected-event workflow_dispatch
+            --expected-event "$EXPECTED_WORKFLOW_EVENT"
 
       - name: Attest exact host-tools bundle
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
@@ -592,10 +562,14 @@ jobs:
     needs:
       - validate-dispatch
       - build-host-tools
+      - validate-security-provenance
     if: >-
+      always() &&
       needs.validate-dispatch.result == 'success' &&
       needs.build-host-tools.result == 'success' &&
-      github.event_name == 'workflow_dispatch' &&
+      (needs.validate-security-provenance.result == 'success' ||
+      (inputs.mode == 'preflight' && needs.validate-security-provenance.result == 'skipped')) &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
       (inputs.mode == 'deploy' || inputs.mode == 'preflight')
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -624,7 +598,7 @@ jobs:
       attestations: read
       contents: read
     env:
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha }}
       HOST_TOOLS_SHA: ${{ needs.build-host-tools.outputs.host_tools_sha }}
       HOST_TOOLS_ARTIFACT_ID: ${{ needs.build-host-tools.outputs.artifact_id }}
       HOST_TOOLS_ARTIFACT_DIGEST: ${{ needs.build-host-tools.outputs.artifact_digest }}
@@ -1305,12 +1279,14 @@ jobs:
     needs:
       - validate-dispatch
       - validate-classifier
+      - validate-security-provenance
       - host-capability-preflight
     if: >-
       needs.validate-dispatch.result == 'success' &&
       needs.validate-classifier.result == 'success' &&
+      needs.validate-security-provenance.result == 'success' &&
       needs.host-capability-preflight.result == 'success' &&
-      github.event_name == 'workflow_dispatch' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
       inputs.mode == 'deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1320,13 +1296,13 @@ jobs:
       id-token: write
       attestations: write
     env:
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha }}
       DEPLOY_MODE: ${{ inputs.mode }}
       RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
       PLATFORM_WEB_NEXT_COMPRESSION: ${{ inputs.web_compression == 'disabled' && 'false' || 'true' }}
       WEB_COMPRESSION: ${{ inputs.web_compression }}
-      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
-      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      CLASSIFIER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_id || github.run_id) || inputs.classifier_run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_attempt || github.run_attempt) || inputs.classifier_run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
     outputs:
       artifact_id: ${{ steps.publish-release-artifact.outputs.artifact-id }}
@@ -1498,14 +1474,14 @@ jobs:
     name: Validate exact security provenance
     needs:
       - validate-dispatch
-      - build-release
+      - validate-classifier
     outputs:
       security_ready: ${{ steps.security_provenance.outputs.security_ready }}
       security_digest: ${{ steps.security_provenance.outputs.security_digest }}
     if: >-
       needs.validate-dispatch.result == 'success' &&
-      needs.build-release.result == 'success' &&
-      github.event_name == 'workflow_dispatch' &&
+      needs.validate-classifier.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
       inputs.mode == 'deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1514,9 +1490,9 @@ jobs:
       contents: read
       statuses: read
     env:
-      TARGET_SHA: ${{ github.sha }}
-      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
-      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha }}
+      CLASSIFIER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_id || github.run_id) || inputs.classifier_run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_attempt || github.run_attempt) || inputs.classifier_run_attempt }}
       SOURCE_RUN_URL: ${{ inputs.classifier_run_id && format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, inputs.classifier_run_id) || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
     steps:
       # This job has a GitHub API token. Resolve the validator from the
@@ -1533,6 +1509,34 @@ jobs:
           test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
           test "$GITHUB_SERVER_URL" = "https://github.com"
           test "$GITHUB_REF" = "refs/heads/dev"
+          dev_ref="$RUNNER_TEMP/platform-current-dev-ref.json"
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/dev" \
+            --output "$dev_ref"
+          /usr/bin/python3 - "$dev_ref" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          target_sha = sys.argv[2]
+          obj = payload.get("object") if isinstance(payload, dict) else None
+          dev_sha = obj.get("sha") if isinstance(obj, dict) else None
+          if (
+              payload.get("ref") != "refs/heads/dev"
+              or not isinstance(obj, dict)
+              or obj.get("type") != "commit"
+              or not isinstance(dev_sha, str)
+              or re.fullmatch(r"[0-9a-f]{40}", dev_sha) is None
+              or dev_sha != target_sha
+          ):
+              raise SystemExit("target SHA is not the current dev head")
+          PY
+          rm -f -- "$dev_ref"
           trusted_ref="$RUNNER_TEMP/platform-trusted-default-ref.json"
           curl --fail-with-body --silent --show-error \
             --header "Authorization: Bearer $GH_TOKEN" \
@@ -1690,7 +1694,7 @@ jobs:
     if: >-
       needs.validate-dispatch.result == 'success' &&
       needs.host-capability-preflight.result == 'success' &&
-      github.event_name == 'workflow_dispatch' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
       inputs.mode == 'preflight'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1699,12 +1703,12 @@ jobs:
       actions: read
       contents: read
     env:
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha }}
       DEPLOY_MODE: preflight
       RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
       WEB_COMPRESSION: ${{ inputs.web_compression }}
-      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
-      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      CLASSIFIER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_id || github.run_id) || inputs.classifier_run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_attempt || github.run_attempt) || inputs.classifier_run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
       HOST_TOOLS_SHA: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}
       HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ needs.host-capability-preflight.outputs.host_tools_sha }}/platform_workflow_remote_dispatch.py
@@ -1847,7 +1851,7 @@ jobs:
       needs.build-release.result == 'success' &&
       needs.validate-security-provenance.result == 'success' &&
       needs.host-capability-preflight.result == 'success' &&
-      github.event_name == 'workflow_dispatch' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') &&
       inputs.mode == 'deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1858,16 +1862,14 @@ jobs:
       contents: read
       statuses: write
     env:
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha }}
       DEPLOY_MODE: deploy
+      EXPECTED_WORKFLOW_EVENT: ${{ github.event_name == 'workflow_call' && 'workflow_call' || 'workflow_dispatch' }}
       RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
       PLATFORM_WEB_NEXT_COMPRESSION: ${{ inputs.web_compression == 'disabled' && 'false' || 'true' }}
       WEB_COMPRESSION: ${{ inputs.web_compression }}
-      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
-      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
-      DISPATCH_KEY: ${{ inputs.dispatch_key }}
-      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
-      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+      CLASSIFIER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_id || github.run_id) || inputs.classifier_run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && (inputs.classifier_run_attempt || github.run_attempt) || inputs.classifier_run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
       PUBLISHED_ARTIFACT_ID: ${{ needs.build-release.outputs.artifact_id }}
       PUBLISHED_ARTIFACT_DIGEST: ${{ needs.build-release.outputs.artifact_digest }}
@@ -2186,51 +2188,6 @@ jobs:
             printf 'RELEASE_PROVENANCE=%s\n' "$release_provenance"
           } >> "$GITHUB_ENV"
 
-      - name: Revalidate active auto-deploy caller lease before production secrets
-        if: ${{ inputs.dispatch_key != '' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test -n "$DISPATCH_KEY" && test -n "$AUTODEPLOY_RUN_ID" && test -n "$AUTODEPLOY_RUN_ATTEMPT"
-          caller_dir="$(mktemp -d "$RUNNER_TEMP/platform-autodeploy-production-lease.XXXXXX")"
-          trap 'rm -rf -- "$caller_dir"' EXIT
-          api_headers=(
-            --header "Authorization: Bearer $GH_TOKEN"
-            --header "Accept: application/vnd.github+json"
-            --header "X-GitHub-Api-Version: 2022-11-28"
-          )
-          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
-            "${api_headers[@]}" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-autodeploy.yml" \
-            --output "$caller_dir/workflow.json"
-          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
-            "${api_headers[@]}" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${AUTODEPLOY_RUN_ID}" \
-            --output "$caller_dir/run.json"
-          /usr/bin/python3 - "$caller_dir/workflow.json" "$caller_dir/run.json" <<'PY'
-          import json
-          from pathlib import Path
-          import os
-          import sys
-
-          sys.path.insert(0, "platform/tools")
-          from platform_workflow_provenance import validate_autodeploy_caller_run
-
-          workflow = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          run = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-          validate_autodeploy_caller_run(
-              workflow,
-              run,
-              expected_run_id=int(os.environ["AUTODEPLOY_RUN_ID"]),
-              expected_attempt=int(os.environ["AUTODEPLOY_RUN_ATTEMPT"]),
-              expected_target_sha=os.environ["TARGET_SHA"],
-              dispatch_key=os.environ["DISPATCH_KEY"],
-          )
-          PY
-          echo "Active auto-deploy caller lease accepted immediately before production secrets."
-
       - name: Validate deployment secrets
         shell: bash
         env:
@@ -2328,12 +2285,12 @@ jobs:
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
             --output "$attempt_metadata"
-          /usr/bin/python3 - "$attempt_metadata" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" "$GITHUB_REPOSITORY" <<'PY'
+          /usr/bin/python3 - "$attempt_metadata" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" "$GITHUB_REPOSITORY" "$EXPECTED_WORKFLOW_EVENT" <<'PY'
           import json
           import sys
           from pathlib import Path
 
-          path, run_id, attempt, target_sha, repository = sys.argv[1:]
+          path, run_id, attempt, target_sha, repository, expected_event = sys.argv[1:]
           payload = json.loads(Path(path).read_text(encoding="ascii"))
           repo = payload.get("repository")
           if (
@@ -2344,7 +2301,7 @@ jobs:
               or payload.get("run_attempt") != int(attempt)
               or payload.get("head_sha") != target_sha
               or payload.get("head_branch") != "dev"
-              or payload.get("event") != "workflow_dispatch"
+              or payload.get("event") != expected_event
               or not isinstance(repo, dict)
               or repo.get("full_name") != repository
           ):

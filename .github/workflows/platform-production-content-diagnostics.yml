@@ -90,8 +90,9 @@ jobs:
           test "$(git rev-parse HEAD)" = "$TRUSTED_SOURCE_SHA"
           # The shared validator owns these exact checks; consumers must not
           # bind an untrusted row to any other workflow: "path": ".github/workflows/platform-production-deploy.yml"
-          # and the source run must carry "event": "workflow_dispatch" with
-          # "conclusion": "success".
+          # and the source run must carry either the native "event":
+          # "workflow_call" or the guarded fallback "event": "workflow_dispatch"
+          # with "conclusion": "success".
           # reimplement status.get("context") == "platform-production-deploy"
           # or status.get("target_url") == os.environ["SOURCE_RUN_URL"].
           # Its closed output is equivalent to output.write("deploy_ready=false\n")

@@ -1249,7 +1249,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
         ).read_text()
-        self.assertIn('"web_compression":"enabled"', workflow)
+        self.assertIn('echo "web_compression=enabled"', workflow)
 
     def test_baseline_runtime_profile_restores_ready_vote_admission_limits(self) -> None:
         workflow = DEPLOY_SUPERVISOR.read_text()
@@ -1348,7 +1348,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
         ).read_text()
         self.assertIn(
-            '"runtime_profile":"ready-vote-static-8"',
+            'echo "runtime_profile=ready-vote-static-8"',
             workflow,
         )
 

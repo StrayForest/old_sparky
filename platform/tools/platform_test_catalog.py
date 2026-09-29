@@ -378,6 +378,8 @@ TOOL_MODULES = frozenset(
     }
 )
 
+# ``test_platform_workflow_provenance`` also owns the native reusable
+# production-call contract; custom REST child-run correlation is not retained.
 # Conservative unit ownership.  Modules not listed here remain integration
 # owned unless a more specific tool/performance/privileged rule applies.
 UNIT_MODULES = frozenset(
@@ -452,10 +454,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 158,
     "module_digest": "a77d2cff5b4122f04ba7932d758aac60cd98e15405d3d09e4cb45da7c1207310",
-    "test_count": 1495,
-    "test_id_digest": "f8d2974649124ce0f5bfdbfece36167281ea0885f6b83db8b39a8ebadc19ca38",
-    "backend_test_count": 1451,
-    "backend_test_id_digest": "e491d9042ca41d639b0f953643a2f063ae982211c888f6d79f3b0aa930347ad0",
+    "test_count": 1486,
+    "test_id_digest": "0fefc1ea6658f01029e37692c1e92edd243a56e14560a81a88a79bd90567484d",
+    "backend_test_count": 1442,
+    "backend_test_id_digest": "58bf5164ea92d61466079fc3b87dc8658d2a3277c29ee87a1a52afa7fd1fb7a9",
     "verification_test_count": 44,
     "verification_test_id_digest": "d8873be495648857a31f012be4e6b1b1438b091214bc6fb046fa620f34debd32",
     "verification_classifier_test_count": 23,
@@ -484,8 +486,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 44,
         "module_digest": "693edb2005c56249ac84c9d1d7367b64e2e3291ef18c6bc05e41ea98967ea406",
-        "test_count": 338,
-        "test_id_digest": "f9af16e725bcd4aac94879e43073e53aad6d1cfbe9fbc60f9a96279b21e953db",
+        "test_count": 329,
+        "test_id_digest": "f86ab2d57b11a4706e6a12b4fc849c0077dad76fd3d3e1f13060bbb829037c9e",
     },
     "backend-integration": {
         "module_count": 41,

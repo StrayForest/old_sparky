@@ -48,45 +48,36 @@ to `dev`. The chain is:
    branch, conclusion, trusted actor, description and attempt URL. The gate
    reads GitHub's paginated [list commit statuses endpoint](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference)
    (`/commits/{sha}/statuses`), retaining each raw row and its full `creator`
-   object. It then requires `platform-security-build=success` and skips a SHA that already
-   reports `platform-production-deploy=success` only when the matching
-   successful deploy attempt has its exact bot-authored marker.
-4. When those checks pass, the auto-deploy workflow dispatches `Platform production deploy`
-   with `mode=deploy` on `dev`. The dispatch uses
-   the pinned GitHub REST `2022-11-28` contract and
-   [`return_run_details=true`](https://docs.github.com/en/rest/actions/workflows?apiVersion=2022-11-28#create-a-workflow-dispatch-event).
-   A supported `200` response is `{workflow_run_id,run_url,html_url}`; the
-   legacy `204` response has no run identity. Both are handled explicitly. A
-   timeout, lost response, `403`, `429`, `5xx` or malformed `200` is
-   `dispatch_unknown`, never a reason to POST again.
-   Every auto-dispatch carries a deterministic, non-secret `dispatch_key`
-   bound to the caller run ID, caller attempt and target SHA. The child exposes
-   that value in its API-visible run title and validates the caller's exact
-   workflow ID/name/repository, `workflow_run` event, `dev` branch, SHA and
-   active run attempt before production secrets. The parent fully paginates an exact-SHA
-   snapshot before dispatch; it adopts one existing exact-key child,
-   rejects duplicate exact-key candidates, and reconciles an unknown response
-   only by exact key plus workflow ID/name/path (the real
-   `.github/workflows/platform-production-deploy.yml` path, without `@ref`),
-   event, branch, repository and SHA; timestamps and “newest run” ordering are
-   never used.
-   Once known, the exact child attempt URL is recorded immediately; the parent
-   polls that run with a 600-second hard deadline. On parent timeout,
-   cancellation or API failure, it cancels the exact run with `actions:write`
-   (normal cancellation `202`/`409`, then one force-cancel last resort). If no
-   child ID was recovered, the child-side caller lease is fail-closed: the
-   child rechecks that the parent attempt is still `in_progress` immediately
-   before secret-bearing steps, so an accepted-but-untracked deployment cannot
-   proceed after the watcher ends. There is no blind retry.
-   A run-level `success` is insufficient: the parent fetches exact
-   `/actions/runs/{id}/attempts/{attempt}/jobs` pages and requires exactly one
-   `Deploy production` job with the same run/attempt/workflow/branch/SHA and
-   `completed`/`success` state. A successful preflight with a skipped deploy job
-   therefore fails the auto-deploy contour. `failure`, `cancelled`,
-   `timed_out`, `action_required`, `stale` and every other non-success terminal
-   conclusion fail it. A valid non-deployable classifier route remains the
-   successful no-op described above and does not enter this polling step.
-5. A secret-free prerequisite independently downloads and validates the exact classifier
+   object. It then requires `platform-security-build=success`; the native
+   called workflow is the one downstream execution for this contour, so the
+   auto-deploy gate does not guess at or deduplicate older child runs.
+4. When those checks pass, the auto-deploy workflow calls
+   [`platform-production-deploy.yml`](../../.github/workflows/platform-production-deploy.yml)
+   as a native reusable workflow job (`uses: ./.github/workflows/platform-production-deploy.yml`).
+   It passes strongly typed `workflow_call` inputs: `mode=deploy`,
+   `runtime_profile=ready-vote-static-8`, `web_compression=enabled`, the exact
+   tested `target_sha`, and the exact security run ID/attempt. There is no REST
+   dispatch, dispatch key, run discovery, timestamp correlation, polling,
+   cancellation API or caller lease in the normal path. The called job is
+   connected with native `needs`/`if`; its failure or cancellation is propagated
+   by the auto-deploy result job, while a valid non-deployable route leaves the
+   called job skipped and the auto-deploy workflow green.
+5. The called workflow accepts both guarded `workflow_call` and exceptional
+   `workflow_dispatch` entrypoints. Its validation jobs accept only those events,
+   validate the exact target SHA/current `dev` head and classifier/security
+   provenance, and do not receive production secret environment variables.
+   Only its environment-approved host capability, preflight and
+   `Deploy production` jobs use the `production` environment and SSH
+   secrets. Its concurrency group is the independent fixed
+   `platform-production-deploy` group with cancellation disabled, so a called
+   run cannot cancel the auto-deploy caller. A manual dispatch remains guarded
+   by the same exact mode, SHA, branch, classifier and preflight checks.
+   The caller intentionally passes no secrets and does not use `secrets: inherit`:
+   GitHub resolves `production` environment secrets on the called jobs, where
+   environment approval still applies, while `workflow_call` cannot receive
+   environment secrets from the caller. See [GitHub's reusable workflow secret
+   semantics](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow).
+6. A secret-free prerequisite independently downloads and validates the exact classifier
    artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
    before its first production write, followed by the security/build check and
@@ -99,7 +90,7 @@ to `dev`. The chain is:
    head. If `dev` moved from `TARGET_SHA` (the A→B race), the workflow aborts
    closed; only then does it transfer and install the artifact and run
    production smoke.
-6. Before the expensive release build, `build-host-tools` resolves the
+7. Before the expensive release build, `build-host-tools` resolves the
    repository-owned `platform/contracts/host_tools_pin.json` from the exact
    target source, validates its repository/commit ancestry and closure
    baseline, then checks out and runs the pinned `HOST_TOOLS_SHA` helper to
@@ -163,7 +154,7 @@ failure status for that exact SHA with `gh api
 repos/StrayForest/old_sparky/statuses/<sha> -f state=failure -f
 context=platform-security-build`; never post success manually.
 
-The dispatch `mode`, runtime profile, release slug, target SHA and artifact
+The workflow `mode`, runtime profile, release slug, target SHA and artifact
 directory are checked by the bounded ASCII input guard before production host
 access or secret-file setup. A deployment release slug is exactly
 `gha-<run_id>-<run_attempt>-<first 12 lowercase characters of target SHA>`;

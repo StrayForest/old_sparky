@@ -34,10 +34,12 @@ SECURITY_WORKFLOW_PATH = ".github/workflows/platform-security.yml"
 SECURITY_WORKFLOW_NAME = "Platform security and build"
 DEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-deploy.yml"
 DEPLOY_WORKFLOW_NAME = "Platform production deploy"
-AUTO_DEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-autodeploy.yml"
-AUTO_DEPLOY_WORKFLOW_NAME = "Platform production auto-deploy"
 DEPLOY_JOB_NAME = "Deploy production"
 PREFLIGHT_JOB_NAME = "Production preflight"
+# The production workflow has two intentionally guarded entrypoints.  Native
+# auto-deploy uses workflow_call; the operator fallback uses workflow_dispatch.
+# No other event may authorize a deployment marker or preflight no-op.
+DEPLOYMENT_EVENTS = ("workflow_call", "workflow_dispatch")
 SECURITY_STATUS_CONTEXT = "platform-security-build"
 DEPLOY_STATUS_CONTEXT = "platform-production-deploy"
 DEPLOY_SUCCESS_DESCRIPTION = "Production deployment and live smoke passed"
@@ -49,38 +51,13 @@ ACTIONS_BOT_TYPE = "Bot"
 # remain authoritative because a different workflow can also use a token.
 ACTIONS_BOT_ID = 41898282
 GITHUB_SERVER_URL = "https://github.com"
-GITHUB_API_URL = "https://api.github.com"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
-DISPATCH_KEY_RE = re.compile(
-    r"^ad-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$"
-)
 UTC_STATUS_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
 STATUS_MAX_AGE = timedelta(days=30)
 STATUS_MAX_FUTURE_SKEW = timedelta(0)
-
-# GitHub currently exposes these lifecycle values for workflow runs.  Keep the
-# accepted set closed: a new/unknown API value must not be treated as pending
-# or successful until this source contract is reviewed.
-DEPLOYMENT_PENDING_STATUSES = frozenset(
-    {"queued", "requested", "waiting", "pending", "in_progress"}
-)
-DEPLOYMENT_TERMINAL_CONCLUSIONS = frozenset(
-    {
-        "action_required",
-        "cancelled",
-        "failure",
-        "neutral",
-        "skipped",
-        "stale",
-        "startup_failure",
-        "timed_out",
-        "success",
-    }
-)
-
 
 class ProvenanceError(ValueError):
     """Raised when an API payload is incomplete, mismatched, or spoofed."""
@@ -245,9 +222,8 @@ def validate_workflow_run_identity(
     """Validate immutable workflow identity and return its attempt URL.
 
     This deliberately does not inspect ``status`` or ``conclusion``.  The
-    auto-deploy dispatcher uses it while a downstream run is still queued or
-    in progress; terminal state is classified separately by
-    :func:`classify_deployment_run`.
+    callers use it before evaluating status/conclusion, so an API identity
+    mismatch cannot be converted into a successful provenance result.
     """
 
     workflow_id = _positive_int(workflow.get("id"), "workflow id")
@@ -321,320 +297,6 @@ def validate_workflow_run(
         if run.get(field) != value:
             raise _fail(f"run {field} is not the expected value")
     return attempt_url
-
-
-def classify_deployment_run(
-    workflow: Mapping[str, Any],
-    run: Mapping[str, Any],
-    *,
-    expected_run_id: int,
-    expected_attempt: int,
-    expected_target_sha: str,
-    dispatch_key: str | None = None,
-    server_url: str = GITHUB_SERVER_URL,
-) -> str:
-    """Classify one exact production-deploy run without guessing its state.
-
-    The return value is one of ``pending``, ``success`` or
-    ``terminal:<conclusion>``.  Unknown status/conclusion values and every
-    identity mismatch raise :class:`ProvenanceError`, so a caller cannot turn
-    an API schema change, rerun or wrong workflow into a green dispatch.
-    """
-
-    validate_workflow_run_identity(
-        workflow,
-        run,
-        expected_run_id=expected_run_id,
-        expected_attempt=expected_attempt,
-        expected_target_sha=expected_target_sha,
-        expected_event="workflow_dispatch",
-        expected_branch="dev",
-        expected_path=DEPLOY_WORKFLOW_PATH,
-        expected_name=DEPLOY_WORKFLOW_NAME,
-        server_url=server_url,
-    )
-    if dispatch_key is not None:
-        validate_dispatch_key(dispatch_key, expected_target_sha=expected_target_sha)
-        if run.get("display_title") != deployment_display_title(dispatch_key):
-            raise _fail("deployment run dispatch key is not canonical")
-    status = run.get("status")
-    conclusion = run.get("conclusion")
-    if not isinstance(status, str):
-        raise _fail("deployment run status is unknown")
-    if status in DEPLOYMENT_PENDING_STATUSES:
-        if conclusion is not None:
-            raise _fail("pending deployment run has a terminal conclusion")
-        return "pending"
-    if status != "completed":
-        raise _fail("deployment run status is unknown")
-    if (
-        not isinstance(conclusion, str)
-        or conclusion not in DEPLOYMENT_TERMINAL_CONCLUSIONS
-    ):
-        raise _fail("deployment run conclusion is unknown")
-    if conclusion == "success":
-        return "success"
-    return f"terminal:{conclusion}"
-
-
-def parse_dispatch_response(
-    payload: object,
-    *,
-    expected_run_id: int | None = None,
-) -> tuple[int, int | None, str]:
-    """Parse GitHub's 200 ``return_run_details`` dispatch response.
-
-    The current REST schema is ``{"workflow_run_id", "run_url",
-    "html_url"}``; ``run_attempt`` is accepted when a GitHub deployment
-    returns it as an extension. A 204 response has no JSON and is handled by
-    the caller's token reconciliation path, never by this function.
-    """
-
-    if not isinstance(payload, Mapping):
-        raise _fail("workflow dispatch response is malformed")
-    required = {"workflow_run_id", "run_url", "html_url"}
-    allowed = required | {"run_attempt", "run_number"}
-    if not required.issubset(payload) or not set(payload).issubset(allowed):
-        raise _fail("workflow dispatch response schema is not canonical")
-    run_id = _run_id(payload.get("workflow_run_id"), "workflow dispatch run id")
-    if expected_run_id is not None and run_id != _run_id(expected_run_id, "workflow dispatch run id"):
-        raise _fail("workflow dispatch run ID changed during validation")
-    run_url = payload.get("run_url")
-    html_url = payload.get("html_url")
-    expected_api_url = f"{GITHUB_API_URL}/repos/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}"
-    expected_html_url = f"{GITHUB_SERVER_URL}/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}"
-    if run_url != expected_api_url or html_url != expected_html_url:
-        raise _fail("workflow dispatch response URL is not canonical")
-    attempt_hint: int | None = None
-    if "run_attempt" in payload:
-        attempt_hint = _run_id(payload.get("run_attempt"), "workflow dispatch run attempt")
-        if attempt_hint != 1:
-            raise _fail("workflow dispatch returned a rerun attempt")
-    if "run_number" in payload:
-        _run_id(payload.get("run_number"), "workflow dispatch run number")
-    return run_id, attempt_hint, html_url
-
-
-def validate_autodeploy_caller_run(
-    workflow: Mapping[str, Any],
-    run: Mapping[str, Any],
-    *,
-    expected_run_id: int,
-    expected_attempt: int,
-    expected_target_sha: str,
-    dispatch_key: str,
-    server_url: str = GITHUB_SERVER_URL,
-) -> str:
-    """Validate the active auto-deploy caller lease before child secrets."""
-
-    validate_dispatch_key(
-        dispatch_key,
-        expected_target_sha=expected_target_sha,
-    )
-    attempt_url = validate_workflow_run_identity(
-        workflow,
-        run,
-        expected_run_id=expected_run_id,
-        expected_attempt=expected_attempt,
-        expected_target_sha=expected_target_sha,
-        expected_event="workflow_run",
-        expected_branch="dev",
-        expected_path=AUTO_DEPLOY_WORKFLOW_PATH,
-        expected_name=AUTO_DEPLOY_WORKFLOW_NAME,
-        server_url=server_url,
-    )
-    if run.get("status") != "in_progress" or run.get("conclusion") is not None:
-        raise _fail("auto-deploy caller lease is not active")
-    if dispatch_key != expected_dispatch_key(
-        expected_run_id,
-        expected_attempt,
-        expected_target_sha,
-    ):
-        raise _fail("dispatch key is not bound to the caller")
-    return attempt_url
-
-
-def deployment_run_rows(
-    payload: object,
-    *,
-    expected_target_sha: str,
-    expected_workflow_id: int,
-    expected_dispatch_key: str | None = None,
-) -> list[Mapping[str, Any]]:
-    """Validate a complete bounded workflow-run listing response.
-
-    GitHub's workflow-run listing is only a discovery hint. Every row is
-    checked for the exact dispatch identity before a caller can compare it to
-    a pre-dispatch snapshot. The returned run's display title carries the
-    caller-bound dispatch key when this is an auto-deploy dispatch.
-
-    GitHub returns the real workflow path without an ``@ref`` suffix.  Keep
-    that exact path in the identity contract alongside the workflow ID, name,
-    repository, event and target SHA; an invented ``@ref`` path is rejected.
-    """
-
-    if not isinstance(payload, Mapping):
-        raise _fail("deployment run listing is malformed")
-    total_count = payload.get("total_count")
-    rows = payload.get("workflow_runs")
-    if (
-        isinstance(total_count, bool)
-        or not isinstance(total_count, int)
-        or total_count < 0
-        or total_count > 100_000
-        or not isinstance(rows, list)
-        or len(rows) != total_count
-    ):
-        raise _fail("deployment run listing count is malformed")
-    if (
-        not isinstance(expected_target_sha, str)
-        or SHA_RE.fullmatch(expected_target_sha) is None
-    ):
-        raise _fail("target SHA is not canonical")
-    if expected_dispatch_key is not None:
-        validate_dispatch_key(
-            expected_dispatch_key,
-            expected_target_sha=expected_target_sha,
-        )
-    _run_id(expected_workflow_id, "expected workflow id")
-    seen_ids: set[int] = set()
-    validated: list[Mapping[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, Mapping):
-            raise _fail("deployment run row is malformed")
-        run_id = _run_id(row.get("id"), "deployment run id")
-        if run_id in seen_ids:
-            raise _fail("deployment run row id is ambiguous")
-        seen_ids.add(run_id)
-        attempt = _run_id(row.get("run_attempt"), "deployment run attempt")
-        if (
-            type(row.get("workflow_id")) is not int
-            or row.get("workflow_id") != expected_workflow_id
-        ):
-            raise _fail("deployment run workflow is not canonical")
-        if row.get("name") != DEPLOY_WORKFLOW_NAME:
-            raise _fail("deployment run name is not canonical")
-        if row.get("path") != DEPLOY_WORKFLOW_PATH:
-            raise _fail("deployment run path is not canonical")
-        if row.get("event") != "workflow_dispatch":
-            raise _fail("deployment run event is not canonical")
-        if row.get("head_branch") != "dev":
-            raise _fail("deployment run branch is not canonical")
-        if row.get("head_sha") != expected_target_sha:
-            raise _fail("deployment run SHA is not canonical")
-        validate_repository_identity(row)
-        status = row.get("status")
-        conclusion = row.get("conclusion")
-        if (
-            not isinstance(status, str)
-            or status not in DEPLOYMENT_PENDING_STATUSES
-            and status != "completed"
-        ):
-            raise _fail("deployment run status is unknown")
-        if status == "completed":
-            if (
-                not isinstance(conclusion, str)
-                or conclusion not in DEPLOYMENT_TERMINAL_CONCLUSIONS
-            ):
-                raise _fail("deployment run conclusion is unknown")
-        elif conclusion is not None:
-            raise _fail("pending deployment run has a terminal conclusion")
-        if (
-            expected_dispatch_key is not None
-            and row.get("display_title") == deployment_display_title(expected_dispatch_key)
-            and attempt != 1
-        ):
-            raise _fail("correlated deployment run attempt is not the first attempt")
-        validated.append(row)
-    return validated
-
-
-def select_new_deployment_run(
-    payload: object,
-    *,
-    prior_run_ids: Sequence[int] | set[int],
-    dispatch_key: str,
-    expected_target_sha: str,
-    expected_workflow_id: int,
-) -> tuple[int, int] | None:
-    """Select exactly one new run carrying the exact caller-bound token.
-
-    ``None`` means the GitHub list has not observed the dispatch yet.  More
-    than one new exact run is an ambiguity (for example, an operator started a
-    manual run concurrently), never a reason to choose the newest row.
-    """
-
-    validate_dispatch_key(
-        dispatch_key,
-        expected_target_sha=expected_target_sha,
-    )
-    prior: set[int] = set()
-    for value in prior_run_ids:
-        prior.add(_run_id(value, "prior deployment run id"))
-    rows = deployment_run_rows(
-        payload,
-        expected_target_sha=expected_target_sha,
-        expected_workflow_id=expected_workflow_id,
-        expected_dispatch_key=dispatch_key,
-    )
-    candidates = [
-        row
-        for row in rows
-        if _run_id(row.get("id"), "deployment run id") not in prior
-        and row.get("display_title") == deployment_display_title(dispatch_key)
-    ]
-    if len(candidates) > 1:
-        raise _fail("new downstream deployment run is ambiguous")
-    if not candidates:
-        return None
-    selected = candidates[0]
-    attempt = _run_id(selected.get("run_attempt"), "deployment run attempt")
-    if attempt != 1:
-        raise _fail("correlated deployment run attempt is not the first attempt")
-    return (
-        _run_id(selected.get("id"), "deployment run id"),
-        attempt,
-    )
-
-
-def deployment_display_title(dispatch_key: str) -> str:
-    """Return the API-visible workflow run title for an auto-dispatch token."""
-
-    validate_dispatch_key(dispatch_key)
-    return f"{DEPLOY_WORKFLOW_NAME} [{dispatch_key}]"
-
-
-def expected_dispatch_key(
-    caller_run_id: int,
-    caller_attempt: int,
-    expected_target_sha: str,
-) -> str:
-    """Derive the non-secret token bound to one auto-deploy run attempt."""
-
-    caller_run_id = _run_id(caller_run_id, "caller run id")
-    caller_attempt = _run_id(caller_attempt, "caller run attempt")
-    if not isinstance(expected_target_sha, str) or SHA_RE.fullmatch(expected_target_sha) is None:
-        raise _fail("target SHA is not canonical")
-    token = f"ad-{caller_run_id}-{caller_attempt}-{expected_target_sha[:12]}"
-    validate_dispatch_key(token, expected_target_sha=expected_target_sha)
-    return token
-
-
-def validate_dispatch_key(
-    value: object,
-    *,
-    expected_target_sha: str | None = None,
-) -> str:
-    """Validate the closed, non-secret child run dispatch key."""
-
-    if not isinstance(value, str) or DISPATCH_KEY_RE.fullmatch(value) is None:
-        raise _fail("dispatch key is malformed")
-    if expected_target_sha is not None:
-        if not isinstance(expected_target_sha, str) or SHA_RE.fullmatch(expected_target_sha) is None:
-            raise _fail("target SHA is not canonical")
-        if not value.endswith(f"-{expected_target_sha[:12]}"):
-            raise _fail("dispatch key is not bound to the target SHA")
-    return value
 
 
 def latest_context_status(
@@ -796,80 +458,6 @@ def _validate_job_rows(jobs: Sequence[Mapping[str, Any]]) -> None:
             raise _fail("job name is malformed")
 
 
-def deployment_job_rows(
-    payload: object,
-    *,
-    expected_run_id: int,
-    expected_attempt: int,
-) -> list[Mapping[str, Any]]:
-    """Validate one complete exact-attempt workflow-jobs response."""
-
-    if not isinstance(payload, Mapping):
-        raise _fail("deployment job payload is malformed")
-    total_count = payload.get("total_count")
-    rows = payload.get("jobs")
-    if (
-        isinstance(total_count, bool)
-        or not isinstance(total_count, int)
-        or total_count < 0
-        or total_count > 1000
-        or not isinstance(rows, list)
-        or len(rows) != total_count
-    ):
-        raise _fail("deployment job pagination is incomplete")
-    expected_id = _run_id(expected_run_id, "expected deployment run id")
-    expected_attempt = _run_id(expected_attempt, "expected deployment run attempt")
-    _validate_job_rows(rows)
-    for job in rows:
-        if _run_id(job.get("run_id"), "job run id") != expected_id:
-            raise _fail("deployment job belongs to a different run")
-        if _run_id(job.get("run_attempt"), "job run attempt") != expected_attempt:
-            raise _fail("deployment job belongs to a different attempt")
-        if job.get("workflow_name") != DEPLOY_WORKFLOW_NAME:
-            raise _fail("deployment job workflow is not canonical")
-        if job.get("head_branch") != "dev":
-            raise _fail("deployment job branch is not canonical")
-    return rows
-
-
-def validate_deployment_job_success(
-    jobs: Sequence[Mapping[str, Any]],
-    *,
-    expected_run_id: int,
-    expected_attempt: int,
-    expected_target_sha: str,
-) -> None:
-    """Require exactly one successful Deploy production job for the run."""
-
-    if not isinstance(jobs, Sequence) or isinstance(jobs, (str, bytes)):
-        raise _fail("deployment jobs are malformed")
-    rows = deployment_job_rows(
-        {"total_count": len(jobs), "jobs": list(jobs)},
-        expected_run_id=expected_run_id,
-        expected_attempt=expected_attempt,
-    )
-    expected_id = _run_id(expected_run_id, "expected deployment run id")
-    expected_attempt = _run_id(expected_attempt, "expected deployment run attempt")
-    if not isinstance(expected_target_sha, str) or SHA_RE.fullmatch(expected_target_sha) is None:
-        raise _fail("target SHA is not canonical")
-    if any(job.get("head_sha") != expected_target_sha for job in rows):
-        raise _fail("deployment job SHA is not canonical")
-    matching = [job for job in rows if job.get("name") == DEPLOY_JOB_NAME]
-    if len(matching) != 1:
-        raise _fail("successful Deploy production job is missing or ambiguous")
-    job = matching[0]
-    if (
-        _run_id(job.get("run_id"), "job run id") != expected_id
-        or _run_id(job.get("run_attempt"), "job run attempt") != expected_attempt
-        or job.get("workflow_name") != DEPLOY_WORKFLOW_NAME
-        or job.get("head_branch") != "dev"
-        or job.get("head_sha") != expected_target_sha
-        or job.get("status") != "completed"
-        or job.get("conclusion") != "success"
-    ):
-        raise _fail("Deploy production job did not complete successfully")
-
-
 def _validate_status_rows(statuses: Sequence[Mapping[str, Any]]) -> None:
     """Validate the identity shape of every row in a complete status page set."""
 
@@ -974,15 +562,28 @@ def validate_deployment_marker(
     expected_attempt: int,
     expected_target_sha: str,
     expected_run_url: str | None = None,
+    expected_event: str | None = None,
     server_url: str = GITHUB_SERVER_URL,
     now: datetime | None = None,
     max_age: timedelta = STATUS_MAX_AGE,
     max_future_skew: timedelta = STATUS_MAX_FUTURE_SKEW,
 ) -> str:
-    """Validate a successful deploy run and its exact bot-produced marker."""
+    """Validate a successful deploy run and its exact bot-produced marker.
+
+    ``workflow_call`` is the native auto-deploy entrypoint and
+    ``workflow_dispatch`` is the guarded operator fallback.  When a caller
+    does not provide ``expected_event``, the run's event is still required to
+    be one of those two exact values; an explicit value additionally binds the
+    snapshot to that entrypoint.
+    """
 
     _validate_job_rows(jobs)
     _validate_status_rows(statuses)
+    actual_event = run.get("event")
+    if actual_event not in DEPLOYMENT_EVENTS:
+        raise _fail("deployment workflow event is not an allowed entrypoint")
+    if expected_event is not None and expected_event != actual_event:
+        raise _fail("deployment workflow event does not match the expected entrypoint")
 
     attempt_url = validate_workflow_run(
         workflow,
@@ -990,7 +591,7 @@ def validate_deployment_marker(
         expected_run_id=expected_run_id,
         expected_attempt=expected_attempt,
         expected_target_sha=expected_target_sha,
-        expected_event="workflow_dispatch",
+        expected_event=actual_event,
         expected_branch="dev",
         expected_path=DEPLOY_WORKFLOW_PATH,
         expected_name=DEPLOY_WORKFLOW_NAME,
@@ -1033,6 +634,7 @@ def validate_deployment_event(
     expected_attempt: int,
     expected_target_sha: str,
     expected_run_url: str | None = None,
+    expected_event: str | None = None,
     server_url: str = GITHUB_SERVER_URL,
     now: datetime | None = None,
     max_age: timedelta = STATUS_MAX_AGE,
@@ -1049,13 +651,18 @@ def validate_deployment_event(
 
     _validate_job_rows(jobs)
     _validate_status_rows(statuses)
+    actual_event = run.get("event")
+    if actual_event not in DEPLOYMENT_EVENTS:
+        raise _fail("deployment workflow event is not an allowed entrypoint")
+    if expected_event is not None and expected_event != actual_event:
+        raise _fail("deployment workflow event does not match the expected entrypoint")
     attempt_url = validate_workflow_run(
         workflow,
         run,
         expected_run_id=expected_run_id,
         expected_attempt=expected_attempt,
         expected_target_sha=expected_target_sha,
-        expected_event="workflow_dispatch",
+        expected_event=actual_event,
         expected_branch="dev",
         expected_path=DEPLOY_WORKFLOW_PATH,
         expected_name=DEPLOY_WORKFLOW_NAME,
@@ -1202,6 +809,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--expected-target-sha", required=True)
         command_parser.add_argument("--expected-run-url")
         if command == "deployment":
+            command_parser.add_argument("--expected-event", choices=DEPLOYMENT_EVENTS)
             command_parser.add_argument(
                 "--allow-preflight-noop",
                 action="store_true",
@@ -1260,6 +868,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     expected_attempt=expected_attempt,
                     expected_target_sha=args.expected_target_sha,
                     expected_run_url=args.expected_run_url,
+                    expected_event=args.expected_event,
                     now=now,
                 )
                 attempt_url = canonical_attempt_url(
@@ -1278,6 +887,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     expected_attempt=expected_attempt,
                     expected_target_sha=args.expected_target_sha,
                     expected_run_url=args.expected_run_url,
+                    expected_event=args.expected_event,
                     now=now,
                 )
             context = DEPLOY_STATUS_CONTEXT
