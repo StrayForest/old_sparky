@@ -1218,6 +1218,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     "conclusion": "success",
                     "name": "Platform security and build",
                     "path": ".github/workflows/platform-security.yml",
+                    "display_title": "Merge pull request #125 from StrayForest/codex/recovery-attestation-j…",
                     "repository": {"full_name": repository},
                 },
                 "jobs.json": {
@@ -1281,8 +1282,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             def write_fixture(value: dict[str, object]) -> None:
                 for name, payload in value.items():
                     (metadata / name).write_text(
-                        json.dumps(payload, sort_keys=True),
-                        encoding="ascii",
+                        json.dumps(payload, sort_keys=True, ensure_ascii=False),
+                        encoding="utf-8",
                     )
 
             def validate(
@@ -1292,8 +1293,10 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 selected_recovery_run_id: str = recovery_run_id,
                 selected_recovery_attempt: str = recovery_attempt,
                 selected_recovery_workflow_sha: str = recovery_workflow_sha,
+                write: bool = True,
             ) -> dict[str, object]:
-                write_fixture(value or valid)
+                if write:
+                    write_fixture(value or valid)
                 return recovery.validate_publish_metadata(
                     metadata,
                     repository=repository,
@@ -1316,6 +1319,16 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             provenance_value = result["provenance"]
             self.assertEqual(provenance_value["artifact_sha256"], route_digest)
             self.assertFalse(provenance_value["deployable"])
+
+            # GitHub's run payload may contain non-ASCII descriptive metadata;
+            # it must not prevent validation of the exact ASCII provenance
+            # fields.  Invalid UTF-8 remains fail-closed with the input label.
+            write_fixture(valid)
+            (metadata / "run.json").write_bytes(b'{"display_title":"\xff"}')
+            with self.assertRaisesRegex(
+                recovery.RecoveryBootstrapError, r"^security run is invalid$"
+            ):
+                validate(write=False)
 
             # Two completed producer runs may legitimately publish the same
             # security source SHA (for example after a recovery workflow

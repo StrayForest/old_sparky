@@ -390,7 +390,10 @@ def _read_publish_json(path: Path, *, label: str) -> object:
             label=label,
             allowed_modes={0o400, 0o440, 0o444, 0o600, 0o640, 0o644},
         )
-        return json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+        # GitHub API responses are UTF-8 and may contain Unicode in descriptive
+        # fields that are not part of the provenance contract.  Keep strict
+        # duplicate-key parsing and reject malformed UTF-8 below.
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
     except (UnicodeError, json.JSONDecodeError, RecoveryBootstrapError) as exc:
         if isinstance(exc, RecoveryBootstrapError):
             raise
