@@ -118,6 +118,12 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
     def test_security_web_reports_are_attempt_bound_and_playwright_install_is_hermetic(self) -> None:
         security = (WORKFLOW_ROOT / "platform-security.yml").read_text(encoding="utf-8")
         self.assertIn("platform-web-playwright-report-${{ github.run_id }}-${{ github.run_attempt }}", security)
+        self.assertIn("platform-web-playwright-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}", security)
+        self.assertIn("platform-web-hermetic-timing-${{ github.run_id }}-${{ github.run_attempt }}", security)
+        self.assertIn("PLATFORM_WEB_HERMETIC_TIMING_PATH: ${{ runner.temp }}/platform-web-hermetic-summary.json", security)
+        self.assertIn("if: ${{ failure() }}", security)
+        self.assertIn("if: ${{ always() }}", security)
+        self.assertIn("retention-days: 5", security)
         self.assertNotIn("playwright install chromium", security)
 
     def test_live_user_qa_uses_only_the_fixed_host_dispatch_boundary(self) -> None:
