@@ -545,19 +545,18 @@ jobs:
                   continue
               signature = result.get("signature")
               certificate = signature.get("certificate") if isinstance(signature, dict) else None
-              extensions = certificate.get("extensions") if isinstance(certificate, dict) else None
               statement = result.get("statement")
               timestamps = result.get("verifiedTimestamps")
-              if not isinstance(extensions, dict) or not isinstance(statement, dict) or not isinstance(timestamps, list) or not timestamps:
+              if not isinstance(certificate, dict) or not isinstance(statement, dict) or not isinstance(timestamps, list) or not timestamps:
                   continue
               if (
-                  extensions.get("issuer") != "https://token.actions.githubusercontent.com"
-                  or extensions.get("sourceRepositoryURI") != expected_repo
-                  or extensions.get("sourceRepositoryRef") != "refs/heads/dev"
-                  or extensions.get("sourceRepositoryDigest") != os.environ.get("RECOVERY_WORKFLOW_SHA", "")
-                  or extensions.get("buildConfigURI") != expected_build
-                  or extensions.get("buildSignerURI") != expected_build
-                  or extensions.get("runInvocationURI") != expected_runner
+                  certificate.get("issuer") != "https://token.actions.githubusercontent.com"
+                  or certificate.get("sourceRepositoryURI") != expected_repo
+                  or certificate.get("sourceRepositoryRef") != "refs/heads/dev"
+                  or certificate.get("sourceRepositoryDigest") != os.environ.get("RECOVERY_WORKFLOW_SHA", "")
+                  or certificate.get("buildConfigURI") != expected_build
+                  or certificate.get("buildSignerURI") != expected_build
+                  or certificate.get("runInvocationURI") != expected_runner
               ):
                   continue
               subjects = statement.get("subject")
