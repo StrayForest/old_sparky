@@ -556,6 +556,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     )
                     self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", source)
                     continue
+                if filename == "platform-production-storage-diagnostics.yml":
+                    self.assertIn(
+                        'test -f "$maintenance_tool" && test ! -L "$maintenance_tool"',
+                        source,
+                    )
+                    self.assertIn("platform_storage_diagnostics_sanitizer.py", source)
+                    self.assertIn('"reason": "sanitizer_unavailable"', source)
+                    continue
                 self.assertIn(
                     'test -f "$input_guard" && test ! -L "$input_guard"',
                     source,

@@ -1657,7 +1657,15 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                             secret_names.intersection(step_secrets), location
                         )
                         self.assertNotIn("secrets.PROD_SSH_", step, location)
-                    if uses and ssh_material_cleanup_seen:
+                    storage_evidence_upload = (
+                        # This one upload is deliberately after SSH cleanup:
+                        # the sanitizer creates a fixed schema artifact even
+                        # when cleanup itself failed, so observability is not
+                        # lost with the fail-closed result.
+                        uses.startswith("actions/upload-artifact@")
+                        and "platform-production-storage-diagnostics-artifact.txt" in step
+                    )
+                    if uses and ssh_material_cleanup_seen and not storage_evidence_upload:
                         self.assertRegex(
                             step,
                             r"steps\.cleanup_ssh\.outcome\s*==\s*['\"]success['\"]",
@@ -1756,7 +1764,8 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("expected_sha", workflow)
-        self.assertIn("platform_storage_maintenance.py\" --json", workflow)
+        self.assertIn("platform_storage_maintenance.py", workflow)
+        self.assertIn("--json", workflow)
         self.assertIn(
             "df -B1 --output=size,used,avail,pcent -- \"$path\"", workflow
         )
@@ -1765,7 +1774,42 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         )
         self.assertIn("journalctl --disk-usage", workflow)
         self.assertIn("du -x -s -B1 -- \"$path\"", workflow)
+        self.assertIn("platform_storage_diagnostics_sanitizer.py", workflow)
+        self.assertIn("platform_storage_maintenance.py", workflow)
+        self.assertIn("sha256sum --strict --check -- manifest.sha256", workflow)
+        self.assertNotIn("platform_workflow_input_guard.py", workflow)
         self.assertIn("platform_storage_evidence_summary.py", workflow)
+        self.assertNotIn('summary_tool="$current/tools/platform_storage_evidence_summary.py"', workflow)
+        self.assertIn(
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+            workflow,
+        )
+        self.assertIn('ref: ${{ github.sha }}', workflow)
+        self.assertIn("timeout --foreground 600s ssh", workflow)
+        self.assertIn("ulimit -f 1025", workflow)
+        self.assertIn('remote_stderr_bytes="$(wc -c <"$ssh_error"', workflow)
+        self.assertIn('report_present=false', workflow)
+        self.assertIn('if [[ "$remote_status" = 0 && "$report_present" = true ]]', workflow)
+        self.assertIn('DIAGNOSTICS_REMOTE_STATUS=', workflow)
+        self.assertIn('DIAGNOSTICS_REPORT_PRESENT=', workflow)
+        self.assertIn('raw_output_included', workflow)
+        self.assertIn('regular file:1:600', workflow)
+        self.assertIn('bounded evidence was published', workflow)
+        self.assertIn(
+            'if: ${{ always() }}',
+            workflow,
+        )
+        self.assertIn(
+            '"$RUNNER_TEMP/platform-production-storage-diagnostics.txt"',
+            workflow,
+        )
+        self.assertIn(
+            '"$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"',
+            workflow,
+        )
+        self.assertNotIn('cat "$ssh_error"', workflow)
+        self.assertNotIn('echo "$ssh_error"', workflow)
+        self.assertNotIn('cp -- "$remote_report" "$public_artifact"', workflow)
         self.assertNotIn("df -hT", workflow)
         self.assertNotIn("findmnt", workflow)
         self.assertNotIn("fuser", workflow)
@@ -1773,6 +1817,14 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertNotIn("--apply", workflow)
         self.assertNotIn("systemctl restart", workflow)
         self.assertNotIn("rm -rf", workflow)
+        self.assertLess(
+            workflow.index("- name: Remove production SSH material"),
+            workflow.index("- name: Sanitize storage diagnostic evidence"),
+        )
+        self.assertLess(
+            workflow.index("- name: Upload storage diagnostic evidence"),
+            workflow.index("- name: Remove private storage diagnostic captures"),
+        )
 
     def test_as12_proof_is_read_only_and_sha_locked(self) -> None:
         proof = (WORKFLOW_DIR / "platform-production-as12-proof.yml").read_text(

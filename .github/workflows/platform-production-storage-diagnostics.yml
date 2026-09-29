@@ -16,8 +16,45 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Prepare exact storage evidence projector
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact workflow source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Package fixed projector closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          projector_dir="$RUNNER_TEMP/platform-storage-projector"
+          install -d -m 700 "$projector_dir"
+          for source in platform_storage_diagnostics_sanitizer.py platform_storage_evidence_summary.py; do
+            source_path="$GITHUB_WORKSPACE/platform/tools/$source"
+            test -f "$source_path" && test ! -L "$source_path"
+            install -m 600 "$source_path" "$projector_dir/$source"
+          done
+          (
+            cd "$projector_dir"
+            sha256sum -- *.py > manifest.sha256
+          )
+          chmod 600 "$projector_dir/manifest.sha256"
+
+      - name: Upload fixed projector closure
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-production-storage-projector-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-storage-projector
+          if-no-files-found: error
+          retention-days: 1
+
   collect:
     name: Collect read-only storage evidence
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: production
@@ -33,6 +70,25 @@ jobs:
 
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "expected_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
+
+      - name: Download exact diagnostics projector
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-storage-projector-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-storage-projector
+
+      - name: Verify fixed projector closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          projector_dir="$RUNNER_TEMP/platform-storage-projector"
+          for source in platform_storage_diagnostics_sanitizer.py platform_storage_evidence_summary.py manifest.sha256; do
+            test -f "$projector_dir/$source" && test ! -L "$projector_dir/$source"
+          done
+          (
+            cd "$projector_dir"
+            sha256sum --strict --check -- manifest.sha256
+          )
 
       - name: Validate production SSH inputs
         shell: bash
@@ -90,34 +146,40 @@ jobs:
           : >"$remote_report"
           : >"$ssh_error"
           chmod 600 "$remote_report" "$ssh_error"
-          if ! ssh \
-            -F "$SSH_DIR/config" \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=3 \
-            -o ConnectTimeout=10 \
-            -i "$SSH_DIR/id_ed25519" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$EXPECTED_SHA" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
+          set +e
+          (
+            # 1025 filesystem blocks bound each private capture to 524800
+            # bytes.  The projector reads one byte beyond its 512 KiB input
+            # limit, so a producer that reaches this ceiling is fail-closed
+            # as truncated instead of filling the runner disk.
+            ulimit -f 1025
+            timeout --foreground 600s ssh \
+              -F "$SSH_DIR/config" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=3 \
+              -o ConnectTimeout=10 \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              bash -s -- "$EXPECTED_SHA" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
           set -Eeuo pipefail
 
           expected_sha="$1"
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           python_bin="$runtime/shared/venv/bin/python"
-          summary_tool="$current/tools/platform_storage_evidence_summary.py"
-          input_guard="$current/tools/platform_workflow_input_guard.py"
+          maintenance_tool="$current/tools/platform_storage_maintenance.py"
 
           test "$(id -u)" -eq 0 || { echo "Production diagnostics must run as root." >&2; exit 1; }
-          test -f "$input_guard" && test ! -L "$input_guard" \
-            || { echo "Workflow input guard is missing or unsafe." >&2; exit 1; }
-          /usr/bin/python3 -I "$input_guard" sha --value "$expected_sha" >/dev/null \
+          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "expected_sha is invalid." >&2; exit 1; }
           test -L "$current" || { echo "Current release symlink is missing." >&2; exit 1; }
           test -x "$python_bin" || { echo "Shared Python runtime is missing." >&2; exit 1; }
-          test -f "$summary_tool" && test ! -L "$summary_tool" \
-            || { echo "Storage evidence summary helper is missing or unsafe." >&2; exit 1; }
+          test -f "$maintenance_tool" && test ! -L "$maintenance_tool" \
+            || { echo "Storage maintenance helper is missing or unsafe." >&2; exit 1; }
+          test -f "$current/RELEASE.json" && test ! -L "$current/RELEASE.json" \
+            || { echo "active release manifest is missing." >&2; exit 1; }
 
           active_sha="$(/usr/bin/python3 -I - "$current/RELEASE.json" <<'PY'
           import json
@@ -147,8 +209,7 @@ jobs:
             lock_state=held
           fi
           exec 9>&-
-          printf 'state=%s\n' "$lock_state" \
-            | /usr/bin/python3 -I "$summary_tool" --mode lock
+          printf 'state=%s\n' "$lock_state"
 
           echo '=== filesystem_usage ==='
           emit_disk_usage() {
@@ -157,12 +218,12 @@ jobs:
             local bytes_output inode_output
             bytes_output="$(df -B1 --output=size,used,avail,pcent -- "$path" 2>/dev/null)" \
               || { echo "disk usage producer failed." >&2; exit 1; }
-            printf '%s\n' "$bytes_output" \
-              | /usr/bin/python3 -I "$summary_tool" --mode df --category "$category"
+            printf '%s\n' "--- df $category"
+            printf '%s\n' "$bytes_output"
             inode_output="$(df --output=iused,iavail,ipcent -- "$path" 2>/dev/null)" \
               || { echo "inode usage producer failed." >&2; exit 1; }
-            printf '%s\n' "$inode_output" \
-              | /usr/bin/python3 -I "$summary_tool" --mode inode --category "$category"
+            printf '%s\n' "--- inode $category"
+            printf '%s\n' "$inode_output"
           }
           emit_disk_usage root /
           emit_disk_usage tmp /tmp
@@ -173,8 +234,7 @@ jobs:
           echo '=== journal_usage ==='
           journal_usage="$(journalctl --disk-usage --no-pager 2>/dev/null)" \
             || { echo "journal usage producer failed." >&2; exit 1; }
-          printf '%s\n' "$journal_usage" \
-            | /usr/bin/python3 -I "$summary_tool" --mode journal
+          printf '%s\n' "$journal_usage"
 
           echo '=== service_sandbox ==='
           for service in deadlock-api deadlock-worker deadlock-web; do
@@ -182,8 +242,8 @@ jobs:
               --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec \
               --no-pager 2>/dev/null)" \
               || { echo "service state producer failed." >&2; exit 1; }
-            printf '%s\n' "$service_output" \
-              | /usr/bin/python3 -I "$summary_tool" --mode service --service "$service"
+            printf '%s\n' "--- service $service"
+            printf '%s\n' "$service_output"
           done
 
           echo '=== known_category_usage ==='
@@ -197,8 +257,8 @@ jobs:
             else
               size_output='0'
             fi
-            printf '%s\n' "$size_output" \
-              | /usr/bin/python3 -I "$summary_tool" --mode du --category "$category"
+            printf '%s\n' "--- category $category"
+            printf '%s\n' "$size_output"
           }
           emit_category_size source_release_artifacts "$runtime/dist/releases"
           emit_category_size browser_test_artifacts "$runtime/apps/platform_web"
@@ -209,20 +269,25 @@ jobs:
           echo '=== storage_retention_dry_run ==='
           retention_file="$(mktemp)"
           trap 'rm -f -- "$retention_file"' EXIT
-          "$python_bin" "$current/tools/platform_storage_maintenance.py" --json \
+          "$python_bin" "$maintenance_tool" --json \
             >"$retention_file" 2>/dev/null \
             || { echo "storage retention producer failed." >&2; exit 1; }
-          /usr/bin/python3 -I "$summary_tool" --mode retention <"$retention_file" \
-            || { echo "storage retention summary failed." >&2; exit 1; }
+          cat -- "$retention_file"
           REMOTE
-          then
-            echo "Production storage diagnostics collection failed." >&2
-            exit 1
+          )
+          remote_status="$?"
+          set -e
+          report_present=false
+          if [[ -f "$remote_report" && ! -L "$remote_report" && -s "$remote_report" ]]; then
+            report_present=true
           fi
-          cp "$remote_report" "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
-          chmod 600 "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
-          rm -f -- "$remote_report"
-          test ! -e "$remote_report"
+          printf '%s\n' "DIAGNOSTICS_REMOTE_STATUS=$remote_status" >> "$GITHUB_ENV"
+          printf '%s\n' "DIAGNOSTICS_REPORT_PRESENT=$report_present" >> "$GITHUB_ENV"
+          if [[ "$remote_status" = 0 && "$report_present" = true ]]; then
+            exit 0
+          fi
+          echo "Production storage diagnostics collection failed; private evidence will be projected after SSH cleanup." >&2
+          exit 1
 
       - name: Remove production SSH material
         id: cleanup_ssh
@@ -253,19 +318,164 @@ jobs:
             rmdir -- "$ssh_dir"
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
-          rm -f -- "$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
-          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
-          rm -f -- "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
-          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
 
+      - name: Sanitize storage diagnostic evidence
+        id: sanitize_evidence
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          remote_report="$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
+          ssh_error="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
+          public_artifact="$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+          ssh_dir="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh"
+          failure_tool="$RUNNER_TEMP/platform-storage-projector/platform_storage_diagnostics_sanitizer.py"
+          remote_status="${DIAGNOSTICS_REMOTE_STATUS:-}"
+          report_present="${DIAGNOSTICS_REPORT_PRESENT:-false}"
+          remote_stderr_bytes="$(wc -c <"$ssh_error" 2>/dev/null | tr -d '[:space:]' || true)"
+          if ! [[ "$remote_status" =~ ^[0-9]{1,3}$ ]] || (( remote_status > 255 )); then
+            remote_status=""
+          fi
+          if [[ "$report_present" != true && "$report_present" != false ]]; then
+            report_present=false
+          fi
+          if [[ -e "$public_artifact" || -L "$public_artifact" ]]; then
+            rm -f -- "$public_artifact"
+          fi
+          test ! -e "$public_artifact" && test ! -L "$public_artifact"
+
+          projector_status=1
+          if [[ -f "$ssh_dir/id_ed25519" || -L "$ssh_dir/id_ed25519" ]]; then
+            /usr/bin/python3 -I - "$public_artifact" "$EXPECTED_SHA" "$remote_status" "$remote_stderr_bytes" "$report_present" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          destination, expected, status, stderr_bytes, report = sys.argv[1:]
+          expected = expected if re.fullmatch(r"[0-9a-f]{40}", expected) else "unavailable"
+          try:
+              exit_code = int(status, 10)
+          except (TypeError, ValueError):
+              exit_code = None
+          if exit_code is not None and not 0 <= exit_code <= 255:
+              exit_code = None
+          try:
+              byte_count = int(stderr_bytes, 10)
+          except (TypeError, ValueError):
+              byte_count = None
+          if byte_count is not None and not 0 <= byte_count <= 1000000:
+              byte_count = None
+          payload = {
+              "schema": 1,
+              "kind": "platform_storage_diagnostics_failure",
+              "status": "failed",
+              "raw_output_included": False,
+              "expected_sha": expected,
+              "remote_exit_code": exit_code,
+              "remote_stderr_bytes": byte_count,
+              "stderr_truncated": (
+                  (byte_count is None and bool(stderr_bytes))
+                  or (byte_count is not None and byte_count > 524288)
+              ),
+              "report_present": report == "true",
+              "report_truncated": False,
+              "phase": "cleanup",
+              "reason": "ssh_cleanup_failed",
+              "action": "inspect_runner_ssh_cleanup",
+          }
+          encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(fd, "wb") as stream:
+              stream.write(encoded)
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+            projector_status=1
+          elif [[ ! -f "$failure_tool" || -L "$failure_tool" ]]; then
+            /usr/bin/python3 -I - "$public_artifact" "$EXPECTED_SHA" "$remote_status" "$remote_stderr_bytes" "$report_present" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          destination, expected, status, stderr_bytes, report = sys.argv[1:]
+          expected = expected if re.fullmatch(r"[0-9a-f]{40}", expected) else "unavailable"
+          try:
+              exit_code = int(status, 10)
+          except (TypeError, ValueError):
+              exit_code = None
+          if exit_code is not None and not 0 <= exit_code <= 255:
+              exit_code = None
+          payload = {
+              "schema": 1,
+              "kind": "platform_storage_diagnostics_failure",
+              "status": "failed",
+              "raw_output_included": False,
+              "expected_sha": expected,
+              "remote_exit_code": exit_code,
+              "remote_stderr_bytes": None,
+              "stderr_truncated": True,
+              "report_present": report == "true",
+              "report_truncated": False,
+              "phase": "capture",
+              "reason": "sanitizer_unavailable",
+              "action": "inspect_runner_evidence_projector",
+          }
+          fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(fd, "wb") as stream:
+              stream.write((json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+            projector_status=1
+          else
+            set +e
+            env -i PATH=/usr/bin:/bin /usr/bin/python3 -I "$failure_tool" \
+              --report-path "$remote_report" \
+              --stderr-path "$ssh_error" \
+              --output-path "$public_artifact" \
+              --expected-sha "$EXPECTED_SHA" \
+              --remote-exit-code "$remote_status" \
+              --remote-stderr-bytes "$remote_stderr_bytes" \
+              --report-present "$report_present"
+            projector_status="$?"
+            set -e
+          fi
+          test -f "$public_artifact" && test ! -L "$public_artifact"
+          chmod 600 "$public_artifact"
+          test "$(stat -c '%F:%h:%a' -- "$public_artifact")" = "regular file:1:600"
+          if [[ "$projector_status" -eq 0 ]]; then
+            exit 0
+          fi
+          echo "Storage diagnostics collection failed; bounded evidence was published." >&2
+          exit 1
+
       - name: Upload storage diagnostic evidence
-        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: platform-production-storage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/platform-production-storage-diagnostics-artifact.txt
           if-no-files-found: error
           retention-days: 14
+
+      - name: Remove private storage diagnostic captures
+        id: cleanup_captures
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- \
+            "$RUNNER_TEMP/platform-production-storage-diagnostics.txt" \
+            "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error" \
+            "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
+          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
+          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+          printf '%s\n' 'DIAGNOSTICS_REMOTE_STATUS=' >> "$GITHUB_ENV"
+          printf '%s\n' 'DIAGNOSTICS_REPORT_PRESENT=' >> "$GITHUB_ENV"
