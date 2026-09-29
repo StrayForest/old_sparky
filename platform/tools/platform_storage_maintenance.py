@@ -77,6 +77,7 @@ except ImportError:  # Direct execution from the tools directory.
 DEFAULT_APP_DIR = Path("/opt/oldsparky/platform")
 DEFAULT_SOURCE_RELEASE_DIR = Path("/root/old_sparky/platform/dist/releases")
 DEFAULT_WEB_ARTIFACT_DIR = Path("/root/old_sparky/platform/apps/platform_web")
+BACKUP_ONLY_KEEP = 14
 SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 SAFE_RUNTIME_ID_RE = re.compile(r"^runtime-[0-9a-f]{40}$")
 
@@ -172,6 +173,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--backup-only cannot be combined with --skip-backup")
     if args.backup_only and not args.apply:
         parser.error("--backup-only requires --apply")
+    if args.backup_only and args.backup_keep != BACKUP_ONLY_KEEP:
+        parser.error(
+            f"--backup-only requires --backup-keep {BACKUP_ONLY_KEEP}"
+        )
     if args.report_keep < 1:
         parser.error("--report-keep must be at least 1")
     if not 1 <= args.live_qa_runtime_keep <= 100:
@@ -664,8 +669,11 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
         # third; standalone live-QA retention takes first then the fourth.
         with maintenance_lock_scope(args, app_dir=app_dir) as source_release_dir:
             if getattr(args, "backup_only", False):
-                # Do not construct or apply any retention plan in this mode.
-                # A backup failure therefore exits before any deletion path.
+                # Do not construct or apply release, artifact, transient or
+                # live-QA retention plans in this mode. The backup owner may
+                # rotate only its verified archive set, bounded to 14 copies.
+                # A backup/restore failure therefore exits before rotation
+                # or any other deletion path.
                 maintenance_result = (
                     RetentionPlan((), (), ()),
                     ArtifactRetentionPlan((), (), ()),
@@ -676,7 +684,7 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                         "status": "completed",
                         **run_backup(
                             app_dir,
-                            keep=args.backup_keep,
+                            keep=BACKUP_ONLY_KEEP,
                             max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
                         ),
                     },
@@ -789,6 +797,7 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
         "limits": {
             "minimum_free_bytes": minimum_free_bytes,
             "maximum_used_percent": args.maximum_used_percent,
+            "backup_keep": args.backup_keep,
             "backup_max_age_hours": getattr(args, "backup_max_age_hours", 24.0),
             "live_qa_runtime_keep": args.live_qa_runtime_keep,
         },

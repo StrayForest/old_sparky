@@ -38,8 +38,12 @@ gh workflow run platform-production-backup.yml \
 Wait for the `Platform production backup` workflow to pass before observing
 or repeating the automatic production deployment. It invokes the same
 lock-aware backup-only mode and acquires locks in the fixed order
-release -> retained-load -> build -> live-QA. It performs no retention
-deletion, and a failed backup exits before any pruning path.
+release -> retained-load -> build -> live-QA. Backup-only does not apply
+production-release, source-artifact, transient-browser or live-QA retention.
+After the backup is restore/Alembic/checksum/freshness verified, the backup
+owner may rotate only its own archive/metadata set, bounded to 14 retained
+copies. A create or restore failure exits before rotation or any other
+pruning path.
 
 Check freshness without restoring production:
 

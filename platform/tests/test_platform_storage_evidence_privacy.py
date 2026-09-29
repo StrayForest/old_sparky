@@ -184,33 +184,5 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(report["categories"]["production_releases"]["reclaimable_bytes"], 8192)
         self.assertEqual(report["transient_reclaimable_bytes"]["failed_builds"], 1024)
 
-    def test_retention_summary_accepts_backup_only_mode(self) -> None:
-        report = summarize_retention(
-            json.dumps(
-                {
-                    "ok": True,
-                    "mode": "backup-only",
-                    "production_releases": {},
-                    "source_release_artifacts": {},
-                    "live_qa_runtime_caches": {},
-                    "transient": {},
-                    "disk_before": {},
-                    "disk_after": {},
-                    "limits": {},
-                    "backup": {
-                        "status": "completed",
-                        "restore_verified": True,
-                        "alembic_revision_verified": True,
-                        "checksum_present": True,
-                    },
-                }
-            )
-        )
-
-        self.assertEqual(report["mode"], "backup-only")
-        self.assertEqual(report["backup"]["status"], "completed")
-        self.assertTrue(report["backup"]["restore_verified"])
-
-
 if __name__ == "__main__":
     unittest.main()

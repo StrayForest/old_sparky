@@ -225,6 +225,19 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_storage_maintenance.py",
                 "--backup-only",
                 "--apply",
+                "--backup-keep",
+                "13",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                maintenance.parse_args()
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--backup-only",
+                "--apply",
                 "--skip-backup",
             ],
         ):
@@ -262,6 +275,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
 
         self.assertEqual(run.call_count, 2)
+        self.assertIn("--keep", run.call_args_list[0].args[0])
+        self.assertIn("14", run.call_args_list[0].args[0])
         self.assertIn("--check-latest", run.call_args_list[1].args[0])
         self.assertIn("24.0", run.call_args_list[1].args[0])
         self.assertTrue(result["restore_verified"])
@@ -473,12 +488,54 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertEqual(report["mode"], "backup-only")
         self.assertTrue(report["backup"]["restore_verified"])
         self.assertEqual(events, ["locks-enter", "locks-exit"])
-        run_backup.assert_called_once()
+        run_backup.assert_called_once_with(
+            app_dir,
+            keep=14,
+            max_age_hours=24.0,
+        )
         self.assertTrue(candidate.exists())
         self.assertTrue(web_candidate.exists())
         self.assertEqual(report["production_releases"]["deleted_count"], 0)
         self.assertEqual(report["source_release_artifacts"]["deleted_count"], 0)
         self.assertEqual(report["live_qa_runtime_caches"]["deleted_count"], 0)
+        self.assertEqual(report["limits"]["backup_keep"], 14)
+        self.assertEqual(report["transient"]["failed_builds"]["count"], 0)
+        self.assertEqual(report["transient"]["browser_test_artifacts"]["count"], 0)
+        self.assertEqual(report["transient"]["preprod_screenshots"]["count"], 0)
+
+    def test_backup_only_failure_does_not_prune_or_check_live_qa(self) -> None:
+        app_dir = self.root / "runtime" / "platform"
+        (app_dir / "shared").mkdir(parents=True)
+        current = self.add_runtime_release(app_dir, "release-current")
+        previous = self.add_runtime_release(app_dir, "release-previous")
+        candidate = self.add_runtime_release(app_dir, "release-old")
+        (app_dir / "current").symlink_to(current)
+        (app_dir / "previous").symlink_to(previous)
+        args = self.maintenance_args(app_dir)
+        args.skip_backup = False
+        args.backup_only = True
+
+        @maintenance.contextmanager
+        def tracked_scope(*_args: object, **_kwargs: object):
+            yield self.release_dir
+
+        with (
+            mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
+            mock.patch.object(
+                maintenance,
+                "run_backup",
+                side_effect=RuntimeError("restore verification failed"),
+            ),
+            mock.patch.object(
+                maintenance.live_qa_guard,
+                "prune_runtime_cache_release_lock_held",
+            ) as live_qa_prune,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "restore verification failed"):
+                run_maintenance(args)
+
+        live_qa_prune.assert_not_called()
+        self.assertTrue(candidate.exists())
 
     def test_disk_snapshot_uses_available_free_for_conservative_percent(self) -> None:
         snapshot = snapshot_from_usage(
@@ -630,8 +687,14 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertNotIn("platform_backup_restore_drill.py", workflow)
         self.assertNotIn("--check-latest", workflow)
         self.assertIn('report.get("mode") != "backup-only"', workflow)
+        self.assertIn('limits.get("backup_keep") != 14', workflow)
         self.assertIn('backup.get("restore_verified") is not True', workflow)
         self.assertIn('backup.get("checksum_present") is not True', workflow)
+        self.assertIn('public["mode"] = "backup-only"', workflow)
+        self.assertIn(
+            '"production_releases",\n              "source_release_artifacts",\n              "live_qa_runtime_caches"',
+            workflow,
+        )
 
         maintenance_source = (
             REPO_ROOT / "platform/tools/platform_storage_maintenance.py"

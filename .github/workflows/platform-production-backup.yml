@@ -141,6 +141,9 @@ jobs:
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           if report.get("mode") != "backup-only" or report.get("ok") is not True:
               raise SystemExit("lock-aware backup report is not successful")
+          limits = report.get("limits") or {}
+          if limits.get("backup_keep") != 14:
+              raise SystemExit("backup rotation limit is not 14")
           backup = report.get("backup") or {}
           if (
               backup.get("status") != "completed"
@@ -149,7 +152,45 @@ jobs:
               or backup.get("checksum_present") is not True
           ):
               raise SystemExit("lock-aware backup was not fully verified")
+          for section_name in (
+              "production_releases",
+              "source_release_artifacts",
+              "live_qa_runtime_caches",
+          ):
+              section = report.get(section_name) or {}
+              if (
+                  section.get("deleted_count") != 0
+                  or section.get("reclaimable_bytes", 0) != 0
+              ):
+                  raise SystemExit(f"backup-only changed {section_name}")
+          transient = report.get("transient") or {}
+          for category in (
+              "failed_builds",
+              "browser_test_artifacts",
+              "preprod_screenshots",
+          ):
+              section = transient.get(category) or {}
+              if (
+                  section.get("count") != 0
+                  or section.get("reclaimable_bytes") != 0
+              ):
+                  raise SystemExit(f"backup-only changed {category}")
           PY
+          public_report="$({
+            /usr/bin/python3 -I - "$public_report" <<'PY'
+          import json
+          import sys
+
+          public = json.loads(sys.argv[1])
+          if not isinstance(public, dict) or public.get("mode") != "unknown":
+              raise SystemExit("unexpected retention summary mode")
+          public["mode"] = "backup-only"
+          print(json.dumps(public, sort_keys=True, separators=(",", ":")))
+          PY
+          } 2>/dev/null)" || {
+            echo "Production backup public summary normalization failed" >&2
+            exit 1
+          }
           test -n "$public_report" || {
             echo "Production backup summary was unavailable" >&2
             exit 1

@@ -438,7 +438,7 @@ def summarize_retention(raw: str) -> dict[str, object]:
         "mode": (
             payload.get("mode")
             if isinstance(payload.get("mode"), str)
-            and payload.get("mode") in {"apply", "dry-run", "backup-only"}
+            and payload.get("mode") in {"apply", "dry-run"}
             else "unknown"
         ),
         "categories": categories,
