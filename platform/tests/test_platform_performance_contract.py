@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
 import cProfile
 import json
@@ -11,6 +12,8 @@ import signal
 import tempfile
 import unittest
 from unittest.mock import patch
+
+import yaml
 
 from tools.platform_external_load import (
     ExternalLoadError,
@@ -1017,95 +1020,302 @@ class PerformanceProfileContractTests(unittest.TestCase):
         observer = (root / "tools" / "platform_external_load_observer.py").read_text(
             encoding="utf-8"
         )
-        workflow = (root.parent / ".github" / "workflows" / "platform-production-external-load-trusted.yml").read_text(
-            encoding="utf-8"
-        )
+        workflow_path = root.parent / ".github" / "workflows" / "platform-production-external-load-trusted.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
+        document = yaml.safe_load(workflow)
+        self.assertIsInstance(document, dict)
+        assert isinstance(document, dict)
+        jobs = document.get("jobs")
+        self.assertIsInstance(jobs, dict)
+        assert isinstance(jobs, dict)
         self.assertIn("re.fullmatch(r\"preprod[0-9]{12}[0-9a-f]{4}\", marker)", supervisor)
         self.assertIn('--fixture-marker "$fixture_marker"', supervisor)
         self.assertIn('--external-run-id "$run_id"', supervisor)
         self.assertLess(supervisor.index('--fixture-marker "$fixture_marker"'), supervisor.index(': > "$external_vote_ready"'))
         self.assertIn("pidfd_send_signal", observer)
         self.assertNotIn("os.kill(pid, signum)", observer)
+
+        validate_job = jobs["validate-external-inputs"]
+        self.assertIsInstance(validate_job, dict)
+        assert isinstance(validate_job, dict)
+        validation_step = next(
+            (
+                step
+                for step in validate_job.get("steps", [])
+                if isinstance(step, dict)
+                and step.get("name") == "Reject invalid external-load dispatch before checkout"
+            ),
+            None,
+        )
+        self.assertIsInstance(validation_step, dict)
+        assert isinstance(validation_step, dict)
+        validation_run = validation_step.get("run")
+        self.assertIsInstance(validation_run, str)
+        assert isinstance(validation_run, str)
+        allowlist_match = re.search(
+            r'case\s+"\$PROFILE_ID"\s+in\s*\n\s*'
+            r'(?P<choices>[a-z0-9-]+(?:\|[a-z0-9-]+)*)\s*\)\s*;;',
+            validation_run,
+        )
+        self.assertIsNotNone(allowlist_match)
+        assert allowlist_match is not None
+        trusted_profile_ids = set(allowlist_match.group("choices").split("|"))
+        canonical_profile_ids = {
+            profile_id
+            for profile_id, profile in load_profiles().items()
+            if (
+                profile.get("execution", {}).get("generator")
+                == "GitHub-hosted external runner"
+                and profile.get("portfolio", {}).get("status") == "active"
+                and profile.get("portfolio", {}).get("class") in {"default", "diagnostic"}
+            )
+        }
+        self.assertEqual(trusted_profile_ids, canonical_profile_ids)
+        self.assertIn("ready-vote-saturation-ramp-v4", trusted_profile_ids)
         for deprecated in (
             "ready-vote-saturation-ramp-v1",
             "ready-vote-saturation-ramp-v2",
             "ready-vote-saturation-ramp-v3",
         ):
-            self.assertNotIn(f"          - {deprecated}", workflow)
-        self.assertIn("platform_load.py validate", workflow)
-        self.assertIn('--profile "$PROFILE_ID" --dispatchable', workflow)
+            self.assertNotIn(deprecated, trusted_profile_ids)
+
+        load_step = next(
+            (
+                step
+                for step in jobs["fixture-setup"].get("steps", [])
+                if isinstance(step, dict) and step.get("id") == "external-evaluate"
+            ),
+            None,
+        )
+        self.assertIsInstance(load_step, dict)
+        assert isinstance(load_step, dict)
+        load_run = load_step.get("run")
+        self.assertIsInstance(load_run, str)
+        assert isinstance(load_run, str)
+        self.assertIn("tools/platform_load.py run", load_run)
+        self.assertIn('--profile "$PROFILE_ID"', load_run)
+        self.assertIn('--manifest "$manifest_path"', load_run)
+
+        load_source = (root / "tools" / "platform_load.py").read_text(encoding="utf-8")
+        load_module = ast.parse(load_source, filename="platform_load.py")
+        run_profile_node = next(
+            (
+                node
+                for node in ast.walk(load_module)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "run_profile"
+            ),
+            None,
+        )
+        self.assertIsNotNone(run_profile_node)
+        assert run_profile_node is not None
+        self.assertTrue(run_profile_node.body, "run_profile must enforce dispatchability before running")
+        first_statement = run_profile_node.body[0]
+        self.assertIsInstance(first_statement, ast.Expr)
+        assert isinstance(first_statement, ast.Expr)
+        self.assertIsInstance(first_statement.value, ast.Call)
+        assert isinstance(first_statement.value, ast.Call)
+        self.assertIsInstance(first_statement.value.func, ast.Name)
+        assert isinstance(first_statement.value.func, ast.Name)
+        self.assertEqual(first_statement.value.func.id, "ensure_dispatchable")
+        self.assertEqual(len(first_statement.value.args), 1)
+        self.assertIsInstance(first_statement.value.args[0], ast.Name)
+        assert isinstance(first_statement.value.args[0], ast.Name)
+        self.assertEqual(
+            first_statement.value.args[0].id,
+            "profile",
+            "run_profile must enforce the production dispatch contract before running",
+        )
 
     def test_external_workflow_requires_and_binds_observer_before_evaluation(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root.parent / ".github" / "workflows" / "platform-production-external-load-trusted.yml").read_text(
             encoding="utf-8"
         )
-
-        def job(name: str) -> str:
-            match = re.search(
-                rf"^  {re.escape(name)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
-                workflow,
-                re.MULTILINE | re.DOTALL,
-            )
-            self.assertIsNotNone(match, name)
-            assert match is not None
-            return match.group("body")
-
-        candidate_jobs = {
-            name: job(name)
-            for name in ("validate-external-inputs", "load-client", "evaluate-load")
+        document = yaml.safe_load(workflow)
+        self.assertIsInstance(document, dict)
+        assert isinstance(document, dict)
+        jobs = document.get("jobs")
+        self.assertIsInstance(jobs, dict)
+        assert isinstance(jobs, dict)
+        expected_jobs = {
+            "validate-caller-identity",
+            "resolve-trusted-runner",
+            "validate-external-inputs",
+            "fixture-setup",
+            "load-client",
+            "fixture-finalize",
+            "evaluate-load",
         }
-        for name, body in candidate_jobs.items():
-            self.assertNotRegex(body, r"\bPROD_SSH_(?:HOST|USER|KEY)\b", name)
-            self.assertNotIn("secrets.", body, name)
-        checkout = candidate_jobs["load-client"]
-        self.assertRegex(
-            checkout,
-            re.compile(r"^[ \t]+persist-credentials:[ \t]*false[ \t]*$", re.MULTILINE),
-        )
+        self.assertEqual(set(jobs), expected_jobs)
+
+        def needs(job_id: str) -> set[str]:
+            value = jobs[job_id].get("needs")
+            if value is None:
+                return set()
+            if isinstance(value, str):
+                return {value}
+            self.assertIsInstance(value, list, job_id)
+            assert isinstance(value, list)
+            self.assertTrue(all(isinstance(item, str) for item in value), job_id)
+            return set(value)
+
+        functional_edges = {
+            "validate-external-inputs": set(),
+            "fixture-setup": {"validate-external-inputs"},
+            "load-client": {"validate-external-inputs", "fixture-setup"},
+            "fixture-finalize": {"validate-external-inputs", "fixture-setup", "load-client"},
+            "evaluate-load": {"validate-external-inputs", "fixture-setup", "load-client", "fixture-finalize"},
+        }
+        for job_id, required in functional_edges.items():
+            self.assertTrue(required.issubset(needs(job_id)), job_id)
+
+        # Every job after caller validation is trust-gated independently from
+        # the functional DAG.  This keeps the safety invariant explicit while
+        # allowing a future, reviewed helper dependency to be added.
+        identity_gated_jobs = {
+            "resolve-trusted-runner",
+            "validate-external-inputs",
+            "fixture-setup",
+            "load-client",
+            "fixture-finalize",
+            "evaluate-load",
+        }
+        for job_id in identity_gated_jobs:
+            self.assertIn("validate-caller-identity", needs(job_id), job_id)
+
+        trusted_runner_gated_jobs = {
+            "validate-external-inputs",
+            "fixture-setup",
+            "load-client",
+            "fixture-finalize",
+            "evaluate-load",
+        }
+        for job_id in trusted_runner_gated_jobs:
+            self.assertIn("resolve-trusted-runner", needs(job_id), job_id)
+
+        def job_text(job_id: str) -> str:
+            return json.dumps(jobs[job_id], sort_keys=True)
 
         expected_secret_scopes = {
-            "Validate explicit external production load": set(),
-            "Prepare external fixture with ephemeral SSH": {
-                "PROD_SSH_HOST",
-                "PROD_SSH_USER",
-                "PROD_SSH_KEY",
-            },
-            "Signal fixture completion and collect origin evidence": {
-                "PROD_SSH_HOST",
-                "PROD_SSH_USER",
-                "PROD_SSH_KEY",
-            },
-            "Run checked-out external HTTP load client": set(),
-            "Evaluate checked-out load report": set(),
-            "Exact cleanup of external fixture": {
-                "PROD_SSH_HOST",
-                "PROD_SSH_USER",
-                "PROD_SSH_KEY",
-            },
+            "validate-external-inputs": set(),
+            "fixture-setup": {"PROD_SSH_HOST", "PROD_SSH_USER", "PROD_SSH_KEY"},
+            "load-client": set(),
+            "fixture-finalize": {"PROD_SSH_HOST", "PROD_SSH_USER", "PROD_SSH_KEY"},
+            "evaluate-load": set(),
         }
-        for name, expected in expected_secret_scopes.items():
-            body = next(
-                job(job_name)
-                for job_name in ("validate-external-inputs", "fixture-setup", "load-client", "fixture-finalize", "evaluate-load")
-                if name in job(job_name)
-            )
+        for job_id, expected in expected_secret_scopes.items():
+            body = job_text(job_id)
+            if expected:
+                self.assertIn("secrets.", body, job_id)
+            else:
+                self.assertNotIn("secrets.", body, job_id)
             actual = set(re.findall(r"\bPROD_SSH_(?:HOST|USER|KEY)\b", body))
-            self.assertEqual(actual, expected, name)
+            self.assertEqual(actual, expected, job_id)
 
-        finalizer = job("fixture-finalize")
-        evaluator = job("evaluate-load")
-        self.assertIn("if: ${{ always()", finalizer)
-        self.assertIn("if: ${{ always()", evaluator)
-        self.assertIn("observer", finalizer)
-        self.assertIn("server-observability.json", finalizer)
-        self.assertIn("server-observability.json", evaluator)
-        self.assertIn('needs.fixture-finalize.outputs.observer_ready', evaluator)
-        self.assertIn('needs.fixture-finalize.outputs.cleanup_status', evaluator)
-        self.assertLess(
-            workflow.index("Download fixed origin evidence"),
-            workflow.index("platform/tools/platform_load.py evaluate"),
+        load_client_checkout = next(
+            step
+            for step in jobs["load-client"].get("steps", [])
+            if isinstance(step, dict) and step.get("uses", "").startswith("actions/checkout@")
         )
+        self.assertIsInstance(load_client_checkout.get("with"), dict)
+        assert isinstance(load_client_checkout.get("with"), dict)
+        self.assertIs(load_client_checkout["with"].get("persist-credentials"), False)
+
+        finalizer = jobs["fixture-finalize"]
+        evaluator = jobs["evaluate-load"]
+        self.assertIn("always()", str(finalizer.get("if")))
+        self.assertIn("always()", str(evaluator.get("if")))
+        finalizer_outputs = finalizer.get("outputs")
+        self.assertIsInstance(finalizer_outputs, dict)
+        assert isinstance(finalizer_outputs, dict)
+        self.assertEqual(
+            finalizer_outputs.get("observer_ready"),
+            "${{ steps.external-finalize.outputs.observer_ready }}",
+        )
+        self.assertEqual(
+            finalizer_outputs.get("cleanup_status"),
+            "${{ steps.cleanup.outputs.cleanup_status }}",
+        )
+        self.assertEqual(
+            finalizer_outputs.get("origin_artifact_id"),
+            "${{ steps.publish-origin.outputs.artifact-id }}",
+        )
+
+        finalizer_steps = finalizer.get("steps")
+        evaluator_steps = evaluator.get("steps")
+        self.assertIsInstance(finalizer_steps, list)
+        self.assertIsInstance(evaluator_steps, list)
+        assert isinstance(finalizer_steps, list)
+        assert isinstance(evaluator_steps, list)
+        external_finalize = next(
+            step
+            for step in finalizer_steps
+            if isinstance(step, dict) and step.get("id") == "external-finalize"
+        )
+        self.assertIn("observer_ready=1", external_finalize.get("run", ""))
+        self.assertIn("supervisor.exit", external_finalize.get("run", ""))
+        self.assertIn("matrix-summary.json", external_finalize.get("run", ""))
+        self.assertIn("server-observability.json", external_finalize.get("run", ""))
+        cleanup_step = next(
+            step
+            for step in finalizer_steps
+            if isinstance(step, dict) and step.get("id") == "cleanup"
+        )
+        cleanup_text = json.dumps(cleanup_step, sort_keys=True)
+        self.assertEqual(
+            set(re.findall(r"\bPROD_SSH_(?:HOST|USER|KEY)\b", cleanup_text)),
+            {"PROD_SSH_HOST", "PROD_SSH_USER"},
+        )
+
+        evaluator_step_index = next(
+            index
+            for index, step in enumerate(evaluator_steps)
+            if isinstance(step, dict) and step.get("id") == "evaluate-load"
+        )
+        evidence_step_index = next(
+            index
+            for index, step in enumerate(evaluator_steps)
+            if isinstance(step, dict) and step.get("name") == "Download fixed origin evidence"
+        )
+        artifact_step_index = next(
+            index
+            for index, step in enumerate(evaluator_steps)
+            if isinstance(step, dict) and step.get("id") == "verify-evaluator-artifacts"
+        )
+        self.assertLess(evidence_step_index, evaluator_step_index)
+        self.assertLess(artifact_step_index, evaluator_step_index)
+        evaluate_step = evaluator_steps[evaluator_step_index]
+        evaluate_run = evaluate_step.get("run", "")
+        self.assertIn("needs.fixture-finalize.outputs.observer_ready", evaluate_run)
+        self.assertIn("needs.fixture-finalize.outputs.cleanup_status", evaluate_run)
+        self.assertIn("needs.fixture-finalize.outputs.cleanup_exports_status", evaluate_run)
+        self.assertIn("needs.fixture-finalize.outputs.ssh_cleanup_status", evaluate_run)
+        self.assertIn("needs.fixture-setup.outputs.credential_cleanup_status", evaluate_run)
+        self.assertIn("server-observability.json", evaluate_run)
+        self.assertIn("tools/platform_load.py evaluate", evaluate_run)
+        for artifact_status in (
+            "candidate_artifact_status",
+            "origin_artifact_status",
+            "input_artifact_status",
+        ):
+            self.assertIn(artifact_status, evaluate_run)
+
+        publish_step = next(
+            step
+            for step in evaluator_steps
+            if isinstance(step, dict) and step.get("name") == "Publish external load evidence"
+        )
+        publish_if = str(publish_step.get("if"))
+        for gate in (
+            "needs.fixture-finalize.outputs.observer_ready",
+            "needs.fixture-finalize.outputs.cleanup_status",
+            "needs.fixture-finalize.outputs.ssh_cleanup_status",
+            "steps.verify-evaluator-artifacts.outputs.candidate_artifact_status",
+            "steps.verify-evaluator-artifacts.outputs.origin_artifact_status",
+            "steps.verify-evaluator-artifacts.outputs.input_artifact_status",
+        ):
+            self.assertIn(gate, publish_if)
 
     def test_retained_historical_class_cannot_become_runnable(self) -> None:
         profile = deepcopy(next(iter(load_profiles().values())))
