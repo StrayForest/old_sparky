@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -29,6 +27,8 @@ from tools.platform_storage_diagnostics_sanitizer import (
     project_public_artifact,
 )
 
+from tests.platform_storage_evidence_fixtures import valid_storage_report
+
 
 FORBIDDEN_VALUES = (
     "operator@example.test",
@@ -48,116 +48,6 @@ FORBIDDEN_VALUES = (
 
 def serialized(value: object) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True)
-
-
-def valid_storage_report() -> bytes:
-    lines = [
-        '{"schema":1,"kind":"platform_storage_diagnostics",'
-        '"active_release_id":"release-1",'
-        '"active_source_sha":"' + "a" * 40 + '"}',
-        "=== retained_load_lock ===",
-        "state=unlocked",
-        "=== filesystem_usage ===",
-    ]
-    for category in ("root", "tmp", "var_tmp", "platform_runtime", "logs"):
-        lines.extend(
-            (
-                f"--- df {category}",
-                "Filesystem 1024-blocks Used Available Capacity Mounted on",
-                "1000 400 600 40% /private/path",
-                f"--- inode {category}",
-                "Inodes IUsed IFree IUse% Mounted on",
-                "1000 400 40%",
-            )
-        )
-    lines.extend(("=== journal_usage ===", "Archived and active journals take up 32.0M in the file system."))
-    lines.append("=== service_sandbox ===")
-    for service in ("deadlock-api", "deadlock-worker", "deadlock-web"):
-        lines.extend(
-            (
-                f"--- service {service}",
-                "ActiveState=active",
-                "SubState=running",
-                "Result=success",
-                "ExecMainCode=exited",
-                "ExecMainStatus=0",
-                "NRestarts=0",
-                "MemoryCurrent=1",
-                "MemoryPeak=1",
-                "MemoryMax=infinity",
-                "TasksCurrent=1",
-                "TasksMax=infinity",
-                "CPUUsageNSec=1",
-            )
-        )
-    lines.append("=== known_category_usage ===")
-    for category in (
-        "source_release_artifacts",
-        "browser_test_artifacts",
-        "preprod_screenshots",
-        "live_qa_runtime",
-        "backups",
-    ):
-        lines.extend((f"--- category {category}", "42 /private/path"))
-    lines.extend(
-        (
-            "=== storage_retention_dry_run ===",
-            json.dumps(
-                {
-                    "ok": True,
-                    "mode": "dry-run",
-                    "production_releases": {
-                        "protected": [],
-                        "retained": [],
-                        "deleted": [],
-                        "protected_count": 0,
-                        "retained_count": 0,
-                        "deleted_count": 0,
-                        "reclaimable_bytes": 0,
-                    },
-                    "source_release_artifacts": {
-                        "protected": [],
-                        "retained": [],
-                        "deleted": [],
-                        "protected_count": 0,
-                        "retained_count": 0,
-                        "deleted_count": 0,
-                        "reclaimable_bytes": 0,
-                    },
-                    "live_qa_runtime_caches": {
-                        "protected": [],
-                        "retained": [],
-                        "deleted": [],
-                        "reclaimed_tombstones": [],
-                        "protected_count": 0,
-                        "retained_count": 0,
-                        "deleted_count": 0,
-                        "reclaimed_tombstone_count": 0,
-                    },
-                    "transient": {
-                        "failed_builds": {"count": 0, "reclaimable_bytes": 0},
-                        "browser_test_artifacts": {"count": 0, "reclaimable_bytes": 0},
-                        "preprod_screenshots": {"count": 0, "reclaimable_bytes": 0},
-                        "reclaimable_bytes": {
-                            "failed_builds": 0,
-                            "browser_test_artifacts": 0,
-                            "preprod_screenshots": 0,
-                        },
-                    },
-                    "duration_seconds": 0.1,
-                    "limits": {
-                        "minimum_free_bytes": 1,
-                        "maximum_used_percent": 90,
-                    },
-                    "disk_before": {"free_bytes": 2, "used_percent": 10},
-                    "disk_after": {"free_bytes": 2, "used_percent": 10},
-                    "backup": {"status": "skipped"},
-                },
-                separators=(",", ":"),
-            ),
-        )
-    )
-    return ("\n".join(lines) + "\n").encode()
 
 
 class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
@@ -528,114 +418,6 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertTrue(report["backup"]["checksum_present"])
         self.assertEqual(report["categories"]["production_releases"]["reclaimable_bytes"], 8192)
         self.assertEqual(report["transient_reclaimable_bytes"]["failed_builds"], 1024)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            app_dir = root / "app"
-            releases_dir = app_dir / "releases"
-            current = releases_dir / "release-current"
-            previous = releases_dir / "release-previous"
-            current.mkdir(parents=True)
-            previous.mkdir()
-            (app_dir / "shared" / "preprod-screenshots").mkdir(parents=True)
-            source_dir = root / "dist" / "releases"
-            source_dir.mkdir(parents=True)
-            web_dir = root / "web"
-            web_dir.mkdir()
-            live_qa_root = root / "live-qa"
-            live_qa_root.mkdir()
-            (current / "RELEASE.json").write_text(
-                json.dumps({"source_git_commit": "a" * 40}) + "\n",
-                encoding="utf-8",
-            )
-            (previous / "RELEASE.json").write_text(
-                json.dumps({"source_git_commit": "b" * 40}) + "\n",
-                encoding="utf-8",
-            )
-            (app_dir / "current").symlink_to(current)
-            (app_dir / "previous").symlink_to(previous)
-
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(
-                        Path(__file__).resolve().parents[1]
-                        / "tools"
-                        / "platform_storage_maintenance.py"
-                    ),
-                    "--app-dir",
-                    str(app_dir),
-                    "--source-release-dir",
-                    str(source_dir),
-                    "--web-artifact-dir",
-                    str(web_dir),
-                    "--live-qa-runtime-root",
-                    str(live_qa_root),
-                    "--skip-backup",
-                    "--minimum-free-gib",
-                    "0",
-                    "--maximum-used-percent",
-                    "100",
-                    "--json",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            raw_report = json.loads(completed.stdout)
-            self.assertEqual(
-                set(raw_report["live_qa_runtime_caches"]),
-                {
-                    "protected",
-                    "retained",
-                    "deleted",
-                    "reclaimed_tombstones",
-                    "protected_count",
-                    "retained_count",
-                    "deleted_count",
-                    "reclaimed_tombstone_count",
-                },
-            )
-            projected = summarize_retention(completed.stdout)
-            self.assertEqual(
-                projected["categories"]["live_qa_runtime"],
-                {
-                    "protected_count": 0,
-                    "retained_count": 0,
-                    "deleted_count": 0,
-                    "reclaimed_tombstone_count": 0,
-                },
-            )
-            self.assertNotIn(
-                "reclaimable_bytes",
-                projected["categories"]["live_qa_runtime"],
-            )
-
-            # Exercise the real maintenance producer through the same report
-            # framing and closed artifact validator used by the workflow.
-            report_path = root / "producer-report"
-            stderr_path = root / "producer-stderr"
-            producer_report = valid_storage_report().split(
-                b"=== storage_retention_dry_run ===\n", 1
-            )[0] + b"=== storage_retention_dry_run ===\n" + completed.stdout.encode()
-            report_path.write_bytes(producer_report)
-            stderr_path.write_bytes(b"")
-            artifact = project_public_artifact(
-                expected_sha="a" * 40,
-                remote_exit_code=0,
-                remote_stderr_bytes=0,
-                report_path=report_path,
-                stderr_path=stderr_path,
-                report_present=True,
-            )
-            self.assertEqual(artifact["status"], "passed")
-            self.assertTrue(diagnostics_contract.validate_artifact(artifact))
-            self.assertEqual(
-                artifact["sections"]["retention"]["categories"]["live_qa_runtime"],
-                projected["categories"]["live_qa_runtime"],
-            )
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -14,8 +14,12 @@ import unittest
 from unittest import mock
 
 from tests import platform_test_lock_support as lock_support
+from tests.platform_storage_evidence_fixtures import valid_storage_report
 from tools import platform_storage_maintenance as maintenance
 from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
+from tools.platform_storage_diagnostics_contract import validate_artifact
+from tools.platform_storage_diagnostics_sanitizer import project_public_artifact
+from tools.platform_storage_evidence_summary import summarize_retention
 from tools.platform_storage_maintenance import (
     apply_artifact_retention_plan,
     build_artifact_retention_plan,
@@ -82,6 +86,128 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             skip_backup=True,
             apply=True,
             backup_only=False,
+        )
+
+    def test_real_retention_producer_matches_closed_storage_artifact(self) -> None:
+        """Run the producer in the root-owned contour before projecting it."""
+
+        self.assertEqual(os.geteuid(), 0)
+        root = self.root / "producer-fixture"
+        app_dir = root / "app"
+        releases_dir = app_dir / "releases"
+        current = releases_dir / "release-current"
+        previous = releases_dir / "release-previous"
+        current.mkdir(parents=True)
+        previous.mkdir()
+        (app_dir / "shared" / "preprod-screenshots").mkdir(parents=True)
+        source_dir = root / "dist" / "releases"
+        source_dir.mkdir(parents=True)
+        web_dir = root / "web"
+        web_dir.mkdir()
+        live_qa_root = root / "live-qa"
+        live_qa_root.mkdir()
+        (current / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": "a" * 40}) + "\n",
+            encoding="utf-8",
+        )
+        (previous / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": "b" * 40}) + "\n",
+            encoding="utf-8",
+        )
+        (app_dir / "current").symlink_to(current)
+        (app_dir / "previous").symlink_to(previous)
+
+        fixture_paths = (
+            root,
+            app_dir,
+            releases_dir,
+            current,
+            previous,
+            source_dir,
+            web_dir,
+            live_qa_root,
+        )
+        for path in fixture_paths:
+            self.assertEqual(path.lstat().st_uid, 0, path)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "platform/tools/platform_storage_maintenance.py"),
+                "--app-dir",
+                str(app_dir),
+                "--source-release-dir",
+                str(source_dir),
+                "--web-artifact-dir",
+                str(web_dir),
+                "--live-qa-runtime-root",
+                str(live_qa_root),
+                "--skip-backup",
+                "--minimum-free-gib",
+                "0",
+                "--maximum-used-percent",
+                "100",
+                "--json",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        raw_report = json.loads(completed.stdout)
+        self.assertEqual(
+            set(raw_report["live_qa_runtime_caches"]),
+            {
+                "protected",
+                "retained",
+                "deleted",
+                "reclaimed_tombstones",
+                "protected_count",
+                "retained_count",
+                "deleted_count",
+                "reclaimed_tombstone_count",
+            },
+        )
+        projected = summarize_retention(completed.stdout)
+        self.assertEqual(
+            projected["categories"]["live_qa_runtime"],
+            {
+                "protected_count": 0,
+                "retained_count": 0,
+                "deleted_count": 0,
+                "reclaimed_tombstone_count": 0,
+            },
+        )
+        self.assertNotIn(
+            "reclaimable_bytes",
+            projected["categories"]["live_qa_runtime"],
+        )
+
+        report_path = root / "producer-report"
+        stderr_path = root / "producer-stderr"
+        producer_report = (
+            valid_storage_report().split(
+                b"=== storage_retention_dry_run ===\n", 1
+            )[0]
+            + b"=== storage_retention_dry_run ===\n"
+            + completed.stdout.encode()
+        )
+        report_path.write_bytes(producer_report)
+        stderr_path.write_bytes(b"")
+        artifact = project_public_artifact(
+            expected_sha="a" * 40,
+            remote_exit_code=0,
+            remote_stderr_bytes=0,
+            report_path=report_path,
+            stderr_path=stderr_path,
+            report_present=True,
+        )
+        self.assertEqual(artifact["status"], "passed")
+        self.assertTrue(validate_artifact(artifact))
+        self.assertEqual(
+            artifact["sections"]["retention"]["categories"]["live_qa_runtime"],
+            projected["categories"]["live_qa_runtime"],
         )
 
     def test_artifact_plan_keeps_five_and_protects_rollback(self) -> None:
