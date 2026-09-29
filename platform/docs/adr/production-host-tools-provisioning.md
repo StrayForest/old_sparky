@@ -13,7 +13,7 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
 is the only source for `HOST_TOOLS_SHA`; it currently pins the reviewed
-generation `b3dfba63d85f1d3ba73262fc2ac59f2dd11af90d`. The pin records the
+generation `8202482d3d9bf9170124d56307be8801598a35e9`. The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
 ancestor of the reviewed application target. There is no `current` or
