@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from typing import Any
@@ -68,6 +69,13 @@ SERVICE_PROPERTY_KEYS = (
     "TasksMax",
     "CPUUsageNSec",
 )
+SERVICE_NUMERIC_KEYS = frozenset(
+    set(SERVICE_PROPERTY_KEYS)
+    - {"ActiveState", "SubState", "Result", "ExecMainCode"}
+)
+# systemd reports these limits as the literal value ``infinity``.  Preserve
+# that one documented enum; every other numeric field remains numeric only.
+SERVICE_INFINITY_KEYS = frozenset({"MemoryMax", "TasksMax"})
 _ENUMS = {
     "ActiveState": frozenset(
         {"active", "inactive", "failed", "activating", "deactivating", "reloading"}
@@ -107,6 +115,8 @@ def _read_input() -> str:
 def _safe_int(value: Any, *, maximum: int = 10**18) -> int | None:
     if isinstance(value, bool):
         return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     try:
         number = int(value)
     except (TypeError, ValueError, OverflowError):
@@ -121,7 +131,7 @@ def _safe_percent(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    return number if 0 <= number <= 100 else None
+    return number if math.isfinite(number) and 0 <= number <= 100 else None
 
 
 def _fixed_category(value: str) -> str:
@@ -219,7 +229,10 @@ def summarize_journal(raw: str) -> dict[str, object]:
         raise EvidenceInputError("journal usage producer returned no size")
     amount, unit = matches[-1]
     multiplier = _UNIT_MULTIPLIERS[unit.lower()]
-    size = int(float(amount) * multiplier)
+    numeric_amount = float(amount)
+    if not math.isfinite(numeric_amount):
+        raise EvidenceInputError("journal usage is not finite")
+    size = int(numeric_amount * multiplier)
     if size < 0 or size > 10**18:
         raise EvidenceInputError("journal usage is outside the safe range")
     return {
@@ -234,6 +247,8 @@ def _safe_service_value(key: str, value: str) -> object:
     if key in _ENUMS:
         normalized = value.strip().lower()
         return normalized if normalized in _ENUMS[key] else "unknown"
+    if key in SERVICE_INFINITY_KEYS and value.strip().lower() == "infinity":
+        return "infinity"
     number = _safe_int(value.strip())
     return number
 
@@ -243,10 +258,14 @@ def summarize_service(raw: str, *, service: str) -> dict[str, object]:
         raise EvidenceInputError("service is not allowlisted")
     values: dict[str, object] = {key: None for key in SERVICE_PROPERTY_KEYS}
     recognized = 0
+    seen: set[str] = set()
     for line in raw.splitlines()[:MAX_LINES]:
         key, separator, value = line.partition("=")
         if not separator or key not in values:
             continue
+        if key in seen:
+            raise EvidenceInputError("service producer returned duplicate fields")
+        seen.add(key)
         values[key] = _safe_service_value(key, value)
         recognized += 1
     result = str(values["Result"] or "unknown")
@@ -310,6 +329,7 @@ def summarize_backup(raw: str, *, phase: str) -> dict[str, object]:
     if (
         not isinstance(duration_seconds, (int, float))
         or isinstance(duration_seconds, bool)
+        or not math.isfinite(float(duration_seconds))
         or duration_seconds < 0
         or duration_seconds > 10**9
     ):
@@ -318,6 +338,7 @@ def summarize_backup(raw: str, *, phase: str) -> dict[str, object]:
     if (
         not isinstance(age_hours, (int, float))
         or isinstance(age_hours, bool)
+        or not math.isfinite(float(age_hours))
         or age_hours < 0
         or age_hours > 10**6
     ):
@@ -344,10 +365,10 @@ def summarize_backup(raw: str, *, phase: str) -> dict[str, object]:
 def _section_summary(section: Any) -> dict[str, object]:
     if not isinstance(section, dict):
         section = {}
-    def count(name: str) -> int:
+    def count(name: str) -> int | None:
         value = section.get(name)
-        return len(value) if isinstance(value, list) else 0
-    reclaimable = _safe_int(section.get("reclaimable_bytes"), maximum=10**18) or 0
+        return len(value) if isinstance(value, list) else None
+    reclaimable = _safe_int(section.get("reclaimable_bytes"), maximum=10**18)
     return {
         "protected_count": count("protected"),
         "retained_count": count("retained"),
@@ -371,8 +392,8 @@ def summarize_retention(raw: str) -> dict[str, object]:
         "live_qa_runtime": _section_summary(payload.get("live_qa_runtime_caches")),
     }
     transient = payload.get("transient")
-    transient_bytes: dict[str, int] = {}
-    transient_summary: dict[str, dict[str, int]] = {}
+    transient_bytes: dict[str, int | None] = {}
+    transient_summary: dict[str, dict[str, int | None]] = {}
     if isinstance(transient, dict):
         raw_bytes = transient.get("reclaimable_bytes")
         if isinstance(raw_bytes, dict):
@@ -381,7 +402,7 @@ def summarize_retention(raw: str) -> dict[str, object]:
                 "browser_test_artifacts",
                 "preprod_screenshots",
             ):
-                transient_bytes[category] = _safe_int(raw_bytes.get(category)) or 0
+                transient_bytes[category] = _safe_int(raw_bytes.get(category))
         for category in (
             "failed_builds",
             "browser_test_artifacts",
@@ -391,8 +412,8 @@ def summarize_retention(raw: str) -> dict[str, object]:
             if not isinstance(section, dict):
                 section = {}
             transient_summary[category] = {
-                "count": _safe_int(section.get("count")) or 0,
-                "reclaimable_bytes": transient_bytes.get(category, 0),
+                "count": _safe_int(section.get("count")),
+                "reclaimable_bytes": transient_bytes.get(category),
             }
     disk_after = payload.get("disk_after")
     if not isinstance(disk_after, dict):
@@ -409,6 +430,7 @@ def summarize_retention(raw: str) -> dict[str, object]:
     if (
         not isinstance(duration_seconds, (int, float))
         or isinstance(duration_seconds, bool)
+        or not math.isfinite(float(duration_seconds))
         or duration_seconds < 0
         or duration_seconds > 10**9
     ):
@@ -426,6 +448,7 @@ def summarize_retention(raw: str) -> dict[str, object]:
     if (
         not isinstance(backup_duration_seconds, (int, float))
         or isinstance(backup_duration_seconds, bool)
+        or not math.isfinite(float(backup_duration_seconds))
         or backup_duration_seconds < 0
         or backup_duration_seconds > 10**9
     ):
@@ -524,7 +547,15 @@ def main(argv: list[str] | None = None) -> int:
         # a public diagnostic, even when this helper is called directly.
         print("storage evidence unavailable: internal", file=sys.stderr)
         return 2
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    print(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
     return 0
 
 

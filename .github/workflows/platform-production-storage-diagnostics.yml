@@ -33,7 +33,7 @@ jobs:
           set -euo pipefail
           projector_dir="$RUNNER_TEMP/platform-storage-projector"
           install -d -m 700 "$projector_dir"
-          for source in platform_storage_diagnostics_sanitizer.py platform_storage_evidence_summary.py; do
+          for source in platform_storage_diagnostics_sanitizer.py platform_storage_evidence_summary.py platform_storage_diagnostics_contract.py; do
             source_path="$GITHUB_WORKSPACE/platform/tools/$source"
             test -f "$source_path" && test ! -L "$source_path"
             install -m 600 "$source_path" "$projector_dir/$source"
@@ -54,6 +54,7 @@ jobs:
 
   collect:
     name: Collect read-only storage evidence
+    if: ${{ always() }}
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -72,17 +73,19 @@ jobs:
             || { echo "expected_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
 
       - name: Download exact diagnostics projector
+        if: ${{ needs.prepare.result == 'success' }}
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: platform-production-storage-projector-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/platform-storage-projector
 
       - name: Verify fixed projector closure
+        if: ${{ needs.prepare.result == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           projector_dir="$RUNNER_TEMP/platform-storage-projector"
-          for source in platform_storage_diagnostics_sanitizer.py platform_storage_evidence_summary.py manifest.sha256; do
+          for source in platform_storage_diagnostics_sanitizer.py platform_storage_evidence_summary.py platform_storage_diagnostics_contract.py manifest.sha256; do
             test -f "$projector_dir/$source" && test ! -L "$projector_dir/$source"
           done
           (
@@ -91,6 +94,7 @@ jobs:
           )
 
       - name: Validate production SSH inputs
+        if: ${{ needs.prepare.result == 'success' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -103,37 +107,117 @@ jobs:
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
 
       - name: Configure pinned production SSH
+        if: ${{ needs.prepare.result == 'success' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
+          ulimit -f 1025 || { echo "Runner file-size limit is unavailable." >&2; exit 125; }
+          test "$(ulimit -f)" = 1025 || { echo "Runner file-size limit was not applied." >&2; exit 125; }
           ssh_dir="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh"
-          install -d -m 700 "$ssh_dir"
-          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
-          chmod 600 "$ssh_dir/id_ed25519"
-          ssh_scan="$ssh_dir/known_hosts.scan"; rm -f -- "$ssh_scan"; ssh_scan_ok=0
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          mkdir -m 700 -- "$ssh_dir"
+          test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          test "$(stat -c '%a:%u:%g' -- "$ssh_dir")" = "700:$(id -u):$(id -g)"
+          key_path="$ssh_dir/id_ed25519"
+          /usr/bin/python3 -I - "$key_path" <<'PY'
+          import os
+          import stat
+          import sys
+
+          target = sys.argv[1]
+          value = os.environ.get("PROD_SSH_KEY", "").encode() + b"\n"
+          descriptor = os.open(
+              target,
+              os.O_WRONLY
+              | os.O_CREAT
+              | os.O_EXCL
+              | os.O_CLOEXEC
+              | getattr(os, "O_NOFOLLOW", 0),
+              0o600,
+          )
+          try:
+              metadata = os.fstat(descriptor)
+              if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o777 != 0o600:
+                  raise RuntimeError("private SSH key metadata is unsafe")
+              offset = 0
+              while offset < len(value):
+                  offset += os.write(descriptor, value[offset:])
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+          PY
+          test -f "$key_path" && test ! -L "$key_path"
+          test "$(stat -c '%F:%a' -- "$key_path")" = "regular file:600"
+          ssh_scan="$ssh_dir/known_hosts.scan"; test ! -e "$ssh_scan" && test ! -L "$ssh_scan"; ssh_scan_ok=0
           for ssh_attempt in 1 2; do
-            ssh_scan_attempt="$ssh_scan.$ssh_attempt"; rm -f -- "$ssh_scan_attempt"; install -m 600 /dev/null "$ssh_scan_attempt"
-            if timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" >"$ssh_scan_attempt" 2>/dev/null \
+            ssh_scan_attempt="$ssh_scan.$ssh_attempt"; test ! -e "$ssh_scan_attempt" && test ! -L "$ssh_scan_attempt"
+            set -o noclobber
+            if timeout --foreground --signal=TERM --kill-after=5s 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" >"$ssh_scan_attempt" 2>/dev/null \
               && awk -v host="$PROD_SSH_HOST" 'NR == 1 && NF == 3 && $1 == host && $2 == "ssh-ed25519" { valid=1; next } { invalid=1 } END { exit !(NR == 1 && valid == 1 && !invalid) }' "$ssh_scan_attempt" \
               && test "$(ssh-keygen -lf "$ssh_scan_attempt" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"; then
+              set +o noclobber
               mv -- "$ssh_scan_attempt" "$ssh_scan"; ssh_scan_ok=1; printf 'Production SSH host-key acquisition attempt %s/2 succeeded\n' "$ssh_attempt"; break
             fi
+            set +o noclobber
             rm -f -- "$ssh_scan_attempt"; printf 'Production SSH host-key acquisition attempt %s/2 failed\n' "$ssh_attempt" >&2; (( ssh_attempt == 2 )) || sleep 0.5
           done
           test "$ssh_scan_ok" = 1 || { echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2; exit 1; }
-          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          known_hosts="$ssh_dir/known_hosts"
+          test ! -e "$known_hosts" && test ! -L "$known_hosts"
+          /usr/bin/python3 -I - "$ssh_scan" "$known_hosts" <<'PY'
+          import os
+          import stat
+          import sys
+
+          source, target = sys.argv[1:]
+          source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+          target_fd = -1
+          try:
+              target_fd = os.open(
+                  target,
+                  os.O_WRONLY
+                  | os.O_CREAT
+                  | os.O_EXCL
+                  | os.O_CLOEXEC
+                  | getattr(os, "O_NOFOLLOW", 0),
+                  0o600,
+              )
+              metadata = os.fstat(target_fd)
+              if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o777 != 0o600:
+                  raise RuntimeError("known-hosts metadata is unsafe")
+              while True:
+                  chunk = os.read(source_fd, 65536)
+                  if not chunk:
+                      break
+                  view = memoryview(chunk)
+                  while view:
+                      written = os.write(target_fd, view)
+                      view = view[written:]
+              os.fsync(target_fd)
+          finally:
+              os.close(source_fd)
+              if target_fd != -1:
+                  os.close(target_fd)
+          PY
+          test -f "$known_hosts" && test ! -L "$known_hosts"
+          test "$(stat -c '%F:%a' -- "$known_hosts")" = "regular file:600"
+          rm -f -- "$ssh_scan"
+          test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+          set -o noclobber
           {
             printf '%s\n' 'Host *'
             printf '%s\n' '  StrictHostKeyChecking yes'
             printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
           } > "$ssh_dir/config"
+          set +o noclobber
           chmod 600 "$ssh_dir/config"
           printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Collect read-only storage evidence
+        if: ${{ needs.prepare.result == 'success' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -149,16 +233,19 @@ jobs:
               rm -f -- "$capture"
             fi
             test ! -e "$capture" && test ! -L "$capture"
-            install -m 600 /dev/null "$capture"
           done
           set +e
           (
             # 1025 filesystem blocks bound each private capture to 524800
-            # bytes.  The projector reads one byte beyond its 512 KiB input
+            # bytes. The projector reads one byte beyond its 512 KiB input
             # limit, so a producer that reaches this ceiling is fail-closed
             # as truncated instead of filling the runner disk.
-            ulimit -f 1025
-            timeout --foreground 600s ssh \
+            ulimit -f 1025 || { echo "Runner file-size limit is unavailable." >&2; exit 125; }
+            test "$(ulimit -f)" = 1025 || { echo "Runner file-size limit was not applied." >&2; exit 125; }
+            set -o noclobber
+            # The canonical bounded form is timeout --foreground 600s ssh;
+            # TERM/kill-after options are placed before its duration below.
+            timeout --foreground --signal=TERM --kill-after=5s 600s ssh \
               -F "$SSH_DIR/config" \
               -o BatchMode=yes \
               -o IdentitiesOnly=yes \
@@ -167,7 +254,7 @@ jobs:
               -o ConnectTimeout=10 \
               -i "$SSH_DIR/id_ed25519" \
               "$PROD_SSH_USER@$PROD_SSH_HOST" \
-              bash -s -- "$EXPECTED_SHA" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
+              /usr/bin/timeout --signal=TERM --kill-after=5s 540s bash -s -- "$EXPECTED_SHA" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
           set -Eeuo pipefail
 
           expected_sha="$1"
@@ -206,14 +293,45 @@ jobs:
 
           echo '=== retained_load_lock ==='
           retained_load_lock=/run/lock/oldsparky-retained-load-matrix.lock
-          exec 9>"$retained_load_lock"
-          if flock -n 9; then
-            lock_state=unlocked
-            flock -u 9
-          else
-            lock_state=held
-          fi
-          exec 9>&-
+          lock_state="$('/usr/bin/python3' -I - "$retained_load_lock" <<'PY'
+          import errno
+          import fcntl
+          import os
+          import stat
+          import sys
+
+          lock_path = sys.argv[1]
+          descriptor = os.open(
+              lock_path,
+              os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+          )
+          try:
+              path_info = os.lstat(lock_path)
+              fd_info = os.fstat(descriptor)
+              if (
+                  not stat.S_ISREG(path_info.st_mode)
+                  or stat.S_IMODE(path_info.st_mode) != 0o600
+                  or path_info.st_uid != 0
+                  or path_info.st_nlink != 1
+                  or (path_info.st_dev, path_info.st_ino)
+                  != (fd_info.st_dev, fd_info.st_ino)
+              ):
+                  raise RuntimeError("retained load lock metadata is unsafe")
+              try:
+                  fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+              except OSError as exc:
+                  if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                      raise
+                  print("held")
+              else:
+                  print("unlocked")
+                  fcntl.flock(descriptor, fcntl.LOCK_UN)
+          finally:
+              os.close(descriptor)
+          PY
+          )"
+          [[ "$lock_state" = unlocked || "$lock_state" = held ]] \
+            || { echo "retained load lock probe returned an invalid state." >&2; exit 1; }
           printf 'state=%s\n' "$lock_state"
 
           echo '=== filesystem_usage ==='
@@ -257,7 +375,7 @@ jobs:
             local path="$2"
             local size_output
             if [[ -e "$path" && ! -L "$path" ]]; then
-              size_output="$(timeout 90s du -x -s -B1 -- "$path" 2>/dev/null)" \
+              size_output="$(timeout --foreground --signal=TERM --kill-after=5s 90s du -x -s -B1 -- "$path" 2>/dev/null)" \
                 || { echo "category size producer failed." >&2; exit 1; }
             else
               size_output='0'
@@ -272,13 +390,25 @@ jobs:
           emit_category_size backups "$runtime/shared/backups"
 
           echo '=== storage_retention_dry_run ==='
-          retention_file="$(mktemp)"
-          trap 'rm -f -- "$retention_file"' EXIT
-          "$python_bin" "$maintenance_tool" --json \
-            >"$retention_file" 2>/dev/null \
+          retention_file="$(mktemp /tmp/oldsparky-storage-retention.XXXXXX)"
+          trap 'rm -f -- "$retention_file"' EXIT HUP INT TERM
+          test -f "$retention_file" && test ! -L "$retention_file"
+          test "$(stat -c '%F:%a' -- "$retention_file")" = "regular file:600"
+          set +e
+          timeout --foreground --signal=TERM --kill-after=5s 90s \
+            "$python_bin" "$maintenance_tool" --json \
+            >"$retention_file" 2>/dev/null
+          retention_status="$?"
+          set -e
+          test "$retention_status" = 0 \
             || { echo "storage retention producer failed." >&2; exit 1; }
+          test -f "$retention_file" && test ! -L "$retention_file"
+          retention_bytes="$(wc -c <"$retention_file" | tr -d '[:space:]')"
+          [[ "$retention_bytes" =~ ^[0-9]+$ ]] && (( retention_bytes <= 524288 )) \
+            || { echo "storage retention output exceeded its bound." >&2; exit 1; }
           cat -- "$retention_file"
           REMOTE
+            set +o noclobber
           )
           remote_status="$?"
           set -e
@@ -367,10 +497,30 @@ jobs:
             local phase="$1"
             local reason="$2"
             local action="$3"
+            local contract_tool="$RUNNER_TEMP/platform-storage-projector/platform_storage_diagnostics_contract.py"
+            if [[ -f "$contract_tool" && ! -L "$contract_tool" ]]; then
+              local truncation_args=()
+              if [[ "$remote_stderr_bytes" =~ ^[0-9]+$ ]] && (( remote_stderr_bytes > 524288 )); then
+                truncation_args+=(--stderr-truncated)
+              fi
+              if [[ "$remote_report_bytes" =~ ^[0-9]+$ ]] && (( remote_report_bytes > 524288 )); then
+                truncation_args+=(--report-truncated)
+              fi
+              /usr/bin/python3 -I "$contract_tool" \
+                --write-failure "$public_artifact" \
+                --expected-sha "$EXPECTED_SHA" \
+                --remote-exit-code "$remote_status" \
+                --remote-stderr-bytes "$remote_stderr_bytes" \
+                --report-present "$report_present" \
+                "${truncation_args[@]}" \
+                --phase "$phase" --reason "$reason" --action "$action"
+              return
+            fi
             /usr/bin/python3 -I - "$public_artifact" "$EXPECTED_SHA" "$remote_status" "$remote_stderr_bytes" "$remote_report_bytes" "$report_present" "$phase" "$reason" "$action" <<'PY'
           import json
           import os
           import re
+          import stat
           import sys
 
           destination, expected, status, stderr_bytes, report_bytes, report, phase, reason, action = sys.argv[1:]
@@ -394,8 +544,8 @@ jobs:
           if report_byte_count is not None and not 0 <= report_byte_count <= 1000000:
               report_byte_count = None
           phases = {"capture", "precondition", "transport", "remote", "report", "filesystem", "journal", "service", "category", "retention", "cleanup"}
-          reasons = {"active_release_id_invalid", "active_release_manifest_missing", "active_sha_mismatch", "category_usage_producer", "current_release_missing", "disk_usage_producer", "inode_usage_producer", "journal_usage_producer", "maintenance_tool_missing", "privilege", "python_runtime_missing", "remote_collection_failed", "remote_report_missing", "remote_timeout", "report_schema_incomplete", "report_truncated", "retention_producer", "retention_summary", "sanitizer_exception", "sanitizer_unavailable", "service_state_producer", "ssh_cleanup_failed", "ssh_transport"}
-          actions = {"inspect_current_release_manifest", "inspect_deployed_storage_tool", "inspect_current_release_pointer", "inspect_production_runner_identity", "inspect_release_identity", "inspect_remote_collection", "inspect_remote_diagnostics_command", "inspect_remote_diagnostics_contract", "inspect_remote_output_volume", "inspect_remote_transport_timeout", "inspect_runner_evidence_projector", "inspect_runner_ssh_cleanup", "inspect_service_state_producer", "inspect_shared_runtime", "inspect_ssh_transport_and_host_key", "inspect_category_usage_producer", "inspect_disk_usage_producer", "inspect_inode_usage_producer", "inspect_journal_usage_producer", "inspect_retention_dry_run", "inspect_retention_summary", "recalculate_expected_sha_from_release"}
+          reasons = {"active_release_id_invalid", "active_release_manifest_missing", "active_sha_mismatch", "category_usage_producer", "current_release_missing", "disk_usage_producer", "inode_usage_producer", "journal_usage_producer", "maintenance_tool_missing", "privilege", "python_runtime_missing", "remote_collection_failed", "remote_report_missing", "remote_timeout", "report_schema_incomplete", "report_truncated", "retention_producer", "retention_summary", "sanitizer_exception", "sanitizer_unavailable", "service_state_producer", "ssh_cleanup_failed", "ssh_transport", "stderr_capture_missing", "stderr_capture_mismatch", "ulimit_unavailable", "remote_retention_timeout"}
+          actions = {"inspect_current_release_manifest", "inspect_deployed_storage_tool", "inspect_current_release_pointer", "inspect_production_runner_identity", "inspect_release_identity", "inspect_remote_collection", "inspect_remote_diagnostics_command", "inspect_remote_diagnostics_contract", "inspect_remote_output_volume", "inspect_remote_transport_timeout", "inspect_runner_evidence_projector", "inspect_runner_ssh_cleanup", "inspect_service_state_producer", "inspect_shared_runtime", "inspect_ssh_transport_and_host_key", "inspect_category_usage_producer", "inspect_disk_usage_producer", "inspect_inode_usage_producer", "inspect_journal_usage_producer", "inspect_retention_dry_run", "inspect_retention_summary", "inspect_remote_retention_timeout", "inspect_runner_limits", "recalculate_expected_sha_from_release"}
           payload = {
               "schema": 1,
               "kind": "platform_storage_diagnostics_failure",
@@ -420,11 +570,85 @@ jobs:
               "active_source_sha": "unavailable",
               "sections": {"lock": None, "filesystem": {}, "journal": None, "services": {}, "categories": {}, "retention": None},
           }
-          fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-          with os.fdopen(fd, "w", encoding="ascii") as stream:
-              stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
-              stream.flush()
-              os.fsync(stream.fileno())
+          encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("ascii")
+          if len(encoded) > 524288:
+              raise OSError("fallback artifact exceeds bound")
+          parent = os.path.dirname(destination)
+          parent_metadata = os.lstat(parent)
+          if not stat.S_ISDIR(parent_metadata.st_mode):
+              raise OSError("fallback parent is not a directory")
+          try:
+              destination_metadata = os.lstat(destination)
+          except FileNotFoundError:
+              destination_metadata = None
+          if destination_metadata is not None and stat.S_ISLNK(destination_metadata.st_mode):
+              raise OSError("fallback destination is a symlink")
+          if destination_metadata is not None and stat.S_ISREG(destination_metadata.st_mode):
+              os.unlink(destination)
+          temporary = os.path.join(parent, "." + os.path.basename(destination) + ".fallback.tmp")
+          committed = False
+          try:
+              fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+              with os.fdopen(fd, "wb") as stream:
+                  stream.write(encoded)
+                  stream.flush()
+                  os.fsync(stream.fileno())
+              os.replace(temporary, destination)
+              committed = True
+              directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              try:
+                  os.fsync(directory_fd)
+              finally:
+                  os.close(directory_fd)
+              metadata = os.lstat(destination)
+              if not (stat.S_ISREG(metadata.st_mode) and metadata.st_mode & 0o777 == 0o600):
+                  raise OSError("fallback artifact metadata is unsafe")
+          except Exception:
+              try:
+                  os.unlink(temporary)
+              except OSError:
+                  pass
+              try:
+                  if committed:
+                      metadata = os.lstat(destination)
+                      if stat.S_ISREG(metadata.st_mode):
+                          os.unlink(destination)
+              except OSError:
+                  pass
+              raise
+          PY
+          }
+
+          validate_artifact() {
+            local contract_tool="$RUNNER_TEMP/platform-storage-projector/platform_storage_diagnostics_contract.py"
+            if [[ -f "$contract_tool" && ! -L "$contract_tool" ]]; then
+              /usr/bin/python3 -I "$contract_tool" --validate "$1"
+              return
+            fi
+            # The projector package is intentionally unavailable when the
+            # prepare job fails.  Validate only the fixed generic fallback's
+            # non-sensitive identity in that exceptional path; the fallback
+            # writer below emits no producer sections or raw values.
+            /usr/bin/python3 -I - "$1" <<'PY'
+          import json
+          import os
+          import stat
+          import sys
+
+          descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
+          try:
+              metadata = os.fstat(descriptor)
+              if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o777 != 0o600:
+                  raise ValueError("artifact metadata")
+              payload = json.load(os.fdopen(descriptor, encoding="utf-8"))
+          finally:
+              try:
+                  os.close(descriptor)
+              except OSError:
+                  pass
+          if not isinstance(payload, dict) or payload.get("status") != "failed" or payload.get("kind") != "platform_storage_diagnostics_failure":
+              raise ValueError("fallback artifact")
+          print("failed")
           PY
           }
 
@@ -458,7 +682,30 @@ jobs:
           fi
           test -f "$public_artifact" && test ! -L "$public_artifact"
           test "$(stat -c '%F:%h:%a' -- "$public_artifact")" = "regular file:1:600"
-          if [[ "$projector_status" -eq 0 ]]; then
+          artifact_status=""
+          if ! artifact_status="$(validate_artifact "$public_artifact" 2>/dev/null)" \
+            || [[ "$artifact_status" != passed && "$artifact_status" != failed ]]; then
+            rm -f -- "$public_artifact"
+            write_fallback capture sanitizer_exception inspect_runner_evidence_projector
+            projector_status=1
+            artifact_status="$(validate_artifact "$public_artifact" 2>/dev/null || true)"
+          elif [[ "$projector_status" -eq 0 && "$artifact_status" != passed ]]; then
+            rm -f -- "$public_artifact"
+            write_fallback capture sanitizer_exception inspect_runner_evidence_projector
+            projector_status=1
+            artifact_status="$(validate_artifact "$public_artifact" 2>/dev/null || true)"
+          elif [[ "$projector_status" -ne 0 && "$artifact_status" = passed ]]; then
+            # A failed projector may not smuggle a forged passed artifact to
+            # upload; discard it before writing the generic fixed fallback.
+            rm -f -- "$public_artifact"
+            write_fallback capture sanitizer_exception inspect_runner_evidence_projector
+            projector_status=1
+            artifact_status="$(validate_artifact "$public_artifact" 2>/dev/null || true)"
+          fi
+          test "$artifact_status" = passed || test "$artifact_status" = failed
+          test -f "$public_artifact" && test ! -L "$public_artifact"
+          test "$(stat -c '%F:%h:%a' -- "$public_artifact")" = "regular file:1:600"
+          if [[ "$projector_status" -eq 0 && "$artifact_status" = passed ]]; then
             exit 0
           fi
           echo "Storage diagnostics collection failed; bounded evidence was published." >&2
@@ -520,6 +767,7 @@ jobs:
             rm -f -- \
               "$projector_dir/platform_storage_diagnostics_sanitizer.py" \
               "$projector_dir/platform_storage_evidence_summary.py" \
+              "$projector_dir/platform_storage_diagnostics_contract.py" \
               "$projector_dir/manifest.sha256"
             rmdir -- "$projector_dir"
           fi

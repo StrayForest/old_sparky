@@ -20,6 +20,7 @@ from tools.platform_storage_evidence_summary import (
     summarize_service,
 )
 from tools import platform_storage_diagnostics_sanitizer as diagnostics_sanitizer
+from tools import platform_storage_diagnostics_contract as diagnostics_contract
 from tools.platform_storage_diagnostics_sanitizer import (
     MAX_INPUT_BYTES,
     MAX_REPORTED_BYTES,
@@ -76,6 +77,15 @@ def valid_storage_report() -> bytes:
                 "ActiveState=active",
                 "SubState=running",
                 "Result=success",
+                "ExecMainCode=exited",
+                "ExecMainStatus=0",
+                "NRestarts=0",
+                "MemoryCurrent=1",
+                "MemoryPeak=1",
+                "MemoryMax=infinity",
+                "TasksCurrent=1",
+                "TasksMax=infinity",
+                "CPUUsageNSec=1",
             )
         )
     lines.append("=== known_category_usage ===")
@@ -90,7 +100,49 @@ def valid_storage_report() -> bytes:
     lines.extend(
         (
             "=== storage_retention_dry_run ===",
-            '{"ok":true,"mode":"dry-run"}',
+            json.dumps(
+                {
+                    "ok": True,
+                    "mode": "dry-run",
+                    "production_releases": {
+                        "protected": [],
+                        "retained": [],
+                        "deleted": [],
+                        "reclaimable_bytes": 0,
+                    },
+                    "source_release_artifacts": {
+                        "protected": [],
+                        "retained": [],
+                        "deleted": [],
+                        "reclaimable_bytes": 0,
+                    },
+                    "live_qa_runtime_caches": {
+                        "protected": [],
+                        "retained": [],
+                        "deleted": [],
+                        "reclaimable_bytes": 0,
+                    },
+                    "transient": {
+                        "failed_builds": {"count": 0, "reclaimable_bytes": 0},
+                        "browser_test_artifacts": {"count": 0, "reclaimable_bytes": 0},
+                        "preprod_screenshots": {"count": 0, "reclaimable_bytes": 0},
+                        "reclaimable_bytes": {
+                            "failed_builds": 0,
+                            "browser_test_artifacts": 0,
+                            "preprod_screenshots": 0,
+                        },
+                    },
+                    "duration_seconds": 0.1,
+                    "limits": {
+                        "minimum_free_bytes": 1,
+                        "maximum_used_percent": 90,
+                    },
+                    "disk_before": {"free_bytes": 2, "used_percent": 10},
+                    "disk_after": {"free_bytes": 2, "used_percent": 10},
+                    "backup": {"status": "skipped"},
+                },
+                separators=(",", ":"),
+            ),
         )
     )
     return ("\n".join(lines) + "\n").encode()
@@ -571,6 +623,198 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
             self.assertEqual(sanitized["reason"], "remote_collection_failed")
             self.assertEqual(sanitized["action"], "inspect_remote_collection")
             self.assert_no_forbidden_values(sanitized)
+
+    def test_failure_contract_is_shared_and_atomic_writer_removes_stale_output(self) -> None:
+        self.assertEqual(
+            diagnostics_sanitizer.SAFE_FAILURE_PHASES,
+            diagnostics_contract.SAFE_FAILURE_PHASES,
+        )
+        self.assertEqual(
+            diagnostics_sanitizer.SAFE_FAILURE_REASONS,
+            diagnostics_contract.SAFE_FAILURE_REASONS,
+        )
+        self.assertEqual(
+            diagnostics_sanitizer.SAFE_FAILURE_ACTIONS,
+            diagnostics_contract.SAFE_FAILURE_ACTIONS,
+        )
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        for value in (
+            *diagnostics_contract.SAFE_FAILURE_PHASES,
+            *diagnostics_contract.SAFE_FAILURE_REASONS,
+            *diagnostics_contract.SAFE_FAILURE_ACTIONS,
+        ):
+            self.assertIn(f'"{value}"', workflow)
+        for key in diagnostics_contract.FAILURE_KEYS:
+            self.assertIn(f'"{key}"', workflow)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            output_path = root / "artifact"
+            report_path.write_bytes(valid_storage_report())
+            stderr_path.write_bytes(b"")
+            passed = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            output_path.write_text(json.dumps(passed), encoding="utf-8")
+            with mock.patch.object(
+                diagnostics_sanitizer,
+                "_project_report",
+                side_effect=RuntimeError("projector failed"),
+            ):
+                status = diagnostics_sanitizer.main(
+                    [
+                        "--report-path",
+                        str(report_path),
+                        "--stderr-path",
+                        str(stderr_path),
+                        "--output-path",
+                        str(output_path),
+                        "--expected-sha",
+                        "a" * 40,
+                        "--remote-exit-code",
+                        "1",
+                        "--remote-stderr-bytes",
+                        "0",
+                        "--report-present",
+                        "true",
+                    ]
+                )
+            self.assertEqual(status, 1)
+            self.assertEqual(json.loads(output_path.read_text())["status"], "failed")
+
+            with mock.patch.object(
+                diagnostics_sanitizer,
+                "project_public_artifact",
+                return_value=passed,
+            ):
+                status = diagnostics_sanitizer.main(
+                    [
+                        "--report-path",
+                        str(report_path),
+                        "--stderr-path",
+                        str(stderr_path),
+                        "--output-path",
+                        str(output_path),
+                        "--expected-sha",
+                        "a" * 40,
+                        "--remote-exit-code",
+                        "1",
+                        "--remote-stderr-bytes",
+                        "0",
+                        "--report-present",
+                        "true",
+                    ]
+                )
+            self.assertEqual(status, 1)
+            self.assertEqual(json.loads(output_path.read_text())["status"], "failed")
+
+            output_path.write_text(json.dumps(passed), encoding="utf-8")
+            with mock.patch.object(
+                diagnostics_sanitizer.os,
+                "replace",
+                side_effect=OSError("atomic commit failed"),
+            ):
+                with self.assertRaises(OSError):
+                    diagnostics_sanitizer._write_nofollow(output_path, passed)
+            self.assertFalse(output_path.exists())
+
+            with mock.patch.object(
+                diagnostics_sanitizer.os,
+                "fsync",
+                side_effect=OSError("partial fsync failed"),
+            ):
+                status = diagnostics_sanitizer.main(
+                    [
+                        "--report-path",
+                        str(report_path),
+                        "--stderr-path",
+                        str(stderr_path),
+                        "--output-path",
+                        str(output_path),
+                        "--expected-sha",
+                        "a" * 40,
+                        "--remote-exit-code",
+                        "1",
+                        "--remote-stderr-bytes",
+                        "0",
+                        "--report-present",
+                        "false",
+                    ]
+                )
+            self.assertEqual(status, 1)
+            self.assertFalse(output_path.exists())
+
+            stderr_path.unlink()
+            missing_stderr = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(missing_stderr["reason"], "stderr_capture_missing")
+
+    def test_incomplete_numeric_and_retention_records_cannot_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            stderr_path.write_bytes(b"")
+            missing_service_numeric = valid_storage_report().replace(
+                b"MemoryCurrent=1", b"MemoryCurrent=", 1
+            )
+            report_path.write_bytes(missing_service_numeric)
+            result = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["reason"], "report_schema_incomplete")
+
+            incomplete_retention = valid_storage_report().replace(
+                b'"duration_seconds":0.1', b'"duration_seconds":null', 1
+            )
+            report_path.write_bytes(incomplete_retention)
+            result = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["reason"], "report_schema_incomplete")
+
+            nonfinite = valid_storage_report().replace(
+                b"MemoryMax=infinity", b"MemoryMax=NaN", 1
+            )
+            report_path.write_bytes(nonfinite)
+            result = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["reason"], "report_schema_incomplete")
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,7 +29,6 @@ if str(TOOLS_DIR) not in sys.path:
 
 from platform_storage_evidence_summary import (  # noqa: E402
     EvidenceInputError,
-    SERVICE_PROPERTY_KEYS,
     summarize_df,
     summarize_du,
     summarize_inode,
@@ -37,6 +36,15 @@ from platform_storage_evidence_summary import (  # noqa: E402
     summarize_lock,
     summarize_retention,
     summarize_service,
+)
+from platform_storage_diagnostics_contract import (  # noqa: E402
+    SAFE_FAILURE_ACTIONS as CONTRACT_SAFE_FAILURE_ACTIONS,
+    SAFE_FAILURE_PHASES as CONTRACT_SAFE_FAILURE_PHASES,
+    SAFE_FAILURE_REASONS as CONTRACT_SAFE_FAILURE_REASONS,
+    empty_sections as contract_empty_sections,
+    normalize_failure_values,
+    validate_sections,
+    validate_artifact,
 )
 
 
@@ -48,77 +56,11 @@ MAX_REPORTED_BYTES = 1_000_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 
-# Failure details are a public contract.  Keep these sets closed so a
-# producer-controlled string can never become an artifact field, even if a
-# future caller passes an unexpected value into ``_failure_summary``.
-SAFE_FAILURE_PHASES = frozenset(
-    {
-        "capture",
-        "precondition",
-        "transport",
-        "remote",
-        "report",
-        "filesystem",
-        "journal",
-        "service",
-        "category",
-        "retention",
-        "cleanup",
-    }
-)
-SAFE_FAILURE_REASONS = frozenset(
-    {
-        "active_release_id_invalid",
-        "active_release_manifest_missing",
-        "active_sha_mismatch",
-        "category_usage_producer",
-        "current_release_missing",
-        "disk_usage_producer",
-        "inode_usage_producer",
-        "journal_usage_producer",
-        "maintenance_tool_missing",
-        "privilege",
-        "python_runtime_missing",
-        "remote_collection_failed",
-        "remote_report_missing",
-        "remote_timeout",
-        "report_schema_incomplete",
-        "report_truncated",
-        "retention_producer",
-        "retention_summary",
-        "sanitizer_exception",
-        "sanitizer_unavailable",
-        "service_state_producer",
-        "ssh_cleanup_failed",
-        "ssh_transport",
-    }
-)
-SAFE_FAILURE_ACTIONS = frozenset(
-    {
-        "inspect_current_release_manifest",
-        "inspect_deployed_storage_tool",
-        "inspect_current_release_pointer",
-        "inspect_production_runner_identity",
-        "inspect_release_identity",
-        "inspect_remote_collection",
-        "inspect_remote_diagnostics_command",
-        "inspect_remote_diagnostics_contract",
-        "inspect_remote_output_volume",
-        "inspect_remote_transport_timeout",
-        "inspect_runner_evidence_projector",
-        "inspect_runner_ssh_cleanup",
-        "inspect_service_state_producer",
-        "inspect_shared_runtime",
-        "inspect_ssh_transport_and_host_key",
-        "inspect_category_usage_producer",
-        "inspect_disk_usage_producer",
-        "inspect_inode_usage_producer",
-        "inspect_journal_usage_producer",
-        "inspect_retention_dry_run",
-        "inspect_retention_summary",
-        "recalculate_expected_sha_from_release",
-    }
-)
+# Keep the projector's public names stable while making the packaged contract
+# the single source of truth for the fallback allowlists.
+SAFE_FAILURE_PHASES = CONTRACT_SAFE_FAILURE_PHASES
+SAFE_FAILURE_REASONS = CONTRACT_SAFE_FAILURE_REASONS
+SAFE_FAILURE_ACTIONS = CONTRACT_SAFE_FAILURE_ACTIONS
 
 EXPECTED_SECTIONS = (
     "lock",
@@ -285,14 +227,7 @@ def _read_bounded(path: Path) -> tuple[bytes, bool]:
 
 
 def _empty_sections() -> dict[str, object]:
-    return {
-        "lock": None,
-        "filesystem": {},
-        "journal": None,
-        "services": {},
-        "categories": {},
-        "retention": None,
-    }
+    return contract_empty_sections()
 
 
 def _safe_projection(function: Any, raw: str, **kwargs: object) -> dict[str, object] | None:
@@ -429,61 +364,9 @@ def _record_labels_valid(lines: list[str], prefixes: tuple[str, ...]) -> bool:
     return True
 
 
-def _service_summary_complete(value: object) -> bool:
-    if not isinstance(value, dict) or value.get("status") != "ok":
-        return False
-    properties = value.get("properties")
-    if not isinstance(properties, dict) or set(properties) != set(SERVICE_PROPERTY_KEYS):
-        return False
-    # Unknown enum values indicate that systemd returned a producer shape we
-    # do not understand.  Do not call that a successful strict report.
-    for key in ("ActiveState", "SubState", "Result"):
-        if properties.get(key) in (None, "unknown"):
-            return False
-    return True
-
-
 def _strict_section_success(result: dict[str, object]) -> bool:
     """Require every producer to have yielded its complete closed summary."""
-
-    lock = result.get("lock")
-    if not isinstance(lock, dict) or lock.get("status") != "ok":
-        return False
-    journal = result.get("journal")
-    if not isinstance(journal, dict) or journal.get("status") != "ok":
-        return False
-    filesystem = result.get("filesystem")
-    if not isinstance(filesystem, dict) or set(filesystem) != set(SAFE_CATEGORIES):
-        return False
-    for value in filesystem.values():
-        if (
-            not isinstance(value, dict)
-            or value.get("status") != "ok"
-            or not isinstance(value.get("inode"), dict)
-            or value["inode"].get("status") != "ok"
-        ):
-            return False
-    services = result.get("services")
-    if not isinstance(services, dict) or set(services) != set(SAFE_SERVICES):
-        return False
-    if not all(_service_summary_complete(value) for value in services.values()):
-        return False
-    categories = result.get("categories")
-    if not isinstance(categories, dict) or set(categories) != set(SAFE_DU_CATEGORIES):
-        return False
-    if not all(
-        isinstance(value, dict) and value.get("status") == "ok"
-        for value in categories.values()
-    ):
-        return False
-    retention = result.get("retention")
-    if not isinstance(retention, dict):
-        return False
-    return (
-        retention.get("status") == "ok"
-        and retention.get("ok") is True
-        and retention.get("mode") == "dry-run"
-    )
+    return validate_sections(result)
 
 
 def _project_report(raw: str) -> tuple[dict[str, object], bool]:
@@ -643,24 +526,17 @@ def _failure_summary(
         reason = "remote_collection_failed"
     if not isinstance(action, str) or action not in SAFE_FAILURE_ACTIONS:
         action = "inspect_remote_collection"
-    return {
-        "schema": SCHEMA,
-        "kind": "platform_storage_diagnostics_failure",
-        "status": "failed",
-        "raw_output_included": False,
-        "expected_sha": _safe_sha(expected_sha),
-        "remote_exit_code": exit_code,
-        "remote_stderr_bytes": stderr_bytes,
-        "stderr_truncated": bool(stderr_truncated),
-        "report_present": report,
-        "report_truncated": bool(report_truncated),
-        "phase": phase,
-        "reason": reason,
-        "action": action,
-        "active_release_id": "unavailable",
-        "active_source_sha": "unavailable",
-        "sections": _empty_sections(),
-    }
+    return normalize_failure_values(
+        expected_sha=expected_sha,
+        remote_exit_code=exit_code,
+        remote_stderr_bytes=stderr_bytes,
+        report_present=report,
+        stderr_truncated=bool(stderr_truncated),
+        report_truncated=bool(report_truncated),
+        phase=phase,
+        reason=reason,
+        action=action,
+    )
 
 
 def project_public_artifact(
@@ -676,13 +552,26 @@ def project_public_artifact(
 
     stderr = b""
     stderr_truncated = False
+    stderr_capture_ok = True
     try:
         stderr, stderr_truncated = _read_bounded(stderr_path)
     except (OSError, ValueError):
-        stderr = b""
+        stderr_capture_ok = False
     try:
         report_bytes, report_truncated = _read_bounded(report_path)
     except (OSError, ValueError):
+        if not stderr_capture_ok:
+            return _failure_summary(
+                expected_sha=expected_sha,
+                remote_exit_code=remote_exit_code,
+                remote_stderr_bytes=remote_stderr_bytes,
+                report_present=False,
+                stderr=stderr,
+                stderr_truncated=stderr_truncated,
+                phase="capture",
+                reason="stderr_capture_missing",
+                action="inspect_remote_output_volume",
+            )
         return _failure_summary(
             expected_sha=expected_sha,
             remote_exit_code=remote_exit_code,
@@ -705,8 +594,11 @@ def project_public_artifact(
         and not report_truncated
         and report_complete
         and report_sha_matches
+        and stderr_capture_ok
         and not stderr_truncated
-        and _safe_int(remote_stderr_bytes, maximum=MAX_REPORTED_BYTES) == 0
+        and _safe_int(remote_stderr_bytes, maximum=MAX_REPORTED_BYTES) is not None
+        and len(stderr)
+        == _safe_int(remote_stderr_bytes, maximum=MAX_REPORTED_BYTES)
     )
     if exit_code == 0 and report_ok:
         return {
@@ -725,7 +617,30 @@ def project_public_artifact(
             **report_payload,
         }
 
-    if report_complete and not report_sha_matches:
+    if report_truncated:
+        phase, reason, action = (
+            "capture",
+            "report_truncated",
+            "inspect_remote_output_volume",
+        )
+    elif not stderr_capture_ok:
+        phase, reason, action = (
+            "capture",
+            "stderr_capture_missing",
+            "inspect_remote_output_volume",
+        )
+    elif (
+        _safe_int(remote_stderr_bytes, maximum=MAX_REPORTED_BYTES) is None
+        or stderr_truncated
+        or len(stderr)
+        != _safe_int(remote_stderr_bytes, maximum=MAX_REPORTED_BYTES)
+    ):
+        phase, reason, action = (
+            "capture",
+            "stderr_capture_mismatch",
+            "inspect_remote_output_volume",
+        )
+    elif report_complete and not report_sha_matches:
         phase, reason, action = (
             "precondition",
             "active_sha_mismatch",
@@ -757,25 +672,134 @@ def project_public_artifact(
     return failure
 
 
-def _write_nofollow(path: Path, payload: dict[str, object]) -> None:
-    """Create a mode-600 regular artifact without following a symlink."""
+def _remove_regular_output(path: Path) -> None:
+    """Remove only a private regular output; never follow or unlink a link."""
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    encoded = (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    descriptor = os.open(path, flags, 0o600)
     try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if stat.S_ISREG(metadata.st_mode):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def _validate_written_artifact(path: Path) -> None:
+    metadata = os.lstat(path)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o777 != 0o600:
+        raise OSError("artifact is not a private regular file")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        file_metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(file_metadata.st_mode):
+            raise OSError("artifact is not a private regular file")
+        encoded = bytearray()
+        while len(encoded) <= MAX_INPUT_BYTES:
+            chunk = os.read(descriptor, min(64 * 1024, MAX_INPUT_BYTES + 1 - len(encoded)))
+            if not chunk:
+                break
+            encoded.extend(chunk)
+        if len(encoded) > MAX_INPUT_BYTES:
+            raise OSError("artifact exceeds bound")
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(bytes(encoded).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OSError("artifact is not valid JSON") from exc
+    if not validate_artifact(payload):
+        raise OSError("artifact violates the closed contract")
+
+
+def _write_nofollow(path: Path, payload: dict[str, object]) -> None:
+    """Atomically commit a mode-600 regular artifact without following links."""
+
+    try:
+        if not validate_artifact(payload):
+            raise OSError("artifact violates the closed contract")
+        encoded = (
+            json.dumps(
+                payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+        if len(encoded) > MAX_INPUT_BYTES:
+            raise OSError("artifact exceeds bound")
+    except Exception:
+        _remove_regular_output(path)
+        raise
+    parent = path.parent
+    parent_metadata = os.lstat(parent)
+    if not stat.S_ISDIR(parent_metadata.st_mode):
+        raise OSError("artifact parent is not a directory")
+    try:
+        existing = os.lstat(path)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and stat.S_ISLNK(existing.st_mode):
+        raise OSError("refusing artifact symlink")
+
+    temporary = parent / f".{path.name}.tmp.{os.getpid()}.{id(payload)}"
+    descriptor = -1
+    committed = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o777 != 0o600:
+            raise OSError("artifact temporary file is not private")
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
-    finally:
+        temporary_metadata = os.lstat(temporary)
+        if (
+            not stat.S_ISREG(temporary_metadata.st_mode)
+            or temporary_metadata.st_mode & 0o777 != 0o600
+        ):
+            raise OSError("artifact temporary file changed")
+        os.replace(temporary, path)
+        committed = True
+        directory_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        _validate_written_artifact(path)
+    except Exception:
         if descriptor != -1:
             os.close(descriptor)
-    metadata = path.lstat()
-    if not path.is_file() or path.is_symlink() or metadata.st_mode & 0o777 != 0o600:
-        raise OSError("artifact is not a private regular file")
+        try:
+            os.unlink(temporary)
+        except (FileNotFoundError, OSError):
+            pass
+        # A failed post-write validation must never leave a stale passed
+        # artifact behind.  Preserve a pre-existing symlink for diagnostics.
+        if committed:
+            try:
+                os.unlink(path)
+            except (FileNotFoundError, OSError):
+                pass
+        elif existing is not None:
+            _remove_regular_output(path)
+        raise
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -801,6 +825,10 @@ def main(argv: list[str] | None = None) -> int:
             stderr_path=args.stderr_path,
             report_present=args.report_present,
         )
+        if not validate_artifact(report):
+            raise ValueError("projected artifact violates the closed contract")
+        if report.get("status") == "passed" and args.remote_exit_code not in {"", "0"}:
+            raise ValueError("passed artifact has a non-zero remote status")
         _write_nofollow(args.output_path, report)
     except Exception:
         fallback = _failure_summary(
