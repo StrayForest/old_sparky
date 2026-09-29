@@ -72,6 +72,14 @@ jobs:
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "expected_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
 
+      - name: Checkout canonical diagnostics contract fallback
+        if: ${{ always() }}
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Download exact diagnostics projector
         if: ${{ needs.prepare.result == 'success' }}
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -498,158 +506,34 @@ jobs:
             local reason="$2"
             local action="$3"
             local contract_tool="$RUNNER_TEMP/platform-storage-projector/platform_storage_diagnostics_contract.py"
-            if [[ -f "$contract_tool" && ! -L "$contract_tool" ]]; then
-              local truncation_args=()
-              if [[ "$remote_stderr_bytes" =~ ^[0-9]+$ ]] && (( remote_stderr_bytes > 524288 )); then
-                truncation_args+=(--stderr-truncated)
-              fi
-              if [[ "$remote_report_bytes" =~ ^[0-9]+$ ]] && (( remote_report_bytes > 524288 )); then
-                truncation_args+=(--report-truncated)
-              fi
-              /usr/bin/python3 -I "$contract_tool" \
-                --write-failure "$public_artifact" \
-                --expected-sha "$EXPECTED_SHA" \
-                --remote-exit-code "$remote_status" \
-                --remote-stderr-bytes "$remote_stderr_bytes" \
-                --report-present "$report_present" \
-                "${truncation_args[@]}" \
-                --phase "$phase" --reason "$reason" --action "$action"
-              return
+            if [[ ! -f "$contract_tool" || -L "$contract_tool" ]]; then
+              contract_tool="$GITHUB_WORKSPACE/platform/tools/platform_storage_diagnostics_contract.py"
             fi
-            /usr/bin/python3 -I - "$public_artifact" "$EXPECTED_SHA" "$remote_status" "$remote_stderr_bytes" "$remote_report_bytes" "$report_present" "$phase" "$reason" "$action" <<'PY'
-          import json
-          import os
-          import re
-          import stat
-          import sys
-
-          destination, expected, status, stderr_bytes, report_bytes, report, phase, reason, action = sys.argv[1:]
-          expected = expected if re.fullmatch(r"[0-9a-f]{40}", expected) else "unavailable"
-          try:
-              exit_code = int(status, 10)
-          except (TypeError, ValueError):
-              exit_code = None
-          if exit_code is not None and not 0 <= exit_code <= 255:
-              exit_code = None
-          try:
-              byte_count = int(stderr_bytes, 10)
-          except (TypeError, ValueError):
-              byte_count = None
-          if byte_count is not None and not 0 <= byte_count <= 1000000:
-              byte_count = None
-          try:
-              report_byte_count = int(report_bytes, 10)
-          except (TypeError, ValueError):
-              report_byte_count = None
-          if report_byte_count is not None and not 0 <= report_byte_count <= 1000000:
-              report_byte_count = None
-          phases = {"capture", "precondition", "transport", "remote", "report", "filesystem", "journal", "service", "category", "retention", "cleanup"}
-          reasons = {"active_release_id_invalid", "active_release_manifest_missing", "active_sha_mismatch", "category_usage_producer", "current_release_missing", "disk_usage_producer", "inode_usage_producer", "journal_usage_producer", "maintenance_tool_missing", "privilege", "python_runtime_missing", "remote_collection_failed", "remote_report_missing", "remote_timeout", "report_schema_incomplete", "report_truncated", "retention_producer", "retention_summary", "sanitizer_exception", "sanitizer_unavailable", "service_state_producer", "ssh_cleanup_failed", "ssh_transport", "stderr_capture_missing", "stderr_capture_mismatch", "ulimit_unavailable", "remote_retention_timeout"}
-          actions = {"inspect_current_release_manifest", "inspect_deployed_storage_tool", "inspect_current_release_pointer", "inspect_production_runner_identity", "inspect_release_identity", "inspect_remote_collection", "inspect_remote_diagnostics_command", "inspect_remote_diagnostics_contract", "inspect_remote_output_volume", "inspect_remote_transport_timeout", "inspect_runner_evidence_projector", "inspect_runner_ssh_cleanup", "inspect_service_state_producer", "inspect_shared_runtime", "inspect_ssh_transport_and_host_key", "inspect_category_usage_producer", "inspect_disk_usage_producer", "inspect_inode_usage_producer", "inspect_journal_usage_producer", "inspect_retention_dry_run", "inspect_retention_summary", "inspect_remote_retention_timeout", "inspect_runner_limits", "recalculate_expected_sha_from_release"}
-          payload = {
-              "schema": 1,
-              "kind": "platform_storage_diagnostics_failure",
-              "status": "failed",
-              "raw_output_included": False,
-              "expected_sha": expected,
-              "remote_exit_code": exit_code,
-              "remote_stderr_bytes": byte_count,
-              "stderr_truncated": (
-                  (byte_count is None and bool(stderr_bytes))
-                  or (byte_count is not None and byte_count > 524288)
-              ),
-              "report_present": report == "true",
-              "report_truncated": (
-                  (report_byte_count is None and bool(report_bytes))
-                  or (report_byte_count is not None and report_byte_count > 524288)
-              ),
-              "phase": phase if phase in phases else "capture",
-              "reason": reason if reason in reasons else "remote_collection_failed",
-              "action": action if action in actions else "inspect_remote_collection",
-              "active_release_id": "unavailable",
-              "active_source_sha": "unavailable",
-              "sections": {"lock": None, "filesystem": {}, "journal": None, "services": {}, "categories": {}, "retention": None},
-          }
-          encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("ascii")
-          if len(encoded) > 524288:
-              raise OSError("fallback artifact exceeds bound")
-          parent = os.path.dirname(destination)
-          parent_metadata = os.lstat(parent)
-          if not stat.S_ISDIR(parent_metadata.st_mode):
-              raise OSError("fallback parent is not a directory")
-          try:
-              destination_metadata = os.lstat(destination)
-          except FileNotFoundError:
-              destination_metadata = None
-          if destination_metadata is not None and stat.S_ISLNK(destination_metadata.st_mode):
-              raise OSError("fallback destination is a symlink")
-          if destination_metadata is not None and stat.S_ISREG(destination_metadata.st_mode):
-              os.unlink(destination)
-          temporary = os.path.join(parent, "." + os.path.basename(destination) + ".fallback.tmp")
-          committed = False
-          try:
-              fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-              with os.fdopen(fd, "wb") as stream:
-                  stream.write(encoded)
-                  stream.flush()
-                  os.fsync(stream.fileno())
-              os.replace(temporary, destination)
-              committed = True
-              directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-              try:
-                  os.fsync(directory_fd)
-              finally:
-                  os.close(directory_fd)
-              metadata = os.lstat(destination)
-              if not (stat.S_ISREG(metadata.st_mode) and metadata.st_mode & 0o777 == 0o600):
-                  raise OSError("fallback artifact metadata is unsafe")
-          except Exception:
-              try:
-                  os.unlink(temporary)
-              except OSError:
-                  pass
-              try:
-                  if committed:
-                      metadata = os.lstat(destination)
-                      if stat.S_ISREG(metadata.st_mode):
-                          os.unlink(destination)
-              except OSError:
-                  pass
-              raise
-          PY
+            test -f "$contract_tool" && test ! -L "$contract_tool"
+            local truncation_args=()
+            if [[ "$remote_stderr_bytes" =~ ^[0-9]+$ ]] && (( remote_stderr_bytes > 524288 )); then
+              truncation_args+=(--stderr-truncated)
+            fi
+            if [[ "$remote_report_bytes" =~ ^[0-9]+$ ]] && (( remote_report_bytes > 524288 )); then
+              truncation_args+=(--report-truncated)
+            fi
+            /usr/bin/python3 -I "$contract_tool" \
+              --write-failure "$public_artifact" \
+              --expected-sha "$EXPECTED_SHA" \
+              --remote-exit-code "$remote_status" \
+              --remote-stderr-bytes "$remote_stderr_bytes" \
+              --report-present "$report_present" \
+              "${truncation_args[@]}" \
+              --phase "$phase" --reason "$reason" --action "$action"
           }
 
           validate_artifact() {
             local contract_tool="$RUNNER_TEMP/platform-storage-projector/platform_storage_diagnostics_contract.py"
-            if [[ -f "$contract_tool" && ! -L "$contract_tool" ]]; then
-              /usr/bin/python3 -I "$contract_tool" --validate "$1"
-              return
+            if [[ ! -f "$contract_tool" || -L "$contract_tool" ]]; then
+              contract_tool="$GITHUB_WORKSPACE/platform/tools/platform_storage_diagnostics_contract.py"
             fi
-            # The projector package is intentionally unavailable when the
-            # prepare job fails.  Validate only the fixed generic fallback's
-            # non-sensitive identity in that exceptional path; the fallback
-            # writer below emits no producer sections or raw values.
-            /usr/bin/python3 -I - "$1" <<'PY'
-          import json
-          import os
-          import stat
-          import sys
-
-          descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
-          try:
-              metadata = os.fstat(descriptor)
-              if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o777 != 0o600:
-                  raise ValueError("artifact metadata")
-              payload = json.load(os.fdopen(descriptor, encoding="utf-8"))
-          finally:
-              try:
-                  os.close(descriptor)
-              except OSError:
-                  pass
-          if not isinstance(payload, dict) or payload.get("status") != "failed" or payload.get("kind") != "platform_storage_diagnostics_failure":
-              raise ValueError("fallback artifact")
-          print("failed")
-          PY
+            test -f "$contract_tool" && test ! -L "$contract_tool"
+            /usr/bin/python3 -I "$contract_tool" --validate "$1"
           }
 
           projector_status=1
@@ -711,15 +595,6 @@ jobs:
           echo "Storage diagnostics collection failed; bounded evidence was published." >&2
           exit 1
 
-      - name: Upload storage diagnostic evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: platform-production-storage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/platform-production-storage-diagnostics-artifact.txt
-          if-no-files-found: error
-          retention-days: 14
-
       - name: Remove private storage diagnostic captures
         id: cleanup_captures
         if: ${{ always() }}
@@ -728,14 +603,11 @@ jobs:
           set -euo pipefail
           rm -f -- \
             "$RUNNER_TEMP/platform-production-storage-diagnostics.txt" \
-            "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error" \
-            "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+            "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
           test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics.txt" \
             && test ! -L "$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
           test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error" \
             && test ! -L "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
-          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt" \
-            && test ! -L "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
           ssh_dir="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh"
           if [[ -L "$ssh_dir" ]]; then
             rm -f -- "$ssh_dir"
@@ -777,3 +649,12 @@ jobs:
           test -z "${SSH_DIR:-}"
           printf '%s\n' 'DIAGNOSTICS_REMOTE_STATUS=' >> "$GITHUB_ENV"
           printf '%s\n' 'DIAGNOSTICS_REPORT_PRESENT=' >> "$GITHUB_ENV"
+
+      - name: Upload storage diagnostic evidence
+        if: ${{ always() && steps.cleanup_captures.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-production-storage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-production-storage-diagnostics-artifact.txt
+          if-no-files-found: error
+          retention-days: 14

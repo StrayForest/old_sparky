@@ -295,12 +295,28 @@ def _validate_retention(value: object) -> bool:
     ):
         return False
     categories = value.get("categories")
-    category_keys = {"protected_count", "retained_count", "deleted_count", "reclaimable_bytes"}
+    byte_category_keys = {
+        "protected_count",
+        "retained_count",
+        "deleted_count",
+        "reclaimable_bytes",
+    }
+    live_qa_category_keys = {
+        "protected_count",
+        "retained_count",
+        "deleted_count",
+        "reclaimed_tombstone_count",
+    }
     if not isinstance(categories, dict) or set(categories) != {
         "production_releases", "source_release_artifacts", "live_qa_runtime"
     }:
         return False
-    if not all(_exact_numeric_summary(item, category_keys, maximum=10**18) for item in categories.values()):
+    if not all(
+        _exact_numeric_summary(categories[name], byte_category_keys, maximum=10**18)
+        for name in ("production_releases", "source_release_artifacts")
+    ) or not _exact_numeric_summary(
+        categories["live_qa_runtime"], live_qa_category_keys, maximum=10**18
+    ):
         return False
     transient = value.get("transient")
     transient_keys = {"failed_builds", "browser_test_artifacts", "preprod_screenshots"}
@@ -414,6 +430,9 @@ def validate_artifact(payload: object) -> bool:
             return False
         if (
             payload.get("remote_exit_code") != 0
+            or not _nonnegative(
+                payload.get("remote_stderr_bytes"), maximum=MAX_REPORTED_BYTES
+            )
             or payload.get("report_present") is not True
             or payload.get("stderr_truncated") is not False
             or payload.get("report_truncated") is not False

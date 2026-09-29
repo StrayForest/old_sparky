@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from unittest import mock
@@ -1794,8 +1795,9 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("os.O_RDONLY | os.O_CLOEXEC | getattr(os, \"O_NOFOLLOW\", 0)", workflow)
         self.assertIn("os.O_EXCL", workflow)
         self.assertIn("platform_storage_diagnostics_contract.py", workflow)
-        self.assertIn("os.replace(temporary, destination)", workflow)
-        self.assertIn("allow_nan=False", workflow)
+        contract_source = self.read_tool("platform_storage_diagnostics_contract.py")
+        self.assertIn("os.replace(temporary, path)", contract_source)
+        self.assertIn("allow_nan=False", contract_source)
         self.assertIn("validate_artifact()", workflow)
         self.assertIn("needs.prepare.result == 'success'", workflow)
         self.assertIn('remote_stderr_bytes="$(wc -c <"$ssh_error"', workflow)
@@ -1806,7 +1808,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn('SSH_CLEANUP_OUTCOME:', workflow)
         self.assertIn('write_fallback()', workflow)
         self.assertIn('>/dev/null 2>/dev/null', workflow)
-        self.assertIn('raw_output_included', workflow)
+        self.assertIn('raw_output_included', contract_source)
         self.assertIn('regular file:1:600', workflow)
         self.assertIn('bounded evidence was published', workflow)
         self.assertIn(
@@ -1836,10 +1838,69 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             workflow.index("- name: Sanitize storage diagnostic evidence"),
         )
         self.assertLess(
-            workflow.index("- name: Upload storage diagnostic evidence"),
             workflow.index("- name: Remove private storage diagnostic captures"),
+            workflow.index("- name: Upload storage diagnostic evidence"),
         )
         self.assertIn('rmdir -- "$projector_dir"', workflow)
+
+    def test_storage_diagnostics_upload_is_gated_after_private_cleanup(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        sanitize_start = workflow.index(
+            "- name: Sanitize storage diagnostic evidence"
+        )
+        cleanup_start = workflow.index(
+            "- name: Remove private storage diagnostic captures"
+        )
+        upload_start = workflow.index("- name: Upload storage diagnostic evidence")
+        self.assertLess(sanitize_start, cleanup_start)
+        self.assertLess(cleanup_start, upload_start)
+        cleanup = workflow[cleanup_start:upload_start]
+        upload = workflow[upload_start:]
+        self.assertIn("if: ${{ always() }}", cleanup)
+        self.assertNotIn(
+            "platform-production-storage-diagnostics-artifact.txt", cleanup
+        )
+        self.assertIn(
+            "if: ${{ always() && steps.cleanup_captures.outcome == 'success' }}",
+            upload,
+        )
+        self.assertNotIn("\n      - name:", upload)
+        sanitize = workflow[sanitize_start:cleanup_start]
+        self.assertIn("projector_status=1", sanitize)
+        self.assertIn("exit 1", sanitize)
+
+    def test_storage_diagnostics_lock_probe_preserves_lock_metadata(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("the production lock contract requires a root-owned file")
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        probe_start = workflow.index(
+            "          import errno", workflow.index("lock_state=")
+        )
+        probe_end = workflow.index("          PY", probe_start)
+        probe = textwrap.dedent(workflow[probe_start:probe_end])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lock_path = root / "retained-load.lock"
+            lock_path.write_bytes(b"coordination lock\n")
+            lock_path.chmod(0o600)
+            before = lock_path.stat()
+            probe_path = root / "probe.py"
+            probe_path.write_text(probe, encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, "-I", str(probe_path), str(lock_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "unlocked")
+            after = lock_path.stat()
+            self.assertEqual(after.st_size, before.st_size)
+            self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
 
     def test_as12_proof_is_read_only_and_sha_locked(self) -> None:
         proof = (WORKFLOW_DIR / "platform-production-as12-proof.yml").read_text(

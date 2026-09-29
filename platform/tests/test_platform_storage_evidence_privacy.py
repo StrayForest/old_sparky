@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -120,7 +122,11 @@ def valid_storage_report() -> bytes:
                         "protected": [],
                         "retained": [],
                         "deleted": [],
-                        "reclaimable_bytes": 0,
+                        "reclaimed_tombstones": [],
+                        "protected_count": 0,
+                        "retained_count": 0,
+                        "deleted_count": 0,
+                        "reclaimed_tombstone_count": 0,
                     },
                     "transient": {
                         "failed_builds": {"count": 0, "reclaimable_bytes": 0},
@@ -454,7 +460,11 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
                         "protected": ["runtime-" + "a" * 40],
                         "retained": [],
                         "deleted": [],
-                        "reclaimable_bytes": 0,
+                        "reclaimed_tombstones": [],
+                        "protected_count": 1,
+                        "retained_count": 0,
+                        "deleted_count": 0,
+                        "reclaimed_tombstone_count": 0,
                     },
                     "transient": {
                         "reclaimable_bytes": {
@@ -506,6 +516,118 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertTrue(report["backup"]["checksum_present"])
         self.assertEqual(report["categories"]["production_releases"]["reclaimable_bytes"], 8192)
         self.assertEqual(report["transient_reclaimable_bytes"]["failed_builds"], 1024)
+
+    def test_retention_summary_accepts_actual_maintenance_json_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app_dir = root / "app"
+            releases_dir = app_dir / "releases"
+            current = releases_dir / "release-current"
+            previous = releases_dir / "release-previous"
+            current.mkdir(parents=True)
+            previous.mkdir()
+            (app_dir / "shared" / "preprod-screenshots").mkdir(parents=True)
+            source_dir = root / "dist" / "releases"
+            source_dir.mkdir(parents=True)
+            web_dir = root / "web"
+            web_dir.mkdir()
+            live_qa_root = root / "live-qa"
+            live_qa_root.mkdir()
+            (current / "RELEASE.json").write_text(
+                json.dumps({"source_git_commit": "a" * 40}) + "\n",
+                encoding="utf-8",
+            )
+            (previous / "RELEASE.json").write_text(
+                json.dumps({"source_git_commit": "b" * 40}) + "\n",
+                encoding="utf-8",
+            )
+            (app_dir / "current").symlink_to(current)
+            (app_dir / "previous").symlink_to(previous)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        Path(__file__).resolve().parents[1]
+                        / "tools"
+                        / "platform_storage_maintenance.py"
+                    ),
+                    "--app-dir",
+                    str(app_dir),
+                    "--source-release-dir",
+                    str(source_dir),
+                    "--web-artifact-dir",
+                    str(web_dir),
+                    "--live-qa-runtime-root",
+                    str(live_qa_root),
+                    "--skip-backup",
+                    "--minimum-free-gib",
+                    "0",
+                    "--maximum-used-percent",
+                    "100",
+                    "--json",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            raw_report = json.loads(completed.stdout)
+            self.assertEqual(
+                set(raw_report["live_qa_runtime_caches"]),
+                {
+                    "protected",
+                    "retained",
+                    "deleted",
+                    "reclaimed_tombstones",
+                    "protected_count",
+                    "retained_count",
+                    "deleted_count",
+                    "reclaimed_tombstone_count",
+                },
+            )
+            projected = summarize_retention(completed.stdout)
+            self.assertEqual(
+                projected["categories"]["live_qa_runtime"],
+                {
+                    "protected_count": 0,
+                    "retained_count": 0,
+                    "deleted_count": 0,
+                    "reclaimed_tombstone_count": 0,
+                },
+            )
+            self.assertNotIn(
+                "reclaimable_bytes",
+                projected["categories"]["live_qa_runtime"],
+            )
+
+    def test_live_qa_retention_missing_tombstone_count_rejects_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            stderr_path.write_bytes(b"")
+            report_path.write_bytes(valid_storage_report())
+            artifact = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(artifact["status"], "passed")
+            retention = artifact["sections"]["retention"]
+            del retention["categories"]["live_qa_runtime"][
+                "reclaimed_tombstone_count"
+            ]
+            self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+            retention["categories"]["live_qa_runtime"][
+                "reclaimed_tombstone_count"
+            ] = 0
+            artifact["remote_stderr_bytes"] = None
+            self.assertFalse(diagnostics_contract.validate_artifact(artifact))
 
     def test_failure_schema_is_closed_and_success_validation_is_strict(self) -> None:
         failure_keys = {
@@ -641,14 +763,19 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
             Path(__file__).resolve().parents[2]
             / ".github/workflows/platform-production-storage-diagnostics.yml"
         ).read_text(encoding="utf-8")
+        contract_source = (
+            Path(__file__).resolve().parents[1]
+            / "tools/platform_storage_diagnostics_contract.py"
+        ).read_text(encoding="utf-8")
         for value in (
             *diagnostics_contract.SAFE_FAILURE_PHASES,
             *diagnostics_contract.SAFE_FAILURE_REASONS,
             *diagnostics_contract.SAFE_FAILURE_ACTIONS,
         ):
-            self.assertIn(f'"{value}"', workflow)
+            self.assertIn(f'"{value}"', contract_source)
         for key in diagnostics_contract.FAILURE_KEYS:
-            self.assertIn(f'"{key}"', workflow)
+            self.assertIn(f'"{key}"', contract_source)
+        self.assertIn("platform_storage_diagnostics_contract.py", workflow)
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

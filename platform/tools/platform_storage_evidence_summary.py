@@ -377,6 +377,29 @@ def _section_summary(section: Any) -> dict[str, object]:
     }
 
 
+def _live_qa_section_summary(section: Any) -> dict[str, object]:
+    """Project the live-QA producer's tombstone semantics without bytes."""
+
+    if not isinstance(section, dict):
+        section = {}
+
+    def count(name: str) -> int | None:
+        value = section.get(name)
+        return len(value) if isinstance(value, list) else None
+
+    return {
+        "protected_count": count("protected"),
+        "retained_count": count("retained"),
+        "deleted_count": count("deleted"),
+        # The maintenance producer does not measure reclaimed bytes for live
+        # QA.  Preserve its actual audit count; a missing field remains None
+        # and is rejected by the closed contract rather than becoming zero.
+        "reclaimed_tombstone_count": _safe_int(
+            section.get("reclaimed_tombstone_count"), maximum=10**18
+        ),
+    }
+
+
 def summarize_retention(raw: str) -> dict[str, object]:
     try:
         payload = json.loads(raw)
@@ -389,7 +412,9 @@ def summarize_retention(raw: str) -> dict[str, object]:
         "source_release_artifacts": _section_summary(
             payload.get("source_release_artifacts")
         ),
-        "live_qa_runtime": _section_summary(payload.get("live_qa_runtime_caches")),
+        "live_qa_runtime": _live_qa_section_summary(
+            payload.get("live_qa_runtime_caches")
+        ),
     }
     transient = payload.get("transient")
     transient_bytes: dict[str, int | None] = {}
