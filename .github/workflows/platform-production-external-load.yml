@@ -42,7 +42,7 @@ concurrency:
 
 jobs:
   trusted-external-load:
-    uses: StrayForest/old_sparky/.github/workflows/platform-production-external-load-trusted.yml@579cec5d4bdd6e98dcfe44df4e95015211a77bd5
+    uses: StrayForest/old_sparky/.github/workflows/platform-production-external-load-trusted.yml@4f68a94de85e8354547e1a4222818863f9aeb924
     with:
       confirmation: ${{ inputs.confirmation }}
       control_email: ${{ inputs.control_email }}
