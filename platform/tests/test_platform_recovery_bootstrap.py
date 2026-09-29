@@ -642,16 +642,18 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("bundle_stat_after", workflow)
         self.assertIn("bundle_digest_before", workflow)
         self.assertIn("bundle_digest_after", workflow)
-        for extension in (
-            'extensions.get("issuer")',
-            'extensions.get("sourceRepositoryURI")',
-            'extensions.get("sourceRepositoryRef")',
-            'extensions.get("sourceRepositoryDigest")',
-            'extensions.get("buildConfigURI")',
-            'extensions.get("buildSignerURI")',
-            'extensions.get("runInvocationURI")',
+        for certificate_field in (
+            'certificate.get("issuer")',
+            'certificate.get("sourceRepositoryURI")',
+            'certificate.get("sourceRepositoryRef")',
+            'certificate.get("sourceRepositoryDigest")',
+            'certificate.get("buildConfigURI")',
+            'certificate.get("buildSignerURI")',
+            'certificate.get("runInvocationURI")',
         ):
-            self.assertIn(extension, workflow)
+            self.assertIn(certificate_field, workflow)
+        self.assertNotIn('certificate.get("extensions")', workflow)
+        self.assertNotIn('extensions.get("issuer")', workflow)
         self.assertNotIn('extensions.get("Issuer")', workflow)
         self.assertNotIn('extensions.get("SourceRepositoryURI")', workflow)
         self.assertNotIn('statement.get("predicateType")', workflow)
@@ -1086,7 +1088,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             ".github/workflows/platform-production-recovery-bootstrap-build.yml"
             "@refs/heads/dev"
         )
-        extensions = {
+        certificate = {
             "issuer": "https://token.actions.githubusercontent.com",
             "sourceRepositoryURI": "https://github.com/StrayForest/old_sparky",
             "sourceRepositoryRef": "refs/heads/dev",
@@ -1101,7 +1103,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         payload = [
             {
                 "verificationResult": {
-                    "signature": {"certificate": {"extensions": extensions}},
+                    "signature": {"certificate": certificate},
                     "verifiedTimestamps": [{"timestamp": "2026-09-27T00:00:00Z"}],
                     "statement": {
                         "subject": [{"digest": {"sha256": bundle_digest}}],
@@ -1152,24 +1154,43 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 ),
             ):
                 with self.subTest(field=field):
-                    original = extensions[field]
-                    extensions[field] = bad_value
+                    original = certificate[field]
+                    certificate[field] = bad_value
                     try:
                         self.assertNotEqual(run_policy().returncode, 0)
                     finally:
-                        extensions[field] = original
-            original_runner = extensions["runInvocationURI"]
-            extensions["runInvocationURI"] = original_runner.replace("12345", "54321")
+                        certificate[field] = original
+            original_runner = certificate["runInvocationURI"]
+            certificate["runInvocationURI"] = original_runner.replace("12345", "54321")
             try:
                 self.assertNotEqual(run_policy().returncode, 0)
             finally:
-                extensions["runInvocationURI"] = original_runner
+                certificate["runInvocationURI"] = original_runner
             subject = payload[0]["verificationResult"]["statement"]["subject"][0]["digest"]
             subject["sha256"] = "c" * 64
             try:
                 self.assertNotEqual(run_policy().returncode, 0)
             finally:
                 subject["sha256"] = bundle_digest
+            payload[0]["verificationResult"]["signature"]["certificate"] = {
+                "extensions": dict(certificate),
+            }
+            try:
+                self.assertNotEqual(run_policy().returncode, 0)
+            finally:
+                payload[0]["verificationResult"]["signature"]["certificate"] = certificate
+            payload[0]["verificationResult"]["verifiedTimestamps"] = []
+            try:
+                self.assertNotEqual(run_policy().returncode, 0)
+            finally:
+                payload[0]["verificationResult"]["verifiedTimestamps"] = [{"timestamp": "2026-09-27T00:00:00Z"}]
+            payload[0]["verificationResult"]["statement"]["subject"].append(
+                {"digest": {"sha256": bundle_digest}}
+            )
+            try:
+                self.assertNotEqual(run_policy().returncode, 0)
+            finally:
+                payload[0]["verificationResult"]["statement"]["subject"].pop()
     def test_publish_validation_is_closed_and_behaviourally_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
