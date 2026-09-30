@@ -831,6 +831,8 @@ jobs:
               "platform-recovery-bootstrap/manifest.json",
               "platform-recovery-bootstrap/platform_abort_retained_only.sh",
               "platform-recovery-bootstrap/platform_live_qa_guard.py",
+              "platform-recovery-bootstrap/platform_live_qa_runtime_inputs.json",
+              "platform-recovery-bootstrap/platform_live_qa_runtime_inputs.py",
               "platform-recovery-bootstrap/platform_live_qa_runtime_install.py",
               "platform-recovery-bootstrap/platform_recovery_bootstrap.py",
               "platform-recovery-bootstrap/platform_release_lock.sh",
@@ -894,7 +896,7 @@ jobs:
                           pass
                       raise
           PY
-          for name in manifest.json platform_abort_retained_only.sh platform_live_qa_guard.py platform_live_qa_runtime_install.py platform_recovery_bootstrap.py platform_release_lock.sh platform_release_restore_runtime.sh platform_release_systemd_state.py platform_release_transaction.py platform_recover_pending.sh; do
+          for name in manifest.json platform_abort_retained_only.sh platform_live_qa_guard.py platform_live_qa_runtime_inputs.json platform_live_qa_runtime_inputs.py platform_live_qa_runtime_install.py platform_recovery_bootstrap.py platform_release_lock.sh platform_release_restore_runtime.sh platform_release_systemd_state.py platform_release_transaction.py platform_recover_pending.sh; do
             if [[ "$name" == *.sh ]]; then
               validate_stage_file "$payload/$name" 555
             else

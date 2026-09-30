@@ -15,6 +15,7 @@ import tempfile
 import stat
 import textwrap
 import unittest
+from unittest import mock
 import zipfile
 
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
@@ -23,6 +24,7 @@ from tests.test_platform_validate_release_artifact import (
     RELEASE_SLUG,
     VALIDATOR_SCRIPT,
 )
+from tools import platform_live_qa_runtime_inputs
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -148,6 +150,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         for name in (
             "platform_build_live_qa_runtime.py",
             "platform_live_qa_guard.py",
+            "platform_live_qa_runtime_inputs.py",
+            "platform_live_qa_runtime_inputs.json",
         ):
             destination = tools / name
             shutil.copyfile(TOOLS_DIR / name, destination)
@@ -278,7 +282,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         (node_home / "bin").mkdir(mode=0o755, parents=True)
         cls._write_fixture_file(node_home / "bin/node", b"#!/bin/sh\n", mode=0o755)
         for relative in (
+            "package.json",
             "playwright.live.config.ts",
+            "tests/smoke/live-launch.spec.ts",
             "tests/smoke/live-user-journey.spec.ts",
             "tests/support/live-qa-origin.ts",
             "tests/support/live-qa-sandbox.ts",
@@ -410,6 +416,50 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             for index in range(count)
         ]
 
+    def test_runtime_input_loader_rejects_path_replacement_between_lstat_and_open(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = root / "platform_live_qa_runtime_inputs.json"
+            replacement_path = root / "replacement.json"
+            manifest_path.write_bytes(
+                (TOOLS_DIR / "platform_live_qa_runtime_inputs.json").read_bytes()
+            )
+            os.chmod(manifest_path, 0o444)
+            manifest_bytes = manifest_path.read_bytes()
+            replaced = False
+            real_open = platform_live_qa_runtime_inputs.os.open
+
+            def replace_before_open(
+                candidate: str | os.PathLike[str],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                if Path(candidate) == manifest_path and not replaced:
+                    replacement_path.write_bytes(manifest_bytes)
+                    os.chmod(replacement_path, 0o444)
+                    os.replace(replacement_path, manifest_path)
+                    replaced = True
+                if dir_fd is None:
+                    return real_open(candidate, flags, mode)
+                return real_open(candidate, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch.object(
+                platform_live_qa_runtime_inputs.os,
+                "open",
+                side_effect=replace_before_open,
+            ):
+                with self.assertRaisesRegex(
+                    platform_live_qa_runtime_inputs.RuntimeInputsError,
+                    "changed before it was opened",
+                ):
+                    platform_live_qa_runtime_inputs.load_manifest(manifest_path)
+            self.assertTrue(replaced)
+
     def test_staged_live_qa_build_materializes_validated_browser_links(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -467,6 +517,14 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             spec.loader.exec_module(installer)
             installer.CHROMIUM_SANDBOX_SIZE = len(sandbox)
             installer.CHROMIUM_SANDBOX_SHA256 = hashlib.sha256(sandbox).hexdigest()
+            release_tools = output.parent / "tools"
+            release_tools.mkdir(mode=0o755)
+            shutil.copyfile(
+                TOOLS_DIR / "platform_live_qa_runtime_inputs.json",
+                release_tools / "platform_live_qa_runtime_inputs.json",
+            )
+            os.chown(release_tools / "platform_live_qa_runtime_inputs.json", 0, 0)
+            os.chmod(release_tools / "platform_live_qa_runtime_inputs.json", 0o644)
             installer._validate_runtime_source(output)
 
     def test_staged_live_qa_builder_output_passes_standalone_artifact_validator(
@@ -492,6 +550,35 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertIn(
                 "browsers/chromium-1228/chrome-linux64/resources/accessibility/ax",
                 manifest["files"],
+            )
+
+            loader_check = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    "-c",
+                    (
+                        "import runpy, sys; "
+                        "module = runpy.run_path(sys.argv[1]); "
+                        "print(module['INPUT_MANIFEST_SHA256'])"
+                    ),
+                    str(TOOLS_DIR / "platform_live_qa_runtime_inputs.py"),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(loader_check.returncode, 0, loader_check.stderr)
+            input_manifest = json.loads(
+                (TOOLS_DIR / "platform_live_qa_runtime_inputs.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            self.assertEqual(loader_check.stdout.strip(), input_manifest["digest"])
+            self.assertEqual(
+                loader_check.stdout.strip(), manifest["input_manifest_sha256"]
             )
 
             artifact = root / f"{RELEASE_SLUG}.tar.gz"
@@ -1086,7 +1173,6 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 "web-hermetic",
                 "verification-contract",
             ]
-
             def manifest_payload(runtime_sensitive: bool) -> dict[str, object]:
                 payload: dict[str, object] = {
                     "schema": 1,
@@ -1099,7 +1185,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                     "deployable": True,
                     "fallback": False,
                     "reason": "platform change requires full verification",
-                    "files": ["platform/tools/example.py"],
+                    "files": [
+                        (
+                            "platform/apps/platform_web/package.json"
+                            if runtime_sensitive
+                            else "platform/tools/example.py"
+                        )
+                    ],
                 }
                 payload["digest"] = hashlib.sha256(
                     json.dumps(

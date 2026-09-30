@@ -40,6 +40,21 @@ AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-autode
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
 STATUS_FINALIZER_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security-status-finalizer.yml"
 
+
+def complete_provenance(
+    *, event: str, target_sha: str, branch: str, base: str | None = None,
+    head: str | None = None,
+) -> dict[str, object]:
+    """Build an explicit trusted-range fixture; missing input must stay fallback."""
+
+    return {
+        "complete": True,
+        "base": base or "b" * 40,
+        "head": head or target_sha,
+        "ref": f"refs/heads/{branch}",
+        "source": "github-event",
+    }
+
 # PR117 was merged as a real merge commit.  The push range is the first
 # parent (the branch before the merge) to that merge commit; the PR range is
 # the same base to the source head.  In particular, the PR fixture must not
@@ -96,6 +111,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     target_sha,
                     "--branch",
                     branch,
+                    "--ref",
+                    f"refs/heads/{branch}",
                     "--event-file",
                     str(event_path),
                     "--repo-root",
@@ -154,9 +171,29 @@ class PlatformCiClassifierTests(unittest.TestCase):
             event="push",
             target_sha=self.TARGET_SHA,
             branch="dev",
+            provenance=complete_provenance(
+                event="push", target_sha=self.TARGET_SHA, branch="dev"
+            ),
         )
         self.assertEqual(manifest["schema"], 1)
         self.assertEqual(manifest["version"], 1)
+        self.assertEqual(
+            set(manifest),
+            {
+                "schema",
+                "version",
+                "target_sha",
+                "event",
+                "class",
+                "expected_gates",
+                "runtime_sensitive",
+                "deployable",
+                "fallback",
+                "reason",
+                "files",
+                "digest",
+            },
+        )
         self.assertEqual(manifest["class"], "docs-only")
         self.assertEqual(manifest["expected_gates"], list(DOCS_ONLY_GATE_IDS))
         self.assertFalse(manifest["deployable"])
@@ -170,6 +207,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             event="push",
             target_sha=self.TARGET_SHA,
             branch="dev",
+            provenance=complete_provenance(
+                event="push", target_sha=self.TARGET_SHA, branch="dev"
+            ),
         )
         self.assertEqual(manifest["class"], "full")
         self.assertEqual(manifest["expected_gates"], list(FULL_GATE_IDS))
@@ -210,6 +250,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 event=event,
                 target_sha=self.TARGET_SHA,
                 branch="dev" if event == "push" else "feature/candidate",
+                provenance=complete_provenance(
+                    event=event,
+                    target_sha=self.TARGET_SHA,
+                    branch="dev" if event == "push" else "feature/candidate",
+                ),
             )
             for event in ("pull_request", "push")
         }
@@ -226,7 +271,6 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
         tampered = dict(manifests["push"])
         tampered["deployable"] = True
-        tampered["digest"] = manifest_digest(tampered)
         with self.assertRaises(ClassifierError):
             validate_manifest(tampered)
 
@@ -316,12 +360,20 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     event="pull_request",
                     target_sha=self.TARGET_SHA,
                     branch="feature/candidate",
+                    provenance=complete_provenance(
+                        event="pull_request",
+                        target_sha=self.TARGET_SHA,
+                        branch="feature/candidate",
+                    ),
                 )
                 push = classify(
                     [path],
                     event="push",
                     target_sha=self.TARGET_SHA,
                     branch="dev",
+                    provenance=complete_provenance(
+                        event="push", target_sha=self.TARGET_SHA, branch="dev"
+                    ),
                 )
                 self.assertEqual(pull_request["class"], "full")
                 self.assertFalse(pull_request["deployable"])
@@ -336,6 +388,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             event="push",
             target_sha=self.TARGET_SHA,
             branch="dev",
+            provenance=complete_provenance(
+                event="push", target_sha=self.TARGET_SHA, branch="dev"
+            ),
         )
         self.assertEqual(recovery_only["class"], "full")
         self.assertFalse(recovery_only["deployable"])
@@ -351,6 +406,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             event="push",
             target_sha=self.TARGET_SHA,
             branch="dev",
+            provenance=complete_provenance(
+                event="push", target_sha=self.TARGET_SHA, branch="dev"
+            ),
         )
         self.assertEqual(mixed["class"], "full")
         self.assertTrue(mixed["deployable"])
@@ -372,6 +430,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     event="push",
                     target_sha=self.TARGET_SHA,
                     branch="dev",
+                    provenance=complete_provenance(
+                        event="push", target_sha=self.TARGET_SHA, branch="dev"
+                    ),
                 )
                 self.assertEqual(mixed_control["class"], "full")
                 self.assertFalse(mixed_control["fallback"])
@@ -424,6 +485,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
                         event=event,
                         target_sha=self.TARGET_SHA,
                         branch=branch,
+                        provenance=complete_provenance(
+                            event=event, target_sha=self.TARGET_SHA, branch=branch
+                        ),
                     )
                     self.assertEqual(manifest["class"], expected_class)
                     self.assertEqual(manifest["fallback"], expected_fallback)
@@ -438,21 +502,50 @@ class PlatformCiClassifierTests(unittest.TestCase):
             [runtime_path],
             event="pull_request",
             target_sha=self.TARGET_SHA,
+            provenance=complete_provenance(
+                event="pull_request",
+                target_sha=self.TARGET_SHA,
+                branch="feature/runtime",
+            ),
         )
         self.assertTrue(runtime["runtime_sensitive"])
         validate_manifest(runtime, expected_target_sha=self.TARGET_SHA)
 
         for files in (
             ["platform/docs/test-suite-governance.md"],
-            ["platform/apps/platform_web/package.json"],
         ):
             with self.subTest(files=files):
                 manifest = classify(
                     files,
                     event="pull_request",
                     target_sha=self.TARGET_SHA,
+                    provenance=complete_provenance(
+                        event="pull_request",
+                        target_sha=self.TARGET_SHA,
+                        branch="feature/docs",
+                    ),
                 )
                 self.assertFalse(manifest["runtime_sensitive"])
+                validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+        for files in (
+            ["platform/apps/platform_web/package.json"],
+            ["platform/apps/platform_web/package-lock.json"],
+            ["platform/tools/platform_live_qa_runtime_inputs.json"],
+        ):
+            with self.subTest(runtime_sensitive_files=files):
+                manifest = classify(
+                    files,
+                    event="pull_request",
+                    target_sha=self.TARGET_SHA,
+                    provenance=complete_provenance(
+                        event="pull_request",
+                        target_sha=self.TARGET_SHA,
+                        branch="feature/runtime",
+                    ),
+                )
+                self.assertTrue(manifest["runtime_sensitive"])
+                self.assertFalse(manifest["fallback"])
                 validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
 
         tampered = dict(runtime)
@@ -467,6 +560,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             event="push",
             target_sha=self.TARGET_SHA,
             branch="dev",
+            provenance=complete_provenance(
+                event="push", target_sha=self.TARGET_SHA, branch="dev"
+            ),
         )
         self.assertEqual(manifest["class"], "out-of-scope")
         self.assertEqual(manifest["expected_gates"], list(OUT_OF_SCOPE_GATE_IDS))
@@ -504,8 +600,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
             branch="dev",
         )
         self.assertEqual(workflow_dispatch["event"], "workflow_dispatch")
-        self.assertEqual(workflow_dispatch["class"], "docs-only")
-        self.assertFalse(workflow_dispatch["fallback"])
+        self.assertEqual(workflow_dispatch["class"], "full")
+        self.assertTrue(workflow_dispatch["fallback"])
         self.assertTrue(workflow_dispatch["runtime_sensitive"])
         self.assertFalse(workflow_dispatch["deployable"])
 
@@ -520,6 +616,216 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertTrue(shallow["fallback"])
         self.assertTrue(shallow["runtime_sensitive"])
         self.assertFalse(shallow["deployable"])
+
+    def test_file_list_without_complete_provenance_cannot_select_a_reduced_route(self) -> None:
+        manifest = classify(
+            ["platform/docs/CURRENT.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(manifest["class"], "full")
+        self.assertTrue(manifest["fallback"])
+        self.assertTrue(manifest["runtime_sensitive"])
+        self.assertFalse(manifest["deployable"])
+        validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+    def test_incomplete_or_tampered_provenance_stays_full_and_digest_bound(self) -> None:
+        incomplete = {
+            "complete": False,
+            "base": "",
+            "head": "",
+            "ref": "refs/heads/dev",
+            "source": "git-diff",
+        }
+        manifest = classify(
+            ["platform/docs/CURRENT.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+            provenance=incomplete,
+        )
+        self.assertTrue(manifest["fallback"])
+        validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+        tampered = dict(manifest)
+        tampered["provenance"] = {
+            "complete": True,
+            "base": self.TARGET_SHA,
+            "head": self.TARGET_SHA,
+            "ref": "refs/heads/dev",
+            "source": "github-event",
+        }
+        tampered["digest"] = manifest_digest(tampered)
+        with self.assertRaises(ClassifierError):
+            validate_manifest(tampered, expected_target_sha=self.TARGET_SHA)
+
+    def test_raw_files_input_without_provenance_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files_path = root / "files.txt"
+            output_path = root / "classifier-manifest.json"
+            files_path.write_text("platform/docs/CURRENT.md\n", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "platform/tools/platform_ci_classifier.py"),
+                    "--event",
+                    "push",
+                    "--target-sha",
+                    self.TARGET_SHA,
+                    "--branch",
+                    "dev",
+                    "--files-file",
+                    str(files_path),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            manifest = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["class"], "full")
+            self.assertTrue(manifest["fallback"])
+            self.assertTrue(manifest["runtime_sensitive"])
+            self.assertFalse(manifest["deployable"])
+            validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+    def test_explicit_empty_provenance_overrides_generated_range_without_files_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            provenance_path = root / "provenance.json"
+            output_path = root / "classifier-manifest.json"
+            event_path.write_text(
+                json.dumps({"before": PR117_BASE_SHA, "after": PR117_MERGE_SHA}),
+                encoding="utf-8",
+            )
+            provenance_path.write_text("{}", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "platform/tools/platform_ci_classifier.py"),
+                    "--event",
+                    "push",
+                    "--target-sha",
+                    PR117_MERGE_SHA,
+                    "--branch",
+                    "dev",
+                    "--ref",
+                    "refs/heads/dev",
+                    "--event-file",
+                    str(event_path),
+                    "--provenance-file",
+                    str(provenance_path),
+                    "--repo-root",
+                    str(REPO_ROOT),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            manifest = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["class"], "full")
+            self.assertTrue(manifest["fallback"])
+            self.assertTrue(manifest["runtime_sensitive"])
+            self.assertFalse(manifest["deployable"])
+            validate_manifest(manifest, expected_target_sha=PR117_MERGE_SHA)
+
+    def test_push_requires_head_equal_to_tested_sha_but_pr_uses_source_head(self) -> None:
+        push = classify(
+            ["platform/docs/CURRENT.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+            provenance=complete_provenance(
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+                head="b" * 40,
+            ),
+        )
+        self.assertTrue(push["fallback"])
+        self.assertFalse(push["deployable"])
+
+        pull_request = classify(
+            ["platform/docs/CURRENT.md"],
+            event="pull_request",
+            target_sha=self.TARGET_SHA,
+            branch="feature/source",
+            provenance=complete_provenance(
+                event="pull_request",
+                target_sha=self.TARGET_SHA,
+                branch="feature/source",
+                head="b" * 40,
+            ),
+        )
+        self.assertFalse(pull_request["fallback"])
+        self.assertFalse(pull_request["deployable"])
+
+    def test_all_zero_push_head_or_target_sha_is_fail_closed(self) -> None:
+        full_files = ["platform/apps/platform_api/app/main.py"]
+        zero_head = classify(
+            full_files,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+            provenance=complete_provenance(
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+                head="0" * 40,
+            ),
+        )
+        zero_target = classify(
+            full_files,
+            event="push",
+            target_sha="0" * 40,
+            branch="dev",
+            provenance=complete_provenance(
+                event="push",
+                target_sha="0" * 40,
+                branch="dev",
+            ),
+        )
+        for label, manifest, expected_target in (
+            ("zero head", zero_head, self.TARGET_SHA),
+            ("zero target", zero_target, "0" * 40),
+        ):
+            with self.subTest(sha=label):
+                self.assertEqual(manifest["class"], "full")
+                self.assertTrue(manifest["fallback"])
+                self.assertTrue(manifest["runtime_sensitive"])
+                self.assertFalse(manifest["deployable"])
+                validate_manifest(manifest, expected_target_sha=expected_target)
+
+        generated_zero_head = self._run_classifier_fixture(
+            event="push",
+            payload={"before": PR117_BASE_SHA, "after": "0" * 40},
+            target_sha=PR117_MERGE_SHA,
+            branch="dev",
+        )
+        generated_zero_target = self._run_classifier_fixture(
+            event="push",
+            payload={"before": PR117_BASE_SHA, "after": PR117_MERGE_SHA},
+            target_sha="0" * 40,
+            branch="dev",
+        )
+        for label, manifest, expected_target in (
+            ("generated zero head", generated_zero_head, PR117_MERGE_SHA),
+            ("generated zero target", generated_zero_target, "0" * 40),
+        ):
+            with self.subTest(generated_sha=label):
+                self.assertEqual(manifest["class"], "full")
+                self.assertTrue(manifest["fallback"])
+                self.assertTrue(manifest["runtime_sensitive"])
+                self.assertFalse(manifest["deployable"])
+                validate_manifest(manifest, expected_target_sha=expected_target)
 
     def test_malformed_input_cannot_be_promoted_by_tampering(self) -> None:
         malformed = classify(
@@ -978,9 +1284,17 @@ class PlatformCiClassifierTests(unittest.TestCase):
             ["platform/apps/platform_api/app/main.py"],
             event="pull_request",
             target_sha=self.TARGET_SHA,
+            branch="feature/status",
+            provenance=complete_provenance(
+                event="pull_request",
+                target_sha=self.TARGET_SHA,
+                branch="feature/status",
+                head="b" * 40,
+            ),
         )
         self.assertEqual(pr_manifest["target_sha"], self.TARGET_SHA)
         self.assertEqual(pr_manifest["event"], "pull_request")
+        self.assertFalse(pr_manifest["fallback"])
         self.assertIn("STATUS_START_RESULT", workflow)
         self.assertIn("published_event", workflow)
         self.assertIn("expected_by_class", workflow)
@@ -1261,6 +1575,12 @@ class PlatformCiClassifierTests(unittest.TestCase):
             ["platform/apps/platform_web/package.json"],
             event="pull_request",
             target_sha=self.TARGET_SHA,
+            branch="feature/runtime",
+            provenance=complete_provenance(
+                event="pull_request",
+                target_sha=self.TARGET_SHA,
+                branch="feature/runtime",
+            ),
         )
         encoded = json.dumps(manifest, sort_keys=True)
         self.assertEqual(json.loads(encoded), manifest)
@@ -1270,6 +1590,12 @@ class PlatformCiClassifierTests(unittest.TestCase):
             ["platform/apps/platform_web/package.json"],
             event="pull_request",
             target_sha=self.TARGET_SHA,
+            branch="feature/runtime",
+            provenance=complete_provenance(
+                event="pull_request",
+                target_sha=self.TARGET_SHA,
+                branch="feature/runtime",
+            ),
         )
         manifest["reason"] = "safe\nmalicious=true"
         with tempfile.TemporaryDirectory() as temporary:
@@ -1281,6 +1607,12 @@ class PlatformCiClassifierTests(unittest.TestCase):
             ["platform/apps/platform_web/package.json"],
             event="pull_request",
             target_sha=self.TARGET_SHA,
+            branch="feature/runtime",
+            provenance=complete_provenance(
+                event="pull_request",
+                target_sha=self.TARGET_SHA,
+                branch="feature/runtime",
+            ),
         )
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "output"

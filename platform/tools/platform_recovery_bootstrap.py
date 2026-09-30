@@ -95,6 +95,8 @@ RECOVERY_FILES = (
     "platform_release_restore_runtime.sh",
     "platform_release_systemd_state.py",
     "platform_live_qa_guard.py",
+    "platform_live_qa_runtime_inputs.json",
+    "platform_live_qa_runtime_inputs.py",
     "platform_live_qa_runtime_install.py",
     "platform_recover_pending.sh",
 )

@@ -24,11 +24,17 @@ import sys
 from typing import Iterable, Mapping, Sequence
 
 try:  # Imported as ``tools.platform_ci_classifier`` in the contract tests.
+    from .platform_live_qa_runtime_inputs import (
+        DEFAULT_MANIFEST as RUNTIME_INPUT_MANIFEST,
+    )
     from .platform_workflow_provenance import (
         parse_run_id,
         validate_security_marker,
     )
 except ImportError:  # Executed directly by the runner-side classifier.
+    from platform_live_qa_runtime_inputs import (  # type: ignore[no-redef]
+        DEFAULT_MANIFEST as RUNTIME_INPUT_MANIFEST,
+    )
     from platform_workflow_provenance import (  # type: ignore[no-redef]
         parse_run_id,
         validate_security_marker,
@@ -38,9 +44,12 @@ except ImportError:  # Executed directly by the runner-side classifier.
 MANIFEST_SCHEMA = 1
 MANIFEST_VERSION = 1
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+MAX_CHANGED_FILES = 3000
 SECURITY_WORKFLOW_PATH = ".github/workflows/platform-security.yml"
 SECURITY_WORKFLOW_NAME = "Platform security and build"
 MAX_OUTPUT_VALUE_LENGTH = 512
+PROVENANCE_KEYS = frozenset({"complete", "base", "head", "ref", "source"})
+PROVENANCE_SOURCES = frozenset({"git-diff", "github-event"})
 
 FULL_GATE_IDS: tuple[str, ...] = (
     "backend",
@@ -61,19 +70,7 @@ KNOWN_EVENTS = frozenset({"pull_request", "push", "merge_group", "workflow_dispa
 # this list exact prevents a docs or ordinary application change from paying
 # for the privileged builder regression while ensuring the builder, guard,
 # install/validator contracts and their hermetic test cannot bypass it.
-RUNTIME_SENSITIVE_FILES = frozenset(
-    {
-        "platform/tools/platform_build_live_qa_runtime.py",
-        "platform/tools/platform_build_release.sh",
-        "platform/tools/platform_live_qa_guard.py",
-        "platform/tools/platform_live_qa_runtime_install.py",
-        "platform/tools/platform_validate_release_artifact.py",
-        "platform/tests/test_platform_release_build_contract.py",
-        "platform/tests/test_platform_live_qa_guard.py",
-        "platform/tests/test_platform_live_qa_runtime_install.py",
-        "platform/tests/test_platform_validate_release_artifact.py",
-    }
-)
+RUNTIME_SENSITIVE_FILES = frozenset(RUNTIME_INPUT_MANIFEST.classifier_sensitive_paths)
 
 # These paths are intentionally narrow.  The repository guide declares these
 # trees outside the active platform, so they receive a repository-contract
@@ -295,17 +292,77 @@ def _normalise_files(files: Iterable[str]) -> tuple[list[str], str | None]:
             return [], "malformed changed-file list"
         if "\x00" in value or "\\" in value:
             return [], "malformed changed-file path"
-        if value.startswith("/") or value.startswith("../") or "/../" in value:
+        if (
+            value.startswith("/")
+            or value.startswith("../")
+            or "/../" in value
+            or value.startswith("./")
+            or value.endswith("/")
+            or "//" in value
+        ):
             return [], "malformed changed-file path"
-        if value.startswith("./"):
-            value = value[2:]
-        if not value or value.endswith("/"):
+        if any(component in {"", ".", ".."} for component in value.split("/")):
             return [], "malformed changed-file path"
         normalised.append(value)
     unique = sorted(set(normalised))
     if not unique:
         return [], "changed-file list is empty"
+    if len(unique) > MAX_CHANGED_FILES:
+        return [], "changed-file list exceeds its bound"
     return unique, None
+
+
+def _default_provenance() -> dict[str, object]:
+    return {
+        "complete": False,
+        "base": "",
+        "head": "",
+        "ref": "",
+        "source": "incomplete",
+    }
+
+
+def _normalise_provenance(
+    value: Mapping[str, object] | None,
+) -> tuple[dict[str, object], str | None]:
+    """Validate the exact range identity required for a reduced route."""
+
+    if value is None:
+        return _default_provenance(), "diff provenance is missing"
+    if set(value) != PROVENANCE_KEYS:
+        return _default_provenance(), "diff provenance is incomplete"
+    complete = value.get("complete")
+    base = value.get("base")
+    head = value.get("head")
+    ref = value.get("ref")
+    source = value.get("source")
+    if type(complete) is not bool:
+        return _default_provenance(), "diff provenance completeness is malformed"
+    if not isinstance(base, str) or not isinstance(head, str):
+        return _default_provenance(), "diff provenance SHA values are malformed"
+    if not isinstance(ref, str) or not ref or len(ref) > MAX_OUTPUT_VALUE_LENGTH:
+        return _default_provenance(), "diff provenance ref is malformed"
+    if any(not 0x20 <= ord(character) <= 0x7E for character in ref):
+        return _default_provenance(), "diff provenance ref is malformed"
+    if not isinstance(source, str) or source not in PROVENANCE_SOURCES:
+        return _default_provenance(), "diff provenance source is unknown"
+    normalised = {
+        "complete": complete,
+        "base": base.lower(),
+        "head": head.lower(),
+        "ref": ref,
+        "source": source,
+    }
+    if complete and (
+        SHA_RE.fullmatch(normalised["base"]) is None
+        or SHA_RE.fullmatch(normalised["head"]) is None
+        or set(normalised["base"]) == {"0"}
+        or set(normalised["head"]) == {"0"}
+    ):
+        return _default_provenance(), "diff provenance SHA values are malformed"
+    if not complete:
+        return normalised, "diff provenance is incomplete"
+    return normalised, None
 
 
 def _is_out_of_scope(path: str) -> bool:
@@ -378,6 +435,7 @@ def _build_manifest(
     reason: str,
     route_class: str,
     expected_gates: Sequence[str],
+    provenance: Mapping[str, object],
     runtime_sensitive: bool = False,
     non_deployable: bool = False,
 ) -> dict[str, object]:
@@ -389,6 +447,7 @@ def _build_manifest(
         and event == "push"
         and branch == "dev"
         and bool(SHA_RE.fullmatch(target_sha))
+        and set(target_sha) != {"0"}
     )
     payload: dict[str, object] = {
         "schema": MANIFEST_SCHEMA,
@@ -415,6 +474,7 @@ def classify(
     branch: str = "",
     repository_ready: bool = True,
     fallback_reason: str | None = None,
+    provenance: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a validated route manifest from a changed-file list.
 
@@ -425,21 +485,24 @@ def classify(
 
     raw_files = list(files)
     normalised, malformed_reason = _normalise_files(raw_files)
+    normalised_provenance, provenance_reason = _normalise_provenance(provenance)
     runtime_sensitive = any(path in RUNTIME_SENSITIVE_FILES for path in normalised)
     target_sha = target_sha.lower() if isinstance(target_sha, str) else ""
     event = event if isinstance(event, str) else ""
     branch = branch if isinstance(branch, str) else ""
-    # Only a complete pull-request/push range can prove that a non-sensitive
-    # route is safe.  Dispatch/merge-group events and every unavailable or
-    # malformed range therefore expose the conservative value for later
-    # workflow consumption, even when a caller supplied a plausible file list.
-    runtime_sensitive = (
-        event not in {"pull_request", "push"}
-        or not repository_ready
-        or malformed_reason is not None
-        or not normalised
-        or SHA_RE.fullmatch(target_sha) is None
-        or any(path in RUNTIME_SENSITIVE_FILES for path in normalised)
+    complete_range = (
+        event in {"pull_request", "push"}
+        and repository_ready
+        and malformed_reason is None
+        and provenance_reason is None
+        and bool(normalised_provenance.get("complete"))
+        and SHA_RE.fullmatch(target_sha) is not None
+        and set(target_sha) != {"0"}
+        and (
+            event != "push"
+            or normalised_provenance.get("head") == target_sha
+        )
+        and bool(normalised)
     )
 
     if not repository_ready:
@@ -452,7 +515,8 @@ def classify(
             reason=fallback_reason or "repository state is shallow or unavailable",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
-            runtime_sensitive=runtime_sensitive,
+            provenance=normalised_provenance,
+            runtime_sensitive=True,
         )
     if event not in KNOWN_EVENTS:
         return _build_manifest(
@@ -464,7 +528,8 @@ def classify(
             reason="event is missing or unknown",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
-            runtime_sensitive=runtime_sensitive,
+            provenance=normalised_provenance,
+            runtime_sensitive=True,
         )
     if event == "merge_group":
         return _build_manifest(
@@ -476,7 +541,8 @@ def classify(
             reason="merge_group requires full CI and has no deployment authority",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
-            runtime_sensitive=runtime_sensitive,
+            provenance=normalised_provenance,
+            runtime_sensitive=True,
         )
     if malformed_reason:
         return _build_manifest(
@@ -488,9 +554,10 @@ def classify(
             reason=malformed_reason,
             route_class="full",
             expected_gates=FULL_GATE_IDS,
-            runtime_sensitive=runtime_sensitive,
+            provenance=normalised_provenance,
+            runtime_sensitive=True,
         )
-    if not SHA_RE.fullmatch(target_sha):
+    if SHA_RE.fullmatch(target_sha) is None or set(target_sha) == {"0"}:
         return _build_manifest(
             target_sha=target_sha,
             event=event,
@@ -500,7 +567,8 @@ def classify(
             reason="target SHA is missing or malformed",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
-            runtime_sensitive=runtime_sensitive,
+            provenance=normalised_provenance,
+            runtime_sensitive=True,
         )
     if not normalised:
         return _build_manifest(
@@ -512,7 +580,21 @@ def classify(
             reason="changed-file list is missing",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
-            runtime_sensitive=runtime_sensitive,
+            provenance=normalised_provenance,
+            runtime_sensitive=True,
+        )
+    if provenance_reason is not None or not complete_range:
+        return _build_manifest(
+            target_sha=target_sha,
+            event=event,
+            files=normalised,
+            branch=branch,
+            fallback=True,
+            reason=fallback_reason or provenance_reason or "changed-file range is incomplete",
+            route_class="full",
+            expected_gates=FULL_GATE_IDS,
+            provenance=normalised_provenance,
+            runtime_sensitive=True,
         )
 
     route_class, expected_gates, reason, fallback = _route_for_files(normalised)
@@ -532,6 +614,7 @@ def classify(
         reason=reason,
         route_class=route_class,
         expected_gates=expected_gates,
+        provenance=normalised_provenance,
         runtime_sensitive=runtime_sensitive,
         non_deployable=candidate_packaging_only or recovery_bootstrap_only,
     )
@@ -547,6 +630,9 @@ def validate_manifest(
 
     if not isinstance(manifest, Mapping):
         raise ClassifierError("classifier manifest must be a JSON object")
+    expected_fields = set(_DIGEST_FIELDS) | {"digest"}
+    if set(manifest) != expected_fields:
+        raise ClassifierError("classifier manifest schema is not closed")
     if manifest.get("schema") != MANIFEST_SCHEMA:
         raise ClassifierError("unsupported classifier manifest schema")
     if manifest.get("version") != MANIFEST_VERSION:
@@ -574,15 +660,25 @@ def validate_manifest(
         if not isinstance(manifest.get(field), bool):
             raise ClassifierError(f"classifier {field} must be boolean")
     if not manifest["fallback"] and (
-        not target_sha or not SHA_RE.fullmatch(target_sha)
+        not target_sha
+        or SHA_RE.fullmatch(target_sha) is None
+        or set(target_sha) == {"0"}
     ):
         raise ClassifierError("classifier target_sha is malformed")
     if not isinstance(manifest.get("reason"), str) or not manifest["reason"]:
         raise ClassifierError("classifier reason is missing")
     _single_line_output(manifest["reason"], field="reason")
     files = manifest.get("files")
-    if not isinstance(files, list) or any(not isinstance(path, str) for path in files):
+    if not isinstance(files, list) or len(files) > MAX_CHANGED_FILES or any(
+        not isinstance(path, str) for path in files
+    ):
         raise ClassifierError("classifier files must be a list of strings")
+    if files:
+        normalised_files, files_reason = _normalise_files(files)
+        if files_reason is not None or normalised_files != files:
+            raise ClassifierError("classifier files are not canonical")
+    elif not manifest["fallback"]:
+        raise ClassifierError("trusted classifier files cannot be empty")
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
     expected_runtime_sensitive = (
         manifest["fallback"]
@@ -624,7 +720,8 @@ def _git_changed_files(
     repo_root: Path,
     event: str,
     event_payload: Mapping[str, object],
-) -> tuple[list[str], bool, str | None]:
+    ref: str,
+) -> tuple[list[str], bool, str | None, dict[str, object]]:
     """Read changed files from complete git history, without shell parsing."""
 
     try:
@@ -636,14 +733,14 @@ def _git_changed_files(
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
-        return [], False, "git repository state is unavailable"
+        return [], False, "git repository state is unavailable", _default_provenance()
     if shallow == "true":
-        return [], False, "git checkout is shallow"
+        return [], False, "git checkout is shallow", _default_provenance()
 
     if event == "pull_request":
         pull_request = event_payload.get("pull_request")
         if not isinstance(pull_request, Mapping):
-            return [], False, "pull request metadata is missing"
+            return [], False, "pull request metadata is missing", _default_provenance()
         base = (pull_request.get("base") or {})
         head = (pull_request.get("head") or {})
         base_sha = base.get("sha") if isinstance(base, Mapping) else None
@@ -655,7 +752,7 @@ def _git_changed_files(
             head_sha = event_payload.get("head_commit", {})
             head_sha = head_sha.get("id") if isinstance(head_sha, Mapping) else None
     else:
-        return [], False, "event does not provide a safe changed-file range"
+        return [], False, "event does not provide a safe changed-file range", _default_provenance()
 
     if (
         not isinstance(base_sha, str)
@@ -663,8 +760,15 @@ def _git_changed_files(
         or not SHA_RE.fullmatch(base_sha)
         or not SHA_RE.fullmatch(head_sha)
         or set(base_sha) == {"0"}
+        or set(head_sha) == {"0"}
     ):
-        return [], False, "changed-file range is missing or malformed"
+        return [], False, "changed-file range is missing or malformed", _default_provenance()
+    if not isinstance(ref, str) or not ref:
+        return [], False, "diff ref is missing", _default_provenance()
+    if len(ref) > MAX_OUTPUT_VALUE_LENGTH or any(
+        not 0x20 <= ord(character) <= 0x7E for character in ref
+    ):
+        return [], False, "diff ref is malformed", _default_provenance()
     try:
         result = subprocess.run(
             ["git", "diff", "--name-only", "-z", base_sha, head_sha, "--"],
@@ -674,8 +778,19 @@ def _git_changed_files(
         )
         decoded = result.stdout.decode("utf-8", errors="strict")
     except (OSError, UnicodeDecodeError, subprocess.CalledProcessError):
-        return [], False, "changed-file range cannot be resolved"
-    return decoded.rstrip("\x00").split("\x00") if decoded else [], True, None
+        return [], False, "changed-file range cannot be resolved", _default_provenance()
+    return (
+        decoded.rstrip("\x00").split("\x00") if decoded else [],
+        True,
+        None,
+        {
+            "complete": True,
+            "base": base_sha.lower(),
+            "head": head_sha.lower(),
+            "ref": ref,
+            "source": "git-diff",
+        },
+    )
 
 
 def _load_event_payload(path: Path) -> Mapping[str, object]:
@@ -685,6 +800,16 @@ def _load_event_payload(path: Path) -> Mapping[str, object]:
         raise ClassifierError(f"GitHub event payload is unreadable: {exc}") from exc
     if not isinstance(payload, Mapping):
         raise ClassifierError("GitHub event payload must be an object")
+    return payload
+
+
+def _load_provenance_payload(path: Path) -> Mapping[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ClassifierError("diff provenance file is unreadable") from exc
+    if not isinstance(payload, Mapping):
+        raise ClassifierError("diff provenance file must be an object")
     return payload
 
 
@@ -714,8 +839,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", ""))
     parser.add_argument("--target-sha", default=os.environ.get("GITHUB_SHA", ""))
     parser.add_argument("--branch", default=os.environ.get("GITHUB_REF_NAME", ""))
+    parser.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""))
     parser.add_argument("--event-file", type=Path)
     parser.add_argument("--files-file", type=Path)
+    parser.add_argument("--provenance-file", type=Path)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--github-output", type=Path)
@@ -725,31 +852,40 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     event_payload: Mapping[str, object] = {}
+    explicit_provenance: Mapping[str, object] | None = None
+    provenance_supplied = args.provenance_file is not None
+    provenance_error: str | None = None
+    if args.provenance_file is not None:
+        try:
+            explicit_provenance = _load_provenance_payload(args.provenance_file)
+        except ClassifierError as exc:
+            provenance_error = str(exc)
     if args.event_file is not None:
         try:
             event_payload = _load_event_payload(args.event_file)
-        except ClassifierError as exc:
+        except ClassifierError:
             manifest = classify(
                 [],
                 event=args.event,
                 target_sha=args.target_sha,
                 branch=args.branch,
                 repository_ready=False,
-                fallback_reason=str(exc),
+                fallback_reason="GitHub event payload is unreadable",
             )
         else:
             event = args.event
             if args.files_file is not None:
                 try:
                     files = args.files_file.read_text(encoding="utf-8").splitlines()
-                except (OSError, UnicodeError) as exc:
+                except (OSError, UnicodeError):
                     manifest = classify(
                         [],
                         event=event,
                         target_sha=args.target_sha,
                         branch=args.branch,
                         repository_ready=False,
-                        fallback_reason=f"changed-file list is unreadable: {exc}",
+                        fallback_reason="changed-file list is unreadable",
+                        provenance=explicit_provenance,
                     )
                 else:
                     manifest = classify(
@@ -757,12 +893,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         event=event,
                         target_sha=args.target_sha,
                         branch=args.branch,
+                        provenance=explicit_provenance,
                     )
             else:
-                files, ready, reason = _git_changed_files(
+                files, ready, reason, generated_provenance = _git_changed_files(
                     repo_root=args.repo_root,
                     event=event,
                     event_payload=event_payload,
+                    ref=args.ref,
                 )
                 manifest = classify(
                     files,
@@ -771,18 +909,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     branch=args.branch,
                     repository_ready=ready,
                     fallback_reason=reason,
+                    provenance=(
+                        explicit_provenance
+                        if provenance_supplied
+                        else generated_provenance
+                    ),
                 )
     elif args.files_file is not None:
         try:
             files = args.files_file.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError) as exc:
+        except (OSError, UnicodeError):
             manifest = classify(
                 [],
                 event=args.event,
                 target_sha=args.target_sha,
                 branch=args.branch,
                 repository_ready=False,
-                fallback_reason=f"changed-file list is unreadable: {exc}",
+                fallback_reason="changed-file list is unreadable",
+                provenance=explicit_provenance,
             )
         else:
             manifest = classify(
@@ -790,26 +934,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 event=args.event,
                 target_sha=args.target_sha,
                 branch=args.branch,
+                provenance=explicit_provenance,
             )
     else:
         try:
             event_payload = _load_event_payload(
                 args.event_file or Path(os.environ.get("GITHUB_EVENT_PATH", ""))
             )
-        except ClassifierError as exc:
+        except ClassifierError:
             manifest = classify(
                 [],
                 event=args.event,
                 target_sha=args.target_sha,
                 branch=args.branch,
                 repository_ready=False,
-                fallback_reason=str(exc),
+                fallback_reason="GitHub event payload is unreadable",
+                provenance=explicit_provenance,
             )
         else:
-            files, ready, reason = _git_changed_files(
+            files, ready, reason, generated_provenance = _git_changed_files(
                 repo_root=args.repo_root,
                 event=args.event,
                 event_payload=event_payload,
+                ref=args.ref,
             )
             manifest = classify(
                 files,
@@ -818,7 +965,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 branch=args.branch,
                 repository_ready=ready,
                 fallback_reason=reason,
+                provenance=(
+                    explicit_provenance
+                    if provenance_supplied
+                    else generated_provenance
+                ),
             )
+
+    if provenance_error is not None:
+        manifest = classify(
+            [],
+            event=args.event,
+            target_sha=args.target_sha,
+            branch=args.branch,
+            repository_ready=False,
+            fallback_reason=provenance_error,
+        )
 
     validate_manifest(manifest)
     args.output.parent.mkdir(parents=True, exist_ok=True)

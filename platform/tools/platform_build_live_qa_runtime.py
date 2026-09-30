@@ -84,6 +84,35 @@ def _load_staged_guard():
     return module
 
 
+def _load_staged_runtime_inputs():
+    """Load the adjacent data-only runtime input contract."""
+
+    builder_path = Path(__file__).absolute()
+    _validate_import_file(builder_path, label="staged live-QA runtime builder")
+    tools_directory = builder_path.parent
+    _validate_import_directory(tools_directory)
+    loader_path = tools_directory / "platform_live_qa_runtime_inputs.py"
+    manifest_path = tools_directory / "platform_live_qa_runtime_inputs.json"
+    _validate_import_file(loader_path, label="staged live-QA runtime input loader")
+    _validate_import_file(manifest_path, label="staged live-QA runtime input manifest")
+    spec = importlib.util.spec_from_file_location(
+        "platform_live_qa_runtime_inputs", loader_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("staged live-QA runtime input loader cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(spec.name, None)
+        else:
+            sys.modules[spec.name] = previous
+    return module.load_manifest(manifest_path)
+
+
 try:
     guard = _load_staged_guard()
 except Exception as exc:  # Keep import-boundary failures machine-readable.
@@ -92,19 +121,25 @@ except Exception as exc:  # Keep import-boundary failures machine-readable.
 else:
     _guard_load_error = None
 
+try:
+    runtime_inputs = _load_staged_runtime_inputs()
+except Exception as exc:  # Keep import-boundary failures machine-readable.
+    runtime_inputs = None
+    _runtime_inputs_load_error = exc
+else:
+    _runtime_inputs_load_error = None
+
 
 RUNTIME_SOURCE_FILES = (
-    "playwright.live.config.ts",
-    "tests/smoke/live-user-journey.spec.ts",
-    "tests/support/live-qa-origin.ts",
-    "tests/support/live-qa-sandbox.ts",
-    "package-lock.json",
+    runtime_inputs.runtime_source_files if runtime_inputs is not None else ()
+)
+BUILD_INPUT_FILES = (
+    runtime_inputs.build_input_files if runtime_inputs is not None else ()
 )
 PLAYWRIGHT_PACKAGES = (
-    "@playwright/test",
-    "playwright",
-    "playwright-core",
+    runtime_inputs.runtime_packages if runtime_inputs is not None else ()
 )
+INPUT_MANIFEST_SHA256 = runtime_inputs.digest if runtime_inputs is not None else ""
 SANDBOX_RELATIVE = (
     guard.CHROMIUM_SANDBOX_RELATIVE
     if guard is not None
@@ -696,6 +731,12 @@ def build(platform_root: Path, node_home: Path, output: Path) -> dict[str, objec
             reason="invalid-input",
             phase="validate-input",
         )
+    if _runtime_inputs_load_error is not None or runtime_inputs is None:
+        raise RuntimeBuildError(
+            "staged live-QA runtime input contract is unavailable",
+            reason="invalid-input",
+            phase="validate-input",
+        )
     if os.geteuid() != 0:
         raise RuntimeBuildError("live-QA runtime build requires root")
     phase = "validate-input"
@@ -708,6 +749,33 @@ def build(platform_root: Path, node_home: Path, output: Path) -> dict[str, objec
     node = node_home / "bin/node"
     try:
         _metadata(node)
+        archive_roots = tuple(
+            directory_name
+            for directory_name, _url, _checksum, _byte_size in guard.PLAYWRIGHT_ARCHIVES
+        )
+        if (
+            len(archive_roots) != len(set(archive_roots))
+            or set(archive_roots) != set(runtime_inputs.browser_roots)
+        ):
+            raise RuntimeBuildError(
+                "staged browser archives do not match the runtime input manifest",
+                reason="invalid-input",
+                phase="validate-input",
+            )
+        manifest_sandbox = next(
+            (
+                relative
+                for relative in runtime_inputs.required_runtime_files
+                if relative.endswith("/chrome_sandbox")
+            ),
+            None,
+        )
+        if manifest_sandbox != Path(guard.CHROMIUM_SANDBOX_RELATIVE).as_posix():
+            raise RuntimeBuildError(
+                "staged sandbox path does not match the runtime input manifest",
+                reason="invalid-input",
+                phase="validate-input",
+            )
         output.mkdir(mode=0o700)
         output_created = True
         phase = "copy-source"
@@ -718,6 +786,10 @@ def build(platform_root: Path, node_home: Path, output: Path) -> dict[str, objec
                 output / "web" / relative,
                 executable=relative.endswith(".sh"),
             )
+        # package.json controls the build but is deliberately not part of the
+        # credential-bearing runtime payload.
+        for relative in BUILD_INPUT_FILES:
+            _metadata(web / relative)
         phase = "copy-packages"
         for package in PLAYWRIGHT_PACKAGES:
             _copy_tree(web / "node_modules" / package, output / "web/node_modules" / package)
@@ -783,6 +855,7 @@ def build(platform_root: Path, node_home: Path, output: Path) -> dict[str, objec
         manifest = {
             "version": 1,
             "node_version": guard.NODE_VERSION,
+            "input_manifest_sha256": INPUT_MANIFEST_SHA256,
             "package_lock_sha256": lock_sha256,
             "tree_sha256": tree_sha256,
             "files": files,

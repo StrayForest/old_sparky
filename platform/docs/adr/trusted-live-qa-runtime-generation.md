@@ -16,10 +16,13 @@ needs a deterministic browser runtime without carrying the application's full
 
 Every release artifact must contain a reviewed `liveqa-runtime` member. The
 builder copies only the pinned Node executable, lock-installed Playwright test,
-Playwright and Playwright Core packages, reviewed live-QA sources, and
-checksum-pinned browser archives. Its runtime manifest records the package-lock
-and complete content digests; artifact validation rejects missing, extra,
-symlinked or special runtime members.
+Playwright and Playwright Core packages, the `live-launch` and live-user
+journeys, their reviewed support files, and checksum-pinned browser archives.
+The checked-in `platform_live_qa_runtime_inputs.json` contract is the single
+owner of those runtime inputs and classifier-sensitive paths; its digest is
+carried through the runtime manifest and checked by the builder, installer and
+artifact validator. Artifact validation rejects missing, extra, symlinked or
+special runtime members.
 
 Activation, rollback and recovery reconcile that runtime under the canonical
 release lock into `/root/.oldsparky/liveqa/releases/<source-sha>`. A root-owned

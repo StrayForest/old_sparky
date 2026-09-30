@@ -129,8 +129,9 @@ Do not use grep exclusions to define test ownership.
 ### CI route and fallback contract
 
 The classifier's known routes are distinct from its fail-closed fallback. With
-complete repository state, a recognized event, a non-empty normalized file
-list and a valid target SHA, a known platform/workflow path is exactly
+complete repository state, complete base/head/ref range provenance, a
+recognized event, a non-empty normalized file list and a valid target SHA, a
+known platform/workflow path is exactly
 `class=full`, `fallback=false`; a strict `platform/docs/**` path is `docs-only` with
 `fallback=false`, and an out-of-scope path is `out-of-scope` with
 `fallback=false`. Candidate-packaging-only paths remain `class=full` with
@@ -139,8 +140,14 @@ trusted push events. Application/runtime/migration/release paths are
 deployable only when they are the current `push` to `dev` and pass the exact
 release guard.
 
-Unknown or global paths, malformed paths or provenance, shallow/unavailable
-repository state, an unknown event and every `merge_group` event are
+Range provenance is an input to this decision, not a new classifier-artifact
+field: the schema/version-1 manifest and its existing digest fields remain
+closed for the production consumers. Missing or malformed provenance therefore
+cannot be repaired downstream by adding an unrecognized field.
+
+Unknown or global paths, malformed paths or provenance, file lists without a
+complete trusted range, shallow/unavailable repository state, an unknown event
+and every `merge_group` event are
 `class=full` with `fallback=true` and `deployable=false`. They run the full
 deterministic suite but can never authorize deployment. The classifier and
 manifest schema are maintained in the [canonical classifier source](../tools/platform_ci_classifier.py);

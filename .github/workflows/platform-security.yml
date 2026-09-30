@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          /usr/bin/python3 - "$GITHUB_EVENT_PATH" "$GITHUB_WORKSPACE/candidate-data" "$RUNNER_TEMP/platform-ci-changed-files.txt" <<'PY'
+          /usr/bin/python3 - "$GITHUB_EVENT_PATH" "$GITHUB_WORKSPACE/candidate-data" "$RUNNER_TEMP/platform-ci-changed-files.txt" "$RUNNER_TEMP/platform-ci-diff-provenance.json" <<'PY'
           import json
           from pathlib import Path
           import os
@@ -52,9 +52,26 @@ jobs:
           import subprocess
           import sys
 
-          event_path, repo_root, output_path = sys.argv[1:]
-          payload = json.loads(Path(event_path).read_text(encoding="utf-8"))
+          event_path, repo_root, output_path, provenance_path = sys.argv[1:]
           event = os.environ.get("GITHUB_EVENT_NAME", "")
+          ref = os.environ.get("GITHUB_REF", "")
+          incomplete = {
+              "complete": False,
+              "base": "",
+              "head": "",
+              "ref": ref,
+              "source": "git-diff",
+          }
+          try:
+              payload = json.loads(Path(event_path).read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              Path(output_path).write_text("\x00\n", encoding="utf-8")
+              Path(provenance_path).write_text(json.dumps(incomplete), encoding="utf-8")
+              raise SystemExit(0)
+          if not isinstance(payload, dict):
+              Path(output_path).write_text("\x00\n", encoding="utf-8")
+              Path(provenance_path).write_text(json.dumps(incomplete), encoding="utf-8")
+              raise SystemExit(0)
           base = source_head = None
           if event == "push":
               base = payload.get("before")
@@ -68,6 +85,7 @@ jobs:
           sha_re = re.compile(r"^[0-9a-f]{40}$")
           if not isinstance(base, str) or not isinstance(source_head, str) or not sha_re.fullmatch(base) or not sha_re.fullmatch(source_head) or set(base) == {"0"}:
               Path(output_path).write_text("\x00\n", encoding="utf-8")
+              Path(provenance_path).write_text(json.dumps(incomplete), encoding="utf-8")
               raise SystemExit(0)
           try:
               result = subprocess.run(
@@ -79,12 +97,21 @@ jobs:
               raw = result.stdout.decode("utf-8", errors="strict")
           except (OSError, UnicodeError, subprocess.CalledProcessError):
               Path(output_path).write_text("\x00\n", encoding="utf-8")
+              Path(provenance_path).write_text(json.dumps(incomplete), encoding="utf-8")
               raise SystemExit(0)
           paths = raw.rstrip("\x00").split("\x00") if raw else []
           if any("\n" in path or "\r" in path for path in paths):
               Path(output_path).write_text("\x00\n", encoding="utf-8")
+              Path(provenance_path).write_text(json.dumps(incomplete), encoding="utf-8")
           else:
               Path(output_path).write_text("\n".join(paths) + ("\n" if paths else ""), encoding="utf-8")
+              Path(provenance_path).write_text(json.dumps({
+                  "complete": True,
+                  "base": base,
+                  "head": source_head,
+                  "ref": ref,
+                  "source": "git-diff",
+              }, sort_keys=True), encoding="utf-8")
           PY
 
       - name: Resolve immutable default-branch classifier source
@@ -141,6 +168,8 @@ jobs:
             --branch "${GITHUB_REF_NAME:-}" \
             --event-file "$GITHUB_EVENT_PATH" \
             --files-file "$RUNNER_TEMP/platform-ci-changed-files.txt" \
+            --provenance-file "$RUNNER_TEMP/platform-ci-diff-provenance.json" \
+            --ref "$GITHUB_REF" \
             --output classifier-manifest.json \
             --github-output "$GITHUB_OUTPUT"
       - name: Publish route manifest
