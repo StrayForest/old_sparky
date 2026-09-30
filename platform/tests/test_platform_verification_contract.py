@@ -717,6 +717,22 @@ except lock.VerificationLockError as exc:
         self.assertNotIn("PLATFORM_VERIFICATION_RUNTIME_DIR", workflow)
         self.assertNotIn("sudo install -d", workflow)
         self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 4)
+        self.assertIn(
+            "for identity in oldsparky-web oldsparky-api oldsparky-worker oldsparky-liveqa; do",
+            workflow,
+        )
+        self.assertIn(
+            'test "$(printf \'%s\\n\' "$liveqa_passwd" | cut -d: -f6)" = /nonexistent',
+            workflow,
+        )
+        self.assertIn(
+            'test "$(printf \'%s\\n\' "$liveqa_passwd" | cut -d: -f7)" = /usr/sbin/nologin',
+            workflow,
+        )
+        self.assertIn(
+            'test "$(id -G oldsparky-liveqa | awk \'{print NF}\')" -eq 1',
+            workflow,
+        )
         verification_block = re.search(
             r"^  verification-contract:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,

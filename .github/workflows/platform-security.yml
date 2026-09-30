@@ -335,7 +335,7 @@ jobs:
           test -x /usr/bin/runuser || test -x /usr/sbin/runuser
           test -x /usr/bin/test
           test -x /usr/bin/setpriv
-          for identity in oldsparky-web oldsparky-api oldsparky-worker; do
+          for identity in oldsparky-web oldsparky-api oldsparky-worker oldsparky-liveqa; do
             if ! getent group "$identity" >/dev/null; then
               sudo groupadd --system "$identity"
             fi
@@ -345,6 +345,12 @@ jobs:
             fi
             sudo id "$identity"
           done
+          liveqa_passwd="$(getent passwd oldsparky-liveqa)"
+          test -n "$liveqa_passwd"
+          test "$(printf '%s\n' "$liveqa_passwd" | cut -d: -f6)" = /nonexistent
+          test "$(printf '%s\n' "$liveqa_passwd" | cut -d: -f7)" = /usr/sbin/nologin
+          test "$(id -G oldsparky-liveqa | awk '{print NF}')" -eq 1
+          test "$(id -g oldsparky-liveqa)" = "$(getent group oldsparky-liveqa | cut -d: -f3)"
           if ! getent group oldsparky-media >/dev/null; then
             sudo groupadd --system oldsparky-media
           fi
