@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from tools import platform_systemd_timer_contract as contract
 
@@ -15,6 +16,25 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SYSTEMD_ROOT = REPO_ROOT / "platform" / "deploy" / "systemd"
 SYSTEMD_INSTALLER = REPO_ROOT / "platform" / "tools" / "platform_install_systemd_units.sh"
 MAINTENANCE_INSTALLER = REPO_ROOT / "platform" / "tools" / "platform_install_maintenance.sh"
+
+# Keep command expectations independent from the production contract constants.
+# If both are accidentally changed together, these assertions must still catch
+# an installer widening its enable set or enabling off-site backup.
+EXPECTED_SYSTEMD_SERVICE_ENABLE = (
+    "deadlock-api.service",
+    "deadlock-worker.service",
+    "deadlock-web.service",
+)
+EXPECTED_SYSTEMD_TIMER_ENABLE = (
+    "deadlock-maintenance.timer",
+    "deadlock-logrotate.timer",
+    "deadlock-cloudflare-ips.timer",
+    "deadlock-health-monitor.timer",
+)
+EXPECTED_MAINTENANCE_TIMER_ENABLE = (
+    "deadlock-maintenance.timer",
+    "deadlock-logrotate.timer",
+)
 
 
 def _read_lines(path: Path) -> list[list[str]]:
@@ -97,6 +117,10 @@ class _SystemdInstallerHarness:
             "fail = os.environ.get('FAKE_SYSTEMCTL_FAIL_ACTION')\n"
             "if action == fail:\n"
             "    raise SystemExit(int(os.environ.get('FAKE_SYSTEMCTL_FAIL_RC', '4')))\n"
+            "if action == 'enable' and '--now' in args and os.environ.get('FAKE_SYSTEMCTL_FAIL_ENABLE_NOW') == '1':\n"
+            "    raise SystemExit(int(os.environ.get('FAKE_SYSTEMCTL_FAIL_RC', '4')))\n"
+            "if action == 'start' and os.environ.get('FAKE_SYSTEMCTL_FAIL_START') == '1':\n"
+            "    raise SystemExit(int(os.environ.get('FAKE_SYSTEMCTL_FAIL_RC', '4')))\n"
             "if action == 'is-active':\n"
             "    unit = units[0]\n"
             "    value = state.get('active', {}).get(unit, 'inactive')\n"
@@ -108,6 +132,15 @@ class _SystemdInstallerHarness:
             "    print(value)\n"
             "    raise SystemExit(0 if value in {'enabled', 'static'} else 1)\n"
             "if action == 'daemon-reload':\n"
+            "    count_path = os.environ.get('FAKE_SYSTEMCTL_RELOAD_COUNT')\n"
+            "    count = 0\n"
+            "    if count_path:\n"
+            "        marker = Path(count_path)\n"
+            "        count = int(marker.read_text()) if marker.exists() else 0\n"
+            "        count += 1\n"
+            "        marker.write_text(str(count))\n"
+            "        if os.environ.get('FAKE_SYSTEMCTL_FAIL_RELOAD_AT') == str(count):\n"
+            "            raise SystemExit(int(os.environ.get('FAKE_SYSTEMCTL_FAIL_RC', '4')))\n"
             "    raise SystemExit(0)\n"
             "active = state.setdefault('active', {})\n"
             "enabled = state.setdefault('enabled', {})\n"
@@ -236,6 +269,81 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             with self.assertRaisesRegex(contract.SystemdContractError, "OnCalendar"):
                 contract.validate_all(root)
 
+    def test_parser_rejects_symlink_escape_replacement_and_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "units"
+            root.mkdir()
+            for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                shutil.copy2(source, root / source.name)
+            for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                shutil.copy2(source, root / source.name)
+
+            target = root / "deadlock-maintenance.timer"
+            outside = root.parent / "outside.timer"
+            outside.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+            target.unlink()
+            target.symlink_to(outside)
+            with self.assertRaisesRegex(contract.SystemdContractError, "symlink"):
+                contract.load_units(root)
+
+            # A replacement between directory enumeration and open must not
+            # turn the trusted regular-file check into a symlink read.
+            target.unlink()
+            target.write_text(outside.read_text(encoding="utf-8"), encoding="utf-8")
+            replacement_done = False
+            original_lstat = contract.os.lstat
+
+            def replace_after_lstat(path: Path) -> os.stat_result:
+                nonlocal replacement_done
+                metadata = original_lstat(path)
+                if Path(path) == target and not replacement_done:
+                    replacement_done = True
+                    target.unlink()
+                    target.symlink_to(outside)
+                return metadata
+
+            with mock.patch.object(contract.os, "lstat", side_effect=replace_after_lstat):
+                with self.assertRaisesRegex(contract.SystemdContractError, "open|symlink"):
+                    contract.load_units(root)
+
+            target.unlink()
+            hardlink_source = root.parent / "hardlink-source.timer"
+            shutil.copy2(SYSTEMD_ROOT / target.name, hardlink_source)
+            target.hardlink_to(hardlink_source)
+            with self.assertRaisesRegex(contract.SystemdContractError, "hard-link"):
+                contract.load_units(root)
+
+    def test_failure_contract_rejects_oneshot_failure_hiding_mutations(self) -> None:
+        mutations = (
+            (
+                "SuccessExitStatus=143\n",
+                "SuccessExitStatus",
+            ),
+            (
+                "ExecStartPost=-/bin/true\n",
+                "fail closed",
+            ),
+            (
+                "Restart=on-failure\nRestartSec=5\n",
+                "restart directives",
+            ),
+        )
+        for addition, message in mutations:
+            with self.subTest(addition=addition):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                        shutil.copy2(source, root / source.name)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                        shutil.copy2(source, root / source.name)
+                    service = root / "deadlock-maintenance.service"
+                    service.write_text(
+                        service.read_text(encoding="utf-8") + addition,
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(contract.SystemdContractError, message):
+                        contract.validate_all(root)
+
     def test_installers_have_closed_enable_sets_and_offsite_is_not_enabled(self) -> None:
         systemd_installer = SYSTEMD_INSTALLER.read_text(encoding="utf-8")
         maintenance_installer = MAINTENANCE_INSTALLER.read_text(encoding="utf-8")
@@ -268,8 +376,8 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stderr)
             expected = [
                 ["daemon-reload"],
-                ["enable", *contract.EXPECTED_SYSTEMD_INSTALL_ENABLE[0]],
-                ["enable", "--now", *contract.EXPECTED_SYSTEMD_INSTALL_ENABLE[1]],
+                ["enable", *EXPECTED_SYSTEMD_SERVICE_ENABLE],
+                ["enable", "--now", *EXPECTED_SYSTEMD_TIMER_ENABLE],
             ]
             self.assertEqual(_read_lines(harness.systemctl_log), expected)
             self.assertFalse(
@@ -299,6 +407,49 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             result = harness.run_systemd(FAKE_SYSTEMCTL_FAIL_ACTION="daemon-reload")
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(_read_lines(harness.systemctl_log), [["daemon-reload"]])
+        finally:
+            harness.close()
+
+    def test_systemd_installer_stops_after_service_enable_failure(self) -> None:
+        harness = _SystemdInstallerHarness()
+        try:
+            result = harness.run_systemd(FAKE_SYSTEMCTL_FAIL_ACTION="enable")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                _read_lines(harness.systemctl_log),
+                [
+                    ["daemon-reload"],
+                    ["enable", *EXPECTED_SYSTEMD_SERVICE_ENABLE],
+                ],
+            )
+            state = (
+                json.loads(harness.state.read_text(encoding="utf-8"))
+                if harness.state.exists()
+                else {"active": {}, "enabled": {}}
+            )
+            self.assertEqual(state, {"active": {}, "enabled": {}})
+        finally:
+            harness.close()
+
+    def test_systemd_installer_stops_after_enable_now_failure(self) -> None:
+        harness = _SystemdInstallerHarness()
+        try:
+            result = harness.run_systemd(FAKE_SYSTEMCTL_FAIL_ENABLE_NOW="1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                _read_lines(harness.systemctl_log),
+                [
+                    ["daemon-reload"],
+                    ["enable", *EXPECTED_SYSTEMD_SERVICE_ENABLE],
+                    ["enable", "--now", *EXPECTED_SYSTEMD_TIMER_ENABLE],
+                ],
+            )
+            state = json.loads(harness.state.read_text(encoding="utf-8"))
+            self.assertEqual(
+                state["enabled"],
+                {unit: "enabled" for unit in EXPECTED_SYSTEMD_SERVICE_ENABLE},
+            )
+            self.assertEqual(state["active"], {})
         finally:
             harness.close()
 
@@ -334,6 +485,71 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
         finally:
             harness.close()
 
+    def test_systemd_installer_post_install_reload_failure_restores_retired_unit(self) -> None:
+        harness = _SystemdInstallerHarness()
+        try:
+            retired = harness.destination / "deadlock-retired.service"
+            retired.write_text("[Unit]\nDescription=retired\n", encoding="ascii")
+            retired.chmod(0o644)
+            harness.state.write_text(
+                json.dumps(
+                    {
+                        "active": {retired.name: "active"},
+                        "enabled": {retired.name: "enabled"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = harness.run_systemd(
+                allow_retired=True,
+                FAKE_SYSTEMCTL_RELOAD_COUNT=str(harness.root / "reload-count"),
+                FAKE_SYSTEMCTL_FAIL_RELOAD_AT="2",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            log = _read_lines(harness.systemctl_log)
+            self.assertIn(["daemon-reload"], log)
+            self.assertGreaterEqual(log.count(["daemon-reload"]), 3)
+            self.assertIn(["stop", retired.name], log)
+            self.assertIn(["disable", retired.name], log)
+            self.assertIn(["start", retired.name], log)
+            self.assertIn(["enable", retired.name], log)
+            self.assertTrue(retired.exists())
+            state = json.loads(harness.state.read_text(encoding="utf-8"))
+            self.assertEqual(state["active"][retired.name], "active")
+            self.assertEqual(state["enabled"][retired.name], "enabled")
+        finally:
+            harness.close()
+
+    def test_systemd_installer_retains_rollback_receipt_when_rollback_fails(self) -> None:
+        harness = _SystemdInstallerHarness()
+        try:
+            retired = harness.destination / "deadlock-retired.service"
+            retired.write_text("[Unit]\nDescription=retired\n", encoding="ascii")
+            retired.chmod(0o644)
+            harness.state.write_text(
+                json.dumps(
+                    {
+                        "active": {retired.name: "active"},
+                        "enabled": {retired.name: "enabled"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = harness.run_systemd(
+                allow_retired=True,
+                FAKE_SYSTEMCTL_FAIL_ACTION="disable",
+                FAKE_SYSTEMCTL_FAIL_START="1",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(retired.exists())
+            self.assertTrue(
+                (harness.destination / ".oldsparky-retired-rollback-status").exists()
+            )
+            self.assertTrue(list(harness.destination.glob(".oldsparky-retired.*")))
+            self.assertIn(["start", retired.name], _read_lines(harness.systemctl_log))
+        finally:
+            harness.close()
+
     def test_maintenance_installer_enables_only_its_two_timers_and_is_idempotent(self) -> None:
         harness = _SystemdInstallerHarness()
         try:
@@ -341,7 +557,7 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stderr)
             expected_systemctl = [
                 ["daemon-reload"],
-                ["enable", "--now", *contract.EXPECTED_MAINTENANCE_INSTALL_ENABLE[0]],
+                ["enable", "--now", *EXPECTED_MAINTENANCE_TIMER_ENABLE],
             ]
             self.assertEqual(_read_lines(harness.systemctl_log), expected_systemctl)
             self.assertEqual(
@@ -366,6 +582,22 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             result = harness.run_maintenance(FAKE_SYSTEMCTL_FAIL_ACTION="daemon-reload")
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(_read_lines(harness.systemctl_log), [["daemon-reload"]])
+            self.assertEqual(_read_lines(harness.journalctl_log), [])
+        finally:
+            harness.close()
+
+    def test_maintenance_installer_stops_after_enable_now_failure(self) -> None:
+        harness = _SystemdInstallerHarness()
+        try:
+            result = harness.run_maintenance(FAKE_SYSTEMCTL_FAIL_ENABLE_NOW="1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                _read_lines(harness.systemctl_log),
+                [
+                    ["daemon-reload"],
+                    ["enable", "--now", *EXPECTED_MAINTENANCE_TIMER_ENABLE],
+                ],
+            )
             self.assertEqual(_read_lines(harness.journalctl_log), [])
         finally:
             harness.close()
