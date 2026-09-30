@@ -562,15 +562,39 @@ jobs:
         run: python3 platform/tools/platform_verify.py web-hermetic
         env:
           CI: "true"
+          PLATFORM_WEB_HERMETIC_TIMING_PATH: ${{ runner.temp }}/platform-web-hermetic-summary.json
 
-      - name: Upload Playwright report
-        if: ${{ !cancelled() }}
+      # The report and raw test results contain only mocked/local fixture data;
+      # retain them briefly and publish them only when this gate fails.
+      - name: Upload Playwright report (failures only)
+        if: ${{ failure() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-web-playwright-report-${{ github.run_id }}-${{ github.run_attempt }}
           path: platform/apps/platform_web/playwright-report
+          if-no-files-found: ignore
+          retention-days: 5
+
+      - name: Upload Playwright diagnostics (failures only)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-web-playwright-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            platform/apps/platform_web/test-results
+            platform/apps/platform_web/test-results-participant
+            platform/apps/platform_web/test-results-source-contract
+          if-no-files-found: ignore
+          retention-days: 5
+
+      - name: Upload web hermetic timing summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-web-hermetic-timing-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-web-hermetic-summary.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 5
 
   verification-contract:
     name: Verification contract
