@@ -38,7 +38,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.release_dir = self.root / "dist" / "releases"
-        self.release_dir.mkdir(parents=True)
+        self.release_dir.mkdir(parents=True, mode=0o700)
+        self.release_dir.chmod(0o700)
         self.now = datetime(2026, 7, 20, tzinfo=UTC)
 
     def tearDown(self) -> None:
@@ -46,30 +47,52 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def add_artifact_group(self, slug: str, *, age_days: int) -> None:
         release = self.release_dir / slug
-        release.mkdir()
-        (release / "RELEASE.json").write_text(
+        release.mkdir(mode=0o700)
+        release.chmod(0o700)
+        manifest = release / "RELEASE.json"
+        manifest.write_text(
             json.dumps({"release_slug": slug}), encoding="utf-8"
         )
+        manifest.chmod(0o600)
         archive = self.release_dir / f"{slug}.tar.gz"
         checksum = self.release_dir / f"{slug}.tar.gz.sha256"
         archive.write_bytes(slug.encode())
+        archive.chmod(0o600)
         checksum.write_text("checksum\n", encoding="utf-8")
+        checksum.chmod(0o600)
         timestamp = (self.now - timedelta(days=age_days)).timestamp()
         for path in (release, archive, checksum):
             os.utime(path, (timestamp, timestamp))
 
+    def ensure_runtime_shared(self, app_dir: Path) -> Path:
+        app_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        app_dir.chmod(0o700)
+        shared_dir = app_dir / "shared"
+        shared_dir.mkdir(mode=0o700, exist_ok=True)
+        shared_dir.chmod(0o700)
+        return shared_dir
+
     def add_runtime_release(self, app_dir: Path, slug: str) -> Path:
-        release = app_dir / "releases" / slug
-        release.mkdir(parents=True)
-        (release / "RELEASE.json").write_text(
+        app_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        app_dir.chmod(0o700)
+        releases_dir = app_dir / "releases"
+        releases_dir.mkdir(mode=0o700, exist_ok=True)
+        releases_dir.chmod(0o700)
+        release = releases_dir / slug
+        release.mkdir(mode=0o700)
+        release.chmod(0o700)
+        manifest = release / "RELEASE.json"
+        manifest.write_text(
             json.dumps({"release_slug": slug}),
             encoding="utf-8",
         )
+        manifest.chmod(0o600)
         return release
 
     def maintenance_args(self, app_dir: Path) -> SimpleNamespace:
         web_dir = self.root / "web"
-        web_dir.mkdir(exist_ok=True)
+        web_dir.mkdir(mode=0o700, exist_ok=True)
+        web_dir.chmod(0o700)
         return SimpleNamespace(
             app_dir=app_dir,
             source_release_dir=self.release_dir,
@@ -295,6 +318,15 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         for index in range(7):
             self.add_artifact_group(f"release-{index}", age_days=7 - index)
 
+        for path in self.release_dir.iterdir():
+            metadata = path.lstat()
+            self.assertEqual(metadata.st_uid, 0, path)
+            self.assertEqual(
+                stat.S_IMODE(metadata.st_mode),
+                0o700 if path.is_dir() else 0o600,
+                path,
+            )
+
         plan = build_artifact_retention_plan(
             self.release_dir,
             protected_slugs={"release-0"},
@@ -342,8 +374,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_apply_refuses_pending_release_transaction_before_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        shared_dir = app_dir / "shared"
-        shared_dir.mkdir(parents=True)
+        shared_dir = self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -360,7 +391,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_apply_refuses_build_output_lock_contention_before_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -493,7 +524,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_failure_prevents_retention_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -587,7 +618,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_lock_contention_fails_closed_in_subprocess(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         release_lock = lock_support.create_test_lock("backup-release")
         retained_load_lock = lock_support.create_test_lock("backup-retained")
         try:
@@ -618,7 +649,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_build_lock_contention_fails_closed_in_subprocess(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         source_release_dir = self.root / "source-releases"
         source_release_dir.mkdir(mode=0o700)
         source_release_dir.chmod(0o700)
@@ -643,7 +674,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_only_success_never_applies_retention(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -708,7 +739,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_only_failure_does_not_prune_or_check_live_qa(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -926,7 +957,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_apply_lock_order_and_live_qa_report_are_rollback_safe(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         (app_dir / "current").symlink_to(current)
