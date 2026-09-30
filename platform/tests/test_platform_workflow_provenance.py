@@ -19,6 +19,7 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     _payload_rows,
     deployment_snapshot_digest,
     latest_context_status,
+    validate_auto_release_jobs,
     validate_deployment_event,
     validate_deployment_marker,
 )
@@ -106,9 +107,9 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_run_url=f"{run['html_url']}/wrong",
             )
 
-    def test_native_workflow_call_event_is_bound_without_opening_other_events(self) -> None:
+    def test_inherited_workflow_run_event_is_bound_without_opening_other_events(self) -> None:
         workflow, run, jobs, statuses = self._payload()
-        run["event"] = "workflow_call"
+        run["event"] = "workflow_run"
         self.assertEqual(
             validate_deployment_marker(
                 workflow,
@@ -118,7 +119,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_run_id=1234,
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
-                expected_event="workflow_call",
+                expected_event="workflow_run",
             ),
             "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
         )
@@ -133,7 +134,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_target_sha=self.SHA,
                 expected_event="workflow_dispatch",
             )
-        run["event"] = "workflow_run"
+        run["event"] = "workflow_call"
         with self.assertRaises(ProvenanceError):
             validate_deployment_marker(
                 workflow,
@@ -179,7 +180,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertNotIn("DOWNSTREAM_", auto)
         self.assertNotIn("return_run_details", auto)
         self.assertNotIn("/actions/runs/${selected_id}/cancel", auto)
-        self.assertNotIn("cancel-in-progress: false", auto)
+        self.assertIn("cancel-in-progress: false", auto)
         for permission in (
             "actions: read",
             "attestations: write",
@@ -201,8 +202,8 @@ class WorkflowProvenanceTests(unittest.TestCase):
         ):
             self.assertIn(input_name, child)
         called_inputs = child.split("  workflow_dispatch:", 1)[0]
-        self.assertEqual(called_inputs.count("        type: string"), 6)
-        self.assertEqual(called_inputs.count("        required: true"), 6)
+        self.assertEqual(called_inputs.count("        type: string"), 17)
+        self.assertEqual(called_inputs.count("        required: true"), 17)
         for default in (
             "        default: deploy",
             "        default: ready-vote-static-8",
@@ -211,7 +212,13 @@ class WorkflowProvenanceTests(unittest.TestCase):
         ):
             self.assertIn(default, called_inputs)
         self.assertIn("workflow_dispatch:", child)
-        self.assertIn("workflow_call|workflow_dispatch", child)
+        self.assertIn("workflow_run)", child)
+        self.assertIn("workflow_dispatch)", child)
+        self.assertIn("github.event.workflow_run", child)
+        self.assertIn("caller_workflow_ref", child)
+        self.assertIn("expected_called_workflow_ref", child)
+        self.assertIn("Manual production runs must target the dev branch.", child)
+        self.assertIn("manual deployment target is not the current dev head", child)
         self.assertIn(
             "github.event_name == 'workflow_dispatch' && github.sha || inputs.target_sha",
             child,
@@ -235,6 +242,40 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertIn("statuses: write", child)
         self.assertIn("- validate-security-provenance", child)
         self.assertIn("target SHA is not the current dev head", child)
+
+    def test_native_call_jobs_require_effective_workflow_identity_and_final_barrier(self) -> None:
+        called_sha = "b" * 40
+        jobs = [
+            {
+                "id": 1,
+                "name": "Native production deployment",
+                "status": "completed",
+                "conclusion": "success",
+                "workflow_name": DEPLOY_WORKFLOW_NAME,
+                "workflow_file_path": DEPLOY_WORKFLOW_PATH,
+                "workflow_repository": "StrayForest/old_sparky",
+                "workflow_ref": "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
+                "workflow_sha": called_sha,
+            },
+            {
+                "id": 2,
+                "name": "Auto-deploy result",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        validate_auto_release_jobs(
+            jobs,
+            called_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
+            called_workflow_sha=called_sha,
+        )
+        jobs[0]["workflow_sha"] = "c" * 40
+        with self.assertRaises(ProvenanceError):
+            validate_auto_release_jobs(
+                jobs,
+                called_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
+                called_workflow_sha=called_sha,
+            )
 
     def test_old_attempt_cannot_authorize_mutation(self) -> None:
         workflow, run, jobs, statuses = self._payload()

@@ -36,14 +36,20 @@ DEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-deploy.yml"
 DEPLOY_WORKFLOW_NAME = "Platform production deploy"
 DEPLOY_JOB_NAME = "Deploy production"
 PREFLIGHT_JOB_NAME = "Production preflight"
-# The production workflow has two intentionally guarded entrypoints.  Native
-# auto-deploy uses workflow_call; the operator fallback uses workflow_dispatch.
-# No other event may authorize a deployment marker or preflight no-op.
-DEPLOYMENT_EVENTS = ("workflow_call", "workflow_dispatch")
+# A reusable workflow inherits the caller's event context.  The normal
+# auto-deploy caller is therefore observed as ``workflow_run`` inside the
+# called workflow and in its API run metadata; the operator fallback remains
+# ``workflow_dispatch``.  No other event may authorize a deployment marker or
+# preflight no-op.
+DEPLOYMENT_EVENTS = ("workflow_run", "workflow_dispatch")
 SECURITY_STATUS_CONTEXT = "platform-security-build"
 DEPLOY_STATUS_CONTEXT = "platform-production-deploy"
 DEPLOY_SUCCESS_DESCRIPTION = "Production deployment and live smoke passed"
 SECURITY_SUCCESS_DESCRIPTION = "Platform security and build passed"
+AUTO_WORKFLOW_PATH = ".github/workflows/platform-production-autodeploy.yml"
+AUTO_WORKFLOW_NAME = "Platform production auto-deploy"
+AUTO_CALL_JOB_NAME = "Native production deployment"
+AUTO_FINAL_JOB_NAME = "Auto-deploy result"
 ACTIONS_BOT_LOGIN = "github-actions[bot]"
 ACTIONS_BOT_TYPE = "Bot"
 # The public GitHub Actions bot account is stable and lets consumers reject a
@@ -458,6 +464,213 @@ def _validate_job_rows(jobs: Sequence[Mapping[str, Any]]) -> None:
             raise _fail("job name is malformed")
 
 
+def _job_workflow_identity(
+    job: Mapping[str, Any],
+    *,
+    expected_name: str,
+    expected_workflow_name: str,
+    expected_workflow_path: str,
+    expected_workflow_ref: str,
+    expected_workflow_sha: str,
+) -> None:
+    """Bind a job to the workflow that actually produced that job.
+
+    The top-level run's ``head_sha`` is not a safe substitute for reusable
+    workflow identity.  GitHub's jobs API exposes the effective workflow
+    repository/path/ref/SHA on each job; downstream release consumers must use
+    those fields when accepting a native reusable call.
+    """
+
+    if job.get("name") != expected_name:
+        raise _fail("job name is not canonical")
+    if job.get("workflow_name") != expected_workflow_name:
+        raise _fail("job workflow name is not canonical")
+    if job.get("workflow_file_path") != expected_workflow_path:
+        raise _fail("job workflow file path is not canonical")
+    if job.get("workflow_repository") != REPOSITORY_FULL_NAME:
+        raise _fail("job workflow repository is not canonical")
+    if job.get("workflow_ref") != expected_workflow_ref:
+        raise _fail("job workflow ref is not the expected immutable ref")
+    if job.get("workflow_sha") != expected_workflow_sha:
+        raise _fail("job workflow SHA is not the expected immutable SHA")
+
+
+def _job_state(job: Mapping[str, Any], *, expected_name: str) -> None:
+    if job.get("name") != expected_name:
+        raise _fail("job identity is not canonical")
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        raise _fail("required job did not complete successfully")
+
+
+def validate_auto_release_jobs(
+    jobs: Sequence[Mapping[str, Any]],
+    *,
+    called_workflow_ref: str,
+    called_workflow_sha: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Validate the native reusable call and caller final barrier.
+
+    ``workflow_name``/``workflow_file_path``/``workflow_repository`` and the
+    effective ref/SHA are deliberately read from each API job row.  A job's
+    display name alone is not release authority.
+    """
+
+    _validate_job_rows(jobs)
+    if not isinstance(called_workflow_ref, str) or not called_workflow_ref:
+        raise _fail("called workflow ref is malformed")
+    if not isinstance(called_workflow_sha, str) or SHA_RE.fullmatch(called_workflow_sha) is None:
+        raise _fail("called workflow SHA is malformed")
+    call_jobs = [job for job in jobs if job.get("name") == AUTO_CALL_JOB_NAME]
+    final_jobs = [job for job in jobs if job.get("name") == AUTO_FINAL_JOB_NAME]
+    if len(call_jobs) != 1 or len(final_jobs) != 1:
+        raise _fail("native call or final barrier job is missing or ambiguous")
+    call_job = call_jobs[0]
+    final_job = final_jobs[0]
+    _job_workflow_identity(
+        call_job,
+        expected_name=AUTO_CALL_JOB_NAME,
+        expected_workflow_name=DEPLOY_WORKFLOW_NAME,
+        expected_workflow_path=DEPLOY_WORKFLOW_PATH,
+        expected_workflow_ref=called_workflow_ref,
+        expected_workflow_sha=called_workflow_sha,
+    )
+    _job_state(call_job, expected_name=AUTO_CALL_JOB_NAME)
+    # The final barrier is owned by the caller workflow.  GitHub's jobs API
+    # does not promise that reusable-call metadata is copied onto this caller
+    # job, so bind it by exact name/result while the reusable job above is
+    # bound by the effective workflow identity fields.
+    _job_state(final_job, expected_name=AUTO_FINAL_JOB_NAME)
+    return call_job, final_job
+
+
+def validate_auto_release_run(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    expected_called_workflow_ref: str,
+    expected_called_workflow_sha: str,
+    expected_run_url: str | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Validate an auto-deploy caller run without trusting its ``head_sha``.
+
+    The target SHA is supplied by a separately validated closed receipt.  The
+    caller run's own SHA is only used to bind its workflow identity and is
+    never treated as the deployment target.
+    """
+
+    _validate_job_rows(jobs)
+    _validate_status_rows(statuses)
+    attempt_url = validate_workflow_run(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=run.get("head_sha"),
+        expected_event="workflow_run",
+        expected_branch="dev",
+        expected_path=AUTO_WORKFLOW_PATH,
+        expected_name=AUTO_WORKFLOW_NAME,
+    )
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise _fail("auto-deploy caller run did not succeed")
+    if expected_run_url is not None and run.get("html_url") != expected_run_url:
+        raise _fail("auto-deploy caller run URL does not match the event")
+    validate_auto_release_jobs(
+        jobs,
+        called_workflow_ref=expected_called_workflow_ref,
+        called_workflow_sha=expected_called_workflow_sha,
+    )
+    marker = latest_context_status(
+        statuses,
+        context=DEPLOY_STATUS_CONTEXT,
+        now=now,
+    )
+    validate_actions_bot_status(
+        marker,
+        expected_context=DEPLOY_STATUS_CONTEXT,
+        expected_state="success",
+        expected_target_url=attempt_url,
+        expected_description=DEPLOY_SUCCESS_DESCRIPTION,
+    )
+    # A closed receipt separately binds the target SHA.  Keep this argument in
+    # the contract so consumers cannot accidentally omit it while assembling
+    # their exact comparison.
+    if not isinstance(expected_target_sha, str) or SHA_RE.fullmatch(expected_target_sha) is None:
+        raise _fail("receipt target SHA is malformed")
+    return attempt_url
+
+
+def validate_manual_deployment_run(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    expected_run_url: str | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Classify a manual production deploy or its read-only preflight.
+
+    Manual preflight is an authenticated, successful no-op and has no release
+    receipt or deploy status marker.  A manual deploy must have the successful
+    deployment job, marker and closed receipt supplied by the consumer.
+    """
+
+    _validate_job_rows(jobs)
+    _validate_status_rows(statuses)
+    validate_workflow_run_identity(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=expected_target_sha,
+        expected_event="workflow_dispatch",
+        expected_branch="dev",
+        expected_path=DEPLOY_WORKFLOW_PATH,
+        expected_name=DEPLOY_WORKFLOW_NAME,
+    )
+    if expected_run_url is not None and run.get("html_url") != expected_run_url:
+        raise _fail("manual production run URL does not match the event")
+    deploy_jobs = [job for job in jobs if job.get("name") == DEPLOY_JOB_NAME]
+    preflight_jobs = [job for job in jobs if job.get("name") == PREFLIGHT_JOB_NAME]
+    if len(deploy_jobs) != 1 or len(preflight_jobs) != 1:
+        raise _fail("manual production job set is missing or ambiguous")
+    deploy_state = (deploy_jobs[0].get("status"), deploy_jobs[0].get("conclusion"))
+    preflight_state = (preflight_jobs[0].get("status"), preflight_jobs[0].get("conclusion"))
+    if deploy_state == ("completed", "success"):
+        if run.get("status") != "completed" or run.get("conclusion") != "success":
+            raise _fail("manual deployment run did not succeed")
+        attempt_url = canonical_attempt_url(
+            run,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+        )
+        marker = latest_context_status(statuses, context=DEPLOY_STATUS_CONTEXT, now=now)
+        validate_actions_bot_status(
+            marker,
+            expected_context=DEPLOY_STATUS_CONTEXT,
+            expected_state="success",
+            expected_target_url=attempt_url,
+            expected_description=DEPLOY_SUCCESS_DESCRIPTION,
+        )
+        return True
+    if deploy_state != ("completed", "skipped") or preflight_state != ("completed", "success"):
+        raise _fail("manual production run is neither a successful deploy nor preflight")
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise _fail("manual preflight run did not succeed")
+    validate_status_collection(statuses, context=DEPLOY_STATUS_CONTEXT, now=now)
+    return False
+
+
 def _validate_status_rows(statuses: Sequence[Mapping[str, Any]]) -> None:
     """Validate the identity shape of every row in a complete status page set."""
 
@@ -570,7 +783,7 @@ def validate_deployment_marker(
 ) -> str:
     """Validate a successful deploy run and its exact bot-produced marker.
 
-    ``workflow_call`` is the native auto-deploy entrypoint and
+    ``workflow_run`` is the inherited native auto-deploy entrypoint and
     ``workflow_dispatch`` is the guarded operator fallback.  When a caller
     does not provide ``expected_event``, the run's event is still required to
     be one of those two exact values; an explicit value additionally binds the
@@ -798,7 +1011,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         description="Validate exact GitHub Actions workflow provenance"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("security", "deployment"):
+    for command in ("security", "deployment", "auto-release", "manual-release"):
         command_parser = subparsers.add_parser(command)
         command_parser.add_argument("--workflow", type=Path, required=True)
         command_parser.add_argument("--run", type=Path, required=True)
@@ -808,13 +1021,16 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--expected-attempt", required=True)
         command_parser.add_argument("--expected-target-sha", required=True)
         command_parser.add_argument("--expected-run-url")
-        if command == "deployment":
+        if command in {"deployment", "auto-release"}:
             command_parser.add_argument("--expected-event", choices=DEPLOYMENT_EVENTS)
             command_parser.add_argument(
                 "--allow-preflight-noop",
                 action="store_true",
                 help="accept an exact successful preflight as a non-mutating no-op",
             )
+        if command == "auto-release":
+            command_parser.add_argument("--called-workflow-ref", required=True)
+            command_parser.add_argument("--called-workflow-sha", required=True)
     return parser
 
 
@@ -848,6 +1064,52 @@ def main(argv: Sequence[str] | None = None) -> int:
                 now=now,
             )
             context = SECURITY_STATUS_CONTEXT
+        elif args.command == "auto-release":
+            if args.jobs is None:
+                raise _fail("auto-release job payload is missing")
+            jobs_payload = _read_json(args.jobs)
+            jobs = _payload_rows(jobs_payload, "jobs", "auto-release job")
+            if not args.called_workflow_ref or not args.called_workflow_sha:
+                raise _fail("auto-release called workflow identity is missing")
+            statuses = _payload_rows(status_payload, "statuses", "auto-release status")
+            attempt_url = validate_auto_release_run(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+                expected_target_sha=args.expected_target_sha,
+                expected_called_workflow_ref=args.called_workflow_ref,
+                expected_called_workflow_sha=args.called_workflow_sha,
+                expected_run_url=args.expected_run_url,
+                now=now,
+            )
+            deploy_ready = True
+            context = DEPLOY_STATUS_CONTEXT
+        elif args.command == "manual-release":
+            if args.jobs is None:
+                raise _fail("manual-release job payload is missing")
+            jobs_payload = _read_json(args.jobs)
+            jobs = _payload_rows(jobs_payload, "jobs", "manual-release job")
+            statuses = _payload_rows(status_payload, "statuses", "manual-release status")
+            deploy_ready = validate_manual_deployment_run(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+                expected_target_sha=args.expected_target_sha,
+                expected_run_url=args.expected_run_url,
+                now=now,
+            )
+            attempt_url = canonical_attempt_url(
+                run,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+            )
+            context = DEPLOY_STATUS_CONTEXT
         else:
             if args.jobs is None:
                 raise _fail("deployment job payload is missing")
@@ -891,7 +1153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     now=now,
                 )
             context = DEPLOY_STATUS_CONTEXT
-        snapshot_jobs = jobs if args.command == "deployment" else []
+        snapshot_jobs = jobs if args.command in {"deployment", "auto-release", "manual-release"} else []
         marker = (
             _status_fingerprint(
                 statuses,
@@ -905,7 +1167,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps(
                 {
                     "attempt_url": attempt_url,
-                    "deploy_ready": deploy_ready if args.command == "deployment" else True,
+                    "deploy_ready": deploy_ready if args.command in {"deployment", "auto-release", "manual-release"} else True,
                     "snapshot_digest": deployment_snapshot_digest(
                         workflow,
                         run,

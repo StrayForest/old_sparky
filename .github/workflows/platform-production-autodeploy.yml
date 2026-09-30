@@ -13,8 +13,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: platform-production-auto-deploy
-  cancel-in-progress: true
+  group: platform-production-release-authority
+  cancel-in-progress: false
 
 jobs:
   validate:
@@ -43,6 +43,8 @@ jobs:
       target_sha: ${{ steps.gate.outputs.target_sha }}
       classifier_run_id: ${{ steps.gate.outputs.classifier_run_id }}
       classifier_run_attempt: ${{ steps.gate.outputs.classifier_run_attempt }}
+      security_run_id: ${{ steps.gate.outputs.security_run_id }}
+      security_run_attempt: ${{ steps.gate.outputs.security_run_attempt }}
       runtime_profile: ${{ steps.gate.outputs.runtime_profile }}
       web_compression: ${{ steps.gate.outputs.web_compression }}
       route_class: ${{ steps.route.outputs.route_class }}
@@ -423,6 +425,8 @@ jobs:
             echo "target_sha=$TARGET_SHA"
             echo "classifier_run_id=$SOURCE_RUN_ID"
             echo "classifier_run_attempt=$SOURCE_RUN_ATTEMPT"
+            echo "security_run_id=$SOURCE_RUN_ID"
+            echo "security_run_attempt=$SOURCE_RUN_ATTEMPT"
             echo "runtime_profile=ready-vote-static-8"
             echo "web_compression=enabled"
           } >> "$GITHUB_OUTPUT"
@@ -590,6 +594,17 @@ jobs:
       target_sha: ${{ needs.validate.outputs.target_sha }}
       classifier_run_id: ${{ needs.validate.outputs.classifier_run_id }}
       classifier_run_attempt: ${{ needs.validate.outputs.classifier_run_attempt }}
+      security_run_id: ${{ needs.validate.outputs.security_run_id }}
+      security_run_attempt: ${{ needs.validate.outputs.security_run_attempt }}
+      caller_kind: auto
+      caller_run_id: ${{ github.run_id }}
+      caller_run_attempt: ${{ github.run_attempt }}
+      caller_workflow_ref: ${{ github.workflow_ref }}
+      caller_workflow_sha: ${{ github.workflow_sha }}
+      caller_sha: ${{ github.sha }}
+      expected_called_workflow_file: .github/workflows/platform-production-deploy.yml
+      expected_called_workflow_ref: StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev
+      expected_called_workflow_sha: ${{ github.workflow_sha }}
 
   # A reusable-workflow call is a real job: failure and cancellation are
   # visible here and must make the enclosing auto-deploy workflow fail too.
@@ -622,6 +637,11 @@ jobs:
             echo "- Security/build run: $SOURCE_RUN_URL"
             echo "- Classifier route: \`$ROUTE_CLASS\` ($ROUTE_REASON)"
           } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VALIDATE_RESULT" == "cancelled" || "$DEPLOY_RESULT" == "cancelled" ]]; then
+            echo "- Result: cancelled; release authority remains recovery-visible" >> "$GITHUB_STEP_SUMMARY"
+            echo "Auto-deploy was cancelled; no green release result is possible." >&2
+            exit 1
+          fi
           if [[ "$VALIDATE_RESULT" != "success" ]]; then
             echo "Exact security/classifier gate did not succeed: $VALIDATE_RESULT" >&2
             exit 1
