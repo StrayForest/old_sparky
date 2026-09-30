@@ -36,6 +36,7 @@ try:
         CI_GATE_IDS,
         DETERMINISTIC_GATE_IDS,
         GATES_BY_ID,
+        RELEASE_RUNTIME_TEST_IDS,
         _backend_command,
         _backend_contour_command,
         _verification_contract_commands,
@@ -64,6 +65,7 @@ except ModuleNotFoundError:  # Direct execution from platform/tools.
         CI_GATE_IDS,
         DETERMINISTIC_GATE_IDS,
         GATES_BY_ID,
+        RELEASE_RUNTIME_TEST_IDS,
         _backend_command,
         _backend_contour_command,
         _verification_contract_commands,
@@ -1375,12 +1377,49 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
     issues: list[str] = []
     fixture = _workflow_job_block(security_text, "release-runtime")
     real = _workflow_job_block(security_text, "release-runtime-real")
+    privileged = _workflow_job_block(security_text, "backend-privileged")
+    status_final = _workflow_job_block(security_text, "status-final")
     if not fixture:
         issues.append("platform-security.yml is missing release-runtime fixture")
     if not real:
         issues.append("platform-security.yml is missing release-runtime-real")
+    if not privileged:
+        issues.append("platform-security.yml is missing backend-privileged release owner")
     if not fixture or not real:
         return issues
+
+    # The focused fixture is only a reduced-route owner.  Full routes already
+    # execute the same release IDs in the root-owned backend contour; keeping
+    # the predicate as one explicit expression prevents full, fallback and
+    # merge-group runs from executing those tests twice.
+    focused_predicate = (
+        "if: >-\n"
+        "      needs.classifier.outputs.class != 'full' &&\n"
+        "      (needs.classifier.outputs.runtime_sensitive == 'true' ||\n"
+        "      needs.classifier.outputs.fallback == 'true')"
+    )
+    if focused_predicate not in fixture:
+        issues.append(
+            "release-runtime fixture must be limited to non-full sensitive/fallback routes"
+        )
+    if "needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true'" in fixture:
+        issues.append("release-runtime fixture must not use the legacy unrestricted predicate")
+    if privileged.count("platform_verify.py backend-privileged") != 1:
+        issues.append("backend-privileged must execute its catalog exactly once")
+    if "if: ${{ needs.classifier.outputs.class == 'full' }}" not in privileged:
+        issues.append("backend-privileged must remain the full-route release-runtime owner")
+    try:
+        catalog_cases = {
+            case.test_id: case
+            for case in cases_for_contour("backend-privileged", discover_test_cases())
+        }
+    except (OSError, SyntaxError, ValueError) as exc:
+        issues.append(f"backend catalog cannot prove release-runtime ownership: {exc}")
+    else:
+        for test_id in RELEASE_RUNTIME_TEST_IDS:
+            case = catalog_cases.get(test_id)
+            if case is None:
+                issues.append(f"release-runtime test ID is not backend-privileged: {test_id}")
 
     if "name: Conditional release runtime fixture" not in fixture:
         issues.append("release-runtime must remain the fixture job")
@@ -1496,6 +1535,25 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         issues.append("release-runtime-real must use task-owned output, not production paths")
     if "platform_build_live_qa_runtime.py" in real_step:
         issues.append("release-runtime-real must call the full canonical builder, not a partial imitation")
+
+    # status-final must apply the exact focused-job predicate while keeping
+    # the trusted-dev real-builder predicate independent of that optimization.
+    if not status_final:
+        issues.append("platform-security.yml is missing status-final release result owner")
+    else:
+        if 'route_class != "full"' not in status_final:
+            issues.append("status-final must suppress focused release-runtime on full routes")
+        if 'and (runtime_sensitive or raw_fallback == "true")' not in status_final:
+            issues.append("status-final must require runtime-sensitive or fallback focused coverage")
+        if 'requires_release_runtime = runtime_sensitive or raw_fallback == "true"' in status_final:
+            issues.append("status-final must not use the legacy unrestricted release predicate")
+        if 'requires_real_release_runtime = (' not in status_final:
+            issues.append("status-final must keep real release-runtime independent")
+        if (
+            'requires_real_release_runtime = requires_release_runtime'
+            in status_final
+        ):
+            issues.append("status-final real release requirement must not depend on focused coverage")
     return issues
 
 

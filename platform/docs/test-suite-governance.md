@@ -22,7 +22,7 @@ placement rules; it does not repeat tool arguments.
 | `web-quality` | web owners | Node 26.3.1 and locked dependencies | local feedback + CI |
 | `web-hermetic` | web owners | local/mocked API and Chromium | local feedback + CI |
 | `verification-contract` | platform tooling owners | repository checkout | CI |
-| `release-runtime` | release owners | root test user; disposable staged checkout and local ZIP fixtures | conditional runtime-sensitive/fallback fixture route |
+| `release-runtime` | release owners | root test user; disposable staged checkout and local ZIP fixtures | conditional non-full runtime-sensitive/fallback fixture route |
 | `server-smoke` | release owners | exact deployed SHA | deployment workflow |
 | `live-public` | production operators | canonical public origin and dedicated QA identity | explicit/release workflow |
 | `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
@@ -46,18 +46,25 @@ from `platform/`; the helper fails closed unless Node 26.3.1 is selected.
 
 The first eight gates are deterministic and always part of the normal CI
 aggregate. The conditional `release-runtime` gate is deterministic as well,
-but is intentionally excluded from `platform_verify.py ci`: the classifier
-enables it for an exact runtime-sensitive path change or for a fail-closed
-fallback route. The fallback condition ensures an uncertain route receives
-the release-runtime coverage without granting it production authority.
-On pull requests and `merge_group`, `release-runtime` is fixture-only: it
+but is intentionally excluded from `platform_verify.py ci`. Its workflow
+predicate is exactly `class != full && (runtime_sensitive || fallback)`, so it
+belongs only to a future reduced route that needs focused release coverage.
+Full routes—including fallback and `merge_group` full routes—already execute
+the same release IDs once through the root-owned `backend-privileged` contour;
+running the focused fixture there would duplicate work. The separate
+`release-runtime-real` trusted-`dev` builder retains its own sensitive/fallback
+predicate and is not coupled to this focused-job optimization. A fallback
+route still receives the full deterministic gates without granting production
+authority.
+When the focused route is selected, `release-runtime` is fixture-only: it
 builds the staged runtime with local small pinned-fixture ZIPs under
 `python -I`, verifies link materialization, manifest/tree/mode invariants and
 downstream install validation. Runtime manifest trees use one explicit POSIX
 component-order key across the builder, installer and standalone artifact
 validator; the fixture gate includes a divergent-path parity regression and a
 builder-to-tar-to-standalone-validator check. The gate has no production
-network, credentials or deployment authority. A separate `release-runtime-real`
+network, credentials or deployment authority. Full pull requests and
+`merge_group` runs use `backend-privileged` for these IDs instead. A separate `release-runtime-real`
 job runs only for a
 classifier-sensitive or fallback `push` to canonical `dev`, or for
 `workflow_dispatch` whose ref is exactly `dev`. It starts on a fresh runner,
@@ -261,9 +268,11 @@ trusted `dev` and invoked with `python -I -B`.
 
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route
-with `fallback=true` and `deployable=false`; these routes also run the
-conditional `release-runtime` fixture gate; a sensitive/fallback push to the
-canonical `dev` branch also runs the separate `release-runtime-real` builder.
+with `fallback=true` and `deployable=false`; their release IDs are covered once
+by `backend-privileged`, while a sensitive/fallback push to the canonical
+`dev` branch also runs the separate `release-runtime-real` builder. Only a
+non-full route with `runtime_sensitive=true` or `fallback=true` runs the
+focused `release-runtime` fixture.
 Known `.github/**` and
 `platform/**` dependency, configuration, migration, workflow and registry
 paths are recognized full routes with `fallback=false`; they are not fallback

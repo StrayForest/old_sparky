@@ -34,6 +34,7 @@ from tools.platform_verify import (
     CI_GATE_IDS,
     DETERMINISTIC_GATE_IDS,
     GATES_BY_ID,
+    RELEASE_RUNTIME_TEST_IDS,
     VerificationError,
     _verification_contract_commands,
     dispatch,
@@ -740,6 +741,17 @@ except lock.VerificationLockError as exc:
         self.assertFalse(GATES_BY_ID["external-load"].deterministic)
         self.assertFalse(GATES_BY_ID["external-load"].local_safe)
         self.assertEqual(registry_payload()["ci_gate_ids"], list(CI_GATE_IDS))
+
+        catalog_cases = {
+            case.test_id: case
+            for case in discover_test_cases()
+            if case.contour == "backend-privileged"
+        }
+        self.assertTrue(RELEASE_RUNTIME_TEST_IDS)
+        for test_id in RELEASE_RUNTIME_TEST_IDS:
+            with self.subTest(release_runtime_id=test_id):
+                self.assertIn(test_id, catalog_cases)
+                self.assertEqual(catalog_cases[test_id].contour, "backend-privileged")
 
         verification_cases = cases_for_contour(
             VERIFICATION_CONTOUR,
