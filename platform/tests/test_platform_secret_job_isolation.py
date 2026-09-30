@@ -228,9 +228,13 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
             "steps.upload-closed-receipt.outputs.artifact-digest != ''",
         ):
             self.assertIn(marker, finalizer)
-        self.assertIn("repository: ${{ env.CALLED_WORKFLOW_REPOSITORY }}", finalizer)
-        self.assertIn("ref: ${{ env.CALLED_WORKFLOW_SHA }}", finalizer)
+        self.assertIn("repository: ${{ steps.called-workflow-identity.outputs.repository }}", finalizer)
+        self.assertIn("ref: ${{ steps.called-workflow-identity.outputs.sha }}", finalizer)
         self.assertIn("CALLED_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}", finalizer)
+        self.assertNotIn(
+            "CALLED_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}\n",
+            finalizer.split("    steps:", 1)[0],
+        )
         self.assertIn('test "$(git rev-parse HEAD)" = "$EXPECTED_CALLED_WORKFLOW_SHA"', finalizer)
 
 

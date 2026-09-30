@@ -47,6 +47,16 @@ jobs:
       security_run_attempt: ${{ steps.gate.outputs.security_run_attempt }}
       runtime_profile: ${{ steps.gate.outputs.runtime_profile }}
       web_compression: ${{ steps.gate.outputs.web_compression }}
+      mode: ${{ steps.gate.outputs.mode }}
+      caller_kind: ${{ steps.gate.outputs.caller_kind }}
+      caller_run_id: ${{ steps.gate.outputs.caller_run_id }}
+      caller_run_attempt: ${{ steps.gate.outputs.caller_run_attempt }}
+      caller_workflow_ref: ${{ steps.gate.outputs.caller_workflow_ref }}
+      caller_workflow_sha: ${{ steps.gate.outputs.caller_workflow_sha }}
+      caller_sha: ${{ steps.gate.outputs.caller_sha }}
+      expected_called_workflow_file: ${{ steps.gate.outputs.expected_called_workflow_file }}
+      expected_called_workflow_ref: ${{ steps.gate.outputs.expected_called_workflow_ref }}
+      expected_called_workflow_sha: ${{ steps.gate.outputs.expected_called_workflow_sha }}
       route_class: ${{ steps.route.outputs.route_class }}
       route_reason: ${{ steps.route.outputs.route_reason }}
     steps:
@@ -418,6 +428,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
+          CALLER_RUN_ID: ${{ github.run_id }}
+          CALLER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CALLER_SHA: ${{ github.sha }}
+          EXPECTED_CALLED_WORKFLOW_FILE: .github/workflows/platform-production-deploy.yml
+          EXPECTED_CALLED_WORKFLOW_REF: StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev
+          EXPECTED_CALLED_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
 
@@ -429,6 +447,16 @@ jobs:
             echo "security_run_attempt=$SOURCE_RUN_ATTEMPT"
             echo "runtime_profile=ready-vote-static-8"
             echo "web_compression=enabled"
+            echo "mode=deploy"
+            echo "caller_kind=auto"
+            echo "caller_run_id=$CALLER_RUN_ID"
+            echo "caller_run_attempt=$CALLER_RUN_ATTEMPT"
+            echo "caller_workflow_ref=$CALLER_WORKFLOW_REF"
+            echo "caller_workflow_sha=$CALLER_WORKFLOW_SHA"
+            echo "caller_sha=$CALLER_SHA"
+            echo "expected_called_workflow_file=$EXPECTED_CALLED_WORKFLOW_FILE"
+            echo "expected_called_workflow_ref=$EXPECTED_CALLED_WORKFLOW_REF"
+            echo "expected_called_workflow_sha=$EXPECTED_CALLED_WORKFLOW_SHA"
           } >> "$GITHUB_OUTPUT"
 
           branch_json="$(
@@ -452,7 +480,7 @@ jobs:
             exit 0
           fi
 
-          if [[ "$ROUTE_DEPLOYABLE" != "true" ]]; then
+          if [[ "$ROUTE_CLASS" != "full" || "$ROUTE_DEPLOYABLE" != "true" ]]; then
             echo "Classifier route is non-deployable ($ROUTE_CLASS); no production deployment required."
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -570,6 +598,7 @@ jobs:
           if first != second:
               raise SystemExit("platform-security-build status changed during validation")
           PY
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
           rm -rf -- "$status_dir"
           test ! -e "$status_dir"
 
@@ -588,7 +617,7 @@ jobs:
       statuses: write
     uses: ./.github/workflows/platform-production-deploy.yml
     with:
-      mode: deploy
+      mode: ${{ needs.validate.outputs.mode }}
       runtime_profile: ${{ needs.validate.outputs.runtime_profile }}
       web_compression: ${{ needs.validate.outputs.web_compression }}
       target_sha: ${{ needs.validate.outputs.target_sha }}
@@ -596,15 +625,15 @@ jobs:
       classifier_run_attempt: ${{ needs.validate.outputs.classifier_run_attempt }}
       security_run_id: ${{ needs.validate.outputs.security_run_id }}
       security_run_attempt: ${{ needs.validate.outputs.security_run_attempt }}
-      caller_kind: auto
-      caller_run_id: ${{ github.run_id }}
-      caller_run_attempt: ${{ github.run_attempt }}
-      caller_workflow_ref: ${{ github.workflow_ref }}
-      caller_workflow_sha: ${{ github.workflow_sha }}
-      caller_sha: ${{ github.sha }}
-      expected_called_workflow_file: .github/workflows/platform-production-deploy.yml
-      expected_called_workflow_ref: StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev
-      expected_called_workflow_sha: ${{ github.workflow_sha }}
+      caller_kind: ${{ needs.validate.outputs.caller_kind }}
+      caller_run_id: ${{ needs.validate.outputs.caller_run_id }}
+      caller_run_attempt: ${{ needs.validate.outputs.caller_run_attempt }}
+      caller_workflow_ref: ${{ needs.validate.outputs.caller_workflow_ref }}
+      caller_workflow_sha: ${{ needs.validate.outputs.caller_workflow_sha }}
+      caller_sha: ${{ needs.validate.outputs.caller_sha }}
+      expected_called_workflow_file: ${{ needs.validate.outputs.expected_called_workflow_file }}
+      expected_called_workflow_ref: ${{ needs.validate.outputs.expected_called_workflow_ref }}
+      expected_called_workflow_sha: ${{ needs.validate.outputs.expected_called_workflow_sha }}
 
   # A reusable-workflow call is a real job: failure and cancellation are
   # visible here and must make the enclosing auto-deploy workflow fail too.

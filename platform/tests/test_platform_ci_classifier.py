@@ -295,7 +295,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(route["route_fallback"], str(push_manifest["fallback"]).lower())
         self.assertEqual(route["route_digest"], push_manifest["digest"])
         self.assertIn(
-            'if [[ "$ROUTE_DEPLOYABLE" != "true" ]]',
+            'if [[ "$ROUTE_CLASS" != "full" || "$ROUTE_DEPLOYABLE" != "true" ]]',
             AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8"),
         )
         self.assertIn(

@@ -27,7 +27,8 @@ import sys
 import tempfile
 import time
 from typing import Any
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from urllib.parse import urlsplit
 
 
@@ -52,7 +53,6 @@ DEPLOY_SUCCESS_DESCRIPTION = "Production deployment and live smoke passed"
 SECURITY_SUCCESS_DESCRIPTION = "Platform security and build passed"
 AUTO_WORKFLOW_PATH = ".github/workflows/platform-production-autodeploy.yml"
 AUTO_WORKFLOW_NAME = "Platform production auto-deploy"
-AUTO_CALL_JOB_NAME = "Native production deployment"
 AUTO_FINAL_JOB_NAME = "Auto-deploy result"
 ACTIONS_BOT_LOGIN = "github-actions[bot]"
 ACTIONS_BOT_TYPE = "Bot"
@@ -68,6 +68,25 @@ UTC_STATUS_TIMESTAMP_RE = re.compile(
 )
 STATUS_MAX_AGE = timedelta(days=30)
 STATUS_MAX_FUTURE_SKEW = timedelta(0)
+_WORKFLOW_LOCATOR_RE = re.compile(r"^[A-Za-z0-9._/-]{1,256}$")
+_WORKFLOW_PATH_RE = re.compile(r"^\.github/workflows/[A-Za-z0-9._/-]+\.(?:yml|yaml)$")
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Keep the bearer-token API request from following a signed ZIP URL."""
+
+    def redirect_request(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
+
+
+def _open_no_redirect(request: Request, *, timeout: int):
+    """Open one URL without installing urllib's redirect handler."""
+
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
 
 class ProvenanceError(ValueError):
     """Raised when an API payload is incomplete, mismatched, or spoofed."""
@@ -470,7 +489,7 @@ def _validate_job_rows(jobs: Sequence[Mapping[str, Any]]) -> None:
         for field in ("run_id", "run_attempt"):
             _run_id(job[field], f"job {field}")
         for field in ("runner_id", "runner_group_id"):
-            if field in job and (
+            if field in job and job[field] is not None and (
                 isinstance(job[field], bool)
                 or not isinstance(job[field], int)
                 or job[field] <= 0
@@ -482,6 +501,32 @@ def _validate_job_rows(jobs: Sequence[Mapping[str, Any]]) -> None:
             raise _fail("job status is malformed")
         if job["conclusion"] is not None and not isinstance(job["conclusion"], str):
             raise _fail("job conclusion is malformed")
+        for field in (
+            "node_id",
+            "url",
+            "html_url",
+            "run_url",
+            "workflow_run_url",
+            "check_run_url",
+            "created_at",
+            "started_at",
+            "completed_at",
+            "head_branch",
+            "workflow_name",
+        ):
+            if field in job and job[field] is not None and not isinstance(job[field], str):
+                raise _fail(f"job {field} is malformed")
+        for field in ("runner_name", "runner_group_name"):
+            if field in job and job[field] is not None and not isinstance(job[field], str):
+                raise _fail(f"job {field} is malformed")
+        if "labels" in job:
+            labels = job["labels"]
+            if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
+                raise _fail("job labels are malformed")
+        if "steps" in job:
+            steps = job["steps"]
+            if not isinstance(steps, list) or any(not isinstance(step, Mapping) for step in steps):
+                raise _fail("job steps are malformed")
 
 
 _DOCUMENTED_JOB_FIELDS = frozenset(
@@ -491,15 +536,21 @@ _DOCUMENTED_JOB_FIELDS = frozenset(
         "run_attempt",
         "node_id",
         "head_sha",
+        "head_branch",
         "url",
         "html_url",
+        "run_url",
+        "workflow_run_url",
         "status",
         "conclusion",
+        "created_at",
         "started_at",
         "completed_at",
         "name",
+        "workflow_name",
         "check_run_url",
         "steps",
+        "labels",
         "runner_id",
         "runner_name",
         "runner_group_id",
@@ -519,8 +570,9 @@ def _job_state(
     expected_run_id: int | None = None,
     expected_attempt: int | None = None,
     expected_head_sha: str | None = None,
+    allow_reusable_prefix: bool = False,
 ) -> None:
-    if job.get("name") != expected_name:
+    if not _job_name_matches(job, expected_name, allow_reusable_prefix=allow_reusable_prefix):
         raise _fail("job identity is not canonical")
     # These documented jobs API fields are required by the downstream
     # boundary and bind this row to the exact run attempt.  A job name alone
@@ -533,6 +585,23 @@ def _job_state(
         raise _fail("job head SHA does not match the requested run")
     if job.get("status") != "completed" or job.get("conclusion") != "success":
         raise _fail("required job did not complete successfully")
+
+
+def _job_name_matches(
+    job: Mapping[str, Any],
+    expected_name: str,
+    *,
+    allow_reusable_prefix: bool = False,
+) -> bool:
+    name = job.get("name")
+    if name == expected_name:
+        return True
+    return bool(
+        allow_reusable_prefix
+        and isinstance(name, str)
+        and name.endswith(f" / {expected_name}")
+        and name != f" / {expected_name}"
+    )
 
 
 def _bind_job_identity(
@@ -574,10 +643,9 @@ def validate_referenced_workflows(
         raise _fail("called workflow ref is malformed")
     if not isinstance(expected_workflow_sha, str) or SHA_RE.fullmatch(expected_workflow_sha) is None:
         raise _fail("called workflow SHA is malformed")
-    prefix = f"{REPOSITORY_FULL_NAME}/{expected_workflow_path}@"
-    if not expected_workflow_ref.startswith(prefix):
-        raise _fail("called workflow ref is not canonical")
-    expected_ref = expected_workflow_ref[len(prefix):]
+    expected_path, _expected_locator = _parse_workflow_ref(expected_workflow_ref)
+    if expected_path != expected_workflow_path:
+        raise _fail("called workflow path is not canonical")
     references = run.get("referenced_workflows")
     if not isinstance(references, Sequence) or isinstance(references, (str, bytes)):
         raise _fail("workflow-run referenced_workflows is missing")
@@ -585,21 +653,47 @@ def validate_referenced_workflows(
     for reference in references:
         if not isinstance(reference, Mapping):
             raise _fail("workflow-run referenced workflow row is malformed")
-        if set(reference) != {"path", "ref", "sha"}:
+        if set(reference) not in ({"path", "sha"}, {"path", "ref", "sha"}):
             raise _fail("workflow-run referenced workflow fields are undocumented")
-        if not isinstance(reference.get("path"), str) or not isinstance(reference.get("ref"), str):
-            raise _fail("workflow-run referenced workflow path/ref is malformed")
+        reference_path = _normalise_referenced_workflow_path(reference.get("path"))
+        if "ref" in reference and reference.get("ref") is not None:
+            if not isinstance(reference.get("ref"), str) or _WORKFLOW_LOCATOR_RE.fullmatch(reference["ref"]) is None:
+                raise _fail("workflow-run referenced workflow ref is malformed")
         if SHA_RE.fullmatch(str(reference.get("sha"))) is None:
             raise _fail("workflow-run referenced workflow SHA is malformed")
         if (
-            reference.get("path") == expected_workflow_path
-            and reference.get("ref") == expected_ref
+            reference_path == expected_workflow_path
             and reference.get("sha") == expected_workflow_sha
         ):
             matches.append(reference)
     if len(matches) != 1:
         raise _fail("exact called workflow reference is missing or ambiguous")
     return matches[0]
+
+
+def _parse_workflow_ref(value: str) -> tuple[str, str]:
+    """Parse the canonical owner/repository/workflow path locator form."""
+
+    owner_path, separator, locator = value.rpartition("@")
+    prefix = f"{REPOSITORY_FULL_NAME}/"
+    if not separator or not owner_path.startswith(prefix) or not locator:
+        raise _fail("called workflow ref is not canonical")
+    path = owner_path[len(prefix):]
+    if _WORKFLOW_PATH_RE.fullmatch(path) is None or _WORKFLOW_LOCATOR_RE.fullmatch(locator) is None:
+        raise _fail("called workflow ref is not canonical")
+    if "//" in path or ".." in path or ".." in locator:
+        raise _fail("called workflow ref is not canonical")
+    return path, locator
+
+
+def _normalise_referenced_workflow_path(value: object) -> str:
+    if not isinstance(value, str):
+        raise _fail("workflow-run referenced workflow path is malformed")
+    prefix = f"{REPOSITORY_FULL_NAME}/"
+    path = value[len(prefix):] if value.startswith(prefix) else value
+    if _WORKFLOW_PATH_RE.fullmatch(path) is None or ".." in path:
+        raise _fail("workflow-run referenced workflow path is malformed")
+    return path
 
 
 def validate_auto_release_jobs(
@@ -617,23 +711,26 @@ def validate_auto_release_jobs(
     """
 
     _validate_job_rows(jobs)
-    call_jobs = [job for job in jobs if job.get("name") == AUTO_CALL_JOB_NAME]
+    call_jobs = [
+        job for job in jobs
+        if _job_name_matches(job, DEPLOY_JOB_NAME, allow_reusable_prefix=True)
+    ]
     final_jobs = [job for job in jobs if job.get("name") == AUTO_FINAL_JOB_NAME]
     if len(call_jobs) != 1 or len(final_jobs) != 1:
-        raise _fail("native call or final barrier job is missing or ambiguous")
+        raise _fail("called deploy or final barrier job is missing or ambiguous")
     call_job = call_jobs[0]
     final_job = final_jobs[0]
     _job_state(
         call_job,
-        expected_name=AUTO_CALL_JOB_NAME,
+        expected_name=DEPLOY_JOB_NAME,
         expected_run_id=expected_run_id,
         expected_attempt=expected_attempt,
         expected_head_sha=expected_head_sha,
+        allow_reusable_prefix=True,
     )
-    # The final barrier is owned by the caller workflow.  GitHub's jobs API
-    # does not promise that reusable-call metadata is copied onto this caller
-    # job, so bind it by exact name/result while the reusable job above is
-    # bound by the effective workflow identity fields.
+    # The final barrier is owned by the caller workflow.  Bind it by exact
+    # name/result while the reusable job above is bound by its called-job
+    # name and documented run identity fields.
     _job_state(
         final_job,
         expected_name=AUTO_FINAL_JOB_NAME,
@@ -673,7 +770,10 @@ def validate_auto_noop_run(
     )
     if expected_run_url is not None and run.get("html_url") != expected_run_url:
         raise _fail("auto-deploy caller run URL does not match the event")
-    call_jobs = [job for job in jobs if job.get("name") == AUTO_CALL_JOB_NAME]
+    call_jobs = [
+        job for job in jobs
+        if _job_name_matches(job, DEPLOY_JOB_NAME, allow_reusable_prefix=True)
+    ]
     final_jobs = [job for job in jobs if job.get("name") == AUTO_FINAL_JOB_NAME]
     if len(call_jobs) != 1 or len(final_jobs) != 1:
         raise _fail("auto no-op job set is missing or ambiguous")
@@ -684,7 +784,7 @@ def validate_auto_noop_run(
         expected_head_sha=expected_target_sha,
     )
     if (call_jobs[0].get("status"), call_jobs[0].get("conclusion")) != ("completed", "skipped"):
-        raise _fail("auto no-op native call is not skipped")
+        raise _fail("auto no-op called deploy job is not skipped")
     _job_state(
         final_jobs[0],
         expected_name=AUTO_FINAL_JOB_NAME,
@@ -1263,13 +1363,77 @@ def _api_get_bytes(api_url: str, token: str, path: str) -> bytes:
         },
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        response = _open_no_redirect(request, timeout=30)
+    except HTTPError as exc:
+        if exc.code != 302:
+            raise _fail("GitHub artifact download failed") from exc
+        location = exc.headers.get("Location") if exc.headers is not None else None
+    except Exception as exc:  # pragma: no cover - network boundary
+        raise _fail("GitHub artifact download failed") from exc
+    else:
+        try:
+            status = response.status
+            headers = getattr(response, "headers", None) or {}
+            location = headers.get("Location")
+        finally:
+            response.close()
+        if status != 302:
+            raise _fail("GitHub artifact download did not return the expected redirect")
+    redirect_url = _validate_artifact_redirect(location)
+    redirect_request = Request(redirect_url, headers={"Accept": "application/octet-stream"})
+    try:
+        with _open_no_redirect(redirect_request, timeout=30) as response:
+            if response.status != 200:
+                raise _fail("signed GitHub artifact URL did not return the artifact")
             data = response.read(8 * 1024 * 1024 + 1)
+    except ProvenanceError:
+        raise
     except Exception as exc:  # pragma: no cover - network boundary
         raise _fail("GitHub artifact download failed") from exc
     if len(data) > 8 * 1024 * 1024:
         raise _fail("GitHub artifact is oversized")
     return data
+
+
+def _validate_artifact_redirect(location: object) -> str:
+    """Accept exactly one HTTPS redirect to a GitHub signed-artifact host."""
+
+    if not isinstance(location, str) or len(location) > 4096:
+        raise _fail("GitHub artifact redirect is malformed")
+    try:
+        parsed = urlsplit(location)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise _fail("GitHub artifact redirect is malformed") from exc
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+        or not parsed.path
+        or not _is_allowed_artifact_host(hostname.lower())
+    ):
+        raise _fail("GitHub artifact redirect host or scheme is not trusted")
+    return location
+
+
+def _is_allowed_artifact_host(hostname: str) -> bool:
+    """Return whether hostname is a GitHub-supported signed artifact host."""
+
+    if hostname == "objects.githubusercontent.com":
+        return True
+    if hostname.endswith(".actions.githubusercontent.com"):
+        return hostname.count(".") >= 2 and all(
+            label and re.fullmatch(r"[a-z0-9-]+", label) for label in hostname.split(".")
+        )
+    if hostname.endswith(".blob.core.windows.net"):
+        return hostname.count(".") >= 4 and all(
+            label and re.fullmatch(r"[a-z0-9-]+", label) for label in hostname.split(".")
+        )
+    return False
 
 
 def _api_paginate_with_total(
@@ -1463,8 +1627,12 @@ def validate_downstream_api(
     if artifact is None:
         raise _fail("closed release receipt artifact is missing or ambiguous")
     workflow_run = _as_mapping(artifact.get("workflow_run"), "receipt artifact workflow run")
-    if workflow_run.get("id") != run_id or workflow_run.get("run_attempt") != attempt:
-        raise _fail("receipt artifact is not bound to the exact attempt")
+    # The artifact-list API's nested workflow_run object documents the run ID
+    # but does not provide run_attempt.  The exact artifact name binds the
+    # requested attempt; the separately fetched jobs/run snapshots and closed
+    # receipt bind that attempt independently below.
+    if workflow_run.get("id") != run_id:
+        raise _fail("receipt artifact is not bound to the exact run")
     artifact_id = artifact.get("id")
     if type(artifact_id) is not int or artifact_id <= 0:
         raise _fail("receipt artifact ID is malformed")

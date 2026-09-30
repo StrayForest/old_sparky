@@ -3122,10 +3122,6 @@ jobs:
       CALLER_WORKFLOW_SHA: ${{ github.event_name == 'workflow_dispatch' && github.workflow_sha || inputs.caller_workflow_sha }}
       EXPECTED_CALLED_WORKFLOW_REF: ${{ github.event_name == 'workflow_dispatch' && github.workflow_ref || inputs.expected_called_workflow_ref }}
       EXPECTED_CALLED_WORKFLOW_SHA: ${{ github.event_name == 'workflow_dispatch' && github.workflow_sha || inputs.expected_called_workflow_sha }}
-      CALLED_WORKFLOW_REF: ${{ job.workflow_ref }}
-      CALLED_WORKFLOW_SHA: ${{ job.workflow_sha }}
-      CALLED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
-      CALLED_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
       STATUS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.run_id || inputs.caller_run_id }}
       STATUS_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && github.run_attempt || inputs.caller_run_attempt }}
       STATUS_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event_name == 'workflow_dispatch' && github.run_id || inputs.caller_run_id }}/attempts/${{ github.event_name == 'workflow_dispatch' && github.run_attempt || inputs.caller_run_attempt }}
@@ -3140,18 +3136,50 @@ jobs:
       RECEIPT_CONTENT_NAME: platform-production-release-receipt-content-${{ github.event_name == 'workflow_dispatch' && github.run_id || inputs.caller_run_id }}-${{ github.event_name == 'workflow_dispatch' && github.run_attempt || inputs.caller_run_attempt }}
       RECEIPT_NAME: platform-production-release-receipt-${{ github.event_name == 'workflow_dispatch' && github.run_id || inputs.caller_run_id }}-${{ github.event_name == 'workflow_dispatch' && github.run_attempt || inputs.caller_run_attempt }}
     steps:
+      - name: Capture called workflow identity
+        id: called-workflow-identity
+        if: ${{ always() && inputs.mode == 'deploy' && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && needs.production.result == 'success' }}
+        shell: bash
+        env:
+          CALLED_WORKFLOW_REF: ${{ job.workflow_ref }}
+          CALLED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          CALLED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          CALLED_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          test -n "$CALLED_WORKFLOW_REPOSITORY"
+          test -n "$CALLED_WORKFLOW_FILE_PATH"
+          test -n "$CALLED_WORKFLOW_REF"
+          test -n "$CALLED_WORKFLOW_SHA"
+          test "$CALLED_WORKFLOW_REPOSITORY" = "StrayForest/old_sparky"
+          test "$CALLED_WORKFLOW_FILE_PATH" = ".github/workflows/platform-production-deploy.yml"
+          test "$CALLED_WORKFLOW_REF" = "$EXPECTED_CALLED_WORKFLOW_REF"
+          [[ "$CALLED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$CALLED_WORKFLOW_SHA" = "$EXPECTED_CALLED_WORKFLOW_SHA"
+          {
+            echo "repository=$CALLED_WORKFLOW_REPOSITORY"
+            echo "file_path=$CALLED_WORKFLOW_FILE_PATH"
+            echo "ref=$CALLED_WORKFLOW_REF"
+            echo "sha=$CALLED_WORKFLOW_SHA"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout exact called workflow source
         if: ${{ always() && inputs.mode == 'deploy' && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && needs.production.result == 'success' }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          repository: ${{ env.CALLED_WORKFLOW_REPOSITORY }}
-          ref: ${{ env.CALLED_WORKFLOW_SHA }}
+          repository: ${{ steps.called-workflow-identity.outputs.repository }}
+          ref: ${{ steps.called-workflow-identity.outputs.sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Require exact trusted called workflow checkout
         if: ${{ always() && inputs.mode == 'deploy' && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && needs.production.result == 'success' }}
         shell: bash
+        env:
+          CALLED_WORKFLOW_REPOSITORY: ${{ steps.called-workflow-identity.outputs.repository }}
+          CALLED_WORKFLOW_FILE_PATH: ${{ steps.called-workflow-identity.outputs.file_path }}
+          CALLED_WORKFLOW_REF: ${{ steps.called-workflow-identity.outputs.ref }}
+          CALLED_WORKFLOW_SHA: ${{ steps.called-workflow-identity.outputs.sha }}
         run: |
           set -euo pipefail
           test "$CALLED_WORKFLOW_REPOSITORY" = "StrayForest/old_sparky"
@@ -3226,6 +3254,11 @@ jobs:
           needs.release-status-pending.result == 'success' &&
           needs.validate-security-provenance.result == 'success'
         shell: bash
+        env:
+          CALLED_WORKFLOW_REPOSITORY: ${{ steps.called-workflow-identity.outputs.repository }}
+          CALLED_WORKFLOW_FILE_PATH: ${{ steps.called-workflow-identity.outputs.file_path }}
+          CALLED_WORKFLOW_REF: ${{ steps.called-workflow-identity.outputs.ref }}
+          CALLED_WORKFLOW_SHA: ${{ steps.called-workflow-identity.outputs.sha }}
         run: |
           set -euo pipefail
           umask 077
@@ -3366,13 +3399,14 @@ jobs:
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           artifact_id, digest, name, run_id, attempt, output = sys.argv[2:]
           workflow_run = payload.get("workflow_run")
+          nested_attempt = None if not isinstance(workflow_run, dict) else workflow_run.get("run_attempt")
           if (
               type(payload.get("id")) is not int or str(payload["id"]) != artifact_id
               or payload.get("name") != name or payload.get("expired") is not False
               or type(payload.get("size_in_bytes")) is not int or payload["size_in_bytes"] <= 0
               or payload.get("digest") != digest or not isinstance(workflow_run, dict)
               or str(workflow_run.get("id")) != run_id
-              or workflow_run.get("run_attempt") not in (None, int(attempt))
+              or nested_attempt is not None and (type(nested_attempt) is not int or nested_attempt != int(attempt))
           ):
               raise SystemExit("receipt content artifact metadata is not exact")
           with Path(output).open("a", encoding="utf-8") as stream:

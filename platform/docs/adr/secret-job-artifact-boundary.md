@@ -49,7 +49,9 @@ only after the closed receipt has been written, uploaded and assigned a
 non-empty artifact identity. Reusable-call provenance comes from the
 workflow-run `referenced_workflows` records and the called job's runtime
 `job.workflow_repository`, `job.workflow_file_path`, `job.workflow_ref`, and
-`job.workflow_sha` context, not invented fields on the jobs REST rows.
+`job.workflow_sha` context, not invented fields on the jobs REST rows. The
+canonical `owner/repository/workflow@locator` ref is only a mutable API
+locator; the recorded called-workflow SHA is the authoritative identity.
 
 ## Consequences
 

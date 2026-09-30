@@ -28,7 +28,6 @@ DEPLOY_WORKFLOW_NAME = "Platform production deploy"
 DEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-deploy.yml"
 DEPLOY_JOB_NAME = "Deploy production"
 PREFLIGHT_JOB_NAME = "Production preflight"
-AUTO_CALL_JOB_NAME = "Native production deployment"
 AUTO_FINAL_JOB_NAME = "Auto-deploy result"
 RELEASE_FINAL_JOB_NAME = "Release finalizer"
 RECEIPT_KIND = "platform-production-release"
@@ -387,6 +386,11 @@ def validate_artifact_metadata(
 
     metadata = _mapping(payload, "artifact metadata")
     workflow_run = _mapping(metadata.get("workflow_run"), "artifact workflow run")
+    try:
+        expected_attempt_number = int(expected_run_attempt)
+    except (TypeError, ValueError) as exc:
+        raise _fail("expected artifact workflow run attempt is malformed") from exc
+    nested_attempt = workflow_run.get("run_attempt")
     if (
         type(metadata.get("id")) is not int
         or metadata.get("id") != expected_id
@@ -397,7 +401,9 @@ def validate_artifact_metadata(
         or metadata.get("digest") != expected_digest
         or type(workflow_run.get("id")) is not int
         or str(workflow_run.get("id")) != expected_run_id
-        or workflow_run.get("run_attempt") not in (None, int(expected_run_attempt))
+        or nested_attempt is not None and (
+            type(nested_attempt) is not int or nested_attempt != expected_attempt_number
+        )
         or workflow_run.get("head_sha") is not None and (not isinstance(workflow_run.get("head_sha"), str) or SHA_RE.fullmatch(workflow_run["head_sha"]) is None)
     ):
         raise _fail("receipt artifact metadata is not exact")

@@ -36,8 +36,10 @@ class WorkflowProvenanceTests(unittest.TestCase):
     SHA = "a" * 40
 
     class _Response:
-        def __init__(self, body: bytes) -> None:
+        def __init__(self, body: bytes, *, status: int = 200, headers: dict[str, str] | None = None) -> None:
             self.body = body
+            self.status = status
+            self.headers = headers or {}
 
         def __enter__(self):
             return self
@@ -47,6 +49,9 @@ class WorkflowProvenanceTests(unittest.TestCase):
 
         def read(self, _limit: int = -1) -> bytes:
             return self.body
+
+        def close(self) -> None:
+            return None
 
     def _payload(self) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
         run_id = 1234
@@ -84,6 +89,15 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 "name": "Deploy production",
                 "status": "completed",
                 "conclusion": "success",
+                "created_at": "2026-09-19T09:00:00Z",
+                "head_branch": "dev",
+                "labels": ["ubuntu-latest"],
+                "run_url": base,
+                "workflow_name": DEPLOY_WORKFLOW_NAME,
+                "runner_id": None,
+                "runner_name": None,
+                "runner_group_id": None,
+                "runner_group_name": None,
             }
         ]
         statuses = [
@@ -183,14 +197,28 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertIn("needs: validate", auto)
         self.assertIn("needs.validate.outputs.deploy == 'true'", auto)
         for input_name in (
-            "mode: deploy",
+            "mode: ${{ needs.validate.outputs.mode }}",
             "runtime_profile: ${{ needs.validate.outputs.runtime_profile }}",
             "web_compression: ${{ needs.validate.outputs.web_compression }}",
             "target_sha: ${{ needs.validate.outputs.target_sha }}",
             "classifier_run_id: ${{ needs.validate.outputs.classifier_run_id }}",
             "classifier_run_attempt: ${{ needs.validate.outputs.classifier_run_attempt }}",
+            "security_run_id: ${{ needs.validate.outputs.security_run_id }}",
+            "security_run_attempt: ${{ needs.validate.outputs.security_run_attempt }}",
+            "caller_kind: ${{ needs.validate.outputs.caller_kind }}",
+            "caller_run_id: ${{ needs.validate.outputs.caller_run_id }}",
+            "caller_run_attempt: ${{ needs.validate.outputs.caller_run_attempt }}",
+            "caller_workflow_ref: ${{ needs.validate.outputs.caller_workflow_ref }}",
+            "caller_workflow_sha: ${{ needs.validate.outputs.caller_workflow_sha }}",
+            "caller_sha: ${{ needs.validate.outputs.caller_sha }}",
+            "expected_called_workflow_file: ${{ needs.validate.outputs.expected_called_workflow_file }}",
+            "expected_called_workflow_ref: ${{ needs.validate.outputs.expected_called_workflow_ref }}",
+            "expected_called_workflow_sha: ${{ needs.validate.outputs.expected_called_workflow_sha }}",
         ):
             self.assertIn(input_name, auto)
+        self.assertIn('echo "deploy=true" >> "$GITHUB_OUTPUT"', auto)
+        self.assertGreaterEqual(auto.count('echo "deploy=false" >> "$GITHUB_OUTPUT"'), 2)
+        self.assertIn('ROUTE_CLASS" != "full"', auto)
         self.assertIn("DEPLOY_RESULT: ${{ needs.deploy.result }}", auto)
         self.assertIn("Native production deployment did not succeed", auto)
         self.assertIn('[[ "$DEPLOY_RESULT" != "success" ]]', auto)
@@ -265,6 +293,36 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertIn("statuses: write", child)
         self.assertIn("- validate-security-provenance", child)
         self.assertIn("target SHA is not the current dev head", child)
+        finalizer = child.split("  release-finalizer:", 1)[1]
+        job_env = finalizer.split("    steps:", 1)[0]
+        self.assertNotIn("job.workflow_", job_env)
+        capture = finalizer.split("- name: Capture called workflow identity", 1)[1].split(
+            "- name: Checkout exact called workflow source", 1
+        )[0]
+        for field in (
+            "job.workflow_repository",
+            "job.workflow_file_path",
+            "job.workflow_ref",
+            "job.workflow_sha",
+        ):
+            self.assertIn(field, capture)
+        self.assertIn('test -n "$CALLED_WORKFLOW_REPOSITORY"', capture)
+        self.assertIn("steps.called-workflow-identity.outputs.sha", finalizer)
+        for line in finalizer.splitlines():
+            if "job.workflow_" in line:
+                self.assertEqual(len(line) - len(line.lstrip()), 10)
+
+    def test_called_workflow_context_is_step_env_only(self) -> None:
+        source = (WORKFLOW_DIR / "platform-production-deploy.yml").read_text(encoding="utf-8")
+        finalizer = source.split("  release-finalizer:", 1)[1]
+        job_header, steps = finalizer.split("    steps:", 1)
+        self.assertNotIn("job.workflow_", job_header)
+        context_lines = [line for line in steps.splitlines() if "job.workflow_" in line]
+        self.assertEqual(len(context_lines), 4)
+        self.assertTrue(all(line.startswith("          ") for line in context_lines))
+        self.assertIn("id: called-workflow-identity", steps)
+        self.assertIn('test -n "$CALLED_WORKFLOW_SHA"', steps)
+        self.assertIn(">> \"$GITHUB_OUTPUT\"", steps)
 
     def test_native_call_jobs_use_only_documented_job_fields_and_final_barrier(self) -> None:
         called_sha = "b" * 40
@@ -274,7 +332,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 "run_id": 1234,
                 "run_attempt": 2,
                 "head_sha": called_sha,
-                "name": "Native production deployment",
+                "name": "Caller / Deploy production",
                 "status": "completed",
                 "conclusion": "success",
             },
@@ -303,6 +361,55 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_head_sha=called_sha,
             )
 
+    def test_auto_jobs_accept_real_reusable_shape_and_reject_synthetic_call_name(self) -> None:
+        called_sha = "b" * 40
+        optional = {
+            "created_at": "2026-09-19T09:00:00Z",
+            "head_branch": "dev",
+            "labels": ["ubuntu-latest"],
+            "run_url": "https://github.com/StrayForest/old_sparky/actions/runs/1234",
+            "workflow_name": "Platform production deploy",
+            "runner_id": None,
+            "runner_name": None,
+            "runner_group_id": None,
+            "runner_group_name": None,
+        }
+        jobs = [
+            {
+                **optional,
+                "id": 1,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": called_sha,
+                "name": "Caller / Deploy production",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                **optional,
+                "id": 2,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": called_sha,
+                "name": "Auto-deploy result",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        validate_auto_release_jobs(
+            jobs,
+            expected_run_id=1234,
+            expected_attempt=2,
+            expected_head_sha=called_sha,
+        )
+        with self.assertRaises(ProvenanceError):
+            validate_auto_release_jobs(
+                [{**jobs[0], "name": "Native production deployment"}, jobs[1]],
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_head_sha=called_sha,
+            )
+
     def test_invented_jobs_workflow_fields_are_rejected(self) -> None:
         jobs = [{
             "id": 1,
@@ -317,18 +424,24 @@ class WorkflowProvenanceTests(unittest.TestCase):
     def test_referenced_workflow_fixture_binds_path_ref_and_sha(self) -> None:
         run = {
             "referenced_workflows": [{
-                "path": DEPLOY_WORKFLOW_PATH,
-                "ref": "refs/heads/dev",
+                "path": f"StrayForest/old_sparky/{DEPLOY_WORKFLOW_PATH}",
                 "sha": "b" * 40,
             }]
         }
-        self.assertEqual(
+        matched = validate_referenced_workflows(
+            run,
+            expected_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
+            expected_workflow_sha="b" * 40,
+        )
+        self.assertEqual(matched["path"], f"StrayForest/old_sparky/{DEPLOY_WORKFLOW_PATH}")
+        run["referenced_workflows"][0]["ref"] = "refs/heads/feature/mutable-locator"
+        self.assertIs(
             validate_referenced_workflows(
                 run,
                 expected_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
                 expected_workflow_sha="b" * 40,
-            )["path"],
-            DEPLOY_WORKFLOW_PATH,
+            ),
+            matched,
         )
         run["referenced_workflows"][0]["sha"] = "c" * 40
         with self.assertRaises(ProvenanceError):
@@ -646,17 +759,30 @@ class WorkflowProvenanceTests(unittest.TestCase):
             "path": ".github/workflows/platform-production-autodeploy.yml",
             "event": "workflow_run",
         })
+        optional = {
+            "created_at": "2026-09-19T09:00:00Z",
+            "head_branch": "dev",
+            "labels": [],
+            "run_url": run["html_url"],
+            "workflow_name": "Platform production deploy",
+            "runner_id": None,
+            "runner_name": None,
+            "runner_group_id": None,
+            "runner_group_name": None,
+        }
         jobs = [
             {
+                **optional,
                 "id": 9001,
                 "run_id": 1234,
                 "run_attempt": 2,
                 "head_sha": self.SHA,
-                "name": "Native production deployment",
+                "name": "Caller / Deploy production",
                 "status": "completed",
                 "conclusion": "skipped",
             },
             {
+                **optional,
                 "id": 9002,
                 "run_id": 1234,
                 "run_attempt": 2,
@@ -780,9 +906,13 @@ class WorkflowProvenanceTests(unittest.TestCase):
 
     def test_artifact_download_is_authenticated_without_echoing_private_token(self) -> None:
         token = "private-token-that-must-not-leak"
+        signed_url = "https://productionresultssa0.blob.core.windows.net/actions/9.zip?sig=signed"
         with patch(
-            "tools.platform_workflow_provenance.urlopen",
-            return_value=self._Response(b"zip-bytes"),
+            "tools.platform_workflow_provenance._open_no_redirect",
+            side_effect=[
+                self._Response(b"", status=302, headers={"Location": signed_url}),
+                self._Response(b"zip-bytes", status=200),
+            ],
         ) as opened:
             self.assertEqual(
                 _api_get_bytes(
@@ -792,11 +922,33 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 ),
                 b"zip-bytes",
             )
-        request = opened.call_args.args[0]
-        self.assertEqual(request.get_header("Authorization"), f"Bearer {token}")
-        self.assertEqual(request.get_header("Accept"), "application/vnd.github+json")
-        self.assertEqual(request.get_header("X-github-api-version"), "2022-11-28")
-        self.assertNotIn(token, request.full_url)
+        api_request = opened.call_args_list[0].args[0]
+        artifact_request = opened.call_args_list[1].args[0]
+        self.assertEqual(api_request.get_header("Authorization"), f"Bearer {token}")
+        self.assertEqual(api_request.get_header("Accept"), "application/vnd.github+json")
+        self.assertEqual(api_request.get_header("X-github-api-version"), "2022-11-28")
+        self.assertNotIn(token, api_request.full_url)
+        self.assertIsNone(artifact_request.get_header("Authorization"))
+        self.assertIsNone(artifact_request.get_header("Cookie"))
+        self.assertEqual(artifact_request.get_header("Accept"), "application/octet-stream")
+        self.assertNotIn(token, artifact_request.full_url)
+
+        redirect_error = HTTPError(
+            "https://api.github.com/repos/PrivateOrg/private-repo/actions/artifacts/9/zip",
+            302,
+            "found",
+            {"Location": signed_url},
+            None,
+        )
+        with patch(
+            "tools.platform_workflow_provenance._open_no_redirect",
+            side_effect=[redirect_error, self._Response(b"zip-bytes", status=200)],
+        ) as opened_error:
+            self.assertEqual(
+                _api_get_bytes("https://api.github.com", token, "/private"),
+                b"zip-bytes",
+            )
+        self.assertIsNone(opened_error.call_args_list[1].args[0].get_header("Authorization"))
 
         unauthorized = HTTPError(
             "https://api.github.com/repos/PrivateOrg/private-repo/actions/artifacts/9/zip",
@@ -805,12 +957,46 @@ class WorkflowProvenanceTests(unittest.TestCase):
             {},
             None,
         )
-        with patch("tools.platform_workflow_provenance.urlopen", side_effect=unauthorized):
+        with patch("tools.platform_workflow_provenance._open_no_redirect", side_effect=unauthorized):
             with self.assertRaises(ProvenanceError) as raised:
                 _api_get_bytes("https://api.github.com", token, "/private")
         self.assertNotIn(token, str(raised.exception))
         with self.assertRaisesRegex(ProvenanceError, "authorization is unavailable"):
             _api_get_bytes("https://api.github.com", "", "/private")
+
+    def test_artifact_redirects_are_single_hop_https_and_allowlisted(self) -> None:
+        for location in (
+            "http://productionresultssa0.blob.core.windows.net/actions/9.zip",
+            "https://evil.example/actions/9.zip",
+            "https://user:password@objects.githubusercontent.com/actions/9.zip",
+            "https://objects.githubusercontent.com",
+        ):
+            with self.subTest(location=location):
+                with patch(
+                    "tools.platform_workflow_provenance._open_no_redirect",
+                    return_value=self._Response(b"", status=302, headers={"Location": location}),
+                ):
+                    with self.assertRaises(ProvenanceError):
+                        _api_get_bytes("https://api.github.com", "token", "/private")
+
+        with patch(
+            "tools.platform_workflow_provenance._open_no_redirect",
+            side_effect=[
+                self._Response(
+                    b"",
+                    status=302,
+                    headers={"Location": "https://productionresultssa0.blob.core.windows.net/actions/9.zip"},
+                ),
+                self._Response(
+                    b"",
+                    status=302,
+                    headers={"Location": "https://objects.githubusercontent.com/actions/9.zip"},
+                ),
+            ],
+        ) as opened:
+            with self.assertRaises(ProvenanceError):
+                _api_get_bytes("https://api.github.com", "token", "/private")
+        self.assertEqual(opened.call_count, 2)
 
     def test_paginated_collections_require_stable_total_exact_cardinality_and_unique_names(self) -> None:
         page_one_rows = [{"id": index, "name": f"artifact-{index}"} for index in range(1, 101)]

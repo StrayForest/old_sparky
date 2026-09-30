@@ -16,6 +16,7 @@ from platform_release_receipt import (  # noqa: E402
     ReceiptError,
     canonical_bytes,
     inspect_single_member_archive,
+    validate_artifact_metadata,
     validate_receipt,
     write_receipt,
 )
@@ -145,6 +146,37 @@ class ReleaseReceiptTests(unittest.TestCase):
         payload["caller"]["workflow_name"] = "Platform production auto-deploy"
         with self.assertRaises(ReceiptError):
             validate_receipt(payload)
+
+    def test_artifact_api_metadata_does_not_require_nested_run_attempt(self) -> None:
+        metadata = {
+            "id": 300,
+            "name": "platform-production-release-receipt-content-200-1",
+            "expired": False,
+            "size_in_bytes": 512,
+            "digest": "sha256:" + "b" * 64,
+            "workflow_run": {"id": 200, "head_sha": self.SHA},
+        }
+        self.assertIs(
+            validate_artifact_metadata(
+                metadata,
+                expected_id=300,
+                expected_name="platform-production-release-receipt-content-200-1",
+                expected_run_id="200",
+                expected_run_attempt="1",
+                expected_digest="sha256:" + "b" * 64,
+            ),
+            metadata,
+        )
+        metadata["workflow_run"]["run_attempt"] = 2
+        with self.assertRaises(ReceiptError):
+            validate_artifact_metadata(
+                metadata,
+                expected_id=300,
+                expected_name="platform-production-release-receipt-content-200-1",
+                expected_run_id="200",
+                expected_run_attempt="1",
+                expected_digest="sha256:" + "b" * 64,
+            )
 
 
 if __name__ == "__main__":
