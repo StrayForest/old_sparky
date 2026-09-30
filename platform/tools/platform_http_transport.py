@@ -54,10 +54,26 @@ class TransportResponse:
 class _TimedHTTPConnection(http.client.HTTPConnection):
     """HTTPConnection that separates name resolution and TCP connection time."""
 
-    def __init__(self, host: str, port: int, *, timeout: float) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout: float,
+        deadline: float | None = None,
+    ) -> None:
         super().__init__(host, port, timeout=timeout)
         self.phase_timing: dict[str, float] = {}
         self._last_connect_finished: float | None = None
+        self.deadline = deadline
+
+    def _remaining_timeout(self) -> float:
+        if self.deadline is None:
+            return float(self.timeout)
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("HTTP transport absolute deadline exceeded")
+        return min(float(self.timeout), remaining)
 
     def endheaders(
         self,
@@ -87,7 +103,7 @@ class _TimedHTTPConnection(http.client.HTTPConnection):
         tcp_started = time.perf_counter()
         for family, socktype, proto, _canonname, sockaddr in addresses:
             candidate = socket.socket(family, socktype, proto)
-            candidate.settimeout(self.timeout)
+            candidate.settimeout(self._remaining_timeout())
             try:
                 candidate.connect(sockaddr)
             except OSError as error:
@@ -113,13 +129,15 @@ class _TimedHTTPSConnection(_TimedHTTPConnection):
         *,
         timeout: float,
         context: ssl.SSLContext,
+        deadline: float | None = None,
     ) -> None:
-        super().__init__(host, port, timeout=timeout)
+        super().__init__(host, port, timeout=timeout, deadline=deadline)
         self.context = context
 
     def connect(self) -> None:
         super().connect()
         assert self.sock is not None
+        self.sock.settimeout(self._remaining_timeout())
         tls_started = time.perf_counter()
         try:
             self.sock = self.context.wrap_socket(self.sock, server_hostname=self.host)
@@ -149,20 +167,38 @@ class HTTP11KeepAliveClient:
         self._ssl_context = ssl.create_default_context()
         self.last_timing: dict[str, Any] = {}
 
+    def set_timeout(self, timeout: float) -> None:
+        """Apply the current request timeout to a reused socket as well."""
+
+        numeric = float(timeout)
+        if not numeric > 0:
+            raise ValueError("HTTP transport timeout must be positive")
+        self._timeout = numeric
+        if self._connection is not None:
+            self._connection.timeout = numeric
+            if self._connection.sock is not None:
+                self._connection.sock.settimeout(numeric)
+
     def close(self) -> None:
         if self._connection is not None:
             self._connection.close()
             self._connection = None
 
-    def _new_connection(self) -> _TimedHTTPConnection:
+    def _new_connection(self, *, deadline: float | None = None) -> _TimedHTTPConnection:
         if self._scheme == "https":
             return _TimedHTTPSConnection(
                 self._host,
                 self._port,
                 timeout=self._timeout,
                 context=self._ssl_context,
+                deadline=deadline,
             )
-        return _TimedHTTPConnection(self._host, self._port, timeout=self._timeout)
+        return _TimedHTTPConnection(
+            self._host,
+            self._port,
+            timeout=self._timeout,
+            deadline=deadline,
+        )
 
     @staticmethod
     def _http_version(response: http.client.HTTPResponse) -> str:
@@ -173,14 +209,33 @@ class HTTP11KeepAliveClient:
             return "1.0"
         return str(version)
 
-    def get(self, path: str, *, headers: dict[str, str]) -> TransportResponse:
+    def get(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str],
+        timeout: float | None = None,
+        deadline: float | None = None,
+    ) -> TransportResponse:
         if not path.startswith("/") or "\r" in path or "\n" in path:
             raise ValueError("HTTP transport path is invalid")
+        if timeout is not None:
+            self.set_timeout(timeout)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("HTTP transport absolute deadline exceeded")
+            self.set_timeout(min(self._timeout, remaining))
         connection = self._connection
         reused = connection is not None and connection.sock is not None
         if connection is None:
-            connection = self._new_connection()
+            connection = self._new_connection(deadline=deadline)
             self._connection = connection
+        elif deadline is not None:
+            connection.deadline = deadline
+            connection.timeout = min(connection.timeout, max(1e-6, deadline - time.monotonic()))
+            if connection.sock is not None:
+                connection.sock.settimeout(connection.timeout)
 
         started = time.perf_counter()
         connection.phase_timing = {}
@@ -208,6 +263,8 @@ class HTTP11KeepAliveClient:
             headers_finished = time.perf_counter()
             timing["edge_wait_ms"] = (headers_finished - write_finished) * 1_000
             timing["ttfb_ms"] = (headers_finished - started) * 1_000
+            if deadline is not None and connection.sock is not None:
+                connection.sock.settimeout(connection._remaining_timeout())
             body = response.read(self._max_response_bytes + 1)
             body_finished = time.perf_counter()
             timing["body_receive_ms"] = (body_finished - headers_finished) * 1_000

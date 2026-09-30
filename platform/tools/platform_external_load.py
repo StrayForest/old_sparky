@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import http.client
@@ -31,6 +31,10 @@ from urllib.request import Request, urlopen
 
 try:
     from tools.platform_http_transport import HTTP11KeepAliveClient
+    from tools.platform_load_runtime import (
+        LoadRuntimeBudget,
+        LoadRuntimeBudgetExceeded,
+    )
     from tools.platform_load_acceptance import (
         derive_expected_phase_plan,
         evaluate_acceptance,
@@ -38,6 +42,7 @@ try:
     )
 except ModuleNotFoundError:  # Direct execution from platform/tools.
     from platform_http_transport import HTTP11KeepAliveClient
+    from platform_load_runtime import LoadRuntimeBudget, LoadRuntimeBudgetExceeded
     from platform_load_acceptance import (
         derive_expected_phase_plan,
         evaluate_acceptance,
@@ -630,7 +635,14 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], list[VirtualUser]]:
     return payload, users
 
 
-def _trace(origin: str, timeout: float) -> dict[str, Any]:
+def _trace(
+    origin: str,
+    timeout: float,
+    *,
+    budget: LoadRuntimeBudget | None = None,
+) -> dict[str, Any]:
+    if budget is not None:
+        timeout = budget.bound_timeout(timeout, "trace", operation="trace_io")
     request = Request(
         f"{origin}/cdn-cgi/trace",
         method="GET",
@@ -644,6 +656,8 @@ def _trace(origin: str, timeout: float) -> dict[str, Any]:
             # other unique request metadata which is useful only transiently
             # while debugging a live request.
             response.read(16_384)
+            if budget is not None:
+                budget.check("trace", operation="trace_body_complete")
             return {"available": True, "status": safe_status(response.status)}
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
         return {"available": False, "status": 0, "error_class": safe_error_class(type(exc).__name__)}
@@ -665,7 +679,10 @@ def _request(
     attempt_number: int = 1,
     url_prefix: str = "/api/v1",
     diagnostic_id: str | None = None,
+    budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
+    if budget is not None:
+        timeout = budget.bound_timeout(timeout, phase, operation="http_io")
     body = None
     headers = {
         "Accept": "application/json",
@@ -727,6 +744,8 @@ def _request(
             raw_body = first_chunk + response.read(
                 max(0, RESPONSE_BODY_LIMIT - len(first_chunk))
             )
+            if budget is not None:
+                budget.check(phase, operation="body_complete")
             response_bytes = len(raw_body)
             if raw_body:
                 try:
@@ -742,6 +761,8 @@ def _request(
         with_error_body = first_chunk + exc.read(
             max(0, RESPONSE_BODY_LIMIT - len(first_chunk))
         )
+        if budget is not None:
+            budget.check(phase, operation="error_body_complete")
         response_bytes = len(with_error_body)
         error_kind = "http_error"
         if with_error_body:
@@ -795,6 +816,7 @@ def _page_request(
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
     transport: str = DEFAULT_CLIENT_TRANSPORT,
+    budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     """Measure the real Next.js HTML response, including server TTFB."""
 
@@ -807,6 +829,7 @@ def _page_request(
             session_cookie_name=session_cookie_name,
             csrf_cookie_name=csrf_cookie_name,
             diagnostic_id=diagnostic_id,
+            budget=budget,
         )
     if transport != DEFAULT_CLIENT_TRANSPORT:
         raise ExternalLoadError(f"unsupported page-load transport: {transport}")
@@ -824,6 +847,7 @@ def _page_request(
         extra_headers={"Accept": "text/html"},
         url_prefix="",
         diagnostic_id=diagnostic_id,
+        budget=budget,
     )
 
 
@@ -854,6 +878,7 @@ def _page_request_http11_keepalive(
     session_cookie_name: str,
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
+    budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     """Measure a page request over explicit HTTP/1.1 per-thread keep-alive."""
 
@@ -869,11 +894,31 @@ def _page_request_http11_keepalive(
         "X-CSRF-Token": user.csrf_token,
         "X-Platform-QA-Phase": phase,
     }
+    if budget is not None:
+        timeout = budget.bound_timeout(timeout, phase, operation="http_io")
     client = _http11_keepalive_client(origin, timeout)
+    if budget is not None:
+        client.set_timeout(timeout)
     started_at = time.monotonic()
     started_at_utc = datetime.now(UTC).isoformat()
     try:
-        response = client.get(path, headers=request_headers)
+        response = client.get(
+            path,
+            headers=request_headers,
+            timeout=timeout,
+            deadline=(
+                min(
+                    budget.scenario_deadline_monotonic,
+                    budget.runner_deadline_monotonic,
+                )
+                if budget is not None and budget.runner_deadline_monotonic is not None
+                else budget.scenario_deadline_monotonic
+                if budget is not None
+                else None
+            ),
+        )
+        if budget is not None:
+            budget.check(phase, operation="body_complete")
         finished_at = time.monotonic()
         status = response.status
         error_kind = None if status == 200 else "unexpected_status"
@@ -963,16 +1008,25 @@ def run_phase(
     concurrency: int,
     timeout: float,
     request_builder,
+    budget: LoadRuntimeBudget | None = None,
 ) -> list[Any]:
+    if budget is not None:
+        budget.check(phase, operation="phase_start")
     offsets = spread_offsets(len(users), spread_seconds)
     phase_started_at = time.monotonic()
     results: list[Any] = []
-    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load") as executor:
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load")
+    try:
         futures: list[Future[Any]] = []
         for user, offset in zip(users, offsets, strict=True):
             delay = phase_started_at + offset - time.monotonic()
             if delay > 0:
-                time.sleep(delay)
+                if budget is not None:
+                    budget.sleep(delay, phase, operation="phase_pacing")
+                else:
+                    time.sleep(delay)
+            if budget is not None:
+                budget.check(phase, operation="request_submit")
             enqueued_at = time.monotonic()
             scheduled_at = phase_started_at + offset
 
@@ -994,8 +1048,39 @@ def run_phase(
                 )
 
             futures.append(executor.submit(invoke))
-        for future in as_completed(futures):
-            results.append(future.result())
+        pending = set(futures)
+        while pending:
+            if budget is None:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            else:
+                budget.check(phase, operation="future_wait")
+                remaining = budget.remaining_seconds()
+                runner_remaining = budget.remaining_runner_seconds()
+                if runner_remaining is not None:
+                    remaining = min(remaining, runner_remaining)
+                done, pending = wait(
+                    pending,
+                    timeout=max(0.0, remaining),
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    budget.check(phase, operation="future_wait")
+            if budget is not None:
+                budget.check(phase, operation="future_complete")
+            for future in done:
+                results.append(future.result())
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        # A thread blocked in DNS/socket I/O cannot be joined safely here.  The
+        # process supervisor owns the kill boundary; do not let executor
+        # context-manager shutdown consume the remaining cleanup window.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    if budget is not None:
+        budget.check(phase, operation="phase_complete")
     return results
 
 
@@ -1008,6 +1093,7 @@ def run_rate_phase(
     concurrency: int,
     timeout: float,
     request_builder,
+    budget: LoadRuntimeBudget | None = None,
 ) -> tuple[list[Any], float]:
     """Run a paced phase and return its submission window separately from drain time."""
 
@@ -1016,11 +1102,17 @@ def run_rate_phase(
     first_submission_at: float | None = None
     last_submission_at: float | None = None
     futures: list[Future[Any]] = []
-    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load") as executor:
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load")
+    try:
         for user, offset in zip(users, offsets, strict=True):
             delay = phase_started_at + offset - time.monotonic()
             if delay > 0:
-                time.sleep(delay)
+                if budget is not None:
+                    budget.sleep(delay, phase, operation="phase_pacing")
+                else:
+                    time.sleep(delay)
+            if budget is not None:
+                budget.check(phase, operation="request_submit")
             submitted_at = time.monotonic()
             if first_submission_at is None:
                 first_submission_at = submitted_at
@@ -1045,7 +1137,37 @@ def run_rate_phase(
                 )
 
             futures.append(executor.submit(invoke))
-        results = [future.result() for future in as_completed(futures)]
+        results = []
+        pending = set(futures)
+        while pending:
+            if budget is None:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            else:
+                budget.check(phase, operation="future_wait")
+                remaining = budget.remaining_seconds()
+                runner_remaining = budget.remaining_runner_seconds()
+                if runner_remaining is not None:
+                    remaining = min(remaining, runner_remaining)
+                done, pending = wait(
+                    pending,
+                    timeout=max(0.0, remaining),
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    budget.check(phase, operation="future_wait")
+            if budget is not None:
+                budget.check(phase, operation="future_complete")
+            for future in done:
+                results.append(future.result())
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    if budget is not None:
+        budget.check(phase, operation="phase_complete")
     if first_submission_at is None or last_submission_at is None:
         submission_window_seconds = 0.001
     elif len(users) == 1:
@@ -1326,6 +1448,7 @@ def _ready_vote_request(
     session_cookie_name: str,
     csrf_cookie_name: str,
     attempt_number: int = 1,
+    budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     return _request(
         origin,
@@ -1338,6 +1461,7 @@ def _ready_vote_request(
         csrf_cookie_name=csrf_cookie_name,
         json_payload={"choice": "yes"},
         attempt_number=attempt_number,
+        budget=budget,
     )
 
 
@@ -1390,6 +1514,7 @@ def _ready_vote_action(
     session_cookie_name: str,
     csrf_cookie_name: str,
     retry_policy: dict[str, Any] | None = None,
+    budget: LoadRuntimeBudget | None = None,
 ) -> LogicalRequestResult:
     """Issue one request plus only the profile's explicit overload retries."""
 
@@ -1397,6 +1522,8 @@ def _ready_vote_action(
     attempts: list[RequestResult] = []
     max_retries = 2 if retry_policy is None else int(retry_policy["max_retries"])
     for retry_index in range(max_retries + 1):
+        if budget is not None:
+            budget.check(phase, operation="retry_start")
         result = _ready_vote_request(
             origin,
             user,
@@ -1405,13 +1532,16 @@ def _ready_vote_action(
             session_cookie_name=session_cookie_name,
             csrf_cookie_name=csrf_cookie_name,
             attempt_number=retry_index + 1,
+            budget=budget,
         )
         attempts.append(result)
         if not _ready_vote_overload(result) or retry_index >= max_retries:
             break
-        time.sleep(
-            _ready_vote_retry_delay_ms(result, retry_index, retry_policy) / 1000
-        )
+        delay = _ready_vote_retry_delay_ms(result, retry_index, retry_policy) / 1000
+        if budget is not None:
+            budget.sleep(delay, phase, operation="retry_backoff")
+        else:
+            time.sleep(delay)
     finished_at = time.monotonic()
     return LogicalRequestResult(
         attempts=attempts,
@@ -1529,7 +1659,10 @@ def run_load(
     timeout_diagnostics_run_id: str | None = None,
     client_transport: str = DEFAULT_CLIENT_TRANSPORT,
     max_http_attempts: int | None = None,
+    runtime_budget: LoadRuntimeBudget | None = None,
 ) -> dict[str, Any]:
+    if runtime_budget is not None:
+        runtime_budget.check("preflight", operation="run_start")
     for value, field in (
         (duplicate_count, "duplicate_count"),
         (manual_refresh_count, "manual_refresh_count"),
@@ -1771,7 +1904,16 @@ def run_load(
     session_cookie_name = str(manifest["session_cookie_name"])
     csrf_cookie_name = str(manifest["csrf_cookie_name"])
     started_at = datetime.now(UTC)
-    trace = _trace(origin, timeout=min(timeout, 10.0))
+    if runtime_budget is None:
+        trace = _trace(origin, timeout=min(timeout, 10.0))
+    else:
+        trace = _trace(
+            origin,
+            timeout=min(timeout, 10.0),
+            budget=runtime_budget,
+        )
+    if runtime_budget is not None:
+        runtime_budget.check("trace", operation="trace_complete")
     phase_results: dict[str, dict[str, Any]] = {}
     all_results: list[RequestResult] = []
 
@@ -1788,7 +1930,15 @@ def run_load(
             }
             if retry_policy is not None:
                 kwargs["retry_policy"] = retry_policy
-            return _ready_vote_action(origin_value, user, phase, request_timeout, **kwargs)
+            if runtime_budget is not None:
+                kwargs["budget"] = runtime_budget
+            return _ready_vote_action(
+                origin_value,
+                user,
+                phase,
+                request_timeout,
+                **kwargs,
+            )
 
         primary_started_at = time.monotonic()
         primary: list[LogicalRequestResult] = []
@@ -1827,6 +1977,7 @@ def run_load(
                     concurrency=concurrency,
                     timeout=timeout,
                     request_builder=vote_builder,
+                    budget=runtime_budget,
                 )
                 offered_window_seconds += phase_submission_window
                 phase_attempts = _flatten_logical_results(phase_results_for_users)
@@ -1893,6 +2044,7 @@ def run_load(
                 concurrency=concurrency,
                 timeout=timeout,
                 request_builder=vote_builder,
+                budget=runtime_budget,
             )
         primary_attempts = _flatten_logical_results(primary)
         primary_wall_seconds = max(0.001, time.monotonic() - primary_started_at)
@@ -1950,6 +2102,7 @@ def run_load(
             concurrency=concurrency,
             timeout=timeout,
             request_builder=vote_builder,
+            budget=runtime_budget,
         )
         duplicate_attempts = _flatten_logical_results(duplicates)
         duplicate_logical = summarize_logical_results(
@@ -2035,6 +2188,7 @@ def run_load(
                 timeout=timeout,
                 session_cookie_name=session_cookie_name,
                 csrf_cookie_name=csrf_cookie_name,
+                **({"budget": runtime_budget} if runtime_budget is not None else {}),
             )
             result = _annotate_timing(
                 result,
@@ -2160,6 +2314,7 @@ def run_load(
                 user,
                 phase,
                 request_timeout,
+                **({"budget": runtime_budget} if runtime_budget is not None else {}),
                 **request_kwargs,
             )
 
@@ -2172,6 +2327,7 @@ def run_load(
             concurrency=concurrency,
             timeout=timeout,
             request_builder=page_builder,
+            budget=runtime_budget,
         )
         page_summary = summarize_results(
             page_results,
@@ -2207,6 +2363,7 @@ def run_load(
                 timeout=request_timeout,
                 session_cookie_name=session_cookie_name,
                 csrf_cookie_name=csrf_cookie_name,
+                **({"budget": runtime_budget} if runtime_budget is not None else {}),
             )
             if index % 10 < 5 and result.response_etag:
                 initial_workspace_etags[user.user_id] = result.response_etag
@@ -2225,6 +2382,7 @@ def run_load(
                 concurrency=stage_concurrency,
                 timeout=timeout,
                 request_builder=read_builder,
+                budget=runtime_budget,
             )
             read_results.extend(stage_results)
             stage_summary = summarize_results(
@@ -2300,6 +2458,7 @@ def run_load(
                     csrf_cookie_name=csrf_cookie_name,
                     expected_statuses=frozenset({200, 304}),
                     extra_headers={"If-None-Match": etag},
+                    **({"budget": runtime_budget} if runtime_budget is not None else {}),
                 )
 
             refresh_started_at = time.monotonic()
@@ -2311,6 +2470,7 @@ def run_load(
                 concurrency=concurrency,
                 timeout=timeout,
                 request_builder=refresh_builder,
+                budget=runtime_budget,
             )
             refresh_summary = summarize_results(
                 refresh_results,

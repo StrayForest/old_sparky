@@ -28,6 +28,7 @@ from tools.platform_load import (
     load_profiles,
     profile_digest,
     run_profile,
+    run_profile_worker,
     validate_profile,
 )
 from tools.platform_verify import (
@@ -1084,7 +1085,11 @@ except lock.VerificationLockError as exc:
                 ),
             ):
                 self.assertEqual(
-                    run_profile(profile, Path(directory) / "manifest.json", report_path),
+                    run_profile_worker(
+                        profile,
+                        Path(directory) / "manifest.json",
+                        report_path,
+                    ),
                     0,
                 )
             report = json.loads(report_path.read_text(encoding="utf-8"))

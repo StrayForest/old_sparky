@@ -2,7 +2,7 @@
 
 - Status: Active reference and operator how-to
 - Owner: Performance and web verification owners
-- Last reviewed: 2026-09-19
+- Last reviewed: 2026-09-30
 
 This document owns the detailed retained-load cleanup, hermetic web verification,
 external-load workflow barrier and evidence-projection contracts. The
@@ -47,7 +47,7 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | Boundary | Passing value |
 | --- | --- |
 | dispatch, setup and load-client jobs | job result `success`; setup `setup_status=0` |
-| measured load | authoritative `load_status=0`; report present |
+| measured load | closed report present; a non-zero client status is retained as failed evidence and cannot pass evaluation |
 | remote/finalization | `remote_status=0`, `observer_ready=1`, `finalize_status=0` |
 | cleanup/export cleanup | `cleanup_status=0`, `cleanup_exports_status=0` |
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
@@ -56,6 +56,16 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 The evidence artifact is published only after every row passes; missing or
 mismatched artifacts and remote, projection, sanitizer or cleanup failures
 cannot be hidden by the evaluator.
+
+The measured client is supervised in a separate process group. Its scenario
+deadline and whole-runner deadline are absolute monotonic budgets; a blocked
+DNS/socket/body read or future is terminated with `TERM`, then `KILL` after a
+short grace period, and the parent waits for the group before publishing the
+final report. A malformed or killed worker is represented by a closed failed
+report with partial/in-flight-unknown flags. Candidate report upload and the
+`always()` fixture finalizer are independent of the client exit code, so a
+runtime timeout cannot skip cleanup or leave a background load mutating the
+fixture while cleanup begins.
 
 Load/QA evidence is a fixed, privacy-bounded set: route classes/templates,
 numeric timings/counts/statuses and allowlisted error/backend/wait classes. It

@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-09-11
+- Last reviewed: 2026-09-30
 
 The top-level JSON files in `profiles/` are the only authored canonical load
 contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
@@ -48,6 +48,37 @@ cleanup contour. The portfolio block additionally records owner, hypothesis,
 class/status, cadence, environment, request/cost budget and last accepted
 evidence. Only active profiles are runnable. Its SHA-256 digest is recorded
 with every retained result.
+
+### Runtime deadlines and kill boundary
+
+`portfolio.request_budget.max_duration_seconds` is the absolute measurement
+deadline. `portfolio.cost_budget.max_runner_minutes` is a separate whole-runner
+ceiling that includes worker startup, imports, report publication and the
+supervisor grace window; profile validation requires the measurement budget to
+finish strictly before that outer ceiling. Both deadlines are monotonic and
+start before the trace and first measured I/O.
+
+`platform_load.py run` is only a supervisor. It starts the complete load
+engine in a new process group, passes the same absolute deadlines to the
+worker, and sends `TERM` followed by `KILL` after a bounded grace period. The
+worker report is private and is copied to the final report atomically only
+after the worker and all group descendants have exited. A killed, malformed or
+incomplete worker produces a closed failed report with `partial_work=true` and
+`inflight_unknown=true`; it can therefore be uploaded for diagnosis without
+being mistaken for a passing measurement. Linux workers also set
+`PR_SET_PDEATHSIG` as a second orphan guard.
+
+DNS resolution, TCP connect, TLS, request writes, response headers/body,
+retry backoff and executor futures all consume the same absolute budget. The
+HTTP/1.1 candidate keeps one connection per load-worker thread and does not
+spawn a subprocess per request; a blocked resolver or socket remains
+reclaimable because the entire engine is inside the killable group.
+
+The external-load workflow publishes a closed candidate report whenever one is
+available, regardless of the client exit status. Its independent finalizer
+still runs with `always()` and owns fixture cleanup; only the later evaluation,
+sanitization and exact cleanup gates can produce a successful evidence
+artifact.
 
 The external runner preserves schema-1 report fields and adds measurement
 schema 2. Compatibility `latency` remains service latency; the additive timing

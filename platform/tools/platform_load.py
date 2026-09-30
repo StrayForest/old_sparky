@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from typing import Any, Sequence
 
 try:
@@ -373,12 +374,16 @@ def _validate_portfolio(value: Any) -> dict[str, Any]:
         portfolio.get("cost_budget"),
         field="portfolio.cost_budget",
     )
-    _require_number(
+    max_runner_minutes = _require_number(
         cost_budget.get("max_runner_minutes"),
         field="portfolio.cost_budget.max_runner_minutes",
         minimum=0.1,
         maximum=100_000,
     )
+    if request_budget["max_duration_seconds"] >= max_runner_minutes * 60:
+        raise LoadProfileError(
+            "portfolio.max_duration_seconds must be strictly below the whole-runner budget"
+        )
     if not isinstance(cost_budget.get("basis"), str) or not cost_budget["basis"].strip():
         raise LoadProfileError("portfolio.cost_budget.basis is required")
     evidence = portfolio.get("last_accepted_evidence")
@@ -1409,6 +1414,9 @@ def _write_failed_report(
     error: BaseException,
     *,
     decision: str = "LOAD RUN FAILED",
+    runtime_budget: Mapping[str, Any] | None = None,
+    partial_work: bool = False,
+    inflight_unknown: bool = False,
 ) -> None:
     """Persist a schema-compatible failed report for runner/setup errors."""
 
@@ -1436,7 +1444,11 @@ def _write_failed_report(
             "contract_ok": False,
             "error_class": error_class,
         },
+        "partial_work": bool(partial_work),
+        "inflight_unknown": bool(inflight_unknown),
     }
+    if runtime_budget is not None:
+        payload["runtime_budget"] = dict(runtime_budget)
     report_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -1516,21 +1528,33 @@ def _external_run_id() -> str:
     return candidate
 
 
-def run_profile(
+def run_profile_worker(
     profile: Mapping[str, Any],
     manifest_path: Path,
     report_path: Path,
     *,
     timeout_diagnostics_run_id: str | None = None,
+    runtime_config: Mapping[str, Any] | None = None,
 ) -> int:
+    """Execute one load scenario inside the killable worker process.
+
+    This function deliberately does not create a process or publish a final
+    report.  ``run_profile`` is the parent-side entry point; the worker CLI
+    invokes this function with a private child-report path.
+    """
     ensure_dispatchable(profile)
     # Imported lazily so profile listing and contract validation remain free of
     # application/runtime imports.  The module is the external runner client;
     # this process is expected to run on the GitHub-hosted load runner.
     try:
         from tools.platform_external_load import ExternalLoadError, load_manifest, run_load
+        from tools.platform_load_runtime import (
+            LoadRuntimeBudget,
+            LoadRuntimeBudgetExceeded,
+        )
     except ModuleNotFoundError:  # Direct execution from platform/tools.
         from platform_external_load import ExternalLoadError, load_manifest, run_load
+        from platform_load_runtime import LoadRuntimeBudget, LoadRuntimeBudgetExceeded
 
     contract = profile_contract(profile)
     try:
@@ -1575,68 +1599,99 @@ def run_profile(
     traffic = profile["traffic"]
     acceptance = profile["acceptance"]
     client_transport = str(profile.get("client_transport", DEFAULT_CLIENT_TRANSPORT))
-    report = _run_external_load_or_report(
-        run_load,
-        profile=profile,
-        contract=contract,
-        report_path=report_path,
-        error_type=ExternalLoadError,
-        manifest=manifest,
-        users=users,
-        mode=str(profile["mode"]),
-        spread_seconds=float(traffic["spread_seconds"]),
-        concurrency=int(traffic["concurrency"]),
-        timeout=float(traffic["timeout_seconds"]),
-        duplicate_count=int(traffic["duplicate_count"]),
-        manual_refresh_count=int(traffic["manual_refresh_count"]),
-        p95_budget_ms=float(
-            (acceptance.get("logical_latency") or acceptance.get("slo", {}).get("logical_latency"))["p95_ms"]
-        ),
-        p99_budget_ms=float(
-            (acceptance.get("logical_latency") or acceptance.get("slo", {}).get("logical_latency"))["p99_ms"]
-        ),
-        failure_budget_percent=(
-            float(acceptance["logical_final_failure_percent"])
-            if "logical_final_failure_percent" in acceptance
-            else None
-        ),
-        retry_policy=traffic["retry"],
-        phase_plan=traffic.get("phases") or None,
-        concurrency_stages=traffic.get("concurrency_stages") or None,
-        scenario_kind=str(acceptance.get("kind") or "slo"),
-        acceptance_contract=acceptance,
-        require_exact_observer_binding=(
-            profile.get("execution", {}).get("require_exact_observer_binding") is True
-        ),
-        authoritative_binding={
-            "profile_id": contract["profile_id"],
-            "profile_version": contract["profile_version"],
-            "profile_digest": contract["profile_digest"],
-            "source_git_sha": source_git_sha,
-            "external_run_id": external_run_id,
-        },
-        expected_profile_id=str(contract["profile_id"]),
-        expected_profile_version=int(contract["profile_version"]),
-        expected_profile_digest=str(contract["profile_digest"]),
-        expected_primary_action_count=int(
-            contract["planned_work"]["primary_logical_actions"]
-        ),
-        expected_total_logical_action_count=int(
-            contract["planned_work"]["logical_actions"]
-        ),
-        expected_stage_action_counts=(
-            contract["planned_work"].get("stage_logical_actions")
-            if profile.get("mode") == "read-mix"
-            and profile.get("traffic", {}).get("concurrency_stages") is not None
-            else None
-        ),
-        expected_state_read_count=int(
-            contract["planned_work"]["state_read_requests"]
-        ),
-        timeout_diagnostics_run_id=timeout_diagnostics_run_id,
-        client_transport=client_transport,
-        max_http_attempts=int(profile["portfolio"]["request_budget"]["max_http_attempts"]),
-    )
+    runtime_budget = None
+    if runtime_config is not None:
+        runtime_budget = LoadRuntimeBudget(
+            float(runtime_config["scenario_deadline_monotonic"])
+            - float(runtime_config["started_at_monotonic"]),
+            max_runner_minutes=(
+                float(runtime_config["runner_deadline_monotonic"])
+                - float(runtime_config["started_at_monotonic"])
+            )
+            / 60.0,
+            started_at_monotonic=float(runtime_config["started_at_monotonic"]),
+            runner_started_at_monotonic=float(runtime_config["started_at_monotonic"]),
+        )
+    try:
+        report = _run_external_load_or_report(
+            run_load,
+            profile=profile,
+            contract=contract,
+            report_path=report_path,
+            error_type=ExternalLoadError,
+            manifest=manifest,
+            users=users,
+            mode=str(profile["mode"]),
+            spread_seconds=float(traffic["spread_seconds"]),
+            concurrency=int(traffic["concurrency"]),
+            timeout=float(traffic["timeout_seconds"]),
+            duplicate_count=int(traffic["duplicate_count"]),
+            manual_refresh_count=int(traffic["manual_refresh_count"]),
+            p95_budget_ms=float(
+                (acceptance.get("logical_latency") or acceptance.get("slo", {}).get("logical_latency"))["p95_ms"]
+            ),
+            p99_budget_ms=float(
+                (acceptance.get("logical_latency") or acceptance.get("slo", {}).get("logical_latency"))["p99_ms"]
+            ),
+            failure_budget_percent=(
+                float(acceptance["logical_final_failure_percent"])
+                if "logical_final_failure_percent" in acceptance
+                else None
+            ),
+            retry_policy=traffic["retry"],
+            phase_plan=traffic.get("phases") or None,
+            concurrency_stages=traffic.get("concurrency_stages") or None,
+            scenario_kind=str(acceptance.get("kind") or "slo"),
+            acceptance_contract=acceptance,
+            require_exact_observer_binding=(
+                profile.get("execution", {}).get("require_exact_observer_binding") is True
+            ),
+            authoritative_binding={
+                "profile_id": contract["profile_id"],
+                "profile_version": contract["profile_version"],
+                "profile_digest": contract["profile_digest"],
+                "source_git_sha": source_git_sha,
+                "external_run_id": external_run_id,
+            },
+            expected_profile_id=str(contract["profile_id"]),
+            expected_profile_version=int(contract["profile_version"]),
+            expected_profile_digest=str(contract["profile_digest"]),
+            expected_primary_action_count=int(
+                contract["planned_work"]["primary_logical_actions"]
+            ),
+            expected_total_logical_action_count=int(
+                contract["planned_work"]["logical_actions"]
+            ),
+            expected_stage_action_counts=(
+                contract["planned_work"].get("stage_logical_actions")
+                if profile.get("mode") == "read-mix"
+                and profile.get("traffic", {}).get("concurrency_stages") is not None
+                else None
+            ),
+            expected_state_read_count=int(
+                contract["planned_work"]["state_read_requests"]
+            ),
+            timeout_diagnostics_run_id=timeout_diagnostics_run_id,
+            client_transport=client_transport,
+            max_http_attempts=int(profile["portfolio"]["request_budget"]["max_http_attempts"]),
+            runtime_budget=runtime_budget,
+        )
+    except LoadRuntimeBudgetExceeded as exc:
+        status = runtime_budget.runner_budget_status(
+            phase=exc.phase,
+            reason=exc.reason,
+        ) if runtime_budget is not None else None
+        _write_failed_report(
+            profile,
+            contract,
+            report_path,
+            exc,
+            decision="LOAD RUNTIME BUDGET EXCEEDED",
+            runtime_budget=status,
+            partial_work=True,
+            inflight_unknown=True,
+        )
+        return 1
     if report is None:
         return 1
     report["source_git_sha"] = source_git_sha
@@ -1656,6 +1711,8 @@ def run_profile(
         "version": 2,
         "location": "GitHub-hosted external runner",
     }
+    if runtime_budget is not None:
+        report["runtime_budget"] = runtime_budget.runner_budget_status()
     raw_http = report.get("raw_http") or report.get("overall") or {}
     overall = report.get("overall") or raw_http
     actual_http_attempts = int(overall.get("requests") or 0)
@@ -1725,6 +1782,109 @@ def run_profile(
     # subsequent evaluate step is the only place that can attach the exact
     # observer binding and turn the report into an accepted result.
     return 0 if acceptance_result.get("passed") is True else 1
+
+
+def run_profile(
+    profile: Mapping[str, Any],
+    manifest_path: Path,
+    report_path: Path,
+    *,
+    timeout_diagnostics_run_id: str | None = None,
+) -> int:
+    """Run the external generator behind the process-group deadline guard.
+
+    The parent owns both absolute budgets and never executes measured HTTP
+    work.  A valid worker report is copied atomically only after the child has
+    exited; a killed, malformed or missing child report becomes a closed
+    failed report so the independent fixture finalizer can still run.
+    """
+
+    ensure_dispatchable(profile)
+    contract = profile_contract(profile)
+    try:
+        source_git_sha = _source_git_sha()
+        external_run_id = _external_run_id()
+    except LoadProfileError as exc:
+        _write_failed_report(
+            profile,
+            contract,
+            report_path,
+            exc,
+            decision="LOAD REPORT BINDING FAIL",
+        )
+        print(
+            json.dumps(
+                {
+                    "profile_id": profile.get("profile_id"),
+                    "decision": "LOAD REPORT BINDING FAIL",
+                    "passed": False,
+                    "error_class": safe_error_class(type(exc).__name__),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 1
+
+    request_budget = profile["portfolio"]["request_budget"]
+    cost_budget = profile["portfolio"]["cost_budget"]
+    max_duration_seconds = float(request_budget["max_duration_seconds"])
+    max_runner_minutes = float(cost_budget["max_runner_minutes"])
+    try:
+        from tools.platform_load_runtime import run_supervised
+    except ModuleNotFoundError:  # Direct execution from platform/tools.
+        from platform_load_runtime import run_supervised
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{report_path.name}.worker-",
+        dir=report_path.parent,
+    ) as worker_directory:
+        worker_report_path = Path(worker_directory) / "child-report.json"
+        worker_config = {
+            "profile_id": str(profile["profile_id"]),
+            "manifest_path": str(manifest_path),
+            "timeout_diagnostics_run_id": timeout_diagnostics_run_id,
+        }
+        result = run_supervised(
+            worker_command=(
+                sys.executable,
+                str(Path(__file__).with_name("platform_load_worker.py")),
+            ),
+            report_path=report_path,
+            worker_report_path=worker_report_path,
+            max_duration_seconds=max_duration_seconds,
+            max_runner_minutes=max_runner_minutes,
+            worker_config=worker_config,
+        )
+
+    payload = result.report
+    decision = (
+        payload.get("acceptance", {}).get("decision")
+        if isinstance(payload.get("acceptance"), Mapping)
+        else None
+    )
+    print(
+        json.dumps(
+            {
+                "profile_id": profile.get("profile_id"),
+                "decision": decision or result.reason,
+                "passed": payload.get("acceptance", {}).get("passed") is True
+                if isinstance(payload.get("acceptance"), Mapping)
+                else False,
+                "partial_work": result.partial_work,
+                "inflight_unknown": result.inflight_unknown,
+                "signal": result.signal,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return (
+        0
+        if isinstance(payload.get("acceptance"), Mapping)
+        and payload["acceptance"].get("passed") is True
+        and result.returncode == 0
+        else 1
+    )
 
 
 def evaluate_report(
@@ -1810,9 +1970,34 @@ def evaluate_report(
     report_binding = _report_binding(profile, report)
     report["report_binding"] = report_binding
     if not report_binding["complete"]:
+        existing_acceptance = report.get("acceptance")
+        existing_decision = (
+            existing_acceptance.get("decision")
+            if isinstance(existing_acceptance, Mapping)
+            else None
+        )
+        runtime_supervisor = report.get("runtime_supervisor")
+        runtime_reason = (
+            runtime_supervisor.get("reason")
+            if isinstance(runtime_supervisor, Mapping)
+            else None
+        )
+        # Keep a closed supervisor outcome visible through the final evaluator.
+        # A killed/malformed child cannot satisfy the normal binding contract,
+        # but replacing a precise absolute-budget diagnosis with a generic
+        # binding failure makes timeout triage needlessly ambiguous.
+        runtime_budget_exceeded = (
+            existing_decision == "LOAD RUNTIME BUDGET EXCEEDED"
+            or runtime_reason in {"max_duration_seconds", "max_runner_minutes"}
+        )
+        binding_decision = (
+            "LOAD RUNTIME BUDGET EXCEEDED"
+            if runtime_budget_exceeded
+            else "LOAD REPORT BINDING FAIL"
+        )
         report["acceptance"] = {
             "passed": False,
-            "decision": "LOAD REPORT BINDING FAIL",
+            "decision": binding_decision,
             "contract_ok": False,
             "checks": {"report_binding": False},
             "report_binding": report_binding,
@@ -1825,7 +2010,7 @@ def evaluate_report(
             json.dumps(
                 {
                     "profile_id": profile["profile_id"],
-                    "decision": "LOAD REPORT BINDING FAIL",
+                    "decision": binding_decision,
                     "passed": False,
                 },
                 ensure_ascii=False,

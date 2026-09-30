@@ -546,7 +546,10 @@ jobs:
           else
             printf '%s\n' 'load-client profile validation failed' > "$load_log"
           fi
-          if [[ "$load_status" == 0 && -s "$load_report" ]]; then report_ready=1; fi
+          # A bounded failed measurement is still a closed candidate artifact;
+          # the independent finalizer must receive it so fixture cleanup is
+          # never coupled to the client exit code.
+          if [[ -s "$load_report" ]]; then report_ready=1; fi
           chmod 600 "$load_report" "$load_log" 2>/dev/null || true
           printf '%s\n' "$load_status" > "$artifact_dir/load-status"
           if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then
@@ -605,7 +608,7 @@ jobs:
           exit "$load_status"
       - name: Publish candidate load data
         id: publish-candidate
-        if: ${{ always() && steps.external-evaluate.outputs.load_status == '0' && steps.external-evaluate.outputs.report_ready == '1' }}
+        if: ${{ always() && steps.external-evaluate.outputs.report_ready == '1' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1243,8 +1246,6 @@ jobs:
             && "${{ needs.fixture-setup.result }}" == success \
             && "${{ needs.fixture-setup.outputs.setup_status }}" == 0 \
             && "${{ needs.fixture-setup.outputs.ssh_cleanup_status }}" == 0 \
-            && "${{ needs.load-client.result }}" == success \
-            && "${{ needs.load-client.outputs.load_status }}" == 0 \
             && "${{ needs.load-client.outputs.report_ready }}" == 1 \
             && "${{ needs.fixture-finalize.result }}" == success \
             && "${{ needs.fixture-finalize.outputs.remote_status }}" == 0 \
@@ -1265,7 +1266,7 @@ jobs:
           path, target_sha, run_id, attempt = sys.argv[1:]
           payload = json.loads(Path(path).read_text(encoding="utf-8"))
           expected = {"schema", "status", "report_ready", "target_sha", "run_id", "run_attempt"}
-          if set(payload) != expected or payload.get("schema") != 1 or payload.get("status") != 0 or payload.get("report_ready") is not True or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id or payload.get("run_attempt") != attempt:
+          if set(payload) != expected or payload.get("schema") != 1 or payload.get("report_ready") is not True or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id or payload.get("run_attempt") != attempt:
               raise SystemExit("authoritative load-status is not bound to this run")
           PY
             then upstream_ready=1; fi
@@ -1360,7 +1361,6 @@ jobs:
           needs.fixture-setup.outputs.setup_status == '0' &&
           needs.fixture-setup.outputs.ssh_cleanup_status == '0' &&
           needs.load-client.result == 'success' &&
-          needs.load-client.outputs.load_status == '0' &&
           needs.load-client.outputs.report_ready == '1' &&
           needs.fixture-finalize.result == 'success' &&
           needs.fixture-finalize.outputs.remote_status == '0' &&

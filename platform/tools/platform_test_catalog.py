@@ -165,6 +165,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_live_qa_runtime_install
     test_platform_live_qa_wrappers
     test_platform_load_acceptance
+    test_platform_load_runtime
     test_platform_logging
     test_platform_manual_live_auth_qa
     test_platform_match_progression_api
@@ -293,6 +294,7 @@ PERFORMANCE_MODULES = frozenset(
         "test_platform_cpu_profile",
         "test_platform_external_load",
         "test_platform_load_acceptance",
+        "test_platform_load_runtime",
         "test_platform_performance_contract",
         "test_platform_production_qa_write_burst_profile",
         "test_platform_request_performance",
@@ -450,12 +452,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 158,
-    "module_digest": "a77d2cff5b4122f04ba7932d758aac60cd98e15405d3d09e4cb45da7c1207310",
-    "test_count": 1482,
-    "test_id_digest": "b19a6988f480d506b0327a48b81f9b1be460d619230d8b564550cf07b29177d2",
-    "backend_test_count": 1439,
-    "backend_test_id_digest": "a302ce211f4e381379f55192aa1aab55289f6ec229c0ae0c40becd89fe1cd735",
+    "module_count": 159,
+    "module_digest": "9a3f1b4cfc1e655e6c6ebfd598b0d2f0533819405be3efc8435007c673b8f31d",
+    "test_count": 1490,
+    "test_id_digest": "beabf1b8fb1fc7e0a9040a5174334a9e8eea2a83ef94ee6688e541c6ff0e7c57",
+    "backend_test_count": 1447,
+    "backend_test_id_digest": "58ed3ff5784b4f8d3922be7847fae99fb7b5f589b6ebcedf385a36b7caf4900c",
     "verification_test_count": 43,
     "verification_test_id_digest": "96877f621915f8c64da8cce03023abf7f9e934df2858a41a4126b005ebcb0bc5",
     "verification_classifier_test_count": 23,
@@ -500,10 +502,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "731a9caf5b247612d12f2fe6bd7ed1c3ec2326dba7e79703e72701b01fdb500d",
     },
     "performance-contract": {
-        "module_count": 10,
-        "module_digest": "5135af80b8695bc35d28c0670ce787c21f34ad541652cb9bedd2d3dd8ff17c4d",
-        "test_count": 130,
-        "test_id_digest": "051e436c7526bb61388f1ce545210ffd2674989aa54b7139b9ebcabf44f17740",
+        "module_count": 11,
+        "module_digest": "ac879f1b292f00df28f399af5e34ed8995b39878e1961386b8eb055bb1d025e0",
+        "test_count": 138,
+        "test_id_digest": "9c3b74f2f1edef366ab11ca427197e77004d652f7d8acb2df85458960424aa79",
     },
     VERIFICATION_CONTOUR: {
         "module_count": 2,

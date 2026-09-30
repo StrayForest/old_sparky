@@ -36,6 +36,7 @@ from tools.platform_load import (
     load_profiles,
     profile_contract,
     run_profile,
+    run_profile_worker,
     validate_profile,
     _run_external_load_or_report,
     main as platform_load_main,
@@ -469,7 +470,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
                     {"SOURCE_GIT_SHA": "a" * 40, "GITHUB_RUN_ID": "26082900000000"},
                 ),
             ):
-                result = run_profile(
+                result = run_profile_worker(
                     profile,
                     manifest_path=Path(directory) / "manifest.json",
                     report_path=report_path,
@@ -493,7 +494,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 report_path = Path(directory) / "missing-binding-report.json"
                 with patch.dict(os.environ, environment, clear=True):
-                    missing_result = run_profile(
+                    missing_result = run_profile_worker(
                         profile,
                         manifest_path=Path(directory) / "manifest.json",
                         report_path=report_path,
@@ -605,7 +606,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
                         },
                     ),
                 ):
-                    run_result = run_profile(
+                    run_result = run_profile_worker(
                         scenario,
                         manifest_path=Path(directory) / "manifest.json",
                         report_path=report_path,

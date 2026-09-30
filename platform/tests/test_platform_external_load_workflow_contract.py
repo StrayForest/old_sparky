@@ -195,7 +195,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
     def test_evaluator_cannot_hide_upstream_failure_or_publish_success(self) -> None:
         evaluator = self.jobs["evaluate-load"]
         self.assertIn("upstream_ready=0", evaluator)
-        self.assertIn('needs.load-client.outputs.load_status }}\" == 0', evaluator)
+        self.assertIn('needs.load-client.outputs.report_ready }}\" == 1', evaluator)
+        self.assertNotIn('needs.load-client.outputs.load_status }}\" == 0', evaluator)
         self.assertIn('needs.fixture-finalize.outputs.cleanup_exports_status }}\" == 0', evaluator)
         publish = evaluator.split("- name: Publish external load evidence", 1)[1]
         self.assertIn("needs.load-client.result == 'success'", publish)
