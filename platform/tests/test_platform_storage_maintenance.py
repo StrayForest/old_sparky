@@ -134,9 +134,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         source_dir.mkdir(mode=0o700)
         web_dir = root / "web"
         web_dir.mkdir(mode=0o700)
+        # An absent explicit cache root is the hermetic no-op boundary.  It
+        # keeps this read-only producer from inspecting the machine-wide
+        # live-QA process/cgroup boundary or touching its machine lock.
         live_qa_root = root / "live-qa"
-        live_qa_root.mkdir(mode=0o755)
-        live_qa_root.chmod(0o755)
         current_manifest = current / "RELEASE.json"
         previous_manifest = previous / "RELEASE.json"
         current_manifest.write_text(
@@ -163,7 +164,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             root / "dist": 0o700,
             source_dir: 0o700,
             web_dir: 0o700,
-            live_qa_root: 0o755,
             current_manifest: 0o600,
             previous_manifest: 0o600,
         }
@@ -257,6 +257,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             },
             before_links,
         )
+        self.assertFalse(live_qa_root.exists())
         raw_report = json.loads(completed.stdout)
         self.assertEqual(
             set(raw_report["live_qa_runtime_caches"]),
