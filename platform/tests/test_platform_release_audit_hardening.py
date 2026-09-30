@@ -1509,10 +1509,12 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             self.assertIn('output.write("deploy_ready=false\\n")', workflow, name)
             self.assertIn('output.write("deploy_ready=true\\n")', workflow, name)
             self.assertIn(
-                "steps.verify_deploy_provenance.outputs.deploy_ready == 'true'",
+                "steps.downstream_receipt_provenance.outputs.deploy_ready",
                 workflow,
                 name,
             )
+            self.assertNotIn("steps.deployment_provenance.outputs", workflow, name)
+            self.assertIn("steps.downstream_receipt_provenance.outputs.target_sha", workflow, name)
             self.assertIn(f'context\\":\\"{marker}', workflow, name)
 
         self.assertEqual(diagnostics.count("home_content.refresh_home_content()"), 1)

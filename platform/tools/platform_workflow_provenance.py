@@ -25,6 +25,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 from typing import Any
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
@@ -457,32 +458,30 @@ def _validate_job_rows(jobs: Sequence[Mapping[str, Any]]) -> None:
         unknown = set(job) - _DOCUMENTED_JOB_FIELDS
         if unknown:
             raise _fail("job row contains undocumented fields")
-        # GitHub always supplies an id.  Missing ids are as unsafe as string
-        # or boolean ids because they make a row impossible to bind to the
-        # exact API object that was snapshotted.
-        if "id" not in job:
-            raise _fail("job id is missing")
+        missing = _REQUIRED_JOB_FIELDS - set(job)
+        if missing:
+            raise _fail("job row is missing documented identity fields")
         job_id = _positive_int(job.get("id"), "job id")
         if job_id in seen_ids:
             raise _fail("job row id is ambiguous")
         seen_ids.add(job_id)
         if not isinstance(job.get("name"), str):
             raise _fail("job name is malformed")
-        for field in ("run_id", "run_attempt", "runner_id", "runner_group_id"):
+        for field in ("run_id", "run_attempt"):
+            _run_id(job[field], f"job {field}")
+        for field in ("runner_id", "runner_group_id"):
             if field in job and (
                 isinstance(job[field], bool)
                 or not isinstance(job[field], int)
                 or job[field] <= 0
             ):
                 raise _fail(f"job {field} is malformed")
-        if "head_sha" in job and (
-            not isinstance(job["head_sha"], str)
-            or SHA_RE.fullmatch(job["head_sha"]) is None
-        ):
+        if not isinstance(job["head_sha"], str) or SHA_RE.fullmatch(job["head_sha"]) is None:
             raise _fail("job head SHA is malformed")
-        for field in ("status", "conclusion"):
-            if field in job and job[field] is not None and not isinstance(job[field], str):
-                raise _fail(f"job {field} is malformed")
+        if not isinstance(job["status"], str):
+            raise _fail("job status is malformed")
+        if job["conclusion"] is not None and not isinstance(job["conclusion"], str):
+            raise _fail("job conclusion is malformed")
 
 
 _DOCUMENTED_JOB_FIELDS = frozenset(
@@ -508,6 +507,10 @@ _DOCUMENTED_JOB_FIELDS = frozenset(
     }
 )
 
+_REQUIRED_JOB_FIELDS = frozenset(
+    {"id", "run_id", "run_attempt", "head_sha", "name", "status", "conclusion"}
+)
+
 
 def _job_state(
     job: Mapping[str, Any],
@@ -519,13 +522,14 @@ def _job_state(
 ) -> None:
     if job.get("name") != expected_name:
         raise _fail("job identity is not canonical")
-    # These are documented jobs API fields.  They are optional for old API
-    # snapshots, but when present they must bind the row to this exact run.
-    if "run_id" in job and expected_run_id is not None and job.get("run_id") != expected_run_id:
+    # These documented jobs API fields are required by the downstream
+    # boundary and bind this row to the exact run attempt.  A job name alone
+    # is not an identity and must never authorize a release.
+    if expected_run_id is not None and job.get("run_id") != expected_run_id:
         raise _fail("job run id does not match the requested run")
-    if "run_attempt" in job and expected_attempt is not None and job.get("run_attempt") != expected_attempt:
+    if expected_attempt is not None and job.get("run_attempt") != expected_attempt:
         raise _fail("job run attempt does not match the requested attempt")
-    if "head_sha" in job and expected_head_sha is not None and job.get("head_sha") != expected_head_sha:
+    if expected_head_sha is not None and job.get("head_sha") != expected_head_sha:
         raise _fail("job head SHA does not match the requested run")
     if job.get("status") != "completed" or job.get("conclusion") != "success":
         raise _fail("required job did not complete successfully")
@@ -538,13 +542,13 @@ def _bind_job_identity(
     expected_attempt: int,
     expected_head_sha: str,
 ) -> None:
-    """Validate optional documented job bindings without requiring a result."""
+    """Validate documented job bindings without requiring a result."""
 
-    if "run_id" in job and job.get("run_id") != expected_run_id:
+    if job.get("run_id") != expected_run_id:
         raise _fail("job run id does not match the requested run")
-    if "run_attempt" in job and job.get("run_attempt") != expected_attempt:
+    if job.get("run_attempt") != expected_attempt:
         raise _fail("job run attempt does not match the requested attempt")
-    if "head_sha" in job and job.get("head_sha") != expected_head_sha:
+    if job.get("head_sha") != expected_head_sha:
         raise _fail("job head SHA does not match the requested run")
 
 
@@ -560,9 +564,10 @@ def validate_referenced_workflows(
     The jobs REST resource does not expose workflow repository/path/ref/SHA.
     Those values are therefore taken only from the workflow-run
     ``referenced_workflows`` records, whose documented fields are ``path``,
-    ``ref`` and ``sha``.  Runtime receipt producers separately record the
-    called workflow context; the two records are compared by downstream
-    consumers.
+    ``ref`` and ``sha``.  The SHA is the authoritative immutable identity;
+    the mutable branch ref is only the API locator and must never substitute
+    for the SHA.  Runtime receipt producers separately record the called
+    workflow context; the two records are compared by downstream consumers.
     """
 
     if not isinstance(expected_workflow_ref, str) or not expected_workflow_ref:
@@ -600,8 +605,6 @@ def validate_referenced_workflows(
 def validate_auto_release_jobs(
     jobs: Sequence[Mapping[str, Any]],
     *,
-    called_workflow_ref: str,
-    called_workflow_sha: str,
     expected_run_id: int | None = None,
     expected_attempt: int | None = None,
     expected_head_sha: str | None = None,
@@ -733,6 +736,9 @@ def validate_auto_release_run(
         run,
         expected_run_id=expected_run_id,
         expected_attempt=expected_attempt,
+        # The caller run and its jobs are bound to the caller's documented
+        # head SHA.  The receipt target is validated separately and is the
+        # only SHA returned to downstream consumers.
         expected_target_sha=run.get("head_sha"),
         expected_event="workflow_run",
         expected_branch="dev",
@@ -750,8 +756,6 @@ def validate_auto_release_run(
     )
     validate_auto_release_jobs(
         jobs,
-        called_workflow_ref=expected_called_workflow_ref,
-        called_workflow_sha=expected_called_workflow_sha,
         expected_run_id=expected_run_id,
         expected_attempt=expected_attempt,
         expected_head_sha=run.get("head_sha"),
@@ -1248,6 +1252,8 @@ def _api_get(api_url: str, token: str, path: str) -> object:
 
 
 def _api_get_bytes(api_url: str, token: str, path: str) -> bytes:
+    if not isinstance(token, str) or not token:
+        raise _fail("GitHub API authorization is unavailable")
     request = Request(
         f"{api_url.rstrip('/')}{path}",
         headers={
@@ -1266,29 +1272,80 @@ def _api_get_bytes(api_url: str, token: str, path: str) -> bytes:
     return data
 
 
-def _api_paginate(api_url: str, token: str, path: str, key: str | None) -> list[Mapping[str, Any]]:
+def _api_paginate_with_total(
+    api_url: str,
+    token: str,
+    path: str,
+    key: str | None,
+) -> tuple[list[Mapping[str, Any]], int | None]:
+    """Read a bounded, complete API collection and its advertised count.
+
+    Jobs and artifacts are object-list endpoints with ``total_count``.  A
+    short page alone is not proof that the collection was complete: a mutable
+    or truncated response can otherwise hide a required row.  Require one
+    stable count and exact accumulated cardinality.  Statuses are the one
+    GitHub endpoint consumed here that returns a bare list, so it remains
+    bounded by page size and the adjacent-snapshot comparison.
+    """
+
     rows: list[Mapping[str, Any]] = []
-    seen: set[int] = set()
+    seen_ids: set[int] = set()
+    seen_names: set[str] = set()
+    expected_total: int | None = None
     for page in range(1, 1001):
         payload = _api_get(api_url, token, f"{path}?per_page=100&page={page}")
-        page_rows = payload if key is None else _as_mapping(payload, "paginated response").get(key)
+        if key is None:
+            page_rows = payload
+        else:
+            response = _as_mapping(payload, "paginated response")
+            total_count = response.get("total_count")
+            if (
+                isinstance(total_count, bool)
+                or not isinstance(total_count, int)
+                or total_count < 0
+                or total_count > 100_000
+            ):
+                raise _fail("paginated response count is malformed")
+            if expected_total is None:
+                expected_total = total_count
+            elif total_count != expected_total:
+                raise _fail("paginated response count changed")
+            page_rows = response.get(key)
         if not isinstance(page_rows, list) or len(page_rows) > 100 or any(not isinstance(row, Mapping) for row in page_rows):
             raise _fail("paginated response is malformed")
+        if expected_total is not None and len(rows) + len(page_rows) > expected_total:
+            raise _fail("paginated response cardinality exceeds total count")
         for row in page_rows:
             row_id = row.get("id")
-            if type(row_id) is not int or row_id <= 0 or row_id in seen:
+            if type(row_id) is not int or row_id <= 0 or row_id in seen_ids:
                 raise _fail("paginated rows are duplicate or malformed")
-            seen.add(row_id)
+            seen_ids.add(row_id)
+            if key in {"jobs", "artifacts"}:
+                name = row.get("name")
+                if not isinstance(name, str) or not name or name in seen_names:
+                    raise _fail("paginated row names are duplicate or malformed")
+                seen_names.add(name)
             rows.append(row)
+        if expected_total is not None and len(rows) == expected_total:
+            return rows, expected_total
         if len(page_rows) < 100:
-            return rows
+            if expected_total is not None and len(rows) != expected_total:
+                raise _fail("paginated response is incomplete")
+            return rows, expected_total
     raise _fail("pagination exceeded its bound")
 
 
+def _api_paginate(api_url: str, token: str, path: str, key: str | None) -> list[Mapping[str, Any]]:
+    """Compatibility wrapper returning a complete collection without count."""
+
+    rows, _ = _api_paginate_with_total(api_url, token, path, key)
+    return rows
+
+
 def _stable_api_snapshot(api_url: str, token: str, path: str, key: str | None) -> list[Mapping[str, Any]]:
-    first = _api_paginate(api_url, token, path, key)
-    second = _api_paginate(api_url, token, path, key)
-    if first != second:
+    first, first_total = _api_paginate_with_total(api_url, token, path, key)
+    second, second_total = _api_paginate_with_total(api_url, token, path, key)
+    if first_total != second_total or first != second:
         raise _fail("API snapshot changed during validation")
     return first
 
@@ -1352,21 +1409,61 @@ def validate_downstream_api(
         else:
             return {"deploy_ready": False, "target_sha": run.get("head_sha"), "snapshot_digest": deployment_snapshot_digest(workflow, run, jobs, source_statuses)}
     elif mode == "manual":
-        if validate_manual_deployment_run(
-            workflow, run, jobs, source_statuses,
-            expected_run_id=run_id, expected_attempt=attempt,
-            expected_target_sha=run.get("head_sha"), expected_run_url=run_url,
-        ) is False:
-            return {"deploy_ready": False, "target_sha": run.get("head_sha"), "snapshot_digest": deployment_snapshot_digest(workflow, run, jobs, source_statuses)}
+        # Only a read-only preflight may be classified before the receipt is
+        # available.  A successful deployment is re-bound below to the
+        # receipt target SHA; the triggering run SHA is not an authorization
+        # target for downstream work.
+        try:
+            manual_ready = validate_manual_deployment_run(
+                workflow,
+                run,
+                jobs,
+                source_statuses,
+                expected_run_id=run_id,
+                expected_attempt=attempt,
+                expected_target_sha=run.get("head_sha"),
+                expected_run_url=run_url,
+            )
+        except ProvenanceError:
+            manual_ready = None
+        if manual_ready is False:
+            return {
+                "deploy_ready": False,
+                "target_sha": run.get("head_sha"),
+                "snapshot_digest": deployment_snapshot_digest(
+                    workflow, run, jobs, source_statuses
+                ),
+            }
 
-    artifact_rows = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}/artifacts", "artifacts")
     expected_name = f"platform-production-release-receipt-{run_id}-{attempt}"
-    matches = [row for row in artifact_rows if row.get("name") == expected_name and row.get("expired") is False]
-    if len(matches) != 1:
+    artifact_rows: list[Mapping[str, Any]] = []
+    artifact: Mapping[str, Any] | None = None
+    for artifact_attempt in range(1, 4):
+        artifact_rows = _stable_api_snapshot(
+            api_url,
+            token,
+            f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}/artifacts",
+            "artifacts",
+        )
+        matches = [
+            row
+            for row in artifact_rows
+            if row.get("name") == expected_name and row.get("expired") is False
+        ]
+        if len(matches) == 1:
+            artifact = matches[0]
+            break
+        if len(matches) > 1:
+            raise _fail("closed release receipt artifact is missing or ambiguous")
+        if artifact_attempt < 3:
+            # GitHub's artifact index can lag the successful finalizer by a
+            # short interval.  Read back a bounded number of times; never
+            # treat an absent or ambiguous index row as success.
+            time.sleep(0.5 * artifact_attempt)
+    if artifact is None:
         raise _fail("closed release receipt artifact is missing or ambiguous")
-    artifact = matches[0]
     workflow_run = _as_mapping(artifact.get("workflow_run"), "receipt artifact workflow run")
-    if workflow_run.get("id") != run_id or workflow_run.get("run_attempt") not in (None, attempt):
+    if workflow_run.get("id") != run_id or workflow_run.get("run_attempt") != attempt:
         raise _fail("receipt artifact is not bound to the exact attempt")
     artifact_id = artifact.get("id")
     if type(artifact_id) is not int or artifact_id <= 0:
@@ -1382,8 +1479,10 @@ def validate_downstream_api(
             expected_status_url=run_url + f"/attempts/{attempt}", expected_mode="deploy",
         )
         content_artifact = receipt["artifact"]
-        content_metadata = _as_mapping(
-            _api_get(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/artifacts/{content_artifact['id']}"),
+        content_metadata = _stable_api_object(
+            api_url,
+            token,
+            f"/repos/{REPOSITORY_FULL_NAME}/actions/artifacts/{content_artifact['id']}",
             "receipt content artifact metadata",
         )
         validate_artifact_metadata(
@@ -1535,7 +1634,9 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--jobs", type=Path)
         command_parser.add_argument("--expected-run-id", required=True)
         command_parser.add_argument("--expected-attempt", required=True)
-        command_parser.add_argument("--expected-target-sha", required=True)
+        command_parser.add_argument(
+            "--expected-target-sha", required=command != "downstream-api"
+        )
         command_parser.add_argument("--expected-run-url")
         if command in {"deployment", "auto-release"}:
             command_parser.add_argument("--expected-event", choices=DEPLOYMENT_EVENTS)

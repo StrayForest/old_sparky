@@ -9,12 +9,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: platform-production-content-diagnostics
+  # Preserve the run that owns a pending status until its finalizer resolves
+  # it; overlapping status writers are not safe for this context.
+  cancel-in-progress: false
+
 jobs:
   validate-content-provenance:
     name: Validate content diagnostics handoff
     outputs:
       deploy_ready: ${{ steps.downstream_receipt_provenance.outputs.deploy_ready }}
       provenance_digest: ${{ steps.downstream_receipt_provenance.outputs.provenance_digest }}
+      target_sha: ${{ steps.downstream_receipt_provenance.outputs.target_sha }}
     permissions:
       actions: read
       contents: read
@@ -28,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || '' }}
       SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
       SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
       SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
@@ -230,7 +237,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            printf '%s\n' 'deploy_ready=true' 'provenance_digest=' >> "$GITHUB_OUTPUT"
+            printf '%s\n' 'deploy_ready=true' 'provenance_digest=' "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           [[ "$SOURCE_WORKFLOW" == "Platform production auto-deploy" || "$SOURCE_WORKFLOW" == "Platform production deploy" ]]
@@ -241,8 +248,7 @@ jobs:
           [[ "$SOURCE_WORKFLOW" == "Platform production deploy" ]] && mode=manual
           result="$(env -u GITHUB_TOKEN /usr/bin/python3 platform/tools/platform_workflow_provenance.py downstream-api \
             --mode "$mode" --api-url "$API_URL" --expected-run-id "$SOURCE_RUN_ID" \
-            --expected-attempt "$SOURCE_RUN_ATTEMPT" --expected-run-url "$SOURCE_RUN_URL" \
-            --expected-target-sha "${{ github.event.workflow_run.head_sha }}")"
+            --expected-attempt "$SOURCE_RUN_ATTEMPT" --expected-run-url "$SOURCE_RUN_URL")"
           /usr/bin/python3 - "$result" "$GITHUB_OUTPUT" "$GITHUB_ENV" <<'PY'
           import json
           import re
@@ -256,14 +262,14 @@ jobs:
           if not isinstance(payload["deploy_ready"], bool) or re.fullmatch(r"[0-9a-f]{40}", target or "") is None or re.fullmatch(r"[0-9a-f]{64}", digest or "") is None:
               raise SystemExit(1)
           with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
-              output.write(f"deploy_ready={'true' if payload['deploy_ready'] else 'false'}\nprovenance_digest={digest}\n")
+              output.write(f"deploy_ready={'true' if payload['deploy_ready'] else 'false'}\nprovenance_digest={digest}\ntarget_sha={target}\n")
           with Path(sys.argv[3]).open("a", encoding="utf-8") as output:
               output.write(f"TARGET_SHA={target}\n")
           PY
 
   content-diagnostics:
     # The shared handoff replaces the former inline gate
-    # steps.verify_deploy_provenance.outputs.deploy_ready == 'true'.
+    # steps.downstream_receipt_provenance.outputs.deploy_ready == 'true'.
     permissions:
       contents: read
       statuses: write
@@ -277,7 +283,7 @@ jobs:
     timeout-minutes: 10
     environment: production
     env:
-      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      TARGET_SHA: ${{ needs.validate-content-provenance.outputs.target_sha }}
       SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
       SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
       SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
@@ -601,34 +607,56 @@ jobs:
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
 
-      - name: Mark content diagnostics successful
-        if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
+  content-diagnostics-finalizer:
+    name: Finalize content diagnostics status
+    needs:
+      - validate-content-provenance
+      - content-diagnostics
+    if: >-
+      always() &&
+      needs.validate-content-provenance.result == 'success' &&
+      needs.validate-content-provenance.outputs.deploy_ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      TARGET_SHA: ${{ needs.validate-content-provenance.outputs.target_sha }}
+      DIAGNOSTICS_RESULT: ${{ needs.content-diagnostics.result }}
+    steps:
+      - name: Resolve terminal content diagnostics status
+        if: ${{ always() }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"success\",\"context\":\"platform-content-diagnostics\",\"description\":\"Production content diagnostics passed\",\"target_url\":\"${run_url}\"}"
+          if [[ "$DIAGNOSTICS_RESULT" == "success" ]]; then
+            state=success
+            description='Production content diagnostics passed'
+          else
+            state=failure
+            description='Production content diagnostics failed'
+          fi
+          /usr/bin/python3 - "$state" "$description" "$run_url" <<'PY' > "$RUNNER_TEMP/platform-content-diagnostics-status.json"
+          import json
+          import sys
 
-      - name: Mark content diagnostics failed
-        if: ${{ failure() }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          print(json.dumps({
+              "state": sys.argv[1],
+              "context": "platform-content-diagnostics",
+              "description": sys.argv[2],
+              "target_url": sys.argv[3],
+          }, separators=(",", ":")))
+          PY
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"failure\",\"context\":\"platform-content-diagnostics\",\"description\":\"Production content diagnostics failed\",\"target_url\":\"${run_url}\"}"
+            --data-binary @"$RUNNER_TEMP/platform-content-diagnostics-status.json"
+          rm -f -- "$RUNNER_TEMP/platform-content-diagnostics-status.json"

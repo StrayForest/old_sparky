@@ -111,7 +111,7 @@ is not the CI or release reproducibility contract.
 1. Read `CURRENT.md` and identify the owner layer/document.
 2. Define behavior, permissions, data impact, rollback and focused tests.
 3. Keep routes thin; place workflow rules in domain/services and persistence in models/repositories.
-4. For schema work, use an expand migration compatible with the previous release. Never edit an applied migration. The historical `20260901_0051` catalog migration is retried through `tools/platform_tournament_list_read_model_recovery.py` before the exact production `upgrade head` command; revision `20260913_0053` validates and repairs databases that already recorded 0051/0052.
+4. For schema work, use an expand migration compatible with the previous release. Never edit an applied migration. The historical `20260901_0051` catalog migration is retried through `tools/platform_tournament_list_read_model_recovery.py` before the exact production `upgrade head` command; revision `20260913_0053` validates and repairs databases that already recorded 0051/0052. This is a source/procedure statement, not proof that 0053 is deployed; only an exact release receipt plus authoritative host evidence may update `CURRENT.md`.
 5. Add regression coverage before broad gates. For async UI mutations, cover duplicate-submit, stale-response and editable-draft races when applicable; permission-sensitive UI must consume backend capabilities rather than infer access from visibility or presentation state.
 6. Remove replaced imports, CSS, mocks, routes and stale documentation.
 7. Push the coherent reviewed package and use GitHub Actions as the release verification authority. Local checks may help diagnose a failure but are not the normal production gate.
@@ -119,8 +119,12 @@ is not the CI or release reproducibility contract.
 9. For production-bound work merged or pushed to `dev`, wait for the exact-SHA `Platform security and build` push run. When it succeeds for the current `dev` HEAD with `deployable=true`, `Platform production auto-deploy` downloads and validates the exact classifier artifact before dispatching the immutable `Platform production deploy` workflow automatically; valid CI-only full routes finish as no-ops.
 10. Follow the deployment runbook and the [release state machine](release-state-machine.md) through live validation. Do not manually dispatch production for the normal `dev` path and do not call the low-level release installer directly.
 11. Downstream QA is receipt-gated: auto/manual deploy workflow-run events
-    require the exact receipt, bounded stable snapshots and marker checks;
-    successful auto no-ops and manual preflights intentionally skip QA.
+    require the exact closed receipt, authenticated ZIP download, complete
+    bounded snapshots and marker checks. The receipt target SHA is exported
+    once and feeds every later status, remote guard and QA step. Successful
+    auto no-ops and manual preflights intentionally skip QA; non-cancelling
+    concurrency plus an `always()` finalizer resolves pending status on
+    failure or cancellation.
 12. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
 
 The test-group ownership and runner contract is maintained in

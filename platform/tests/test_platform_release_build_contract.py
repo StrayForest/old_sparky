@@ -2329,10 +2329,15 @@ cleanup
         handoff_download = production.index(
             "      - name: Download closed deployment handoff"
         )
-        first_production_curl = production.index(
+        upload_start = production.index("      - name: Upload verified CI artifact")
+        upload_next_step = production.find("\n      - name:", upload_start + 1)
+        upload_step = production[upload_start:upload_next_step]
+        first_upload_curl = upload_step.index(
             "curl --fail-with-body --silent --show-error"
         )
-        self.assertLess(handoff_download, first_production_curl)
+        self.assertLess(handoff_download, upload_start)
+        self.assertIn("require_current_dev_head", upload_step)
+        self.assertLess(upload_step.index("require_current_dev_head"), first_upload_curl)
         self.assertIn("      - validate-dispatch", production)
         self.assertIn("needs.validate-dispatch.result == 'success'", production)
 

@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
@@ -17,6 +19,9 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     DEPLOY_STATUS_CONTEXT,
     ProvenanceError,
     _payload_rows,
+    _api_get_bytes,
+    _api_paginate,
+    _stable_api_snapshot,
     deployment_snapshot_digest,
     latest_context_status,
     validate_auto_release_jobs,
@@ -29,6 +34,19 @@ from tools.platform_workflow_provenance import (  # noqa: E402
 
 class WorkflowProvenanceTests(unittest.TestCase):
     SHA = "a" * 40
+
+    class _Response:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit: int = -1) -> bytes:
+            return self.body
 
     def _payload(self) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
         run_id = 1234
@@ -272,8 +290,6 @@ class WorkflowProvenanceTests(unittest.TestCase):
         ]
         validate_auto_release_jobs(
             jobs,
-            called_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
-            called_workflow_sha=called_sha,
             expected_run_id=1234,
             expected_attempt=2,
             expected_head_sha=called_sha,
@@ -282,8 +298,6 @@ class WorkflowProvenanceTests(unittest.TestCase):
         with self.assertRaises(ProvenanceError):
             validate_auto_release_jobs(
                 jobs,
-                called_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
-                called_workflow_sha=called_sha,
                 expected_run_id=1234,
                 expected_attempt=2,
                 expected_head_sha=called_sha,
@@ -589,12 +603,18 @@ class WorkflowProvenanceTests(unittest.TestCase):
         jobs = [
             {
                 "id": 9001,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": self.SHA,
                 "name": "Deploy production",
                 "status": "completed",
                 "conclusion": "skipped",
             },
             {
                 "id": 9002,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": self.SHA,
                 "name": "Production preflight",
                 "status": "completed",
                 "conclusion": "success",
@@ -629,12 +649,18 @@ class WorkflowProvenanceTests(unittest.TestCase):
         jobs = [
             {
                 "id": 9001,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": self.SHA,
                 "name": "Native production deployment",
                 "status": "completed",
                 "conclusion": "skipped",
             },
             {
                 "id": 9002,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": self.SHA,
                 "name": "Auto-deploy result",
                 "status": "completed",
                 "conclusion": "success",
@@ -738,17 +764,113 @@ class WorkflowProvenanceTests(unittest.TestCase):
                     )
                     self.assertIn("status rows contain duplicate or malformed IDs", source)
 
+    def test_downstream_consumers_bind_receipt_target_and_terminal_status_finalizers(self) -> None:
+        patch_qa = (WORKFLOW_DIR / "platform-patch-translation-qa.yml").read_text(encoding="utf-8")
+        content = (WORKFLOW_DIR / "platform-production-content-diagnostics.yml").read_text(encoding="utf-8")
+        for source in (patch_qa, content):
+            self.assertIn("steps.downstream_receipt_provenance.outputs.target_sha", source)
+            self.assertNotIn("workflow_run.head_sha", source)
+            self.assertIn("finalizer:", source)
+            self.assertIn("cancel-in-progress: false", source)
+        serializer = patch_qa.split("- name: Serialize closed translation QA handoff", 1)[1]
+        self.assertIn("steps.downstream_receipt_provenance.outputs.deploy_ready", serializer)
+        self.assertNotIn("steps.deployment_provenance.outputs", serializer)
+        content_job = content.split("  content-diagnostics:", 1)[1]
+        self.assertIn("TARGET_SHA: ${{ needs.validate-content-provenance.outputs.target_sha }}", content_job)
+
+    def test_artifact_download_is_authenticated_without_echoing_private_token(self) -> None:
+        token = "private-token-that-must-not-leak"
+        with patch(
+            "tools.platform_workflow_provenance.urlopen",
+            return_value=self._Response(b"zip-bytes"),
+        ) as opened:
+            self.assertEqual(
+                _api_get_bytes(
+                    "https://api.github.com",
+                    token,
+                    "/repos/PrivateOrg/private-repo/actions/artifacts/9/zip",
+                ),
+                b"zip-bytes",
+            )
+        request = opened.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), f"Bearer {token}")
+        self.assertEqual(request.get_header("Accept"), "application/vnd.github+json")
+        self.assertEqual(request.get_header("X-github-api-version"), "2022-11-28")
+        self.assertNotIn(token, request.full_url)
+
+        unauthorized = HTTPError(
+            "https://api.github.com/repos/PrivateOrg/private-repo/actions/artifacts/9/zip",
+            401,
+            "unauthorized",
+            {},
+            None,
+        )
+        with patch("tools.platform_workflow_provenance.urlopen", side_effect=unauthorized):
+            with self.assertRaises(ProvenanceError) as raised:
+                _api_get_bytes("https://api.github.com", token, "/private")
+        self.assertNotIn(token, str(raised.exception))
+        with self.assertRaisesRegex(ProvenanceError, "authorization is unavailable"):
+            _api_get_bytes("https://api.github.com", "", "/private")
+
+    def test_paginated_collections_require_stable_total_exact_cardinality_and_unique_names(self) -> None:
+        page_one_rows = [{"id": index, "name": f"artifact-{index}"} for index in range(1, 101)]
+        page_two_rows = [{"id": 101, "name": "artifact-101"}]
+        page_one = {"total_count": 101, "artifacts": page_one_rows}
+        page_two = {"total_count": 101, "artifacts": page_two_rows}
+        with patch(
+            "tools.platform_workflow_provenance._api_get",
+            side_effect=[page_one, page_two],
+        ):
+            self.assertEqual(
+                _api_paginate("https://api.github.com", "token", "/artifacts", "artifacts"),
+                page_one_rows + page_two_rows,
+            )
+
+        cases = (
+            [
+                {"total_count": 2, "artifacts": [{"id": 1, "name": "one"}]},
+            ],
+            [
+                {"total_count": 2, "artifacts": [{"id": 1, "name": "one"}]},
+                {"total_count": 2, "artifacts": [{"id": 2, "name": "one"}]},
+            ],
+            [
+                {"total_count": 101, "artifacts": page_one_rows},
+                {"total_count": 100, "artifacts": page_two_rows},
+            ],
+        )
+        for responses in cases:
+            with self.subTest(responses=responses):
+                with patch("tools.platform_workflow_provenance._api_get", side_effect=responses):
+                    with self.assertRaises(ProvenanceError):
+                        _api_paginate("https://api.github.com", "token", "/artifacts", "artifacts")
+
+        first_snapshot = {"total_count": 1, "artifacts": [{"id": 1, "name": "one"}]}
+        changed_snapshot = {"total_count": 2, "artifacts": [{"id": 1, "name": "one"}]}
+        with patch(
+            "tools.platform_workflow_provenance._api_get",
+            side_effect=[first_snapshot, changed_snapshot],
+        ):
+            with self.assertRaisesRegex(ProvenanceError, "count changed|incomplete"):
+                _stable_api_snapshot("https://api.github.com", "token", "/artifacts", "artifacts")
+
     def test_preflight_rejects_future_or_tied_deployment_markers(self) -> None:
         workflow, run, _jobs, _statuses = self._payload()
         jobs = [
             {
                 "id": 9001,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": self.SHA,
                 "name": "Deploy production",
                 "status": "completed",
                 "conclusion": "skipped",
             },
             {
                 "id": 9002,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": self.SHA,
                 "name": "Production preflight",
                 "status": "completed",
                 "conclusion": "success",

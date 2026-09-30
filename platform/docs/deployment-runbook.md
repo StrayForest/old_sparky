@@ -77,13 +77,15 @@ to `dev`. The chain is:
    environment approval still applies, while `workflow_call` cannot receive
    environment secrets from the caller. See [GitHub's reusable workflow secret
    semantics](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow).
-6. Downstream patch-translation and content-diagnostics runs listen to both
-   auto-deploy and manual deploy workflow runs. The shared validator accepts a
-   deploy only after the exact run-attempt receipt artifact has one canonical
-   member and matching API/ZIP/content digests, takes `TARGET_SHA` from that
-   receipt, and revalidates security/classifier plus caller/called refs, jobs
-   and the bot-authored attempt marker. Valid non-deployable auto runs and
-   manual preflights are markerless no-ops and never start QA.
+6. Downstream patch-translation and content-diagnostics listen to auto-deploy
+   and manual deploy runs. The validator requires an exact closed receipt
+   member with matching API/ZIP/content digests; authenticated reads
+   and bounded lists require stable counts, exact cardinality and unique IDs/names.
+   Receipt `TARGET_SHA` alone feeds statuses, remote guards and QA. Auto requires
+   successful reusable `Deploy production`/`Auto-deploy result`; called identity
+   is receipt/`referenced_workflows` data (SHA authoritative, dev ref a locator).
+   Manual requires exact `workflow_dispatch` and successful `Deploy production`;
+   valid no-ops skip QA and a non-cancelling `always()` finalizer resolves failures.
 7. A secret-free prerequisite independently downloads and validates the exact classifier
    artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
@@ -226,9 +228,8 @@ and a table matching the historical 0051 schema is present. It validates the
 table and constraints, idempotently backfills the projection, and repairs only
 invalid/unfinished concurrent indexes before stamping 0051. A valid index with
 the wrong definition or table, or any incompatible table/constraint, fails
-closed. Revision `20260913_0053` provides the same validation/repair as a
-forward migration for databases that already recorded 0051/0052; no downgrade
-or automatic migration reversal is performed.
+closed. Revision `20260913_0053` provides the same validation/repair as a forward migration for databases that already recorded 0051/0052; no downgrade or automatic migration reversal is performed.
+This checked-in procedure is not deployment evidence; confirm production revision from the exact receipt and host evidence before recording it as deployed.
 
 The migration wrapper has a bounded 300-second outer operation deadline that
 covers preflight, partial-0051 repair and the final `upgrade head` command. The
