@@ -1,6 +1,5 @@
 import { expect, test } from "@playwright/test";
 import type { Page, Route, TestInfo } from "@playwright/test";
-import { validateLiveQaOrigin } from "../support/live-qa-origin";
 
 async function authenticateTestUser(page: Page, extraCookies: Array<{ name: string; value: string }> = []) {
   await page.context().addCookies([
@@ -96,52 +95,6 @@ async function trackCsrfTokenRequests(page: Page) {
   });
   return requests;
 }
-
-test("credential-bearing live QA accepts only the exact HTTPS production origin", () => {
-  expect(validateLiveQaOrigin({
-    allowLoopback: false,
-    configured: "https://old-sparky.com/",
-    expected: "https://old-sparky.com",
-  })).toBe("https://old-sparky.com");
-  expect(() => validateLiveQaOrigin({
-    allowLoopback: false,
-    configured: "https://lookalike.example",
-    expected: "https://old-sparky.com",
-  })).toThrow(/does not match/u);
-  for (const configured of [
-    "http://old-sparky.com",
-    "https://user:secret@old-sparky.com",
-    "https://old-sparky.com/path",
-    "https://old-sparky.com/?token=secret",
-    "https://old-sparky.com/#fragment",
-  ]) {
-    expect(() => validateLiveQaOrigin({
-      allowLoopback: false,
-      configured,
-      expected: "https://old-sparky.com",
-    })).toThrow();
-  }
-  expect(() => validateLiveQaOrigin({
-    allowLoopback: false,
-    configured: "http://127.0.0.1:3100",
-    expected: "http://127.0.0.1:3100",
-  })).toThrow(/loopback/u);
-  expect(() => validateLiveQaOrigin({
-    allowLoopback: false,
-    configured: "https://attacker.example",
-    expected: "https://attacker.example",
-  })).toThrow(/old-sparky\.com/u);
-  expect(() => validateLiveQaOrigin({
-    allowLoopback: true,
-    configured: "https://attacker.example",
-    expected: "https://attacker.example",
-  })).toThrow(/loopback/u);
-  expect(validateLiveQaOrigin({
-    allowLoopback: true,
-    configured: "http://127.0.0.1:3100",
-    expected: "http://127.0.0.1:3100",
-  })).toBe("http://127.0.0.1:3100");
-});
 
 test("document CSP uses one fresh nonce and leaves static responses unscoped", async ({ page, request }) => {
   const first = await request.get("/");
@@ -497,39 +450,6 @@ test("site footer exposes valid navigation and project attribution", async ({ pa
   expect(await page.evaluate(() => (
     document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1
   ))).toBe(true);
-});
-
-test("public discovery documents expose the canonical origin without publishing support email", async ({ request }) => {
-  const [robots, sitemap, manifest, security, privacy, terms] = await Promise.all([
-    request.get("/robots.txt"),
-    request.get("/sitemap.xml"),
-    request.get("/manifest.webmanifest"),
-    request.get("/.well-known/security.txt"),
-    request.get("/privacy"),
-    request.get("/terms")
-  ]);
-
-  expect(robots.ok()).toBe(true);
-  const robotsBody = await robots.text();
-  expect(robotsBody).toContain("User-Agent: *");
-  expect(robotsBody).toContain("Allow: /");
-  expect(robotsBody).toContain("Sitemap: https://old-sparky.com/sitemap.xml");
-  expect(robotsBody).not.toMatch(/(?:admin|auth|profile|api|reset-password)/iu);
-  expect(sitemap.ok()).toBe(true);
-  const sitemapBody = await sitemap.text();
-  expect(sitemapBody).toContain("https://old-sparky.com/privacy");
-  expect(sitemapBody).toContain("https://old-sparky.com/terms");
-  const sitemapUrls = [...sitemapBody.matchAll(/<loc>([^<]+)<\/loc>/gu)].map((match) => match[1]);
-  expect(new Set(sitemapUrls).size).toBe(sitemapUrls.length);
-  expect(sitemapUrls.filter((url) => url.includes("/patches/")).length).toBe(4);
-  expect(sitemapBody).toContain("https://old-sparky.com/patches/1836506165584438");
-  expect(manifest.ok()).toBe(true);
-  expect((await manifest.json()).name).toBe("Old Sparky Arena");
-  expect(security.ok()).toBe(true);
-  const publicContactDocuments = [await security.text(), await privacy.text(), await terms.text()];
-  expect(publicContactDocuments[0]).toContain("Contact: https://old-sparky.com/info#support");
-  expect(publicContactDocuments.every((document) => !document.includes("support@old-sparky.com"))).toBe(true);
-  expect(publicContactDocuments.every((document) => !document.includes("mailto:"))).toBe(true);
 });
 
 test("header marks only the selected tournament navigation item", async ({ page }) => {

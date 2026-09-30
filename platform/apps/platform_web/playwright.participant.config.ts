@@ -3,6 +3,7 @@ import { defineConfig, devices } from "@playwright/test";
 const apiPort = 3199;
 const webPort = 3101;
 const preparedBuildDir = process.env.PLATFORM_WEB_HERMETIC_BUILD_DIR;
+const hermeticTimingReporter = "./tests/support/hermetic-timing-reporter.mjs";
 const standaloneWebServerCommand = [
   preparedBuildDir
     ? `rm -rf .next/standalone && cp -a "${preparedBuildDir}/standalone" .next/standalone`
@@ -26,10 +27,11 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   retries: 0,
-  reporter: [["list"]],
+  reporter: [["list"], [hermeticTimingReporter]],
   use: {
     baseURL: `http://127.0.0.1:${webPort}`,
-    trace: "retain-on-failure"
+    trace: "retain-on-failure",
+    video: process.env.CI ? "retain-on-failure" : "off"
   },
   webServer: {
     command: standaloneWebServerCommand,

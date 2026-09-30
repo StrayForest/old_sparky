@@ -345,15 +345,31 @@ immutable build. Smoke and participant runs are separate and sequential; each
 starts fresh API/web processes with `reuseExistingServer: false`, so no
 ambient server, browser or database state is reused.
 
-The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and
+The responsive smoke projects own `desktop`, `wide-1300`, `tablet-820` and
 `mobile-layout` viewports. Responsive specs run in that matrix; the explicit
 desktop-only list in the
 [`playwright.config.ts`](../apps/platform_web/playwright.config.ts)
-is owned only by the `desktop` project. The participant-progressive suite has
+is owned only by the `desktop` project. The race-protection journey runs on
+`desktop` and `mobile-layout`: its request-ordering assertions retain the
+narrow-viewport registration controls coverage while the wider responsive
+projects avoid repeating the same state-identity journey. Pure origin
+validation belongs to the source-contract runner, and request-only public
+discovery documents use the single `request-contract` project; their complete
+assertion bodies remain in those dedicated contours rather than being dropped
+with the browser fixture. The participant-progressive suite has
 its own sequential one-worker contour and explicit desktop/mobile projects in
 [`playwright.participant.config.ts`](../apps/platform_web/playwright.participant.config.ts).
-Do not infer viewport ownership from a test name or silently add an exclusion;
-update the owning config and its contract test when the matrix changes.
+The hermetic runner emits a bounded, title-free phase/project timing JSON
+summary for CI and fails the gate if the configured summary cannot be written.
+The workflow uploads that summary on every outcome with a missing-file error;
+Playwright reports, traces, videos and raw test results remain failure-only
+diagnostics with five-day retention. These artifacts contain mocked/local
+fixture data and are not an evidence store for production users. Before the
+browser contour starts, the runner invokes Playwright `--list` and compares the
+complete sorted `(file,title,project)` set with a checked-in digest, rejecting
+duplicates and any missing or extra assignment. Do not infer viewport
+ownership from a test name or silently add an exclusion; update the owning
+config and its contract test when the matrix changes.
 
 ## Local and GitHub verification
 
