@@ -829,6 +829,65 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 ],
             )
 
+    def test_deploy_dag_upgrades_schema_once_and_reuses_same_handoff(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        host_preflight = workflow.split(
+            "  host-capability-preflight:", 1
+        )[1].split("  build-release:", 1)[0]
+        build = workflow.split("  build-release:", 1)[1].split(
+            "  validate-security-provenance:", 1
+        )[0]
+        preflight = workflow.split("  preflight:", 1)[1].split(
+            "  production:", 1
+        )[0]
+        production = workflow.split("  production:", 1)[1]
+
+        # The original schema-1 artifact remains the input for isolated build
+        # and preflight.  No deploy-mode consumer may silently fall back to it.
+        self.assertNotIn("platform-production-deploy-input-v2-", workflow)
+        self.assertIn(
+            "name: platform-production-deploy-input-${{ github.run_id }}-${{ github.run_attempt }}",
+            build,
+        )
+        self.assertIn(
+            "name: platform-production-deploy-input-${{ github.run_id }}-${{ github.run_attempt }}",
+            preflight,
+        )
+        self.assertIn('payload.get("schema") not in (1, "1")', build)
+        self.assertIn('payload.get("schema") not in (1, "1")', preflight)
+        self.assertIn("needs.verify-host-tools.result == 'success'", host_preflight)
+        self.assertNotIn("Materialize final schema-2 deployment handoff", host_preflight)
+
+        # The environment-approved production job creates the final closed
+        # payload with the pinned validator, then both dispatcher calls consume
+        # that one path.  The hash handoff catches any mutation between calls.
+        self.assertIn(
+            "- validate-dispatch\n      - validate-classifier\n      - build-release\n      - validate-security-provenance\n      - host-capability-preflight",
+            production,
+        )
+        self.assertIn("needs.validate-dispatch.result == 'success'", production)
+        self.assertIn("needs.build-release.result == 'success'", production)
+        self.assertIn(
+            "needs.host-capability-preflight.result == 'success'", production
+        )
+        materialize = production.index("Materialize final schema-2 deployment handoff")
+        prepare = production.index('production-prepare-artifact < "$input_path"')
+        deploy = production.index('production-deploy < "$input_path"')
+        self.assertLess(materialize, prepare)
+        self.assertLess(prepare, deploy)
+        self.assertIn('base.get("schema") not in (1, "1")', production)
+        self.assertIn('base["schema"] = 2', production)
+        self.assertIn("module.validate_deployment_payload(base)", production)
+        self.assertIn('payload.get("schema") not in (1, "1")', production)
+        self.assertIn('printf \'DEPLOY_INPUT_SHA256=%s\\n\'', production)
+        self.assertIn('test "$input_sha256" = "${DEPLOY_INPUT_SHA256:-}"', production)
+        self.assertEqual(
+            production.count('production-prepare-artifact < "$input_path"'), 1
+        )
+        self.assertEqual(production.count('production-deploy < "$input_path"'), 1)
+
     def test_bounded_dispatch_child_terminates_process_group_on_timeout(self) -> None:
         child = Mock(pid=9876)
         child.wait.side_effect = [

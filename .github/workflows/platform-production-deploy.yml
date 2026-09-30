@@ -1663,6 +1663,75 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      # The original schema-1 handoff remains the input to the isolated build
+      # and preflight jobs.  Only this deploy job, after all host claims have
+      # crossed the environment boundary, upgrades it once to the closed
+      # schema-2 payload consumed by both dispatcher calls below.
+      - name: Materialize final schema-2 deployment handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          input_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          host_payload="$RUNNER_TEMP/platform-production-host-claims.json"
+          validator="$GITHUB_WORKSPACE/trusted-host-tools/platform/tools/platform_workflow_input_guard.py"
+          test -f "$input_path" && test ! -L "$input_path"
+          test "$(stat -c '%F:%h:%a' -- "$input_path")" = "regular file:1:600"
+          test ! -e "$host_payload" && test ! -L "$host_payload"
+          test -f "$validator" && test ! -L "$validator"
+          test "$(git -C "$GITHUB_WORKSPACE/trusted-host-tools" rev-parse HEAD)" = "$HOST_TOOLS_SHA"
+          /usr/bin/python3 -I -B "$validator" host-tools \
+            --output "$host_payload" \
+            --target-sha "$TARGET_SHA" \
+            --host-tools-sha "$HOST_TOOLS_SHA" \
+            --artifact-id "$HOST_TOOLS_ARTIFACT_ID" \
+            --artifact-name "$HOST_TOOLS_ARTIFACT_NAME" \
+            --artifact-size "$HOST_TOOLS_ARTIFACT_SIZE" \
+            --artifact-digest "$HOST_TOOLS_ARTIFACT_DIGEST" \
+            --bundle-sha256 "$HOST_TOOLS_BUNDLE_SHA256" \
+            --manifest-sha256 "$HOST_TOOLS_MANIFEST_SHA256" \
+            --capabilities-sha256 "$HOST_TOOLS_CAPABILITIES_SHA256" \
+            --files-contract-sha256 "$HOST_TOOLS_FILES_CONTRACT_SHA256" \
+            --modes-contract-sha256 "$HOST_TOOLS_MODES_CONTRACT_SHA256" \
+            --signer-workflow "$HOST_TOOLS_SIGNER_WORKFLOW" \
+            --source-ref "$HOST_TOOLS_SOURCE_REF" \
+            --source-digest "$HOST_TOOLS_SOURCE_DIGEST" \
+            --attestation-run-id "$HOST_TOOLS_ATTESTATION_RUN_ID" \
+            --attestation-run-attempt "$HOST_TOOLS_ATTESTATION_RUN_ATTEMPT" \
+            --attestation-job-id "$HOST_TOOLS_ATTESTATION_JOB_ID"
+          test "$(stat -c '%F:%h:%a' -- "$host_payload")" = "regular file:1:600"
+          /usr/bin/python3 -I -B - "$input_path" "$host_payload" "$validator" <<'PY'
+          import importlib.util
+          import json
+          from pathlib import Path
+          import sys
+
+          input_path, host_path, validator_path = map(Path, sys.argv[1:])
+          spec = importlib.util.spec_from_file_location("trusted_workflow_input_guard", validator_path)
+          if spec is None or spec.loader is None:
+              raise SystemExit("trusted workflow input validator could not be loaded")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          base = json.loads(input_path.read_text(encoding="utf-8"))
+          host_tools = json.loads(host_path.read_text(encoding="utf-8"))
+          if (
+              not isinstance(base, dict)
+              or not isinstance(host_tools, dict)
+              or base.get("schema") not in (1, "1")
+              or base.get("mode") != "deploy"
+          ):
+              raise SystemExit("deploy handoff base schema is invalid")
+          base["schema"] = 2
+          base["host_tools"] = host_tools
+          validated = module.validate_deployment_payload(base)
+          if validated.get("schema") != "2" or "host_tools" not in validated:
+              raise SystemExit("deployment handoff was not upgraded to schema 2")
+          module._write_private_json(input_path, validated)
+          PY
+          test "$(stat -c '%F:%h:%a' -- "$input_path")" = "regular file:1:600"
+          rm -f -- "$host_payload"
+          test ! -e "$host_payload" && test ! -L "$host_payload"
+
       - name: Verify and extract exact raw API release artifact
         shell: bash
         env:
@@ -1827,6 +1896,9 @@ jobs:
             test "$dev_sha" = "$TARGET_SHA" || { echo "Refusing production side effects: dev moved from $TARGET_SHA to $dev_sha." >&2; exit 1; }
           }
           require_current_dev_head
+          input_sha256="$(sha256sum "$input_path" | awk '{print $1}')"
+          [[ "$input_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'DEPLOY_INPUT_SHA256=%s\n' "$input_sha256" >> "$GITHUB_ENV"
           timeout --foreground 300s ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-prepare-artifact < "$input_path"
           timeout --foreground 300s scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_ARTIFACT" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
@@ -1845,6 +1917,9 @@ jobs:
           branch_json="$(curl --fail-with-body --silent --show-error --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
           dev_sha="$(printf '%s' "$branch_json" | /usr/bin/python3 -c 'import json,sys; payload=json.load(sys.stdin); sha=payload["commit"]["sha"]; assert isinstance(sha,str) and len(sha)==40 and all(c in "0123456789abcdef" for c in sha), "current dev head SHA is malformed"; print(sha)')"
           test "$dev_sha" = "$TARGET_SHA" || { echo "Refusing activation: dev moved from $TARGET_SHA to $dev_sha." >&2; exit 1; }
+          input_sha256="$(sha256sum "$input_path" | awk '{print $1}')"
+          [[ "$input_sha256" =~ ^[0-9a-f]{64}$ ]]
+          test "$input_sha256" = "${DEPLOY_INPUT_SHA256:-}"
           remote_log="$RUNNER_TEMP/platform-production-deploy-remote.log"
           remote_error="$RUNNER_TEMP/platform-production-deploy-remote-error.log"
           umask 077; : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
@@ -1871,7 +1946,7 @@ jobs:
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/platform-production-deploy-ssh"
           test "$ssh_dir" = "$RUNNER_TEMP/platform-production-deploy-ssh"
-          rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$RUNNER_TEMP/platform-production-deploy-remote.log" "$RUNNER_TEMP/platform-production-deploy-remote-error.log" "$RUNNER_TEMP/platform-release-artifact.zip"
+          rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$RUNNER_TEMP/platform-production-host-claims.json" "$RUNNER_TEMP/platform-production-deploy-remote.log" "$RUNNER_TEMP/platform-production-deploy-remote-error.log" "$RUNNER_TEMP/platform-release-artifact.zip"
           release_dir="$RUNNER_TEMP/release"
           if [[ -d "$release_dir" && ! -L "$release_dir" ]]; then
             rm -rf -- "$release_dir"
