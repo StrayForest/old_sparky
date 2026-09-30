@@ -81,8 +81,9 @@ class PlatformPatchTranslationQAPrivacyTests(unittest.TestCase):
         self.assertNotIn('kind": "translation_qa"', content_diagnostics)
         self.assertNotIn("translate_patch_to_russian", content_diagnostics)
         self.assertNotIn("MAX_OPENAI_CALLS", content_diagnostics)
-        self.assertIn("PRODUCTION_PATCH_DISTRIBUTION", content_diagnostics)
         self.assertIn("patches_available", content_diagnostics)
+        self.assertIn("platform_content_diagnostics.py", content_diagnostics)
+        self.assertIn("--require-passed", content_diagnostics)
         self.assertIn("retention-days: 14", content_diagnostics)
         self.assertFalse(
             (WORKFLOW_ROOT / "platform-production-diagnostics.yml").exists()

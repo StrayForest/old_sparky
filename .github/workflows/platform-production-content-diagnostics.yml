@@ -24,6 +24,8 @@ jobs:
     outputs:
       deploy_ready: ${{ steps.deployment_provenance.outputs.deploy_ready }}
       provenance_digest: ${{ steps.deployment_provenance.outputs.provenance_digest }}
+      trusted_source_sha: ${{ steps.trusted_default.outputs.sha }}
+      trusted_helper_digest: ${{ steps.stage_diagnostics_helper.outputs.digest }}
     permissions:
       actions: read
       contents: read
@@ -87,6 +89,28 @@ jobs:
           ref: ${{ steps.trusted_default.outputs.sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Stage trusted diagnostics helper
+        id: stage_diagnostics_helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper_dir="$RUNNER_TEMP/platform-content-diagnostics-helper"
+          install -d -m 700 "$helper_dir"
+          install -m 600 platform/tools/platform_content_diagnostics.py \
+            "$helper_dir/platform_content_diagnostics.py"
+          digest="$(sha256sum "$helper_dir/platform_content_diagnostics.py" | awk '{print $1}')"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Upload trusted diagnostics helper
+        if: ${{ success() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-content-diagnostics-helper-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-content-diagnostics-helper
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Validate content diagnostics input
         shell: bash
@@ -256,8 +280,28 @@ jobs:
       SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
       SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
       SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
+      DIAGNOSTICS_TOOL: ${{ runner.temp }}/platform-content-diagnostics-helper/platform_content_diagnostics.py
 
     steps:
+      - name: Download trusted diagnostics helper
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-content-diagnostics-helper-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-content-diagnostics-helper
+
+      - name: Verify trusted diagnostics helper digest
+        shell: bash
+        env:
+          EXPECTED_HELPER_DIGEST: ${{ needs.validate-content-provenance.outputs.trusted_helper_digest }}
+        run: |
+          set -euo pipefail
+          test -f "$DIAGNOSTICS_TOOL" && test ! -L "$DIAGNOSTICS_TOOL"
+          chmod 600 "$DIAGNOSTICS_TOOL"
+          actual_digest="$(sha256sum "$DIAGNOSTICS_TOOL" | awk '{print $1}')"
+          [[ "$EXPECTED_HELPER_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          test "$actual_digest" = "$EXPECTED_HELPER_DIGEST"
+          test "$(stat -c '%a' "$DIAGNOSTICS_TOOL")" = 600
+
       - name: Consume validated deployment provenance
         if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
         shell: bash
@@ -365,138 +409,100 @@ jobs:
           source "$runtime/current/tools/platform_runtime_common.sh"
           platform_load_env_file
           export PYTHONPATH="$runtime/current"
-
-          "$runtime/shared/venv/bin/python" - <<'PY'
+          probe_dir="$(mktemp -d /tmp/oldsparky-content-diagnostics.XXXXXX)"
+          chmod 700 "$probe_dir"
+          trap 'rm -rf -- "$probe_dir"' EXIT
+          "$runtime/shared/venv/bin/python" - "$probe_dir" <<'PY' >/dev/null
           import asyncio
-          import re
+          import json
+          from pathlib import Path
+          import sys
 
           import httpx
 
-          from apps.platform_api.app.api.schemas import PatchDetailResponse
           from apps.platform_api.app.services import home_content_security
-          from apps.platform_api.app.services import patch_detail_security
-
-          PATCH_ID_RE = re.compile(r"^[0-9]{1,32}$")
 
 
-          class PatchDistributionFailure(RuntimeError):
-              def __init__(self, error_class: str) -> None:
-                  super().__init__(error_class)
-                  self.error_class = error_class
-
-
-          def fail(error_class: str) -> None:
-              raise PatchDistributionFailure(error_class)
-
-
-          def validate_detail(payload: object, *, expected_id: str) -> int:
+          async def fetch_detail(client: httpx.AsyncClient, url: str) -> dict[str, object]:
+              response = await client.get(url)
+              response.raise_for_status()
+              payload = response.json()
               if not isinstance(payload, dict):
-                  fail("producer")
-              try:
-                  parsed = PatchDetailResponse.model_validate(payload)
-              except Exception:
-                  fail("producer")
-              if parsed.id != expected_id:
-                  fail("producer")
-              sections = payload.get("sections")
-              if not isinstance(sections, list) or not sections:
-                  fail("producer")
-              return len(sections)
-
-
-          async def fetch_api_detail(
-              client: httpx.AsyncClient,
-              url: str,
-          ) -> dict[str, object]:
-              try:
-                  response = await client.get(url)
-                  response.raise_for_status()
-                  payload = response.json()
-              except Exception:
-                  fail("remote_or_transport")
-              if not isinstance(payload, dict):
-                  fail("remote_or_transport")
+                  raise ValueError("patch detail response is not an object")
               return payload
 
 
-          async def main() -> None:
-              refreshed = await home_content_security.refresh_home_content(force=True)
-              if not isinstance(refreshed, dict) or refreshed.get("patches_available") is not True:
-                  fail("producer")
-              patches = refreshed.get("patches")
+          async def main(output_dir: Path) -> None:
+              home = await home_content_security.refresh_content_distribution(force=True)
+              if not isinstance(home, dict) or home.get("patches_available") is not True:
+                  raise ValueError("patch distribution is unavailable")
+              (output_dir / "home.json").write_text(
+                  json.dumps(home, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8",
+              )
+              patches = home.get("patches") if isinstance(home, dict) else None
               if not isinstance(patches, list) or not patches:
-                  fail("producer")
+                  raise ValueError("patch distribution is empty")
               latest = patches[0]
-              if not isinstance(latest, dict):
-                  fail("producer")
-              latest_id = str(latest.get("id") or "")
-              if PATCH_ID_RE.fullmatch(latest_id) is None:
-                  fail("producer")
-
-              internal_detail = await patch_detail_security.get_patch_detail(latest_id)
-              internal_sections = validate_detail(internal_detail, expected_id=latest_id)
-
+              latest_id = latest.get("id") if isinstance(latest, dict) else None
+              if not isinstance(latest_id, str):
+                  raise ValueError("latest patch identifier is unavailable")
+              internal_detail = await home_content_security.get_cached_patch_detail(latest_id)
+              if internal_detail is None:
+                  raise ValueError("structured patch detail is unavailable")
+              (output_dir / "internal.json").write_text(
+                  json.dumps(internal_detail, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8",
+              )
               async with httpx.AsyncClient(
                   timeout=15,
                   follow_redirects=False,
                   headers={"Accept": "application/json"},
               ) as client:
                   internal_api, public_api = await asyncio.gather(
-                      fetch_api_detail(
+                      fetch_detail(
                           client,
                           f"http://127.0.0.1:8010/api/v1/content/patches/{latest_id}",
                       ),
-                      fetch_api_detail(
+                      fetch_detail(
                           client,
                           f"https://old-sparky.com/api/v1/content/patches/{latest_id}",
                       ),
                   )
-              internal_api_sections = validate_detail(internal_api, expected_id=latest_id)
-              public_api_sections = validate_detail(public_api, expected_id=latest_id)
-              print(
-                  "PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed "
-                  "error_class=none latest_patch_id="
-                  + latest_id
-                  + " internal_section_count="
-                  + str(internal_sections)
-                  + " internal_api_section_count="
-                  + str(internal_api_sections)
-                  + " public_api_section_count="
-                  + str(public_api_sections)
+              (output_dir / "internal-api.json").write_text(
+                  json.dumps(internal_api, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8",
+              )
+              (output_dir / "public-api.json").write_text(
+                  json.dumps(public_api, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8",
               )
 
 
-          try:
-              asyncio.run(main())
-          except PatchDistributionFailure as error:
-              print(
-                  "PRODUCTION_PATCH_DISTRIBUTION schema=1 status=failed "
-                  f"error_class={error.error_class} latest_patch_id=unavailable "
-                  "internal_section_count=0 internal_api_section_count=0 "
-                  "public_api_section_count=0"
-              )
-              raise SystemExit(1)
-          except Exception:
-              print(
-                  "PRODUCTION_PATCH_DISTRIBUTION schema=1 status=failed "
-                  "error_class=internal latest_patch_id=unavailable "
-                  "internal_section_count=0 internal_api_section_count=0 "
-                  "public_api_section_count=0"
-              )
-              raise SystemExit(1)
+          asyncio.run(main(Path(sys.argv[1])))
           PY
+          /usr/bin/python3 "$runtime/current/tools/platform_content_diagnostics.py" verify \
+            --home "$probe_dir/home.json" \
+            --internal "$probe_dir/internal.json" \
+            --internal-api "$probe_dir/internal-api.json" \
+            --public-api "$probe_dir/public-api.json"
           MUTATION
           REMOTE
           remote_status=$?
           set -e
-          summary_count="$(grep -Ec '^PRODUCTION_PATCH_DISTRIBUTION schema=1 status=(passed|failed) error_class=[a-z_]+ latest_patch_id=(unavailable|[0-9]{1,32}) internal_section_count=[0-9]+ internal_api_section_count=[0-9]+ public_api_section_count=[0-9]+$' "$remote_log" || true)"
-          passed_count="$(grep -Ec '^PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed error_class=none latest_patch_id=[0-9]{1,32} internal_section_count=[1-9][0-9]* internal_api_section_count=[1-9][0-9]* public_api_section_count=[1-9][0-9]*$' "$remote_log" || true)"
-          if (( remote_status != 0 )) || [[ "$summary_count" != "1" ]] || [[ "$passed_count" != "1" ]]; then
+          if (( remote_status != 0 )); then
             rm -f -- "$remote_log" "$remote_error"
-            printf '%s\n' 'PRODUCTION_PATCH_DISTRIBUTION schema=1 status=failed error_class=remote_or_transport latest_patch_id=unavailable internal_section_count=0 internal_api_section_count=0 public_api_section_count=0'
+            /usr/bin/python3 "$DIAGNOSTICS_TOOL" failure-summary \
+              --error-class remote_or_transport
             exit 1
           fi
-          summary_line="$(grep -E '^PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed error_class=none latest_patch_id=[0-9]{1,32} internal_section_count=[1-9][0-9]* internal_api_section_count=[1-9][0-9]* public_api_section_count=[1-9][0-9]*$' "$remote_log")"
+          if ! summary_line="$(/usr/bin/python3 "$DIAGNOSTICS_TOOL" parse-summary \
+            --file "$remote_log" --require-passed --exit-code "$remote_status")"; then
+            rm -f -- "$remote_log" "$remote_error"
+            /usr/bin/python3 "$DIAGNOSTICS_TOOL" failure-summary \
+              --error-class malformed
+            exit 1
+          fi
           printf '%s\n' "$summary_line"
           printf 'summary_line=%s\n' "$summary_line" >> "$GITHUB_OUTPUT"
           rm -f -- "$remote_log" "$remote_error"
@@ -728,49 +734,15 @@ jobs:
           set -euo pipefail
           umask 077
           aggregate="$RUNNER_TEMP/platform-production-content-diagnostics-aggregate.json"
-          /usr/bin/python3 - "$aggregate" "$TARGET_SHA" "$GITHUB_EVENT_NAME" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PATCH_OUTCOME" "$PATCH_SUMMARY" "$CONTENT_OUTCOME" <<'PY'
-          import json
-          from pathlib import Path
-          import re
-          import sys
-
-          output, target_sha, event, run_id, run_attempt, patch_outcome, patch_summary, content_outcome = sys.argv[1:]
-          safe_sha = target_sha if re.fullmatch(r"[0-9a-f]{40}", target_sha) else "unavailable"
-          safe_event = event if event in {"workflow_dispatch", "workflow_run"} else "unavailable"
-          safe_run_id = int(run_id) if re.fullmatch(r"[1-9][0-9]{0,31}", run_id) else 0
-          safe_attempt = int(run_attempt) if re.fullmatch(r"[1-9][0-9]{0,31}", run_attempt) else 0
-          allowed_outcomes = {"success", "failure", "cancelled", "skipped"}
-          patch_status = patch_outcome if patch_outcome in allowed_outcomes else "unknown"
-          content_status = content_outcome if content_outcome in allowed_outcomes else "unknown"
-          patch_match = re.fullmatch(
-              r"PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed error_class=none "
-              r"latest_patch_id=([0-9]{1,32}) internal_section_count=([1-9][0-9]*) "
-              r"internal_api_section_count=([1-9][0-9]*) public_api_section_count=([1-9][0-9]*)",
-              patch_summary,
-          )
-          status = "passed" if patch_status == content_status == "success" and patch_match else "failed"
-          payload = {
-              "schema": 1,
-              "kind": "platform_content_diagnostics",
-              "status": status,
-              "error_class": "none" if status == "passed" else "diagnostic_failed",
-              "event": safe_event,
-              "run_id": safe_run_id,
-              "run_attempt": safe_attempt,
-              "target_sha": safe_sha,
-              "patch_distribution_status": patch_status,
-              "content_status": content_status,
-              "latest_patch_id": patch_match.group(1) if patch_match else "unavailable",
-              "internal_section_count": int(patch_match.group(2)) if patch_match else 0,
-              "internal_api_section_count": int(patch_match.group(3)) if patch_match else 0,
-              "public_api_section_count": int(patch_match.group(4)) if patch_match else 0,
-          }
-          Path(output).write_text(
-              json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n",
-              encoding="utf-8",
-          )
-          Path(output).chmod(0o600)
-          PY
+          /usr/bin/python3 "$DIAGNOSTICS_TOOL" evidence \
+            --output "$aggregate" \
+            --target-sha "$TARGET_SHA" \
+            --event "$GITHUB_EVENT_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --patch-outcome "$PATCH_OUTCOME" \
+            --patch-summary "$PATCH_SUMMARY" \
+            --content-outcome "$CONTENT_OUTCOME"
 
       - name: Upload sanitized aggregate diagnostic evidence
         if: ${{ always() }}

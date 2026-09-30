@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from apps.platform_api.app.api.routes import content as content_routes
 from apps.platform_api.app.services import home_content, home_content_security
+from apps.platform_api.app.services import patch_translation
+from apps.platform_api.app.services import patch_translation_runtime
 from python_packages.platform_infra.config import PlatformSettings
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
@@ -151,7 +153,7 @@ class PatchSitemapProjectionTests(PlatformIsolatedAsyncioTestCase):
             patch.object(home_content, "_fetch_steam_patches", new=AsyncMock(return_value=(patches, details))),
             patch.object(home_content, "_fetch_youtube_videos", new=AsyncMock(return_value=[])),
             patch.object(home_content, "_fetch_deadlock_asset_catalog", new=AsyncMock(return_value={})),
-            patch.object(home_content_security, "ensure_patch_translation_records", new=AsyncMock(side_effect=register)),
+            patch.object(patch_translation, "ensure_patch_translation_records", new=AsyncMock(side_effect=register)),
             patch.object(home_content, "publish_patch_sitemap_index", new=AsyncMock(side_effect=publish)),
         ):
             payload = await home_content_security.refresh_home_content(force=True)
@@ -178,6 +180,32 @@ class PatchSitemapProjectionTests(PlatformIsolatedAsyncioTestCase):
 
         self.assertEqual(json.loads(cache.values[home_content.PATCH_SITEMAP_INDEX_KEY]), previous)
         publish.assert_not_awaited()
+
+    async def test_translation_free_distribution_refresh_never_registers_or_calls_openai(self) -> None:
+        patches = [_patch_summary("1001", 1)]
+        details = {"1001": _patch_detail("1001", 1)}
+        cache = _Cache()
+        settings = PlatformSettings(_env_file=None)
+        register = AsyncMock(side_effect=AssertionError("diagnostics must not register translations"))
+        request_openai = AsyncMock(side_effect=AssertionError("diagnostics must not call OpenAI"))
+        enqueue = Mock(side_effect=AssertionError("diagnostics must not enqueue Celery work"))
+        with (
+            patch.object(home_content_security, "redis_client", return_value=cache),
+            patch.object(home_content_security, "get_settings", return_value=settings),
+            patch.object(home_content_security, "BoundedNoRedirectAsyncClient", return_value=_ClientContext()),
+            patch.object(home_content, "_fetch_steam_patches", new=AsyncMock(return_value=(patches, details))),
+            patch.object(home_content, "_fetch_youtube_videos", new=AsyncMock(return_value=[])),
+            patch.object(home_content, "_fetch_deadlock_asset_catalog", new=AsyncMock(return_value={})),
+            patch.object(patch_translation, "ensure_patch_translation_records", new=register),
+            patch.object(patch_translation_runtime, "_enqueue_translation_task", new=enqueue),
+            patch.object(patch_translation_runtime, "_request_openai", new=request_openai),
+        ):
+            payload = await home_content_security.refresh_content_distribution(force=True)
+
+        self.assertTrue(payload["patches_available"])
+        register.assert_not_awaited()
+        enqueue.assert_not_called()
+        request_openai.assert_not_awaited()
 
 
 class _ClientContext:

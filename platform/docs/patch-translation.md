@@ -172,7 +172,8 @@ and verifies that the latest numeric patch ID and non-empty schema-valid
 sections agree across the internal and public APIs. Keep the translation
 regression set and its `MAX_OPENAI_CALLS` budget in
 `platform-patch-translation-qa.yml`; do not add a second production
-translation owner.
+translation owner. Its refresh calls the translation-free distribution API and
+does not register records, enqueue Celery work or perform an OpenAI fallback.
 
 Manual/diagnostic comparison is still required when changing prompt/glossary behavior because numeric correctness alone cannot detect terminology mistakes, item/mechanic ambiguity, prose truncation or awkward Russian phrasing.
 

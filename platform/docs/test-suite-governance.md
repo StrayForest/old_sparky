@@ -483,6 +483,11 @@ non-empty numeric latest ID and non-empty schema-valid sections; a malformed,
 empty or failed producer result cannot become a successful workflow. Its
 workflow-dispatch path is bound to a required exact `expected_sha`, and its
 aggregate evidence is sanitized before the fourteen-day artifact upload.
+The closed summary, section projection/parity check and evidence writer live in
+the stdlib-only `platform/tools/platform_content_diagnostics.py` contract; the
+diagnostic refresh owner never registers or enqueues translations. The
+credential-bearing job consumes only the digest-bound helper artifact staged by
+the trusted provenance job; it never checks out candidate code.
 Russian translation and every OpenAI call belong only to
 `platform-patch-translation-qa.yml`, which owns the explicit
 `MAX_OPENAI_CALLS` budget. Content diagnostics must not grow a second
