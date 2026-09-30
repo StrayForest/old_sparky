@@ -1463,12 +1463,11 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         content = (
             WORKFLOW_DIR / "platform-production-content-diagnostics.yml"
         ).read_text(encoding="utf-8")
-        diagnostics = (WORKFLOW_DIR / "platform-production-diagnostics.yml").read_text(
-            encoding="utf-8"
-        )
+        diagnostics_path = WORKFLOW_DIR / "platform-production-diagnostics.yml"
+        self.assertFalse(diagnostics_path.exists())
+        diagnostics = content
         self.assertNotIn("\n  push:\n", content)
-        self.assertNotIn("\n  push:\n", diagnostics)
-        for workflow in (content, diagnostics):
+        for workflow in (content,):
             self.assertIn("platform_release_lock_exec.sh", workflow)
             self.assertIn("--expected-sha", workflow)
 
@@ -1515,9 +1514,17 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             )
             self.assertIn(f'context\\":\\"{marker}', workflow, name)
 
-        self.assertEqual(diagnostics.count("home_content.refresh_home_content()"), 1)
-        self.assertIn('print("PRODUCTION_PATCH_ID=" + patch_id)', diagnostics)
-        self.assertIn('sed -n \'s/^PRODUCTION_PATCH_ID=//p\'', diagnostics)
+        self.assertEqual(diagnostics.count("home_content_security.refresh_home_content(force=True)"), 1)
+        self.assertIn("patches_available", diagnostics)
+        self.assertIn("PRODUCTION_PATCH_DISTRIBUTION", diagnostics)
+        self.assertIn("status=passed", diagnostics)
+        self.assertIn("passed_count", diagnostics)
+        self.assertIn("retention-days: 14", diagnostics)
+        self.assertIn("expected_sha:", diagnostics)
+        self.assertIn("platform_workflow_input_guard.py sha", diagnostics)
+        self.assertIn("PatchDetailResponse.model_validate", diagnostics)
+        self.assertNotIn("translate_patch_to_russian", diagnostics)
+        self.assertNotIn("MAX_OPENAI_CALLS", diagnostics)
         deploy = (WORKFLOW_DIR / "platform-production-deploy.yml").read_text(
             encoding="utf-8"
         )
@@ -1528,7 +1535,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn('description\\":\\"Production deployment and live smoke passed', deploy[marker_at:])
 
     def test_all_production_ssh_workflows_pin_host_identity(self) -> None:
-        workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-as12-proof.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml', 'platform-production-external-load.yml', 'platform-production-release-abort.yml', 'platform-production-retained-load-cleanup.yml', 'platform-production-retained-load-abort.yml', 'platform-production-storage-diagnostics.yml', 'platform-production-web-runtime-diagnostics.yml')
+        workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-as12-proof.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-external-load.yml', 'platform-production-release-abort.yml', 'platform-production-retained-load-cleanup.yml', 'platform-production-retained-load-abort.yml', 'platform-production-storage-diagnostics.yml', 'platform-production-web-runtime-diagnostics.yml')
         expected_fingerprint = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
         for name in workflow_names:
             workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
@@ -1580,7 +1587,6 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             "platform-production-backup.yml": "platform-production-backup-ssh",
             "platform-production-content-diagnostics.yml": "platform-production-content-diagnostics-ssh",
             "platform-production-deploy.yml": "platform-production-deploy-ssh",
-            "platform-production-diagnostics.yml": "platform-production-diagnostics-ssh",
             "platform-production-release-abort.yml": "platform-production-release-abort-ssh",
             "platform-production-release-recover.yml": "platform-production-release-recovery-ssh",
             "platform-production-service-recovery.yml": "platform-production-service-recovery-ssh",
@@ -1926,7 +1932,6 @@ class ReleaseHardeningContractTests(unittest.TestCase):
     def test_translation_workflows_never_source_production_dotenv(self) -> None:
         for name in (
             "platform-patch-translation-qa.yml",
-            "platform-production-diagnostics.yml",
         ):
             workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
             self.assertNotIn('. "$PLATFORM_ENV_FILE"', workflow, name)

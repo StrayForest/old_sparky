@@ -165,6 +165,15 @@ its result. It must not run in a polling loop or be described as a pure QA
 check. A read-only check must fail on cache miss instead of invoking the
 translator.
 
+`Platform production content diagnostics` is a separate owner and does not
+translate patches or call OpenAI. It only forces the hardened patch refresh,
+checks that the refreshed home payload advertises available non-empty patches,
+and verifies that the latest numeric patch ID and non-empty schema-valid
+sections agree across the internal and public APIs. Keep the translation
+regression set and its `MAX_OPENAI_CALLS` budget in
+`platform-patch-translation-qa.yml`; do not add a second production
+translation owner.
+
 Manual/diagnostic comparison is still required when changing prompt/glossary behavior because numeric correctness alone cannot detect terminology mistakes, item/mechanic ambiguity, prose truncation or awkward Russian phrasing.
 
 ## Code owners

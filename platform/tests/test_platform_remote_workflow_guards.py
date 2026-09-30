@@ -603,6 +603,34 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
         self.assertNotIn("operator", rendered.stdout)
         self.assertNotIn("production.example.test", rendered.stdout)
 
+    def test_content_diagnostics_owns_patch_distribution_without_translation(self) -> None:
+        workflow_path = WORKFLOW_ROOT / "platform-production-content-diagnostics.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
+
+        self.assertIn("  workflow_dispatch:\n    inputs:\n      expected_sha:", workflow)
+        self.assertIn("        required: true", workflow)
+        self.assertNotIn("\n  push:\n", workflow)
+        self.assertIn("platform_workflow_input_guard.py sha", workflow)
+        self.assertIn("platform_release_lock_exec.sh", workflow)
+        self.assertIn("--expected-sha", workflow)
+        self.assertIn("home_content_security.refresh_home_content(force=True)", workflow)
+        self.assertIn('refreshed.get("patches_available") is not True', workflow)
+        self.assertIn("PATCH_ID_RE = re.compile", workflow)
+        self.assertIn("PatchDetailResponse.model_validate", workflow)
+        self.assertIn("127.0.0.1:8010/api/v1/content/patches", workflow)
+        self.assertIn("https://old-sparky.com/api/v1/content/patches", workflow)
+        self.assertIn("PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed", workflow)
+        self.assertIn("PRODUCTION_PATCH_DISTRIBUTION schema=1 status=failed", workflow)
+        self.assertIn('summary_count" != "1"', workflow)
+        self.assertIn('if (( remote_status != 0 ))', workflow)
+        self.assertIn('[[ "$passed_count" != "1" ]]', workflow)
+        self.assertIn("Write sanitized aggregate diagnostic evidence", workflow)
+        self.assertIn("Upload sanitized aggregate diagnostic evidence", workflow)
+        self.assertIn("retention-days: 14", workflow)
+        self.assertNotIn("translate_patch_to_russian", workflow)
+        self.assertNotIn("MAX_OPENAI_CALLS", workflow)
+        self.assertFalse((WORKFLOW_ROOT / "platform-production-diagnostics.yml").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

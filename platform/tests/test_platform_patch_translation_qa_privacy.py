@@ -67,8 +67,8 @@ class PlatformPatchTranslationQAPrivacyTests(unittest.TestCase):
         warmup = (WORKFLOW_ROOT / "platform-patch-translation-qa.yml").read_text(
             encoding="utf-8"
         )
-        diagnostics = (
-            WORKFLOW_ROOT / "platform-production-diagnostics.yml"
+        content_diagnostics = (
+            WORKFLOW_ROOT / "platform-production-content-diagnostics.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("translation-qa-private", warmup)
         self.assertIn("translation-qa-public", warmup)
@@ -76,9 +76,25 @@ class PlatformPatchTranslationQAPrivacyTests(unittest.TestCase):
         self.assertNotIn("PATCH_TRANSLATION_LONGEST", warmup)
         self.assertNotIn("journalctl -u", warmup)
         self.assertNotIn('cat \"$remote_log\"', warmup)
-        self.assertNotIn('cat \"$remote_log\"', diagnostics)
+        self.assertNotIn('cat \"$remote_log\"', content_diagnostics)
         self.assertIn('kind": "translation_qa"', warmup)
-        self.assertIn('kind": "translation_qa"', diagnostics)
+        self.assertNotIn('kind": "translation_qa"', content_diagnostics)
+        self.assertNotIn("translate_patch_to_russian", content_diagnostics)
+        self.assertNotIn("MAX_OPENAI_CALLS", content_diagnostics)
+        self.assertIn("PRODUCTION_PATCH_DISTRIBUTION", content_diagnostics)
+        self.assertIn("patches_available", content_diagnostics)
+        self.assertIn("retention-days: 14", content_diagnostics)
+        self.assertFalse(
+            (WORKFLOW_ROOT / "platform-production-diagnostics.yml").exists()
+        )
+
+    def test_production_translation_owner_is_unique(self) -> None:
+        owners: list[str] = []
+        for path in sorted((*WORKFLOW_ROOT.glob("*.yml"), *WORKFLOW_ROOT.glob("*.yaml"))):
+            source = path.read_text(encoding="utf-8")
+            if "translate_patch_to_russian" in source or "MAX_OPENAI_CALLS" in source:
+                owners.append(path.name)
+        self.assertEqual(owners, ["platform-patch-translation-qa.yml"])
 
 
 if __name__ == "__main__":

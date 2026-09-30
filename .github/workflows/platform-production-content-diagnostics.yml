@@ -2,12 +2,21 @@ name: Platform production content diagnostics
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Exact source SHA currently deployed on the production VPS"
+        required: true
+        type: string
   workflow_run:
     workflows: ["Platform production deploy"]
     types: [completed]
 
 permissions:
   contents: read
+
+concurrency:
+  group: platform-production-deploy
+  cancel-in-progress: false
 
 jobs:
   validate-content-provenance:
@@ -26,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.expected_sha }}
       SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
       SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
       SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
@@ -78,6 +87,19 @@ jobs:
           ref: ${{ steps.trusted_default.outputs.sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Validate content diagnostics input
+        shell: bash
+        env:
+          TARGET_SHA: ${{ env.TARGET_SHA }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            test "$GITHUB_REF" = "refs/heads/dev" \
+              || { echo "Production content diagnostics must run from dev." >&2; exit 1; }
+          fi
+          /usr/bin/python3 -I platform/tools/platform_workflow_input_guard.py sha \
+            --value "$TARGET_SHA"
 
       - name: Verify exact completed production deployment provenance (shared validator)
         id: deployment_provenance
@@ -230,7 +252,7 @@ jobs:
     timeout-minutes: 10
     environment: production
     env:
-      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.expected_sha }}
       SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
       SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
       SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
@@ -300,7 +322,187 @@ jobs:
           chmod 600 "$ssh_dir/known_hosts"
           printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
+      - name: Verify latest patch distribution
+        id: patch_distribution
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          remote_log="$RUNNER_TEMP/platform-production-content-diagnostics-patch.log"
+          remote_error="$RUNNER_TEMP/platform-production-content-diagnostics-patch-error.log"
+          : >"$remote_log"
+          : >"$remote_error"
+          chmod 600 "$remote_log" "$remote_error"
+          set +e
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -F "$SSH_DIR/config" \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$TARGET_SHA" >"$remote_log" 2>"$remote_error" <<'REMOTE'
+          set -Eeuo pipefail
+          target_sha="$1"
+          runtime=/opt/oldsparky/platform
+          guard="$runtime/current/tools/platform_release_lock_exec.sh"
+          test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
+            || { echo "Production mutation guard is missing" >&2; exit 1; }
+          /bin/bash "$guard" \
+            --app-dir "$runtime" \
+            --expected-sha "$target_sha" \
+            -- /bin/bash -s <<'MUTATION'
+          set -Eeuo pipefail
+          runtime=/opt/oldsparky/platform
+          cd "$runtime/current"
+          export PLATFORM_APP_DIR="$runtime"
+          export PLATFORM_SHARED_DIR="$runtime/shared"
+          export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          export PLATFORM_PYTHON_BIN="$runtime/shared/venv/bin/python"
+          source "$runtime/current/tools/platform_runtime_common.sh"
+          platform_load_env_file
+          export PYTHONPATH="$runtime/current"
+
+          "$runtime/shared/venv/bin/python" - <<'PY'
+          import asyncio
+          import re
+
+          import httpx
+
+          from apps.platform_api.app.api.schemas import PatchDetailResponse
+          from apps.platform_api.app.services import home_content_security
+          from apps.platform_api.app.services import patch_detail_security
+
+          PATCH_ID_RE = re.compile(r"^[0-9]{1,32}$")
+
+
+          class PatchDistributionFailure(RuntimeError):
+              def __init__(self, error_class: str) -> None:
+                  super().__init__(error_class)
+                  self.error_class = error_class
+
+
+          def fail(error_class: str) -> None:
+              raise PatchDistributionFailure(error_class)
+
+
+          def validate_detail(payload: object, *, expected_id: str) -> int:
+              if not isinstance(payload, dict):
+                  fail("producer")
+              try:
+                  parsed = PatchDetailResponse.model_validate(payload)
+              except Exception:
+                  fail("producer")
+              if parsed.id != expected_id:
+                  fail("producer")
+              sections = payload.get("sections")
+              if not isinstance(sections, list) or not sections:
+                  fail("producer")
+              return len(sections)
+
+
+          async def fetch_api_detail(
+              client: httpx.AsyncClient,
+              url: str,
+          ) -> dict[str, object]:
+              try:
+                  response = await client.get(url)
+                  response.raise_for_status()
+                  payload = response.json()
+              except Exception:
+                  fail("remote_or_transport")
+              if not isinstance(payload, dict):
+                  fail("remote_or_transport")
+              return payload
+
+
+          async def main() -> None:
+              refreshed = await home_content_security.refresh_home_content(force=True)
+              if not isinstance(refreshed, dict) or refreshed.get("patches_available") is not True:
+                  fail("producer")
+              patches = refreshed.get("patches")
+              if not isinstance(patches, list) or not patches:
+                  fail("producer")
+              latest = patches[0]
+              if not isinstance(latest, dict):
+                  fail("producer")
+              latest_id = str(latest.get("id") or "")
+              if PATCH_ID_RE.fullmatch(latest_id) is None:
+                  fail("producer")
+
+              internal_detail = await patch_detail_security.get_patch_detail(latest_id)
+              internal_sections = validate_detail(internal_detail, expected_id=latest_id)
+
+              async with httpx.AsyncClient(
+                  timeout=15,
+                  follow_redirects=False,
+                  headers={"Accept": "application/json"},
+              ) as client:
+                  internal_api, public_api = await asyncio.gather(
+                      fetch_api_detail(
+                          client,
+                          f"http://127.0.0.1:8010/api/v1/content/patches/{latest_id}",
+                      ),
+                      fetch_api_detail(
+                          client,
+                          f"https://old-sparky.com/api/v1/content/patches/{latest_id}",
+                      ),
+                  )
+              internal_api_sections = validate_detail(internal_api, expected_id=latest_id)
+              public_api_sections = validate_detail(public_api, expected_id=latest_id)
+              print(
+                  "PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed "
+                  "error_class=none latest_patch_id="
+                  + latest_id
+                  + " internal_section_count="
+                  + str(internal_sections)
+                  + " internal_api_section_count="
+                  + str(internal_api_sections)
+                  + " public_api_section_count="
+                  + str(public_api_sections)
+              )
+
+
+          try:
+              asyncio.run(main())
+          except PatchDistributionFailure as error:
+              print(
+                  "PRODUCTION_PATCH_DISTRIBUTION schema=1 status=failed "
+                  f"error_class={error.error_class} latest_patch_id=unavailable "
+                  "internal_section_count=0 internal_api_section_count=0 "
+                  "public_api_section_count=0"
+              )
+              raise SystemExit(1)
+          except Exception:
+              print(
+                  "PRODUCTION_PATCH_DISTRIBUTION schema=1 status=failed "
+                  "error_class=internal latest_patch_id=unavailable "
+                  "internal_section_count=0 internal_api_section_count=0 "
+                  "public_api_section_count=0"
+              )
+              raise SystemExit(1)
+          PY
+          MUTATION
+          REMOTE
+          remote_status=$?
+          set -e
+          summary_count="$(grep -Ec '^PRODUCTION_PATCH_DISTRIBUTION schema=1 status=(passed|failed) error_class=[a-z_]+ latest_patch_id=(unavailable|[0-9]{1,32}) internal_section_count=[0-9]+ internal_api_section_count=[0-9]+ public_api_section_count=[0-9]+$' "$remote_log" || true)"
+          passed_count="$(grep -Ec '^PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed error_class=none latest_patch_id=[0-9]{1,32} internal_section_count=[1-9][0-9]* internal_api_section_count=[1-9][0-9]* public_api_section_count=[1-9][0-9]*$' "$remote_log" || true)"
+          if (( remote_status != 0 )) || [[ "$summary_count" != "1" ]] || [[ "$passed_count" != "1" ]]; then
+            rm -f -- "$remote_log" "$remote_error"
+            printf '%s\n' 'PRODUCTION_PATCH_DISTRIBUTION schema=1 status=failed error_class=remote_or_transport latest_patch_id=unavailable internal_section_count=0 internal_api_section_count=0 public_api_section_count=0'
+            exit 1
+          fi
+          summary_line="$(grep -E '^PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed error_class=none latest_patch_id=[0-9]{1,32} internal_section_count=[1-9][0-9]* internal_api_section_count=[1-9][0-9]* public_api_section_count=[1-9][0-9]*$' "$remote_log")"
+          printf '%s\n' "$summary_line"
+          printf 'summary_line=%s\n' "$summary_line" >> "$GITHUB_OUTPUT"
+          rm -f -- "$remote_log" "$remote_error"
+
       - name: Probe and refresh production home content
+        id: home_content
         if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
         shell: bash
         env:
@@ -515,6 +717,70 @@ jobs:
           printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=passed error_class=none'
           rm -f -- "$remote_log" "$remote_error"
 
+      - name: Write sanitized aggregate diagnostic evidence
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PATCH_OUTCOME: ${{ steps.patch_distribution.outcome }}
+          PATCH_SUMMARY: ${{ steps.patch_distribution.outputs.summary_line }}
+          CONTENT_OUTCOME: ${{ steps.home_content.outcome }}
+        run: |
+          set -euo pipefail
+          umask 077
+          aggregate="$RUNNER_TEMP/platform-production-content-diagnostics-aggregate.json"
+          /usr/bin/python3 - "$aggregate" "$TARGET_SHA" "$GITHUB_EVENT_NAME" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PATCH_OUTCOME" "$PATCH_SUMMARY" "$CONTENT_OUTCOME" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          output, target_sha, event, run_id, run_attempt, patch_outcome, patch_summary, content_outcome = sys.argv[1:]
+          safe_sha = target_sha if re.fullmatch(r"[0-9a-f]{40}", target_sha) else "unavailable"
+          safe_event = event if event in {"workflow_dispatch", "workflow_run"} else "unavailable"
+          safe_run_id = int(run_id) if re.fullmatch(r"[1-9][0-9]{0,31}", run_id) else 0
+          safe_attempt = int(run_attempt) if re.fullmatch(r"[1-9][0-9]{0,31}", run_attempt) else 0
+          allowed_outcomes = {"success", "failure", "cancelled", "skipped"}
+          patch_status = patch_outcome if patch_outcome in allowed_outcomes else "unknown"
+          content_status = content_outcome if content_outcome in allowed_outcomes else "unknown"
+          patch_match = re.fullmatch(
+              r"PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed error_class=none "
+              r"latest_patch_id=([0-9]{1,32}) internal_section_count=([1-9][0-9]*) "
+              r"internal_api_section_count=([1-9][0-9]*) public_api_section_count=([1-9][0-9]*)",
+              patch_summary,
+          )
+          status = "passed" if patch_status == content_status == "success" and patch_match else "failed"
+          payload = {
+              "schema": 1,
+              "kind": "platform_content_diagnostics",
+              "status": status,
+              "error_class": "none" if status == "passed" else "diagnostic_failed",
+              "event": safe_event,
+              "run_id": safe_run_id,
+              "run_attempt": safe_attempt,
+              "target_sha": safe_sha,
+              "patch_distribution_status": patch_status,
+              "content_status": content_status,
+              "latest_patch_id": patch_match.group(1) if patch_match else "unavailable",
+              "internal_section_count": int(patch_match.group(2)) if patch_match else 0,
+              "internal_api_section_count": int(patch_match.group(3)) if patch_match else 0,
+              "public_api_section_count": int(patch_match.group(4)) if patch_match else 0,
+          }
+          Path(output).write_text(
+              json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          Path(output).chmod(0o600)
+          PY
+
+      - name: Upload sanitized aggregate diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-content-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-production-content-diagnostics-aggregate.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Remove production SSH material
         id: cleanup_ssh
         if: ${{ always() }}
@@ -546,8 +812,12 @@ jobs:
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
           rm -f -- \
+            "$RUNNER_TEMP/platform-production-content-diagnostics-patch.log" \
+            "$RUNNER_TEMP/platform-production-content-diagnostics-patch-error.log" \
             "$RUNNER_TEMP/platform-production-content-diagnostics.log" \
             "$RUNNER_TEMP/platform-production-content-diagnostics-error.log"
+          test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics-patch.log"
+          test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics-patch-error.log"
           test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics.log"
           test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics-error.log"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"

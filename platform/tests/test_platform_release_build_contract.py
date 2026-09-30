@@ -2116,13 +2116,18 @@ cleanup
         for workflow_name in (
             "platform-media-migration-diagnostics.yml",
             "platform-production-content-diagnostics.yml",
-            "platform-production-diagnostics.yml",
             "platform-live-launch.yml",
             "platform-live-user-qa.yml",
         ):
             with self.subTest(workflow=workflow_name):
                 workflow = (REPO_ROOT / ".github/workflows" / workflow_name).read_text()
                 self.assertIn("workflow_dispatch:", workflow)
+        self.assertFalse(
+            (
+                REPO_ROOT
+                / ".github/workflows/platform-production-diagnostics.yml"
+            ).exists()
+        )
 
     def test_external_public_load_keeps_measurement_outside_origin(self) -> None:
         retired_production_workflow = (
