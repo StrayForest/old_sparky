@@ -106,10 +106,9 @@ Read this file for the current production baseline and next engineering priority
 - The production origin perimeter proof passed on 2026-09-05 for source SHA `97db79b681dd90cc8e89dd91f549610c943c16b8`: listener inventory, forwarded-header trust, Cloudflare/Nginx/UFW parity and external IPv4/IPv6 direct-origin blocking are recorded in [`archive/as-12-origin-perimeter-2026-09-05.md`](archive/as-12-origin-perimeter-2026-09-05.md).
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
 - Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
-- Production Alembic head is `20260903_0052`, including Google external identities and browser-bound OAuth state alongside the tournament catalog
-  read-model and keyset-pagination revisions. The migration scenario records
-  this as the current head; see the [deployment runbook](deployment-runbook.md)
-  for the exact release-SHA evidence.
+- Last authoritative production Alembic evidence is `20260903_0052`, including Google external identities, browser-bound OAuth state and the tournament catalog revisions. Source revision `20260913_0053` documents validation/repair
+  but has no host or exact receipt evidence here; do not call it deployed. See
+  the [deployment runbook](deployment-runbook.md) for this evidence boundary.
 - On 2026-08-24 production was reset only after a restore-verified backup
   (`platformdb-20260824T173357Z.dump`, SHA-256
   `3ee0e6616b4af7964578a02d1df9cbef2855b0559bec8a395d3435cd15c0379d`). The
@@ -346,7 +345,7 @@ database budgets are unchanged. The corrected canonical performance model uses
 `ready-vote-stress-15k-v2` and `ready-vote-spike-v1`; the optional 20k stress
 profile is retained only for a specific unresolved question.
 
-Current status: migration `20260903_0052` is the deployed Alembic head. The
+Current status: last authoritative migration evidence remains `20260903_0052`; source-only `20260913_0053` is not asserted as deployed without host proof. The
 `0048` revision adds a partial covering index for the `UserSession` auth query;
 its `EXPLAIN` `Index Only Scan` / `Heap Fetches 0` result is disposable
 engineering evidence, not a production architecture claim. The supported
@@ -584,7 +583,7 @@ and size-based rotation bounds text log files.
   resolves a release-independent, root-owned host-tools generation from the
   repository pin (`HOST_TOOLS_SHA`) before building or transferring a release;
   its one-time out-of-band provisioning and rollback contract is in the
-  [production host-tools provisioning ADR](adr/production-host-tools-provisioning.md).
+  [production host-tools provisioning ADR](adr/production-host-tools-provisioning.md); downstream QA is receipt-gated, takes its target SHA from the closed receipt, and skips valid auto no-ops/manual preflights.
 
 ## Deferred / operator-owned work
 

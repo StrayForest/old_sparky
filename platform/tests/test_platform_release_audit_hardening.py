@@ -1509,10 +1509,12 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             self.assertIn('output.write("deploy_ready=false\\n")', workflow, name)
             self.assertIn('output.write("deploy_ready=true\\n")', workflow, name)
             self.assertIn(
-                "steps.verify_deploy_provenance.outputs.deploy_ready == 'true'",
+                "steps.downstream_receipt_provenance.outputs.deploy_ready",
                 workflow,
                 name,
             )
+            self.assertNotIn("steps.deployment_provenance.outputs", workflow, name)
+            self.assertIn("steps.downstream_receipt_provenance.outputs.target_sha", workflow, name)
             self.assertIn(f'context\\":\\"{marker}', workflow, name)
 
         self.assertEqual(diagnostics.count("home_content.refresh_home_content()"), 1)
@@ -1522,10 +1524,27 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         production_start = deploy.index("  production:")
-        self.assertIn("inputs.mode == 'deploy'", deploy[production_start:])
-        marker_at = deploy.index("Mark production deployment successful")
-        self.assertIn('context\\":\\"platform-production-deploy', deploy[marker_at:])
-        self.assertIn('description\\":\\"Production deployment and live smoke passed', deploy[marker_at:])
+        production = deploy[production_start : deploy.index("  release-status-pending:")]
+        self.assertIn("inputs.mode == 'deploy'", production)
+        pending_start = deploy.index("  release-status-pending:")
+        pending_end = deploy.index("  release-finalizer:", pending_start)
+        pending = deploy[pending_start:pending_end]
+        self.assertIn("      - name: Mark top-level release pending", pending)
+        self.assertIn('STATUS_URL: ${{ github.server_url }}', pending)
+        self.assertIn(
+            '[[ "$STATUS_URL" =~ ^https://github\\.com/StrayForest/old_sparky/actions/runs/',
+            pending,
+        )
+        self.assertIn('"context": "platform-production-deploy"', pending)
+        self.assertIn('"target_url": sys.argv[1]', pending)
+
+        finalizer = deploy[deploy.index("  release-finalizer:") :]
+        self.assertIn("      - name: Mark top-level release successful", finalizer)
+        self.assertIn('STATUS_URL: ${{ github.server_url }}', finalizer)
+        self.assertIn('/attempts/${{', finalizer)
+        self.assertIn('"context": "platform-production-deploy"', finalizer)
+        self.assertIn('"target_url": sys.argv[1]', finalizer)
+        self.assertIn('"description": "Production deployment and live smoke passed"', finalizer)
 
     def test_all_production_ssh_workflows_pin_host_identity(self) -> None:
         workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-as12-proof.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml', 'platform-production-external-load.yml', 'platform-production-release-abort.yml', 'platform-production-retained-load-cleanup.yml', 'platform-production-retained-load-abort.yml', 'platform-production-storage-diagnostics.yml', 'platform-production-web-runtime-diagnostics.yml')

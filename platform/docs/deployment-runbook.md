@@ -48,13 +48,46 @@ to `dev`. The chain is:
    branch, conclusion, trusted actor, description and attempt URL. The gate
    reads GitHub's paginated [list commit statuses endpoint](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference)
    (`/commits/{sha}/statuses`), retaining each raw row and its full `creator`
-   object. It then requires `platform-security-build=success` and skips a SHA that already
-   reports `platform-production-deploy=success` only when the matching
-   successful deploy attempt has its exact bot-authored marker.
-4. When those checks pass, the auto-deploy workflow dispatches
-   `Platform production deploy` with `mode=deploy` on `dev`.
-5. A secret-free prerequisite independently downloads and validates the exact
-   classifier artifact before the expensive candidate build is allowed to run.
+   object. It then requires `platform-security-build=success`; the native
+   called workflow is the one downstream execution for this contour, so the
+   auto-deploy gate does not guess at or deduplicate older child runs.
+4. When those checks pass, the auto-deploy workflow calls
+   [`platform-production-deploy.yml`](../../.github/workflows/platform-production-deploy.yml)
+   as a native reusable workflow job (`uses: ./.github/workflows/platform-production-deploy.yml`).
+   It passes strongly typed `workflow_call` inputs: `mode=deploy`,
+   `runtime_profile=ready-vote-static-8`, `web_compression=enabled`, the exact
+   tested `target_sha`, and the exact security run ID/attempt. There is no REST
+   dispatch, dispatch key, run discovery, timestamp correlation, polling,
+   cancellation API or caller lease in the normal path. The called job is
+   connected with native `needs`/`if`; its failure or cancellation is propagated
+   by the auto-deploy result job, while a valid non-deployable route leaves the
+   called job skipped and the auto-deploy workflow green.
+5. The called workflow accepts both guarded `workflow_call` and exceptional
+   `workflow_dispatch` entrypoints. Its validation jobs accept only those events,
+   validate the exact target SHA/current `dev` head and classifier/security
+   provenance, and do not receive production secret environment variables.
+   Only its environment-approved host capability, preflight and
+   `Deploy production` jobs use the `production` environment and SSH
+   secrets. Its concurrency group is the independent fixed
+   `platform-production-deploy` group with cancellation disabled, so a called
+   run cannot cancel the auto-deploy caller. A manual dispatch remains guarded
+   by the same exact mode, SHA, branch, classifier and preflight checks.
+   The caller intentionally passes no secrets and does not use `secrets: inherit`:
+   GitHub resolves `production` environment secrets on the called jobs, where
+   environment approval still applies, while `workflow_call` cannot receive
+   environment secrets from the caller. See [GitHub's reusable workflow secret
+   semantics](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow).
+6. Downstream patch-translation and content-diagnostics listen to auto-deploy
+   and manual deploy runs. The validator requires an exact closed receipt
+   member with matching API/ZIP/content digests; authenticated reads
+   and bounded lists require stable counts, exact cardinality and unique IDs/names.
+   Receipt `TARGET_SHA` alone feeds statuses, remote guards and QA. Auto requires
+   successful reusable `Deploy production`/`Auto-deploy result`; called identity
+   is receipt/`referenced_workflows` data (SHA authoritative, dev ref a locator).
+   Manual requires exact `workflow_dispatch` and successful `Deploy production`;
+   valid no-ops skip QA and a non-cancelling `always()` finalizer resolves failures.
+7. A secret-free prerequisite independently downloads and validates the exact classifier
+   artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
    before its first production write, followed by the security/build check and
    immutable artifact consumption. The classifier artifact is treated as
@@ -66,7 +99,7 @@ to `dev`. The chain is:
    head. If `dev` moved from `TARGET_SHA` (the A→B race), the workflow aborts
    closed; only then does it transfer and install the artifact and run
    production smoke.
-6. Before the expensive release build, `build-host-tools` resolves the
+7. Before the expensive release build, `build-host-tools` resolves the
    repository-owned `platform/contracts/host_tools_pin.json` from the exact
    target source, validates its repository/commit ancestry and closure
    baseline, then checks out and runs the pinned `HOST_TOOLS_SHA` helper to
@@ -93,7 +126,6 @@ to `dev`. The chain is:
    `size_in_bytes` to the downloaded archive byte size.
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
-
 ### Non-deployable pull-request host-tools candidate
 
 The default-branch `Platform host-tools candidate` workflow is evidence-only.
@@ -116,7 +148,6 @@ closed-member checks.  The evidence receipt is explicitly non-deployable;
 production workflows do not consume either `platform-host-tools-candidate-*`
 artifact prefix.  If this workflow fails, do not retry with a manual dispatch,
 host access or production release; investigate the exact run and PR state.
-
 The security workflow also has a separate `workflow_run` status finalizer. It
 uses only `statuses: write`, no checkout or secrets, and always overwrites the
 `platform-security-build` context for the completed run's exact `head_sha` and
@@ -132,7 +163,7 @@ failure status for that exact SHA with `gh api
 repos/StrayForest/old_sparky/statuses/<sha> -f state=failure -f
 context=platform-security-build`; never post success manually.
 
-The dispatch `mode`, runtime profile, release slug, target SHA and artifact
+The workflow `mode`, runtime profile, release slug, target SHA and artifact
 directory are checked by the bounded ASCII input guard before production host
 access or secret-file setup. A deployment release slug is exactly
 `gha-<run_id>-<run_attempt>-<first 12 lowercase characters of target SHA>`;
@@ -197,9 +228,8 @@ and a table matching the historical 0051 schema is present. It validates the
 table and constraints, idempotently backfills the projection, and repairs only
 invalid/unfinished concurrent indexes before stamping 0051. A valid index with
 the wrong definition or table, or any incompatible table/constraint, fails
-closed. Revision `20260913_0053` provides the same validation/repair as a
-forward migration for databases that already recorded 0051/0052; no downgrade
-or automatic migration reversal is performed.
+closed. Revision `20260913_0053` provides the same validation/repair as a forward migration for databases that already recorded 0051/0052; no downgrade or automatic migration reversal is performed.
+This checked-in procedure is not deployment evidence; confirm production revision from the exact receipt and host evidence before recording it as deployed.
 
 The migration wrapper has a bounded 300-second outer operation deadline that
 covers preflight, partial-0051 repair and the final `upgrade head` command. The

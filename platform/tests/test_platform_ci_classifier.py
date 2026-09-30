@@ -295,7 +295,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(route["route_fallback"], str(push_manifest["fallback"]).lower())
         self.assertEqual(route["route_digest"], push_manifest["digest"])
         self.assertIn(
-            'if [[ "$ROUTE_DEPLOYABLE" != "true" ]]',
+            'if [[ "$ROUTE_CLASS" != "full" || "$ROUTE_DEPLOYABLE" != "true" ]]',
             AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8"),
         )
         self.assertIn(
@@ -616,8 +616,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertNotIn("fail-closed fallback route", security)
         self.assertIn('"$ROUTE_DEPLOYABLE" != "true"', auto)
         self.assertIn('echo "deploy=false" >> "$GITHUB_OUTPUT"', auto)
-        self.assertIn("Dispatch production deployment", auto)
-        self.assertIn("steps.gate.outputs.deploy == 'true'", auto)
+        self.assertIn("uses: ./.github/workflows/platform-production-deploy.yml", auto)
+        self.assertIn("needs.validate.outputs.deploy == 'true'", auto)
         self.assertIn(
             'type(manifest.get("deployable")) is not bool',
             auto,
@@ -900,7 +900,6 @@ class PlatformCiClassifierTests(unittest.TestCase):
         production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("platform_workflow_provenance.py", auto)
         self.assertGreaterEqual(auto.count('"$PROVENANCE_TOOL" security'), 3)
-        self.assertIn('"$PROVENANCE_TOOL" deployment', auto)
         self.assertNotIn("from datetime import", auto)
         self.assertNotIn("timestamp_re =", auto)
         self.assertNotIn("sorted(set(candidates)", auto)
@@ -917,10 +916,12 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertNotIn("/commits/${TARGET_SHA}/status?per_page=100&page=${page}", auto)
         self.assertNotIn("/commits/${TARGET_SHA}/status\"", auto)
         self.assertNotIn("combined-status pagination", auto)
-        self.assertIn("deployment run pagination exceeded its bound", auto)
-        self.assertIn("deployment job pagination exceeded its bound", auto)
-        self.assertIn("contains duplicate IDs", auto)
-        self.assertIn("total_count changed during pagination", auto)
+        self.assertIn("uses: ./.github/workflows/platform-production-deploy.yml", auto)
+        self.assertIn("needs.validate.outputs.deploy == 'true'", auto)
+        self.assertIn("DEPLOY_RESULT: ${{ needs.deploy.result }}", auto)
+        self.assertIn("Native production deployment did not succeed", auto)
+        self.assertNotIn("dispatch_key", auto)
+        self.assertNotIn("DOWNSTREAM_", auto)
         self.assertIn("SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml", auto)
         self.assertIn("SECURITY_WORKFLOW_FILE: platform-security.yml", auto)
         self.assertIn("actions/workflows/${SECURITY_WORKFLOW_FILE}", auto)

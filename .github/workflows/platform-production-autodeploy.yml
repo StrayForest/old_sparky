@@ -13,13 +13,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: platform-production-auto-deploy
-  cancel-in-progress: true
+  group: platform-production-release-authority
+  cancel-in-progress: false
 
 jobs:
-  dispatch:
+  validate:
     permissions:
-      actions: write
+      actions: read
       contents: read
       statuses: read
     if: >-
@@ -38,6 +38,27 @@ jobs:
       SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
       SECURITY_WORKFLOW_FILE: platform-security.yml
       PROVENANCE_TOOL: ${{ github.workspace }}/platform/tools/platform_workflow_provenance.py
+    outputs:
+      deploy: ${{ steps.gate.outputs.deploy }}
+      target_sha: ${{ steps.gate.outputs.target_sha }}
+      classifier_run_id: ${{ steps.gate.outputs.classifier_run_id }}
+      classifier_run_attempt: ${{ steps.gate.outputs.classifier_run_attempt }}
+      security_run_id: ${{ steps.gate.outputs.security_run_id }}
+      security_run_attempt: ${{ steps.gate.outputs.security_run_attempt }}
+      runtime_profile: ${{ steps.gate.outputs.runtime_profile }}
+      web_compression: ${{ steps.gate.outputs.web_compression }}
+      mode: ${{ steps.gate.outputs.mode }}
+      caller_kind: ${{ steps.gate.outputs.caller_kind }}
+      caller_run_id: ${{ steps.gate.outputs.caller_run_id }}
+      caller_run_attempt: ${{ steps.gate.outputs.caller_run_attempt }}
+      caller_workflow_ref: ${{ steps.gate.outputs.caller_workflow_ref }}
+      caller_workflow_sha: ${{ steps.gate.outputs.caller_workflow_sha }}
+      caller_sha: ${{ steps.gate.outputs.caller_sha }}
+      expected_called_workflow_file: ${{ steps.gate.outputs.expected_called_workflow_file }}
+      expected_called_workflow_ref: ${{ steps.gate.outputs.expected_called_workflow_ref }}
+      expected_called_workflow_sha: ${{ steps.gate.outputs.expected_called_workflow_sha }}
+      route_class: ${{ steps.route.outputs.route_class }}
+      route_reason: ${{ steps.route.outputs.route_reason }}
     steps:
       - name: Checkout exact source for shared provenance validation
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -385,7 +406,7 @@ jobs:
               raise SystemExit("classifier digest does not match manifest")
           # A full route can intentionally be CI-only (for example, the
           # trusted host-tools candidate packaging).  The classifier's
-          # deployable bit, not the route class alone, controls dispatch.
+          # deployable bit, not the route class alone, controls the native call.
           if type(manifest.get("deployable")) is not bool:
               raise SystemExit("full route may be non-deployable, but its flag must be boolean")
           if recovery_bootstrap_only and manifest["deployable"]:
@@ -407,8 +428,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
+          CALLER_RUN_ID: ${{ github.run_id }}
+          CALLER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CALLER_SHA: ${{ github.sha }}
+          EXPECTED_CALLED_WORKFLOW_FILE: .github/workflows/platform-production-deploy.yml
+          EXPECTED_CALLED_WORKFLOW_REF: StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev
+          EXPECTED_CALLED_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
+
+          {
+            echo "target_sha=$TARGET_SHA"
+            echo "classifier_run_id=$SOURCE_RUN_ID"
+            echo "classifier_run_attempt=$SOURCE_RUN_ATTEMPT"
+            echo "security_run_id=$SOURCE_RUN_ID"
+            echo "security_run_attempt=$SOURCE_RUN_ATTEMPT"
+            echo "runtime_profile=ready-vote-static-8"
+            echo "web_compression=enabled"
+            echo "mode=deploy"
+            echo "caller_kind=auto"
+            echo "caller_run_id=$CALLER_RUN_ID"
+            echo "caller_run_attempt=$CALLER_RUN_ATTEMPT"
+            echo "caller_workflow_ref=$CALLER_WORKFLOW_REF"
+            echo "caller_workflow_sha=$CALLER_WORKFLOW_SHA"
+            echo "caller_sha=$CALLER_SHA"
+            echo "expected_called_workflow_file=$EXPECTED_CALLED_WORKFLOW_FILE"
+            echo "expected_called_workflow_ref=$EXPECTED_CALLED_WORKFLOW_REF"
+            echo "expected_called_workflow_sha=$EXPECTED_CALLED_WORKFLOW_SHA"
+          } >> "$GITHUB_OUTPUT"
 
           branch_json="$(
             curl --fail-with-body --silent --show-error \
@@ -431,7 +480,7 @@ jobs:
             exit 0
           fi
 
-          if [[ "$ROUTE_DEPLOYABLE" != "true" ]]; then
+          if [[ "$ROUTE_CLASS" != "full" || "$ROUTE_DEPLOYABLE" != "true" ]]; then
             echo "Classifier route is non-deployable ($ROUTE_CLASS); no production deployment required."
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -517,7 +566,7 @@ jobs:
           # Read the complete status list twice immediately before the
           # deployment candidate check. Equality is over the shared validator
           # output, not merely state/URL fields, so mutations cannot suppress a
-          # required dispatch.
+          # required native deployment call.
           for snapshot in first second; do
             fetch_security_snapshot "$status_dir/$snapshot"
           done
@@ -549,289 +598,93 @@ jobs:
           if first != second:
               raise SystemExit("platform-security-build status changed during validation")
           PY
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
           rm -rf -- "$status_dir"
           test ! -e "$status_dir"
 
-          # A status context alone is not an authentication signal: any actor
-          # with statuses:write can post the same name.  Only an exact,
-          # completed Deploy production job with its bot-produced attempt
-          # marker may suppress a new dispatch.  Every API request is fail-
-          # closed, while a missing exact deploy run means dispatch is needed.
-          deployment_dir="$(mktemp -d "$RUNNER_TEMP/platform-deploy-provenance.XXXXXX")"
-          trap 'rm -rf -- "$deployment_dir" "$status_dir"' EXIT
-          curl --fail-with-body --silent --show-error \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml" \
-            --output "$deployment_dir/workflow.json"
-          fetch_deployment_runs() {
-            local output_path="$1" page=1 count page_path
-            local pages_dir="$deployment_dir/run-pages"
-            install -d -m 700 "$pages_dir"
-            while :; do
-              page_path="$pages_dir/page-${page}.json"
-              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
-                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/runs?event=workflow_dispatch&branch=dev&head_sha=${TARGET_SHA}&per_page=100&page=${page}" \
-                --output "$page_path"
-              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
 
-          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if not isinstance(payload, dict) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 99999:
-              raise SystemExit("deployment run pagination response is malformed")
-          rows = payload.get("workflow_runs")
-          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
-              raise SystemExit("deployment run page rows are malformed")
-          ids = []
-          for row in rows:
-              if type(row.get("id")) is not int or row["id"] <= 0 or type(row.get("run_attempt")) is not int or row["run_attempt"] <= 0:
-                  raise SystemExit("deployment run identity is malformed")
-              ids.append(row["id"])
-          if len(ids) != len(set(ids)):
-              raise SystemExit("deployment run page contains duplicate IDs")
-          marker = Path(sys.argv[2])
-          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
-              raise SystemExit("deployment run total_count changed during pagination")
-          marker.write_text(str(payload["total_count"]), encoding="ascii")
-          print(len(rows))
-          PY
-              )"
-              if (( count < 100 )); then
-                break
-              fi
-              ((page += 1))
-              (( page <= 1000 )) || { echo "deployment run pagination exceeded its bound" >&2; exit 1; }
-            done
-            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
+  deploy:
+    name: Native production deployment
+    needs: validate
+    if: >-
+      needs.validate.result == 'success' &&
+      needs.validate.outputs.deploy == 'true'
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+      statuses: write
+    uses: ./.github/workflows/platform-production-deploy.yml
+    with:
+      mode: ${{ needs.validate.outputs.mode }}
+      runtime_profile: ${{ needs.validate.outputs.runtime_profile }}
+      web_compression: ${{ needs.validate.outputs.web_compression }}
+      target_sha: ${{ needs.validate.outputs.target_sha }}
+      classifier_run_id: ${{ needs.validate.outputs.classifier_run_id }}
+      classifier_run_attempt: ${{ needs.validate.outputs.classifier_run_attempt }}
+      security_run_id: ${{ needs.validate.outputs.security_run_id }}
+      security_run_attempt: ${{ needs.validate.outputs.security_run_attempt }}
+      caller_kind: ${{ needs.validate.outputs.caller_kind }}
+      caller_run_id: ${{ needs.validate.outputs.caller_run_id }}
+      caller_run_attempt: ${{ needs.validate.outputs.caller_run_attempt }}
+      caller_workflow_ref: ${{ needs.validate.outputs.caller_workflow_ref }}
+      caller_workflow_sha: ${{ needs.validate.outputs.caller_workflow_sha }}
+      caller_sha: ${{ needs.validate.outputs.caller_sha }}
+      expected_called_workflow_file: ${{ needs.validate.outputs.expected_called_workflow_file }}
+      expected_called_workflow_ref: ${{ needs.validate.outputs.expected_called_workflow_ref }}
+      expected_called_workflow_sha: ${{ needs.validate.outputs.expected_called_workflow_sha }}
 
-          pages_dir, output_path = map(Path, sys.argv[1:])
-          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
-          rows = []
-          seen = set()
-          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
-              payload = json.loads(path.read_text(encoding="utf-8"))
-              page_rows = payload.get("workflow_runs") if isinstance(payload, dict) else None
-              if not isinstance(page_rows, list):
-                  raise SystemExit("deployment run page rows are malformed")
-              for row in page_rows:
-                  run_id = row.get("id")
-                  if type(run_id) is not int or run_id <= 0 or run_id in seen:
-                      raise SystemExit("deployment run rows contain duplicate or malformed IDs")
-                  seen.add(run_id)
-                  rows.append(row)
-          if len(rows) != expected_total:
-              raise SystemExit("deployment run pagination is incomplete")
-          output_path.write_text(json.dumps({"total_count": expected_total, "workflow_runs": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-          PY
-          }
-          fetch_deployment_runs "$deployment_dir/runs.json"
-          fetch_deployment_jobs() {
-            local run_id="$1" attempt="$2" output_path="$3" page=1 count page_path
-            local pages_dir="$deployment_dir/job-pages-$run_id-$attempt"
-            install -d -m 700 "$pages_dir"
-            while :; do
-              page_path="$pages_dir/page-${page}.json"
-              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
-                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/$run_id/attempts/$attempt/jobs?per_page=100&page=${page}" \
-                --output "$page_path"
-              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if not isinstance(payload, dict) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 99999:
-              raise SystemExit("deployment job pagination response is malformed")
-          rows = payload.get("jobs")
-          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
-              raise SystemExit("deployment job page rows are malformed")
-          ids = []
-          for row in rows:
-              if type(row.get("id")) is not int or row["id"] <= 0:
-                  raise SystemExit("deployment job ID is malformed")
-              ids.append(row["id"])
-          if len(ids) != len(set(ids)):
-              raise SystemExit("deployment job page contains duplicate IDs")
-          marker = Path(sys.argv[2])
-          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
-              raise SystemExit("deployment job total_count changed during pagination")
-          marker.write_text(str(payload["total_count"]), encoding="ascii")
-          print(len(rows))
-          PY
-              )"
-              if (( count < 100 )); then
-                break
-              fi
-              ((page += 1))
-              (( page <= 1000 )) || { echo "deployment job pagination exceeded its bound" >&2; exit 1; }
-            done
-            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          pages_dir, output_path = map(Path, sys.argv[1:])
-          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
-          rows = []
-          seen = set()
-          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
-              payload = json.loads(path.read_text(encoding="utf-8"))
-              page_rows = payload.get("jobs") if isinstance(payload, dict) else None
-              if not isinstance(page_rows, list):
-                  raise SystemExit("deployment job page rows are malformed")
-              for row in page_rows:
-                  job_id = row.get("id")
-                  if type(job_id) is not int or job_id <= 0 or job_id in seen:
-                      raise SystemExit("deployment job rows contain duplicate or malformed IDs")
-                  seen.add(job_id)
-                  rows.append(row)
-          if len(rows) != expected_total:
-              raise SystemExit("deployment job pagination is incomplete")
-          output_path.write_text(json.dumps({"total_count": expected_total, "jobs": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-          PY
-          }
-          readarray -t deployment_candidates < <(
-            /usr/bin/python3 - "$deployment_dir/workflow.json" "$deployment_dir/runs.json" <<'PY'
-          import json
-          from pathlib import Path
-          import re
-          import sys
-
-          workflow, payload = (
-              json.loads(Path(path).read_text(encoding="utf-8"))
-              for path in sys.argv[1:]
-          )
-          if not isinstance(workflow, dict) or not isinstance(payload, dict):
-              raise SystemExit("production deploy workflow response is malformed")
-          runs = payload.get("workflow_runs")
-          if not isinstance(runs, list):
-              raise SystemExit("production deploy run response is malformed")
-          # Preserve API order. Authorization is performed by the shared
-          # validator for every candidate; no lexicographic or guessed
-          # "latest" run is allowed to suppress a dispatch.
-          seen_runs = set()
-          for run in runs:
-              if not isinstance(run, dict):
-                  raise SystemExit("production deploy run row is malformed")
-              run_id = run.get("id")
-              attempt = run.get("run_attempt")
-              if (
-                  type(run_id) is int
-                  and type(attempt) is int
-                  and re.fullmatch(r"[1-9][0-9]{0,31}", str(run_id))
-                  and re.fullmatch(r"[1-9][0-9]{0,31}", str(attempt))
-              ):
-                  if run_id in seen_runs:
-                      raise SystemExit("production deploy run rows contain duplicate IDs")
-                  seen_runs.add(run_id)
-                  print(f"{run_id}\t{attempt}")
-              else:
-                  raise SystemExit("production deploy run identity is malformed")
-          PY
-          )
-          for candidate in "${deployment_candidates[@]}"; do
-            IFS=$'\t' read -r deployment_run_id deployment_attempt <<< "$candidate"
-            curl --fail-with-body --silent --show-error \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${deployment_run_id}" \
-              --output "$deployment_dir/run.json"
-            fetch_deployment_jobs "$deployment_run_id" "$deployment_attempt" "$deployment_dir/jobs.json"
-            fetch_statuses "$deployment_dir/statuses-$deployment_run_id-$deployment_attempt.json"
-            if env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" deployment \
-              --workflow "$deployment_dir/workflow.json" \
-              --run "$deployment_dir/run.json" \
-              --jobs "$deployment_dir/jobs.json" \
-              --status "$deployment_dir/statuses-$deployment_run_id-$deployment_attempt.json" \
-              --expected-run-id "$deployment_run_id" \
-              --expected-attempt "$deployment_attempt" \
-              --expected-target-sha "$TARGET_SHA" \
-              > "$deployment_dir/validated-marker.json"
-            then
-              echo "Production already has an authenticated successful deploy for this exact SHA/run attempt; nothing to dispatch."
-              echo "deploy=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-
-          echo "deploy=true" >> "$GITHUB_OUTPUT"
-
-      - name: Dispatch production deployment
-        if: ${{ steps.gate.outputs.deploy == 'true' }}
+  # A reusable-workflow call is a real job: failure and cancellation are
+  # visible here and must make the enclosing auto-deploy workflow fail too.
+  final:
+    name: Auto-deploy result
+    needs:
+      - validate
+      - deploy
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VALIDATE_RESULT: ${{ needs.validate.result }}
+      DEPLOY_RESULT: ${{ needs.deploy.result }}
+      SHOULD_DEPLOY: ${{ needs.validate.outputs.deploy }}
+      TARGET_SHA: ${{ needs.validate.outputs.target_sha }}
+      SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+      ROUTE_CLASS: ${{ needs.validate.outputs.route_class }}
+      ROUTE_REASON: ${{ needs.validate.outputs.route_reason }}
+    steps:
+      - name: Propagate native deployment result
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          branch_json="$(
-            curl --fail-with-body --silent --show-error \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev"
-          )"
-          dev_sha="$(
-            printf '%s' "$branch_json" | /usr/bin/python3 -c '
-          import json
-          import sys
-          print(json.load(sys.stdin)["commit"]["sha"])
-          '
-          )"
-          test "$dev_sha" = "$TARGET_SHA" || {
-            echo "Refusing stale dispatch: dev moved from $TARGET_SHA to $dev_sha." >&2
-            exit 1
-          }
-
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches" \
-            --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" <<'PY'
-          import json
-          import sys
-          # Keep the reviewed default profile and compression contract explicit:
-          # "runtime_profile":"ready-vote-static-8" and "web_compression":"enabled".
-          print(json.dumps({
-              "ref": "dev",
-              "inputs": {
-                  "mode": "deploy",
-                  "runtime_profile": "ready-vote-static-8",
-                  "web_compression": "enabled",
-                  "classifier_run_id": sys.argv[1],
-                  "classifier_run_attempt": sys.argv[2],
-              },
-          }))
-          PY
-            )"
-
-      - name: Auto-deploy summary
-        if: ${{ always() }}
-        shell: bash
-        env:
-          SHOULD_DEPLOY: ${{ steps.gate.outputs.deploy }}
-          SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
-          ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
-          ROUTE_REASON: ${{ steps.route.outputs.route_reason }}
-        run: |
           {
             echo "### Platform production auto-deploy"
             echo
             echo "- Tested commit: \`$TARGET_SHA\`"
             echo "- Security/build run: $SOURCE_RUN_URL"
             echo "- Classifier route: \`$ROUTE_CLASS\` ($ROUTE_REASON)"
-            if [[ "$SHOULD_DEPLOY" == "true" ]]; then
-              echo "- Result: production deployment dispatched"
-            else
-              echo "- Result: no deployment required"
-            fi
           } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VALIDATE_RESULT" == "cancelled" || "$DEPLOY_RESULT" == "cancelled" ]]; then
+            echo "- Result: cancelled; release authority remains recovery-visible" >> "$GITHUB_STEP_SUMMARY"
+            echo "Auto-deploy was cancelled; no green release result is possible." >&2
+            exit 1
+          fi
+          if [[ "$VALIDATE_RESULT" != "success" ]]; then
+            echo "Exact security/classifier gate did not succeed: $VALIDATE_RESULT" >&2
+            exit 1
+          fi
+          if [[ "$SHOULD_DEPLOY" == "true" ]]; then
+            if [[ "$DEPLOY_RESULT" != "success" ]]; then
+              echo "- Result: native production deployment $DEPLOY_RESULT" >> "$GITHUB_STEP_SUMMARY"
+              echo "Native production deployment did not succeed: $DEPLOY_RESULT" >&2
+              exit 1
+            fi
+            echo "- Result: production deployment completed successfully" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$SHOULD_DEPLOY" == "false" && "$DEPLOY_RESULT" == "skipped" ]]; then
+            echo "- Result: no deployment required" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Unexpected auto-deploy result: gate=$SHOULD_DEPLOY called=$DEPLOY_RESULT" >&2
+            exit 1
+          fi

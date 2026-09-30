@@ -93,6 +93,14 @@ secret-scope and provider-entitlement checks have evidence.
   activation remains behind its restore-drill gate.
 - Post-deploy patch translation is reported as a controlled warm-up with an
   explicit OpenAI cache-miss call budget, not read-only QA.
+- Downstream QA rejects workflow-head-SHA and display-name-only authority. It
+  requires the closed single-member receipt with matching authenticated
+  artifact/content digests, complete paginated snapshots (stable counts,
+  cardinality and unique IDs/names), exact caller/called refs and the
+  bot-authored deployment attempt marker. The receipt target SHA, not the
+  triggering workflow envelope, feeds statuses and remote mutation guards;
+  preflight and no-deploy routes cannot start QA, and cancelled runs have a
+  bounded terminal status finalizer.
 - The production workflow builds and attests the immutable release and
   artifact-bound wheelhouse in CI, publishes its digest, and sends only that
   digest-verified artifact to the VPS. The VPS does not resolve dependencies or

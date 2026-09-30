@@ -45,7 +45,9 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertNotIn("current/tools/platform_workflow_remote_dispatch.py", jobs["preflight"])
         self.assertIn("inputs.mode == 'deploy' || inputs.mode == 'preflight'", jobs["build-host-tools"])
         self.assertIn("inputs.mode == 'deploy' || inputs.mode == 'preflight'", jobs["host-capability-preflight"])
-        self.assertIn("needs:\n      - validate-dispatch\n      - build-release", source)
+        self.assertIn("      - validate-dispatch\n", jobs["production"])
+        self.assertIn("      - build-release\n", jobs["production"])
+        self.assertIn("      - validate-security-provenance\n", jobs["production"])
         self.assertIn("needs.build-release.result == 'success'", jobs["production"])
         self.assertIn("path: trusted-classifier", jobs["production"])
         self.assertNotIn("ref: ${{ env.TARGET_SHA }}", jobs["production"])
@@ -192,6 +194,48 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertIn("sha256sum -c", deploy)
         self.assertIn("classifier-manifest.json", deploy)
         self.assertIn("digest", deploy)
+
+    def test_host_tools_candidate_code_is_before_secret_boundary(self) -> None:
+        source = _workflow("platform-production-deploy.yml")
+        host_job = _job_blocks(source)["host-capability-preflight"]
+        secret_at = host_job.index("PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}")
+        # A hostile candidate may replace every file in the downloaded bundle;
+        # no bundle executable or input guard may run after the secret-bearing
+        # step starts.  The only post-boundary command is the fixed remote
+        # dispatcher path validated by the closed handoff.
+        for marker in (
+            "platform_workflow_input_guard.py",
+            "platform_host_tools_bundle.py",
+            "$inner_root/",
+        ):
+            self.assertNotIn(marker, host_job[secret_at:])
+        self.assertIn("This parser is fixed workflow code", host_job[secret_at:])
+        self.assertIn("HOST_TOOLS_DISPATCHER", host_job[secret_at:])
+
+    def test_green_release_requires_closed_receipt_write_and_upload(self) -> None:
+        source = _workflow("platform-production-deploy.yml")
+        finalizer = _job_blocks(source)["release-finalizer"]
+        self.assertIn("id: create-receipt-content", finalizer)
+        self.assertIn("id: create-closed-receipt", finalizer)
+        self.assertIn("id: upload-closed-receipt", finalizer)
+        for marker in (
+            "steps.create-receipt-content.outcome == 'success'",
+            "steps.upload-receipt-content.outcome == 'success'",
+            "steps.receipt-metadata.outcome == 'success'",
+            "steps.create-closed-receipt.outcome == 'success'",
+            "steps.upload-closed-receipt.outcome == 'success'",
+            "steps.upload-closed-receipt.outputs.artifact-id != ''",
+            "steps.upload-closed-receipt.outputs.artifact-digest != ''",
+        ):
+            self.assertIn(marker, finalizer)
+        self.assertIn("repository: ${{ steps.called-workflow-identity.outputs.repository }}", finalizer)
+        self.assertIn("ref: ${{ steps.called-workflow-identity.outputs.sha }}", finalizer)
+        self.assertIn("CALLED_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}", finalizer)
+        self.assertNotIn(
+            "CALLED_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}\n",
+            finalizer.split("    steps:", 1)[0],
+        )
+        self.assertIn('test "$(git rev-parse HEAD)" = "$EXPECTED_CALLED_WORKFLOW_SHA"', finalizer)
 
 
 if __name__ == "__main__":

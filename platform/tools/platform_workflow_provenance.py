@@ -20,10 +20,15 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
+import tempfile
+import time
 from typing import Any
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from urllib.parse import urlsplit
 
 
@@ -36,10 +41,19 @@ DEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-deploy.yml"
 DEPLOY_WORKFLOW_NAME = "Platform production deploy"
 DEPLOY_JOB_NAME = "Deploy production"
 PREFLIGHT_JOB_NAME = "Production preflight"
+# A reusable workflow inherits the caller's event context.  The normal
+# auto-deploy caller is therefore observed as ``workflow_run`` inside the
+# called workflow and in its API run metadata; the operator fallback remains
+# ``workflow_dispatch``.  No other event may authorize a deployment marker or
+# preflight no-op.
+DEPLOYMENT_EVENTS = ("workflow_run", "workflow_dispatch")
 SECURITY_STATUS_CONTEXT = "platform-security-build"
 DEPLOY_STATUS_CONTEXT = "platform-production-deploy"
 DEPLOY_SUCCESS_DESCRIPTION = "Production deployment and live smoke passed"
 SECURITY_SUCCESS_DESCRIPTION = "Platform security and build passed"
+AUTO_WORKFLOW_PATH = ".github/workflows/platform-production-autodeploy.yml"
+AUTO_WORKFLOW_NAME = "Platform production auto-deploy"
+AUTO_FINAL_JOB_NAME = "Auto-deploy result"
 ACTIONS_BOT_LOGIN = "github-actions[bot]"
 ACTIONS_BOT_TYPE = "Bot"
 # The public GitHub Actions bot account is stable and lets consumers reject a
@@ -54,6 +68,24 @@ UTC_STATUS_TIMESTAMP_RE = re.compile(
 )
 STATUS_MAX_AGE = timedelta(days=30)
 STATUS_MAX_FUTURE_SKEW = timedelta(0)
+_WORKFLOW_LOCATOR_RE = re.compile(r"^[A-Za-z0-9._/-]{1,256}$")
+_WORKFLOW_PATH_RE = re.compile(r"^\.github/workflows/[A-Za-z0-9._/-]+\.(?:yml|yaml)$")
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Keep the bearer-token API request from following a signed ZIP URL."""
+
+    def redirect_request(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
+
+
+def _open_no_redirect(request: Request, *, timeout: int):
+    """Open one URL without installing urllib's redirect handler."""
+
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
 
 
 class ProvenanceError(ValueError):
@@ -203,7 +235,7 @@ def canonical_attempt_url(
     return f"{base}/attempts/{expected_attempt}"
 
 
-def validate_workflow_run(
+def validate_workflow_run_identity(
     workflow: Mapping[str, Any],
     run: Mapping[str, Any],
     *,
@@ -216,7 +248,12 @@ def validate_workflow_run(
     expected_name: str,
     server_url: str = GITHUB_SERVER_URL,
 ) -> str:
-    """Validate workflow metadata and return its exact attempt URL."""
+    """Validate immutable workflow identity and return its attempt URL.
+
+    This deliberately does not inspect ``status`` or ``conclusion``.  The
+    callers use it before evaluating status/conclusion, so an API identity
+    mismatch cannot be converted into a successful provenance result.
+    """
 
     workflow_id = _positive_int(workflow.get("id"), "workflow id")
     if workflow.get("path") != expected_path:
@@ -245,8 +282,6 @@ def validate_workflow_run(
         "event": expected_event,
         "head_branch": expected_branch,
         "head_sha": expected_target_sha,
-        "status": "completed",
-        "conclusion": "success",
     }
     for field, value in expected.items():
         if run.get(field) != value:
@@ -257,6 +292,40 @@ def validate_workflow_run(
         expected_attempt=expected_attempt,
         server_url=server_url,
     )
+
+
+def validate_workflow_run(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    expected_event: str,
+    expected_branch: str,
+    expected_path: str,
+    expected_name: str,
+    server_url: str = GITHUB_SERVER_URL,
+) -> str:
+    """Validate workflow metadata and a completed successful run."""
+
+    attempt_url = validate_workflow_run_identity(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=expected_target_sha,
+        expected_event=expected_event,
+        expected_branch=expected_branch,
+        expected_path=expected_path,
+        expected_name=expected_name,
+        server_url=server_url,
+    )
+    expected = {"status": "completed", "conclusion": "success"}
+    for field, value in expected.items():
+        if run.get(field) != value:
+            raise _fail(f"run {field} is not the expected value")
+    return attempt_url
 
 
 def latest_context_status(
@@ -405,17 +474,496 @@ def _validate_job_rows(jobs: Sequence[Mapping[str, Any]]) -> None:
         raise _fail("job row is malformed")
     seen_ids: set[int] = set()
     for job in jobs:
-        # GitHub always supplies an id.  Missing ids are as unsafe as string
-        # or boolean ids because they make a row impossible to bind to the
-        # exact API object that was snapshotted.
-        if "id" not in job:
-            raise _fail("job id is missing")
+        unknown = set(job) - _DOCUMENTED_JOB_FIELDS
+        if unknown:
+            raise _fail("job row contains undocumented fields")
+        missing = _REQUIRED_JOB_FIELDS - set(job)
+        if missing:
+            raise _fail("job row is missing documented identity fields")
         job_id = _positive_int(job.get("id"), "job id")
         if job_id in seen_ids:
             raise _fail("job row id is ambiguous")
         seen_ids.add(job_id)
         if not isinstance(job.get("name"), str):
             raise _fail("job name is malformed")
+        for field in ("run_id", "run_attempt"):
+            _run_id(job[field], f"job {field}")
+        for field in ("runner_id", "runner_group_id"):
+            if field in job and job[field] is not None and (
+                isinstance(job[field], bool)
+                or not isinstance(job[field], int)
+                or job[field] <= 0
+            ):
+                raise _fail(f"job {field} is malformed")
+        if not isinstance(job["head_sha"], str) or SHA_RE.fullmatch(job["head_sha"]) is None:
+            raise _fail("job head SHA is malformed")
+        if not isinstance(job["status"], str):
+            raise _fail("job status is malformed")
+        if job["conclusion"] is not None and not isinstance(job["conclusion"], str):
+            raise _fail("job conclusion is malformed")
+        for field in (
+            "node_id",
+            "url",
+            "html_url",
+            "run_url",
+            "workflow_run_url",
+            "check_run_url",
+            "created_at",
+            "started_at",
+            "completed_at",
+            "head_branch",
+            "workflow_name",
+        ):
+            if field in job and job[field] is not None and not isinstance(job[field], str):
+                raise _fail(f"job {field} is malformed")
+        for field in ("runner_name", "runner_group_name"):
+            if field in job and job[field] is not None and not isinstance(job[field], str):
+                raise _fail(f"job {field} is malformed")
+        if "labels" in job:
+            labels = job["labels"]
+            if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
+                raise _fail("job labels are malformed")
+        if "steps" in job:
+            steps = job["steps"]
+            if not isinstance(steps, list) or any(not isinstance(step, Mapping) for step in steps):
+                raise _fail("job steps are malformed")
+
+
+_DOCUMENTED_JOB_FIELDS = frozenset(
+    {
+        "id",
+        "run_id",
+        "run_attempt",
+        "node_id",
+        "head_sha",
+        "head_branch",
+        "url",
+        "html_url",
+        "run_url",
+        "workflow_run_url",
+        "status",
+        "conclusion",
+        "created_at",
+        "started_at",
+        "completed_at",
+        "name",
+        "workflow_name",
+        "check_run_url",
+        "steps",
+        "labels",
+        "runner_id",
+        "runner_name",
+        "runner_group_id",
+        "runner_group_name",
+    }
+)
+
+_REQUIRED_JOB_FIELDS = frozenset(
+    {"id", "run_id", "run_attempt", "head_sha", "name", "status", "conclusion"}
+)
+
+
+def _job_state(
+    job: Mapping[str, Any],
+    *,
+    expected_name: str,
+    expected_run_id: int | None = None,
+    expected_attempt: int | None = None,
+    expected_head_sha: str | None = None,
+    allow_reusable_prefix: bool = False,
+) -> None:
+    if not _job_name_matches(job, expected_name, allow_reusable_prefix=allow_reusable_prefix):
+        raise _fail("job identity is not canonical")
+    # These documented jobs API fields are required by the downstream
+    # boundary and bind this row to the exact run attempt.  A job name alone
+    # is not an identity and must never authorize a release.
+    if expected_run_id is not None and job.get("run_id") != expected_run_id:
+        raise _fail("job run id does not match the requested run")
+    if expected_attempt is not None and job.get("run_attempt") != expected_attempt:
+        raise _fail("job run attempt does not match the requested attempt")
+    if expected_head_sha is not None and job.get("head_sha") != expected_head_sha:
+        raise _fail("job head SHA does not match the requested run")
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        raise _fail("required job did not complete successfully")
+
+
+def _job_name_matches(
+    job: Mapping[str, Any],
+    expected_name: str,
+    *,
+    allow_reusable_prefix: bool = False,
+) -> bool:
+    name = job.get("name")
+    if name == expected_name:
+        return True
+    return bool(
+        allow_reusable_prefix
+        and isinstance(name, str)
+        and name.endswith(f" / {expected_name}")
+        and name != f" / {expected_name}"
+    )
+
+
+def _bind_job_identity(
+    job: Mapping[str, Any],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_head_sha: str,
+) -> None:
+    """Validate documented job bindings without requiring a result."""
+
+    if job.get("run_id") != expected_run_id:
+        raise _fail("job run id does not match the requested run")
+    if job.get("run_attempt") != expected_attempt:
+        raise _fail("job run attempt does not match the requested attempt")
+    if job.get("head_sha") != expected_head_sha:
+        raise _fail("job head SHA does not match the requested run")
+
+
+def validate_referenced_workflows(
+    run: Mapping[str, Any],
+    *,
+    expected_workflow_ref: str,
+    expected_workflow_sha: str,
+    expected_workflow_path: str = DEPLOY_WORKFLOW_PATH,
+) -> Mapping[str, Any]:
+    """Bind a reusable call to the API run's documented references.
+
+    The jobs REST resource does not expose workflow repository/path/ref/SHA.
+    Those values are therefore taken only from the workflow-run
+    ``referenced_workflows`` records, whose documented fields are ``path``,
+    ``ref`` and ``sha``.  The SHA is the authoritative immutable identity;
+    the mutable branch ref is only the API locator and must never substitute
+    for the SHA.  Runtime receipt producers separately record the called
+    workflow context; the two records are compared by downstream consumers.
+    """
+
+    if not isinstance(expected_workflow_ref, str) or not expected_workflow_ref:
+        raise _fail("called workflow ref is malformed")
+    if not isinstance(expected_workflow_sha, str) or SHA_RE.fullmatch(expected_workflow_sha) is None:
+        raise _fail("called workflow SHA is malformed")
+    expected_path, _expected_locator = _parse_workflow_ref(expected_workflow_ref)
+    if expected_path != expected_workflow_path:
+        raise _fail("called workflow path is not canonical")
+    references = run.get("referenced_workflows")
+    if not isinstance(references, Sequence) or isinstance(references, (str, bytes)):
+        raise _fail("workflow-run referenced_workflows is missing")
+    matches: list[Mapping[str, Any]] = []
+    for reference in references:
+        if not isinstance(reference, Mapping):
+            raise _fail("workflow-run referenced workflow row is malformed")
+        if set(reference) not in ({"path", "sha"}, {"path", "ref", "sha"}):
+            raise _fail("workflow-run referenced workflow fields are undocumented")
+        reference_path = _normalise_referenced_workflow_path(reference.get("path"))
+        if "ref" in reference and reference.get("ref") is not None:
+            if not isinstance(reference.get("ref"), str) or _WORKFLOW_LOCATOR_RE.fullmatch(reference["ref"]) is None:
+                raise _fail("workflow-run referenced workflow ref is malformed")
+        if SHA_RE.fullmatch(str(reference.get("sha"))) is None:
+            raise _fail("workflow-run referenced workflow SHA is malformed")
+        if (
+            reference_path == expected_workflow_path
+            and reference.get("sha") == expected_workflow_sha
+        ):
+            matches.append(reference)
+    if len(matches) != 1:
+        raise _fail("exact called workflow reference is missing or ambiguous")
+    return matches[0]
+
+
+def _parse_workflow_ref(value: str) -> tuple[str, str]:
+    """Parse the canonical owner/repository/workflow path locator form."""
+
+    owner_path, separator, locator = value.rpartition("@")
+    prefix = f"{REPOSITORY_FULL_NAME}/"
+    if not separator or not owner_path.startswith(prefix) or not locator:
+        raise _fail("called workflow ref is not canonical")
+    path = owner_path[len(prefix):]
+    if _WORKFLOW_PATH_RE.fullmatch(path) is None or _WORKFLOW_LOCATOR_RE.fullmatch(locator) is None:
+        raise _fail("called workflow ref is not canonical")
+    if "//" in path or ".." in path or ".." in locator:
+        raise _fail("called workflow ref is not canonical")
+    return path, locator
+
+
+def _normalise_referenced_workflow_path(value: object) -> str:
+    if not isinstance(value, str):
+        raise _fail("workflow-run referenced workflow path is malformed")
+    prefix = f"{REPOSITORY_FULL_NAME}/"
+    path = value[len(prefix):] if value.startswith(prefix) else value
+    if _WORKFLOW_PATH_RE.fullmatch(path) is None or ".." in path:
+        raise _fail("workflow-run referenced workflow path is malformed")
+    return path
+
+
+def validate_auto_release_jobs(
+    jobs: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int | None = None,
+    expected_attempt: int | None = None,
+    expected_head_sha: str | None = None,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Validate the native reusable call and caller final barrier.
+
+    The jobs resource is used only for documented job identity/result fields.
+    Reusable workflow identity is validated separately from the run's
+    ``referenced_workflows`` API field.
+    """
+
+    _validate_job_rows(jobs)
+    call_jobs = [
+        job for job in jobs
+        if _job_name_matches(job, DEPLOY_JOB_NAME, allow_reusable_prefix=True)
+    ]
+    final_jobs = [job for job in jobs if job.get("name") == AUTO_FINAL_JOB_NAME]
+    if len(call_jobs) != 1 or len(final_jobs) != 1:
+        raise _fail("called deploy or final barrier job is missing or ambiguous")
+    call_job = call_jobs[0]
+    final_job = final_jobs[0]
+    _job_state(
+        call_job,
+        expected_name=DEPLOY_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_head_sha,
+        allow_reusable_prefix=True,
+    )
+    # The final barrier is owned by the caller workflow.  Bind it by exact
+    # name/result while the reusable job above is bound by its called-job
+    # name and documented run identity fields.
+    _job_state(
+        final_job,
+        expected_name=AUTO_FINAL_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_head_sha,
+    )
+    return call_job, final_job
+
+
+def validate_auto_noop_run(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    expected_run_url: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Accept only a successful, non-deployable auto run as a closed no-op."""
+
+    _validate_job_rows(jobs)
+    _validate_status_rows(statuses)
+    validate_workflow_run(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=expected_target_sha,
+        expected_event="workflow_run",
+        expected_branch="dev",
+        expected_path=AUTO_WORKFLOW_PATH,
+        expected_name=AUTO_WORKFLOW_NAME,
+    )
+    if expected_run_url is not None and run.get("html_url") != expected_run_url:
+        raise _fail("auto-deploy caller run URL does not match the event")
+    call_jobs = [
+        job for job in jobs
+        if _job_name_matches(job, DEPLOY_JOB_NAME, allow_reusable_prefix=True)
+    ]
+    final_jobs = [job for job in jobs if job.get("name") == AUTO_FINAL_JOB_NAME]
+    if len(call_jobs) != 1 or len(final_jobs) != 1:
+        raise _fail("auto no-op job set is missing or ambiguous")
+    _bind_job_identity(
+        call_jobs[0],
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
+    if (call_jobs[0].get("status"), call_jobs[0].get("conclusion")) != ("completed", "skipped"):
+        raise _fail("auto no-op called deploy job is not skipped")
+    _job_state(
+        final_jobs[0],
+        expected_name=AUTO_FINAL_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise _fail("auto no-op caller run did not succeed")
+    validate_status_collection(
+        statuses,
+        context=DEPLOY_STATUS_CONTEXT,
+        now=now,
+    )
+    attempt_url = canonical_attempt_url(
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+    )
+    if any(row.get("context") == DEPLOY_STATUS_CONTEXT and row.get("target_url") == attempt_url for row in statuses):
+        raise _fail("auto no-op has a deployment marker")
+
+
+def validate_auto_release_run(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    expected_called_workflow_ref: str,
+    expected_called_workflow_sha: str,
+    expected_run_url: str | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Validate an auto-deploy caller run without trusting its ``head_sha``.
+
+    The target SHA is supplied by a separately validated closed receipt.  The
+    caller run's own SHA is only used to bind its workflow identity and is
+    never treated as the deployment target.
+    """
+
+    _validate_job_rows(jobs)
+    _validate_status_rows(statuses)
+    attempt_url = validate_workflow_run(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        # The caller run and its jobs are bound to the caller's documented
+        # head SHA.  The receipt target is validated separately and is the
+        # only SHA returned to downstream consumers.
+        expected_target_sha=run.get("head_sha"),
+        expected_event="workflow_run",
+        expected_branch="dev",
+        expected_path=AUTO_WORKFLOW_PATH,
+        expected_name=AUTO_WORKFLOW_NAME,
+    )
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise _fail("auto-deploy caller run did not succeed")
+    if expected_run_url is not None and run.get("html_url") != expected_run_url:
+        raise _fail("auto-deploy caller run URL does not match the event")
+    validate_referenced_workflows(
+        run,
+        expected_workflow_ref=expected_called_workflow_ref,
+        expected_workflow_sha=expected_called_workflow_sha,
+    )
+    validate_auto_release_jobs(
+        jobs,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=run.get("head_sha"),
+    )
+    marker = latest_context_status(
+        statuses,
+        context=DEPLOY_STATUS_CONTEXT,
+        now=now,
+    )
+    validate_actions_bot_status(
+        marker,
+        expected_context=DEPLOY_STATUS_CONTEXT,
+        expected_state="success",
+        expected_target_url=attempt_url,
+        expected_description=DEPLOY_SUCCESS_DESCRIPTION,
+    )
+    # A closed receipt separately binds the target SHA.  Keep this argument in
+    # the contract so consumers cannot accidentally omit it while assembling
+    # their exact comparison.
+    if not isinstance(expected_target_sha, str) or SHA_RE.fullmatch(expected_target_sha) is None:
+        raise _fail("receipt target SHA is malformed")
+    return attempt_url
+
+
+def validate_manual_deployment_run(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    expected_run_url: str | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Classify a manual production deploy or its read-only preflight.
+
+    Manual preflight is an authenticated, successful no-op and has no release
+    receipt or deploy status marker.  A manual deploy must have the successful
+    deployment job, marker and closed receipt supplied by the consumer.
+    """
+
+    _validate_job_rows(jobs)
+    _validate_status_rows(statuses)
+    validate_workflow_run_identity(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=expected_target_sha,
+        expected_event="workflow_dispatch",
+        expected_branch="dev",
+        expected_path=DEPLOY_WORKFLOW_PATH,
+        expected_name=DEPLOY_WORKFLOW_NAME,
+    )
+    if expected_run_url is not None and run.get("html_url") != expected_run_url:
+        raise _fail("manual production run URL does not match the event")
+    deploy_jobs = [job for job in jobs if job.get("name") == DEPLOY_JOB_NAME]
+    preflight_jobs = [job for job in jobs if job.get("name") == PREFLIGHT_JOB_NAME]
+    if len(deploy_jobs) != 1 or len(preflight_jobs) != 1:
+        raise _fail("manual production job set is missing or ambiguous")
+    for job in (deploy_jobs[0], preflight_jobs[0]):
+        _bind_job_identity(
+            job,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_head_sha=expected_target_sha,
+        )
+    deploy_state = (deploy_jobs[0].get("status"), deploy_jobs[0].get("conclusion"))
+    preflight_state = (preflight_jobs[0].get("status"), preflight_jobs[0].get("conclusion"))
+    if deploy_state == ("completed", "success"):
+        _job_state(
+            deploy_jobs[0],
+            expected_name=DEPLOY_JOB_NAME,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_head_sha=expected_target_sha,
+        )
+        if run.get("status") != "completed" or run.get("conclusion") != "success":
+            raise _fail("manual deployment run did not succeed")
+        attempt_url = canonical_attempt_url(
+            run,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+        )
+        marker = latest_context_status(statuses, context=DEPLOY_STATUS_CONTEXT, now=now)
+        validate_actions_bot_status(
+            marker,
+            expected_context=DEPLOY_STATUS_CONTEXT,
+            expected_state="success",
+            expected_target_url=attempt_url,
+            expected_description=DEPLOY_SUCCESS_DESCRIPTION,
+        )
+        return True
+    if deploy_state != ("completed", "skipped") or preflight_state != ("completed", "success"):
+        raise _fail("manual production run is neither a successful deploy nor preflight")
+    _job_state(
+        preflight_jobs[0],
+        expected_name=PREFLIGHT_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise _fail("manual preflight run did not succeed")
+    validate_status_collection(statuses, context=DEPLOY_STATUS_CONTEXT, now=now)
+    return False
 
 
 def _validate_status_rows(statuses: Sequence[Mapping[str, Any]]) -> None:
@@ -522,15 +1070,28 @@ def validate_deployment_marker(
     expected_attempt: int,
     expected_target_sha: str,
     expected_run_url: str | None = None,
+    expected_event: str | None = None,
     server_url: str = GITHUB_SERVER_URL,
     now: datetime | None = None,
     max_age: timedelta = STATUS_MAX_AGE,
     max_future_skew: timedelta = STATUS_MAX_FUTURE_SKEW,
 ) -> str:
-    """Validate a successful deploy run and its exact bot-produced marker."""
+    """Validate a successful deploy run and its exact bot-produced marker.
+
+    ``workflow_run`` is the inherited native auto-deploy entrypoint and
+    ``workflow_dispatch`` is the guarded operator fallback.  When a caller
+    does not provide ``expected_event``, the run's event is still required to
+    be one of those two exact values; an explicit value additionally binds the
+    snapshot to that entrypoint.
+    """
 
     _validate_job_rows(jobs)
     _validate_status_rows(statuses)
+    actual_event = run.get("event")
+    if actual_event not in DEPLOYMENT_EVENTS:
+        raise _fail("deployment workflow event is not an allowed entrypoint")
+    if expected_event is not None and expected_event != actual_event:
+        raise _fail("deployment workflow event does not match the expected entrypoint")
 
     attempt_url = validate_workflow_run(
         workflow,
@@ -538,7 +1099,7 @@ def validate_deployment_marker(
         expected_run_id=expected_run_id,
         expected_attempt=expected_attempt,
         expected_target_sha=expected_target_sha,
-        expected_event="workflow_dispatch",
+        expected_event=actual_event,
         expected_branch="dev",
         expected_path=DEPLOY_WORKFLOW_PATH,
         expected_name=DEPLOY_WORKFLOW_NAME,
@@ -552,8 +1113,13 @@ def validate_deployment_marker(
     job = matching_jobs[0]
     if not isinstance(job, Mapping):
         raise _fail("Deploy production job metadata is malformed")
-    if job.get("status") != "completed" or job.get("conclusion") != "success":
-        raise _fail("Deploy production job did not complete successfully")
+    _job_state(
+        job,
+        expected_name=DEPLOY_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
     marker = latest_context_status(
         statuses,
         context=DEPLOY_STATUS_CONTEXT,
@@ -581,6 +1147,7 @@ def validate_deployment_event(
     expected_attempt: int,
     expected_target_sha: str,
     expected_run_url: str | None = None,
+    expected_event: str | None = None,
     server_url: str = GITHUB_SERVER_URL,
     now: datetime | None = None,
     max_age: timedelta = STATUS_MAX_AGE,
@@ -597,13 +1164,18 @@ def validate_deployment_event(
 
     _validate_job_rows(jobs)
     _validate_status_rows(statuses)
+    actual_event = run.get("event")
+    if actual_event not in DEPLOYMENT_EVENTS:
+        raise _fail("deployment workflow event is not an allowed entrypoint")
+    if expected_event is not None and expected_event != actual_event:
+        raise _fail("deployment workflow event does not match the expected entrypoint")
     attempt_url = validate_workflow_run(
         workflow,
         run,
         expected_run_id=expected_run_id,
         expected_attempt=expected_attempt,
         expected_target_sha=expected_target_sha,
-        expected_event="workflow_dispatch",
+        expected_event=actual_event,
         expected_branch="dev",
         expected_path=DEPLOY_WORKFLOW_PATH,
         expected_name=DEPLOY_WORKFLOW_NAME,
@@ -618,6 +1190,13 @@ def validate_deployment_event(
     deploy_job = matching_deploy_jobs[0]
     deploy_state = (deploy_job.get("status"), deploy_job.get("conclusion"))
     if deploy_state == ("completed", "success"):
+        _job_state(
+            deploy_job,
+            expected_name=DEPLOY_JOB_NAME,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_head_sha=expected_target_sha,
+        )
         marker = latest_context_status(
             statuses,
             context=DEPLOY_STATUS_CONTEXT,
@@ -647,6 +1226,13 @@ def validate_deployment_event(
         or preflight_job.get("conclusion") != "success"
     ):
         raise _fail("preflight job did not complete successfully")
+    _job_state(
+        preflight_job,
+        expected_name=PREFLIGHT_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
 
     # A preflight has no success marker, but a status response still has to be
     # complete and well-formed.  This rejects a malformed/future/tied marker
@@ -665,6 +1251,475 @@ def validate_deployment_event(
         ):
             raise _fail("preflight has a deployment marker")
     return False
+
+
+def validate_downstream_snapshot(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    receipt: Mapping[str, Any],
+    *,
+    mode: str,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_run_url: str,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Bind one downstream snapshot to the closed release receipt.
+
+    The receipt supplies the deployment target.  The triggering run SHA is
+    used only to authenticate the workflow-run envelope and never becomes the
+    QA target.  ``False`` is reserved for a valid auto non-deployable no-op;
+    manual preflight is also returned false and has no marker authority.
+    """
+
+    try:
+        from platform_release_receipt import validate_receipt
+    except ImportError:  # pragma: no cover - direct runner execution
+        from .platform_release_receipt import validate_receipt
+
+    validated_receipt = validate_receipt(
+        receipt,
+        expected_mode="deploy",
+        expected_status_url=expected_run_url + f"/attempts/{expected_attempt}",
+    )
+    target_sha = validated_receipt["target_sha"]
+    caller = validated_receipt["caller"]
+    called = validated_receipt["called"]
+    if caller.get("run_id") != str(expected_run_id) or caller.get("run_attempt") != str(expected_attempt):
+        raise _fail("receipt caller does not match the exact source attempt")
+    if called.get("run_id") != str(expected_run_id) or called.get("run_attempt") != str(expected_attempt):
+        raise _fail("receipt called run does not match the exact source attempt")
+    if mode == "auto":
+        if caller.get("event") != "workflow_run" or called.get("event") != "workflow_run":
+            raise _fail("auto receipt entrypoint is not workflow_run")
+        validate_auto_release_run(
+            workflow,
+            run,
+            jobs,
+            statuses,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_target_sha=target_sha,
+            expected_called_workflow_ref=called["workflow_ref"],
+            expected_called_workflow_sha=called["workflow_sha"],
+            expected_run_url=expected_run_url,
+            now=now,
+        )
+        return True, target_sha
+    if mode == "manual":
+        if caller.get("event") != "workflow_dispatch" or called.get("event") != "workflow_dispatch":
+            raise _fail("manual receipt entrypoint is not workflow_dispatch")
+        if not validate_manual_deployment_run(
+            workflow,
+            run,
+            jobs,
+            statuses,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_target_sha=target_sha,
+            expected_run_url=expected_run_url,
+            now=now,
+        ):
+            raise _fail("manual receipt is not a successful deployment")
+        return True, target_sha
+    raise _fail("downstream mode is not canonical")
+
+
+def _api_get(api_url: str, token: str, path: str) -> object:
+    if not isinstance(token, str) or not token:
+        raise _fail("GitHub API authorization is unavailable")
+    request = Request(
+        f"{api_url.rstrip('/')}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            data = response.read(8 * 1024 * 1024 + 1)
+    except Exception as exc:  # pragma: no cover - network boundary
+        raise _fail("GitHub API snapshot failed") from exc
+    if len(data) > 8 * 1024 * 1024:
+        raise _fail("GitHub API snapshot is oversized")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise _fail("GitHub API snapshot is malformed") from exc
+
+
+def _api_get_bytes(api_url: str, token: str, path: str) -> bytes:
+    if not isinstance(token, str) or not token:
+        raise _fail("GitHub API authorization is unavailable")
+    request = Request(
+        f"{api_url.rstrip('/')}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        response = _open_no_redirect(request, timeout=30)
+    except HTTPError as exc:
+        if exc.code != 302:
+            raise _fail("GitHub artifact download failed") from exc
+        location = exc.headers.get("Location") if exc.headers is not None else None
+    except Exception as exc:  # pragma: no cover - network boundary
+        raise _fail("GitHub artifact download failed") from exc
+    else:
+        try:
+            status = response.status
+            headers = getattr(response, "headers", None) or {}
+            location = headers.get("Location")
+        finally:
+            response.close()
+        if status != 302:
+            raise _fail("GitHub artifact download did not return the expected redirect")
+    redirect_url = _validate_artifact_redirect(location)
+    redirect_request = Request(redirect_url, headers={"Accept": "application/octet-stream"})
+    try:
+        with _open_no_redirect(redirect_request, timeout=30) as response:
+            if response.status != 200:
+                raise _fail("signed GitHub artifact URL did not return the artifact")
+            data = response.read(8 * 1024 * 1024 + 1)
+    except ProvenanceError:
+        raise
+    except Exception as exc:  # pragma: no cover - network boundary
+        raise _fail("GitHub artifact download failed") from exc
+    if len(data) > 8 * 1024 * 1024:
+        raise _fail("GitHub artifact is oversized")
+    return data
+
+
+def _validate_artifact_redirect(location: object) -> str:
+    """Accept exactly one HTTPS redirect to a GitHub signed-artifact host."""
+
+    if not isinstance(location, str) or len(location) > 4096:
+        raise _fail("GitHub artifact redirect is malformed")
+    try:
+        parsed = urlsplit(location)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise _fail("GitHub artifact redirect is malformed") from exc
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+        or not parsed.path
+        or not _is_allowed_artifact_host(hostname.lower())
+    ):
+        raise _fail("GitHub artifact redirect host or scheme is not trusted")
+    return location
+
+
+def _is_allowed_artifact_host(hostname: str) -> bool:
+    """Return whether hostname is a GitHub-supported signed artifact host."""
+
+    if hostname == "objects.githubusercontent.com":
+        return True
+    if hostname.endswith(".actions.githubusercontent.com"):
+        return hostname.count(".") >= 2 and all(
+            label and re.fullmatch(r"[a-z0-9-]+", label) for label in hostname.split(".")
+        )
+    if hostname.endswith(".blob.core.windows.net"):
+        return hostname.count(".") >= 4 and all(
+            label and re.fullmatch(r"[a-z0-9-]+", label) for label in hostname.split(".")
+        )
+    return False
+
+
+def _api_paginate_with_total(
+    api_url: str,
+    token: str,
+    path: str,
+    key: str | None,
+) -> tuple[list[Mapping[str, Any]], int | None]:
+    """Read a bounded, complete API collection and its advertised count.
+
+    Jobs and artifacts are object-list endpoints with ``total_count``.  A
+    short page alone is not proof that the collection was complete: a mutable
+    or truncated response can otherwise hide a required row.  Require one
+    stable count and exact accumulated cardinality.  Statuses are the one
+    GitHub endpoint consumed here that returns a bare list, so it remains
+    bounded by page size and the adjacent-snapshot comparison.
+    """
+
+    rows: list[Mapping[str, Any]] = []
+    seen_ids: set[int] = set()
+    seen_names: set[str] = set()
+    expected_total: int | None = None
+    for page in range(1, 1001):
+        payload = _api_get(api_url, token, f"{path}?per_page=100&page={page}")
+        if key is None:
+            page_rows = payload
+        else:
+            response = _as_mapping(payload, "paginated response")
+            total_count = response.get("total_count")
+            if (
+                isinstance(total_count, bool)
+                or not isinstance(total_count, int)
+                or total_count < 0
+                or total_count > 100_000
+            ):
+                raise _fail("paginated response count is malformed")
+            if expected_total is None:
+                expected_total = total_count
+            elif total_count != expected_total:
+                raise _fail("paginated response count changed")
+            page_rows = response.get(key)
+        if not isinstance(page_rows, list) or len(page_rows) > 100 or any(not isinstance(row, Mapping) for row in page_rows):
+            raise _fail("paginated response is malformed")
+        if expected_total is not None and len(rows) + len(page_rows) > expected_total:
+            raise _fail("paginated response cardinality exceeds total count")
+        for row in page_rows:
+            row_id = row.get("id")
+            if type(row_id) is not int or row_id <= 0 or row_id in seen_ids:
+                raise _fail("paginated rows are duplicate or malformed")
+            seen_ids.add(row_id)
+            if key in {"jobs", "artifacts"}:
+                name = row.get("name")
+                if not isinstance(name, str) or not name or name in seen_names:
+                    raise _fail("paginated row names are duplicate or malformed")
+                seen_names.add(name)
+            rows.append(row)
+        if expected_total is not None and len(rows) == expected_total:
+            return rows, expected_total
+        if len(page_rows) < 100:
+            if expected_total is not None and len(rows) != expected_total:
+                raise _fail("paginated response is incomplete")
+            return rows, expected_total
+    raise _fail("pagination exceeded its bound")
+
+
+def _api_paginate(api_url: str, token: str, path: str, key: str | None) -> list[Mapping[str, Any]]:
+    """Compatibility wrapper returning a complete collection without count."""
+
+    rows, _ = _api_paginate_with_total(api_url, token, path, key)
+    return rows
+
+
+def _stable_api_snapshot(api_url: str, token: str, path: str, key: str | None) -> list[Mapping[str, Any]]:
+    first, first_total = _api_paginate_with_total(api_url, token, path, key)
+    second, second_total = _api_paginate_with_total(api_url, token, path, key)
+    if first_total != second_total or first != second:
+        raise _fail("API snapshot changed during validation")
+    return first
+
+
+def _stable_api_object(api_url: str, token: str, path: str, field: str) -> Mapping[str, Any]:
+    first = _as_mapping(_api_get(api_url, token, path), field)
+    second = _as_mapping(_api_get(api_url, token, path), field)
+    if first != second:
+        raise _fail("API object changed during validation")
+    return first
+
+
+def validate_downstream_api(
+    *,
+    api_url: str,
+    token: str,
+    mode: str,
+    run_id: int,
+    attempt: int,
+    run_url: str,
+) -> Mapping[str, Any]:
+    """Fetch and validate one exact auto/manual release attempt for consumers."""
+
+    try:
+        from platform_release_receipt import validate_closed_receipt_archive
+    except ImportError:  # pragma: no cover - package execution
+        from .platform_release_receipt import validate_closed_receipt_archive
+
+    def bind_receipt_identity(identity: Mapping[str, Any], api_run: Mapping[str, Any], *, expected_id: int, expected_attempt: int) -> None:
+        if (
+            identity.get("run_id") != str(expected_id)
+            or identity.get("run_attempt") != str(expected_attempt)
+            or identity.get("event") != api_run.get("event")
+            or identity.get("workflow_name") != api_run.get("name")
+            or identity.get("repository") != REPOSITORY_FULL_NAME
+            or identity.get("workflow_sha") != api_run.get("head_sha")
+        ):
+            raise _fail("receipt workflow reference does not match API run")
+        if api_run.get("workflow_ref") is not None and identity.get("workflow_ref") != api_run.get("workflow_ref"):
+            raise _fail("receipt workflow ref does not match API run")
+
+    if mode == "auto":
+        workflow_path = AUTO_WORKFLOW_PATH
+    elif mode == "manual":
+        workflow_path = DEPLOY_WORKFLOW_PATH
+    else:
+        raise _fail("downstream mode is not canonical")
+    workflow = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/workflows/{Path(workflow_path).name}", "workflow")
+    run = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}", "run")
+    jobs = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+    source_statuses = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/commits/{run.get('head_sha')}/statuses", None)
+    if mode == "auto":
+        try:
+            validate_auto_noop_run(
+                workflow, run, jobs, source_statuses,
+                expected_run_id=run_id, expected_attempt=attempt,
+                expected_target_sha=run.get("head_sha"), expected_run_url=run_url,
+            )
+        except ProvenanceError:
+            pass
+        else:
+            return {"deploy_ready": False, "target_sha": run.get("head_sha"), "snapshot_digest": deployment_snapshot_digest(workflow, run, jobs, source_statuses)}
+    elif mode == "manual":
+        # Only a read-only preflight may be classified before the receipt is
+        # available.  A successful deployment is re-bound below to the
+        # receipt target SHA; the triggering run SHA is not an authorization
+        # target for downstream work.
+        try:
+            manual_ready = validate_manual_deployment_run(
+                workflow,
+                run,
+                jobs,
+                source_statuses,
+                expected_run_id=run_id,
+                expected_attempt=attempt,
+                expected_target_sha=run.get("head_sha"),
+                expected_run_url=run_url,
+            )
+        except ProvenanceError:
+            manual_ready = None
+        if manual_ready is False:
+            return {
+                "deploy_ready": False,
+                "target_sha": run.get("head_sha"),
+                "snapshot_digest": deployment_snapshot_digest(
+                    workflow, run, jobs, source_statuses
+                ),
+            }
+
+    expected_name = f"platform-production-release-receipt-{run_id}-{attempt}"
+    artifact_rows: list[Mapping[str, Any]] = []
+    artifact: Mapping[str, Any] | None = None
+    for artifact_attempt in range(1, 4):
+        artifact_rows = _stable_api_snapshot(
+            api_url,
+            token,
+            f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}/artifacts",
+            "artifacts",
+        )
+        matches = [
+            row
+            for row in artifact_rows
+            if row.get("name") == expected_name and row.get("expired") is False
+        ]
+        if len(matches) == 1:
+            artifact = matches[0]
+            break
+        if len(matches) > 1:
+            raise _fail("closed release receipt artifact is missing or ambiguous")
+        if artifact_attempt < 3:
+            # GitHub's artifact index can lag the successful finalizer by a
+            # short interval.  Read back a bounded number of times; never
+            # treat an absent or ambiguous index row as success.
+            time.sleep(0.5 * artifact_attempt)
+    if artifact is None:
+        raise _fail("closed release receipt artifact is missing or ambiguous")
+    workflow_run = _as_mapping(artifact.get("workflow_run"), "receipt artifact workflow run")
+    # The artifact-list API's nested workflow_run object documents the run ID
+    # but does not provide run_attempt.  The exact artifact name binds the
+    # requested attempt; the separately fetched jobs/run snapshots and closed
+    # receipt bind that attempt independently below.
+    if workflow_run.get("id") != run_id:
+        raise _fail("receipt artifact is not bound to the exact run")
+    artifact_id = artifact.get("id")
+    if type(artifact_id) is not int or artifact_id <= 0:
+        raise _fail("receipt artifact ID is malformed")
+    data = _api_get_bytes(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/artifacts/{artifact_id}/zip")
+    with tempfile.TemporaryDirectory(prefix="platform-downstream-", dir=None) as directory:
+        archive = Path(directory) / "receipt.zip"
+        archive.write_bytes(data)
+        archive.chmod(0o600)
+        from platform_release_receipt import validate_artifact_metadata, validate_closed_receipt_archive, validate_single_member_archive
+        receipt = validate_closed_receipt_archive(
+            archive, artifact, expected_run_id=str(run_id), expected_run_attempt=str(attempt),
+            expected_status_url=run_url + f"/attempts/{attempt}", expected_mode="deploy",
+        )
+        content_artifact = receipt["artifact"]
+        content_metadata = _stable_api_object(
+            api_url,
+            token,
+            f"/repos/{REPOSITORY_FULL_NAME}/actions/artifacts/{content_artifact['id']}",
+            "receipt content artifact metadata",
+        )
+        validate_artifact_metadata(
+            content_metadata,
+            expected_id=content_artifact["id"],
+            expected_name=content_artifact["name"],
+            expected_run_id=str(run_id),
+            expected_run_attempt=str(attempt),
+            expected_digest=content_artifact["digest"],
+        )
+        content_bytes = _api_get_bytes(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/artifacts/{content_artifact['id']}/zip")
+        content_archive = Path(directory) / "receipt-content.zip"
+        content_archive.write_bytes(content_bytes)
+        content_archive.chmod(0o600)
+        if content_metadata.get("size_in_bytes") != len(content_bytes):
+            raise _fail("receipt content artifact size does not match download")
+        if hashlib.sha256(content_bytes).hexdigest() != content_artifact["digest"].removeprefix("sha256:"):
+            raise _fail("receipt content artifact ZIP digest does not match")
+        validate_single_member_archive(
+            content_archive,
+            expected_content_sha256=content_artifact["content_sha256"],
+        )
+        target_sha = receipt["target_sha"]
+        statuses = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/commits/{target_sha}/statuses", None)
+        result = validate_downstream_snapshot(
+            workflow, run, jobs, statuses, receipt, mode=mode,
+            expected_run_id=run_id, expected_attempt=attempt, expected_run_url=run_url, now=datetime.now(timezone.utc),
+        )
+        security = receipt["security"]
+        security_workflow = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/workflows/platform-security.yml", "security workflow")
+        security_run_id = parse_run_id(security["run_id"], "security run id")
+        security_attempt = parse_run_id(security["run_attempt"], "security run attempt")
+        security_run = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{security_run_id}", "security run")
+        bind_receipt_identity(security, security_run, expected_id=security_run_id, expected_attempt=security_attempt)
+        security_statuses = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/commits/{target_sha}/statuses", None)
+        validate_security_marker(security_workflow, security_run, security_statuses, expected_run_id=security_run_id, expected_attempt=security_attempt, expected_target_sha=target_sha, now=datetime.now(timezone.utc))
+        classifier = receipt["classifier"]
+        classifier_run_id = parse_run_id(classifier["run_id"], "classifier run id")
+        classifier_attempt = parse_run_id(classifier["run_attempt"], "classifier run attempt")
+        classifier_run = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{classifier_run_id}", "classifier run")
+        bind_receipt_identity(classifier, classifier_run, expected_id=classifier_run_id, expected_attempt=classifier_attempt)
+        validate_workflow_run(
+            security_workflow,
+            classifier_run,
+            expected_run_id=classifier_run_id,
+            expected_attempt=classifier_attempt,
+            expected_target_sha=target_sha,
+            expected_event="push",
+            expected_branch="dev",
+            expected_path=SECURITY_WORKFLOW_PATH,
+            expected_name=SECURITY_WORKFLOW_NAME,
+        )
+        classifier_artifacts = _stable_api_snapshot(
+            api_url,
+            token,
+            f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{classifier_run_id}/artifacts",
+            "artifacts",
+        )
+        classifier_name = f"platform-ci-route-{classifier_run_id}-{classifier_attempt}"
+        classifier_matches = [
+            row for row in classifier_artifacts
+            if row.get("name") == classifier_name and row.get("expired") is False
+        ]
+        if len(classifier_matches) != 1:
+            raise _fail("classifier artifact is missing or ambiguous")
+        classifier_workflow_run = _as_mapping(classifier_matches[0].get("workflow_run"), "classifier artifact workflow run")
+        if classifier_workflow_run.get("id") != classifier_run_id or classifier_workflow_run.get("run_attempt") not in (None, classifier_attempt) or classifier_workflow_run.get("head_sha") != target_sha:
+            raise _fail("classifier artifact is not bound to the receipt reference")
+        return {"deploy_ready": result[0], "target_sha": result[1], "snapshot_digest": deployment_snapshot_digest(workflow, run, jobs, statuses)}
 
 
 class _ProvenanceArgumentParser(argparse.ArgumentParser):
@@ -739,22 +1794,37 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         description="Validate exact GitHub Actions workflow provenance"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("security", "deployment"):
+    for command in ("security", "deployment", "auto-release", "manual-release", "auto-noop", "downstream", "downstream-api"):
         command_parser = subparsers.add_parser(command)
-        command_parser.add_argument("--workflow", type=Path, required=True)
-        command_parser.add_argument("--run", type=Path, required=True)
-        command_parser.add_argument("--status", type=Path, required=True)
+        command_parser.add_argument("--workflow", type=Path, required=command != "downstream-api")
+        command_parser.add_argument("--run", type=Path, required=command != "downstream-api")
+        command_parser.add_argument("--status", type=Path, required=command != "downstream-api")
         command_parser.add_argument("--jobs", type=Path)
         command_parser.add_argument("--expected-run-id", required=True)
         command_parser.add_argument("--expected-attempt", required=True)
-        command_parser.add_argument("--expected-target-sha", required=True)
+        command_parser.add_argument(
+            "--expected-target-sha", required=command != "downstream-api"
+        )
         command_parser.add_argument("--expected-run-url")
-        if command == "deployment":
+        if command in {"deployment", "auto-release"}:
+            command_parser.add_argument("--expected-event", choices=DEPLOYMENT_EVENTS)
             command_parser.add_argument(
                 "--allow-preflight-noop",
                 action="store_true",
                 help="accept an exact successful preflight as a non-mutating no-op",
             )
+        if command == "auto-release":
+            command_parser.add_argument("--called-workflow-ref")
+            command_parser.add_argument("--called-workflow-sha")
+        if command == "auto-noop":
+            command_parser.add_argument("--expected-event", choices=("workflow_run",), default="workflow_run")
+        if command == "downstream":
+            command_parser.add_argument("--receipt", type=Path, required=True)
+            command_parser.add_argument("--mode", choices=("auto", "manual"), required=True)
+        if command == "downstream-api":
+            command_parser.add_argument("--mode", choices=("auto", "manual"), required=True)
+            command_parser.add_argument("--api-url", required=True)
+            command_parser.add_argument("--token-env", default="GH_TOKEN")
     return parser
 
 
@@ -763,6 +1833,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         args = _build_cli_parser().parse_args(argv)
+        if args.command == "downstream-api":
+            expected_run_id = parse_run_id(args.expected_run_id, "expected run id")
+            expected_attempt = parse_run_id(args.expected_attempt, "expected run attempt")
+            result = validate_downstream_api(
+                api_url=args.api_url,
+                token=os.environ.get(args.token_env, ""),
+                mode=args.mode,
+                run_id=expected_run_id,
+                attempt=expected_attempt,
+                run_url=args.expected_run_url or f"{GITHUB_SERVER_URL}/{REPOSITORY_FULL_NAME}/actions/runs/{expected_run_id}",
+            )
+            print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+            return 0
         workflow = _read_json(args.workflow)
         run = _read_json(args.run)
         status_payload = _read_json(args.status)
@@ -788,6 +1871,93 @@ def main(argv: Sequence[str] | None = None) -> int:
                 now=now,
             )
             context = SECURITY_STATUS_CONTEXT
+        elif args.command == "auto-noop":
+            if args.jobs is None:
+                raise _fail("auto no-op job payload is missing")
+            jobs = _payload_rows(_read_json(args.jobs), "jobs", "auto no-op job")
+            statuses = _payload_rows(status_payload, "statuses", "auto no-op status")
+            validate_auto_noop_run(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+                expected_target_sha=args.expected_target_sha,
+                expected_run_url=args.expected_run_url,
+                now=now,
+            )
+            attempt_url = canonical_attempt_url(run, expected_run_id=expected_run_id, expected_attempt=expected_attempt)
+            deploy_ready = False
+            context = DEPLOY_STATUS_CONTEXT
+        elif args.command == "auto-release":
+            if args.jobs is None:
+                raise _fail("auto-release job payload is missing")
+            jobs_payload = _read_json(args.jobs)
+            jobs = _payload_rows(jobs_payload, "jobs", "auto-release job")
+            if not args.called_workflow_ref or not args.called_workflow_sha:
+                raise _fail("auto-release called workflow identity is missing")
+            statuses = _payload_rows(status_payload, "statuses", "auto-release status")
+            attempt_url = validate_auto_release_run(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+                expected_target_sha=args.expected_target_sha,
+                expected_called_workflow_ref=args.called_workflow_ref,
+                expected_called_workflow_sha=args.called_workflow_sha,
+                expected_run_url=args.expected_run_url,
+                now=now,
+            )
+            deploy_ready = True
+            context = DEPLOY_STATUS_CONTEXT
+        elif args.command == "manual-release":
+            if args.jobs is None:
+                raise _fail("manual-release job payload is missing")
+            jobs_payload = _read_json(args.jobs)
+            jobs = _payload_rows(jobs_payload, "jobs", "manual-release job")
+            statuses = _payload_rows(status_payload, "statuses", "manual-release status")
+            deploy_ready = validate_manual_deployment_run(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+                expected_target_sha=args.expected_target_sha,
+                expected_run_url=args.expected_run_url,
+                now=now,
+            )
+            attempt_url = canonical_attempt_url(
+                run,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+            )
+            context = DEPLOY_STATUS_CONTEXT
+        elif args.command == "downstream":
+            if args.jobs is None:
+                raise _fail("downstream job payload is missing")
+            jobs = _payload_rows(_read_json(args.jobs), "jobs", "downstream job")
+            statuses = _payload_rows(status_payload, "statuses", "downstream status")
+            receipt = _read_json(args.receipt)
+            if not isinstance(receipt, Mapping):
+                raise _fail("downstream receipt is malformed")
+            deploy_ready, target_sha = validate_downstream_snapshot(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                receipt,
+                mode=args.mode,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+                expected_run_url=args.expected_run_url or canonical_run_url(run, expected_run_id=expected_run_id),
+                now=now,
+            )
+            attempt_url = canonical_attempt_url(run, expected_run_id=expected_run_id, expected_attempt=expected_attempt)
+            context = DEPLOY_STATUS_CONTEXT
         else:
             if args.jobs is None:
                 raise _fail("deployment job payload is missing")
@@ -808,6 +1978,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     expected_attempt=expected_attempt,
                     expected_target_sha=args.expected_target_sha,
                     expected_run_url=args.expected_run_url,
+                    expected_event=args.expected_event,
                     now=now,
                 )
                 attempt_url = canonical_attempt_url(
@@ -826,10 +1997,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     expected_attempt=expected_attempt,
                     expected_target_sha=args.expected_target_sha,
                     expected_run_url=args.expected_run_url,
+                    expected_event=args.expected_event,
                     now=now,
                 )
             context = DEPLOY_STATUS_CONTEXT
-        snapshot_jobs = jobs if args.command == "deployment" else []
+        snapshot_jobs = jobs if args.command in {"deployment", "auto-release", "manual-release", "auto-noop", "downstream"} else []
         marker = (
             _status_fingerprint(
                 statuses,
@@ -843,7 +2015,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps(
                 {
                     "attempt_url": attempt_url,
-                    "deploy_ready": deploy_ready if args.command == "deployment" else True,
+                    "deploy_ready": deploy_ready if args.command in {"deployment", "auto-release", "manual-release", "auto-noop", "downstream"} else True,
                     "snapshot_digest": deployment_snapshot_digest(
                         workflow,
                         run,

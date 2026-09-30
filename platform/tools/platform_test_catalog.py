@@ -216,6 +216,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_release_build_diagnostics
     test_platform_release_build_contract
     test_platform_release_recovery_boundaries
+    test_platform_release_receipt
     test_platform_release_retention
     test_platform_release_systemd_state
     test_platform_release_venv_rollback
@@ -319,6 +320,7 @@ PRIVILEGED_MODULES = frozenset(
         "test_platform_release_build_diagnostics",
         "test_platform_release_build_contract",
         "test_platform_release_recovery_boundaries",
+        "test_platform_release_receipt",
         "test_platform_release_retention",
         "test_platform_release_systemd_state",
         "test_platform_release_venv_rollback",
@@ -378,6 +380,8 @@ TOOL_MODULES = frozenset(
     }
 )
 
+# ``test_platform_workflow_provenance`` also owns the native reusable
+# production-call contract; custom REST child-run correlation is not retained.
 # Conservative unit ownership.  Modules not listed here remain integration
 # owned unless a more specific tool/performance/privileged rule applies.
 UNIT_MODULES = frozenset(
@@ -450,12 +454,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 158,
-    "module_digest": "a77d2cff5b4122f04ba7932d758aac60cd98e15405d3d09e4cb45da7c1207310",
-    "test_count": 1484,
-    "test_id_digest": "185c8277500c8914469efa60c06417bac20d629b13ad14b61f22f516543fa848",
-    "backend_test_count": 1440,
-    "backend_test_id_digest": "3b0227185027b296032627730b1a46ad9503bffb7a5078f4a2f3f039d29a3e7b",
+    "module_count": 159,
+    "module_digest": "3e48b181062910c6d11a19ddc716d40c89ce709284bf1b27c2a9fc173efc3ff5",
+    "test_count": 1504,
+    "test_id_digest": "9e1fa38939b4050321bef6051db0be4c74c8a7b0d1edf7e62ed6571aed1bc516",
+    "backend_test_count": 1460,
+    "backend_test_id_digest": "5ea5351e4a627832673f21dd8eee69569b8627b53fbb98ab30da974313d18a33",
     "verification_test_count": 44,
     "verification_test_id_digest": "d8873be495648857a31f012be4e6b1b1438b091214bc6fb046fa620f34debd32",
     "verification_classifier_test_count": 23,
@@ -484,8 +488,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 44,
         "module_digest": "693edb2005c56249ac84c9d1d7367b64e2e3291ef18c6bc05e41ea98967ea406",
-        "test_count": 327,
-        "test_id_digest": "ff4e622f593023380b76b8cccaeb04235661c2295c02d9f571386b9614af962b",
+        "test_count": 341,
+        "test_id_digest": "40b15a19bbcabec77dbe459f2192a2d42b55b43bf33e43b9325b6af729d2b3aa",
     },
     "backend-integration": {
         "module_count": 41,
@@ -494,10 +498,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "411315f9d37a3d56602fc98050deaaa86dc2206c7ca94298522dade78173dc6c",
     },
     "backend-privileged": {
-        "module_count": 23,
-        "module_digest": "2034d1a0a01dffe5b141118aa1b90c060268b28eadc0bf2165954c36c260dc1e",
-        "test_count": 438,
-        "test_id_digest": "731a9caf5b247612d12f2fe6bd7ed1c3ec2326dba7e79703e72701b01fdb500d",
+        "module_count": 24,
+        "module_digest": "1e6399d9a9c88f3a86f6c558545735cdba1b3d4814f1fcbc1281c39a32679a3b",
+        "test_count": 444,
+        "test_id_digest": "37350cc06d16d1fc17820751b9a49b298479e9cfd1992c3c8d9be17560c23ff2",
     },
     "performance-contract": {
         "module_count": 10,
