@@ -1455,14 +1455,49 @@ jobs:
           name: platform-production-deploy-input-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/deploy-input
 
+      - name: Checkout pinned host-tools input verifier
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}
+          path: trusted-host-tools
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Normalize downloaded schema-1 deployment handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          source_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          private_dir="$RUNNER_TEMP/platform-production-deploy-handoff"
+          private_path="$private_dir/platform-production-deploy-input.json"
+          trusted_tool="$GITHUB_WORKSPACE/trusted-host-tools/platform/tools/platform_workflow_input_guard.py"
+          test -f "$trusted_tool" && test ! -L "$trusted_tool"
+          test "$(git -C "$GITHUB_WORKSPACE/trusted-host-tools" rev-parse HEAD)" = "$HOST_TOOLS_SHA"
+          test ! -e "$private_dir" && test ! -L "$private_dir"
+          mkdir -- "$private_dir"
+          chmod 0700 "$private_dir"
+          test "$(stat -c '%u:%g:%F:%h:%a' -- "$private_dir")" = "$(id -u):$(id -g):directory:1:700"
+          test ! -e "$private_path" && test ! -L "$private_path"
+          source_sha256="$(
+            /usr/bin/python3 -I -B "$trusted_tool" materialize-deployment --input "$source_path" --output "$private_path" --mode deploy
+          )"
+          [[ "$source_sha256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(stat -c '%u:%g:%F:%h:%a' -- "$private_path")" = "$(id -u):$(id -g):regular file:1:600"
+          cmp -s -- "$source_path" "$private_path"
+          test "$source_sha256" = "$(sha256sum -- "$private_path" | awk '{print $1}')"
+          rm -f -- "$source_path"
+          test ! -e "$source_path" && test ! -L "$source_path"
+
       - name: Validate production deployment inputs
         shell: bash
         run: |
           set -euo pipefail
-          test -f "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" && test ! -L "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          input_path="$RUNNER_TEMP/platform-production-deploy-handoff/platform-production-deploy-input.json"
+          test "$(stat -c '%u:%g:%F:%h:%a' -- "$input_path")" = "$(id -u):$(id -g):regular file:1:600"
           test -n "$CLASSIFIER_RUN_ID" || { echo "classifier_run_id is required for production deploy" >&2; exit 1; }
           test -n "$CLASSIFIER_RUN_ATTEMPT" || { echo "classifier_run_attempt is required for production deploy" >&2; exit 1; }
-          /usr/bin/python3 - "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$TARGET_SHA" "$RUNTIME_PROFILE" "$WEB_COMPRESSION" "$CLASSIFIER_RUN_ID" "$CLASSIFIER_RUN_ATTEMPT" <<'PY'
+          /usr/bin/python3 - "$input_path" "$TARGET_SHA" "$RUNTIME_PROFILE" "$WEB_COMPRESSION" "$CLASSIFIER_RUN_ID" "$CLASSIFIER_RUN_ATTEMPT" <<'PY'
           import json
           from pathlib import Path
           import re
@@ -1655,14 +1690,6 @@ jobs:
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
             --data "{\"state\":\"pending\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment is running\",\"target_url\":\"${run_url}\"}"
 
-      - name: Checkout pinned host-tools release verifier
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}
-          path: trusted-host-tools
-          fetch-depth: 1
-          persist-credentials: false
-
       # The original schema-1 handoff remains the input to the isolated build
       # and preflight jobs.  Only this deploy job, after all host claims have
       # crossed the environment boundary, upgrades it once to the closed
@@ -1672,11 +1699,10 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          input_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          input_path="$RUNNER_TEMP/platform-production-deploy-handoff/platform-production-deploy-input.json"
           host_payload="$RUNNER_TEMP/platform-production-host-claims.json"
           validator="$GITHUB_WORKSPACE/trusted-host-tools/platform/tools/platform_workflow_input_guard.py"
-          test -f "$input_path" && test ! -L "$input_path"
-          test "$(stat -c '%F:%h:%a' -- "$input_path")" = "regular file:1:600"
+          test "$(stat -c '%u:%g:%F:%h:%a' -- "$input_path")" = "$(id -u):$(id -g):regular file:1:600"
           test ! -e "$host_payload" && test ! -L "$host_payload"
           test -f "$validator" && test ! -L "$validator"
           test "$(git -C "$GITHUB_WORKSPACE/trusted-host-tools" rev-parse HEAD)" = "$HOST_TOOLS_SHA"
@@ -1699,7 +1725,7 @@ jobs:
             --attestation-run-id "$HOST_TOOLS_ATTESTATION_RUN_ID" \
             --attestation-run-attempt "$HOST_TOOLS_ATTESTATION_RUN_ATTEMPT" \
             --attestation-job-id "$HOST_TOOLS_ATTESTATION_JOB_ID"
-          test "$(stat -c '%F:%h:%a' -- "$host_payload")" = "regular file:1:600"
+          test "$(stat -c '%u:%g:%F:%h:%a' -- "$host_payload")" = "$(id -u):$(id -g):regular file:1:600"
           /usr/bin/python3 -I -B - "$input_path" "$host_payload" "$validator" <<'PY'
           import importlib.util
           import json
@@ -1728,7 +1754,7 @@ jobs:
               raise SystemExit("deployment handoff was not upgraded to schema 2")
           module._write_private_json(input_path, validated)
           PY
-          test "$(stat -c '%F:%h:%a' -- "$input_path")" = "regular file:1:600"
+          test "$(stat -c '%u:%g:%F:%h:%a' -- "$input_path")" = "$(id -u):$(id -g):regular file:1:600"
           rm -f -- "$host_payload"
           test ! -e "$host_payload" && test ! -L "$host_payload"
 
@@ -1765,7 +1791,7 @@ jobs:
           curl --fail-with-body --silent --show-error --location --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}/zip" --output "$artifact_zip"
           printf '%s  %s\n' "$PUBLISHED_ARTIFACT_DIGEST" "$artifact_zip" | sha256sum -c - >/dev/null 2>/dev/null || { echo "Published GitHub artifact digest verification failed" >&2; exit 1; }
-          release_slug="$(/usr/bin/python3 - "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$TARGET_SHA" <<'PY'
+          release_slug="$(/usr/bin/python3 - "$RUNNER_TEMP/platform-production-deploy-handoff/platform-production-deploy-input.json" "$TARGET_SHA" <<'PY'
           import json
           from pathlib import Path
           import re
@@ -1887,7 +1913,7 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
-          input_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          input_path="$RUNNER_TEMP/platform-production-deploy-handoff/platform-production-deploy-input.json"
           test -s "$input_path"
           require_current_dev_head() {
             local branch_json dev_sha
@@ -1913,7 +1939,7 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
-          input_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          input_path="$RUNNER_TEMP/platform-production-deploy-handoff/platform-production-deploy-input.json"
           branch_json="$(curl --fail-with-body --silent --show-error --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
           dev_sha="$(printf '%s' "$branch_json" | /usr/bin/python3 -c 'import json,sys; payload=json.load(sys.stdin); sha=payload["commit"]["sha"]; assert isinstance(sha,str) and len(sha)==40 and all(c in "0123456789abcdef" for c in sha), "current dev head SHA is malformed"; print(sha)')"
           test "$dev_sha" = "$TARGET_SHA" || { echo "Refusing activation: dev moved from $TARGET_SHA to $dev_sha." >&2; exit 1; }
@@ -1946,7 +1972,20 @@ jobs:
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/platform-production-deploy-ssh"
           test "$ssh_dir" = "$RUNNER_TEMP/platform-production-deploy-ssh"
-          rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$RUNNER_TEMP/platform-production-host-claims.json" "$RUNNER_TEMP/platform-production-deploy-remote.log" "$RUNNER_TEMP/platform-production-deploy-remote-error.log" "$RUNNER_TEMP/platform-release-artifact.zip"
+          rm -f -- "$RUNNER_TEMP/platform-production-host-claims.json" "$RUNNER_TEMP/platform-production-deploy-remote.log" "$RUNNER_TEMP/platform-production-deploy-remote-error.log" "$RUNNER_TEMP/platform-release-artifact.zip"
+          private_dir="$RUNNER_TEMP/platform-production-deploy-handoff"
+          if [[ -d "$private_dir" && ! -L "$private_dir" ]]; then
+            rm -f -- "$private_dir/platform-production-deploy-input.json"
+            test ! -e "$private_dir/platform-production-deploy-input.json" && test ! -L "$private_dir/platform-production-deploy-input.json"
+            rmdir -- "$private_dir"
+          fi
+          test ! -e "$private_dir" && test ! -L "$private_dir"
+          if [[ -d "$RUNNER_TEMP/deploy-input" && ! -L "$RUNNER_TEMP/deploy-input" ]]; then
+            rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+            test ! -e "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" && test ! -L "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+            rmdir -- "$RUNNER_TEMP/deploy-input"
+          fi
+          test ! -e "$RUNNER_TEMP/deploy-input" && test ! -L "$RUNNER_TEMP/deploy-input"
           release_dir="$RUNNER_TEMP/release"
           if [[ -d "$release_dir" && ! -L "$release_dir" ]]; then
             rm -rf -- "$release_dir"

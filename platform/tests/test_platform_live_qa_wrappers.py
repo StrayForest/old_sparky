@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from io import BytesIO, StringIO, TextIOWrapper
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -90,6 +91,126 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             with self.subTest(field=field):
                 with self.assertRaises(WorkflowInputError):
                     validate_host_tools_payload({**valid, field: value})
+
+    def test_downloaded_deployment_handoff_mode_loss_is_repaired(self) -> None:
+        payload = {
+            "schema": 1,
+            "mode": "deploy",
+            "runtime_profile": "baseline",
+            "release_slug": "gha-123456-2-" + "a" * 12,
+            "target_sha": "a" * 40,
+            "artifact_remote_dir": "/tmp/old-sparky-platform-artifact-123456-2",
+            "classifier_run_id": "123456",
+            "classifier_run_attempt": "2",
+            "web_compression": "enabled",
+        }
+        raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_dir = root / "downloaded"
+            source_dir.mkdir(mode=0o700)
+            source = source_dir / "platform-production-deploy-input.json"
+            source.write_bytes(raw)
+            source.chmod(0o644)
+            private_dir = root / "private"
+            private_dir.mkdir(mode=0o700)
+            private = private_dir / "platform-production-deploy-input.json"
+
+            digest = platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
+                source,
+                private,
+                expected_mode="deploy",
+            )
+
+            self.assertEqual(source.read_bytes(), private.read_bytes())
+            self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+            source_metadata = source.stat()
+            private_metadata = private.stat()
+            self.assertEqual(source_metadata.st_mode & 0o777, 0o644)
+            self.assertEqual(private_metadata.st_mode & 0o777, 0o600)
+            self.assertEqual(source_metadata.st_nlink, 1)
+            self.assertEqual(private_metadata.st_nlink, 1)
+            self.assertEqual(private_metadata.st_uid, os.getuid())
+            self.assertEqual(private_metadata.st_gid, os.getgid())
+
+            source.chmod(0o600)
+            with self.assertRaises(WorkflowInputError):
+                platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
+                    source,
+                    root / "private-wrong-mode.json",
+                    expected_mode="deploy",
+                )
+            source.chmod(0o644)
+
+            extra = source_dir / "unexpected"
+            extra.write_bytes(b"unexpected\n")
+            with self.assertRaises(WorkflowInputError):
+                platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
+                    source,
+                    root / "private-extra.json",
+                    expected_mode="deploy",
+                )
+            extra.unlink()
+
+            symlink_parent = root / "symlink-parent"
+            symlink_parent.symlink_to(source_dir, target_is_directory=True)
+            with self.assertRaises(WorkflowInputError):
+                platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
+                    symlink_parent / source.name,
+                    root / "private-symlink-parent.json",
+                    expected_mode="deploy",
+                )
+            symlink_parent.unlink()
+
+            with self.assertRaises(WorkflowInputError):
+                platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
+                    source,
+                    private,
+                    expected_mode="deploy",
+                )
+
+            source_link = source_dir / "source-link"
+            source_link.symlink_to(source)
+            with self.assertRaises(WorkflowInputError):
+                platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
+                    source_link,
+                    root / "private-link.json",
+                    expected_mode="deploy",
+                )
+            source_link.unlink()
+
+            source_hardlink = source_dir / "source-hardlink"
+            os.link(source, source_hardlink)
+            with self.assertRaises(WorkflowInputError):
+                platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
+                    source,
+                    root / "private-hardlink-source.json",
+                    expected_mode="deploy",
+                )
+            source_hardlink.unlink()
+
+            destination_link = root / "destination-link"
+            destination_link.symlink_to(source)
+            with self.assertRaises(WorkflowInputError):
+                platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
+                    source,
+                    destination_link,
+                    expected_mode="deploy",
+                )
+            destination_link.unlink()
+
+            destination_hardlink = root / "destination-hardlink"
+            destination_peer = root / "destination-peer"
+            destination_peer.write_bytes(b"peer\n")
+            os.link(destination_peer, destination_hardlink)
+            with self.assertRaises(WorkflowInputError):
+                platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
+                    source,
+                    destination_hardlink,
+                    expected_mode="deploy",
+                )
 
     def test_live_launch_workflow_delegates_to_server_supervisor(self) -> None:
         source = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(
@@ -871,6 +992,32 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("needs.build-release.result == 'success'", production)
         self.assertIn(
             "needs.host-capability-preflight.result == 'success'", production
+        )
+        self.assertIn("Normalize downloaded schema-1 deployment handoff", production)
+        self.assertIn("materialize-deployment", production)
+        self.assertIn("cmp -s -- \"$source_path\" \"$private_path\"", production)
+        self.assertIn(
+            'test "$(stat -c \'%u:%g:%F:%h:%a\' -- "$private_path")" = "$(id -u):$(id -g):regular file:1:600"',
+            production,
+        )
+        self.assertIn('rm -f -- "$source_path"', production)
+        self.assertIn(
+            'private_dir="$RUNNER_TEMP/platform-production-deploy-handoff"',
+            production,
+        )
+        self.assertEqual(
+            production.count(
+                'input_path="$RUNNER_TEMP/platform-production-deploy-handoff/platform-production-deploy-input.json"'
+            ),
+            4,
+        )
+        self.assertNotIn(
+            'production-prepare-artifact < "$RUNNER_TEMP/deploy-input/',
+            production,
+        )
+        self.assertNotIn(
+            'production-deploy < "$RUNNER_TEMP/deploy-input/',
+            production,
         )
         materialize = production.index("Materialize final schema-2 deployment handoff")
         prepare = production.index('production-prepare-artifact < "$input_path"')
