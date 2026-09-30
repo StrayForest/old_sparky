@@ -21,6 +21,8 @@ from typing import Any
 SCHEMA = 1
 MAX_INPUT_BYTES = 256 * 1024
 MAX_LINES = 512
+MAX_LEGACY_RETENTION_ITEMS = 16_384
+MAX_RETENTION_BYTES = 10**18
 _INTEGER_RE = re.compile(r"^[0-9]{1,20}$")
 _PERCENT_RE = re.compile(r"^([0-9]{1,3})(?:\.[0-9]{1,2})?%$")
 _JOURNAL_SIZE_RE = re.compile(
@@ -124,6 +126,69 @@ def _safe_int(value: Any, *, maximum: int = 10**18) -> int | None:
     if number < 0 or number > maximum:
         return None
     return number
+
+
+def _strict_legacy_bytes(value: Any) -> int | None:
+    """Accept only bounded integer byte values from legacy output."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= MAX_RETENTION_BYTES else None
+
+
+def _legacy_list_count(value: Any) -> int | None:
+    if not isinstance(value, list) or len(value) > MAX_LEGACY_RETENTION_ITEMS:
+        return None
+    return len(value)
+
+
+_LEGACY_ITEM_BYTE_FIELDS = ("size_bytes", "bytes", "reclaimable_bytes")
+
+
+def _legacy_item_bytes(value: list[Any]) -> int | None:
+    """Sum bounded byte fields on legacy item records, fail-closed."""
+
+    if len(value) > MAX_LEGACY_RETENTION_ITEMS or not value:
+        return 0 if not value else None
+    total = 0
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        fields = [name for name in _LEGACY_ITEM_BYTE_FIELDS if name in item]
+        # Metadata is intentionally not accepted here: an item must be a
+        # single known byte field, so unknown/malformed records cannot smuggle
+        # an inferred size into the public summary.
+        if len(fields) != 1 or set(item) != set(fields):
+            return None
+        amount = _strict_legacy_bytes(item[fields[0]])
+        if amount is None or total > MAX_RETENTION_BYTES - amount:
+            return None
+        total += amount
+    return total
+
+
+def _legacy_transient_bytes(
+    section: Any, aggregate: Any
+) -> tuple[int | None, int | None]:
+    """Normalize one legacy transient list without inventing byte values."""
+
+    count = _legacy_list_count(section)
+    if count is None:
+        return None, None
+    if not section:
+        return count, 0
+    if all(isinstance(item, str) for item in section):
+        # The deployed pre-count helpers expose names in the list and the
+        # measured bytes in the category aggregate map.  Validate that map
+        # value strictly; a missing/invalid value remains unknown.
+        return count, _strict_legacy_bytes(aggregate)
+    item_bytes = _legacy_item_bytes(section)
+    aggregate_bytes = _strict_legacy_bytes(aggregate)
+    if item_bytes is None:
+        return count, None
+    if aggregate is not None and aggregate_bytes != item_bytes:
+        return count, None
+    return count, item_bytes
 
 
 def _safe_percent(value: Any) -> float | None:
@@ -373,12 +438,16 @@ def _section_summary(section: Any) -> dict[str, object]:
         # plan.  Prefer those producer values so the projected contract stays
         # aligned even when a safe-id list is filtered; retain the list-length
         # fallback for older deployed helpers that predate the count fields.
-        explicit = _safe_int(section.get(f"{name}_count"), maximum=10**18)
+        explicit = _safe_int(
+            section.get(f"{name}_count"), maximum=MAX_RETENTION_BYTES
+        )
         if explicit is not None:
             return explicit
         value = section.get(name)
-        return len(value) if isinstance(value, list) else None
-    reclaimable = _safe_int(section.get("reclaimable_bytes"), maximum=10**18)
+        return _legacy_list_count(value)
+    reclaimable = _safe_int(
+        section.get("reclaimable_bytes"), maximum=MAX_RETENTION_BYTES
+    )
     return {
         "protected_count": count("protected"),
         "retained_count": count("retained"),
@@ -394,22 +463,30 @@ def _live_qa_section_summary(section: Any) -> dict[str, object]:
         section = {}
 
     def count(name: str) -> int | None:
-        explicit = _safe_int(section.get(f"{name}_count"), maximum=10**18)
+        explicit = _safe_int(
+            section.get(f"{name}_count"), maximum=MAX_RETENTION_BYTES
+        )
         if explicit is not None:
             return explicit
         value = section.get(name)
-        return len(value) if isinstance(value, list) else None
+        return _legacy_list_count(value)
 
+    reclaimed_tombstone_count = _safe_int(
+        section.get("reclaimed_tombstone_count"), maximum=MAX_RETENTION_BYTES
+    )
+    if reclaimed_tombstone_count is None:
+        reclaimed_tombstone_count = _legacy_list_count(
+            section.get("reclaimed_tombstones")
+        )
     return {
         "protected_count": count("protected"),
         "retained_count": count("retained"),
         "deleted_count": count("deleted"),
         # The maintenance producer does not measure reclaimed bytes for live
-        # QA.  Preserve its actual audit count; a missing field remains None
-        # and is rejected by the closed contract rather than becoming zero.
-        "reclaimed_tombstone_count": _safe_int(
-            section.get("reclaimed_tombstone_count"), maximum=10**18
-        ),
+        # QA. Preserve its actual audit count; older helpers expose only the
+        # tombstone list, while a missing field remains None and is rejected
+        # by the closed contract rather than becoming zero.
+        "reclaimed_tombstone_count": reclaimed_tombstone_count,
     }
 
 
@@ -434,24 +511,34 @@ def summarize_retention(raw: str) -> dict[str, object]:
     transient_summary: dict[str, dict[str, int | None]] = {}
     if isinstance(transient, dict):
         raw_bytes = transient.get("reclaimable_bytes")
-        if isinstance(raw_bytes, dict):
-            for category in (
-                "failed_builds",
-                "browser_test_artifacts",
-                "preprod_screenshots",
-            ):
-                transient_bytes[category] = _safe_int(raw_bytes.get(category))
         for category in (
             "failed_builds",
             "browser_test_artifacts",
             "preprod_screenshots",
         ):
             section = transient.get(category)
+            if isinstance(section, list):
+                aggregate = (
+                    raw_bytes.get(category) if isinstance(raw_bytes, dict) else None
+                )
+                count, reclaimable = _legacy_transient_bytes(section, aggregate)
+                transient_bytes[category] = reclaimable
+                transient_summary[category] = {
+                    "count": count,
+                    "reclaimable_bytes": reclaimable,
+                }
+                continue
             if not isinstance(section, dict):
                 section = {}
+            transient_bytes[category] = _safe_int(
+                raw_bytes.get(category) if isinstance(raw_bytes, dict) else None,
+                maximum=MAX_RETENTION_BYTES,
+            )
             transient_summary[category] = {
-                "count": _safe_int(section.get("count")),
-                "reclaimable_bytes": transient_bytes.get(category),
+                "count": _safe_int(
+                    section.get("count"), maximum=MAX_RETENTION_BYTES
+                ),
+                "reclaimable_bytes": transient_bytes[category],
             }
     disk_after = payload.get("disk_after")
     if not isinstance(disk_after, dict):

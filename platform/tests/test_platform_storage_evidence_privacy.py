@@ -27,7 +27,12 @@ from tools.platform_storage_diagnostics_sanitizer import (
     project_public_artifact,
 )
 
-from tests.platform_storage_evidence_fixtures import valid_storage_report
+from tests.platform_storage_evidence_fixtures import (
+    LEGACY_RETENTION_0700_OUTPUT,
+    LEGACY_RETENTION_87547_OUTPUT,
+    legacy_storage_report,
+    valid_storage_report,
+)
 
 
 FORBIDDEN_VALUES = (
@@ -443,6 +448,111 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
                 "reclaimed_tombstone_count"
             ] = 0
             artifact["remote_stderr_bytes"] = None
+            self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+
+    def test_legacy_deployed_retention_shapes_normalize_and_validate(self) -> None:
+        self.assertEqual(LEGACY_RETENTION_0700_OUTPUT, LEGACY_RETENTION_87547_OUTPUT)
+        for fixture in (LEGACY_RETENTION_0700_OUTPUT, LEGACY_RETENTION_87547_OUTPUT):
+            with self.subTest(fixture=fixture[:12]):
+                projected = summarize_retention(fixture.decode("utf-8"))
+                self.assertEqual(
+                    projected["categories"]["live_qa_runtime"][
+                        "reclaimed_tombstone_count"
+                    ],
+                    1,
+                )
+                self.assertEqual(
+                    projected["transient"],
+                    {
+                        "failed_builds": {"count": 1, "reclaimable_bytes": 13},
+                        "browser_test_artifacts": {
+                            "count": 1,
+                            "reclaimable_bytes": 17,
+                        },
+                        "preprod_screenshots": {
+                            "count": 1,
+                            "reclaimable_bytes": 19,
+                        },
+                    },
+                )
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "report"
+                    stderr_path = root / "stderr"
+                    stderr_path.write_bytes(b"")
+                    report_path.write_bytes(legacy_storage_report(fixture))
+                    artifact = project_public_artifact(
+                        expected_sha="a" * 40,
+                        remote_exit_code=0,
+                        remote_stderr_bytes=0,
+                        report_path=report_path,
+                        stderr_path=stderr_path,
+                        report_present=True,
+                    )
+                    self.assertEqual(artifact["status"], "passed")
+                    self.assertTrue(diagnostics_contract.validate_artifact(artifact))
+
+    def test_legacy_item_bytes_are_explicit_and_bounded(self) -> None:
+        payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+        payload["transient"]["failed_builds"] = [
+            {"size_bytes": 5},
+            {"size_bytes": 8},
+        ]
+        payload["transient"]["reclaimable_bytes"].pop("failed_builds")
+        projected = summarize_retention(json.dumps(payload))
+        self.assertEqual(
+            projected["transient"]["failed_builds"],
+            {"count": 2, "reclaimable_bytes": 13},
+        )
+
+    def test_legacy_malformed_bytes_fail_closed(self) -> None:
+        mutations = (
+            ("failed_builds", -1),
+            ("browser_test_artifacts", float("nan")),
+            ("preprod_screenshots", 10**18 + 1),
+            ("failed_builds", "13"),
+        )
+        for category, value in mutations:
+            with self.subTest(category=category, value=value):
+                payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+                payload["transient"]["reclaimable_bytes"][category] = value
+                mutated = json.dumps(payload).encode()
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "report"
+                    stderr_path = root / "stderr"
+                    stderr_path.write_bytes(b"")
+                    report_path.write_bytes(legacy_storage_report(mutated))
+                    artifact = project_public_artifact(
+                        expected_sha="a" * 40,
+                        remote_exit_code=0,
+                        remote_stderr_bytes=0,
+                        report_path=report_path,
+                        stderr_path=stderr_path,
+                        report_present=True,
+                    )
+                    self.assertEqual(artifact["status"], "failed")
+                    self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+
+        payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+        payload["transient"]["failed_builds"] = [{"unknown_bytes": 13}]
+        payload["transient"]["reclaimable_bytes"].pop("failed_builds")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            stderr_path.write_bytes(b"")
+            report_path.write_bytes(legacy_storage_report(json.dumps(payload).encode()))
+            artifact = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(artifact["status"], "failed")
             self.assertFalse(diagnostics_contract.validate_artifact(artifact))
 
     def test_failure_schema_is_closed_and_success_validation_is_strict(self) -> None:

@@ -120,3 +120,38 @@ def valid_storage_report() -> bytes:
         )
     )
     return ("\n".join(lines) + "\n").encode()
+
+
+# Both recorded deployed helpers (0700b7402ecdd182fe0cfba4feae14f15fb68243
+# and 87547df2abd4aa06a07f4dd4b4f730e9912707e1) emit this same legacy
+# pre-count retention shape. Keep this synthetic, fixed fixture free of host
+# paths, identities, and live timestamps.
+LEGACY_RETENTION_0700_OUTPUT = (
+    b'{"ok":true,"mode":"dry-run","started_at_utc":"2026-09-30T12:34:56Z",'
+    b'"completed_at_utc":"2026-09-30T12:34:56Z","duration_seconds":0.0,'
+    b'"backup":{"status":"skipped"},"production_releases":{"protected":["release-current",'
+    b'"release-previous"],"retained":[],"deleted":[],"reclaimable_bytes":0},'
+    b'"source_release_artifacts":{"protected":[],"retained":[],"deleted":[],"reclaimable_bytes":0},'
+    b'"live_qa_runtime_caches":{"protected":[],"retained":[],"deleted":[],'
+    b'"reclaimed_tombstones":["runtime-old"]},"transient":{"failed_builds":[".build-old"],'
+    b'"browser_test_artifacts":["test-results-old"],"preprod_screenshots":["shot-old.png"],'
+    b'"reclaimable_bytes":{"failed_builds":13,"browser_test_artifacts":17,"preprod_screenshots":19}},'
+    b'"disk_before":{"total_bytes":1000000,"used_bytes":400000,"free_bytes":600000,"used_percent":40.0},'
+    b'"disk_after":{"total_bytes":1000000,"used_bytes":400000,"free_bytes":600000,"used_percent":40.0},'
+    b'"limits":{"minimum_free_bytes":0,"maximum_used_percent":100.0,"live_qa_runtime_keep":1}}'
+)
+
+# The producer source is byte-for-byte equivalent at the second recorded SHA;
+# retain a separate name so both deployment records are regression-covered.
+LEGACY_RETENTION_87547_OUTPUT = LEGACY_RETENTION_0700_OUTPUT
+
+
+def legacy_storage_report(retention_output: bytes) -> bytes:
+    """Frame one fixed retention result as a complete diagnostics report."""
+
+    prefix, separator, _suffix = valid_storage_report().partition(
+        b"=== storage_retention_dry_run ===\n"
+    )
+    if not separator:
+        raise AssertionError("storage fixture is missing the retention frame")
+    return prefix + separator + retention_output

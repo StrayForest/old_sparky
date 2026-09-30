@@ -253,6 +253,31 @@ def _exact_numeric_summary(value: object, keys: set[str], *, maximum: float | No
     )
 
 
+def _exact_integer_summary(
+    value: object, keys: set[str], *, maximum: int | None = None
+) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == keys
+        and all(
+            isinstance(value.get(key), int)
+            and not isinstance(value.get(key), bool)
+            and value.get(key) >= 0
+            and (maximum is None or value.get(key) <= maximum)
+            for key in keys
+        )
+    )
+
+
+def _nonnegative_integer(value: object, *, maximum: int | None = None) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+        and (maximum is None or value <= maximum)
+    )
+
+
 def _validate_service(value: object) -> bool:
     if not isinstance(value, dict) or set(value) != {
         "schema", "kind", "status", "service", "error_class", "properties"
@@ -312,9 +337,9 @@ def _validate_retention(value: object) -> bool:
     }:
         return False
     if not all(
-        _exact_numeric_summary(categories[name], byte_category_keys, maximum=10**18)
+        _exact_integer_summary(categories[name], byte_category_keys, maximum=10**18)
         for name in ("production_releases", "source_release_artifacts")
-    ) or not _exact_numeric_summary(
+    ) or not _exact_integer_summary(
         categories["live_qa_runtime"], live_qa_category_keys, maximum=10**18
     ):
         return False
@@ -323,12 +348,12 @@ def _validate_retention(value: object) -> bool:
     item_keys = {"count", "reclaimable_bytes"}
     if not isinstance(transient, dict) or set(transient) != transient_keys:
         return False
-    if not all(_exact_numeric_summary(item, item_keys, maximum=10**18) for item in transient.values()):
+    if not all(_exact_integer_summary(item, item_keys, maximum=10**18) for item in transient.values()):
         return False
     transient_bytes = value.get("transient_reclaimable_bytes")
     if not isinstance(transient_bytes, dict) or set(transient_bytes) != transient_keys:
         return False
-    if not all(_nonnegative(item, maximum=10**18) for item in transient_bytes.values()):
+    if not all(_nonnegative_integer(item, maximum=10**18) for item in transient_bytes.values()):
         return False
     if not _nonnegative(value.get("duration_seconds"), maximum=10**9):
         return False
