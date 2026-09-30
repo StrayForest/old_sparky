@@ -27,6 +27,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |
+| Host systemd schedules and timer activation | [Systemd timer policy](systemd-timer-policy.md) |
 | Retained-load cleanup and hermetic web verification | [Retained-load and web verification](retained-load-and-web-verification.md) |
 | Authenticated HTML transport / TTFB hops | [Performance transport runbook](performance-transport-runbook.md) |
 | Load profiles and performance evidence | [`platform/performance/README.md`](../performance/README.md) |

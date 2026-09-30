@@ -24,11 +24,11 @@ platform dependencies.
 `deadlock-health-monitor.timer` performs the lightweight five-minute readiness,
 service, disk, memory, backup-age and certificate-expiry gate.
 `deadlock-maintenance.timer` runs the daily restore-verified backup and bounded
-retention workflow.
-
+retention workflow. The closed schedule and installer policy are in the
+[systemd timer policy](systemd-timer-policy.md); the hermetic
+`tests.test_platform_systemd_timer_contract` contract checks it.
 The complete production perimeter proof is the SHA-locked operator workflow;
 run it after the exact release is active:
-
 ```bash
 gh workflow run platform-production-as12-proof.yml \
   --repo StrayForest/old_sparky --ref dev \
