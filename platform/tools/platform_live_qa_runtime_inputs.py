@@ -236,6 +236,22 @@ def _manifest_from_payload(payload: Mapping[str, object]) -> RuntimeInputManifes
     )
 
 
+def _manifest_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return the path identity needed to bind lstat to the opened file."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def _read_manifest(path: Path) -> Mapping[str, object]:
     try:
         metadata = path.lstat()
@@ -247,6 +263,7 @@ def _read_manifest(path: Path) -> Mapping[str, object]:
             or metadata.st_size > MAX_MANIFEST_BYTES
         ):
             raise RuntimeInputsError("runtime input manifest metadata is unsafe")
+        lstat_identity = _manifest_identity(metadata)
         descriptor = os.open(
             path,
             os.O_RDONLY
@@ -259,6 +276,10 @@ def _read_manifest(path: Path) -> Mapping[str, object]:
         raise RuntimeInputsError("runtime input manifest is unavailable") from exc
     try:
         before = os.fstat(descriptor)
+        if _manifest_identity(before) != lstat_identity:
+            raise RuntimeInputsError(
+                "runtime input manifest changed before it was opened"
+            )
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_nlink != 1
@@ -275,29 +296,7 @@ def _read_manifest(path: Path) -> Mapping[str, object]:
             chunks.append(chunk)
             remaining -= len(chunk)
         after = os.fstat(descriptor)
-        identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_nlink,
-            before.st_uid,
-            before.st_gid,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        after_identity = (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_nlink,
-            after.st_uid,
-            after.st_gid,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        if after_identity != identity:
+        if _manifest_identity(after) != lstat_identity:
             raise RuntimeInputsError("runtime input manifest changed while reading")
         raw = b"".join(chunks)
     except OSError as exc:

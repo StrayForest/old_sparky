@@ -693,6 +693,50 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertFalse(manifest["deployable"])
             validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
 
+    def test_explicit_empty_provenance_overrides_generated_range_without_files_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            provenance_path = root / "provenance.json"
+            output_path = root / "classifier-manifest.json"
+            event_path.write_text(
+                json.dumps({"before": PR117_BASE_SHA, "after": PR117_MERGE_SHA}),
+                encoding="utf-8",
+            )
+            provenance_path.write_text("{}", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "platform/tools/platform_ci_classifier.py"),
+                    "--event",
+                    "push",
+                    "--target-sha",
+                    PR117_MERGE_SHA,
+                    "--branch",
+                    "dev",
+                    "--ref",
+                    "refs/heads/dev",
+                    "--event-file",
+                    str(event_path),
+                    "--provenance-file",
+                    str(provenance_path),
+                    "--repo-root",
+                    str(REPO_ROOT),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            manifest = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["class"], "full")
+            self.assertTrue(manifest["fallback"])
+            self.assertTrue(manifest["runtime_sensitive"])
+            self.assertFalse(manifest["deployable"])
+            validate_manifest(manifest, expected_target_sha=PR117_MERGE_SHA)
+
     def test_push_requires_head_equal_to_tested_sha_but_pr_uses_source_head(self) -> None:
         push = classify(
             ["platform/docs/CURRENT.md"],
@@ -723,6 +767,65 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         self.assertFalse(pull_request["fallback"])
         self.assertFalse(pull_request["deployable"])
+
+    def test_all_zero_push_head_or_target_sha_is_fail_closed(self) -> None:
+        full_files = ["platform/apps/platform_api/app/main.py"]
+        zero_head = classify(
+            full_files,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+            provenance=complete_provenance(
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+                head="0" * 40,
+            ),
+        )
+        zero_target = classify(
+            full_files,
+            event="push",
+            target_sha="0" * 40,
+            branch="dev",
+            provenance=complete_provenance(
+                event="push",
+                target_sha="0" * 40,
+                branch="dev",
+            ),
+        )
+        for label, manifest, expected_target in (
+            ("zero head", zero_head, self.TARGET_SHA),
+            ("zero target", zero_target, "0" * 40),
+        ):
+            with self.subTest(sha=label):
+                self.assertEqual(manifest["class"], "full")
+                self.assertTrue(manifest["fallback"])
+                self.assertTrue(manifest["runtime_sensitive"])
+                self.assertFalse(manifest["deployable"])
+                validate_manifest(manifest, expected_target_sha=expected_target)
+
+        generated_zero_head = self._run_classifier_fixture(
+            event="push",
+            payload={"before": PR117_BASE_SHA, "after": "0" * 40},
+            target_sha=PR117_MERGE_SHA,
+            branch="dev",
+        )
+        generated_zero_target = self._run_classifier_fixture(
+            event="push",
+            payload={"before": PR117_BASE_SHA, "after": PR117_MERGE_SHA},
+            target_sha="0" * 40,
+            branch="dev",
+        )
+        for label, manifest, expected_target in (
+            ("generated zero head", generated_zero_head, PR117_MERGE_SHA),
+            ("generated zero target", generated_zero_target, "0" * 40),
+        ):
+            with self.subTest(generated_sha=label):
+                self.assertEqual(manifest["class"], "full")
+                self.assertTrue(manifest["fallback"])
+                self.assertTrue(manifest["runtime_sensitive"])
+                self.assertFalse(manifest["deployable"])
+                validate_manifest(manifest, expected_target_sha=expected_target)
 
     def test_malformed_input_cannot_be_promoted_by_tampering(self) -> None:
         malformed = classify(

@@ -357,6 +357,7 @@ def _normalise_provenance(
         SHA_RE.fullmatch(normalised["base"]) is None
         or SHA_RE.fullmatch(normalised["head"]) is None
         or set(normalised["base"]) == {"0"}
+        or set(normalised["head"]) == {"0"}
     ):
         return _default_provenance(), "diff provenance SHA values are malformed"
     if not complete:
@@ -446,6 +447,7 @@ def _build_manifest(
         and event == "push"
         and branch == "dev"
         and bool(SHA_RE.fullmatch(target_sha))
+        and set(target_sha) != {"0"}
     )
     payload: dict[str, object] = {
         "schema": MANIFEST_SCHEMA,
@@ -495,6 +497,7 @@ def classify(
         and provenance_reason is None
         and bool(normalised_provenance.get("complete"))
         and SHA_RE.fullmatch(target_sha) is not None
+        and set(target_sha) != {"0"}
         and (
             event != "push"
             or normalised_provenance.get("head") == target_sha
@@ -554,7 +557,7 @@ def classify(
             provenance=normalised_provenance,
             runtime_sensitive=True,
         )
-    if not SHA_RE.fullmatch(target_sha):
+    if SHA_RE.fullmatch(target_sha) is None or set(target_sha) == {"0"}:
         return _build_manifest(
             target_sha=target_sha,
             event=event,
@@ -657,7 +660,9 @@ def validate_manifest(
         if not isinstance(manifest.get(field), bool):
             raise ClassifierError(f"classifier {field} must be boolean")
     if not manifest["fallback"] and (
-        not target_sha or not SHA_RE.fullmatch(target_sha)
+        not target_sha
+        or SHA_RE.fullmatch(target_sha) is None
+        or set(target_sha) == {"0"}
     ):
         raise ClassifierError("classifier target_sha is malformed")
     if not isinstance(manifest.get("reason"), str) or not manifest["reason"]:
@@ -755,6 +760,7 @@ def _git_changed_files(
         or not SHA_RE.fullmatch(base_sha)
         or not SHA_RE.fullmatch(head_sha)
         or set(base_sha) == {"0"}
+        or set(head_sha) == {"0"}
     ):
         return [], False, "changed-file range is missing or malformed", _default_provenance()
     if not isinstance(ref, str) or not ref:
@@ -847,6 +853,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     event_payload: Mapping[str, object] = {}
     explicit_provenance: Mapping[str, object] | None = None
+    provenance_supplied = args.provenance_file is not None
     provenance_error: str | None = None
     if args.provenance_file is not None:
         try:
@@ -902,7 +909,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     branch=args.branch,
                     repository_ready=ready,
                     fallback_reason=reason,
-                    provenance=explicit_provenance or generated_provenance,
+                    provenance=(
+                        explicit_provenance
+                        if provenance_supplied
+                        else generated_provenance
+                    ),
                 )
     elif args.files_file is not None:
         try:
@@ -954,7 +965,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 branch=args.branch,
                 repository_ready=ready,
                 fallback_reason=reason,
-                provenance=explicit_provenance or generated_provenance,
+                provenance=(
+                    explicit_provenance
+                    if provenance_supplied
+                    else generated_provenance
+                ),
             )
 
     if provenance_error is not None:
