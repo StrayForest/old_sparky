@@ -170,10 +170,29 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             for path in (app_dir / "current", app_dir / "previous")
         }
 
-        completed = subprocess.run(
+        # Keep the fixture substitutions, but otherwise mirror the production
+        # diagnostics command: a JSON dry-run with no backup/apply switches.
+        producer_argv = [
+            sys.executable,
+            str(REPO_ROOT / "platform/tools/platform_storage_maintenance.py"),
+            "--app-dir",
+            str(app_dir),
+            "--source-release-dir",
+            str(source_dir),
+            "--web-artifact-dir",
+            str(web_dir),
+            "--live-qa-runtime-root",
+            str(live_qa_root),
+            "--minimum-free-gib",
+            "0",
+            "--maximum-used-percent",
+            "100",
+            "--json",
+            "--skip-backup",
+        ]
+        self.assertEqual(
+            producer_argv[2:],
             [
-                sys.executable,
-                str(REPO_ROOT / "platform/tools/platform_storage_maintenance.py"),
                 "--app-dir",
                 str(app_dir),
                 "--source-release-dir",
@@ -187,7 +206,13 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "--maximum-used-percent",
                 "100",
                 "--json",
+                "--skip-backup",
             ],
+        )
+        self.assertNotIn("--backup-only", producer_argv)
+        self.assertNotIn("--apply", producer_argv)
+        completed = subprocess.run(
+            producer_argv,
             check=False,
             capture_output=True,
             text=True,

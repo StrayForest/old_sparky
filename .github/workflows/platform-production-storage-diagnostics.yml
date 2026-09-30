@@ -477,7 +477,7 @@ jobs:
           test "$(stat -c '%F:%a' -- "$retention_file")" = "regular file:600"
           set +e
           timeout --foreground --signal=TERM --kill-after=5s 90s \
-            "$python_bin" "$maintenance_tool" --json \
+            "$python_bin" "$maintenance_tool" --json --skip-backup \
             >"$retention_file" 2>/dev/null
           retention_status="$?"
           set -e

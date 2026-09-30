@@ -1768,6 +1768,10 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("platform_storage_maintenance.py", workflow)
         self.assertIn("--json", workflow)
         self.assertIn(
+            '"$python_bin" "$maintenance_tool" --json --skip-backup',
+            workflow,
+        )
+        self.assertIn(
             "df -B1 --output=size,used,avail,pcent -- \"$path\"", workflow
         )
         self.assertIn(
