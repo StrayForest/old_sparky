@@ -237,7 +237,8 @@ HOST_TOOLS_ROOT=/opt/oldsparky/platform/shared/host-tools
 The helper requires UID and EUID 0, a no-symlink root-owned parent chain with
 no untrusted write access (a root-owned sticky system temporary directory is
 allowed), and a same-filesystem private stage under `host-tools`, with
-`O_EXCL|O_NOFOLLOW` full writes and `fsync` of every file/stage/parent. It applies `root:root`, `0555`
+unnamed `O_TMPFILE` writes, `linkat` publication through directory descriptors,
+`O_NOFOLLOW` and `fsync` of every file/stage/parent. It applies `root:root`, `0555`
 to all 13 scripts and `0444` to `manifest.json`/`capabilities.txt`, checks the
 exact inventory and digests, then publishes with Linux `renameat2`+
 `RENAME_NOREPLACE`; `os.replace`, plain `mv` and overwrite are not accepted.
@@ -258,12 +259,14 @@ reviewed `dev` push/automatic chain.
 Evidence is never stored under `HOST_TOOLS_ROOT` or a generation directory.
 `INSTALL_EVIDENCE` must be a newly-created fixed handoff filename in a
 root-owned, non-symlink, mode-0700 secure directory (a root-owned sticky parent
-such as `/tmp` is allowed). The file is opened with `O_EXCL|O_NOFOLLOW`, fully
-written, fsynced and rechecked by pathname/device/inode/link-count/mode/owner;
-an existing file, symlink, hardlink, special file, partial write, missing
-primitive or cross-device stage is a hard failure. Parent directories are
-fsynced after unlink. Signals, `KeyboardInterrupt` and `SystemExit` retain
-their original exception and never trigger broad quarantine. `current`,
+such as `/tmp` is allowed). The file is published from an unnamed
+`O_TMPFILE` inode with `linkat` through a directory descriptor, fully written,
+fsynced and rechecked by pathname/device/inode/link-count/mode/owner; an
+existing mismatched file, symlink, hardlink, special file, partial write,
+missing primitive or cross-device stage is a hard failure. An exact existing
+receipt may be adopted on an idempotent retry. Parent directories are fsynced
+after publication or unlink. Signals, `KeyboardInterrupt` and `SystemExit`
+retain their original exception and never trigger broad quarantine. `current`,
 `previous` and all pre-existing generations are outside the cleanup identity
 set.
 
@@ -271,8 +274,8 @@ The trusted-root threat model is explicit: the reviewed helper and the
 independently supplied receipt digest are trusted inputs; artifact bytes,
 artifact paths, receipt contents, handoff paths and host-directory entries are
 attacker-controlled. The helper therefore rejects unavailable
-`O_DIRECTORY`/`O_CLOEXEC`/`O_NOFOLLOW`/`O_EXCL`, `dir_fd`, `pread`, `fchmod`,
-`fchown`, `fsync` or `renameat2(RENAME_NOREPLACE)` semantics rather than
+`O_DIRECTORY`/`O_CLOEXEC`/`O_NOFOLLOW`/`O_EXCL`/`O_TMPFILE`, `linkat`, `dir_fd`,
+`pread`, `fchmod`, `fchown`, `fsync` or `renameat2(RENAME_NOREPLACE)` semantics rather than
 falling back to weaker operations. After byte/provenance verification it runs
 exact `/usr/bin/python3.12 -I -B` capability and host-contract self-tests in
 that new generation, then repeats the closed inventory check; failure removes

@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -216,6 +218,34 @@ class HostToolsInstallerTests(unittest.TestCase):
                         )
                 self.assertFalse(output.exists())
 
+    def test_outer_link_interrupt_reconciles_exact_published_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            outer, digests = self._artifact(work)
+            output = work / "linked-inner.zip"
+            original_hook = bundle.INJECTION_HOOK
+
+            def interrupt(point: str) -> None:
+                if point in {"linkat_after_success", "outer_extract_after_link"}:
+                    raise KeyboardInterrupt(point)
+
+            bundle.INJECTION_HOOK = interrupt
+            try:
+                for point in ("linkat_after_success", "outer_extract_after_link"):
+                    with self.subTest(point=point):
+                        with self.assertRaises(KeyboardInterrupt):
+                            bundle.extract_outer_bundle(
+                                outer,
+                                output,
+                                expected_outer_sha256=digests["outer"],
+                                expected_inner_sha256=digests["inner"],
+                            )
+                        self.assertTrue(output.is_file())
+                        self.assertEqual(output.stat().st_nlink, 1)
+                        output.unlink()
+            finally:
+                bundle.INJECTION_HOOK = original_hook
+
     def test_signal_abort_preserves_original_and_cleans_partial_stage_member(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -305,6 +335,39 @@ class HostToolsInstallerTests(unittest.TestCase):
                             )
                     self.assertFalse(evidence.exists())
 
+    def test_evidence_is_final_commit_marker_and_retry_adopts_exact_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host_root = root / "host-tools"
+            host_root.mkdir(mode=0o755)
+            handoff = root / "secure-handoff"
+            handoff.mkdir(mode=0o700)
+            evidence = handoff / "evidence.json"
+            payload = {"schema": bundle.PROVENANCE_SCHEMA, "status": "installed"}
+            original_hook = bundle.INJECTION_HOOK
+
+            def interrupt(point: str) -> None:
+                if point == "evidence_after_link":
+                    raise KeyboardInterrupt(point)
+
+            bundle.INJECTION_HOOK = interrupt
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    bundle._write_evidence(evidence, payload, host_tools_root=host_root)
+            finally:
+                bundle.INJECTION_HOOK = original_hook
+            self.assertTrue(evidence.is_file())
+            first_inode = evidence.stat().st_ino
+            adopted = bundle._write_evidence(evidence, payload, host_tools_root=host_root)
+            self.assertEqual(adopted.metadata.st_ino, first_inode)
+            self.assertEqual(evidence.read_bytes(), bundle._canonical_json(payload))
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle._write_evidence(
+                    evidence,
+                    {"schema": bundle.PROVENANCE_SCHEMA, "status": "different"},
+                    host_tools_root=host_root,
+                )
+
     def test_evidence_output_under_generation_is_rejected_before_install(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -393,6 +456,21 @@ class HostToolsInstallerTests(unittest.TestCase):
                 "LOCAL GATE BLOCKED: missing privileged namespace prerequisite "
                 + ", ".join(missing)
             )
+        opt_before = subprocess.check_output(
+            ["/usr/bin/stat", "-c", "%d:%i:%u:%g:%a", "/opt"],
+            text=True,
+        ).strip()
+        mountinfo_before = tuple(
+            line
+            for line in Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines()
+            if len(line.split()) > 4 and line.split()[4] == "/opt"
+        )
+        host_generation = Path("/opt/oldsparky/platform/shared/host-tools") / SOURCE_SHA
+        host_generation_before = (
+            (host_generation.stat().st_dev, host_generation.stat().st_ino, host_generation.stat().st_mode)
+            if host_generation.exists()
+            else None
+        )
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
             outer, digests = self._artifact(work)
@@ -478,8 +556,73 @@ class HostToolsInstallerTests(unittest.TestCase):
                 payload["self_tests"],
                 {"host-capabilities": "passed", "host-contract": "passed"},
             )
+            self.assertEqual(list(payload["self_tests"]), ["host-capabilities", "host-contract"])
+        opt_after = subprocess.check_output(
+            ["/usr/bin/stat", "-c", "%d:%i:%u:%g:%a", "/opt"],
+            text=True,
+        ).strip()
+        mountinfo_after = tuple(
+            line
+            for line in Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines()
+            if len(line.split()) > 4 and line.split()[4] == "/opt"
+        )
+        self.assertEqual(opt_after, opt_before)
+        self.assertEqual(mountinfo_after, mountinfo_before)
+        if host_generation_before is None:
+            self.assertFalse(host_generation.exists())
+        else:
+            self.assertEqual(
+                (host_generation.stat().st_dev, host_generation.stat().st_ino, host_generation.stat().st_mode),
+                host_generation_before,
+            )
 
-    def test_evidence_failure_rolls_back_only_new_generation(self) -> None:
+    def test_self_tests_keep_capabilities_before_contract_and_fail_closed(self) -> None:
+        generation = Path("/tmp") / ("host-tools-self-test-" + SOURCE_SHA)
+        calls: list[str] = []
+        expected_capabilities = (
+            "HOST_TOOLS schema=1 "
+            f"source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
+            "dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 "
+            "python_isolated=1 python_bytecode_disabled=1\n"
+        )
+        expected_contract = (
+            "HOST_TOOLS_CONTRACT "
+            f"source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
+            f"manifest_sha256={'f' * 64} capabilities_sha256={'e' * 64}\n"
+        )
+
+        def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            action = "host-capabilities" if "host-capabilities" in command else "host-contract"
+            calls.append(action)
+            output = (
+                expected_capabilities
+                if action == "host-capabilities"
+                else expected_contract
+            )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=output.encode("ascii"),
+                stderr=b"",
+            )
+
+        with patch.object(bundle.subprocess, "run", side_effect=fake_run):
+            result = bundle._run_post_install_self_tests(
+                generation,
+                source_sha=SOURCE_SHA,
+                manifest_sha256="f" * 64,
+                capabilities_sha256="e" * 64,
+            )
+        self.assertEqual(calls, ["host-capabilities", "host-contract"])
+        self.assertEqual(
+            result,
+            {
+                "host-capabilities": expected_capabilities,
+                "host-contract": expected_contract,
+            },
+        )
+
+    def test_evidence_failure_retains_generation_without_success_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
             host_root = work / "host-tools"
@@ -518,15 +661,44 @@ class HostToolsInstallerTests(unittest.TestCase):
                             expected_receipt_sha256=receipt_sha256,
                             evidence_output=evidence,
                         )
-            self.assertFalse((host_root / SOURCE_SHA).exists())
+            # Generation publication is durable/uncertain before evidence is
+            # the final commit marker.  A failed evidence write therefore
+            # retains the exact generation for reconciliation/retry, while
+            # never leaving an ``installed`` receipt behind.
+            self.assertTrue((host_root / SOURCE_SHA).exists())
+            self.assertFalse(evidence.exists())
             self.assertEqual((host_root / "current").read_text(encoding="ascii"), "keep\n")
             self.assertEqual((host_root / "previous").read_text(encoding="ascii"), "keep\n")
 
+    def test_rename_interrupt_reconciles_exact_generation_without_stage_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            host_root = work / "host-tools"
+            host_root.mkdir()
+            original_hook = bundle.INJECTION_HOOK
+
+            def interrupt(point: str) -> None:
+                if point == "rename_noreplace_after_success":
+                    raise KeyboardInterrupt(point)
+
+            bundle.INJECTION_HOOK = interrupt
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    self._install(host_root, work)
+            finally:
+                bundle.INJECTION_HOOK = original_hook
+            generation = host_root / SOURCE_SHA
+            self.assertTrue(generation.is_dir())
+            self.assertFalse(any(path.name.startswith(".host-tools-stage-") for path in host_root.iterdir()))
+
     def test_missing_primitives_and_device_mismatch_fail_closed(self) -> None:
-        for name in ("O_DIRECTORY", "O_CLOEXEC", "O_NOFOLLOW", "O_EXCL"):
+        for name in ("O_DIRECTORY", "O_CLOEXEC", "O_NOFOLLOW", "O_EXCL", "O_TMPFILE"):
             with self.subTest(primitive=name), patch.object(bundle.os, name, None):
                 with self.assertRaises(bundle.HostToolsBundleError):
                     bundle._require_install_primitives()
+        with patch.object(bundle.ctypes, "CDLL", return_value=object()):
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle._require_install_primitives()
         for name in ("pread", "fchmod", "fchown", "fsync"):
             with self.subTest(primitive=name), patch.object(bundle.os, name, None):
                 with self.assertRaises(bundle.HostToolsBundleError):
@@ -616,6 +788,181 @@ class HostToolsInstallerTests(unittest.TestCase):
                     security_run_attempt=SECURITY_RUN_ATTEMPT,
                     expected_receipt_sha256=receipt_sha256,
                 )
+
+
+class HostToolsTrustedOutputTests(unittest.TestCase):
+    def test_outer_extraction_uses_current_unprivileged_owner(self) -> None:
+        """The secret-free output policy is distinct from root installation."""
+
+        if os.getuid() != 0:
+            self.skipTest("the focused runner is already unprivileged")
+        runuser = shutil.which("runuser")
+        if runuser is None:
+            self.fail("LOCAL GATE BLOCKED: runuser is required for the unprivileged output test")
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            outer, digests = HostToolsInstallerTests()._artifact(work)
+            output_dir = work / "unprivileged-output"
+            output_dir.mkdir(mode=0o700)
+            os.chown(work, 65534, 65534)
+            os.chown(outer, 65534, 65534)
+            os.chown(output_dir, 65534, 65534)
+            os.chmod(work, 0o755)
+            os.chmod(outer, 0o644)
+            helper = bundle.__file__
+            script = (
+                "from pathlib import Path; "
+                "from tools import platform_host_tools_bundle as b; "
+                "import os, sys; "
+                "p=Path(sys.argv[1]); "
+                "b.extract_outer_bundle(p/'outer-0.zip', p/'unprivileged-output'/'inner.zip', "
+                "expected_outer_sha256=sys.argv[2], expected_inner_sha256=sys.argv[3]); "
+                "q=p/'unprivileged-output'/'inner.zip'; "
+                "assert q.stat().st_uid == os.getuid() and q.stat().st_gid == os.getgid(); "
+                "assert (q.stat().st_mode & 0o777) == 0o600"
+            )
+            completed = subprocess.run(
+                [
+                    runuser,
+                    "-u",
+                    "nobody",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(work),
+                    digests["outer"],
+                    digests["inner"],
+                ],
+                env={**os.environ, "PYTHONPATH": str(Path(helper).parents[1])},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
+class ReleaseArtifactRawZipTests(unittest.TestCase):
+    def _zip_fixture(
+        self,
+        root: Path,
+        slug: str,
+        members: list[tuple[str, bytes, int | None]],
+    ) -> tuple[Path, str]:
+        archive = root / "release-api.zip"
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as opened:
+            for name, data, external_attr in members:
+                info = zipfile.ZipInfo(name)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                if external_attr is not None:
+                    info.create_system = 3
+                    info.external_attr = external_attr
+                opened.writestr(info, data)
+        return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    def test_raw_api_release_zip_round_trip_is_exact_three_member_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            slug = "gha-123-4-abcdefabcdef"
+            names = (
+                f"{slug}.tar.gz",
+                f"{slug}.tar.gz.sha256",
+                "RELEASE.provenance.json",
+            )
+            payloads = {
+                names[0]: b"release archive bytes\n",
+                names[1]: f"{'a' * 64}  {names[0]}\n".encode("ascii"),
+                names[2]: b'{"schema":1}\n',
+            }
+            archive, digest = self._zip_fixture(
+                root,
+                slug,
+                [(name, payloads[name], None) for name in names],
+            )
+            summary = bundle.extract_release_artifact(
+                archive,
+                root / "release",
+                release_slug=slug,
+                expected_archive_sha256=digest,
+            )
+            output = root / "release"
+            self.assertEqual(set(path.name for path in output.iterdir()), set(names))
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in output.iterdir()}, payloads
+            )
+            self.assertEqual(summary["archive_sha256"], digest)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+            for path in output.iterdir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(path.stat().st_uid, os.getuid())
+                self.assertEqual(path.stat().st_gid, os.getgid())
+
+    def test_raw_api_release_zip_rejects_bad_members_and_retains_uncertain_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            slug = "gha-123-4-abcdefabcdef"
+            expected = {
+                f"{slug}.tar.gz": b"archive",
+                f"{slug}.tar.gz.sha256": b"checksum",
+                "RELEASE.provenance.json": b"provenance",
+            }
+            cases = {
+                "traversal": [
+                    ("../escape", b"x", None),
+                    *[(name, data, None) for name, data in expected.items()],
+                ],
+                "extra": [
+                    *[(name, data, None) for name, data in expected.items()],
+                    ("extra", b"x", None),
+                ],
+                "link": [
+                    (
+                        name,
+                        data,
+                        ((stat.S_IFLNK | 0o777) << 16)
+                        if name == f"{slug}.tar.gz"
+                        else None,
+                    )
+                    for name, data in expected.items()
+                ],
+            }
+            for label, members in cases.items():
+                with self.subTest(label=label):
+                    archive, digest = self._zip_fixture(root, slug, members)
+                    with self.assertRaises(bundle.HostToolsBundleError):
+                        bundle.extract_release_artifact(
+                            archive,
+                            root / f"release-{label}",
+                            release_slug=slug,
+                            expected_archive_sha256=digest,
+                        )
+            valid_archive, valid_digest = self._zip_fixture(
+                root,
+                slug,
+                [(name, data, None) for name, data in expected.items()],
+            )
+            output = root / "retained"
+            original_hook = bundle.INJECTION_HOOK
+
+            def interrupt(point: str) -> None:
+                if point == "release_extract_after_rename":
+                    raise KeyboardInterrupt()
+
+            bundle.INJECTION_HOOK = interrupt
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    bundle.extract_release_artifact(
+                        valid_archive,
+                        output,
+                        release_slug=slug,
+                        expected_archive_sha256=valid_digest,
+                    )
+            finally:
+                bundle.INJECTION_HOOK = original_hook
+            self.assertTrue(output.is_dir())
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in output.iterdir()}, expected
+            )
 
 
 class HostToolsOuterEnvelopeTests(unittest.TestCase):

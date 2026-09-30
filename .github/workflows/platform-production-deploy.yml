@@ -742,33 +742,33 @@ jobs:
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
-          scan="$ssh_dir/known_hosts"
-          scan_ok=0
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh_scan_ok=0
           for ssh_attempt in 1 2; do
-            candidate="$ssh_dir/known_hosts.$ssh_attempt"
-            rm -f -- "$candidate"
-            install -m 600 /dev/null "$candidate"
-            if timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" >"$candidate" 2>/dev/null \
-              && awk -v host="$PROD_SSH_HOST" 'NR == 1 && NF == 3 && $1 == host && $2 == "ssh-ed25519" { valid=1; next } { invalid=1 } END { exit !(NR == 1 && valid == 1 && !invalid) }' "$candidate" \
-              && test "$(ssh-keygen -lf "$candidate" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"; then
-              mv -- "$candidate" "$scan"
-              scan_ok=1
+            ssh_scan_attempt="$ssh_scan.$ssh_attempt"
+            rm -f -- "$ssh_scan_attempt"
+            install -m 600 /dev/null "$ssh_scan_attempt"
+            if timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" >"$ssh_scan_attempt" 2>/dev/null \
+              && awk -v host="$PROD_SSH_HOST" 'NR == 1 && NF == 3 && $1 == host && $2 == "ssh-ed25519" { valid=1; next } { invalid=1 } END { exit !(NR == 1 && valid == 1 && !invalid) }' "$ssh_scan_attempt" \
+              && test "$(ssh-keygen -lf "$ssh_scan_attempt" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"; then
+              mv -- "$ssh_scan_attempt" "$ssh_scan"
+              ssh_scan_ok=1
               break
             fi
-            rm -f -- "$candidate"
+            rm -f -- "$ssh_scan_attempt"
             (( ssh_attempt == 2 )) || sleep 0.5
           done
-          test "$scan_ok" = 1
+          test "$ssh_scan_ok" = 1
           {
             printf '%s\n' 'Host *'
             printf '  StrictHostKeyChecking yes\n'
-            printf '  UserKnownHostsFile %s\n' "$scan"
+            printf '  UserKnownHostsFile %s\n' "$ssh_scan"
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
           test "$(stat -c '%F:%a' -- "$ssh_dir")" = "directory:700"
           test "$(stat -c '%u:%g' -- "$ssh_dir")" = "$(id -u):$(id -g)"
           test "$(stat -c '%F:%h:%a' -- "$ssh_dir/config")" = "regular file:1:600"
-          test "$(stat -c '%F:%h:%a' -- "$ssh_dir/known_hosts")" = "regular file:1:600"
+          test "$(stat -c '%F:%h:%a' -- "$ssh_scan")" = "regular file:1:600"
           test "$(stat -c '%F:%h:%a' -- "$ssh_dir/id_ed25519")" = "regular file:1:600"
           printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
@@ -829,7 +829,7 @@ jobs:
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/platform-host-capability-ssh"
           if [[ -d "$ssh_dir" && ! -L "$ssh_dir" ]]; then
-            rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.1" "$ssh_dir/known_hosts.2" "$ssh_dir/config"
+            rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts.scan" "$ssh_dir/known_hosts.scan.1" "$ssh_dir/known_hosts.scan.2" "$ssh_dir/config"
             rmdir -- "$ssh_dir"
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
@@ -1630,13 +1630,15 @@ jobs:
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
             --data "{\"state\":\"pending\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment is running\",\"target_url\":\"${run_url}\"}"
 
-      - name: Download published release artifact for deployment
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+      - name: Checkout pinned host-tools release verifier
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          name: platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/release
+          ref: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}
+          path: trusted-host-tools
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Verify published release artifact
+      - name: Verify and extract exact raw API release artifact
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1647,22 +1649,25 @@ jobs:
           [[ "$PUBLISHED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || { echo "Published GitHub artifact ID is invalid" >&2; exit 1; }
           [[ "$PUBLISHED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo "Published GitHub artifact digest is invalid" >&2; exit 1; }
           artifact_metadata="$RUNNER_TEMP/platform-release-artifact-metadata.json"
+          expected_artifact_name='platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}'
+          test "$expected_artifact_name" = "platform-release-artifact-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}" --output "$artifact_metadata"
-          /usr/bin/python3 - "$artifact_metadata" "$PUBLISHED_ARTIFACT_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          /usr/bin/python3 - "$artifact_metadata" "$PUBLISHED_ARTIFACT_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" "$expected_artifact_name" <<'PY'
           import json
           from pathlib import Path
           import sys
 
-          metadata_path, artifact_id, run_id, attempt, target_sha = sys.argv[1:]
+          metadata_path, artifact_id, run_id, attempt, target_sha, expected_name = sys.argv[1:]
           payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-          if payload.get("id") != int(artifact_id) or payload.get("name") != f"platform-release-artifact-{run_id}-{attempt}" or payload.get("expired") is not False:
+          if payload.get("id") != int(artifact_id) or payload.get("name") != expected_name or payload.get("expired") is not False:
               raise SystemExit("published release artifact metadata is not the exact current-run artifact")
           workflow_run = payload.get("workflow_run")
           if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
               raise SystemExit("published release artifact is not bound to this exact workflow run and SHA")
           PY
           artifact_zip="$RUNNER_TEMP/platform-release-artifact.zip"
+          rm -f -- "$artifact_zip"
           curl --fail-with-body --silent --show-error --location --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}/zip" --output "$artifact_zip"
           printf '%s  %s\n' "$PUBLISHED_ARTIFACT_DIGEST" "$artifact_zip" | sha256sum -c - >/dev/null 2>/dev/null || { echo "Published GitHub artifact digest verification failed" >&2; exit 1; }
@@ -1684,11 +1689,22 @@ jobs:
           print(release_slug)
           PY
           )"
-          release_archive="$(find "$RUNNER_TEMP/release" -maxdepth 1 -type f -name "${release_slug}.tar.gz" -print -quit)"
-          test -n "$release_archive" || { echo "Published release artifact is missing" >&2; exit 1; }
-          release_checksum="${release_archive}.sha256"
-          release_provenance="$RUNNER_TEMP/release/RELEASE.provenance.json"
-          test -f "$release_checksum" && test -f "$release_provenance"
+          trusted_tool="$GITHUB_WORKSPACE/trusted-host-tools/platform/tools/platform_host_tools_bundle.py"
+          test -f "$trusted_tool" && test ! -L "$trusted_tool"
+          test "$(git -C "$GITHUB_WORKSPACE/trusted-host-tools" rev-parse HEAD)" = "$HOST_TOOLS_SHA"
+          release_dir="$RUNNER_TEMP/release"
+          test ! -e "$release_dir" && test ! -L "$release_dir"
+          env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -I -B "$trusted_tool" extract-release-artifact \
+            --archive "$artifact_zip" \
+            --output-dir "$release_dir" \
+            --release-slug "$release_slug" \
+            --expected-archive-sha256 "$PUBLISHED_ARTIFACT_DIGEST"
+          release_archive="$release_dir/${release_slug}.tar.gz"
+          release_checksum="$release_dir/${release_slug}.tar.gz.sha256"
+          release_provenance="$release_dir/RELEASE.provenance.json"
+          for release_file in "$release_archive" "$release_checksum" "$release_provenance"; do
+            test -f "$release_file" && test ! -L "$release_file"
+          done
           (cd "$(dirname "$release_archive")" && sha256sum -c "$(basename "$release_checksum")")
           /usr/bin/python3 - "$release_archive" "$release_provenance" "$TARGET_SHA" <<'PY'
           import hashlib
@@ -1831,6 +1847,16 @@ jobs:
           ssh_dir="$RUNNER_TEMP/platform-production-deploy-ssh"
           test "$ssh_dir" = "$RUNNER_TEMP/platform-production-deploy-ssh"
           rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$RUNNER_TEMP/platform-production-deploy-remote.log" "$RUNNER_TEMP/platform-production-deploy-remote-error.log" "$RUNNER_TEMP/platform-release-artifact.zip"
+          release_dir="$RUNNER_TEMP/release"
+          if [[ -d "$release_dir" && ! -L "$release_dir" ]]; then
+            rm -rf -- "$release_dir"
+          fi
+          test ! -e "$release_dir" && test ! -L "$release_dir"
+          trusted_root="$GITHUB_WORKSPACE/trusted-host-tools"
+          if [[ -d "$trusted_root" && ! -L "$trusted_root" ]]; then
+            rm -rf -- "$trusted_root"
+          fi
+          test ! -e "$trusted_root" && test ! -L "$trusted_root"
           if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
             test -d "$ssh_dir" && test ! -L "$ssh_dir"
             rm -f -- \

@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import zipfile
+from collections.abc import Callable
 
 
 SCHEMA = 1
@@ -30,6 +31,9 @@ PROVENANCE_SCHEMA = 2
 TOOLSET_VERSION = "production-host-tools-v2"
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_ARCHIVE_BYTES = 8 * 1024 * 1024
+MAX_RELEASE_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
+MAX_RELEASE_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
+MAX_RELEASE_MEMBER_COUNT = 3
 MAX_FILE_BYTES = 512 * 1024
 MAX_FILE_COUNT = 32
 MAX_OUTER_MEMBER_BYTES = MAX_BUNDLE_BYTES
@@ -40,6 +44,7 @@ OUTER_MEMBER_NAME = "platform-host-tools-bundle.zip"
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SAFE_FILE_RE = re.compile(r"^platform_[A-Za-z0-9_.-]+\.(?:py|sh)$")
+RELEASE_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 
 # This is the complete release-independent closure used by the fixed
 # dispatcher and production deployment control after one generation is
@@ -82,6 +87,9 @@ HOST_GENERATION_MODE = 0o555
 STAGE_MODE = 0o700
 EVIDENCE_MODE = 0o600
 RENAME_NOREPLACE = 1
+AT_EMPTY_PATH = 0x1000
+AT_FDCWD = -100
+AT_SYMLINK_FOLLOW = 0x400
 HOST_TOOLS_INVENTORY = frozenset((*HOST_TOOL_FILES, "manifest.json", "capabilities.txt"))
 MAX_EVIDENCE_BYTES = 64 * 1024
 PROVENANCE_RECEIPT_MAX_BYTES = 64 * 1024
@@ -104,6 +112,12 @@ HOST_ARTIFACT_NAME_RE = re.compile(
     r"^platform-host-tools-bundle-(?P<run_id>[1-9][0-9]{0,31})-"
     r"(?P<run_attempt>[1-9][0-9]{0,31})$"
 )
+
+# Tests and the operator-side verifier need deterministic ways to exercise
+# every post-creation/post-publish interruption window.  The hook is inert in
+# production and deliberately raises whatever BaseException the caller asks
+# it to raise; cleanup code below must preserve that original exception.
+INJECTION_HOOK: Callable[[str], None] | None = None
 PROVENANCE_RECEIPT_KEYS = frozenset(
     {
         "schema",
@@ -137,6 +151,34 @@ class HostToolsBundleError(ValueError):
     """Bounded validation failure for the offline host-tools contract."""
 
 
+class _OwnedFile:
+    """Identity and byte contract for one file created by this process."""
+
+    __slots__ = ("metadata", "size", "sha256", "mode", "uid", "gid")
+
+    def __init__(
+        self,
+        metadata: os.stat_result,
+        size: int,
+        sha256: str,
+        mode: int,
+        uid: int,
+        gid: int,
+    ) -> None:
+        self.metadata = metadata
+        self.size = size
+        self.sha256 = sha256
+        self.mode = mode
+        self.uid = uid
+        self.gid = gid
+
+
+def _injection_point(name: str) -> None:
+    hook = INJECTION_HOOK
+    if hook is not None:
+        hook(name)
+
+
 def _require_os_flag(name: str) -> int:
     """Require a kernel flag instead of silently weakening the boundary."""
 
@@ -153,6 +195,27 @@ def _require_fd_primitive(name: str) -> object:
     return primitive
 
 
+def _linkat_function() -> object:
+    """Return the libc ``linkat`` primitive used for unnamed publication."""
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        linkat = libc.linkat
+        linkat.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        linkat.restype = ctypes.c_int
+        return linkat
+    except (AttributeError, OSError, TypeError) as exc:
+        raise HostToolsBundleError(
+            "host-tools atomic file publish primitive is unavailable"
+        ) from exc
+
+
 def _require_dir_fd_support() -> None:
     supported = getattr(os, "supports_dir_fd", ())
     required = (os.open, os.stat, os.unlink, os.rmdir, os.mkdir)
@@ -163,8 +226,9 @@ def _require_dir_fd_support() -> None:
 def _require_install_primitives() -> None:
     """Fail closed when any identity-safe filesystem primitive is absent."""
 
-    for name in ("O_DIRECTORY", "O_CLOEXEC", "O_NOFOLLOW", "O_EXCL"):
+    for name in ("O_DIRECTORY", "O_CLOEXEC", "O_NOFOLLOW", "O_EXCL", "O_TMPFILE"):
         _require_os_flag(name)
+    _linkat_function()
     _require_dir_fd_support()
     for name in ("pread", "fchmod", "fchown", "fsync"):
         _require_fd_primitive(name)
@@ -180,6 +244,72 @@ def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
         and left.st_ino == right.st_ino
         and left.st_nlink == right.st_nlink
     )
+
+
+def _trusted_owner() -> tuple[int, int]:
+    """Return the uid/gid allowed for secret-free runner output."""
+
+    return os.getuid(), os.getgid()
+
+
+def _read_fd_digest(descriptor: int, size: int) -> str:
+    """Hash exactly ``size`` bytes from an already identity-checked fd."""
+
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < size:
+        chunk = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise HostToolsBundleError("host-tools file is truncated")
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest()
+
+
+def _owned_file(
+    metadata: os.stat_result,
+    *,
+    data: bytes | None = None,
+    digest: str | None = None,
+    mode: int,
+    uid: int,
+    gid: int,
+) -> _OwnedFile:
+    if data is not None:
+        size = len(data)
+        expected_digest = _sha256_bytes(data)
+    else:
+        size = metadata.st_size
+        expected_digest = digest
+    if expected_digest is None:
+        raise HostToolsBundleError("host-tools owned file digest is unavailable")
+    return _OwnedFile(metadata, size, expected_digest, mode, uid, gid)
+
+
+def _owned_file_matches(
+    metadata: os.stat_result,
+    owned: _OwnedFile,
+    *,
+    descriptor: int | None = None,
+) -> bool:
+    if (
+        not _same_identity(metadata, owned.metadata)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size != owned.size
+        or stat.S_IMODE(metadata.st_mode) != owned.mode
+        or metadata.st_uid != owned.uid
+        or metadata.st_gid != owned.gid
+    ):
+        return False
+    if descriptor is None:
+        return False
+    try:
+        opened = os.fstat(descriptor)
+        if not _same_identity(opened, metadata):
+            return False
+        return _read_fd_digest(descriptor, owned.size) == owned.sha256
+    except (OSError, HostToolsBundleError):
+        return False
 
 
 def _close_quietly(descriptor: int | None) -> None:
@@ -372,6 +502,7 @@ def _bounded_zip_info(
     expected_name: str | None,
     maximum_member_bytes: int,
     expected_prefix: str | None = None,
+    maximum_compressed_bytes: int | None = None,
 ) -> str:
     """Validate path/type/size/ratio metadata before reading a member."""
 
@@ -399,11 +530,16 @@ def _bounded_zip_info(
     if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
         raise HostToolsBundleError("host-tools archive compression is unsafe")
     _zip_member_mode(info)
+    compressed_bound = (
+        MAX_ARTIFACT_ARCHIVE_BYTES
+        if maximum_compressed_bytes is None
+        else maximum_compressed_bytes
+    )
     if (
         info.file_size < 0
         or info.compress_size < 0
         or info.file_size > maximum_member_bytes
-        or info.compress_size > MAX_ARTIFACT_ARCHIVE_BYTES
+        or info.compress_size > compressed_bound
     ):
         raise HostToolsBundleError("host-tools archive member exceeds its bound")
     if info.file_size and (
@@ -561,30 +697,30 @@ def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, 
     manifest = _manifest(source_sha, records)
     manifest_bytes = _canonical_json(manifest)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _regular_directory(output.parent)
     _safe_leaf(output.name, "host-tools bundle output name")
-    temporary = output.with_name(f".{output.name}.tmp")
-    _safe_leaf(temporary.name, "host-tools bundle temporary name")
-    parent_fd, parent_metadata = _open_no_symlink_directory(output.parent)
+    parent_fd, parent_metadata = _open_no_symlink_directory(
+        output.parent, require_trusted_owner=True
+    )
     descriptor: int | None = None
-    temporary_created = False
     temporary_identity: os.stat_result | None = None
     published = False
     failure: BaseException | None = None
     try:
         descriptor = os.open(
-            temporary.name,
+            ".",
             os.O_RDWR
-            | os.O_CREAT
-            | _require_os_flag("O_EXCL")
+            | _require_os_flag("O_TMPFILE")
             | _require_os_flag("O_CLOEXEC")
             | _require_no_follow(),
             0o600,
             dir_fd=parent_fd,
         )
-        temporary_created = True
-        with os.fdopen(descriptor, "w+b") as stream:
+        owner_uid, owner_gid = _trusted_owner()
+        os.fchown(descriptor, owner_uid, owner_gid)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(os.dup(descriptor), "w+b") as stream:
             with zipfile.ZipFile(
                 stream,
                 mode="w",
@@ -597,24 +733,38 @@ def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, 
                 archive.writestr(_zip_info("manifest.json", DATA_MODE), manifest_bytes)
             stream.flush()
             os.fsync(stream.fileno())
-        temporary_identity = os.stat(temporary.name, dir_fd=parent_fd, follow_symlinks=False)
+        temporary_identity = os.fstat(descriptor)
         if (
             not stat.S_ISREG(temporary_identity.st_mode)
             or temporary_identity.st_dev != parent_metadata.st_dev
-            or temporary_identity.st_nlink != 1
+            or temporary_identity.st_nlink not in {0, 1}
             or stat.S_IMODE(temporary_identity.st_mode) != 0o600
+            or temporary_identity.st_uid != owner_uid
+            or temporary_identity.st_gid != owner_gid
             or temporary_identity.st_size > MAX_BUNDLE_BYTES
         ):
             raise HostToolsBundleError("host-tools bundle exceeds its bound")
-        _rename_noreplace(
+        _injection_point("build_bundle_after_temp_identity")
+        _link_tmpfile_noreplace(descriptor, parent_fd, output.name)
+        _injection_point("build_bundle_after_rename")
+        published_identity = _reconcile_linked_file(
             parent_fd,
-            temporary.name,
             output.name,
+            descriptor,
             temporary_identity,
+            expected_device=parent_metadata.st_dev,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            mode=0o600,
+            size=temporary_identity.st_size,
+            digest=_read_fd_digest(descriptor, temporary_identity.st_size),
         )
+        if published_identity is None:
+            raise HostToolsBundleError("host-tools bundle publication identity changed")
         published = True
+        _injection_point("build_bundle_before_parent_fsync")
         os.fsync(parent_fd)
-        temporary_created = False
+        _injection_point("build_bundle_after_parent_fsync")
     except HostToolsBundleError as exc:
         failure = exc
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
@@ -623,12 +773,31 @@ def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, 
     except BaseException as exc:
         failure = exc
     finally:
+        if (
+            failure is not None
+            and not published
+            and descriptor is not None
+            and temporary_identity is not None
+        ):
+            # Reconcile the exact inode if linkat completed before an
+            # interrupt reached Python.  An uncertain/foreign pathname is
+            # retained for operator inspection; no replacement is attempted.
+            try:
+                _reconcile_linked_file(
+                    parent_fd,
+                    output.name,
+                    descriptor,
+                    temporary_identity,
+                    expected_device=parent_metadata.st_dev,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                    mode=0o600,
+                    size=temporary_identity.st_size,
+                    digest=_read_fd_digest(descriptor, temporary_identity.st_size),
+                )
+            except BaseException:
+                pass
         _close_quietly(descriptor)
-        if failure is not None and temporary_identity is not None:
-            if published:
-                _remove_owned_file(parent_fd, output.name, temporary_identity)
-            elif temporary_created:
-                _remove_owned_file(parent_fd, temporary.name, temporary_identity)
         _close_quietly(parent_fd)
     if failure is not None:
         raise failure
@@ -952,8 +1121,345 @@ def verify_outer_contract(
     return summary
 
 
+def _release_archive_member_name(release_slug: str, suffix: str) -> str:
+    if RELEASE_SLUG_RE.fullmatch(release_slug) is None:
+        raise HostToolsBundleError("release slug is invalid")
+    return f"{release_slug}{suffix}"
+
+
+def _open_input_archive(path: Path) -> tuple[int, int, os.stat_result]:
+    """Open one raw API ZIP through a no-follow parent descriptor."""
+
+    if not isinstance(path, Path) or not path.is_absolute() or ".." in path.parts:
+        raise HostToolsBundleError("release artifact path is invalid")
+    parent_fd, _ = _open_no_symlink_directory(path.parent)
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | _require_os_flag("O_CLOEXEC")
+            | _require_no_follow(),
+            dir_fd=parent_fd,
+        )
+        metadata = os.fstat(descriptor)
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size < 0
+            or metadata.st_size > MAX_RELEASE_ARTIFACT_BYTES
+            or not _same_identity(metadata, current)
+        ):
+            _close_quietly(descriptor)
+            _close_quietly(parent_fd)
+            raise HostToolsBundleError("release artifact metadata is unsafe")
+        return parent_fd, descriptor, metadata
+    except HostToolsBundleError:
+        raise
+    except OSError as exc:
+        _close_quietly(parent_fd)
+        raise HostToolsBundleError("release artifact cannot be opened") from exc
+
+
+def _write_release_member(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    stage_fd: int,
+    *,
+    expected_device: int,
+) -> _OwnedFile:
+    """Stream one exact raw-release ZIP member into the private stage."""
+
+    name = info.filename
+    owner_uid, owner_gid = _trusted_owner()
+    descriptor: int | None = None
+    identity: os.stat_result | None = None
+    created = False
+    completed = False
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDWR
+            | os.O_CREAT
+            | _require_os_flag("O_EXCL")
+            | _require_os_flag("O_CLOEXEC")
+            | _require_no_follow(),
+            0o600,
+            dir_fd=stage_fd,
+        )
+        created = True
+        total = 0
+        digest = hashlib.sha256()
+        try:
+            source = archive.open(info, mode="r")
+        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
+            raise HostToolsBundleError("release artifact member cannot be opened") from exc
+        with source:
+            while True:
+                chunk = source.read(min(1024 * 1024, MAX_RELEASE_MEMBER_BYTES - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_RELEASE_MEMBER_BYTES:
+                    raise HostToolsBundleError("release artifact member exceeds its bound")
+                _write_all(descriptor, chunk)
+                digest.update(chunk)
+        if total != info.file_size:
+            raise HostToolsBundleError("release artifact member is truncated")
+        os.fchown(descriptor, owner_uid, owner_gid)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        identity = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(identity.st_mode)
+            or identity.st_dev != expected_device
+            or identity.st_nlink != 1
+            or identity.st_size != total
+            or identity.st_uid != owner_uid
+            or identity.st_gid != owner_gid
+            or stat.S_IMODE(identity.st_mode) != 0o600
+        ):
+            raise HostToolsBundleError("release artifact member metadata is unsafe")
+        pathname = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+        if not _same_identity(pathname, identity):
+            raise HostToolsBundleError("release artifact member identity changed")
+        completed = True
+        return _OwnedFile(identity, total, digest.hexdigest(), 0o600, owner_uid, owner_gid)
+    except HostToolsBundleError:
+        raise
+    except OSError as exc:
+        raise HostToolsBundleError("release artifact member could not be written") from exc
+    finally:
+        _close_quietly(descriptor)
+        if created and identity is None:
+            try:
+                identity = _lstat_at(stage_fd, name)
+            except BaseException:
+                identity = None
+        if created and not completed and identity is not None:
+            # The caller's directory cleanup owns the complete-file case.  A
+            # partial member is removed here only after the exact inode is
+            # still visible; a replacement remains quarantined.
+            try:
+                current = _lstat_at(stage_fd, name)
+                if _same_identity(current, identity):
+                    os.unlink(name, dir_fd=stage_fd)
+                    os.fsync(stage_fd)
+            except BaseException:
+                pass
+
+
+def extract_release_artifact(
+    archive_path: Path,
+    output_dir: Path,
+    *,
+    release_slug: str,
+    expected_archive_sha256: str,
+) -> dict[str, str]:
+    """Verify and atomically extract the exact three-file API artifact ZIP.
+
+    This runs from the pinned host-tools checkout before deployment secrets are
+    validated.  It never consumes an ``actions/download-artifact`` directory;
+    the raw API ZIP bytes that are digested here are the bytes later copied to
+    the production host.
+    """
+
+    _require_install_primitives()
+    _safe_leaf(output_dir.name, "release extraction directory name")
+    if (
+        not isinstance(output_dir, Path)
+        or not output_dir.is_absolute()
+        or ".." in output_dir.parts
+        or output_dir == Path("/")
+    ):
+        raise HostToolsBundleError("release extraction directory path is invalid")
+    expected_archive = _digest_argument(
+        expected_archive_sha256, "expected release artifact digest"
+    )
+    artifact_name = _release_archive_member_name(release_slug, ".tar.gz")
+    checksum_name = _release_archive_member_name(release_slug, ".tar.gz.sha256")
+    provenance_name = "RELEASE.provenance.json"
+    expected_names = {artifact_name, checksum_name, provenance_name}
+    archive_parent_fd: int | None = None
+    archive_fd: int | None = None
+    archive_stream = None
+    output_parent_fd: int | None = None
+    stage_fd: int | None = None
+    stage_name: str | None = None
+    stage_identity: os.stat_result | None = None
+    owned_members: dict[str, _OwnedFile] = {}
+    published = False
+    failure: BaseException | None = None
+    try:
+        archive_parent_fd, archive_fd, archive_metadata = _open_input_archive(archive_path)
+        raw_digest = hashlib.sha256()
+        os.lseek(archive_fd, 0, os.SEEK_SET)
+        total = 0
+        while True:
+            chunk = os.read(archive_fd, min(1024 * 1024, MAX_RELEASE_ARTIFACT_BYTES - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_RELEASE_ARTIFACT_BYTES:
+                raise HostToolsBundleError("release artifact exceeds its size bound")
+            raw_digest.update(chunk)
+        if total != archive_metadata.st_size or raw_digest.hexdigest() != expected_archive:
+            raise HostToolsBundleError("release artifact digest does not match API bytes")
+        after_digest = os.fstat(archive_fd)
+        if not _same_identity(after_digest, archive_metadata) or after_digest.st_size != total:
+            raise HostToolsBundleError("release artifact changed while reading")
+        os.lseek(archive_fd, 0, os.SEEK_SET)
+        archive_stream = os.fdopen(os.dup(archive_fd), "rb", closefd=True)
+        try:
+            archive = zipfile.ZipFile(archive_stream, mode="r", allowZip64=False)
+        except (OSError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            raise HostToolsBundleError("release artifact ZIP is invalid") from exc
+        with archive:
+            infos = archive.infolist()
+            if len(infos) != MAX_RELEASE_MEMBER_COUNT:
+                raise HostToolsBundleError("release artifact member count is invalid")
+            seen: set[str] = set()
+            total_uncompressed = 0
+            for info in infos:
+                _bounded_zip_info(
+                    info,
+                    expected_name=None,
+                    maximum_member_bytes=MAX_RELEASE_MEMBER_BYTES,
+                    maximum_compressed_bytes=MAX_RELEASE_ARTIFACT_BYTES,
+                )
+                if info.filename not in expected_names or info.filename in seen:
+                    raise HostToolsBundleError("release artifact member allowlist is invalid")
+                seen.add(info.filename)
+                total_uncompressed += info.file_size
+                if total_uncompressed > MAX_RELEASE_ARTIFACT_BYTES:
+                    raise HostToolsBundleError("release artifact expanded size exceeds its bound")
+            if seen != expected_names:
+                raise HostToolsBundleError("release artifact member allowlist is incomplete")
+            output_parent_fd, output_parent_metadata = _open_no_symlink_directory(
+                output_dir.parent, require_trusted_owner=True
+            )
+            for _ in range(16):
+                candidate = f".release-stage-{secrets.token_hex(8)}"
+                try:
+                    os.mkdir(candidate, STAGE_MODE, dir_fd=output_parent_fd)
+                except FileExistsError:
+                    continue
+                stage_name = candidate
+                break
+            if stage_name is None:
+                raise HostToolsBundleError("release extraction stage name collision")
+            stage_identity = _lstat_at(output_parent_fd, stage_name)
+            owner_uid, owner_gid = _trusted_owner()
+            if (
+                not stat.S_ISDIR(stage_identity.st_mode)
+                or stage_identity.st_dev != output_parent_metadata.st_dev
+                or stage_identity.st_nlink != 2
+                or stage_identity.st_uid != owner_uid
+                or stage_identity.st_gid != owner_gid
+                or stat.S_IMODE(stage_identity.st_mode) != STAGE_MODE
+            ):
+                raise HostToolsBundleError("release extraction stage metadata is unsafe")
+            _injection_point("release_extract_after_mkdir")
+            stage_fd = os.open(
+                stage_name,
+                os.O_RDONLY
+                | _require_os_flag("O_DIRECTORY")
+                | _require_os_flag("O_CLOEXEC")
+                | _require_no_follow(),
+                dir_fd=output_parent_fd,
+            )
+            by_name = {info.filename: info for info in infos}
+            for name in sorted(expected_names):
+                owned_members[name] = _write_release_member(
+                    archive,
+                    by_name[name],
+                    stage_fd,
+                    expected_device=output_parent_metadata.st_dev,
+                )
+            if set(os.listdir(stage_fd)) != expected_names:
+                raise HostToolsBundleError("release extraction inventory is not closed")
+            os.fsync(stage_fd)
+            _injection_point("release_extract_before_rename")
+            _rename_noreplace(
+                output_parent_fd,
+                stage_name,
+                output_dir.name,
+                stage_identity,
+            )
+            _injection_point("release_extract_after_rename")
+            output_identity = _reconcile_renamed_directory(
+                output_parent_fd,
+                output_dir.name,
+                stage_identity,
+                expected_device=output_parent_metadata.st_dev,
+            )
+            if output_identity is None:
+                raise HostToolsBundleError("release extraction publication identity changed")
+            published = True
+            _injection_point("release_extract_before_parent_fsync")
+            os.fsync(output_parent_fd)
+            _injection_point("release_extract_after_parent_fsync")
+    except HostToolsBundleError as exc:
+        failure = exc
+    except OSError as exc:
+        failure = HostToolsBundleError("release artifact extraction failed")
+        failure.__cause__ = exc
+    except (ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        failure = HostToolsBundleError("release artifact extraction failed")
+        failure.__cause__ = exc
+    except BaseException as exc:
+        failure = exc
+    finally:
+        if archive_stream is not None:
+            try:
+                archive_stream.close()
+            except BaseException:
+                pass
+        _close_quietly(archive_fd)
+        _close_quietly(archive_parent_fd)
+        _close_quietly(stage_fd)
+        if failure is not None and not published and output_parent_fd is not None:
+            if stage_name is not None and stage_identity is not None:
+                reconciled = _reconcile_renamed_directory(
+                    output_parent_fd,
+                    output_dir.name,
+                    stage_identity,
+                )
+                if reconciled is not None:
+                    # The kernel move may have completed before Python
+                    # observed an interrupt from the rename helper.  Keep
+                    # the exact published directory for operator
+                    # reconciliation; never attempt to remove it as a stage.
+                    published = True
+                    stage_name = None
+                if not published:
+                    try:
+                        _cleanup_owned_directory(
+                            output_parent_fd,
+                            stage_name,
+                            stage_identity,
+                            owned_members,
+                            expected_device=os.fstat(output_parent_fd).st_dev,
+                        )
+                    except BaseException:
+                        pass
+        _close_quietly(output_parent_fd)
+    if failure is not None:
+        raise failure
+    return {
+        "archive": str(output_dir / artifact_name),
+        "checksum": str(output_dir / checksum_name),
+        "provenance": str(output_dir / provenance_name),
+        "release_slug": release_slug,
+        "archive_sha256": expected_archive,
+    }
+
+
 def _open_no_symlink_directory(
-    path: Path, *, require_root_owned: bool = False
+    path: Path,
+    *,
+    require_root_owned: bool = False,
+    require_trusted_owner: bool = False,
 ) -> tuple[int, os.stat_result]:
     """Open every directory component with ``openat`` and ``O_NOFOLLOW``."""
 
@@ -985,23 +1491,33 @@ def _open_no_symlink_directory(
                 raise HostToolsBundleError("host-tools directory is unavailable") from exc
             _close_quietly(descriptor)
             descriptor = next_descriptor
-            if require_root_owned:
+            if require_root_owned or require_trusted_owner:
                 component_metadata = os.fstat(descriptor)
                 final_component = component == path.parts[-1]
-                if (
-                    component_metadata.st_uid != 0
-                    or component_metadata.st_gid != 0
-                    or (
-                        stat.S_IMODE(component_metadata.st_mode) & 0o022
-                        and (
-                            final_component
-                            or not (
-                                stat.S_IMODE(component_metadata.st_mode) & 0o002
-                                and stat.S_IMODE(component_metadata.st_mode) & stat.S_ISVTX
-                            )
+                mode = stat.S_IMODE(component_metadata.st_mode)
+                trusted_uid, trusted_gid = _trusted_owner()
+                if require_root_owned:
+                    owner_invalid = (
+                        component_metadata.st_uid != 0
+                        or component_metadata.st_gid != 0
+                    )
+                else:
+                    owner_invalid = final_component and (
+                        (
+                            component_metadata.st_uid != trusted_uid
+                            or component_metadata.st_gid != trusted_gid
+                        )
+                        and not (
+                            mode & 0o002
+                            and mode & stat.S_ISVTX
+                            and not mode & 0o020
                         )
                     )
-                ):
+                writable_invalid = bool(mode & 0o022) and (
+                    final_component
+                    or not (mode & 0o002 and mode & stat.S_ISVTX)
+                )
+                if owner_invalid or writable_invalid:
                     raise HostToolsBundleError("host-tools handoff parent metadata is unsafe")
         metadata = os.fstat(descriptor)
         if not stat.S_ISDIR(metadata.st_mode):
@@ -1035,46 +1551,63 @@ def extract_outer_bundle(
         expected_outer_sha256=expected_outer_sha256,
         expected_inner_sha256=expected_inner_sha256,
     )
-    parent_fd, parent_before = _open_no_symlink_directory(output.parent)
+    parent_fd, parent_before = _open_no_symlink_directory(
+        output.parent, require_trusted_owner=True
+    )
     descriptor: int | None = None
-    created = False
-    written_identity: os.stat_result | None = None
+    temporary_identity: os.stat_result | None = None
+    published_identity: os.stat_result | None = None
+    published = False
     failure: BaseException | None = None
     try:
-        descriptor = os.open(
-            output.name,
-            os.O_RDWR
-            | os.O_CREAT
-            | _require_os_flag("O_EXCL")
-            | _require_os_flag("O_CLOEXEC")
-            | _require_no_follow(),
-            0o600,
-            dir_fd=parent_fd,
-        )
-        created = True
+        owner_uid, owner_gid = _trusted_owner()
+        try:
+            descriptor = os.open(
+                ".",
+                os.O_RDWR
+                | _require_os_flag("O_TMPFILE")
+                | _require_os_flag("O_CLOEXEC")
+                | _require_no_follow(),
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise HostToolsBundleError("host-tools extracted member could not be opened") from exc
+        os.fchown(descriptor, owner_uid, owner_gid)
+        os.fchmod(descriptor, 0o600)
         _write_all(descriptor, bytes(summary["inner_bytes"]))
         os.fsync(descriptor)
-        metadata = os.fstat(descriptor)
-        written_identity = metadata
+        temporary_identity = os.fstat(descriptor)
         if (
-            metadata.st_dev != parent_before.st_dev
-            or not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-            or metadata.st_size != len(summary["inner_bytes"])
-            or _sha256_bytes(os.pread(descriptor, metadata.st_size, 0)) != summary["bundle_sha256"]
+            not stat.S_ISREG(temporary_identity.st_mode)
+            or temporary_identity.st_dev != parent_before.st_dev
+            or temporary_identity.st_nlink not in {0, 1}
+            or temporary_identity.st_uid != owner_uid
+            or temporary_identity.st_gid != owner_gid
+            or stat.S_IMODE(temporary_identity.st_mode) != 0o600
+            or temporary_identity.st_size != len(summary["inner_bytes"])
+            or _read_fd_digest(descriptor, temporary_identity.st_size)
+            != summary["bundle_sha256"]
         ):
-            raise HostToolsBundleError("host-tools extracted member identity is unsafe")
-        pathname = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not _same_identity(pathname, metadata)
-            or not stat.S_ISREG(pathname.st_mode)
-            or pathname.st_uid != 0
-            or pathname.st_gid != 0
-            or stat.S_IMODE(pathname.st_mode) != 0o600
-            or pathname.st_dev != parent_before.st_dev
-        ):
+            raise HostToolsBundleError("host-tools extracted member metadata is unsafe")
+        _injection_point("outer_extract_after_write")
+        _link_tmpfile_noreplace(descriptor, parent_fd, output.name)
+        _injection_point("outer_extract_after_link")
+        published_identity = _reconcile_linked_file(
+            parent_fd,
+            output.name,
+            descriptor,
+            temporary_identity,
+            expected_device=parent_before.st_dev,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            mode=0o600,
+            size=temporary_identity.st_size,
+            digest=summary["bundle_sha256"],
+        )
+        if published_identity is None:
             raise HostToolsBundleError("host-tools extracted member identity changed")
+        published = True
     except HostToolsBundleError as exc:
         failure = exc
     except OSError as exc:
@@ -1085,35 +1618,47 @@ def extract_outer_bundle(
         # rewritten as an OSError or hidden by cleanup failures.
         failure = exc
     finally:
-        if descriptor is not None and created and written_identity is None:
-            try:
-                written_identity = os.fstat(descriptor)
-            except BaseException:
-                pass
+        if (
+            failure is not None
+            and not published
+            and descriptor is not None
+            and temporary_identity is not None
+        ):
+            reconciled = _reconcile_linked_file(
+                parent_fd,
+                output.name,
+                descriptor,
+                temporary_identity,
+                expected_device=parent_before.st_dev,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                mode=0o600,
+                size=temporary_identity.st_size,
+                digest=summary["bundle_sha256"],
+            )
+            if reconciled is not None:
+                # linkat may have completed before an injected signal or
+                # interpreter exit reached Python.  Retain the exact output
+                # and let the caller/retry reconcile it; never unlink a
+                # pathname that may have crossed the publication boundary.
+                published = True
+                published_identity = reconciled
         _close_quietly(descriptor)
     if failure is not None:
-        # Do not unlink a path whose identity is no longer ours.  This is the
-        # only cleanup performed by the extractor after a partial write.  If
-        # identity cannot be proven, leave the pathname in place for operator
-        # quarantine; never guess and unlink a raced object.
-        if created and written_identity is not None:
-            try:
-                current = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
-                if _same_identity(current, written_identity):
-                    os.unlink(output.name, dir_fd=parent_fd)
-                    os.fsync(parent_fd)
-            except BaseException:
-                pass
         _close_quietly(parent_fd)
         raise failure
     try:
+        _injection_point("outer_extract_before_parent_fsync")
         os.fsync(parent_fd)
-    except OSError as exc:
+        _injection_point("outer_extract_after_parent_fsync")
+    except BaseException as exc:
         # Publishing is complete only after the containing directory is
-        # durable.  If that final durability step fails, remove precisely
-        # the inode created above; never unlink a raced replacement.
-        _remove_owned_file(parent_fd, output.name, written_identity)
+        # durable.  The linked inode is retained when this durability step
+        # is interrupted or fails; a retry adopts/reconciles the exact final
+        # commit marker instead of guessing at pathname ownership.
         _close_quietly(parent_fd)
+        if not isinstance(exc, OSError):
+            raise
         raise HostToolsBundleError("host-tools output parent could not be synced") from exc
     _close_quietly(parent_fd)
     return {key: value for key, value in summary.items() if key != "inner_bytes"}
@@ -1444,6 +1989,119 @@ def _lstat_at(parent_fd: int, name: str) -> os.stat_result:
         raise HostToolsBundleError("host-tools path metadata is unavailable") from exc
 
 
+def _reconcile_linked_file(
+    parent_fd: int,
+    target: str,
+    descriptor: int,
+    temporary_identity: os.stat_result,
+    *,
+    expected_device: int,
+    owner_uid: int,
+    owner_gid: int,
+    mode: int,
+    size: int,
+    digest: str,
+) -> os.stat_result | None:
+    """Prove that a pathname is the exact inode just linked by this process.
+
+    ``O_TMPFILE`` starts with link count zero and becomes link count one after
+    ``linkat(AT_EMPTY_PATH)``.  Reconciliation therefore compares the stable
+    device/inode pair and then checks the published pathname, open descriptor,
+    metadata and bytes independently.  A missing or foreign pathname is never
+    repaired by this helper.
+    """
+
+    try:
+        current = _lstat_at(parent_fd, target)
+        opened = os.fstat(descriptor)
+    except (HostToolsBundleError, OSError):
+        return None
+    if (
+        current.st_dev != temporary_identity.st_dev
+        or current.st_ino != temporary_identity.st_ino
+        or opened.st_dev != current.st_dev
+        or opened.st_ino != current.st_ino
+        or not stat.S_ISREG(current.st_mode)
+        or current.st_nlink != 1
+        or current.st_dev != expected_device
+        or current.st_uid != owner_uid
+        or current.st_gid != owner_gid
+        or stat.S_IMODE(current.st_mode) != mode
+        or current.st_size != size
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_size != size
+        or opened.st_uid != owner_uid
+        or opened.st_gid != owner_gid
+        or stat.S_IMODE(opened.st_mode) != mode
+    ):
+        return None
+    try:
+        return current if _read_fd_digest(descriptor, size) == digest else None
+    except (HostToolsBundleError, OSError):
+        return None
+
+
+def _reconcile_renamed_directory(
+    parent_fd: int,
+    target: str,
+    expected_identity: os.stat_result,
+    *,
+    expected_device: int | None = None,
+) -> os.stat_result | None:
+    """Reconcile a directory after ``renameat2`` may have completed.
+
+    The stage and final generation names are different pathnames for the same
+    directory inode.  Only an exact device/inode/type/link-count match is
+    considered a successful move; a foreign target is left untouched.
+    """
+
+    try:
+        current = _lstat_at(parent_fd, target)
+    except (HostToolsBundleError, OSError):
+        return None
+    if (
+        current.st_dev != expected_identity.st_dev
+        or current.st_ino != expected_identity.st_ino
+        or stat.S_IFMT(current.st_mode) != stat.S_IFMT(expected_identity.st_mode)
+        or stat.S_ISLNK(current.st_mode)
+        or current.st_nlink != expected_identity.st_nlink
+        or (expected_device is not None and current.st_dev != expected_device)
+    ):
+        return None
+    return current
+
+
+def _link_tmpfile_noreplace(descriptor: int, parent_fd: int, target: str) -> None:
+    """Atomically publish an unnamed O_TMPFILE inode without replacement."""
+
+    _safe_leaf(target, "host-tools output name")
+    linkat = _linkat_function()
+    destination = os.fsencode(target)
+    if linkat(descriptor, b"", parent_fd, destination, AT_EMPTY_PATH) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise HostToolsBundleError("host-tools output already exists")
+        if error in {errno.EACCES, errno.EPERM, errno.ENOENT}:
+            # Linux restricts AT_EMPTY_PATH to callers with
+            # CAP_DAC_READ_SEARCH even when the O_TMPFILE inode is owned by
+            # the caller.  The procfd spelling resolves the same unnamed
+            # inode through the kernel's fd link and remains a linkat-only,
+            # no-overwrite publication; it never falls back to a named
+            # temporary file or pathname replacement.
+            procfd = os.fsencode(f"/proc/self/fd/{descriptor}")
+            if linkat(AT_FDCWD, procfd, parent_fd, destination, AT_SYMLINK_FOLLOW) == 0:
+                _injection_point("linkat_after_success")
+                return
+            error = ctypes.get_errno()
+            if error == errno.EEXIST:
+                raise HostToolsBundleError("host-tools output already exists")
+        if error in {errno.EXDEV, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP}:
+            raise HostToolsBundleError("host-tools atomic file publish cannot be proven")
+        raise HostToolsBundleError("host-tools atomic file publish failed")
+    _injection_point("linkat_after_success")
+
+
 def _rename_noreplace(
     parent_fd: int,
     source: str,
@@ -1493,6 +2151,10 @@ def _rename_noreplace(
         if error in {errno.EXDEV, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP}:
             raise HostToolsBundleError("host-tools no-overwrite publish cannot be proven")
         raise HostToolsBundleError("host-tools generation could not be published")
+    # The kernel move has completed at this point, but the caller has not yet
+    # updated its publication state.  Keep this explicit interruption window
+    # so reconciliation tests (and the real handler) cover that gap.
+    _injection_point("rename_noreplace_after_success")
 
 
 def _new_stage(
@@ -1504,26 +2166,34 @@ def _new_stage(
     _require_install_primitives()
     for _ in range(16):
         name = f".host-tools-stage-{source_sha}-{secrets.token_hex(8)}"
+        metadata: os.stat_result | None = None
         try:
             os.mkdir(name, STAGE_MODE, dir_fd=host_fd)
         except FileExistsError:
             continue
         except OSError as exc:
             raise HostToolsBundleError("host-tools private stage could not be created") from exc
-        metadata = _lstat_at(host_fd, name)
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != 0
-            or metadata.st_gid != 0
-            or metadata.st_nlink != 2
-            or stat.S_IMODE(metadata.st_mode) != STAGE_MODE
-            or metadata.st_dev != expected_device
-        ):
-            # The directory was just created by this process, but retain the
-            # same inode/empty-directory proof used for all later cleanup.
-            _cleanup_owned_directory(host_fd, name, metadata, {})
-            raise HostToolsBundleError("host-tools private stage metadata is unsafe")
-        return name, metadata
+        try:
+            metadata = _lstat_at(host_fd, name)
+            _injection_point("new_stage_after_mkdir")
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_nlink != 2
+                or stat.S_IMODE(metadata.st_mode) != STAGE_MODE
+                or metadata.st_dev != expected_device
+            ):
+                raise HostToolsBundleError("host-tools private stage metadata is unsafe")
+            return name, metadata
+        except BaseException:
+            # ``mkdirat`` and the subsequent metadata assignment are not one
+            # atomic Python operation.  If the identity was captured, remove
+            # only that exact empty directory; otherwise leave it for an
+            # operator quarantine rather than guessing at a raced pathname.
+            if metadata is not None:
+                _cleanup_owned_directory(host_fd, name, metadata, {}, expected_device=expected_device)
+            raise
     raise HostToolsBundleError("host-tools private stage name collision")
 
 
@@ -1534,6 +2204,7 @@ def _write_stage_member(
     mode: int,
     *,
     expected_device: int,
+    owned_members: dict[str, _OwnedFile] | None = None,
 ) -> os.stat_result:
     _safe_leaf(name, "host-tools member name")
     if (
@@ -1587,6 +2258,19 @@ def _write_stage_member(
             or stat.S_IMODE(pathname.st_mode) != mode
         ):
             raise HostToolsBundleError("host-tools staged member identity changed")
+        owned = _owned_file(
+            metadata,
+            data=data,
+            mode=mode,
+            uid=0,
+            gid=0,
+        )
+        if owned_members is not None:
+            # Record ownership before returning to the caller.  This closes
+            # the otherwise untracked gap between a successful helper return
+            # and the caller's dictionary assignment.
+            owned_members[name] = owned
+        _injection_point("stage_member_after_write")
         completed = True
         return metadata
     except HostToolsBundleError:
@@ -1608,7 +2292,10 @@ def _write_stage_member(
         if created and not completed and identity is not None:
             try:
                 current = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
-                if _same_identity(current, identity):
+                if owned_members is not None and name in owned_members:
+                    _remove_owned_file(stage_fd, name, owned_members[name])
+                    owned_members.pop(name, None)
+                elif _same_identity(current, identity):
                     os.unlink(name, dir_fd=stage_fd)
                     os.fsync(stage_fd)
             except BaseException:
@@ -1711,7 +2398,7 @@ def _cleanup_owned_directory(
     parent_fd: int,
     name: str,
     identity: os.stat_result,
-    child_identities: dict[str, os.stat_result],
+    child_identities: dict[str, os.stat_result | _OwnedFile],
     *,
     expected_device: int | None = None,
 ) -> bool:
@@ -1740,16 +2427,23 @@ def _cleanup_owned_directory(
                 return False
             for child, child_identity in child_identities.items():
                 current_child = _lstat_at(stage_fd, child)
+                expected = (
+                    child_identity.metadata
+                    if isinstance(child_identity, _OwnedFile)
+                    else child_identity
+                )
                 if (
-                    current_child.st_dev != child_identity.st_dev
-                    or current_child.st_ino != child_identity.st_ino
-                    or current_child.st_nlink != child_identity.st_nlink
+                    not _same_identity(current_child, expected)
                     or not stat.S_ISREG(current_child.st_mode)
                     or (expected_device is not None and current_child.st_dev != expected_device)
                 ):
                     return False
             for child in child_identities:
-                os.unlink(child, dir_fd=stage_fd)
+                child_identity = child_identities[child]
+                if isinstance(child_identity, _OwnedFile):
+                    _remove_owned_file(stage_fd, child, child_identity)
+                else:
+                    os.unlink(child, dir_fd=stage_fd)
             os.fsync(stage_fd)
         finally:
             os.close(stage_fd)
@@ -1833,19 +2527,32 @@ def _run_post_install_self_tests(
 def _remove_owned_file(
     parent_fd: int,
     name: str,
-    identity: os.stat_result | None,
+    identity: os.stat_result | _OwnedFile | None,
 ) -> None:
-    """Unlink one created file only while its inode identity is unchanged."""
+    """Unlink one created file only while identity and bytes are unchanged."""
 
     if identity is None:
         return
+    if isinstance(identity, _OwnedFile):
+        owned = identity
+        expected_identity = identity.metadata
+    else:
+        owned = None
+        expected_identity = identity
     try:
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            current.st_dev != identity.st_dev
-            or current.st_ino != identity.st_ino
-            or current.st_nlink != identity.st_nlink
-        ):
+        if owned is not None:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | _require_os_flag("O_CLOEXEC") | _require_no_follow(),
+                dir_fd=parent_fd,
+            )
+            try:
+                if not _owned_file_matches(current, owned, descriptor=descriptor):
+                    return
+            finally:
+                _close_quietly(descriptor)
+        elif not _same_identity(current, expected_identity):
             return
         os.unlink(name, dir_fd=parent_fd)
         os.fsync(parent_fd)
@@ -1888,7 +2595,12 @@ def _validate_evidence_output(path: Path, host_tools_root: Path) -> None:
     _close_quietly(parent_fd)
 
 
-def _write_evidence(path: Path, payload: dict[str, object], *, host_tools_root: Path) -> None:
+def _write_evidence(
+    path: Path,
+    payload: dict[str, object],
+    *,
+    host_tools_root: Path,
+) -> _OwnedFile:
     encoded = _canonical_json(payload)
     if len(encoded) > MAX_EVIDENCE_BYTES:
         raise HostToolsBundleError("host-tools install evidence exceeds its bound")
@@ -1898,46 +2610,129 @@ def _write_evidence(path: Path, payload: dict[str, object], *, host_tools_root: 
         path.parent, host_tools_root=host_tools_root
     )
     descriptor: int | None = None
-    created = False
-    written_identity: os.stat_result | None = None
+    temporary_identity: os.stat_result | None = None
+    written_owned: _OwnedFile | None = None
+    published = False
     failure: BaseException | None = None
+    owner_uid = 0
+    owner_gid = 0
+
+    def adopt_existing() -> _OwnedFile:
+        """Adopt an exact prior receipt during an idempotent retry."""
+
+        existing_descriptor: int | None = None
+        try:
+            existing_descriptor = os.open(
+                path.name,
+                os.O_RDONLY
+                | _require_os_flag("O_CLOEXEC")
+                | _require_no_follow(),
+                dir_fd=parent_fd,
+            )
+            existing = os.fstat(existing_descriptor)
+            if (
+                not stat.S_ISREG(existing.st_mode)
+                or existing.st_dev != parent_metadata.st_dev
+                or existing.st_uid != owner_uid
+                or existing.st_gid != owner_gid
+                or existing.st_nlink != 1
+                or stat.S_IMODE(existing.st_mode) != EVIDENCE_MODE
+                or existing.st_size != len(encoded)
+                or _read_fd_digest(existing_descriptor, existing.st_size)
+                != _sha256_bytes(encoded)
+            ):
+                raise HostToolsBundleError("host-tools install evidence already exists")
+            return _owned_file(
+                existing,
+                data=encoded,
+                mode=EVIDENCE_MODE,
+                uid=owner_uid,
+                gid=owner_gid,
+            )
+        except FileNotFoundError as exc:
+            raise HostToolsBundleError("host-tools install evidence disappeared") from exc
+        except OSError as exc:
+            raise HostToolsBundleError("host-tools install evidence cannot be opened") from exc
+        finally:
+            _close_quietly(existing_descriptor)
+
     try:
-        descriptor = os.open(
-            path.name,
-            os.O_RDWR
-            | os.O_CREAT
-            | _require_os_flag("O_EXCL")
-            | _require_os_flag("O_CLOEXEC")
-            | _require_no_follow(),
-            EVIDENCE_MODE,
-            dir_fd=parent_fd,
-        )
-        created = True
-        _write_all(descriptor, encoded)
-        os.fchown(descriptor, 0, 0)
-        os.fchmod(descriptor, EVIDENCE_MODE)
-        os.fsync(descriptor)
-        metadata = os.fstat(descriptor)
-        written_identity = metadata
-        if (
-            metadata.st_dev != parent_metadata.st_dev
-            or not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != 0
-            or metadata.st_gid != 0
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != EVIDENCE_MODE
-            or metadata.st_size != len(encoded)
-            or _sha256_bytes(os.pread(descriptor, metadata.st_size, 0)) != _sha256_bytes(encoded)
-        ):
-            raise HostToolsBundleError("host-tools install evidence metadata is unsafe")
-        pathname = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not _same_identity(pathname, metadata)
-            or pathname.st_uid != 0
-            or pathname.st_gid != 0
-            or stat.S_IMODE(pathname.st_mode) != EVIDENCE_MODE
-        ):
-            raise HostToolsBundleError("host-tools install evidence identity changed")
+        owner_uid, owner_gid = 0, 0
+        try:
+            descriptor = os.open(
+                ".",
+                os.O_RDWR
+                | _require_os_flag("O_TMPFILE")
+                | _require_os_flag("O_CLOEXEC")
+                | _require_no_follow(),
+                EVIDENCE_MODE,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            # A destination may have been linked by an earlier interrupted
+            # attempt.  Only an exact root-owned receipt is adoptable; every
+            # mismatch remains a fail-closed operator condition.
+            if exc.errno != errno.EEXIST:
+                raise HostToolsBundleError(
+                    "host-tools install evidence temporary file could not be opened"
+                ) from exc
+            written_owned = adopt_existing()
+            published = True
+            _injection_point("evidence_existing_adopt")
+            os.fsync(parent_fd)
+        else:
+            os.fchown(descriptor, owner_uid, owner_gid)
+            os.fchmod(descriptor, EVIDENCE_MODE)
+            _write_all(descriptor, encoded)
+            os.fsync(descriptor)
+            temporary_identity = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(temporary_identity.st_mode)
+                or temporary_identity.st_dev != parent_metadata.st_dev
+                or temporary_identity.st_nlink not in {0, 1}
+                or temporary_identity.st_uid != owner_uid
+                or temporary_identity.st_gid != owner_gid
+                or stat.S_IMODE(temporary_identity.st_mode) != EVIDENCE_MODE
+                or temporary_identity.st_size != len(encoded)
+                or _read_fd_digest(descriptor, temporary_identity.st_size)
+                != _sha256_bytes(encoded)
+            ):
+                raise HostToolsBundleError("host-tools install evidence metadata is unsafe")
+            _injection_point("evidence_after_write")
+            try:
+                _link_tmpfile_noreplace(descriptor, parent_fd, path.name)
+            except HostToolsBundleError as exc:
+                if str(exc) != "host-tools output already exists":
+                    raise
+                _close_quietly(descriptor)
+                descriptor = None
+                written_owned = adopt_existing()
+                published = True
+                _injection_point("evidence_existing_adopt")
+            if not published:
+                published_identity = _reconcile_linked_file(
+                    parent_fd,
+                    path.name,
+                    descriptor,
+                    temporary_identity,
+                    expected_device=parent_metadata.st_dev,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                    mode=EVIDENCE_MODE,
+                    size=temporary_identity.st_size,
+                    digest=_sha256_bytes(encoded),
+                )
+                if published_identity is None:
+                    raise HostToolsBundleError("host-tools install evidence identity changed")
+                written_owned = _owned_file(
+                    published_identity,
+                    data=encoded,
+                    mode=EVIDENCE_MODE,
+                    uid=owner_uid,
+                    gid=owner_gid,
+                )
+                published = True
+                _injection_point("evidence_after_link")
     except HostToolsBundleError as exc:
         failure = exc
     except OSError as exc:
@@ -1946,26 +2741,53 @@ def _write_evidence(path: Path, payload: dict[str, object], *, host_tools_root: 
     except BaseException as exc:
         failure = exc
     finally:
-        if descriptor is not None and created and written_identity is None:
-            try:
-                written_identity = os.fstat(descriptor)
-            except BaseException:
-                pass
+        if (
+            failure is not None
+            and not published
+            and descriptor is not None
+            and temporary_identity is not None
+        ):
+            reconciled = _reconcile_linked_file(
+                parent_fd,
+                path.name,
+                descriptor,
+                temporary_identity,
+                expected_device=parent_metadata.st_dev,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                mode=EVIDENCE_MODE,
+                size=temporary_identity.st_size,
+                digest=_sha256_bytes(encoded),
+            )
+            if reconciled is not None:
+                written_owned = _owned_file(
+                    reconciled,
+                    data=encoded,
+                    mode=EVIDENCE_MODE,
+                    uid=owner_uid,
+                    gid=owner_gid,
+                )
+                published = True
         _close_quietly(descriptor)
     if failure is not None:
-        # An interrupted evidence write is removed only when the path still
-        # names the inode opened above.  An identity mismatch is quarantined.
-        if created:
-            _remove_owned_file(parent_fd, path.name, written_identity)
+        # Evidence is the final commit marker.  If linkat completed before an
+        # interrupt, retain the exact marker and let an idempotent retry adopt
+        # it; a foreign/mismatched pathname is never removed.
         _close_quietly(parent_fd)
         raise failure
     try:
+        _injection_point("evidence_before_parent_fsync")
         os.fsync(parent_fd)
-    except OSError as exc:
-        _remove_owned_file(parent_fd, path.name, written_identity)
-        raise HostToolsBundleError("host-tools install evidence parent could not be synced") from exc
-    finally:
+        _injection_point("evidence_after_parent_fsync")
+    except BaseException as exc:
         _close_quietly(parent_fd)
+        if not isinstance(exc, OSError):
+            raise
+        raise HostToolsBundleError("host-tools install evidence parent could not be synced") from exc
+    _close_quietly(parent_fd)
+    if written_owned is None:
+        raise HostToolsBundleError("host-tools install evidence identity is unavailable")
+    return written_owned
 
 
 def install_bundle(
@@ -2031,7 +2853,7 @@ def install_bundle(
     host_fd, host_metadata = _open_host_tools_root(host_tools_root)
     stage_name: str | None = None
     stage_identity: os.stat_result | None = None
-    child_identities: dict[str, os.stat_result] = {}
+    child_identities: dict[str, os.stat_result | _OwnedFile] = {}
     published = False
     target_identity: os.stat_result | None = None
     installation_complete = False
@@ -2065,26 +2887,29 @@ def install_bundle(
             if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
                 raise HostToolsBundleError("host-tools bundle manifest is invalid")
             for name in HOST_TOOL_FILES:
-                child_identities[name] = _write_stage_member(
+                _write_stage_member(
                     stage_fd,
                     name,
                     bytes(members[name]),
                     EXECUTABLE_MODE,
                     expected_device=host_metadata.st_dev,
+                    owned_members=child_identities,
                 )
-            child_identities["capabilities.txt"] = _write_stage_member(
+            _write_stage_member(
                 stage_fd,
                 "capabilities.txt",
                 bytes(members["capabilities.txt"]),
                 DATA_MODE,
                 expected_device=host_metadata.st_dev,
+                owned_members=child_identities,
             )
-            child_identities["manifest.json"] = _write_stage_member(
+            _write_stage_member(
                 stage_fd,
                 "manifest.json",
                 bytes(members["manifest.json"]),
                 DATA_MODE,
                 expected_device=host_metadata.st_dev,
+                owned_members=child_identities,
             )
             if set(os.listdir(stage_fd)) != HOST_TOOLS_INVENTORY:
                 raise HostToolsBundleError("host-tools private stage inventory is not closed")
@@ -2171,6 +2996,7 @@ def install_bundle(
         }
         if evidence_output is not None:
             _write_evidence(evidence_output, evidence, host_tools_root=host_tools_root)
+            _injection_point("install_after_evidence_write")
         installation_complete = True
         print(
             f"HOST_TOOLS_INSTALL schema={PROVENANCE_SCHEMA} status=installed "
@@ -2180,15 +3006,24 @@ def install_bundle(
         return evidence
     except BaseException as original:
         try:
-            if published and target_identity is not None and not installation_complete:
-                _cleanup_owned_directory(
+            # A successful rename may have happened before Python observed
+            # it (including a KeyboardInterrupt in the rename helper).  Prove
+            # that outcome through the dirfd before deciding whether the
+            # pathname is still a private stage.  A foreign target is left
+            # untouched, while an exact target is retained for reconciliation
+            # and never recursively deleted.
+            if stage_name is not None and stage_identity is not None:
+                reconciled = _reconcile_renamed_directory(
                     host_fd,
                     source_sha,
-                    target_identity,
-                    child_identities,
+                    stage_identity,
                     expected_device=host_metadata.st_dev,
                 )
-            elif stage_name is not None and stage_identity is not None and not published:
+                if reconciled is not None:
+                    published = True
+                    target_identity = reconciled
+                    stage_name = None
+            if stage_name is not None and stage_identity is not None:
                 _cleanup_owned_directory(
                     host_fd,
                     stage_name,
@@ -2495,6 +3330,11 @@ def _parser() -> argparse.ArgumentParser:
     extract.add_argument("--output", required=True)
     extract.add_argument("--expected-outer-sha256", required=True)
     extract.add_argument("--expected-inner-sha256", required=True)
+    release = subparsers.add_parser("extract-release-artifact")
+    release.add_argument("--archive", required=True)
+    release.add_argument("--output-dir", required=True)
+    release.add_argument("--release-slug", required=True)
+    release.add_argument("--expected-archive-sha256", required=True)
     install = subparsers.add_parser("install")
     install.add_argument("--outer-bundle", required=True)
     install.add_argument("--host-tools-root", required=True)
@@ -2560,19 +3400,25 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if arguments.command == "verify-outer":
-            verifier = verify_outer_bundle
             if arguments.contract_dir is not None:
-                verifier = lambda outer, **kwargs: verify_outer_contract(
-                    outer, Path(arguments.contract_dir), **kwargs
+                summary = verify_outer_contract(
+                    Path(arguments.outer_bundle),
+                    Path(arguments.contract_dir),
+                    expected_outer_sha256=arguments.expected_outer_sha256,
+                    expected_inner_sha256=arguments.expected_inner_sha256,
+                    expected_source_sha=arguments.expected_source_sha,
+                    expected_manifest_sha256=arguments.expected_manifest_sha256,
+                    expected_capabilities_sha256=arguments.expected_capabilities_sha256,
                 )
-            summary = verifier(
-                Path(arguments.outer_bundle),
-                expected_outer_sha256=arguments.expected_outer_sha256,
-                expected_inner_sha256=arguments.expected_inner_sha256,
-                expected_source_sha=arguments.expected_source_sha,
-                expected_manifest_sha256=arguments.expected_manifest_sha256,
-                expected_capabilities_sha256=arguments.expected_capabilities_sha256,
-            )
+            else:
+                summary = verify_outer_bundle(
+                    Path(arguments.outer_bundle),
+                    expected_outer_sha256=arguments.expected_outer_sha256,
+                    expected_inner_sha256=arguments.expected_inner_sha256,
+                    expected_source_sha=arguments.expected_source_sha,
+                    expected_manifest_sha256=arguments.expected_manifest_sha256,
+                    expected_capabilities_sha256=arguments.expected_capabilities_sha256,
+                )
             print(
                 "HOST_TOOLS_OUTER schema=1 status=verified "
                 f"outer_sha256={summary['outer_sha256']} "
@@ -2591,6 +3437,20 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "HOST_TOOLS_OUTER schema=1 status=extracted "
                 f"outer_sha256={summary['outer_sha256']} inner_sha256={summary['bundle_sha256']}"
+            )
+            return 0
+        if arguments.command == "extract-release-artifact":
+            summary = extract_release_artifact(
+                Path(arguments.archive),
+                Path(arguments.output_dir),
+                release_slug=arguments.release_slug,
+                expected_archive_sha256=arguments.expected_archive_sha256,
+            )
+            print(
+                "RELEASE_ARTIFACT schema=1 status=extracted "
+                f"release_slug={summary['release_slug']} "
+                f"archive={summary['archive']} checksum={summary['checksum']} "
+                f"provenance={summary['provenance']} archive_sha256={summary['archive_sha256']}"
             )
             return 0
         if arguments.command == "install":

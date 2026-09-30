@@ -4,8 +4,7 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from contextlib import redirect_stdout
-from io import BytesIO, StringIO
+from io import BytesIO
 from pathlib import Path
 import re
 import resource
@@ -15,7 +14,6 @@ import subprocess
 import tempfile
 import textwrap
 import threading
-from types import SimpleNamespace
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -23,7 +21,6 @@ from unittest.mock import patch
 from tools import platform_host_tools_bundle as bundle
 from tools import platform_host_tools_candidate as candidate
 from tools import platform_host_tools_pin as pin
-from tools import platform_workflow_remote_dispatch as dispatcher
 from tools.platform_verify_contract import (
     _workflow_step_blocks,
     host_tools_candidate_artifact_zip_curl_blocks,
@@ -1362,6 +1359,114 @@ raise SystemExit(module.main(["host-capabilities"]))
         self.assertIn("expected_contract=", probe)
         self.assertNotIn("platform/tools/platform_workflow_remote_dispatch.py", probe)
         self.assertNotIn("platform_host_tools_bundle.py", probe)
+
+    def test_remote_capability_probe_executes_against_fake_ssh(self) -> None:
+        """Run the final host-capability/digest/mode/stdin SSH block, not only text checks."""
+
+        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        step_start = workflow.index("      - name: Probe immutable installed generation\n")
+        step_end = workflow.index("\n      - name:", step_start + 1)
+        step = workflow[step_start:step_end]
+        body = step.split("        run: |\n", 1)[1]
+        body = "\n".join(
+            line[10:] if line.startswith("          ") else line
+            for line in body.splitlines()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir(mode=0o700)
+            (ssh_dir / "config").write_text("Host *\n", encoding="ascii")
+            (ssh_dir / "id_ed25519").write_text("fixture\n", encoding="ascii")
+            log = root / "ssh.log"
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                textwrap.dedent(
+                    """
+                    #!/usr/bin/env python3
+                    import os
+                    import sys
+
+                    args = sys.argv[1:]
+                    host_index = next(index for index, value in enumerate(args) if "@" in value)
+                    command = args[host_index + 1:]
+                    with open(os.environ["FAKE_SSH_LOG"], "a", encoding="ascii") as log:
+                        log.write(" ".join(command) + "\\n")
+                    if command[:2] == ["/usr/bin/id", "-u"]:
+                        print("0")
+                    elif command and command[0] == "/usr/bin/stat":
+                        path = command[-1]
+                        if path.endswith(os.environ["HOST_TOOLS_SHA"]):
+                            print("directory:0:0:2:555")
+                        elif path.endswith("capabilities.txt") or path.endswith("manifest.json"):
+                            print("regular file:0:0:1:444")
+                        else:
+                            print("regular file:0:0:1:555")
+                    elif command and command[0] == "/usr/bin/find":
+                        print("\\n".join(sorted([
+                            "capabilities.txt", "manifest.json",
+                            "platform_workflow_remote_dispatch.py",
+                            "platform_workflow_input_guard.py",
+                            "platform_prepare_artifact_dir.py",
+                            "platform_production_deploy_supervisor.sh",
+                            "platform_release_lock.sh", "platform_release_preflight.sh",
+                            "platform_validate_release_artifact.py",
+                            "platform_safe_env_exec.py", "platform_render_service_envs.py",
+                            "platform_validate_edge_policy.py",
+                            "platform_configure_shared_env.py",
+                            "platform_update_cloudflare_ips.py",
+                            "platform_storage_evidence_summary.py",
+                        ])))
+                    elif "host-capabilities" in command:
+                        sha = os.environ["HOST_TOOLS_SHA"]
+                        print(f"HOST_TOOLS schema=1 source_sha={sha} generation={sha} dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1")
+                    elif "host-contract" in command:
+                        print("HOST_TOOLS_CONTRACT source_sha=" + command[-3] + " generation=" + command[-3] + " manifest_sha256=" + command[-2] + " capabilities_sha256=" + command[-1])
+                    else:
+                        raise SystemExit("unexpected fake SSH command")
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            target_sha = "a" * 40
+            host_tools_sha = "b" * 40
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "SSH_DIR": str(ssh_dir),
+                "PROD_SSH_HOST": "fake.example",
+                "PROD_SSH_USER": "runner",
+                "TARGET_SHA": target_sha,
+                "HOST_TOOLS_SHA": host_tools_sha,
+                "HOST_TOOLS_SOURCE_DIGEST": target_sha,
+                "HOST_TOOLS_SOURCE_REF": "refs/heads/dev",
+                "HOST_TOOLS_ATTESTATION_RUN_ID": "77",
+                "HOST_TOOLS_ATTESTATION_RUN_ATTEMPT": "1",
+                "HOST_TOOLS_BUNDLE_SHA256": "c" * 64,
+                "HOST_TOOLS_MANIFEST_SHA256": "d" * 64,
+                "HOST_TOOLS_CAPABILITIES_SHA256": "e" * 64,
+                "GITHUB_RUN_ID": "77",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "FAKE_SSH_LOG": str(log),
+                "BASH_ENV": "/dev/null",
+            }
+            completed = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", body],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            calls = log.read_text(encoding="ascii").splitlines()
+            self.assertGreaterEqual(sum("host-capabilities" in call for call in calls), 1)
+            self.assertGreaterEqual(sum("host-contract" in call for call in calls), 1)
+            self.assertGreaterEqual(sum("/usr/bin/stat" in call for call in calls), 15)
 
     def test_remote_inventory_shell_fixture_carries_dotfiles_and_extras_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

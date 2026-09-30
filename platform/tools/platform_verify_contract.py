@@ -765,7 +765,6 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         "platform_build_release.py",
         "platform_load.py",
         "platform_live_launch_report.py",
-        "platform_host_tools_bundle.py",
         "/usr/bin/unzip",
         "/usr/bin/zipinfo",
         "host-tools-handoff",
@@ -774,7 +773,23 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         if marker in production:
             issues.append(f"production secret job must not execute candidate code: {marker}")
     if "actions/download-artifact@" not in production:
-        issues.append("production secret job must consume the immutable artifact via download-artifact")
+        issues.append("production secret job must consume the closed deployment handoff")
+    if "actions/artifacts/${PUBLISHED_ARTIFACT_ID}/zip" not in production:
+        issues.append("production deploy must fetch the release artifact through the raw API")
+    if "extract-release-artifact" not in production:
+        issues.append("production deploy must extract the exact raw release ZIP with the pinned verifier")
+    if "ref: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}" not in production:
+        issues.append("production deploy must pin the raw release verifier to HOST_TOOLS_SHA")
+    if (
+        'env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -I -B "$trusted_tool" '
+        "extract-release-artifact"
+        not in production
+    ):
+        issues.append("raw release extraction must run the pinned verifier in an isolated environment")
+    release_download = _workflow_step_blocks(production)
+    for step in release_download:
+        if "platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}" in step and "actions/download-artifact@" in step:
+            issues.append("production deploy must not use action-extracted release bytes")
     if "id-token: write" in production or "attestations: write" in production:
         issues.append("production secret job must not receive candidate-build signing permissions")
 
@@ -803,7 +818,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
 
     exact_artifact_name = "platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}"
     if exact_artifact_name not in production:
-        issues.append("production deploy must download the exact current-run release artifact")
+        issues.append("production deploy must bind the exact current-run release metadata")
     for marker in (
         "PUBLISHED_ARTIFACT_ID: ${{ needs.build-release.outputs.artifact_id }}",
         "PUBLISHED_ARTIFACT_DIGEST: ${{ needs.build-release.outputs.artifact_digest }}",

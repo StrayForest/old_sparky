@@ -120,7 +120,7 @@ HOST_TOOLS_SHA='<40-lowercase-hex-C>' SOURCE_HEAD_SHA='<40-lowercase-hex-E>' PAC
 The root-only command verifies bounded one-member/15-member ZIPs, requires a root-owned no-follow parent chain without untrusted write access, writes a
 same-filesystem no-follow stage, applies `root:root`/`0555`/`0444`, and uses
 `renameat2(RENAME_NOREPLACE)` while preserving generations and pointers. It
-runs both self-tests and emits bounded mode-0600 evidence in a separate root-owned secure handoff directory—not under the host-tools root or any generation. Evidence uses exclusive no-follow creation, full-write/fsync and post-write pathname/device/inode/link-count/mode/owner checks. Failures, missing primitives, device/link races, duplicate/unknown receipt fields or a 16th member fail closed; cleanup is identity-scoped and parent directories are fsynced after unlink. The fixed self-tests run as `/usr/bin/python3.12 -I -B` after verification and before evidence publication.
+runs both self-tests and emits bounded mode-0600 evidence in a separate root-owned secure handoff directory—not under the host-tools root or any generation. Bundle, outer-member and evidence publication use unnamed `O_TMPFILE` inodes, `linkat` through directory descriptors and exact post-link identity reconciliation; no named temporary or replacement path is accepted. Failures, missing primitives, device/link races, duplicate/unknown receipt fields or a 16th member fail closed; cleanup is identity-scoped and parent directories are fsynced after unlink. The fixed self-tests run as `/usr/bin/python3.12 -I -B` after verification and before evidence publication.
 
 ### Non-deployable pull-request host-tools candidate
 
