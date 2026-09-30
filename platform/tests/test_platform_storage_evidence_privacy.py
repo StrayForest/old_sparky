@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 from tools.platform_storage_evidence_summary import (
     summarize_backup,
@@ -14,6 +18,20 @@ from tools.platform_storage_evidence_summary import (
     summarize_lock,
     summarize_retention,
     summarize_service,
+)
+from tools import platform_storage_diagnostics_sanitizer as diagnostics_sanitizer
+from tools import platform_storage_diagnostics_contract as diagnostics_contract
+from tools.platform_storage_diagnostics_sanitizer import (
+    MAX_INPUT_BYTES,
+    MAX_REPORTED_BYTES,
+    project_public_artifact,
+)
+
+from tests.platform_storage_evidence_fixtures import (
+    LEGACY_RETENTION_0700_OUTPUT,
+    LEGACY_RETENTION_87547_OUTPUT,
+    legacy_storage_report,
+    valid_storage_report,
 )
 
 
@@ -106,6 +124,218 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(backup["removed_count"], 1)
         self.assertTrue(backup["restore_verified"])
 
+        hostile_stderr = (
+            b"active release SHA differs from expected_sha. "
+            b"Authorization: Bearer secret-token "
+            b"Cookie: session=secret-session; csrf=secret-csrf "
+            b"https://old-sparky.example/invite/INVITE-CODE?token=secret-token "
+            b"/home/operator/private-report.json "
+            b"ssh -i /root/.ssh/id_ed25519 operator@example.test"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            output_path = root / "artifact"
+            report_path.write_bytes(
+                b"raw secret-token /home/operator/private-report.json "
+                b"https://old-sparky.example/invite/INVITE-CODE?token=secret-token\n"
+                + valid_storage_report()
+            )
+            stderr_path.write_bytes(b"")
+            success = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(success["status"], "passed")
+            self.assertEqual(success["kind"], "platform_storage_diagnostics")
+            self.assertNotIn("failure", success)
+            self.assertFalse(success["raw_output_included"])
+            self.assert_no_forbidden_values(success)
+            self.assertNotIn("private/path", serialized(success))
+
+            success_output = root / "success-artifact"
+            success_status = diagnostics_sanitizer.main(
+                [
+                    "--report-path",
+                    str(report_path),
+                    "--stderr-path",
+                    str(stderr_path),
+                    "--output-path",
+                    str(success_output),
+                    "--expected-sha",
+                    "a" * 40,
+                    "--remote-exit-code",
+                    "0",
+                    "--remote-stderr-bytes",
+                    "0",
+                    "--report-present",
+                    "true",
+                ]
+            )
+            self.assertEqual(success_status, 0)
+            self.assertEqual(success_output.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(success_output.is_symlink())
+            self.assertNotIn("failure", json.loads(success_output.read_text()))
+
+            invalid_report_path = root / "invalid-report"
+            invalid_report_path.write_bytes(
+                valid_storage_report().replace(
+                    b"42 /private/path", b"not-a-size /private/path", 1
+                )
+            )
+            invalid_report = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=1,
+                remote_stderr_bytes=0,
+                report_path=invalid_report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(invalid_report["reason"], "report_schema_incomplete")
+
+            stderr_path.write_bytes(hostile_stderr + b"\x00\x1b[31m\xff\xfe")
+            report_path.unlink()
+            failure = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=1,
+                remote_stderr_bytes=len(hostile_stderr),
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=False,
+            )
+            self.assert_no_forbidden_values(failure)
+            self.assertEqual(failure["status"], "failed")
+            self.assertFalse(failure["raw_output_included"])
+            self.assertEqual(failure["phase"], "precondition")
+            self.assertEqual(failure["reason"], "active_sha_mismatch")
+            self.assertEqual(failure["action"], "recalculate_expected_sha_from_release")
+            self.assertFalse(failure["report_present"])
+
+            stderr_path.write_bytes(b"")
+            before_report = project_public_artifact(
+                expected_sha="not-a-sha",
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=False,
+            )
+            self.assertEqual(before_report["reason"], "remote_report_missing")
+            self.assertEqual(before_report["expected_sha"], "unavailable")
+
+            report_path.write_bytes(b"x" * (MAX_INPUT_BYTES + 1))
+            stderr_path.write_bytes(b"y" * (MAX_INPUT_BYTES + 1))
+            oversized = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=1,
+                remote_stderr_bytes=MAX_REPORTED_BYTES + 1,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(oversized["reason"], "report_truncated")
+            self.assertTrue(oversized["stderr_truncated"])
+            self.assertTrue(oversized["report_truncated"])
+            self.assertIsNone(oversized["remote_stderr_bytes"])
+
+            report_path.unlink()
+            stderr_path.write_bytes(b"private transport path /root/.ssh/id_ed25519")
+            transport = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=255,
+                remote_stderr_bytes=12,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=False,
+            )
+            self.assertEqual(transport["reason"], "ssh_transport")
+            self.assert_no_forbidden_values(transport)
+
+            timeout = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=124,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=False,
+            )
+            self.assertEqual(timeout["reason"], "remote_timeout")
+
+            fifo = root / "endless"
+            os.mkfifo(fifo)
+            endless = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=1,
+                remote_stderr_bytes=0,
+                report_path=fifo,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(endless["reason"], "remote_report_missing")
+
+            exception_output = root / "exception-artifact"
+            report_path.write_bytes(valid_storage_report())
+            with mock.patch.object(
+                diagnostics_sanitizer,
+                "_project_report",
+                side_effect=RuntimeError("secret path must not escape"),
+            ):
+                status = diagnostics_sanitizer.main(
+                    [
+                        "--report-path",
+                        str(report_path),
+                        "--stderr-path",
+                        str(stderr_path),
+                        "--output-path",
+                        str(exception_output),
+                        "--expected-sha",
+                        "a" * 40,
+                        "--remote-exit-code",
+                        "1",
+                        "--remote-stderr-bytes",
+                        "0",
+                        "--report-present",
+                        "true",
+                    ]
+                )
+            self.assertEqual(status, 1)
+            exception_report = json.loads(exception_output.read_text())
+            self.assertEqual(exception_report["reason"], "sanitizer_exception")
+            self.assert_no_forbidden_values(exception_report)
+
+            output_path.symlink_to(stderr_path)
+            with mock.patch.object(
+                diagnostics_sanitizer,
+                "_project_report",
+                side_effect=RuntimeError("secret path must not escape"),
+            ):
+                status = diagnostics_sanitizer.main(
+                    [
+                        "--report-path",
+                        str(report_path),
+                        "--stderr-path",
+                        str(stderr_path),
+                        "--output-path",
+                        str(output_path),
+                        "--expected-sha",
+                        "a" * 40,
+                        "--remote-exit-code",
+                        "1",
+                        "--remote-stderr-bytes",
+                        "0",
+                        "--report-present",
+                        "true",
+                    ]
+                )
+            self.assertEqual(status, 1)
+            self.assertTrue(output_path.is_symlink())
+            self.assertEqual(output_path.read_bytes(), stderr_path.read_bytes())
+
     def test_retention_summary_keeps_numeric_recovery_audit_only(self) -> None:
         report = summarize_retention(
             json.dumps(
@@ -119,19 +349,29 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
                             "operator@example.test",
                             "/home/operator/private-report.json",
                         ],
+                        "protected_count": 1,
+                        "retained_count": 1,
+                        "deleted_count": 2,
                         "reclaimable_bytes": 8192,
                     },
                     "source_release_artifacts": {
                         "protected": ["release-20260912"],
                         "retained": [],
                         "deleted": [],
+                        "protected_count": 1,
+                        "retained_count": 0,
+                        "deleted_count": 0,
                         "reclaimable_bytes": 0,
                     },
                     "live_qa_runtime_caches": {
                         "protected": ["runtime-" + "a" * 40],
                         "retained": [],
                         "deleted": [],
-                        "reclaimable_bytes": 0,
+                        "reclaimed_tombstones": [],
+                        "protected_count": 1,
+                        "retained_count": 0,
+                        "deleted_count": 0,
+                        "reclaimed_tombstone_count": 0,
                     },
                     "transient": {
                         "reclaimable_bytes": {
@@ -183,6 +423,547 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
         self.assertTrue(report["backup"]["checksum_present"])
         self.assertEqual(report["categories"]["production_releases"]["reclaimable_bytes"], 8192)
         self.assertEqual(report["transient_reclaimable_bytes"]["failed_builds"], 1024)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            stderr_path.write_bytes(b"")
+            report_path.write_bytes(valid_storage_report())
+            artifact = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(artifact["status"], "passed")
+            retention = artifact["sections"]["retention"]
+            del retention["categories"]["live_qa_runtime"][
+                "reclaimed_tombstone_count"
+            ]
+            self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+            retention["categories"]["live_qa_runtime"][
+                "reclaimed_tombstone_count"
+            ] = 0
+            artifact["remote_stderr_bytes"] = None
+            self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+
+    def test_legacy_deployed_retention_fixtures_normalize_byte_for_byte(self) -> None:
+        self.assertEqual(LEGACY_RETENTION_0700_OUTPUT, LEGACY_RETENTION_87547_OUTPUT)
+        for fixture in (LEGACY_RETENTION_0700_OUTPUT, LEGACY_RETENTION_87547_OUTPUT):
+            with self.subTest(fixture=fixture[:12]):
+                projected = summarize_retention(fixture.decode("utf-8"))
+                self.assertEqual(
+                    projected["categories"]["live_qa_runtime"][
+                        "reclaimed_tombstone_count"
+                    ],
+                    1,
+                )
+                self.assertEqual(
+                    projected["transient"],
+                    {
+                        "failed_builds": {"count": 1, "reclaimable_bytes": 13},
+                        "browser_test_artifacts": {
+                            "count": 1,
+                            "reclaimable_bytes": 17,
+                        },
+                        "preprod_screenshots": {
+                            "count": 1,
+                            "reclaimable_bytes": 19,
+                        },
+                    },
+                )
+                self.assertEqual(
+                    projected["transient_reclaimable_bytes"],
+                    {
+                        "failed_builds": 13,
+                        "browser_test_artifacts": 17,
+                        "preprod_screenshots": 19,
+                    },
+                )
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "report"
+                    stderr_path = root / "stderr"
+                    stderr_path.write_bytes(b"")
+                    report_path.write_bytes(legacy_storage_report(fixture))
+                    artifact = project_public_artifact(
+                        expected_sha="a" * 40,
+                        remote_exit_code=0,
+                        remote_stderr_bytes=0,
+                        report_path=report_path,
+                        stderr_path=stderr_path,
+                        report_present=True,
+                    )
+                    self.assertEqual(artifact["status"], "passed")
+                    self.assertTrue(diagnostics_contract.validate_artifact(artifact))
+
+        item_payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+        item_payload["transient"]["failed_builds"] = [
+            {"size_bytes": 5},
+            {"size_bytes": 8},
+        ]
+        item_payload["transient"]["reclaimable_bytes"].pop("failed_builds")
+        item_projected = summarize_retention(json.dumps(item_payload))
+        self.assertEqual(
+            item_projected["transient"]["failed_builds"],
+            {"count": 2, "reclaimable_bytes": 13},
+        )
+
+    def test_legacy_retention_projects_passed_closed_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            stderr_path.write_bytes(b"")
+            report_path.write_bytes(legacy_storage_report(LEGACY_RETENTION_0700_OUTPUT))
+            artifact = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(artifact["status"], "passed")
+            self.assertTrue(diagnostics_contract.validate_artifact(artifact))
+            retention = artifact["sections"]["retention"]
+            self.assertEqual(
+                retention["categories"]["live_qa_runtime"][
+                    "reclaimed_tombstone_count"
+                ],
+                1,
+            )
+            self.assertEqual(retention["transient"]["failed_builds"]["count"], 1)
+
+    def test_legacy_retention_malformed_bytes_fail_closed(self) -> None:
+        mutations = (
+            ("failed_builds", -1),
+            ("browser_test_artifacts", float("nan")),
+            ("preprod_screenshots", 10**18 + 1),
+            ("failed_builds", "13"),
+        )
+        for category, value in mutations:
+            with self.subTest(category=category, value=value):
+                payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+                payload["transient"]["reclaimable_bytes"][category] = value
+                mutated = (json.dumps(payload, indent=2) + "\n").encode()
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "report"
+                    stderr_path = root / "stderr"
+                    stderr_path.write_bytes(b"")
+                    report_path.write_bytes(legacy_storage_report(mutated))
+                    artifact = project_public_artifact(
+                        expected_sha="a" * 40,
+                        remote_exit_code=0,
+                        remote_stderr_bytes=0,
+                        report_path=report_path,
+                        stderr_path=stderr_path,
+                        report_present=True,
+                    )
+                    self.assertEqual(artifact["status"], "failed")
+                    self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+
+        payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+        payload["transient"]["failed_builds"] = [{"name": ".build-old"}]
+        payload["transient"]["reclaimable_bytes"].pop("failed_builds")
+        malformed_item = (json.dumps(payload, indent=2) + "\n").encode()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            stderr_path.write_bytes(b"")
+            report_path.write_bytes(legacy_storage_report(malformed_item))
+            artifact = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(artifact["status"], "failed")
+            self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+
+        extra_item_keys = (
+            {"size_bytes": 13, "name": ".build-old"},
+            {"unknown_bytes": 13},
+            {"size_bytes": 13, "bytes": 0},
+        )
+        for item in extra_item_keys:
+            with self.subTest(item=item):
+                payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+                payload["transient"]["failed_builds"] = [item]
+                payload["transient"]["reclaimable_bytes"].pop("failed_builds")
+                mutated = (json.dumps(payload, indent=2) + "\n").encode()
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "report"
+                    stderr_path = root / "stderr"
+                    stderr_path.write_bytes(b"")
+                    report_path.write_bytes(legacy_storage_report(mutated))
+                    artifact = project_public_artifact(
+                        expected_sha="a" * 40,
+                        remote_exit_code=0,
+                        remote_stderr_bytes=0,
+                        report_path=report_path,
+                        stderr_path=stderr_path,
+                        report_present=True,
+                    )
+                    self.assertEqual(artifact["status"], "failed")
+                    self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+
+        empty_list_mutations = (
+            ("negative", -1),
+            ("nonfinite", float("nan")),
+            ("string", "0"),
+            ("missing", ...),
+            ("unknown", {"unknown_bytes": 0}),
+        )
+        for label, value in empty_list_mutations:
+            with self.subTest(empty_list=label):
+                payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+                payload["transient"]["failed_builds"] = []
+                aggregate = payload["transient"]["reclaimable_bytes"]
+                if value is ...:
+                    aggregate.pop("failed_builds")
+                else:
+                    aggregate["failed_builds"] = value
+                mutated = (json.dumps(payload, indent=2) + "\n").encode()
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "report"
+                    stderr_path = root / "stderr"
+                    stderr_path.write_bytes(b"")
+                    report_path.write_bytes(legacy_storage_report(mutated))
+                    artifact = project_public_artifact(
+                        expected_sha="a" * 40,
+                        remote_exit_code=0,
+                        remote_stderr_bytes=0,
+                        report_path=report_path,
+                        stderr_path=stderr_path,
+                        report_present=True,
+                    )
+                    self.assertEqual(artifact["status"], "failed")
+                    self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+
+    def test_failure_schema_is_closed_and_success_validation_is_strict(self) -> None:
+        failure_keys = {
+            "schema",
+            "kind",
+            "status",
+            "raw_output_included",
+            "expected_sha",
+            "remote_exit_code",
+            "remote_stderr_bytes",
+            "stderr_truncated",
+            "report_present",
+            "report_truncated",
+            "phase",
+            "reason",
+            "action",
+            "active_release_id",
+            "active_source_sha",
+            "sections",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            stderr_path.write_bytes(b"")
+
+            before_report = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=255,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=False,
+            )
+            self.assertEqual(set(before_report), failure_keys)
+            self.assertEqual(before_report["reason"], "ssh_transport")
+            self.assertIn(before_report["phase"], diagnostics_sanitizer.SAFE_FAILURE_PHASES)
+            self.assertIn(before_report["reason"], diagnostics_sanitizer.SAFE_FAILURE_REASONS)
+            self.assertIn(before_report["action"], diagnostics_sanitizer.SAFE_FAILURE_ACTIONS)
+            self.assertEqual(before_report["active_source_sha"], "unavailable")
+            self.assertFalse(before_report["raw_output_included"])
+
+            malformed = valid_storage_report().replace(
+                b'"active_source_sha":"' + b"a" * 40 + b'"}',
+                b'"active_source_sha":"' + b"a" * 40 + b'","unexpected":"drop"}',
+            )
+            report_path.write_bytes(malformed)
+            invalid = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(invalid["reason"], "report_schema_incomplete")
+            self.assertEqual(set(invalid), failure_keys | {"active_release_id", "active_source_sha", "sections"})
+
+            unknown_record = valid_storage_report().replace(
+                b"--- df root\n", b"--- unexpected root\n--- df root\n", 1
+            )
+            report_path.write_bytes(unknown_record)
+            invalid = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(invalid["reason"], "report_schema_incomplete")
+
+            malformed_report_path = root / "malformed-report"
+            malformed_report_path.write_bytes(
+                valid_storage_report().replace(
+                    b"state=unlocked", b"state=unlocked\x00\x1b[31m", 1
+                )
+            )
+            malformed_report = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=malformed_report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(malformed_report["status"], "failed")
+            self.assertEqual(malformed_report["reason"], "report_schema_incomplete")
+            self.assert_no_forbidden_values(malformed_report)
+
+            report_path.write_bytes(valid_storage_report())
+            stderr_path.write_bytes(b"warning=\xff\x00\x1b[31m")
+            noisy_success = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=11,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(noisy_success["status"], "failed")
+            self.assertFalse(noisy_success["raw_output_included"])
+            self.assert_no_forbidden_values(noisy_success)
+
+            sanitized = diagnostics_sanitizer._failure_summary(
+                expected_sha="a" * 40,
+                remote_exit_code=1,
+                remote_stderr_bytes=0,
+                report_present=False,
+                phase="private-secret",
+                reason="private-secret",
+                action="private-secret",
+            )
+            self.assertEqual(sanitized["phase"], "capture")
+            self.assertEqual(sanitized["reason"], "remote_collection_failed")
+            self.assertEqual(sanitized["action"], "inspect_remote_collection")
+            self.assert_no_forbidden_values(sanitized)
+
+    def test_failure_contract_is_shared_and_atomic_writer_removes_stale_output(self) -> None:
+        self.assertEqual(
+            diagnostics_sanitizer.SAFE_FAILURE_PHASES,
+            diagnostics_contract.SAFE_FAILURE_PHASES,
+        )
+        self.assertEqual(
+            diagnostics_sanitizer.SAFE_FAILURE_REASONS,
+            diagnostics_contract.SAFE_FAILURE_REASONS,
+        )
+        self.assertEqual(
+            diagnostics_sanitizer.SAFE_FAILURE_ACTIONS,
+            diagnostics_contract.SAFE_FAILURE_ACTIONS,
+        )
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        contract_source = (
+            Path(__file__).resolve().parents[1]
+            / "tools/platform_storage_diagnostics_contract.py"
+        ).read_text(encoding="utf-8")
+        for value in (
+            *diagnostics_contract.SAFE_FAILURE_PHASES,
+            *diagnostics_contract.SAFE_FAILURE_REASONS,
+            *diagnostics_contract.SAFE_FAILURE_ACTIONS,
+        ):
+            self.assertIn(f'"{value}"', contract_source)
+        for key in diagnostics_contract.FAILURE_KEYS:
+            self.assertIn(f'"{key}"', contract_source)
+        self.assertIn("platform_storage_diagnostics_contract.py", workflow)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            output_path = root / "artifact"
+            report_path.write_bytes(valid_storage_report())
+            stderr_path.write_bytes(b"")
+            passed = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            output_path.write_text(json.dumps(passed), encoding="utf-8")
+            with mock.patch.object(
+                diagnostics_sanitizer,
+                "_project_report",
+                side_effect=RuntimeError("projector failed"),
+            ):
+                status = diagnostics_sanitizer.main(
+                    [
+                        "--report-path",
+                        str(report_path),
+                        "--stderr-path",
+                        str(stderr_path),
+                        "--output-path",
+                        str(output_path),
+                        "--expected-sha",
+                        "a" * 40,
+                        "--remote-exit-code",
+                        "1",
+                        "--remote-stderr-bytes",
+                        "0",
+                        "--report-present",
+                        "true",
+                    ]
+                )
+            self.assertEqual(status, 1)
+            self.assertEqual(json.loads(output_path.read_text())["status"], "failed")
+
+            with mock.patch.object(
+                diagnostics_sanitizer,
+                "project_public_artifact",
+                return_value=passed,
+            ):
+                status = diagnostics_sanitizer.main(
+                    [
+                        "--report-path",
+                        str(report_path),
+                        "--stderr-path",
+                        str(stderr_path),
+                        "--output-path",
+                        str(output_path),
+                        "--expected-sha",
+                        "a" * 40,
+                        "--remote-exit-code",
+                        "1",
+                        "--remote-stderr-bytes",
+                        "0",
+                        "--report-present",
+                        "true",
+                    ]
+                )
+            self.assertEqual(status, 1)
+            self.assertEqual(json.loads(output_path.read_text())["status"], "failed")
+
+            output_path.write_text(json.dumps(passed), encoding="utf-8")
+            with mock.patch.object(
+                diagnostics_sanitizer.os,
+                "replace",
+                side_effect=OSError("atomic commit failed"),
+            ):
+                with self.assertRaises(OSError):
+                    diagnostics_sanitizer._write_nofollow(output_path, passed)
+            self.assertFalse(output_path.exists())
+
+            with mock.patch.object(
+                diagnostics_sanitizer.os,
+                "fsync",
+                side_effect=OSError("partial fsync failed"),
+            ):
+                status = diagnostics_sanitizer.main(
+                    [
+                        "--report-path",
+                        str(report_path),
+                        "--stderr-path",
+                        str(stderr_path),
+                        "--output-path",
+                        str(output_path),
+                        "--expected-sha",
+                        "a" * 40,
+                        "--remote-exit-code",
+                        "1",
+                        "--remote-stderr-bytes",
+                        "0",
+                        "--report-present",
+                        "false",
+                    ]
+                )
+            self.assertEqual(status, 1)
+            self.assertFalse(output_path.exists())
+
+            stderr_path.unlink()
+            missing_stderr = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(missing_stderr["reason"], "stderr_capture_missing")
+
+    def test_incomplete_numeric_and_retention_records_cannot_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report"
+            stderr_path = root / "stderr"
+            stderr_path.write_bytes(b"")
+            missing_service_numeric = valid_storage_report().replace(
+                b"MemoryCurrent=1", b"MemoryCurrent=", 1
+            )
+            report_path.write_bytes(missing_service_numeric)
+            result = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["reason"], "report_schema_incomplete")
+
+            incomplete_retention = valid_storage_report().replace(
+                b'"duration_seconds":0.1', b'"duration_seconds":null', 1
+            )
+            report_path.write_bytes(incomplete_retention)
+            result = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["reason"], "report_schema_incomplete")
+
+            nonfinite = valid_storage_report().replace(
+                b"MemoryMax=infinity", b"MemoryMax=NaN", 1
+            )
+            report_path.write_bytes(nonfinite)
+            result = project_public_artifact(
+                expected_sha="a" * 40,
+                remote_exit_code=0,
+                remote_stderr_bytes=0,
+                report_path=report_path,
+                stderr_path=stderr_path,
+                report_present=True,
+            )
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["reason"], "report_schema_incomplete")
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,8 +15,12 @@ import unittest
 from unittest import mock
 
 from tests import platform_test_lock_support as lock_support
+from tests.platform_storage_evidence_fixtures import valid_storage_report
 from tools import platform_storage_maintenance as maintenance
 from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
+from tools.platform_storage_diagnostics_contract import validate_artifact
+from tools.platform_storage_diagnostics_sanitizer import project_public_artifact
+from tools.platform_storage_evidence_summary import summarize_retention
 from tools.platform_storage_maintenance import (
     apply_artifact_retention_plan,
     build_artifact_retention_plan,
@@ -33,7 +38,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.release_dir = self.root / "dist" / "releases"
-        self.release_dir.mkdir(parents=True)
+        self.release_dir.mkdir(parents=True, mode=0o700)
+        self.release_dir.chmod(0o700)
         self.now = datetime(2026, 7, 20, tzinfo=UTC)
 
     def tearDown(self) -> None:
@@ -41,30 +47,52 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def add_artifact_group(self, slug: str, *, age_days: int) -> None:
         release = self.release_dir / slug
-        release.mkdir()
-        (release / "RELEASE.json").write_text(
+        release.mkdir(mode=0o700)
+        release.chmod(0o700)
+        manifest = release / "RELEASE.json"
+        manifest.write_text(
             json.dumps({"release_slug": slug}), encoding="utf-8"
         )
+        manifest.chmod(0o600)
         archive = self.release_dir / f"{slug}.tar.gz"
         checksum = self.release_dir / f"{slug}.tar.gz.sha256"
         archive.write_bytes(slug.encode())
+        archive.chmod(0o600)
         checksum.write_text("checksum\n", encoding="utf-8")
+        checksum.chmod(0o600)
         timestamp = (self.now - timedelta(days=age_days)).timestamp()
         for path in (release, archive, checksum):
             os.utime(path, (timestamp, timestamp))
 
+    def ensure_runtime_shared(self, app_dir: Path) -> Path:
+        app_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        app_dir.chmod(0o700)
+        shared_dir = app_dir / "shared"
+        shared_dir.mkdir(mode=0o700, exist_ok=True)
+        shared_dir.chmod(0o700)
+        return shared_dir
+
     def add_runtime_release(self, app_dir: Path, slug: str) -> Path:
-        release = app_dir / "releases" / slug
-        release.mkdir(parents=True)
-        (release / "RELEASE.json").write_text(
+        app_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        app_dir.chmod(0o700)
+        releases_dir = app_dir / "releases"
+        releases_dir.mkdir(mode=0o700, exist_ok=True)
+        releases_dir.chmod(0o700)
+        release = releases_dir / slug
+        release.mkdir(mode=0o700)
+        release.chmod(0o700)
+        manifest = release / "RELEASE.json"
+        manifest.write_text(
             json.dumps({"release_slug": slug}),
             encoding="utf-8",
         )
+        manifest.chmod(0o600)
         return release
 
     def maintenance_args(self, app_dir: Path) -> SimpleNamespace:
         web_dir = self.root / "web"
-        web_dir.mkdir(exist_ok=True)
+        web_dir.mkdir(mode=0o700, exist_ok=True)
+        web_dir.chmod(0o700)
         return SimpleNamespace(
             app_dir=app_dir,
             source_release_dir=self.release_dir,
@@ -84,9 +112,220 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             backup_only=False,
         )
 
+    def test_real_retention_producer_matches_closed_storage_artifact(self) -> None:
+        """Run the producer in the root-owned contour before projecting it."""
+
+        self.assertEqual(os.geteuid(), 0)
+        root = self.root / "producer-fixture"
+        app_dir = root / "app"
+        releases_dir = app_dir / "releases"
+        current = releases_dir / "release-current"
+        previous = releases_dir / "release-previous"
+        root.mkdir(mode=0o700)
+        app_dir.mkdir(mode=0o700)
+        releases_dir.mkdir(mode=0o700)
+        current.mkdir(mode=0o700)
+        previous.mkdir(mode=0o700)
+        shared_dir = app_dir / "shared"
+        shared_dir.mkdir(mode=0o700)
+        (shared_dir / "preprod-screenshots").mkdir(mode=0o700)
+        source_dir = root / "dist" / "releases"
+        (root / "dist").mkdir(mode=0o700)
+        source_dir.mkdir(mode=0o700)
+        web_dir = root / "web"
+        web_dir.mkdir(mode=0o700)
+        live_qa_root = root / "live-qa"
+        live_qa_root.mkdir(mode=0o755)
+        live_qa_root.chmod(0o755)
+        current_manifest = current / "RELEASE.json"
+        previous_manifest = previous / "RELEASE.json"
+        current_manifest.write_text(
+            json.dumps({"source_git_commit": "a" * 40}) + "\n",
+            encoding="utf-8",
+        )
+        previous_manifest.write_text(
+            json.dumps({"source_git_commit": "b" * 40}) + "\n",
+            encoding="utf-8",
+        )
+        current_manifest.chmod(0o600)
+        previous_manifest.chmod(0o600)
+        (app_dir / "current").symlink_to(current)
+        (app_dir / "previous").symlink_to(previous)
+
+        fixture_paths = {
+            root: 0o700,
+            app_dir: 0o700,
+            releases_dir: 0o700,
+            current: 0o700,
+            previous: 0o700,
+            shared_dir: 0o700,
+            shared_dir / "preprod-screenshots": 0o700,
+            root / "dist": 0o700,
+            source_dir: 0o700,
+            web_dir: 0o700,
+            live_qa_root: 0o755,
+            current_manifest: 0o600,
+            previous_manifest: 0o600,
+        }
+        for path, expected_mode in fixture_paths.items():
+            metadata = path.lstat()
+            self.assertEqual(metadata.st_uid, 0, path)
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), expected_mode, path)
+
+        def metadata_snapshot(path: Path) -> tuple[int, ...]:
+            metadata = path.lstat()
+            return (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+
+        before_metadata = {
+            path: metadata_snapshot(path) for path in fixture_paths
+        }
+        before_links = {
+            path: os.readlink(path)
+            for path in (app_dir / "current", app_dir / "previous")
+        }
+
+        # Keep the fixture substitutions, but otherwise mirror the production
+        # diagnostics command: a JSON dry-run with no backup/apply switches.
+        producer_argv = [
+            sys.executable,
+            str(REPO_ROOT / "platform/tools/platform_storage_maintenance.py"),
+            "--app-dir",
+            str(app_dir),
+            "--source-release-dir",
+            str(source_dir),
+            "--web-artifact-dir",
+            str(web_dir),
+            "--live-qa-runtime-root",
+            str(live_qa_root),
+            "--minimum-free-gib",
+            "0",
+            "--maximum-used-percent",
+            "100",
+            "--json",
+            "--skip-backup",
+        ]
+        self.assertEqual(
+            producer_argv[2:],
+            [
+                "--app-dir",
+                str(app_dir),
+                "--source-release-dir",
+                str(source_dir),
+                "--web-artifact-dir",
+                str(web_dir),
+                "--live-qa-runtime-root",
+                str(live_qa_root),
+                "--minimum-free-gib",
+                "0",
+                "--maximum-used-percent",
+                "100",
+                "--json",
+                "--skip-backup",
+            ],
+        )
+        self.assertNotIn("--backup-only", producer_argv)
+        self.assertNotIn("--apply", producer_argv)
+        completed = subprocess.run(
+            producer_argv,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
+        self.assertEqual(
+            {path: metadata_snapshot(path) for path in fixture_paths},
+            before_metadata,
+        )
+        self.assertEqual(
+            {
+                path: os.readlink(path)
+                for path in (app_dir / "current", app_dir / "previous")
+            },
+            before_links,
+        )
+        raw_report = json.loads(completed.stdout)
+        self.assertEqual(
+            set(raw_report["live_qa_runtime_caches"]),
+            {
+                "protected",
+                "retained",
+                "deleted",
+                "reclaimed_tombstones",
+                "protected_count",
+                "retained_count",
+                "deleted_count",
+                "reclaimed_tombstone_count",
+            },
+        )
+        projected = summarize_retention(completed.stdout)
+        self.assertEqual(
+            projected["categories"]["live_qa_runtime"],
+            {
+                "protected_count": 0,
+                "retained_count": 0,
+                "deleted_count": 0,
+                "reclaimed_tombstone_count": 0,
+            },
+        )
+        self.assertNotIn(
+            "reclaimable_bytes",
+            projected["categories"]["live_qa_runtime"],
+        )
+
+        report_path = root / "producer-report"
+        stderr_path = root / "producer-stderr"
+        producer_report = (
+            valid_storage_report().split(
+                b"=== storage_retention_dry_run ===\n", 1
+            )[0]
+            + b"=== storage_retention_dry_run ===\n"
+            + completed.stdout.encode()
+        )
+        report_path.write_bytes(producer_report)
+        stderr_path.write_bytes(b"")
+        report_path.chmod(0o600)
+        stderr_path.chmod(0o600)
+        artifact = project_public_artifact(
+            expected_sha="a" * 40,
+            remote_exit_code=0,
+            remote_stderr_bytes=0,
+            report_path=report_path,
+            stderr_path=stderr_path,
+            report_present=True,
+        )
+        self.assertEqual(artifact["status"], "passed")
+        self.assertTrue(validate_artifact(artifact))
+        self.assertEqual(
+            artifact["sections"]["retention"]["categories"]["live_qa_runtime"],
+            projected["categories"]["live_qa_runtime"],
+        )
+
     def test_artifact_plan_keeps_five_and_protects_rollback(self) -> None:
         for index in range(7):
             self.add_artifact_group(f"release-{index}", age_days=7 - index)
+
+        for path in self.release_dir.iterdir():
+            metadata = path.lstat()
+            self.assertEqual(metadata.st_uid, 0, path)
+            self.assertEqual(
+                stat.S_IMODE(metadata.st_mode),
+                0o700 if path.is_dir() else 0o600,
+                path,
+            )
 
         plan = build_artifact_retention_plan(
             self.release_dir,
@@ -135,8 +374,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_apply_refuses_pending_release_transaction_before_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        shared_dir = app_dir / "shared"
-        shared_dir.mkdir(parents=True)
+        shared_dir = self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -153,7 +391,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_apply_refuses_build_output_lock_contention_before_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -286,7 +524,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_failure_prevents_retention_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -380,7 +618,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_lock_contention_fails_closed_in_subprocess(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         release_lock = lock_support.create_test_lock("backup-release")
         retained_load_lock = lock_support.create_test_lock("backup-retained")
         try:
@@ -411,7 +649,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_build_lock_contention_fails_closed_in_subprocess(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         source_release_dir = self.root / "source-releases"
         source_release_dir.mkdir(mode=0o700)
         source_release_dir.chmod(0o700)
@@ -436,7 +674,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_only_success_never_applies_retention(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -501,7 +739,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_backup_only_failure_does_not_prune_or_check_live_qa(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         candidate = self.add_runtime_release(app_dir, "release-old")
@@ -719,7 +957,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
     def test_apply_lock_order_and_live_qa_report_are_rollback_safe(self) -> None:
         app_dir = self.root / "runtime" / "platform"
-        (app_dir / "shared").mkdir(parents=True)
+        self.ensure_runtime_shared(app_dir)
         current = self.add_runtime_release(app_dir, "release-current")
         previous = self.add_runtime_release(app_dir, "release-previous")
         (app_dir / "current").symlink_to(current)

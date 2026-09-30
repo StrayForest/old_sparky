@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import subprocess
 import sys
 import time
 import unittest
@@ -636,6 +637,46 @@ def _privileged_preflight(cases: Sequence[TestCase]) -> None:
         raise SystemExit(
             "LOCAL GATE BLOCKED: backend-privileged wrapper tests require /usr/bin/setpriv."
         )
+    if "test_platform_host_tools_installer" in modules:
+        required = ("/usr/bin/unshare", "/usr/bin/mount", "/usr/bin/python3.12")
+        missing = [path for path in required if not Path(path).is_file()]
+        if missing:
+            raise SystemExit(
+                "LOCAL GATE BLOCKED: backend-privileged host-tools namespace tests "
+                "require " + ", ".join(missing) + "."
+            )
+        try:
+            probe = subprocess.run(
+                [
+                    "/usr/bin/unshare",
+                    "--mount",
+                    "--fork",
+                    "--propagation",
+                    "private",
+                    "/usr/bin/mount",
+                    "-t",
+                    "tmpfs",
+                    "-o",
+                    "mode=0755",
+                    "tmpfs",
+                    "/opt",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=15,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SystemExit(
+                "LOCAL GATE BLOCKED: backend-privileged host-tools namespace "
+                "mount probe is unavailable."
+            ) from exc
+        if probe.returncode != 0:
+            raise SystemExit(
+                "LOCAL GATE BLOCKED: backend-privileged host-tools namespace "
+                "mount probe is unavailable."
+            )
 
 
 def _require_root_identity(contour: str) -> None:

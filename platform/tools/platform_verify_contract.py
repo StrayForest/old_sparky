@@ -464,6 +464,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             "validate-dispatch",
             "validate-classifier",
             "build-host-tools",
+            "verify-host-tools",
             "host-capability-preflight",
             "build-release",
             "preflight",
@@ -493,6 +494,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
     for branch in (
         "validate-classifier",
         "build-host-tools",
+        "verify-host-tools",
         "host-capability-preflight",
         "build-release",
         "preflight",
@@ -523,6 +525,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         issues.append("classifier prerequisite job is required before candidate build")
 
     host_build = jobs["build-host-tools"]
+    host_verify = jobs["verify-host-tools"]
     host_preflight = jobs["host-capability-preflight"]
     preflight = jobs["preflight"]
     if host_build:
@@ -560,27 +563,46 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host-tools bundle builder must always clean its temporary data")
         if "inputs.mode == 'deploy' || inputs.mode == 'preflight'" not in host_build:
             issues.append("host-tools bundle builder must cover both production dispatch modes")
+    if host_verify:
+        if "environment: production" in host_verify or _production_job_secret_names(host_verify):
+            issues.append("host-tools verifier must be secret-free and outside the production environment")
+        if "actions/checkout@" not in host_verify or "ref: ${{ needs.build-host-tools.outputs.host_tools_sha }}" not in host_verify:
+            issues.append("host-tools verifier must checkout the exact pinned helper source")
+        for marker in (
+            "actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip",
+            "verify-artifact-metadata",
+            "sha256sum -c",
+            "verify-outer",
+            "extract-outer",
+            "gh attestation verify",
+            "--contract-dir",
+        ):
+            if marker not in host_verify:
+                issues.append(f"host-tools verifier is missing {marker}")
+        if "if: ${{ always() }}" not in host_verify or "Remove verifier material" not in host_verify:
+            issues.append("host-tools verifier must always clean its temporary data")
+        if "PROD_SSH_" in host_verify or "environment: production" in host_verify:
+            issues.append("host-tools verifier must not receive production credentials")
+    elif host_preflight:
+        issues.append("secret-free host-tools verifier job is required before capability approval")
     if host_preflight:
         if "environment: production" not in host_preflight:
             issues.append("host capability preflight must own the production environment")
-        if "- build-host-tools" not in host_preflight:
-            issues.append("host capability preflight must wait for the exact host-tools artifact")
-        if "needs.build-host-tools.result == 'success'" not in host_preflight:
-            issues.append("host capability preflight must propagate bundle-builder failure")
-        if "actions/download-artifact@" not in host_preflight or "artifact-ids:" not in host_preflight:
-            issues.append("host capability preflight must download the exact bundle artifact")
-        if "HOST_TOOLS_SHA: ${{ needs.build-host-tools.outputs.host_tools_sha }}" not in host_preflight:
-            issues.append("host capability preflight must consume the pinned HOST_TOOLS_SHA output")
-        if "/opt/oldsparky/platform/shared/host-tools/${{ needs.build-host-tools.outputs.host_tools_sha }}" not in host_preflight:
+        if "- verify-host-tools" not in host_preflight:
+            issues.append("host capability preflight must wait for the secret-free host-tools verifier")
+        if "needs.verify-host-tools.result == 'success'" not in host_preflight:
+            issues.append("host capability preflight must propagate host-tools verifier failure")
+        if "actions/download-artifact@" in host_preflight:
+            issues.append("host capability preflight must not download a host-tools artifact")
+        if "HOST_TOOLS_SHA: ${{ needs.verify-host-tools.outputs.host_tools_sha }}" not in host_preflight:
+            issues.append("host capability preflight must consume the pinned verifier output")
+        if "/opt/oldsparky/platform/shared/host-tools/${{ needs.verify-host-tools.outputs.host_tools_sha }}" not in host_preflight:
             issues.append("host capability preflight must address the pinned host-tools generation")
         if "actions/checkout@" in host_preflight:
             issues.append("host capability preflight must not checkout repository source")
         if "platform_host_tools_bundle.py" in host_preflight:
             issues.append("host capability preflight must not execute the bundle verifier")
-        for command in ("/usr/bin/zipinfo", "/usr/bin/unzip", "files.sha256", "files.modes"):
-            if command not in host_preflight:
-                issues.append(f"host capability preflight must validate bundle data with {command}")
-        for command in ("/usr/bin/id -u", "/usr/bin/stat", "/usr/bin/sha256sum", "/usr/bin/test"):
+        for command in ("/usr/bin/id -u", "/usr/bin/stat", "/usr/bin/find", "test "):
             if command not in host_preflight:
                 issues.append(f"host capability preflight must use fixed {command} checks")
         if any(marker in host_preflight for marker in ("bash -s", "python -c", "platform_host_tools_install")):
@@ -591,7 +613,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host capability preflight must not upload a bundle or deploy artifact")
         if (
             "if: ${{ always() }}" not in host_preflight
-            or "Remove host capability verifier material" not in host_preflight
+            or "Remove capability verifier material" not in host_preflight
         ):
             issues.append("host capability preflight must always clean its verifier material")
         if "inputs.mode == 'deploy' || inputs.mode == 'preflight'" not in host_preflight:
@@ -602,7 +624,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             (
                 index
                 for index, step in enumerate(steps)
-                if "- name: Validate root SSH identity and installed generation" in step
+                if "- name: Configure pinned production SSH" in step
             ),
             None,
         )
@@ -610,7 +632,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             (
                 index
                 for index, step in enumerate(steps)
-                if "- name: Probe immutable host dispatcher capabilities" in step
+                if "- name: Probe immutable installed generation" in step
             ),
             None,
         )
@@ -627,40 +649,25 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         if probe_step_index is not None:
             probe_step = steps[probe_step_index]
             for marker in (
-                '/usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-capabilities',
-                "/usr/bin/timeout --signal=TERM --kill-after=2s 15s",
-                "ulimit -f 1",
-                "remote=(ssh -n -T ",
-                "< /dev/null",
-                ") 2>/dev/null < /dev/null | /usr/bin/head -c 512 > \"$probe_output\"",
-                'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
+                '/usr/bin/python3.12 -I -B "$dispatcher" host-capabilities',
+                "/usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s",
+                'expected_capabilities="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
                 'dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"',
-                'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
-                "command_rc=",
-                "expected_bytes=",
-                "actual_bytes=",
-                "expected_sha256=",
-                "actual_sha256=",
-                "actual_cr_count=",
-                "actual_lf_count=",
-                "exact_one_line=",
+                'expected_contract="HOST_TOOLS_CONTRACT source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA manifest_sha256=$HOST_TOOLS_MANIFEST_SHA256 capabilities_sha256=$HOST_TOOLS_CAPABILITIES_SHA256"',
+                'test "$(run_remote /usr/bin/python3.12 -I -B "$dispatcher" host-capabilities | tr -d \'\\r\')"',
+                'test "$(run_remote /usr/bin/python3.12 -I -B "$dispatcher" host-contract',
             ):
                 if marker not in probe_step:
                     issues.append(f"host capability probe is missing fixed contract marker: {marker}")
-            ssh_dir_stat = 'test "$(stat -c \'%F:%a\' -- "$HOST_TOOLS_SSH_DIR")" = "directory:700"'
-            if ssh_dir_stat not in probe_step:
+            ssh_dir_stat = 'test "$(stat -c \'%F:%a\' -- "$ssh_dir")" = "directory:700"'
+            if ssh_dir_stat not in host_preflight:
                 issues.append("host capability probe must accept real SSH directory link counts")
-            ssh_dir_owner = 'test "$(stat -c \'%u:%g\' -- "$HOST_TOOLS_SSH_DIR")" = "$(id -u):$(id -g)"'
-            if ssh_dir_owner not in probe_step:
+            ssh_dir_owner = 'test "$(stat -c \'%u:%g\' -- "$ssh_dir")" = "$(id -u):$(id -g)"'
+            if ssh_dir_owner not in host_preflight:
                 issues.append("host capability probe must retain SSH directory ownership checks")
             if 'stat -c \'%F:%h:%a\' -- "$HOST_TOOLS_SSH_DIR"' in probe_step:
                 issues.append("host capability probe must not require SSH directory nlink 1")
-            if not re.search(
-                r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I -B '
-                r'"\$HOST_TOOLS_DISPATCHER" host-capabilities$',
-                probe_step,
-                re.MULTILINE,
-            ):
+            if 'run_remote /usr/bin/python3.12 -I -B "$dispatcher" host-capabilities' not in probe_step:
                 issues.append("host capability probe must invoke the immutable dispatcher with fixed argv")
 
     if preflight:
@@ -758,12 +765,31 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         "platform_build_release.py",
         "platform_load.py",
         "platform_live_launch_report.py",
+        "/usr/bin/unzip",
+        "/usr/bin/zipinfo",
+        "host-tools-handoff",
     )
     for marker in candidate_markers:
         if marker in production:
             issues.append(f"production secret job must not execute candidate code: {marker}")
     if "actions/download-artifact@" not in production:
-        issues.append("production secret job must consume the immutable artifact via download-artifact")
+        issues.append("production secret job must consume the closed deployment handoff")
+    if "actions/artifacts/${PUBLISHED_ARTIFACT_ID}/zip" not in production:
+        issues.append("production deploy must fetch the release artifact through the raw API")
+    if "extract-release-artifact" not in production:
+        issues.append("production deploy must extract the exact raw release ZIP with the pinned verifier")
+    if "ref: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}" not in production:
+        issues.append("production deploy must pin the raw release verifier to HOST_TOOLS_SHA")
+    if (
+        'env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -I -B "$trusted_tool" '
+        "extract-release-artifact"
+        not in production
+    ):
+        issues.append("raw release extraction must run the pinned verifier in an isolated environment")
+    release_download = _workflow_step_blocks(production)
+    for step in release_download:
+        if "platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}" in step and "actions/download-artifact@" in step:
+            issues.append("production deploy must not use action-extracted release bytes")
     if "id-token: write" in production or "attestations: write" in production:
         issues.append("production secret job must not receive candidate-build signing permissions")
 
@@ -792,7 +818,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
 
     exact_artifact_name = "platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}"
     if exact_artifact_name not in production:
-        issues.append("production deploy must download the exact current-run release artifact")
+        issues.append("production deploy must bind the exact current-run release metadata")
     for marker in (
         "PUBLISHED_ARTIFACT_ID: ${{ needs.build-release.outputs.artifact_id }}",
         "PUBLISHED_ARTIFACT_DIGEST: ${{ needs.build-release.outputs.artifact_digest }}",
@@ -810,7 +836,6 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         "Validate deployment secrets": {"PROD_SSH_HOST", "PROD_SSH_USER", "PROD_SSH_KEY"},
         "Configure SSH": {"PROD_SSH_HOST", "PROD_SSH_KEY"},
         "Verify SSH connection": {"PROD_SSH_HOST", "PROD_SSH_USER"},
-        "Revalidate host-tools contract before production side effects": {"PROD_SSH_HOST", "PROD_SSH_USER"},
         "Upload verified CI artifact": {"PROD_SSH_HOST", "PROD_SSH_USER"},
         "Run production preflight or deployment": {"PROD_SSH_HOST", "PROD_SSH_USER"},
     }

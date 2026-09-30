@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from typing import Any
@@ -20,6 +21,8 @@ from typing import Any
 SCHEMA = 1
 MAX_INPUT_BYTES = 256 * 1024
 MAX_LINES = 512
+MAX_LEGACY_RETENTION_ITEMS = 16_384
+MAX_RETENTION_BYTES = 10**18
 _INTEGER_RE = re.compile(r"^[0-9]{1,20}$")
 _PERCENT_RE = re.compile(r"^([0-9]{1,3})(?:\.[0-9]{1,2})?%$")
 _JOURNAL_SIZE_RE = re.compile(
@@ -68,6 +71,13 @@ SERVICE_PROPERTY_KEYS = (
     "TasksMax",
     "CPUUsageNSec",
 )
+SERVICE_NUMERIC_KEYS = frozenset(
+    set(SERVICE_PROPERTY_KEYS)
+    - {"ActiveState", "SubState", "Result", "ExecMainCode"}
+)
+# systemd reports these limits as the literal value ``infinity``.  Preserve
+# that one documented enum; every other numeric field remains numeric only.
+SERVICE_INFINITY_KEYS = frozenset({"MemoryMax", "TasksMax"})
 _ENUMS = {
     "ActiveState": frozenset(
         {"active", "inactive", "failed", "activating", "deactivating", "reloading"}
@@ -107,6 +117,8 @@ def _read_input() -> str:
 def _safe_int(value: Any, *, maximum: int = 10**18) -> int | None:
     if isinstance(value, bool):
         return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     try:
         number = int(value)
     except (TypeError, ValueError, OverflowError):
@@ -116,12 +128,92 @@ def _safe_int(value: Any, *, maximum: int = 10**18) -> int | None:
     return number
 
 
+def _strict_legacy_bytes(value: Any) -> int | None:
+    """Accept only the integer byte values emitted by the old helper.
+
+    The deployed pre-count helper emits integer aggregate byte fields.  Do not
+    coerce strings or floating point values here: a legacy list is accepted
+    only when its byte accounting is an actual bounded integer.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= MAX_RETENTION_BYTES else None
+
+
+def _legacy_list_count(value: Any) -> int | None:
+    if not isinstance(value, list) or len(value) > MAX_LEGACY_RETENTION_ITEMS:
+        return None
+    return len(value)
+
+
+_LEGACY_ITEM_BYTE_FIELDS = ("size_bytes", "bytes", "reclaimable_bytes")
+
+
+def _legacy_item_bytes(value: list[Any]) -> int | None:
+    """Sum explicit byte fields when a legacy list carries item records.
+
+    Older maintenance output normally contains path-name strings and a
+    category aggregate under ``transient.reclaimable_bytes``.  Some staged
+    helpers emitted item records instead; those records are accepted only
+    when exactly one known byte field is present on every item.  Returning
+    ``None`` for an unknown item shape keeps the projector fail-closed rather
+    than turning unknown bytes into zero.
+    """
+
+    if len(value) > MAX_LEGACY_RETENTION_ITEMS:
+        return None
+    if not value:
+        return 0
+    if not all(isinstance(item, dict) for item in value):
+        return None
+    total = 0
+    for item in value:
+        fields = [name for name in _LEGACY_ITEM_BYTE_FIELDS if name in item]
+        if len(fields) != 1 or set(item) != set(fields):
+            return None
+        amount = _strict_legacy_bytes(item[fields[0]])
+        if amount is None or total > MAX_RETENTION_BYTES - amount:
+            return None
+        total += amount
+    return total
+
+
+def _legacy_transient_bytes(
+    section: Any, aggregate: Any
+) -> tuple[int | None, int | None]:
+    """Normalize one pre-count transient section without inventing bytes."""
+
+    count = _legacy_list_count(section)
+    if count is None:
+        return None, None
+    aggregate_bytes = _strict_legacy_bytes(aggregate)
+    if not section:
+        # An empty legacy list still carries an aggregate byte claim.  Require
+        # the claim to be the known zero value instead of silently converting
+        # a missing, malformed, or nonzero value into zero.
+        return count, 0 if aggregate_bytes == 0 else None
+    if all(isinstance(item, str) for item in section):
+        # The deployed 0700/875 helper emits path-name lists.  Their measured
+        # bytes live in the aggregate map, so a missing/invalid value is
+        # unknown, not zero.
+        return count, aggregate_bytes
+    if not all(isinstance(item, dict) for item in section):
+        return count, None
+    item_bytes = _legacy_item_bytes(section)
+    if item_bytes is not None:
+        if aggregate is not None and aggregate_bytes != item_bytes:
+            return count, None
+        return count, item_bytes
+    return count, None
+
+
 def _safe_percent(value: Any) -> float | None:
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    return number if 0 <= number <= 100 else None
+    return number if math.isfinite(number) and 0 <= number <= 100 else None
 
 
 def _fixed_category(value: str) -> str:
@@ -219,7 +311,10 @@ def summarize_journal(raw: str) -> dict[str, object]:
         raise EvidenceInputError("journal usage producer returned no size")
     amount, unit = matches[-1]
     multiplier = _UNIT_MULTIPLIERS[unit.lower()]
-    size = int(float(amount) * multiplier)
+    numeric_amount = float(amount)
+    if not math.isfinite(numeric_amount):
+        raise EvidenceInputError("journal usage is not finite")
+    size = int(numeric_amount * multiplier)
     if size < 0 or size > 10**18:
         raise EvidenceInputError("journal usage is outside the safe range")
     return {
@@ -234,6 +329,8 @@ def _safe_service_value(key: str, value: str) -> object:
     if key in _ENUMS:
         normalized = value.strip().lower()
         return normalized if normalized in _ENUMS[key] else "unknown"
+    if key in SERVICE_INFINITY_KEYS and value.strip().lower() == "infinity":
+        return "infinity"
     number = _safe_int(value.strip())
     return number
 
@@ -243,10 +340,14 @@ def summarize_service(raw: str, *, service: str) -> dict[str, object]:
         raise EvidenceInputError("service is not allowlisted")
     values: dict[str, object] = {key: None for key in SERVICE_PROPERTY_KEYS}
     recognized = 0
+    seen: set[str] = set()
     for line in raw.splitlines()[:MAX_LINES]:
         key, separator, value = line.partition("=")
         if not separator or key not in values:
             continue
+        if key in seen:
+            raise EvidenceInputError("service producer returned duplicate fields")
+        seen.add(key)
         values[key] = _safe_service_value(key, value)
         recognized += 1
     result = str(values["Result"] or "unknown")
@@ -310,6 +411,7 @@ def summarize_backup(raw: str, *, phase: str) -> dict[str, object]:
     if (
         not isinstance(duration_seconds, (int, float))
         or isinstance(duration_seconds, bool)
+        or not math.isfinite(float(duration_seconds))
         or duration_seconds < 0
         or duration_seconds > 10**9
     ):
@@ -318,6 +420,7 @@ def summarize_backup(raw: str, *, phase: str) -> dict[str, object]:
     if (
         not isinstance(age_hours, (int, float))
         or isinstance(age_hours, bool)
+        or not math.isfinite(float(age_hours))
         or age_hours < 0
         or age_hours > 10**6
     ):
@@ -342,17 +445,61 @@ def summarize_backup(raw: str, *, phase: str) -> dict[str, object]:
 
 
 def _section_summary(section: Any) -> dict[str, object]:
+    """Project producer counts, retaining list lengths only for legacy output."""
+
     if not isinstance(section, dict):
         section = {}
-    def count(name: str) -> int:
+
+    def count(name: str) -> int | None:
+        # The maintenance producer emits explicit counts from its retention
+        # plan.  Prefer those producer values so the projected contract stays
+        # aligned even when a safe-id list is filtered; retain the list-length
+        # fallback for older deployed helpers that predate the count fields.
+        explicit = _safe_int(section.get(f"{name}_count"), maximum=MAX_RETENTION_BYTES)
+        if explicit is not None:
+            return explicit
         value = section.get(name)
-        return len(value) if isinstance(value, list) else 0
-    reclaimable = _safe_int(section.get("reclaimable_bytes"), maximum=10**18) or 0
+        return _legacy_list_count(value)
+    reclaimable = _safe_int(
+        section.get("reclaimable_bytes"), maximum=MAX_RETENTION_BYTES
+    )
     return {
         "protected_count": count("protected"),
         "retained_count": count("retained"),
         "deleted_count": count("deleted"),
         "reclaimable_bytes": reclaimable,
+    }
+
+
+def _live_qa_section_summary(section: Any) -> dict[str, object]:
+    """Project live-QA producer counts and tombstones without fabricated bytes."""
+
+    if not isinstance(section, dict):
+        section = {}
+
+    def count(name: str) -> int | None:
+        explicit = _safe_int(section.get(f"{name}_count"), maximum=MAX_RETENTION_BYTES)
+        if explicit is not None:
+            return explicit
+        value = section.get(name)
+        return _legacy_list_count(value)
+
+    reclaimed_tombstone_count = _safe_int(
+        section.get("reclaimed_tombstone_count"), maximum=MAX_RETENTION_BYTES
+    )
+    if reclaimed_tombstone_count is None:
+        reclaimed_tombstone_count = _legacy_list_count(
+            section.get("reclaimed_tombstones")
+        )
+    return {
+        "protected_count": count("protected"),
+        "retained_count": count("retained"),
+        "deleted_count": count("deleted"),
+        # The maintenance producer does not measure reclaimed bytes for live
+        # QA.  Preserve its actual audit count; older helpers expose only the
+        # tombstone list, while a missing field remains None and is rejected
+        # by the closed contract rather than becoming zero.
+        "reclaimed_tombstone_count": reclaimed_tombstone_count,
     }
 
 
@@ -368,31 +515,43 @@ def summarize_retention(raw: str) -> dict[str, object]:
         "source_release_artifacts": _section_summary(
             payload.get("source_release_artifacts")
         ),
-        "live_qa_runtime": _section_summary(payload.get("live_qa_runtime_caches")),
+        "live_qa_runtime": _live_qa_section_summary(
+            payload.get("live_qa_runtime_caches")
+        ),
     }
     transient = payload.get("transient")
-    transient_bytes: dict[str, int] = {}
-    transient_summary: dict[str, dict[str, int]] = {}
+    transient_bytes: dict[str, int | None] = {}
+    transient_summary: dict[str, dict[str, int | None]] = {}
     if isinstance(transient, dict):
         raw_bytes = transient.get("reclaimable_bytes")
-        if isinstance(raw_bytes, dict):
-            for category in (
-                "failed_builds",
-                "browser_test_artifacts",
-                "preprod_screenshots",
-            ):
-                transient_bytes[category] = _safe_int(raw_bytes.get(category)) or 0
         for category in (
             "failed_builds",
             "browser_test_artifacts",
             "preprod_screenshots",
         ):
             section = transient.get(category)
+            if isinstance(section, list):
+                aggregate = (
+                    raw_bytes.get(category) if isinstance(raw_bytes, dict) else None
+                )
+                count, reclaimable = _legacy_transient_bytes(section, aggregate)
+                transient_bytes[category] = reclaimable
+                transient_summary[category] = {
+                    "count": count,
+                    "reclaimable_bytes": reclaimable,
+                }
+                continue
             if not isinstance(section, dict):
                 section = {}
+            transient_bytes[category] = _safe_int(
+                raw_bytes.get(category) if isinstance(raw_bytes, dict) else None,
+                maximum=MAX_RETENTION_BYTES,
+            )
             transient_summary[category] = {
-                "count": _safe_int(section.get("count")) or 0,
-                "reclaimable_bytes": transient_bytes.get(category, 0),
+                "count": _safe_int(
+                    section.get("count"), maximum=MAX_RETENTION_BYTES
+                ),
+                "reclaimable_bytes": transient_bytes[category],
             }
     disk_after = payload.get("disk_after")
     if not isinstance(disk_after, dict):
@@ -409,6 +568,7 @@ def summarize_retention(raw: str) -> dict[str, object]:
     if (
         not isinstance(duration_seconds, (int, float))
         or isinstance(duration_seconds, bool)
+        or not math.isfinite(float(duration_seconds))
         or duration_seconds < 0
         or duration_seconds > 10**9
     ):
@@ -426,6 +586,7 @@ def summarize_retention(raw: str) -> dict[str, object]:
     if (
         not isinstance(backup_duration_seconds, (int, float))
         or isinstance(backup_duration_seconds, bool)
+        or not math.isfinite(float(backup_duration_seconds))
         or backup_duration_seconds < 0
         or backup_duration_seconds > 10**9
     ):
@@ -524,7 +685,15 @@ def main(argv: list[str] | None = None) -> int:
         # a public diagnostic, even when this helper is called directly.
         print("storage evidence unavailable: internal", file=sys.stderr)
         return 2
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    print(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
     return 0
 
 

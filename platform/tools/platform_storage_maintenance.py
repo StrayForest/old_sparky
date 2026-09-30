@@ -135,6 +135,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-keep", type=int, default=30)
     parser.add_argument("--live-qa-runtime-keep", type=int, default=1)
     parser.add_argument(
+        "--live-qa-runtime-root",
+        type=Path,
+        default=live_qa_guard.RUNNER_CACHE_ROOT,
+    )
+    parser.add_argument(
         "--minimum-free-gib", type=float, default=DEFAULT_MIN_FREE_GIB
     )
     parser.add_argument(

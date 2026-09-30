@@ -70,8 +70,15 @@ def _extract_scan_template(source: str) -> str:
         source[keyscan:],
         re.MULTILINE,
     )
-    if start < 0 or keyscan < 0 or install is None:
+    if start < 0 or keyscan < 0:
         raise AssertionError("workflow did not contain a complete SSH scan setup")
+    if install is None:
+        # Storage diagnostics uses an O_NOFOLLOW/O_EXCL copy for known_hosts;
+        # its hardened block ends at the post-copy metadata assertion.
+        secure_copy = source.find('test "$(stat -c \'%F:%a\' -- "$known_hosts")', keyscan)
+        if secure_copy < 0:
+            raise AssertionError("workflow did not contain a complete SSH scan setup")
+        return textwrap.dedent(source[start:secure_copy]).strip()
     return textwrap.dedent(source[start : keyscan + install.start()]).strip()
 
 
@@ -81,6 +88,7 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
         workflow_count = 0
         standard_blocks: list[str] = []
         as12_blocks: list[str] = []
+        hardened_blocks: list[str] = []
         paths = sorted((*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")))
         for path in paths:
             runs = _workflow_runs(path)
@@ -103,13 +111,22 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                 site_count += 1
                 block = _extract_scan_template(run)
                 self.assertIn("for ssh_attempt in 1 2; do", block, path.name)
-                self.assertIn(
-                    "timeout --foreground 4s ssh-keyscan -T 3 -t ed25519",
-                    block,
-                    path.name,
-                )
-                self.assertIn('>"$ssh_scan_attempt" 2>/dev/null', block, path.name)
-                self.assertIn('install -m 600 /dev/null "$ssh_scan_attempt"', block, path.name)
+                if path.name == "platform-production-storage-diagnostics.yml":
+                    self.assertIn(
+                        "timeout --foreground --signal=TERM --kill-after=5s 4s ssh-keyscan -T 3 -t ed25519",
+                        block,
+                        path.name,
+                    )
+                    self.assertIn('set -o noclobber', block, path.name)
+                    self.assertIn("os.O_EXCL", block, path.name)
+                else:
+                    self.assertIn(
+                        "timeout --foreground 4s ssh-keyscan -T 3 -t ed25519",
+                        block,
+                        path.name,
+                    )
+                    self.assertIn('>"$ssh_scan_attempt" 2>/dev/null', block, path.name)
+                    self.assertIn('install -m 600 /dev/null "$ssh_scan_attempt"', block, path.name)
                 self.assertIn(
                     'NF == 3 && $1 == host && $2 == "ssh-ed25519"',
                     block,
@@ -125,8 +142,11 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                 self.assertIn("attempt %s/2 failed", block, path.name)
                 self.assertIn("attempt %s/2 succeeded", block, path.name)
                 self.assertIn("(( ssh_attempt == 2 )) || sleep 0.5", block, path.name)
-                self.assertGreaterEqual(block.count('rm -f -- "$ssh_scan_attempt"'), 2, path.name)
-                target = (
+                if path.name == "platform-production-storage-diagnostics.yml":
+                    self.assertGreaterEqual(block.count('rm -f -- "$ssh_scan_attempt"'), 1, path.name)
+                else:
+                    self.assertGreaterEqual(block.count('rm -f -- "$ssh_scan_attempt"'), 2, path.name)
+                target = hardened_blocks if path.name == "platform-production-storage-diagnostics.yml" else (
                     as12_blocks
                     if path.name == "platform-production-as12-proof.yml"
                     else standard_blocks
@@ -134,8 +154,9 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                 target.append(block)
         self.assertEqual(workflow_count, 21)
         self.assertEqual(site_count, 24)
-        self.assertEqual(len(standard_blocks), 23)
+        self.assertEqual(len(standard_blocks), 22)
         self.assertEqual(len(set(standard_blocks)), 1)
+        self.assertEqual(len(hardened_blocks), 1)
         self.assertEqual(len(as12_blocks), 1)
         self.assertEqual(
             as12_blocks[0],

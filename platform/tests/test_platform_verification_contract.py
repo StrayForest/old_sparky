@@ -34,6 +34,7 @@ from tools.platform_verify import (
     CI_GATE_IDS,
     DETERMINISTIC_GATE_IDS,
     GATES_BY_ID,
+    SECURITY_AUDIT_LOCKS,
     VerificationError,
     _verification_contract_commands,
     dispatch,
@@ -717,6 +718,44 @@ except lock.VerificationLockError as exc:
         self.assertNotIn("PLATFORM_VERIFICATION_RUNTIME_DIR", workflow)
         self.assertNotIn("sudo install -d", workflow)
         self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 4)
+        self.assertIn(
+            "for identity in oldsparky-platform oldsparky-web oldsparky-api oldsparky-worker oldsparky-liveqa; do",
+            workflow,
+        )
+        self.assertIn(
+            'platform_passwd="$(getent passwd oldsparky-platform)"',
+            workflow,
+        )
+        self.assertIn(
+            'test "$(id -G oldsparky-platform | awk \'{print NF}\')" -eq 1',
+            workflow,
+        )
+        self.assertIn(
+            'test "$(printf \'%s\\n\' "$liveqa_passwd" | cut -d: -f6)" = /nonexistent',
+            workflow,
+        )
+        self.assertIn(
+            'test "$(printf \'%s\\n\' "$liveqa_passwd" | cut -d: -f7)" = /usr/sbin/nologin',
+            workflow,
+        )
+        self.assertIn(
+            'test "$(id -G oldsparky-liveqa | awk \'{print NF}\')" -eq 1',
+            workflow,
+        )
+        self.assertIn("Preflight live-QA guard boundaries", workflow)
+        self.assertIn(
+            '("liveqa_identity", guard.liveqa_identity),',
+            workflow,
+        )
+        self.assertIn(
+            '("liveqa_cgroup_process_ids", guard._liveqa_cgroup_process_ids),',
+            workflow,
+        )
+        self.assertIn(
+            '("liveqa_process_ids", guard._liveqa_process_ids),',
+            workflow,
+        )
+        self.assertIn("LIVE_QA_PREFLIGHT status=failed", workflow)
         verification_block = re.search(
             r"^  verification-contract:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,
@@ -749,8 +788,26 @@ except lock.VerificationLockError as exc:
             sum(case.module == "test_platform_ci_classifier" for case in verification_cases),
             int(EXPECTED_SNAPSHOT["verification_classifier_test_count"]),
         )
-        with patch("tools.platform_verify._run", return_value=0) as run:
+        with patch("tools.platform_verify._run", return_value=0) as verification_run:
             self.assertEqual(dispatch(VERIFICATION_CONTOUR), 0)
+
+        with patch("tools.platform_verify._run", side_effect=[17, 0, 0, 0]) as run:
+            self.assertEqual(dispatch("security"), 17)
+        self.assertEqual(run.call_count, 4)
+        audit_calls = run.call_args_list[:2]
+        self.assertEqual(
+            [call.args[0] for call in audit_calls],
+            [f"security/dependency-audit/{lock}" for lock in SECURITY_AUDIT_LOCKS],
+        )
+        audit_commands = [call.args[1] for call in audit_calls]
+        for command, lock in zip(audit_commands, SECURITY_AUDIT_LOCKS):
+            self.assertEqual(command[:3], [sys.executable, "-m", "pip_audit"])
+            self.assertIn("--strict", command)
+            self.assertIn("--disable-pip", command)
+            self.assertIn("--require-hashes", command)
+            self.assertEqual(command[-2:], ["-r", lock])
+        self.assertNotIn(SECURITY_AUDIT_LOCKS[1], audit_commands[0])
+        self.assertNotIn(SECURITY_AUDIT_LOCKS[0], audit_commands[1])
 
         self.assertIsNone(
             _integration_preflight_error(
@@ -776,7 +833,7 @@ except lock.VerificationLockError as exc:
         self.assertIn("missing required seed roles", str(missing_seed))
         self.assertIn("authenticated_user", str(missing_seed))
         self.assertEqual(
-            [call.args[1] for call in run.call_args_list],
+            [call.args[1] for call in verification_run.call_args_list],
             list(_verification_contract_commands()),
         )
 

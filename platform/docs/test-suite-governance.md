@@ -241,6 +241,13 @@ attestation and upload.  Its successful output is bounded review evidence
 only: it never grants deploy/provision authority and production workflows must
 not consume its artifact prefixes.
 
+The root-side outer-envelope/installer adversarial tests in
+`test_platform_host_tools_installer` are owned by `backend-privileged` because
+they exercise root identity, ownership, no-overwrite publication and
+identity-scoped cleanup. They use temporary root-owned directories and mock
+the fixed self-tests; a missing root-capable runner is a blocked gate, never a
+permission-relaxed skip.
+
 The handoff context keeps the triggering PR source head **E** separate from
 the synthetic merge SHA **M** that the security workflow tested.  The trusted
 validator binds the exact workflow/run/attempt and its embedded PR snapshot,
@@ -404,8 +411,14 @@ The installer and generator sanitize ambient pip configuration through
 [`tools/platform_ci_pip_env.sh`](../tools/platform_ci_pip_env.sh), use only
 the canonical PyPI index, and never forward extra indexes, trusted hosts,
 find-links, certificate paths or proxy variables.
-The security dependency-audit gate also audits this complete lock, so the
-runtime, quality and security tool dependency sets are covered by one report.
+The security dependency-audit gate independently audits both
+`requirements-ci.lock.txt` and the release/runtime
+`requirements-platform.lock.txt` in the same already-installed CI virtualenv.
+Each invocation is strict, hash-locked and resolver-free
+(`--strict --disable-pip --require-hashes`); the two lock files are never
+combined into a duplicate requirement set. Both audits run even when the
+first reports a vulnerability, and any failure makes the security gate fail.
+No second dependency bootstrap or virtualenv is created for the runtime audit.
 
 Each job's setup-python cache is keyed by the lock path, so lock changes
 invalidate dependency artifacts without sharing a mutable virtualenv between
@@ -544,6 +557,21 @@ variants, including a recovery-job/evidence/API pairing mutation, and covers
 the exact legacy-v2 no-systemd cleanup bridge. The
 workflow is evidence-only and non-deployable; live execution remains an
 explicit operator recovery action.
+
+The host-tools installer contour (`tests.test_platform_host_tools_installer`)
+is privileged and must run the real installer, including both fixed
+`/usr/bin/python3.12 -I -B` self-tests, inside a private mount namespace with
+a tmpfs mounted at the fixed `/opt/oldsparky/platform/shared/host-tools`
+root. `/usr/bin/unshare`, `/usr/bin/mount` and `/usr/bin/python3.12` are hard
+prerequisites; when a runner cannot provide them the contour is
+`LOCAL GATE BLOCKED`, never a silent skip. The tests cover real
+`RENAME_NOREPLACE` `EEXIST`, injected `EXDEV`/`ENOSYS`, device mismatch,
+symlink/hardlink/special-file races, unavailable filesystem primitives,
+partial writes, `KeyboardInterrupt`/`SystemExit` cleanup, closed schema-v2
+receipt mismatches (including duplicate/unknown/missing claims), evidence
+outside the host root, rollback preserving `current`/`previous`, exact
+15-member inventory and absence of pycache/extras. The namespace is private
+and is never allowed to touch the host's production `/opt`.
 
 The `docs` gate checks document shape, repository-local links and project skill
 frontmatter/interface metadata. `verification-contract` checks registry/CI

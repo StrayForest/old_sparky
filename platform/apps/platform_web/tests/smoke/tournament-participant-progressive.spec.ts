@@ -34,8 +34,17 @@ let authBootstrapRequests = 0;
 let csrfRequests = 0;
 let readyVoteRequests = 0;
 let forcedReadyVoteOverloads = 0;
+let readyVoteOverloadAttempt = 0;
 let holdFirstReadyVoteResponse = false;
+let holdSecondReadyVoteResponse = false;
 let releaseHeldReadyVoteResponse: (() => void) | null = null;
+
+function releaseHeldReadyVoteResponseNow(): void {
+  const release = releaseHeldReadyVoteResponse;
+  releaseHeldReadyVoteResponse = null;
+  release?.();
+}
+
 let bracketRequests = 0;
 let inviteClaimRequests = 0;
 let workspaceInFlight = 0;
@@ -157,8 +166,11 @@ test.beforeAll(async () => {
     ) {
       readyVoteRequests += 1;
       if (forcedReadyVoteOverloads > 0) {
+        readyVoteOverloadAttempt += 1;
         forcedReadyVoteOverloads -= 1;
-        if (holdFirstReadyVoteResponse) {
+        const holdResponse = (readyVoteOverloadAttempt === 1 && holdFirstReadyVoteResponse)
+          || (readyVoteOverloadAttempt === 2 && holdSecondReadyVoteResponse);
+        if (holdResponse) {
           await new Promise<void>((resolve) => {
             releaseHeldReadyVoteResponse = resolve;
           });
@@ -194,7 +206,9 @@ test.beforeEach(() => {
   csrfRequests = 0;
   readyVoteRequests = 0;
   forcedReadyVoteOverloads = 0;
+  readyVoteOverloadAttempt = 0;
   holdFirstReadyVoteResponse = false;
+  holdSecondReadyVoteResponse = false;
   releaseHeldReadyVoteResponse = null;
   bracketRequests = 0;
   inviteClaimRequests = 0;
@@ -205,8 +219,8 @@ test.beforeEach(() => {
 
 test.afterEach(() => {
   holdFirstReadyVoteResponse = false;
-  releaseHeldReadyVoteResponse?.();
-  releaseHeldReadyVoteResponse = null;
+  holdSecondReadyVoteResponse = false;
+  releaseHeldReadyVoteResponseNow();
   holdNextWorkspaceResponse = false;
   releaseHeldWorkspaceResponse?.();
   releaseHeldWorkspaceResponse = null;
@@ -352,6 +366,7 @@ test("registered detail uses compact workspace state and ready vote avoids full 
 test("ready vote retries bounded overloads as one logical action", async ({ page }) => {
   forcedReadyVoteOverloads = 2;
   holdFirstReadyVoteResponse = true;
+  holdSecondReadyVoteResponse = true;
   await page.clock.install({ time: new Date("2026-07-20T16:10:00Z") });
   await page.context().addCookies([{
     name: "deadlock_platform_session",
@@ -371,10 +386,12 @@ test("ready vote retries bounded overloads as one logical action", async ({ page
   await expect.poll(() => readyVoteRequests).toBe(1);
   await expect.poll(() => releaseHeldReadyVoteResponse !== null).toBe(true);
   holdFirstReadyVoteResponse = false;
-  releaseHeldReadyVoteResponse?.();
-  releaseHeldReadyVoteResponse = null;
+  releaseHeldReadyVoteResponseNow();
   await page.clock.fastForward(500);
   await expect.poll(() => readyVoteRequests).toBe(2);
+  await expect.poll(() => releaseHeldReadyVoteResponse !== null).toBe(true);
+  holdSecondReadyVoteResponse = false;
+  releaseHeldReadyVoteResponseNow();
   await page.clock.fastForward(1_000);
   await expect(page.getByRole("button", { name: "Отменить подтверждение" })).toBeVisible({ timeout: 5_000 });
   await expect.poll(() => readyVoteRequests).toBe(3);

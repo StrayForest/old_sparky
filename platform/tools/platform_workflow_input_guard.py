@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -642,6 +643,203 @@ def load_stdin_payload(*, mode: str) -> dict[str, str]:
     raise _invalid()
 
 
+def _read_descriptor_bytes(descriptor: int, maximum: int) -> bytes:
+    """Read a bounded byte stream from an already identity-checked fd."""
+
+    data = bytearray()
+    while len(data) <= maximum:
+        chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if len(data) > maximum:
+        raise _invalid()
+    return bytes(data)
+
+
+def materialize_downloaded_deployment_handoff(
+    source: Path,
+    destination: Path,
+    *,
+    expected_mode: str,
+) -> str:
+    """Copy one downloaded schema-1 handoff into a private mode-600 file.
+
+    GitHub artifact download restores ordinary files with a non-private mode.
+    The downloaded path is untrusted until it has been opened with
+    O_NOFOLLOW and its runner ownership, regular-file type, link count and
+    closed deployment schema have been checked.  The private destination is
+    created with O_EXCL and the copied bytes are read back through another
+    no-follow descriptor before the path is handed to any later job step.
+    """
+
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if (
+        not isinstance(source, Path)
+        or not isinstance(destination, Path)
+        or not source.is_absolute()
+        or not destination.is_absolute()
+        or expected_mode not in DEPLOY_MODES
+        or not no_follow
+    ):
+        raise _invalid()
+    _reject_symlink_components(source)
+    _reject_symlink_components(destination)
+    owner_uid = os.getuid()
+    owner_gid = os.getgid()
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    source_descriptor: int | None = None
+    destination_descriptor: int | None = None
+    destination_created = False
+    operation_succeeded = False
+    try:
+        source_parent_metadata = source.parent.lstat()
+        source_entries = os.listdir(source.parent)
+    except OSError as exc:
+        raise _invalid() from exc
+    if (
+        stat.S_ISLNK(source_parent_metadata.st_mode)
+        or not stat.S_ISDIR(source_parent_metadata.st_mode)
+        or source_parent_metadata.st_uid != owner_uid
+        or source_parent_metadata.st_gid != owner_gid
+        or source_entries != [source.name]
+    ):
+        raise _invalid()
+    try:
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY | cloexec | no_follow,
+        )
+        source_metadata = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or source_metadata.st_uid != owner_uid
+            or source_metadata.st_gid != owner_gid
+            or source_metadata.st_nlink != 1
+            or stat.S_IMODE(source_metadata.st_mode) != 0o644
+            or source_metadata.st_size < 0
+            or source_metadata.st_size > MAX_INPUT_BYTES
+        ):
+            raise _invalid()
+        source_bytes = _read_descriptor_bytes(source_descriptor, MAX_INPUT_BYTES)
+        source_after = os.fstat(source_descriptor)
+        if (
+            source_after.st_dev != source_metadata.st_dev
+            or source_after.st_ino != source_metadata.st_ino
+            or not stat.S_ISREG(source_after.st_mode)
+            or source_after.st_uid != owner_uid
+            or source_after.st_gid != owner_gid
+            or source_after.st_nlink != 1
+            or stat.S_IMODE(source_after.st_mode) != 0o644
+            or source_after.st_size != len(source_bytes)
+        ):
+            raise _invalid()
+    except OSError as exc:
+        raise _invalid() from exc
+    finally:
+        if source_descriptor is not None:
+            try:
+                os.close(source_descriptor)
+            except OSError:
+                pass
+
+    try:
+        parent_metadata = destination.parent.lstat()
+    except OSError as exc:
+        raise _invalid() from exc
+    if (
+        stat.S_ISLNK(parent_metadata.st_mode)
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != owner_uid
+        or parent_metadata.st_gid != owner_gid
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+    ):
+        raise _invalid()
+    try:
+        destination.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise _invalid() from exc
+    else:
+        raise _invalid()
+    try:
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | cloexec | no_follow,
+            0o600,
+        )
+        destination_created = True
+        offset = 0
+        while offset < len(source_bytes):
+            offset += os.write(destination_descriptor, source_bytes[offset:])
+        os.fchmod(destination_descriptor, 0o600)
+        os.fsync(destination_descriptor)
+        os.close(destination_descriptor)
+        destination_descriptor = None
+
+        destination_descriptor = os.open(
+            destination,
+            os.O_RDONLY | cloexec | no_follow,
+        )
+        destination_metadata = os.fstat(destination_descriptor)
+        if (
+            not stat.S_ISREG(destination_metadata.st_mode)
+            or destination_metadata.st_uid != owner_uid
+            or destination_metadata.st_gid != owner_gid
+            or destination_metadata.st_nlink != 1
+            or stat.S_IMODE(destination_metadata.st_mode) != 0o600
+            or destination_metadata.st_size != len(source_bytes)
+        ):
+            raise _invalid()
+        destination_bytes = _read_descriptor_bytes(
+            destination_descriptor,
+            MAX_INPUT_BYTES,
+        )
+        destination_after = os.fstat(destination_descriptor)
+        if (
+            destination_after.st_dev != destination_metadata.st_dev
+            or destination_after.st_ino != destination_metadata.st_ino
+            or not stat.S_ISREG(destination_after.st_mode)
+            or destination_after.st_uid != owner_uid
+            or destination_after.st_gid != owner_gid
+            or destination_after.st_nlink != 1
+            or stat.S_IMODE(destination_after.st_mode) != 0o600
+            or destination_after.st_size != len(source_bytes)
+            or destination_bytes != source_bytes
+            or hashlib.sha256(destination_bytes).hexdigest()
+            != hashlib.sha256(source_bytes).hexdigest()
+        ):
+            raise _invalid()
+        copied_payload = _load_json_bytes(destination_bytes)
+        validated = validate_deployment_payload(copied_payload)
+        if validated.get("schema") != "1" or validated.get("mode") != expected_mode:
+            raise _invalid()
+        operation_succeeded = True
+        return hashlib.sha256(source_bytes).hexdigest()
+    except OSError as exc:
+        raise _invalid() from exc
+    finally:
+        if destination_descriptor is not None:
+            try:
+                os.close(destination_descriptor)
+            except OSError:
+                pass
+        if destination_created and not operation_succeeded:
+            try:
+                metadata = destination.lstat()
+                if (
+                    stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_uid == owner_uid
+                    and metadata.st_gid == owner_gid
+                    and metadata.st_nlink == 1
+                    and stat.S_IMODE(metadata.st_mode) == 0o600
+                ):
+                    destination.unlink()
+            except OSError:
+                pass
+
+
 def _write_private_json(path: Path, payload: Mapping[str, str]) -> None:
     """Atomically publish a mode-600 JSON handoff without following a symlink."""
 
@@ -839,6 +1037,13 @@ def _parser() -> argparse.ArgumentParser:
     deployment.add_argument("--classifier-run-attempt", required=True)
     deployment.add_argument("--web-compression", required=True)
 
+    materialize_deployment = subparsers.add_parser(
+        "materialize-deployment"
+    )
+    materialize_deployment.add_argument("--input", type=Path, required=True)
+    materialize_deployment.add_argument("--output", type=Path, required=True)
+    materialize_deployment.add_argument("--mode", required=True)
+
     host_tools = subparsers.add_parser("host-tools")
     host_tools.add_argument("--input", type=Path)
     host_tools.add_argument("--output", type=Path)
@@ -905,6 +1110,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "deployment":
             _write_private_json(args.output, _deployment_from_args(args))
+            return 0
+        if args.command == "materialize-deployment":
+            print(
+                materialize_downloaded_deployment_handoff(
+                    args.input,
+                    args.output,
+                    expected_mode=args.mode,
+                )
+            )
             return 0
         if args.command == "host-tools":
             if args.input is not None:

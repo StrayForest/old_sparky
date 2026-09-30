@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from unittest import mock
@@ -1657,7 +1658,15 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                             secret_names.intersection(step_secrets), location
                         )
                         self.assertNotIn("secrets.PROD_SSH_", step, location)
-                    if uses and ssh_material_cleanup_seen:
+                    storage_evidence_upload = (
+                        # This one upload is deliberately after SSH cleanup:
+                        # the sanitizer creates a fixed schema artifact even
+                        # when cleanup itself failed, so observability is not
+                        # lost with the fail-closed result.
+                        uses.startswith("actions/upload-artifact@")
+                        and "platform-production-storage-diagnostics-artifact.txt" in step
+                    )
+                    if uses and ssh_material_cleanup_seen and not storage_evidence_upload:
                         self.assertRegex(
                             step,
                             r"steps\.cleanup_ssh\.outcome\s*==\s*['\"]success['\"]",
@@ -1751,12 +1760,37 @@ class ReleaseHardeningContractTests(unittest.TestCase):
 
         self.assertGreater(expression_count, 0)
 
+    def test_storage_projector_ulimit_matches_512_kib_contract(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        limit_values = re.findall(r"ulimit -f ([0-9]+)", workflow)
+        self.assertEqual(limit_values, ["512", "512"])
+        self.assertEqual(int(limit_values[0]) * 1024, 512 * 1024)
+        bash = subprocess.run(
+            ["bash", "-c", "ulimit -f 512; ulimit -f"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(bash.stdout.strip(), "512")
+        self.assertIn(
+            "Bash's file-size limit uses 1024-byte blocks. 512 blocks bind",
+            workflow,
+        )
+        self.assertIn("exactly 512 KiB", workflow)
+
     def test_storage_diagnostics_are_read_only(self) -> None:
         workflow = (
             WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("expected_sha", workflow)
-        self.assertIn("platform_storage_maintenance.py\" --json", workflow)
+        self.assertIn("platform_storage_maintenance.py", workflow)
+        self.assertIn("--json", workflow)
+        self.assertIn(
+            '"$python_bin" "$maintenance_tool" --json --skip-backup',
+            workflow,
+        )
         self.assertIn(
             "df -B1 --output=size,used,avail,pcent -- \"$path\"", workflow
         )
@@ -1765,7 +1799,61 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         )
         self.assertIn("journalctl --disk-usage", workflow)
         self.assertIn("du -x -s -B1 -- \"$path\"", workflow)
+        self.assertIn("platform_storage_diagnostics_sanitizer.py", workflow)
+        self.assertIn("platform_storage_maintenance.py", workflow)
+        self.assertIn("sha256sum --strict --check -- manifest.sha256", workflow)
+        self.assertNotIn("platform_workflow_input_guard.py", workflow)
         self.assertIn("platform_storage_evidence_summary.py", workflow)
+        self.assertNotIn('summary_tool="$current/tools/platform_storage_evidence_summary.py"', workflow)
+        self.assertIn(
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+            workflow,
+        )
+        self.assertIn('ref: ${{ github.sha }}', workflow)
+        self.assertIn("timeout --foreground 600s ssh", workflow)
+        self.assertIn("--signal=TERM --kill-after=5s 600s ssh", workflow)
+        self.assertIn("timeout --foreground --signal=TERM --kill-after=5s 90s", workflow)
+        self.assertIn("ulimit -f 512", workflow)
+        self.assertIn('test "$(ulimit -f)" = 512', workflow)
+        self.assertNotIn("ulimit -f 1025", workflow)
+        self.assertNotIn('exec 9>"$retained_load_lock"', workflow)
+        self.assertIn("os.O_RDONLY | os.O_CLOEXEC | getattr(os, \"O_NOFOLLOW\", 0)", workflow)
+        self.assertIn("os.O_EXCL", workflow)
+        self.assertIn("platform_storage_diagnostics_contract.py", workflow)
+        contract_source = self.read_tool("platform_storage_diagnostics_contract.py")
+        self.assertIn("os.replace(temporary, path)", contract_source)
+        self.assertIn("allow_nan=False", contract_source)
+        self.assertIn("Validate canonical prepare-failure schema", workflow)
+        self.assertIn('--write-failure "$failure_artifact"', workflow)
+        self.assertIn('--validate "$failure_artifact"', workflow)
+        self.assertIn("validate_artifact()", workflow)
+        self.assertIn("needs.prepare.result == 'success'", workflow)
+        self.assertIn('remote_stderr_bytes="$(wc -c <"$ssh_error"', workflow)
+        self.assertIn('report_present=false', workflow)
+        self.assertIn('if [[ "$remote_status" = 0 && "$report_present" = true ]]', workflow)
+        self.assertIn('DIAGNOSTICS_REMOTE_STATUS=', workflow)
+        self.assertIn('DIAGNOSTICS_REPORT_PRESENT=', workflow)
+        self.assertIn('SSH_CLEANUP_OUTCOME:', workflow)
+        self.assertIn('write_fallback()', workflow)
+        self.assertIn('>/dev/null 2>/dev/null', workflow)
+        self.assertIn('raw_output_included', contract_source)
+        self.assertIn('regular file:1:600', workflow)
+        self.assertIn('bounded evidence was published', workflow)
+        self.assertIn(
+            'if: ${{ always() }}',
+            workflow,
+        )
+        self.assertIn(
+            '"$RUNNER_TEMP/platform-production-storage-diagnostics.txt"',
+            workflow,
+        )
+        self.assertIn(
+            '"$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"',
+            workflow,
+        )
+        self.assertNotIn('cat "$ssh_error"', workflow)
+        self.assertNotIn('echo "$ssh_error"', workflow)
+        self.assertNotIn('cp -- "$remote_report" "$public_artifact"', workflow)
         self.assertNotIn("df -hT", workflow)
         self.assertNotIn("findmnt", workflow)
         self.assertNotIn("fuser", workflow)
@@ -1773,6 +1861,65 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertNotIn("--apply", workflow)
         self.assertNotIn("systemctl restart", workflow)
         self.assertNotIn("rm -rf", workflow)
+        self.assertLess(
+            workflow.index("- name: Remove production SSH material"),
+            workflow.index("- name: Sanitize storage diagnostic evidence"),
+        )
+        self.assertLess(
+            workflow.index("- name: Remove private storage diagnostic captures"),
+            workflow.index("- name: Upload storage diagnostic evidence"),
+        )
+        self.assertIn('rmdir -- "$projector_dir"', workflow)
+        sanitize_start = workflow.index(
+            "- name: Sanitize storage diagnostic evidence"
+        )
+        cleanup_start = workflow.index(
+            "- name: Remove private storage diagnostic captures"
+        )
+        upload_start = workflow.index("- name: Upload storage diagnostic evidence")
+        self.assertLess(sanitize_start, cleanup_start)
+        self.assertLess(cleanup_start, upload_start)
+        cleanup = workflow[cleanup_start:upload_start]
+        upload = workflow[upload_start:]
+        self.assertIn("if: ${{ always() }}", cleanup)
+        self.assertNotIn(
+            "platform-production-storage-diagnostics-artifact.txt", cleanup
+        )
+        self.assertIn(
+            "if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.cleanup_captures.outcome == 'success' }}",
+            upload,
+        )
+        self.assertNotIn("\n      - name:", upload)
+        sanitize = workflow[sanitize_start:cleanup_start]
+        self.assertIn("projector_status=1", sanitize)
+        self.assertIn("exit 1", sanitize)
+        probe_start = workflow.index(
+            "          import errno", workflow.index("lock_state=")
+        )
+        probe_end = workflow.index("          PY", probe_start)
+        probe = textwrap.dedent(workflow[probe_start:probe_end])
+        self.assertIn("os.O_RDONLY", probe)
+        self.assertIn("getattr(os, \"O_NOFOLLOW\", 0)", probe)
+        self.assertIn("fcntl.LOCK_EX | fcntl.LOCK_NB", probe)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lock_path = root / "retained-load.lock"
+            lock_path.write_bytes(b"coordination lock\n")
+            lock_path.chmod(0o600)
+            before = lock_path.stat()
+            probe_path = root / "probe.py"
+            probe_path.write_text(probe, encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, "-I", str(probe_path), str(lock_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "unlocked")
+            after = lock_path.stat()
+            self.assertEqual(after.st_size, before.st_size)
+            self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
 
     def test_as12_proof_is_read_only_and_sha_locked(self) -> None:
         proof = (WORKFLOW_DIR / "platform-production-as12-proof.yml").read_text(
