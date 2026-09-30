@@ -40,6 +40,17 @@ manifest member from the classifier ZIP. Production artifact directories are
 created by a root-owned helper using directory-relative `O_NOFOLLOW` opens,
 atomic `mkdirat`-style creation, and post-create inode checks.
 
+The production deploy workflow validates candidate and host-tools inputs on a
+secret-free runner and publishes a closed handoff. Once `PROD_SSH_*` values
+are readable, the consumer may use only that handoff, fixed system utilities
+and the already provisioned host dispatcher; it must not execute a checkout or
+an extracted candidate/pinned host-tools parser. Release success is published
+only after the closed receipt has been written, uploaded and assigned a
+non-empty artifact identity. Reusable-call provenance comes from the
+workflow-run `referenced_workflows` records and the called job's runtime
+`job.workflow_repository`, `job.workflow_file_path`, `job.workflow_ref`, and
+`job.workflow_sha` context, not invented fields on the jobs REST rows.
+
 ## Consequences
 
 - A live-user QA run is unavailable until the host image provisions the

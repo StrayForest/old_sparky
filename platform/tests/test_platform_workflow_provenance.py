@@ -23,6 +23,7 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     validate_auto_noop_run,
     validate_deployment_event,
     validate_deployment_marker,
+    validate_referenced_workflows,
 )
 
 
@@ -59,6 +60,9 @@ class WorkflowProvenanceTests(unittest.TestCase):
         jobs = [
             {
                 "id": 9001,
+                "run_id": run_id,
+                "run_attempt": attempt,
+                "head_sha": self.SHA,
                 "name": "Deploy production",
                 "status": "completed",
                 "conclusion": "success",
@@ -244,22 +248,23 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertIn("- validate-security-provenance", child)
         self.assertIn("target SHA is not the current dev head", child)
 
-    def test_native_call_jobs_require_effective_workflow_identity_and_final_barrier(self) -> None:
+    def test_native_call_jobs_use_only_documented_job_fields_and_final_barrier(self) -> None:
         called_sha = "b" * 40
         jobs = [
             {
                 "id": 1,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": called_sha,
                 "name": "Native production deployment",
                 "status": "completed",
                 "conclusion": "success",
-                "workflow_name": DEPLOY_WORKFLOW_NAME,
-                "workflow_file_path": DEPLOY_WORKFLOW_PATH,
-                "workflow_repository": "StrayForest/old_sparky",
-                "workflow_ref": "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
-                "workflow_sha": called_sha,
             },
             {
                 "id": 2,
+                "run_id": 1234,
+                "run_attempt": 2,
+                "head_sha": called_sha,
                 "name": "Auto-deploy result",
                 "status": "completed",
                 "conclusion": "success",
@@ -269,13 +274,54 @@ class WorkflowProvenanceTests(unittest.TestCase):
             jobs,
             called_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
             called_workflow_sha=called_sha,
+            expected_run_id=1234,
+            expected_attempt=2,
+            expected_head_sha=called_sha,
         )
-        jobs[0]["workflow_sha"] = "c" * 40
+        jobs[0]["head_sha"] = "c" * 40
         with self.assertRaises(ProvenanceError):
             validate_auto_release_jobs(
                 jobs,
                 called_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
                 called_workflow_sha=called_sha,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_head_sha=called_sha,
+            )
+
+    def test_invented_jobs_workflow_fields_are_rejected(self) -> None:
+        jobs = [{
+            "id": 1,
+            "name": "Deploy production",
+            "status": "completed",
+            "conclusion": "success",
+            "workflow_file_path": DEPLOY_WORKFLOW_PATH,
+        }]
+        with self.assertRaisesRegex(ProvenanceError, "undocumented"):
+            deployment_snapshot_digest({}, {}, jobs, [])
+
+    def test_referenced_workflow_fixture_binds_path_ref_and_sha(self) -> None:
+        run = {
+            "referenced_workflows": [{
+                "path": DEPLOY_WORKFLOW_PATH,
+                "ref": "refs/heads/dev",
+                "sha": "b" * 40,
+            }]
+        }
+        self.assertEqual(
+            validate_referenced_workflows(
+                run,
+                expected_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
+                expected_workflow_sha="b" * 40,
+            )["path"],
+            DEPLOY_WORKFLOW_PATH,
+        )
+        run["referenced_workflows"][0]["sha"] = "c" * 40
+        with self.assertRaises(ProvenanceError):
+            validate_referenced_workflows(
+                run,
+                expected_workflow_ref="StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev",
+                expected_workflow_sha="b" * 40,
             )
 
     def test_old_attempt_cannot_authorize_mutation(self) -> None:

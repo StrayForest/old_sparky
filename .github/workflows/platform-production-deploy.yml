@@ -268,6 +268,15 @@ jobs:
               [[ "$EXPECTED_CALLED_WORKFLOW_FILE" == ".github/workflows/platform-production-deploy.yml" ]] || { echo "Called workflow file identity is malformed." >&2; exit 1; }
               [[ "$EXPECTED_CALLED_WORKFLOW_REF" == "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev" ]] || { echo "Called workflow ref is not the trusted dev ref." >&2; exit 1; }
               [[ "$EXPECTED_CALLED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Called workflow SHA is malformed." >&2; exit 1; }
+              # Reusable workflow inputs are caller-controlled strings.  Bind
+              # every caller identity back to the inherited context before any
+              # downstream job can consume it.
+              test "$CALLER_RUN_ID" = "${{ github.run_id }}"
+              test "$CALLER_RUN_ATTEMPT" = "${{ github.run_attempt }}"
+              test "$CALLER_WORKFLOW_REF" = "${{ github.workflow_ref }}"
+              test "$CALLER_WORKFLOW_SHA" = "${{ github.workflow_sha }}"
+              test "$CALLER_SHA" = "${{ github.sha }}"
+              test "$EXPECTED_CALLED_WORKFLOW_SHA" = "${{ github.workflow_sha }}"
               test "${{ github.workflow_ref }}" = "$CALLER_WORKFLOW_REF"
               test "${{ github.workflow_sha }}" = "$CALLER_WORKFLOW_SHA"
               event_run='${{ toJSON(github.event.workflow_run) }}'
@@ -277,15 +286,21 @@ jobs:
           import sys
           payload = json.loads(sys.argv[1])
           target_sha, security_id, security_attempt = sys.argv[2:]
+          repository = payload.get("repository") if isinstance(payload, dict) else None
           if (
               not isinstance(payload, dict)
               or payload.get("event") != "push"
               or payload.get("status") != "completed"
               or payload.get("conclusion") != "success"
+              or payload.get("id") != int(security_id)
+              or payload.get("run_attempt") != int(security_attempt)
               or payload.get("head_branch") != "dev"
               or payload.get("head_sha") != target_sha
-              or str(payload.get("id")) != security_id
-              or str(payload.get("run_attempt")) != security_attempt
+              or payload.get("name") != "Platform security and build"
+              or payload.get("path") != ".github/workflows/platform-security.yml"
+              or not isinstance(repository, dict)
+              or repository.get("full_name") != "StrayForest/old_sparky"
+              or payload.get("html_url") != f"https://github.com/StrayForest/old_sparky/actions/runs/{security_id}"
               or re.fullmatch(r"[0-9a-f]{40}", target_sha) is None
           ):
               raise SystemExit("inherited workflow_run is not the exact successful security event")
@@ -1277,28 +1292,78 @@ jobs:
               raise SystemExit("host-tools attestation certificate/source/run/subject policy failed")
           PY
           handoff="$RUNNER_TEMP/platform-host-tools-handoff.json"
-          /usr/bin/python3 -I -B "$inner_root/platform_workflow_input_guard.py" host-tools \
-            --output "$handoff" \
-            --target-sha "$TARGET_SHA" \
-            --host-tools-sha "$HOST_TOOLS_SHA" \
-            --artifact-id "$HOST_TOOLS_ARTIFACT_ID" \
-            --artifact-name "$HOST_TOOLS_ARTIFACT_NAME" \
-            --artifact-size "$artifact_size" \
-            --artifact-digest "$outer_digest" \
-            --bundle-sha256 "$bundle_sha256" \
-            --manifest-sha256 "$manifest_sha256" \
-            --capabilities-sha256 "$capabilities_sha256" \
-            --files-contract-sha256 "$files_contract_sha256" \
-            --modes-contract-sha256 "$modes_contract_sha256" \
-            --signer-workflow "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml" \
-            --source-ref refs/heads/dev \
-            --source-digest "$TARGET_SHA" \
-            --attestation-run-id "$GITHUB_RUN_ID" \
-            --attestation-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --attestation-job-id "$build_job_id"
+          # This parser is fixed workflow code.  It intentionally does not
+          # execute the extracted candidate/pinned host-tools bundle after
+          # production secrets become readable.
+          /usr/bin/python3 - "$handoff" "$TARGET_SHA" "$HOST_TOOLS_SHA" "$HOST_TOOLS_ARTIFACT_ID" "$HOST_TOOLS_ARTIFACT_NAME" "$artifact_size" "$outer_digest" "$bundle_sha256" "$manifest_sha256" "$capabilities_sha256" "$files_contract_sha256" "$modes_contract_sha256" "$build_job_id" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          (
+              output, target, host_sha, artifact_id, artifact_name, artifact_size,
+              artifact_digest, bundle_sha, manifest_sha, capabilities_sha,
+              files_sha, modes_sha, job_id,
+          ) = sys.argv[1:]
+          values = {
+              "schema": "1", "target_sha": target, "host_tools_sha": host_sha,
+              "artifact_id": artifact_id, "artifact_name": artifact_name,
+              "artifact_size": artifact_size, "artifact_digest": artifact_digest,
+              "bundle_sha256": bundle_sha, "manifest_sha256": manifest_sha,
+              "capabilities_sha256": capabilities_sha,
+              "files_contract_sha256": files_sha, "modes_contract_sha256": modes_sha,
+              "signer_workflow": "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml",
+              "source_ref": "refs/heads/dev", "source_digest": target,
+              "attestation_run_id": os.environ["GITHUB_RUN_ID"],
+              "attestation_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "attestation_job_id": job_id,
+          }
+          if (
+              set(values) != {
+                  "schema", "target_sha", "host_tools_sha", "artifact_id", "artifact_name",
+                  "artifact_size", "artifact_digest", "bundle_sha256", "manifest_sha256",
+                  "capabilities_sha256", "files_contract_sha256", "modes_contract_sha256",
+                  "signer_workflow", "source_ref", "source_digest", "attestation_run_id",
+                  "attestation_run_attempt", "attestation_job_id",
+              }
+              or values["schema"] != "1"
+              or re.fullmatch(r"[0-9a-f]{40}", target) is None
+              or re.fullmatch(r"[0-9a-f]{40}", host_sha) is None
+              or re.fullmatch(r"[1-9][0-9]{0,31}", artifact_id) is None
+              or re.fullmatch(r"platform-host-tools-bundle-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}", artifact_name) is None
+              or re.fullmatch(r"[1-9][0-9]*", artifact_size) is None
+              or any(re.fullmatch(r"[0-9a-f]{64}", values[key] or "") is None for key in ("artifact_digest", "bundle_sha256", "manifest_sha256", "capabilities_sha256", "files_contract_sha256", "modes_contract_sha256"))
+              or values["source_digest"] != target
+              or values["source_ref"] != "refs/heads/dev"
+          ):
+              raise SystemExit("closed host-tools handoff is malformed")
+          destination = Path(output)
+          fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          try:
+              os.write(fd, (json.dumps(values, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
+              os.fchmod(fd, 0o600)
+          finally:
+              os.close(fd)
+          PY
           test "$(stat -c '%F:%u:%h:%a' -- "$handoff")" = "regular file:0:1:600"
-          /usr/bin/python3 -I -B "$inner_root/platform_workflow_input_guard.py" host-tools \
-            --input "$handoff" >/dev/null
+          /usr/bin/python3 - "$handoff" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          expected = {
+              "schema", "target_sha", "host_tools_sha", "artifact_id", "artifact_name",
+              "artifact_size", "artifact_digest", "bundle_sha256", "manifest_sha256",
+              "capabilities_sha256", "files_contract_sha256", "modes_contract_sha256",
+              "signer_workflow", "source_ref", "source_digest", "attestation_run_id",
+              "attestation_run_attempt", "attestation_job_id",
+          }
+          if set(payload) != expected or payload["schema"] != "1" or payload["source_digest"] != payload["target_sha"]:
+              raise SystemExit("closed host-tools handoff revalidation failed")
+          PY
           /usr/bin/python3 - "$handoff" "$GITHUB_OUTPUT" <<'PY'
           import json
           import sys
@@ -3057,6 +3122,10 @@ jobs:
       CALLER_WORKFLOW_SHA: ${{ github.event_name == 'workflow_dispatch' && github.workflow_sha || inputs.caller_workflow_sha }}
       EXPECTED_CALLED_WORKFLOW_REF: ${{ github.event_name == 'workflow_dispatch' && github.workflow_ref || inputs.expected_called_workflow_ref }}
       EXPECTED_CALLED_WORKFLOW_SHA: ${{ github.event_name == 'workflow_dispatch' && github.workflow_sha || inputs.expected_called_workflow_sha }}
+      CALLED_WORKFLOW_REF: ${{ job.workflow_ref }}
+      CALLED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+      CALLED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+      CALLED_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
       STATUS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.run_id || inputs.caller_run_id }}
       STATUS_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && github.run_attempt || inputs.caller_run_attempt }}
       STATUS_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event_name == 'workflow_dispatch' && github.run_id || inputs.caller_run_id }}/attempts/${{ github.event_name == 'workflow_dispatch' && github.run_attempt || inputs.caller_run_attempt }}
@@ -3075,9 +3144,22 @@ jobs:
         if: ${{ always() && inputs.mode == 'deploy' && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && needs.production.result == 'success' }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ github.sha }}
+          repository: ${{ env.CALLED_WORKFLOW_REPOSITORY }}
+          ref: ${{ env.CALLED_WORKFLOW_SHA }}
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Require exact trusted called workflow checkout
+        if: ${{ always() && inputs.mode == 'deploy' && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && needs.production.result == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$CALLED_WORKFLOW_REPOSITORY" = "StrayForest/old_sparky"
+          test "$CALLED_WORKFLOW_FILE_PATH" = ".github/workflows/platform-production-deploy.yml"
+          test "$CALLED_WORKFLOW_REF" = "$EXPECTED_CALLED_WORKFLOW_REF"
+          test "$CALLED_WORKFLOW_SHA" = "$EXPECTED_CALLED_WORKFLOW_SHA"
+          [[ "$EXPECTED_CALLED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CALLED_WORKFLOW_SHA"
 
       - name: Fail closed on failed or cancelled deployment
         if: >-
@@ -3137,6 +3219,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create canonical receipt content
+        id: create-receipt-content
         if: >-
           always() && inputs.mode == 'deploy' && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') &&
           needs.production.result == 'success' &&
@@ -3160,8 +3243,13 @@ jobs:
           caller_event = "workflow_run" if caller_kind == "auto" else "workflow_dispatch"
           caller_name = "Platform production auto-deploy" if caller_kind == "auto" else "Platform production deploy"
           caller_path = ".github/workflows/platform-production-autodeploy.yml" if caller_kind == "auto" else ".github/workflows/platform-production-deploy.yml"
-          called_ref = os.environ["EXPECTED_CALLED_WORKFLOW_REF"]
-          called_sha = os.environ["EXPECTED_CALLED_WORKFLOW_SHA"]
+          called_path = os.environ["CALLED_WORKFLOW_FILE_PATH"]
+          called_ref = os.environ["CALLED_WORKFLOW_REF"]
+          called_sha = os.environ["CALLED_WORKFLOW_SHA"]
+          if called_path != os.environ["EXPECTED_CALLED_WORKFLOW_FILE"] or called_ref != os.environ["EXPECTED_CALLED_WORKFLOW_REF"] or called_sha != os.environ["EXPECTED_CALLED_WORKFLOW_SHA"]:
+              raise SystemExit("runtime called workflow identity does not match the closed caller binding")
+          if os.environ["CALLED_WORKFLOW_REPOSITORY"] != "StrayForest/old_sparky":
+              raise SystemExit("runtime called workflow repository is not canonical")
           content_name = os.environ["RECEIPT_CONTENT_NAME"]
           payload = {
               "schema": 1,
@@ -3203,7 +3291,7 @@ jobs:
               "called": {
                   "event": caller_event,
                   "workflow_name": "Platform production deploy",
-                  "workflow_path": ".github/workflows/platform-production-deploy.yml",
+                  "workflow_path": called_path,
                   "workflow_ref": called_ref,
                   "workflow_sha": called_sha,
                   "repository": "StrayForest/old_sparky",
@@ -3294,6 +3382,7 @@ jobs:
           rm -f -- "$metadata"
 
       - name: Create immutable closed release receipt
+        id: create-closed-receipt
         if: ${{ success() && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && steps.receipt-metadata.outputs.artifact_size != '' }}
         shell: bash
         env:
@@ -3327,6 +3416,7 @@ jobs:
           test "$(stat -c '%F:%a:%h' "$RUNNER_TEMP/platform-release-receipt.json")" = "regular file:600:1"
 
       - name: Upload immutable closed release receipt
+        id: upload-closed-receipt
         if: ${{ success() && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && steps.receipt-metadata.outputs.artifact_size != '' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -3336,7 +3426,18 @@ jobs:
           retention-days: 30
 
       - name: Mark top-level release successful
-        if: ${{ success() && inputs.mode == 'deploy' && needs.production.result == 'success' }}
+        id: mark-success
+        if: >-
+          success() && inputs.mode == 'deploy' && needs.production.result == 'success' &&
+          steps.create-receipt-content.outcome == 'success' &&
+          steps.upload-receipt-content.outcome == 'success' &&
+          steps.receipt-metadata.outcome == 'success' &&
+          steps.create-closed-receipt.outcome == 'success' &&
+          steps.upload-closed-receipt.outcome == 'success' &&
+          steps.upload-receipt-content.outputs.artifact-id != '' &&
+          steps.upload-receipt-content.outputs.artifact-digest != '' &&
+          steps.upload-closed-receipt.outputs.artifact-id != '' &&
+          steps.upload-closed-receipt.outputs.artifact-digest != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

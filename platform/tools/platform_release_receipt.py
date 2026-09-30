@@ -269,6 +269,9 @@ def validate_receipt(
             else DEPLOY_WORKFLOW_PATH
         ),
     )
+    expected_caller_ref = f"{REPOSITORY_FULL_NAME}/{caller['workflow_path']}@refs/heads/dev"
+    if caller.get("workflow_ref") != expected_caller_ref:
+        raise _fail("caller workflow ref is not the canonical dev ref")
     caller_event = caller.get("event")
     if caller_event == "workflow_run":
         called_event = "workflow_run"
@@ -287,6 +290,9 @@ def validate_receipt(
         expected_name=called_name,
         expected_path=called_path,
     )
+    expected_called_ref = f"{REPOSITORY_FULL_NAME}/{DEPLOY_WORKFLOW_PATH}@refs/heads/dev"
+    if called.get("workflow_ref") != expected_called_ref:
+        raise _fail("called workflow ref is not the canonical dev ref")
     if caller_event == "workflow_run" and receipt.get("mode") != "deploy":
         raise _fail("auto receipt mode is not deploy")
     if caller_event == "workflow_dispatch" and receipt.get("mode") != "deploy":

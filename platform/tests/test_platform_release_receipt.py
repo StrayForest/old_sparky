@@ -140,6 +140,7 @@ class ReleaseReceiptTests(unittest.TestCase):
             payload[identity]["event"] = "workflow_dispatch"
             payload[identity]["workflow_name"] = "Platform production deploy"
             payload[identity]["workflow_path"] = ".github/workflows/platform-production-deploy.yml"
+            payload[identity]["workflow_ref"] = "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev"
         self.assertIs(validate_receipt(payload), payload)
         payload["caller"]["workflow_name"] = "Platform production auto-deploy"
         with self.assertRaises(ReceiptError):

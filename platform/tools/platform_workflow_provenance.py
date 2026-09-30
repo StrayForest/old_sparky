@@ -454,6 +454,9 @@ def _validate_job_rows(jobs: Sequence[Mapping[str, Any]]) -> None:
         raise _fail("job row is malformed")
     seen_ids: set[int] = set()
     for job in jobs:
+        unknown = set(job) - _DOCUMENTED_JOB_FIELDS
+        if unknown:
+            raise _fail("job row contains undocumented fields")
         # GitHub always supplies an id.  Missing ids are as unsafe as string
         # or boolean ids because they make a row impossible to bind to the
         # exact API object that was snapshotted.
@@ -465,44 +468,133 @@ def _validate_job_rows(jobs: Sequence[Mapping[str, Any]]) -> None:
         seen_ids.add(job_id)
         if not isinstance(job.get("name"), str):
             raise _fail("job name is malformed")
+        for field in ("run_id", "run_attempt", "runner_id", "runner_group_id"):
+            if field in job and (
+                isinstance(job[field], bool)
+                or not isinstance(job[field], int)
+                or job[field] <= 0
+            ):
+                raise _fail(f"job {field} is malformed")
+        if "head_sha" in job and (
+            not isinstance(job["head_sha"], str)
+            or SHA_RE.fullmatch(job["head_sha"]) is None
+        ):
+            raise _fail("job head SHA is malformed")
+        for field in ("status", "conclusion"):
+            if field in job and job[field] is not None and not isinstance(job[field], str):
+                raise _fail(f"job {field} is malformed")
 
 
-def _job_workflow_identity(
+_DOCUMENTED_JOB_FIELDS = frozenset(
+    {
+        "id",
+        "run_id",
+        "run_attempt",
+        "node_id",
+        "head_sha",
+        "url",
+        "html_url",
+        "status",
+        "conclusion",
+        "started_at",
+        "completed_at",
+        "name",
+        "check_run_url",
+        "steps",
+        "runner_id",
+        "runner_name",
+        "runner_group_id",
+        "runner_group_name",
+    }
+)
+
+
+def _job_state(
     job: Mapping[str, Any],
     *,
     expected_name: str,
-    expected_workflow_name: str,
-    expected_workflow_path: str,
-    expected_workflow_ref: str,
-    expected_workflow_sha: str,
+    expected_run_id: int | None = None,
+    expected_attempt: int | None = None,
+    expected_head_sha: str | None = None,
 ) -> None:
-    """Bind a job to the workflow that actually produced that job.
-
-    The top-level run's ``head_sha`` is not a safe substitute for reusable
-    workflow identity.  GitHub's jobs API exposes the effective workflow
-    repository/path/ref/SHA on each job; downstream release consumers must use
-    those fields when accepting a native reusable call.
-    """
-
-    if job.get("name") != expected_name:
-        raise _fail("job name is not canonical")
-    if job.get("workflow_name") != expected_workflow_name:
-        raise _fail("job workflow name is not canonical")
-    if job.get("workflow_file_path") != expected_workflow_path:
-        raise _fail("job workflow file path is not canonical")
-    if job.get("workflow_repository") != REPOSITORY_FULL_NAME:
-        raise _fail("job workflow repository is not canonical")
-    if job.get("workflow_ref") != expected_workflow_ref:
-        raise _fail("job workflow ref is not the expected immutable ref")
-    if job.get("workflow_sha") != expected_workflow_sha:
-        raise _fail("job workflow SHA is not the expected immutable SHA")
-
-
-def _job_state(job: Mapping[str, Any], *, expected_name: str) -> None:
     if job.get("name") != expected_name:
         raise _fail("job identity is not canonical")
+    # These are documented jobs API fields.  They are optional for old API
+    # snapshots, but when present they must bind the row to this exact run.
+    if "run_id" in job and expected_run_id is not None and job.get("run_id") != expected_run_id:
+        raise _fail("job run id does not match the requested run")
+    if "run_attempt" in job and expected_attempt is not None and job.get("run_attempt") != expected_attempt:
+        raise _fail("job run attempt does not match the requested attempt")
+    if "head_sha" in job and expected_head_sha is not None and job.get("head_sha") != expected_head_sha:
+        raise _fail("job head SHA does not match the requested run")
     if job.get("status") != "completed" or job.get("conclusion") != "success":
         raise _fail("required job did not complete successfully")
+
+
+def _bind_job_identity(
+    job: Mapping[str, Any],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_head_sha: str,
+) -> None:
+    """Validate optional documented job bindings without requiring a result."""
+
+    if "run_id" in job and job.get("run_id") != expected_run_id:
+        raise _fail("job run id does not match the requested run")
+    if "run_attempt" in job and job.get("run_attempt") != expected_attempt:
+        raise _fail("job run attempt does not match the requested attempt")
+    if "head_sha" in job and job.get("head_sha") != expected_head_sha:
+        raise _fail("job head SHA does not match the requested run")
+
+
+def validate_referenced_workflows(
+    run: Mapping[str, Any],
+    *,
+    expected_workflow_ref: str,
+    expected_workflow_sha: str,
+    expected_workflow_path: str = DEPLOY_WORKFLOW_PATH,
+) -> Mapping[str, Any]:
+    """Bind a reusable call to the API run's documented references.
+
+    The jobs REST resource does not expose workflow repository/path/ref/SHA.
+    Those values are therefore taken only from the workflow-run
+    ``referenced_workflows`` records, whose documented fields are ``path``,
+    ``ref`` and ``sha``.  Runtime receipt producers separately record the
+    called workflow context; the two records are compared by downstream
+    consumers.
+    """
+
+    if not isinstance(expected_workflow_ref, str) or not expected_workflow_ref:
+        raise _fail("called workflow ref is malformed")
+    if not isinstance(expected_workflow_sha, str) or SHA_RE.fullmatch(expected_workflow_sha) is None:
+        raise _fail("called workflow SHA is malformed")
+    prefix = f"{REPOSITORY_FULL_NAME}/{expected_workflow_path}@"
+    if not expected_workflow_ref.startswith(prefix):
+        raise _fail("called workflow ref is not canonical")
+    expected_ref = expected_workflow_ref[len(prefix):]
+    references = run.get("referenced_workflows")
+    if not isinstance(references, Sequence) or isinstance(references, (str, bytes)):
+        raise _fail("workflow-run referenced_workflows is missing")
+    matches: list[Mapping[str, Any]] = []
+    for reference in references:
+        if not isinstance(reference, Mapping):
+            raise _fail("workflow-run referenced workflow row is malformed")
+        if set(reference) != {"path", "ref", "sha"}:
+            raise _fail("workflow-run referenced workflow fields are undocumented")
+        if not isinstance(reference.get("path"), str) or not isinstance(reference.get("ref"), str):
+            raise _fail("workflow-run referenced workflow path/ref is malformed")
+        if SHA_RE.fullmatch(str(reference.get("sha"))) is None:
+            raise _fail("workflow-run referenced workflow SHA is malformed")
+        if (
+            reference.get("path") == expected_workflow_path
+            and reference.get("ref") == expected_ref
+            and reference.get("sha") == expected_workflow_sha
+        ):
+            matches.append(reference)
+    if len(matches) != 1:
+        raise _fail("exact called workflow reference is missing or ambiguous")
+    return matches[0]
 
 
 def validate_auto_release_jobs(
@@ -510,39 +602,42 @@ def validate_auto_release_jobs(
     *,
     called_workflow_ref: str,
     called_workflow_sha: str,
+    expected_run_id: int | None = None,
+    expected_attempt: int | None = None,
+    expected_head_sha: str | None = None,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     """Validate the native reusable call and caller final barrier.
 
-    ``workflow_name``/``workflow_file_path``/``workflow_repository`` and the
-    effective ref/SHA are deliberately read from each API job row.  A job's
-    display name alone is not release authority.
+    The jobs resource is used only for documented job identity/result fields.
+    Reusable workflow identity is validated separately from the run's
+    ``referenced_workflows`` API field.
     """
 
     _validate_job_rows(jobs)
-    if not isinstance(called_workflow_ref, str) or not called_workflow_ref:
-        raise _fail("called workflow ref is malformed")
-    if not isinstance(called_workflow_sha, str) or SHA_RE.fullmatch(called_workflow_sha) is None:
-        raise _fail("called workflow SHA is malformed")
     call_jobs = [job for job in jobs if job.get("name") == AUTO_CALL_JOB_NAME]
     final_jobs = [job for job in jobs if job.get("name") == AUTO_FINAL_JOB_NAME]
     if len(call_jobs) != 1 or len(final_jobs) != 1:
         raise _fail("native call or final barrier job is missing or ambiguous")
     call_job = call_jobs[0]
     final_job = final_jobs[0]
-    _job_workflow_identity(
+    _job_state(
         call_job,
         expected_name=AUTO_CALL_JOB_NAME,
-        expected_workflow_name=DEPLOY_WORKFLOW_NAME,
-        expected_workflow_path=DEPLOY_WORKFLOW_PATH,
-        expected_workflow_ref=called_workflow_ref,
-        expected_workflow_sha=called_workflow_sha,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_head_sha,
     )
-    _job_state(call_job, expected_name=AUTO_CALL_JOB_NAME)
     # The final barrier is owned by the caller workflow.  GitHub's jobs API
     # does not promise that reusable-call metadata is copied onto this caller
     # job, so bind it by exact name/result while the reusable job above is
     # bound by the effective workflow identity fields.
-    _job_state(final_job, expected_name=AUTO_FINAL_JOB_NAME)
+    _job_state(
+        final_job,
+        expected_name=AUTO_FINAL_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_head_sha,
+    )
     return call_job, final_job
 
 
@@ -579,9 +674,21 @@ def validate_auto_noop_run(
     final_jobs = [job for job in jobs if job.get("name") == AUTO_FINAL_JOB_NAME]
     if len(call_jobs) != 1 or len(final_jobs) != 1:
         raise _fail("auto no-op job set is missing or ambiguous")
+    _bind_job_identity(
+        call_jobs[0],
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
     if (call_jobs[0].get("status"), call_jobs[0].get("conclusion")) != ("completed", "skipped"):
         raise _fail("auto no-op native call is not skipped")
-    _job_state(final_jobs[0], expected_name=AUTO_FINAL_JOB_NAME)
+    _job_state(
+        final_jobs[0],
+        expected_name=AUTO_FINAL_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
     if run.get("status") != "completed" or run.get("conclusion") != "success":
         raise _fail("auto no-op caller run did not succeed")
     validate_status_collection(
@@ -636,10 +743,18 @@ def validate_auto_release_run(
         raise _fail("auto-deploy caller run did not succeed")
     if expected_run_url is not None and run.get("html_url") != expected_run_url:
         raise _fail("auto-deploy caller run URL does not match the event")
+    validate_referenced_workflows(
+        run,
+        expected_workflow_ref=expected_called_workflow_ref,
+        expected_workflow_sha=expected_called_workflow_sha,
+    )
     validate_auto_release_jobs(
         jobs,
         called_workflow_ref=expected_called_workflow_ref,
         called_workflow_sha=expected_called_workflow_sha,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=run.get("head_sha"),
     )
     marker = latest_context_status(
         statuses,
@@ -699,9 +814,23 @@ def validate_manual_deployment_run(
     preflight_jobs = [job for job in jobs if job.get("name") == PREFLIGHT_JOB_NAME]
     if len(deploy_jobs) != 1 or len(preflight_jobs) != 1:
         raise _fail("manual production job set is missing or ambiguous")
+    for job in (deploy_jobs[0], preflight_jobs[0]):
+        _bind_job_identity(
+            job,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_head_sha=expected_target_sha,
+        )
     deploy_state = (deploy_jobs[0].get("status"), deploy_jobs[0].get("conclusion"))
     preflight_state = (preflight_jobs[0].get("status"), preflight_jobs[0].get("conclusion"))
     if deploy_state == ("completed", "success"):
+        _job_state(
+            deploy_jobs[0],
+            expected_name=DEPLOY_JOB_NAME,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_head_sha=expected_target_sha,
+        )
         if run.get("status") != "completed" or run.get("conclusion") != "success":
             raise _fail("manual deployment run did not succeed")
         attempt_url = canonical_attempt_url(
@@ -720,6 +849,13 @@ def validate_manual_deployment_run(
         return True
     if deploy_state != ("completed", "skipped") or preflight_state != ("completed", "success"):
         raise _fail("manual production run is neither a successful deploy nor preflight")
+    _job_state(
+        preflight_jobs[0],
+        expected_name=PREFLIGHT_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
     if run.get("status") != "completed" or run.get("conclusion") != "success":
         raise _fail("manual preflight run did not succeed")
     validate_status_collection(statuses, context=DEPLOY_STATUS_CONTEXT, now=now)
@@ -873,8 +1009,13 @@ def validate_deployment_marker(
     job = matching_jobs[0]
     if not isinstance(job, Mapping):
         raise _fail("Deploy production job metadata is malformed")
-    if job.get("status") != "completed" or job.get("conclusion") != "success":
-        raise _fail("Deploy production job did not complete successfully")
+    _job_state(
+        job,
+        expected_name=DEPLOY_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
     marker = latest_context_status(
         statuses,
         context=DEPLOY_STATUS_CONTEXT,
@@ -945,6 +1086,13 @@ def validate_deployment_event(
     deploy_job = matching_deploy_jobs[0]
     deploy_state = (deploy_job.get("status"), deploy_job.get("conclusion"))
     if deploy_state == ("completed", "success"):
+        _job_state(
+            deploy_job,
+            expected_name=DEPLOY_JOB_NAME,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_head_sha=expected_target_sha,
+        )
         marker = latest_context_status(
             statuses,
             context=DEPLOY_STATUS_CONTEXT,
@@ -974,6 +1122,13 @@ def validate_deployment_event(
         or preflight_job.get("conclusion") != "success"
     ):
         raise _fail("preflight job did not complete successfully")
+    _job_state(
+        preflight_job,
+        expected_name=PREFLIGHT_JOB_NAME,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_head_sha=expected_target_sha,
+    )
 
     # A preflight has no success marker, but a status response still has to be
     # complete and well-formed.  This rejects a malformed/future/tied marker
