@@ -1050,6 +1050,21 @@ def _verify_closed_archive(
 ) -> bytes:
     """Verify an upload-artifact ZIP has one bounded regular member."""
 
+    # The host-tools artifact is the production outer envelope.  Delegate its
+    # path/type/ZIP64/bomb checks to the canonical bundle helper instead of
+    # maintaining a second verifier with a weaker contract.
+    if expected_member == bundle.OUTER_MEMBER_NAME:
+        try:
+            return bundle.verify_single_member_archive(
+                archive_path,
+                expected_member=expected_member,
+                maximum_archive_bytes=MAX_ARTIFACT_BYTES,
+                maximum_member_bytes=maximum_member_bytes,
+                expected_member_digest=expected_member_digest,
+            )
+        except bundle.HostToolsBundleError as exc:
+            raise CandidateError("artifact host-tools envelope is invalid") from exc
+
     archive_data = _read_bytes(
         archive_path,
         maximum=MAX_ARTIFACT_BYTES,

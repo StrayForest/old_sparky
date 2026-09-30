@@ -13,8 +13,8 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
 is the only source for `HOST_TOOLS_SHA`; it currently pins the reviewed
-generation `d4d79261cb109c759d27d9a9b17abc24ec35d323`. The pin records the
-expected repository, exact lowercase commit and a closure baseline of paths,
+generation recorded in that contract. The pin records the expected repository,
+exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
 ancestor of the reviewed application target. There is no `current` or
 application-SHA fallback.
@@ -157,70 +157,73 @@ separate classifier and release contract.
 
 ## One-time operator provisioning (out of band)
 
-This repository change prepares and verifies the handoff only. An operator or
-approved host-image/configuration-management authority must perform the
-following once for a reviewed `HOST_TOOLS_SHA`; the GitHub workflow must not be
-used as the installer:
+This repository owns the bounded envelope validator and root-side installer,
+but the installer is deliberately operator-side tooling and is not part of the
+installed 13-script closure. An approved host-image/configuration-management
+authority must perform the operation below for a reviewed `HOST_TOOLS_SHA` **C**;
+the GitHub workflow must not install it. The artifact must already have passed a
+separate approved, pinned attestation verifier. `platform_host_tools_bundle.py`
+does not claim cryptographic attestation verification: it requires that external
+receipt as an input gate and only checks its exact tuple.
 
-1. Record the exact GitHub artifact ID, outer artifact digest, application
-   `TARGET_SHA` and pinned `HOST_TOOLS_SHA` from the successful
-   `build-host-tools` job. Download the ZIP through the
-   approved artifact channel and verify its SHA-256 before opening it.
-2. Run the offline `platform_host_tools_bundle.py verify` command from the
-   pinned reviewed checkout with the expected `HOST_TOOLS_SHA`. Retain the
-   generated manifest/capability checksum files with the provisioning record.
-3. Through the approved root-only console or host-image pipeline, install the
-   validated members atomically at the exact versioned generation path.  Create
-   the directory with `0555`, files with `0555`/`0444` as specified, and verify
-   root ownership, link counts, type and every recorded digest after the copy.
-   Never install through the deployment workflow and never execute a downloaded
-   installer or candidate repository file on the host.
-4. Keep the previous valid generation untouched.  Before allowing deployment,
-   run the same inventory checks recorded by the workflow.  If any check fails,
-   remove only the incomplete new generation through the approved authority
-   and continue using the previous generation; do not repoint `current` and do
-   not weaken the gate.
+Before the root command, record the artifact ID, application/source-head SHA
+**E**, trusted packaging commit, pinned generation **C**, outer artifact SHA-256,
+inner bundle SHA-256, manifest SHA-256, capabilities SHA-256 and the external
+attestation receipt. The outer ZIP is bounded and must contain exactly one
+regular member named `platform-host-tools-bundle.zip`; the inner ZIP is bounded
+and must contain exactly the 15 flat `platform-host-tools/*` members. Traversal,
+backslashes, duplicate/ZIP64/special/link members, compression bombs and digest
+or identity changes fail closed.
 
-The evidence record must include the exact application `TARGET_SHA`, pinned
-`HOST_TOOLS_SHA`, GitHub artifact ID, outer artifact digest, inner bundle
-digest, verifier output, pre/post inventory and the operator/host-image change
-ID. The reviewed offline check is
-deterministic and can be run before the privileged provisioning action:
+Run this exact command from the reviewed checkout that contains the canonical
+helper (mutation: creates one new versioned generation; it does not touch
+release pointers, the database or systemd):
 
 ```bash
-HOST_TOOLS_SHA=<40-lowercase-hex-host-tools-sha>
-BUNDLE=/secure/handoff/platform-host-tools-bundle.zip
-CONTRACT=/secure/handoff/platform-host-tools-contract
-/usr/bin/sha256sum "$BUNDLE"
-/usr/bin/python3 -I platform/tools/platform_host_tools_bundle.py verify \
-  --bundle "$BUNDLE" --expected-source-sha "$HOST_TOOLS_SHA" --contract-dir "$CONTRACT"
+HOST_TOOLS_SHA='<40-lowercase-hex-C>'
+SOURCE_HEAD_SHA='<40-lowercase-hex-E>'
+PACKAGING_COMMIT='<40-lowercase-hex-packaging-commit>'
+ARTIFACT_ID='<positive-decimal-GitHub-artifact-id>'
+OUTER_SHA256='<64-lowercase-hex-outer-digest>' INNER_SHA256='<64-lowercase-hex-inner-digest>' MANIFEST_SHA256='<64-lowercase-hex-manifest-digest>' CAPABILITIES_SHA256='<64-lowercase-hex-capabilities-digest>'
+OUTER_BUNDLE=/secure/handoff/platform-host-tools-artifact.zip
+ATTESTATION=/secure/handoff/attestation-gate.json
+INSTALL_EVIDENCE=/secure/handoff/host-tools-install-evidence.json
+HOST_TOOLS_ROOT=/opt/oldsparky/platform/shared/host-tools
+/usr/bin/python3.12 -I -B platform/tools/platform_host_tools_bundle.py install \
+  --outer-bundle "$OUTER_BUNDLE" \
+  --host-tools-root "$HOST_TOOLS_ROOT" \
+  --expected-source-sha "$HOST_TOOLS_SHA" \
+  --expected-outer-sha256 "$OUTER_SHA256" \
+  --expected-inner-sha256 "$INNER_SHA256" \
+  --expected-manifest-sha256 "$MANIFEST_SHA256" \
+  --expected-capabilities-sha256 "$CAPABILITIES_SHA256" \
+  --artifact-id "$ARTIFACT_ID" \
+  --attestation-evidence "$ATTESTATION" \
+  --source-head-sha "$SOURCE_HEAD_SHA" \
+  --packaging-commit "$PACKAGING_COMMIT" \
+  --evidence-output "$INSTALL_EVIDENCE"
 ```
 
-The approved root-console/configuration-management operation then extracts
-only the verifier-accepted regular members into a private staging directory
-named for `HOST_TOOLS_SHA`, applies the manifest modes/ownership, verifies every
-post-copy digest and performs an atomic `rename` into the versioned generation
-path only after all checks pass.  It must not execute an archive member while
-staging and must leave the prior generation untouched.  The harmless post-copy
-self-test is the fixed installed entrypoint, with no candidate input:
+The helper requires UID and EUID 0, a no-symlink root-owned parent chain with
+no untrusted write access (a root-owned sticky system temporary directory is
+allowed), and a same-filesystem private stage under `host-tools`, with
+`O_EXCL|O_NOFOLLOW` full writes and `fsync` of every file/stage/parent. It applies `root:root`, `0555`
+to all 13 scripts and `0444` to `manifest.json`/`capabilities.txt`, checks the
+exact inventory and digests, then publishes with Linux `renameat2`+
+`RENAME_NOREPLACE`; `os.replace`, plain `mv` and overwrite are not accepted.
+Existing generations and `current`/`previous` are never modified. The helper
+runs both fixed self-tests (`host-capabilities` and `host-contract`) with
+`/usr/bin/python3.12 -I -B`, and rejects any `__pycache__`/`.pyc` or extra.
 
-```bash
-/usr/bin/python3.12 -I -B \
-  /opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA/platform_workflow_remote_dispatch.py \
-  host-capabilities
-```
-
-The self-test must print only the bounded `HOST_TOOLS schema=1 ...` contract,
-including `python_bytecode_disabled=1`, and return zero.  It must not create
-`__pycache__` or `.pyc` entries.  A non-zero result, any metadata/digest mismatch or an
-interrupted staging action is a failed provisioning attempt: quarantine/remove
-only that identified incomplete staging/generation through the approved
-authority, retain the previous valid generation, record post-failure hashes and
-do not retry by changing permissions or using `current/tools`.
-
-The first deployment after provisioning is still an ordinary reviewed `dev`
-push/automatic chain.  A missing or mismatched generation blocks before release
-build, attestation, artifact SCP, pending status or production writes.
+The bounded mode-0600 evidence JSON contains the artifact ID, C/E/packaging
+tuple, all outer/inner/manifest/capability digests, exact inventory and both self-test
+results. A failed or interrupted operation cleans or quarantines only the
+identity-checked stage/generation it created; an identity mismatch is left for
+the operator rather than recursively deleting anything. Stop immediately on
+any failure and investigate before release build, attestation status,
+artifact transfer, database migration, systemd action or production writes.
+The first deployment after successful provisioning remains the ordinary
+reviewed `dev` push/automatic chain.
 
 ## Intentional host-tools bump lifecycle
 

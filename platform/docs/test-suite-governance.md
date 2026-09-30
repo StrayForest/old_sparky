@@ -241,6 +241,13 @@ attestation and upload.  Its successful output is bounded review evidence
 only: it never grants deploy/provision authority and production workflows must
 not consume its artifact prefixes.
 
+The root-side outer-envelope/installer adversarial tests in
+`test_platform_host_tools_installer` are owned by `backend-privileged` because
+they exercise root identity, ownership, no-overwrite publication and
+identity-scoped cleanup. They use temporary root-owned directories and mock
+the fixed self-tests; a missing root-capable runner is a blocked gate, never a
+permission-relaxed skip.
+
 The handoff context keeps the triggering PR source head **E** separate from
 the synthetic merge SHA **M** that the security workflow tested.  The trusted
 validator binds the exact workflow/run/attempt and its embedded PR snapshot,

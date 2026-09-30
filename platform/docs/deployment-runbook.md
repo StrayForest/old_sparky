@@ -94,6 +94,37 @@ to `dev`. The chain is:
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
 
+### Out-of-band host-tools installation gate
+The approved pinned attestation verifier must first emit a bounded receipt for
+the exact **C/E/packaging-commit** tuple. The repository-owned installer does
+not perform or claim cryptographic attestation; it consumes that receipt and
+is operator-side, outside the installed 13-script closure.
+
+From the reviewed checkout, run the following exact root-only command (the
+only mutation is a new versioned generation; it stops before release, database
+or systemd work):
+
+```bash
+HOST_TOOLS_SHA='<40-lowercase-hex-C>' SOURCE_HEAD_SHA='<40-lowercase-hex-E>' PACKAGING_COMMIT='<40-lowercase-hex-packaging-commit>' ARTIFACT_ID='<positive-decimal-artifact-id>' OUTER_SHA256='<64-lowercase-hex-outer>' INNER_SHA256='<64-lowercase-hex-inner>' MANIFEST_SHA256='<64-lowercase-hex-manifest>' CAPABILITIES_SHA256='<64-lowercase-hex-capabilities>'
+/usr/bin/python3.12 -I -B platform/tools/platform_host_tools_bundle.py install \
+  --outer-bundle /secure/handoff/platform-host-tools-artifact.zip \
+  --host-tools-root /opt/oldsparky/platform/shared/host-tools \
+  --expected-source-sha "$HOST_TOOLS_SHA" \
+  --expected-outer-sha256 "$OUTER_SHA256" --expected-inner-sha256 "$INNER_SHA256" \
+  --expected-manifest-sha256 "$MANIFEST_SHA256" --expected-capabilities-sha256 "$CAPABILITIES_SHA256" --artifact-id "$ARTIFACT_ID" \
+  --attestation-evidence /secure/handoff/attestation-gate.json \
+  --source-head-sha "$SOURCE_HEAD_SHA" \
+  --packaging-commit "$PACKAGING_COMMIT" \
+  --evidence-output /secure/handoff/host-tools-install-evidence.json
+```
+
+The root-only command verifies bounded one-member/15-member ZIPs, requires a root-owned no-follow parent chain without untrusted write access, writes a
+same-filesystem no-follow stage, applies `root:root`/`0555`/`0444`, and uses
+`renameat2(RENAME_NOREPLACE)` while preserving generations and pointers. It
+runs both self-tests and emits bounded mode-0600 evidence. Any failure is a
+hard stop before release, artifact transfer, migration, systemd or production
+writes; cleanup is identity-scoped.
+
 ### Non-deployable pull-request host-tools candidate
 
 The default-branch `Platform host-tools candidate` workflow is evidence-only.

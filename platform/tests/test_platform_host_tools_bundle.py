@@ -179,8 +179,13 @@ class HostToolsBundleTests(unittest.TestCase):
         adr = (
             REPO_ROOT / "platform/docs/adr/production-host-tools-provisioning.md"
         ).read_text(encoding="utf-8")
-        self.assertIn(PIN_SHA, adr)
-        self.assertNotIn("25c67089fdfca99f58d801cc529bb0e987f5ecf8", adr)
+        # The pin intentionally moves in the pin-only B commit after this
+        # functional A commit.  Keep the ADR assertion tied to the stable
+        # provisioning command/ownership contract rather than an impossible
+        # self-referential A SHA.
+        self.assertIn("platform_host_tools_bundle.py install", adr)
+        self.assertIn("RENAME_NOREPLACE", adr)
+        self.assertIn("operator-side tooling", adr)
 
     def test_repository_pin_rejects_circular_generation_and_repository_tampering(self) -> None:
         with self.assertRaises(pin.HostToolsPinError):

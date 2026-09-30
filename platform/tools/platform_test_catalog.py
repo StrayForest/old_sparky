@@ -157,6 +157,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_health_monitor
     test_platform_home_content_runtime
     test_platform_host_tools_bundle
+    test_platform_host_tools_installer
     test_platform_http_transport
     test_platform_install_nginx
     test_platform_invite_rate_limit
@@ -325,6 +326,7 @@ PRIVILEGED_MODULES = frozenset(
         "test_platform_recovery_bootstrap",
         "test_platform_remote_workflow_guards",
         "test_platform_safe_env_exec",
+        "test_platform_host_tools_installer",
         "test_platform_storage_maintenance",
         "test_platform_validate_release_artifact",
     }
@@ -450,12 +452,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 158,
-    "module_digest": "a77d2cff5b4122f04ba7932d758aac60cd98e15405d3d09e4cb45da7c1207310",
-    "test_count": 1491,
-    "test_id_digest": "1b8d41a04482bc77e7baac0d7d101d01c15e6776798bce39f203b176609fa263",
-    "backend_test_count": 1447,
-    "backend_test_id_digest": "5934226d972f0e0116b0aa93c85cb4d3aabc8496658a813bcff43a29a2eaf1ad",
+    "module_count": 159,
+    "module_digest": "a1bd9ac0080e9a0dd55e441b4f9239d1ea0932cd8b240982e8beed1e045798e0",
+    "test_count": 1498,
+    "test_id_digest": "4b2f85fcfffffa84252f60430305c2fb28a563b1bce2e90418ff01cd48974008",
+    "backend_test_count": 1454,
+    "backend_test_id_digest": "54786ec8df6adec212ae6b4a08fcdd4915c2d6b730b707d98f7b322e57ce8091",
     "verification_test_count": 44,
     "verification_test_id_digest": "d8873be495648857a31f012be4e6b1b1438b091214bc6fb046fa620f34debd32",
     "verification_classifier_test_count": 23,
@@ -494,10 +496,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "411315f9d37a3d56602fc98050deaaa86dc2206c7ca94298522dade78173dc6c",
     },
     "backend-privileged": {
-        "module_count": 23,
-        "module_digest": "2034d1a0a01dffe5b141118aa1b90c060268b28eadc0bf2165954c36c260dc1e",
-        "test_count": 439,
-        "test_id_digest": "bed1f173fb01c33c66372ce8e3346d6144c8ac482b012c2550c4099128d9f529",
+        "module_count": 24,
+        "module_digest": "da9bfc5aaa72ed5704ccdd6a1acca2c58fd5709c0d81ef30e2df63b76a672a4d",
+        "test_count": 446,
+        "test_id_digest": "1ee65ac698bf5b15693184786393d6f99f9afc063e4633c627e627389fc61f57",
     },
     "performance-contract": {
         "module_count": 10,
