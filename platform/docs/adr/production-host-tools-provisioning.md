@@ -246,6 +246,20 @@ Existing generations and `current`/`previous` are never modified. The helper
 runs both fixed self-tests (`host-capabilities` and `host-contract`) with
 `/usr/bin/python3.12 -I -B`, and rejects any `__pycache__`/`.pyc` or extra.
 
+The installer takes the root-owned, mode-0600 `.host-tools-install.lock`
+beside the host-tools root before inspecting a generation or receipt and holds
+it through generation verification, self-tests, evidence publication and the
+final evidence-parent `fsync`. Contention is bounded and fails closed. A
+documented retry has these exact states: absent generation/absent receipt is a
+fresh install; absent generation with any receipt is an orphan failure; an
+exact generation with no receipt is reverified, self-tested and receives one
+new receipt; an exact generation with an exact receipt is an inode-preserving
+idempotent success; every conflicting generation or receipt fails without
+writing or deleting it. A rename `EEXIST` may rescan and adopt only the exact
+winner under that lock. The trusted-root assumption covers the root-owned
+parent and lock; a malicious root is outside the helper's detection model,
+while replacement names and foreign inodes are always left untouched.
+
 The bounded mode-0600 evidence JSON contains the artifact ID, exact C/E/T/M/
 packaging tuple, all outer/inner/manifest/capability digests, exact inventory and both self-test
 results. A failed or interrupted operation cleans or quarantines only the
@@ -280,6 +294,14 @@ falling back to weaker operations. After byte/provenance verification it runs
 exact `/usr/bin/python3.12 -I -B` capability and host-contract self-tests in
 that new generation, then repeats the closed inventory check; failure removes
 only that new generation when its identity remains provable.
+
+`O_TMPFILE` is required for every published artifact/evidence snapshot. A
+named `O_EXCL` file is permitted only as a private member inside the retained
+stage directory descriptor; it is never public until the complete stage is
+renamed to its generation name. All member writes are relative to that
+retained descriptor, and the stage name is reconciled against its captured
+device/inode immediately before and after publication. A replacement stage
+name therefore cannot receive writes or be deleted by cleanup.
 
 ## Intentional host-tools bump lifecycle
 

@@ -10,8 +10,10 @@ but it never executes an installer from it or copies it to the host.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import ctypes
 import errno
+import fcntl
 import hashlib
 from io import BytesIO
 import json
@@ -86,6 +88,8 @@ DATA_MODE = 0o444
 HOST_GENERATION_MODE = 0o555
 STAGE_MODE = 0o700
 EVIDENCE_MODE = 0o600
+INSTALL_LOCK_NAME = ".host-tools-install.lock"
+INSTALL_LOCK_MODE = 0o600
 RENAME_NOREPLACE = 1
 AT_EMPTY_PATH = 0x1000
 AT_FDCWD = -100
@@ -145,6 +149,28 @@ PROVENANCE_RECEIPT_KEYS = frozenset(
         "packaging_commit",
     }
 )
+
+# Cleanup is best-effort by design once an operation has failed, but the
+# failure itself must remain observable without retaining exception values,
+# tracebacks or attacker-controlled paths.  Keep only a bounded type/scope
+# marker so cleanup cannot replace the original operation exception or grow
+# process memory without bound.
+_CLEANUP_FAILURES: deque[str] = deque(maxlen=16)
+
+
+def _record_cleanup_failure(scope: str, failure: BaseException) -> None:
+    try:
+        marker = f"{scope}:{type(failure).__name__}"
+        _CLEANUP_FAILURES.append(marker[:160])
+    except BaseException:
+        # Recording is itself cleanup bookkeeping and must never escape.
+        pass
+
+
+def cleanup_failures() -> tuple[str, ...]:
+    """Return bounded cleanup-failure markers for diagnostics/tests."""
+
+    return tuple(_CLEANUP_FAILURES)
 
 
 class HostToolsBundleError(ValueError):
@@ -312,15 +338,15 @@ def _owned_file_matches(
         return False
 
 
-def _close_quietly(descriptor: int | None) -> None:
+def _close_quietly(descriptor: int | None, *, scope: str = "close") -> None:
     if descriptor is None:
         return
     try:
         os.close(descriptor)
-    except BaseException:
+    except BaseException as exc:
         # Cleanup must never replace the exception that caused the operation
         # to fail, including KeyboardInterrupt/SystemExit.
-        pass
+        _record_cleanup_failure(scope, exc)
 
 
 def _source_path(source_root: Path, name: str) -> Path:
@@ -706,7 +732,6 @@ def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, 
     descriptor: int | None = None
     temporary_identity: os.stat_result | None = None
     published = False
-    failure: BaseException | None = None
     try:
         descriptor = os.open(
             ".",
@@ -765,16 +790,16 @@ def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, 
         _injection_point("build_bundle_before_parent_fsync")
         os.fsync(parent_fd)
         _injection_point("build_bundle_after_parent_fsync")
-    except HostToolsBundleError as exc:
-        failure = exc
+    except HostToolsBundleError:
+        raise
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
-        failure = HostToolsBundleError("host-tools bundle could not be written")
-        failure.__cause__ = exc
-    except BaseException as exc:
-        failure = exc
+        raise HostToolsBundleError("host-tools bundle could not be written") from exc
+    except BaseException:
+        raise
     finally:
+        active_failure = sys.exc_info()[1]
         if (
-            failure is not None
+            active_failure is not None
             and not published
             and descriptor is not None
             and temporary_identity is not None
@@ -795,12 +820,10 @@ def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, 
                     size=temporary_identity.st_size,
                     digest=_read_fd_digest(descriptor, temporary_identity.st_size),
                 )
-            except BaseException:
-                pass
-        _close_quietly(descriptor)
-        _close_quietly(parent_fd)
-    if failure is not None:
-        raise failure
+            except BaseException as cleanup_failure:
+                _record_cleanup_failure("bundle publication reconciliation", cleanup_failure)
+        _close_quietly(descriptor, scope="bundle temp close")
+        _close_quietly(parent_fd, scope="bundle parent close")
     return verify_bundle(output, expected_source_sha=source_sha)
 
 
@@ -1161,6 +1184,80 @@ def _open_input_archive(path: Path) -> tuple[int, int, os.stat_result]:
         raise HostToolsBundleError("release artifact cannot be opened") from exc
 
 
+def _snapshot_input_archive(path: Path) -> tuple[int, str, int]:
+    """Copy the raw API ZIP once into an immutable anonymous snapshot.
+
+    The API digest and the bytes later parsed by ``zipfile`` come from one
+    source pass.  Parsing never reuses the mutable input descriptor: after the
+    copy is fsynced, only the anonymous ``O_TMPFILE`` descriptor is opened by
+    the ZIP reader.  A same-inode/same-size source rewrite after this point
+    therefore cannot alter the verified extraction, while a rewrite during the
+    copy can only produce a digest mismatch against the independently supplied
+    expected digest.
+    """
+
+    parent_fd, source_fd, source_metadata = _open_input_archive(path)
+    snapshot_fd: int | None = None
+    try:
+        owner_uid, owner_gid = _trusted_owner()
+        snapshot_fd = os.open(
+            ".",
+            os.O_RDWR
+            | _require_os_flag("O_TMPFILE")
+            | _require_os_flag("O_CLOEXEC")
+            | _require_no_follow(),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.fchown(snapshot_fd, owner_uid, owner_gid)
+        os.fchmod(snapshot_fd, 0o600)
+        digest = hashlib.sha256()
+        total = 0
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(
+                source_fd,
+                min(1024 * 1024, MAX_RELEASE_ARTIFACT_BYTES - total + 1),
+            )
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_RELEASE_ARTIFACT_BYTES:
+                raise HostToolsBundleError("release artifact exceeds its size bound")
+            _write_all(snapshot_fd, chunk)
+            digest.update(chunk)
+        source_after = os.fstat(source_fd)
+        if (
+            not _same_identity(source_after, source_metadata)
+            or source_after.st_size != total
+        ):
+            raise HostToolsBundleError("release artifact changed while reading")
+        os.fsync(snapshot_fd)
+        snapshot_metadata = os.fstat(snapshot_fd)
+        if (
+            not stat.S_ISREG(snapshot_metadata.st_mode)
+            or snapshot_metadata.st_dev != source_metadata.st_dev
+            or snapshot_metadata.st_nlink not in {0, 1}
+            or snapshot_metadata.st_uid != owner_uid
+            or snapshot_metadata.st_gid != owner_gid
+            or stat.S_IMODE(snapshot_metadata.st_mode) != 0o600
+            or snapshot_metadata.st_size != total
+            or _read_fd_digest(snapshot_fd, total) != digest.hexdigest()
+        ):
+            raise HostToolsBundleError("release artifact snapshot metadata is unsafe")
+        os.lseek(snapshot_fd, 0, os.SEEK_SET)
+        return snapshot_fd, digest.hexdigest(), total
+    except HostToolsBundleError:
+        _close_quietly(snapshot_fd, scope="release snapshot close")
+        raise
+    except OSError as exc:
+        _close_quietly(snapshot_fd, scope="release snapshot close")
+        raise HostToolsBundleError("release artifact snapshot could not be created") from exc
+    finally:
+        _close_quietly(source_fd, scope="release source close")
+        _close_quietly(parent_fd, scope="release source parent close")
+
+
 def _write_release_member(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
@@ -1234,8 +1331,9 @@ def _write_release_member(
         if created and identity is None:
             try:
                 identity = _lstat_at(stage_fd, name)
-            except BaseException:
+            except BaseException as cleanup_failure:
                 identity = None
+                _record_cleanup_failure("release member identity cleanup", cleanup_failure)
         if created and not completed and identity is not None:
             # The caller's directory cleanup owns the complete-file case.  A
             # partial member is removed here only after the exact inode is
@@ -1245,8 +1343,8 @@ def _write_release_member(
                 if _same_identity(current, identity):
                     os.unlink(name, dir_fd=stage_fd)
                     os.fsync(stage_fd)
-            except BaseException:
-                pass
+            except BaseException as cleanup_failure:
+                _record_cleanup_failure("release member cleanup", cleanup_failure)
 
 
 def extract_release_artifact(
@@ -1280,8 +1378,7 @@ def extract_release_artifact(
     checksum_name = _release_archive_member_name(release_slug, ".tar.gz.sha256")
     provenance_name = "RELEASE.provenance.json"
     expected_names = {artifact_name, checksum_name, provenance_name}
-    archive_parent_fd: int | None = None
-    archive_fd: int | None = None
+    archive_snapshot_fd: int | None = None
     archive_stream = None
     output_parent_fd: int | None = None
     stage_fd: int | None = None
@@ -1289,27 +1386,15 @@ def extract_release_artifact(
     stage_identity: os.stat_result | None = None
     owned_members: dict[str, _OwnedFile] = {}
     published = False
-    failure: BaseException | None = None
     try:
-        archive_parent_fd, archive_fd, archive_metadata = _open_input_archive(archive_path)
-        raw_digest = hashlib.sha256()
-        os.lseek(archive_fd, 0, os.SEEK_SET)
-        total = 0
-        while True:
-            chunk = os.read(archive_fd, min(1024 * 1024, MAX_RELEASE_ARTIFACT_BYTES - total + 1))
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_RELEASE_ARTIFACT_BYTES:
-                raise HostToolsBundleError("release artifact exceeds its size bound")
-            raw_digest.update(chunk)
-        if total != archive_metadata.st_size or raw_digest.hexdigest() != expected_archive:
+        archive_snapshot_fd, raw_archive_digest, _ = _snapshot_input_archive(archive_path)
+        if raw_archive_digest != expected_archive:
             raise HostToolsBundleError("release artifact digest does not match API bytes")
-        after_digest = os.fstat(archive_fd)
-        if not _same_identity(after_digest, archive_metadata) or after_digest.st_size != total:
-            raise HostToolsBundleError("release artifact changed while reading")
-        os.lseek(archive_fd, 0, os.SEEK_SET)
-        archive_stream = os.fdopen(os.dup(archive_fd), "rb", closefd=True)
+        # From this point onward the source pathname is irrelevant.  The
+        # original API ZIP may be replaced or rewritten, but the parser and
+        # extractor consume only the fsynced anonymous snapshot.
+        _injection_point("release_extract_after_snapshot")
+        archive_stream = os.fdopen(os.dup(archive_snapshot_fd), "rb", closefd=True)
         try:
             archive = zipfile.ZipFile(archive_stream, mode="r", allowZip64=False)
         except (OSError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
@@ -1360,6 +1445,9 @@ def extract_release_artifact(
             ):
                 raise HostToolsBundleError("release extraction stage metadata is unsafe")
             _injection_point("release_extract_after_mkdir")
+            current_stage = _lstat_at(output_parent_fd, stage_name)
+            if not _same_identity(current_stage, stage_identity):
+                raise HostToolsBundleError("release extraction stage identity changed")
             stage_fd = os.open(
                 stage_name,
                 os.O_RDONLY
@@ -1368,6 +1456,9 @@ def extract_release_artifact(
                 | _require_no_follow(),
                 dir_fd=output_parent_fd,
             )
+            opened_stage = os.fstat(stage_fd)
+            if not _same_identity(opened_stage, stage_identity):
+                raise HostToolsBundleError("release extraction stage identity changed")
             by_name = {info.filename: info for info in infos}
             for name in sorted(expected_names):
                 owned_members[name] = _write_release_member(
@@ -1399,32 +1490,34 @@ def extract_release_artifact(
             _injection_point("release_extract_before_parent_fsync")
             os.fsync(output_parent_fd)
             _injection_point("release_extract_after_parent_fsync")
-    except HostToolsBundleError as exc:
-        failure = exc
+    except HostToolsBundleError:
+        raise
     except OSError as exc:
-        failure = HostToolsBundleError("release artifact extraction failed")
-        failure.__cause__ = exc
+        raise HostToolsBundleError("release artifact extraction failed") from exc
     except (ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
-        failure = HostToolsBundleError("release artifact extraction failed")
-        failure.__cause__ = exc
-    except BaseException as exc:
-        failure = exc
+        raise HostToolsBundleError("release artifact extraction failed") from exc
+    except BaseException:
+        raise
     finally:
+        active_failure = sys.exc_info()[1]
         if archive_stream is not None:
             try:
                 archive_stream.close()
-            except BaseException:
-                pass
-        _close_quietly(archive_fd)
-        _close_quietly(archive_parent_fd)
+            except BaseException as exc:
+                _record_cleanup_failure("release archive stream close", exc)
+        _close_quietly(archive_snapshot_fd, scope="release snapshot close")
         _close_quietly(stage_fd)
-        if failure is not None and not published and output_parent_fd is not None:
+        if active_failure is not None and not published and output_parent_fd is not None:
             if stage_name is not None and stage_identity is not None:
-                reconciled = _reconcile_renamed_directory(
-                    output_parent_fd,
-                    output_dir.name,
-                    stage_identity,
-                )
+                try:
+                    reconciled = _reconcile_renamed_directory(
+                        output_parent_fd,
+                        output_dir.name,
+                        stage_identity,
+                    )
+                except BaseException as exc:
+                    _record_cleanup_failure("release rename reconciliation", exc)
+                    reconciled = None
                 if reconciled is not None:
                     # The kernel move may have completed before Python
                     # observed an interrupt from the rename helper.  Keep
@@ -1441,11 +1534,9 @@ def extract_release_artifact(
                             owned_members,
                             expected_device=os.fstat(output_parent_fd).st_dev,
                         )
-                    except BaseException:
-                        pass
+                    except BaseException as exc:
+                        _record_cleanup_failure("release stage cleanup", exc)
         _close_quietly(output_parent_fd)
-    if failure is not None:
-        raise failure
     return {
         "archive": str(output_dir / artifact_name),
         "checksum": str(output_dir / checksum_name),
@@ -1558,7 +1649,6 @@ def extract_outer_bundle(
     temporary_identity: os.stat_result | None = None
     published_identity: os.stat_result | None = None
     published = False
-    failure: BaseException | None = None
     try:
         owner_uid, owner_gid = _trusted_owner()
         try:
@@ -1608,34 +1698,38 @@ def extract_outer_bundle(
         if published_identity is None:
             raise HostToolsBundleError("host-tools extracted member identity changed")
         published = True
-    except HostToolsBundleError as exc:
-        failure = exc
+    except HostToolsBundleError:
+        raise
     except OSError as exc:
-        failure = HostToolsBundleError("host-tools extracted member could not be written")
-        failure.__cause__ = exc
-    except BaseException as exc:
+        raise HostToolsBundleError("host-tools extracted member could not be written") from exc
+    except BaseException:
         # Keep the original exception.  In particular, a signal must not be
         # rewritten as an OSError or hidden by cleanup failures.
-        failure = exc
+        raise
     finally:
+        active_failure = sys.exc_info()[1]
         if (
-            failure is not None
+            active_failure is not None
             and not published
             and descriptor is not None
             and temporary_identity is not None
         ):
-            reconciled = _reconcile_linked_file(
-                parent_fd,
-                output.name,
-                descriptor,
-                temporary_identity,
-                expected_device=parent_before.st_dev,
-                owner_uid=owner_uid,
-                owner_gid=owner_gid,
-                mode=0o600,
-                size=temporary_identity.st_size,
-                digest=summary["bundle_sha256"],
-            )
+            try:
+                reconciled = _reconcile_linked_file(
+                    parent_fd,
+                    output.name,
+                    descriptor,
+                    temporary_identity,
+                    expected_device=parent_before.st_dev,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                    mode=0o600,
+                    size=temporary_identity.st_size,
+                    digest=summary["bundle_sha256"],
+                )
+            except BaseException as exc:
+                _record_cleanup_failure("outer file reconciliation", exc)
+                reconciled = None
             if reconciled is not None:
                 # linkat may have completed before an injected signal or
                 # interpreter exit reached Python.  Retain the exact output
@@ -1644,9 +1738,11 @@ def extract_outer_bundle(
                 published = True
                 published_identity = reconciled
         _close_quietly(descriptor)
-    if failure is not None:
+        if active_failure is not None:
+            _close_quietly(parent_fd, scope="outer parent close")
+    if not published:
         _close_quietly(parent_fd)
-        raise failure
+        raise HostToolsBundleError("host-tools extracted member was not published")
     try:
         _injection_point("outer_extract_before_parent_fsync")
         os.fsync(parent_fd)
@@ -1695,7 +1791,6 @@ def _write_exclusive_file_at(
     descriptor: int | None = None
     created = False
     identity: os.stat_result | None = None
-    failure: BaseException | None = None
     try:
         descriptor = os.open(
             name,
@@ -1742,30 +1837,28 @@ def _write_exclusive_file_at(
             raise HostToolsBundleError(f"{description} identity changed")
         os.fsync(parent_fd)
         return identity
-    except HostToolsBundleError as exc:
-        failure = exc
+    except HostToolsBundleError:
+        raise
     except OSError as exc:
-        failure = HostToolsBundleError(f"{description} could not be written")
-        failure.__cause__ = exc
-    except BaseException as exc:
-        failure = exc
+        raise HostToolsBundleError(f"{description} could not be written") from exc
+    except BaseException:
+        raise
     finally:
-        if descriptor is not None and created and identity is None:
+        active_failure = sys.exc_info()[1]
+        if active_failure is not None and descriptor is not None and created and identity is None:
             try:
                 identity = os.fstat(descriptor)
-            except BaseException:
-                pass
-        _close_quietly(descriptor)
-    if failure is not None:
-        if created and identity is not None:
+            except BaseException as cleanup_failure:
+                _record_cleanup_failure(f"{description} identity cleanup", cleanup_failure)
+        _close_quietly(descriptor, scope=f"{description} descriptor close")
+        if active_failure is not None and created and identity is not None:
             try:
                 current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 if _same_identity(current, identity):
                     os.unlink(name, dir_fd=parent_fd)
                     os.fsync(parent_fd)
-            except BaseException:
-                pass
-        raise failure
+            except BaseException as cleanup_failure:
+                _record_cleanup_failure(f"{description} cleanup", cleanup_failure)
     raise AssertionError("exclusive file helper completed without a result")
 
 
@@ -1982,6 +2075,57 @@ def _open_host_tools_root(path: Path) -> tuple[int, os.stat_result]:
     return descriptor, metadata
 
 
+def _open_install_lock(host_tools_root: Path) -> tuple[int, int]:
+    """Take the root-side host-tools installation lock.
+
+    The lock lives beside (rather than inside) the closed generation
+    inventory.  Its parent is walked with the same root-owned/no-follow
+    policy as the host-tools root, and the lock inode is never replaced or
+    deleted by this helper.  A concurrent installer therefore fails before it
+    can inspect, stage, publish, or adopt a generation.
+    """
+
+    parent_fd, parent_metadata = _open_no_symlink_directory(
+        host_tools_root.parent, require_root_owned=True
+    )
+    lock_fd: int | None = None
+    try:
+        lock_fd = os.open(
+            INSTALL_LOCK_NAME,
+            os.O_RDWR
+            | os.O_CREAT
+            | _require_os_flag("O_CLOEXEC")
+            | _require_no_follow(),
+            INSTALL_LOCK_MODE,
+            dir_fd=parent_fd,
+        )
+        metadata = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_dev != parent_metadata.st_dev
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != INSTALL_LOCK_MODE
+        ):
+            raise HostToolsBundleError("host-tools install lock metadata is unsafe")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise HostToolsBundleError("host-tools install lock is held") from exc
+            raise HostToolsBundleError("host-tools install lock cannot be acquired") from exc
+        return parent_fd, lock_fd
+    except HostToolsBundleError:
+        _close_quietly(lock_fd, scope="install lock close")
+        _close_quietly(parent_fd, scope="install lock parent close")
+        raise
+    except OSError as exc:
+        _close_quietly(lock_fd, scope="install lock close")
+        _close_quietly(parent_fd, scope="install lock parent close")
+        raise HostToolsBundleError("host-tools install lock cannot be opened") from exc
+
+
 def _lstat_at(parent_fd: int, name: str) -> os.stat_result:
     try:
         return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -2162,11 +2306,20 @@ def _new_stage(
     source_sha: str,
     *,
     expected_device: int,
-) -> tuple[str, os.stat_result]:
+) -> tuple[str, int, os.stat_result]:
+    """Create and retain the private stage directory descriptor.
+
+    The descriptor is opened before returning and is the only directory handle
+    used for member writes.  The pathname is merely a publication name; a
+    replacement of that name cannot redirect writes through the retained
+    descriptor and is rejected at the pre-rename reconciliation.
+    """
+
     _require_install_primitives()
     for _ in range(16):
         name = f".host-tools-stage-{source_sha}-{secrets.token_hex(8)}"
         metadata: os.stat_result | None = None
+        stage_fd: int | None = None
         try:
             os.mkdir(name, STAGE_MODE, dir_fd=host_fd)
         except FileExistsError:
@@ -2176,6 +2329,13 @@ def _new_stage(
         try:
             metadata = _lstat_at(host_fd, name)
             _injection_point("new_stage_after_mkdir")
+            # The hook models an attacker replacing the public stage name
+            # after mkdir.  Reconcile the name before opening it so the
+            # retained descriptor can never be directed at a replacement
+            # inode.  Once opened, all member writes are fd-relative.
+            current_name = _lstat_at(host_fd, name)
+            if not _same_identity(current_name, metadata):
+                raise HostToolsBundleError("host-tools private stage identity changed")
             if (
                 not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != 0
@@ -2185,14 +2345,43 @@ def _new_stage(
                 or metadata.st_dev != expected_device
             ):
                 raise HostToolsBundleError("host-tools private stage metadata is unsafe")
-            return name, metadata
+            stage_fd = os.open(
+                name,
+                os.O_RDONLY
+                | _require_os_flag("O_DIRECTORY")
+                | _require_os_flag("O_CLOEXEC")
+                | _require_no_follow(),
+                dir_fd=host_fd,
+            )
+            opened = os.fstat(stage_fd)
+            if (
+                not _same_identity(opened, metadata)
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != 0
+                or opened.st_gid != 0
+                or opened.st_nlink != 2
+                or stat.S_IMODE(opened.st_mode) != STAGE_MODE
+                or opened.st_dev != expected_device
+            ):
+                raise HostToolsBundleError("host-tools private stage identity changed")
+            return name, stage_fd, metadata
         except BaseException:
             # ``mkdirat`` and the subsequent metadata assignment are not one
             # atomic Python operation.  If the identity was captured, remove
             # only that exact empty directory; otherwise leave it for an
             # operator quarantine rather than guessing at a raced pathname.
+            _close_quietly(stage_fd, scope="private stage close")
             if metadata is not None:
-                _cleanup_owned_directory(host_fd, name, metadata, {}, expected_device=expected_device)
+                try:
+                    _cleanup_owned_directory(
+                        host_fd,
+                        name,
+                        metadata,
+                        {},
+                        expected_device=expected_device,
+                    )
+                except BaseException as cleanup_failure:
+                    _record_cleanup_failure("private stage cleanup", cleanup_failure)
             raise
     raise HostToolsBundleError("host-tools private stage name collision")
 
@@ -2286,9 +2475,9 @@ def _write_stage_member(
         if descriptor is not None and created and identity is None:
             try:
                 identity = os.fstat(descriptor)
-            except BaseException:
-                pass
-        _close_quietly(descriptor)
+            except BaseException as cleanup_failure:
+                _record_cleanup_failure("stage member identity cleanup", cleanup_failure)
+        _close_quietly(descriptor, scope="stage member close")
         if created and not completed and identity is not None:
             try:
                 current = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
@@ -2298,10 +2487,10 @@ def _write_stage_member(
                 elif _same_identity(current, identity):
                     os.unlink(name, dir_fd=stage_fd)
                     os.fsync(stage_fd)
-            except BaseException:
+            except BaseException as cleanup_failure:
                 # An identity mismatch is an operator quarantine, never a
                 # reason to recursively remove an unknown pathname.
-                pass
+                _record_cleanup_failure("stage member cleanup", cleanup_failure)
 
 
 def _verify_generation_dir(
@@ -2446,7 +2635,10 @@ def _cleanup_owned_directory(
                     os.unlink(child, dir_fd=stage_fd)
             os.fsync(stage_fd)
         finally:
-            os.close(stage_fd)
+            try:
+                os.close(stage_fd)
+            except BaseException as exc:
+                _record_cleanup_failure("owned stage close", exc)
         # Re-check before rmdir.  If the pathname was replaced, leave it for
         # an operator; never recursively delete an unowned object.
         current = _lstat_at(parent_fd, name)
@@ -2455,7 +2647,8 @@ def _cleanup_owned_directory(
         os.rmdir(name, dir_fd=parent_fd)
         os.fsync(parent_fd)
         return True
-    except BaseException:
+    except BaseException as exc:
+        _record_cleanup_failure("owned directory cleanup", exc)
         return False
 
 
@@ -2556,8 +2749,8 @@ def _remove_owned_file(
             return
         os.unlink(name, dir_fd=parent_fd)
         os.fsync(parent_fd)
-    except BaseException:
-        pass
+    except BaseException as cleanup_failure:
+        _record_cleanup_failure("owned file cleanup", cleanup_failure)
 
 
 def _open_secure_handoff_directory(path: Path, *, host_tools_root: Path | None = None) -> tuple[int, os.stat_result]:
@@ -2595,6 +2788,26 @@ def _validate_evidence_output(path: Path, host_tools_root: Path) -> None:
     _close_quietly(parent_fd)
 
 
+def _evidence_exists(path: Path, host_tools_root: Path) -> bool:
+    """Inspect the receipt name without following or changing it."""
+
+    parent_fd, _ = _open_secure_handoff_directory(
+        path.parent, host_tools_root=host_tools_root
+    )
+    try:
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise HostToolsBundleError(
+                "host-tools install evidence cannot be inspected"
+            ) from exc
+        return True
+    finally:
+        _close_quietly(parent_fd, scope="evidence inspect parent close")
+
+
 def _write_evidence(
     path: Path,
     payload: dict[str, object],
@@ -2613,7 +2826,6 @@ def _write_evidence(
     temporary_identity: os.stat_result | None = None
     written_owned: _OwnedFile | None = None
     published = False
-    failure: BaseException | None = None
     owner_uid = 0
     owner_gid = 0
 
@@ -2733,32 +2945,36 @@ def _write_evidence(
                 )
                 published = True
                 _injection_point("evidence_after_link")
-    except HostToolsBundleError as exc:
-        failure = exc
+    except HostToolsBundleError:
+        raise
     except OSError as exc:
-        failure = HostToolsBundleError("host-tools install evidence could not be written")
-        failure.__cause__ = exc
-    except BaseException as exc:
-        failure = exc
+        raise HostToolsBundleError("host-tools install evidence could not be written") from exc
+    except BaseException:
+        raise
     finally:
+        active_failure = sys.exc_info()[1]
         if (
-            failure is not None
+            active_failure is not None
             and not published
             and descriptor is not None
             and temporary_identity is not None
         ):
-            reconciled = _reconcile_linked_file(
-                parent_fd,
-                path.name,
-                descriptor,
-                temporary_identity,
-                expected_device=parent_metadata.st_dev,
-                owner_uid=owner_uid,
-                owner_gid=owner_gid,
-                mode=EVIDENCE_MODE,
-                size=temporary_identity.st_size,
-                digest=_sha256_bytes(encoded),
-            )
+            try:
+                reconciled = _reconcile_linked_file(
+                    parent_fd,
+                    path.name,
+                    descriptor,
+                    temporary_identity,
+                    expected_device=parent_metadata.st_dev,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                    mode=EVIDENCE_MODE,
+                    size=temporary_identity.st_size,
+                    digest=_sha256_bytes(encoded),
+                )
+            except BaseException as cleanup_failure:
+                _record_cleanup_failure("evidence reconciliation", cleanup_failure)
+                reconciled = None
             if reconciled is not None:
                 written_owned = _owned_file(
                     reconciled,
@@ -2769,12 +2985,11 @@ def _write_evidence(
                 )
                 published = True
         _close_quietly(descriptor)
-    if failure is not None:
-        # Evidence is the final commit marker.  If linkat completed before an
-        # interrupt, retain the exact marker and let an idempotent retry adopt
-        # it; a foreign/mismatched pathname is never removed.
-        _close_quietly(parent_fd)
-        raise failure
+        if active_failure is not None:
+            # Evidence is the final commit marker.  If linkat completed before
+            # an interrupt, retain the exact marker and let an idempotent retry
+            # adopt it; a foreign/mismatched pathname is never removed.
+            _close_quietly(parent_fd, scope="evidence parent close")
     try:
         _injection_point("evidence_before_parent_fsync")
         os.fsync(parent_fd)
@@ -2850,14 +3065,24 @@ def install_bundle(
         security_run_attempt=security_run_attempt,
         expected_receipt_sha256=expected_receipt_sha256,
     )
-    host_fd, host_metadata = _open_host_tools_root(host_tools_root)
+    lock_parent_fd: int | None = None
+    lock_fd: int | None = None
+    host_fd: int | None = None
+    host_metadata: os.stat_result | None = None
     stage_name: str | None = None
     stage_identity: os.stat_result | None = None
+    stage_fd: int | None = None
     child_identities: dict[str, os.stat_result | _OwnedFile] = {}
-    published = False
     target_identity: os.stat_result | None = None
-    installation_complete = False
     try:
+        # Hold the root-owned lock from generation/receipt inspection through
+        # the final evidence parent fsync.  This serializes two cooperating
+        # installers and makes EEXIST a deterministic exact-winner rescan,
+        # never an overwrite opportunity.
+        lock_parent_fd, lock_fd = _open_install_lock(host_tools_root)
+        host_fd, host_metadata = _open_host_tools_root(host_tools_root)
+        if evidence_output is not None:
+            _validate_evidence_output(evidence_output, host_tools_root)
         target_name = source_sha
         try:
             existing_target = os.stat(target_name, dir_fd=host_fd, follow_symlinks=False)
@@ -2865,27 +3090,21 @@ def install_bundle(
             existing_target = None
         except OSError as exc:
             raise HostToolsBundleError("host-tools generation target is unavailable") from exc
-        if existing_target is not None:
-            raise HostToolsBundleError("host-tools generation already exists")
-        stage_name, stage_identity = _new_stage(
-            host_fd, source_sha, expected_device=host_metadata.st_dev
-        )
-        stage_fd: int | None = None
-        try:
-            stage_fd = os.open(
-                stage_name,
-                os.O_RDONLY
-                | _require_os_flag("O_DIRECTORY")
-                | _require_os_flag("O_CLOEXEC")
-                | _require_no_follow(),
-                dir_fd=host_fd,
+        if existing_target is None:
+            # A receipt without its exact generation is an orphaned commit
+            # marker.  Never let a fresh install adopt or overwrite it.
+            if evidence_output is not None and _evidence_exists(
+                evidence_output, host_tools_root
+            ):
+                raise HostToolsBundleError(
+                    "host-tools install evidence exists without its generation"
+                )
+            stage_name, stage_fd, stage_identity = _new_stage(
+                host_fd, source_sha, expected_device=host_metadata.st_dev
             )
             members = outer_summary["members"]
             if not isinstance(members, dict):
                 raise HostToolsBundleError("host-tools bundle inventory is invalid")
-            manifest = outer_summary["manifest"]
-            if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
-                raise HostToolsBundleError("host-tools bundle manifest is invalid")
             for name in HOST_TOOL_FILES:
                 _write_stage_member(
                     stage_fd,
@@ -2916,24 +3135,35 @@ def install_bundle(
             os.fchown(stage_fd, 0, 0)
             os.fchmod(stage_fd, HOST_GENERATION_MODE)
             os.fsync(stage_fd)
-            current_stage = _lstat_at(host_fd, stage_name)
-            if (
-                current_stage.st_dev != stage_identity.st_dev
-                or current_stage.st_ino != stage_identity.st_ino
-                or current_stage.st_uid != 0
-                or current_stage.st_gid != 0
-                or stat.S_IMODE(current_stage.st_mode) != HOST_GENERATION_MODE
-                or current_stage.st_nlink != 2
-                or current_stage.st_dev != host_metadata.st_dev
-            ):
-                raise HostToolsBundleError("host-tools private stage changed")
-        finally:
-            _close_quietly(stage_fd)
-        os.fsync(host_fd)
-        _rename_noreplace(host_fd, stage_name, target_name, stage_identity)
-        published = True
-        target_identity = _lstat_at(host_fd, target_name)
-        os.fsync(host_fd)
+            if _reconcile_renamed_directory(
+                host_fd,
+                stage_name,
+                stage_identity,
+                expected_device=host_metadata.st_dev,
+            ) is None:
+                raise HostToolsBundleError("host-tools private stage identity changed")
+            os.fsync(host_fd)
+            _rename_noreplace(host_fd, stage_name, target_name, stage_identity)
+            target_identity = _reconcile_renamed_directory(
+                host_fd,
+                target_name,
+                stage_identity,
+                expected_device=host_metadata.st_dev,
+            )
+            if target_identity is None:
+                raise HostToolsBundleError(
+                    "host-tools generation publication identity changed"
+                )
+            # The name is now the public generation; cleanup must never treat
+            # it as a private stage even if evidence/self-tests fail.
+            stage_name = None
+            os.fsync(host_fd)
+        else:
+            # Existing target adoption is allowed only through the complete
+            # verification below.  A foreign generation, symlink, or partial
+            # inventory fails closed without touching it.
+            target_identity = existing_target
+
         installed = _verify_generation_dir(
             host_tools_root / target_name,
             expected_source_sha=source_sha,
@@ -2942,13 +3172,12 @@ def install_bundle(
             expected_bundle_sha256=inner_sha,
             expected_device=host_metadata.st_dev,
         )
-        current_target = _lstat_at(host_fd, target_name)
-        if (
-            target_identity is None
-            or current_target.st_dev != target_identity.st_dev
-            or current_target.st_ino != target_identity.st_ino
-            or not stat.S_ISDIR(current_target.st_mode)
-        ):
+        if target_identity is None or _reconcile_renamed_directory(
+            host_fd,
+            target_name,
+            target_identity,
+            expected_device=host_metadata.st_dev,
+        ) is None:
             raise HostToolsBundleError("host-tools generation identity changed")
         self_tests = _run_post_install_self_tests(
             host_tools_root / target_name,
@@ -2956,17 +3185,17 @@ def install_bundle(
             manifest_sha256=manifest_sha,
             capabilities_sha256=capabilities_sha,
         )
-        # Re-run the exact inventory/digest check after both child processes.
-        # This is also the no-`__pycache__`/no-extra proof for the installed
-        # generation rather than only a pre-self-test assertion.
-        current_target = _lstat_at(host_fd, target_name)
-        if (
-            target_identity is None
-            or current_target.st_dev != target_identity.st_dev
-            or current_target.st_ino != target_identity.st_ino
-        ):
+        # Repeat inventory, byte, mode, owner and no-extra-member checks after
+        # both self-tests.  This is the retry proof as well as the fresh
+        # publication proof.
+        if target_identity is None or _reconcile_renamed_directory(
+            host_fd,
+            target_name,
+            target_identity,
+            expected_device=host_metadata.st_dev,
+        ) is None:
             raise HostToolsBundleError("host-tools generation identity changed")
-        _verify_generation_dir(
+        installed = _verify_generation_dir(
             host_tools_root / target_name,
             expected_source_sha=source_sha,
             expected_manifest_sha256=manifest_sha,
@@ -2997,22 +3226,18 @@ def install_bundle(
         if evidence_output is not None:
             _write_evidence(evidence_output, evidence, host_tools_root=host_tools_root)
             _injection_point("install_after_evidence_write")
-        installation_complete = True
         print(
             f"HOST_TOOLS_INSTALL schema={PROVENANCE_SCHEMA} status=installed "
             f"artifact_id={artifact_id} source_sha={source_sha} outer_sha256={outer_sha} inner_sha256={inner_sha} "
             f"manifest_sha256={manifest_sha} capabilities_sha256={capabilities_sha}"
         )
         return evidence
-    except BaseException as original:
+    except BaseException:
         try:
-            # A successful rename may have happened before Python observed
-            # it (including a KeyboardInterrupt in the rename helper).  Prove
-            # that outcome through the dirfd before deciding whether the
-            # pathname is still a private stage.  A foreign target is left
-            # untouched, while an exact target is retained for reconciliation
-            # and never recursively deleted.
-            if stage_name is not None and stage_identity is not None:
+            # A successful rename may have happened before Python observed it
+            # (including an injected KeyboardInterrupt).  Reconcile only the
+            # exact inode; a foreign target/stage is retained untouched.
+            if host_fd is not None and stage_name is not None and stage_identity is not None:
                 reconciled = _reconcile_renamed_directory(
                     host_fd,
                     source_sha,
@@ -3020,10 +3245,9 @@ def install_bundle(
                     expected_device=host_metadata.st_dev,
                 )
                 if reconciled is not None:
-                    published = True
                     target_identity = reconciled
                     stage_name = None
-            if stage_name is not None and stage_identity is not None:
+            if host_fd is not None and stage_name is not None and stage_identity is not None:
                 _cleanup_owned_directory(
                     host_fd,
                     stage_name,
@@ -3031,12 +3255,14 @@ def install_bundle(
                     child_identities,
                     expected_device=host_metadata.st_dev,
                 )
-        except BaseException:
-            pass
-        _close_quietly(host_fd)
-        raise original
+        except BaseException as cleanup_failure:
+            _record_cleanup_failure("installer reconciliation", cleanup_failure)
+        raise
     finally:
-        _close_quietly(host_fd)
+        _close_quietly(stage_fd, scope="installer stage close")
+        _close_quietly(host_fd, scope="installer root close")
+        _close_quietly(lock_fd, scope="installer lock close")
+        _close_quietly(lock_parent_fd, scope="installer lock parent close")
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -3144,14 +3370,14 @@ def write_contract_files(summary: dict[str, object], output_dir: Path) -> None:
             )
         os.fsync(contract_fd)
         os.fsync(parent_fd)
-    except BaseException as exc:
+    except BaseException:
         for name, identity in created_files.items():
             _remove_owned_file(contract_fd, name, identity)
         _close_quietly(contract_fd)
         _close_quietly(parent_fd)
         # The directory itself is task-owned when created here.  It is left
         # in place as a secure quarantine if identity cannot be proven.
-        raise exc
+        raise
     finally:
         _close_quietly(contract_fd)
         _close_quietly(parent_fd)

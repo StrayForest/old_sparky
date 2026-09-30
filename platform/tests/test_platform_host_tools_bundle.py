@@ -1389,9 +1389,14 @@ raise SystemExit(module.main(["host-capabilities"]))
                     """
                     #!/usr/bin/env python3
                     import os
+                    import hashlib
                     import sys
 
                     args = sys.argv[1:]
+                    assert "-n" in args, args
+                    # The remote probe is intentionally stdin-safe: consume
+                    # the heredoc/program stream before producing output.
+                    sys.stdin.buffer.read()
                     host_index = next(index for index, value in enumerate(args) if "@" in value)
                     command = args[host_index + 1:]
                     with open(os.environ["FAKE_SSH_LOG"], "a", encoding="ascii") as log:
@@ -1399,13 +1404,22 @@ raise SystemExit(module.main(["host-capabilities"]))
                     if command[:2] == ["/usr/bin/id", "-u"]:
                         print("0")
                     elif command and command[0] == "/usr/bin/stat":
-                        path = command[-1]
-                        if path.endswith(os.environ["HOST_TOOLS_SHA"]):
-                            print("directory:0:0:2:555")
-                        elif path.endswith("capabilities.txt") or path.endswith("manifest.json"):
-                            print("regular file:0:0:1:444")
-                        else:
-                            print("regular file:0:0:1:555")
+                        paths = command[command.index("--") + 1:]
+                        format_arg = command[command.index("-c") + 1]
+                        for path in paths:
+                            if "%a" in format_arg and "%n" in format_arg:
+                                mode = "444" if path.endswith(("capabilities.txt", "manifest.json")) else "555"
+                                print(mode + "  " + path)
+                            elif path.endswith(os.environ["HOST_TOOLS_SHA"]):
+                                print("directory:0:0:2:555")
+                            elif path.endswith("capabilities.txt") or path.endswith("manifest.json"):
+                                print("regular file:0:0:1:444")
+                            else:
+                                print("regular file:0:0:1:555")
+                    elif command and command[0] == "/usr/bin/sha256sum":
+                        paths = command[command.index("--") + 1:]
+                        for path in paths:
+                            print(hashlib.sha256(path.encode("ascii")).hexdigest() + "  " + path)
                     elif command and command[0] == "/usr/bin/find":
                         print("\\n".join(sorted([
                             "capabilities.txt", "manifest.json",
@@ -1435,6 +1449,27 @@ raise SystemExit(module.main(["host-capabilities"]))
             fake_ssh.chmod(0o755)
             target_sha = "a" * 40
             host_tools_sha = "b" * 40
+            relative_files = [
+                "capabilities.txt", "manifest.json",
+                "platform_workflow_remote_dispatch.py", "platform_workflow_input_guard.py",
+                "platform_prepare_artifact_dir.py", "platform_production_deploy_supervisor.sh",
+                "platform_release_lock.sh", "platform_release_preflight.sh",
+                "platform_validate_release_artifact.py", "platform_safe_env_exec.py",
+                "platform_render_service_envs.py", "platform_validate_edge_policy.py",
+                "platform_configure_shared_env.py", "platform_update_cloudflare_ips.py",
+                "platform_storage_evidence_summary.py",
+            ]
+            absolute_files = [f"/opt/oldsparky/platform/shared/host-tools/{host_tools_sha}/{name}" for name in relative_files]
+            file_lines = sorted(
+                f"{hashlib.sha256(path.encode('ascii')).hexdigest()}  {name}"
+                for path, name in zip(absolute_files, relative_files)
+            )
+            files_contract_sha = hashlib.sha256(("\n".join(file_lines) + "\n").encode("ascii")).hexdigest()
+            mode_lines = sorted(
+                f"{'444' if name in {'capabilities.txt', 'manifest.json'} else '555'}  {name}"
+                for name in relative_files
+            )
+            modes_contract_sha = hashlib.sha256(("\n".join(mode_lines) + "\n").encode("ascii")).hexdigest()
             environment = {
                 **os.environ,
                 "PATH": f"{fake_bin}:/usr/bin:/bin",
@@ -1450,6 +1485,8 @@ raise SystemExit(module.main(["host-capabilities"]))
                 "HOST_TOOLS_BUNDLE_SHA256": "c" * 64,
                 "HOST_TOOLS_MANIFEST_SHA256": "d" * 64,
                 "HOST_TOOLS_CAPABILITIES_SHA256": "e" * 64,
+                "HOST_TOOLS_FILES_CONTRACT_SHA256": files_contract_sha,
+                "HOST_TOOLS_MODES_CONTRACT_SHA256": modes_contract_sha,
                 "GITHUB_RUN_ID": "77",
                 "GITHUB_RUN_ATTEMPT": "1",
                 "FAKE_SSH_LOG": str(log),
@@ -1466,7 +1503,24 @@ raise SystemExit(module.main(["host-capabilities"]))
             calls = log.read_text(encoding="ascii").splitlines()
             self.assertGreaterEqual(sum("host-capabilities" in call for call in calls), 1)
             self.assertGreaterEqual(sum("host-contract" in call for call in calls), 1)
-            self.assertGreaterEqual(sum("/usr/bin/stat" in call for call in calls), 15)
+            stat_calls = [call for call in calls if call.startswith("/usr/bin/stat ")]
+            self.assertEqual(len(stat_calls), 17)  # root + 13 scripts + 2 data + mode contract
+            self.assertEqual(sum(call.startswith("/usr/bin/sha256sum ") for call in calls), 1)
+            self.assertEqual(
+                sum("-c %a  %n" in call for call in stat_calls),
+                1,
+            )
+            stat_paths = {
+                path
+                for call in stat_calls
+                if " -- " in call
+                for path in call.rsplit(" -- ", 1)[-1].split()
+            }
+            expected_paths = {
+                "/opt/oldsparky/platform/shared/host-tools/" + host_tools_sha + "/" + name
+                for name in relative_files
+            } | {"/opt/oldsparky/platform/shared/host-tools/" + host_tools_sha}
+            self.assertEqual(stat_paths, expected_paths)
 
     def test_remote_inventory_shell_fixture_carries_dotfiles_and_extras_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2287,6 +2341,26 @@ raise SystemExit(module.main(["host-capabilities"]))
                     local_evidence=local,
                 )
             local.write_bytes(local_bytes)
+            uploaded_mismatch = root / "uploaded-mismatch.zip"
+            uploaded_mismatch_digest = write_archive(
+                uploaded_mismatch,
+                [("platform-host-tools-candidate-evidence.json", b"uploaded-mismatch\n")],
+            )
+            metadata.write_text(
+                metadata.read_text(encoding="ascii").replace(digest, uploaded_mismatch_digest),
+                encoding="ascii",
+            )
+            with self.assertRaises(candidate.CandidateError):
+                candidate.verify_uploaded_evidence(
+                    metadata,
+                    uploaded_mismatch,
+                    artifact_id="777",
+                    artifact_name=artifact_name,
+                    run_id="99",
+                    run_attempt="1",
+                    trusted_sha=trusted_sha,
+                    local_evidence=local,
+                )
             duplicate = root / "duplicate-evidence.zip"
             duplicate_digest = write_archive(
                 duplicate,

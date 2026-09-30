@@ -122,6 +122,8 @@ same-filesystem no-follow stage, applies `root:root`/`0555`/`0444`, and uses
 `renameat2(RENAME_NOREPLACE)` while preserving generations and pointers. It
 runs both self-tests and emits bounded mode-0600 evidence in a separate root-owned secure handoff directory—not under the host-tools root or any generation. Bundle, outer-member and evidence publication use unnamed `O_TMPFILE` inodes, `linkat` through directory descriptors and exact post-link identity reconciliation; no named temporary or replacement path is accepted. Failures, missing primitives, device/link races, duplicate/unknown receipt fields or a 16th member fail closed; cleanup is identity-scoped and parent directories are fsynced after unlink. The fixed self-tests run as `/usr/bin/python3.12 -I -B` after verification and before evidence publication.
 
+The installer holds a root-owned mode-0600 `.host-tools-install.lock` from generation/receipt inspection through the final evidence-parent `fsync`; lock contention fails closed. Retry states are absent/absent fresh, absent/existing orphan failure, exact-generation/missing-receipt full recheck plus self-tests, and exact/exact inode-preserving success; conflicts are never overwritten, and published snapshots require anonymous `O_TMPFILE` (named members stay private until rename).
+
 ### Non-deployable pull-request host-tools candidate
 
 The default-branch `Platform host-tools candidate` workflow is evidence-only.
