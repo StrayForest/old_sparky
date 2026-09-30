@@ -718,7 +718,15 @@ except lock.VerificationLockError as exc:
         self.assertNotIn("sudo install -d", workflow)
         self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 4)
         self.assertIn(
-            "for identity in oldsparky-web oldsparky-api oldsparky-worker oldsparky-liveqa; do",
+            "for identity in oldsparky-platform oldsparky-web oldsparky-api oldsparky-worker oldsparky-liveqa; do",
+            workflow,
+        )
+        self.assertIn(
+            'platform_passwd="$(getent passwd oldsparky-platform)"',
+            workflow,
+        )
+        self.assertIn(
+            'test "$(id -G oldsparky-platform | awk \'{print NF}\')" -eq 1',
             workflow,
         )
         self.assertIn(
@@ -733,6 +741,20 @@ except lock.VerificationLockError as exc:
             'test "$(id -G oldsparky-liveqa | awk \'{print NF}\')" -eq 1',
             workflow,
         )
+        self.assertIn("Preflight live-QA guard boundaries", workflow)
+        self.assertIn(
+            '("liveqa_identity", guard.liveqa_identity),',
+            workflow,
+        )
+        self.assertIn(
+            '("liveqa_cgroup_process_ids", guard._liveqa_cgroup_process_ids),',
+            workflow,
+        )
+        self.assertIn(
+            '("liveqa_process_ids", guard._liveqa_process_ids),',
+            workflow,
+        )
+        self.assertIn("LIVE_QA_PREFLIGHT status=failed", workflow)
         verification_block = re.search(
             r"^  verification-contract:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,

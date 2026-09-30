@@ -335,7 +335,7 @@ jobs:
           test -x /usr/bin/runuser || test -x /usr/sbin/runuser
           test -x /usr/bin/test
           test -x /usr/bin/setpriv
-          for identity in oldsparky-web oldsparky-api oldsparky-worker oldsparky-liveqa; do
+          for identity in oldsparky-platform oldsparky-web oldsparky-api oldsparky-worker oldsparky-liveqa; do
             if ! getent group "$identity" >/dev/null; then
               sudo groupadd --system "$identity"
             fi
@@ -345,6 +345,12 @@ jobs:
             fi
             sudo id "$identity"
           done
+          platform_passwd="$(getent passwd oldsparky-platform)"
+          test -n "$platform_passwd"
+          test "$(printf '%s\n' "$platform_passwd" | cut -d: -f6)" = /nonexistent
+          test "$(printf '%s\n' "$platform_passwd" | cut -d: -f7)" = /usr/sbin/nologin
+          test "$(id -G oldsparky-platform | awk '{print NF}')" -eq 1
+          test "$(id -g oldsparky-platform)" = "$(getent group oldsparky-platform | cut -d: -f3)"
           liveqa_passwd="$(getent passwd oldsparky-liveqa)"
           test -n "$liveqa_passwd"
           test "$(printf '%s\n' "$liveqa_passwd" | cut -d: -f6)" = /nonexistent
@@ -357,6 +363,33 @@ jobs:
           sudo usermod -a -G oldsparky-media oldsparky-api
           sudo usermod -a -G oldsparky-media oldsparky-worker
           getent group oldsparky-media
+      - name: Preflight live-QA guard boundaries
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/platform"
+          sudo -EH env XDG_RUNTIME_DIR= \
+            "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python" - <<'PY'
+          import sys
+          from tools import platform_live_qa_guard as guard
+
+          checks = (
+              ("liveqa_identity", guard.liveqa_identity),
+              ("liveqa_cgroup_process_ids", guard._liveqa_cgroup_process_ids),
+              ("liveqa_process_ids", guard._liveqa_process_ids),
+          )
+          for label, check in checks:
+              try:
+                  value = check()
+              except Exception as exc:
+                  print(
+                      "LIVE_QA_PREFLIGHT status=failed "
+                      f"check={label} error={type(exc).__name__}: {exc}",
+                      file=sys.stderr,
+                  )
+                  raise
+              detail = len(value) if isinstance(value, tuple) else "validated"
+              print(f"LIVE_QA_PREFLIGHT status=passed check={label} detail={detail}")
+          PY
       - name: Run serial privileged catalog contour exactly once as root
         run: >-
           sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
