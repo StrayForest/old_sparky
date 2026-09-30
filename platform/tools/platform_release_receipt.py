@@ -247,6 +247,50 @@ def validate_receipt(
     _string(receipt.get("runtime_profile"), SAFE_TEXT_RE, "runtime profile")
     if receipt.get("web_compression") not in {"enabled", "disabled"}:
         raise _fail("receipt compression mode is malformed")
+    caller = _identity(
+        receipt.get("caller"),
+        field="caller",
+        expected_event=(
+            "workflow_run"
+            if isinstance(receipt.get("caller"), Mapping)
+            and receipt["caller"].get("event") == "workflow_run"
+            else "workflow_dispatch"
+        ),
+        expected_name=(
+            AUTO_WORKFLOW_NAME
+            if isinstance(receipt.get("caller"), Mapping)
+            and receipt["caller"].get("event") == "workflow_run"
+            else DEPLOY_WORKFLOW_NAME
+        ),
+        expected_path=(
+            AUTO_WORKFLOW_PATH
+            if isinstance(receipt.get("caller"), Mapping)
+            and receipt["caller"].get("event") == "workflow_run"
+            else DEPLOY_WORKFLOW_PATH
+        ),
+    )
+    caller_event = caller.get("event")
+    if caller_event == "workflow_run":
+        called_event = "workflow_run"
+        called_name = DEPLOY_WORKFLOW_NAME
+        called_path = DEPLOY_WORKFLOW_PATH
+    elif caller_event == "workflow_dispatch":
+        called_event = "workflow_dispatch"
+        called_name = DEPLOY_WORKFLOW_NAME
+        called_path = DEPLOY_WORKFLOW_PATH
+    else:
+        raise _fail("receipt caller event is not canonical")
+    called = _identity(
+        receipt.get("called"),
+        field="called",
+        expected_event=called_event,
+        expected_name=called_name,
+        expected_path=called_path,
+    )
+    if caller_event == "workflow_run" and receipt.get("mode") != "deploy":
+        raise _fail("auto receipt mode is not deploy")
+    if caller_event == "workflow_dispatch" and receipt.get("mode") != "deploy":
+        raise _fail("manual receipt mode is not deploy")
     _identity(
         receipt.get("security"),
         field="security",
@@ -260,20 +304,6 @@ def validate_receipt(
         expected_event="push",
         expected_name="Platform security and build",
         expected_path=".github/workflows/platform-security.yml",
-    )
-    caller = _identity(
-        receipt.get("caller"),
-        field="caller",
-        expected_event="workflow_run",
-        expected_name=AUTO_WORKFLOW_NAME,
-        expected_path=AUTO_WORKFLOW_PATH,
-    )
-    called = _identity(
-        receipt.get("called"),
-        field="called",
-        expected_event="workflow_run",
-        expected_name=DEPLOY_WORKFLOW_NAME,
-        expected_path=DEPLOY_WORKFLOW_PATH,
     )
     if caller.get("run_id") != called.get("run_id") or caller.get("run_attempt") != called.get("run_attempt"):
         raise _fail("caller and called run identities are not top-level bound")
@@ -424,6 +454,46 @@ def inspect_single_member_archive(
     return validate_receipt(payload), data
 
 
+def validate_closed_receipt_archive(
+    archive_path: Path,
+    metadata: Mapping[str, Any],
+    *,
+    expected_run_id: str,
+    expected_run_attempt: str,
+    expected_status_url: str,
+    expected_mode: str,
+) -> Mapping[str, Any]:
+    """Validate the exact GitHub artifact envelope and closed receipt.
+
+    The API artifact digest is checked against the downloaded ZIP bytes before
+    the ZIP is opened.  The ZIP must contain one canonical receipt member;
+    receipt identity then binds it to the source run attempt and marker URL.
+    """
+
+    metadata = _mapping(metadata, "receipt artifact metadata")
+    digest = metadata.get("digest")
+    if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise _fail("receipt artifact digest is malformed")
+    archive_bytes = archive_path.read_bytes()
+    if type(metadata.get("size_in_bytes")) is not int or metadata["size_in_bytes"] != len(archive_bytes):
+        raise _fail("receipt artifact size does not match download")
+    if hashlib.sha256(archive_bytes).hexdigest() != digest.removeprefix("sha256:"):
+        raise _fail("receipt artifact ZIP digest does not match API metadata")
+    receipt, _ = inspect_single_member_archive(archive_path)
+    validate_receipt(receipt, expected_mode=expected_mode, expected_status_url=expected_status_url)
+    if (
+        receipt["caller"]["run_id"] != expected_run_id
+        or receipt["caller"]["run_attempt"] != expected_run_attempt
+        or receipt["called"]["run_id"] != expected_run_id
+        or receipt["called"]["run_attempt"] != expected_run_attempt
+    ):
+        raise _fail("receipt is not bound to the exact source attempt")
+    artifact = receipt["artifact"]
+    if artifact["workflow_run_id"] != expected_run_id or artifact["workflow_run_attempt"] != expected_run_attempt:
+        raise _fail("receipt content artifact is not bound to the exact source attempt")
+    return receipt
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Validate a platform release receipt")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -431,7 +501,7 @@ def _parser() -> argparse.ArgumentParser:
     read.add_argument("path", type=Path)
     archive = sub.add_parser("validate-archive")
     archive.add_argument("path", type=Path)
-    archive.add_argument("--expected-content-sha256", required=True)
+    archive.add_argument("--expected-content-sha256")
     return parser
 
 
@@ -443,10 +513,13 @@ def main(argv: list[str] | None = None) -> int:
             print("release receipt accepted")
             return 0
         if args.command == "validate-archive":
-            receipt = validate_single_member_archive(
-                args.path,
-                expected_content_sha256=args.expected_content_sha256,
-            )
+            if args.expected_content_sha256:
+                receipt = validate_single_member_archive(
+                    args.path,
+                    expected_content_sha256=args.expected_content_sha256,
+                )
+            else:
+                receipt, _ = inspect_single_member_archive(args.path)
             print(json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
             return 0
         raise _fail()

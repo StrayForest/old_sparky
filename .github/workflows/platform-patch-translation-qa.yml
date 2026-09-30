@@ -9,7 +9,7 @@ on:
         default: "4"
         type: string
   workflow_run:
-    workflows: ["Platform production deploy"]
+    workflows: ["Platform production auto-deploy", "Platform production deploy"]
     types: [completed]
 
 permissions:
@@ -23,8 +23,8 @@ jobs:
   validate-translation-inputs:
     name: Validate translation QA handoff
     outputs:
-      deploy_ready: ${{ steps.deployment_provenance.outputs.deploy_ready }}
-      provenance_digest: ${{ steps.deployment_provenance.outputs.provenance_digest }}
+      deploy_ready: ${{ steps.downstream_receipt_provenance.outputs.deploy_ready }}
+      provenance_digest: ${{ steps.downstream_receipt_provenance.outputs.provenance_digest }}
     permissions:
       actions: read
       contents: read
@@ -32,7 +32,9 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'dev')
+       github.event.workflow_run.head_branch == 'dev' &&
+       (github.event.workflow_run.name == 'Platform production auto-deploy' ||
+        github.event.workflow_run.name == 'Platform production deploy'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -108,6 +110,7 @@ jobs:
             --value "$TARGET_SHA"
       - name: Verify exact completed production deployment provenance (shared validator)
         id: deployment_provenance
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -239,6 +242,49 @@ jobs:
           with Path(sys.argv[3]).open("a", encoding="utf-8") as output:
               output.write(f"deploy_ready={'true' if first['deploy_ready'] else 'false'}\n")
               output.write(f"provenance_digest={digest}\n")
+          PY
+      - name: Validate exact downstream release receipt provenance
+        id: downstream_receipt_provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
+          SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
+          SOURCE_WORKFLOW: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.name || '' }}
+          API_URL: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            printf '%s\n' 'deploy_ready=true' 'provenance_digest=' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$SOURCE_WORKFLOW" == "Platform production auto-deploy" || "$SOURCE_WORKFLOW" == "Platform production deploy" ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$SOURCE_RUN_URL" =~ ^https://github\.com/StrayForest/old_sparky/actions/runs/[1-9][0-9]{0,31}$ ]]
+          mode=auto
+          [[ "$SOURCE_WORKFLOW" == "Platform production deploy" ]] && mode=manual
+          result="$(env -u GITHUB_TOKEN /usr/bin/python3 platform/tools/platform_workflow_provenance.py downstream-api \
+            --mode "$mode" --api-url "$API_URL" --expected-run-id "$SOURCE_RUN_ID" \
+            --expected-attempt "$SOURCE_RUN_ATTEMPT" --expected-run-url "$SOURCE_RUN_URL" \
+            --expected-target-sha "${{ github.event.workflow_run.head_sha }}")"
+          /usr/bin/python3 - "$result" "$GITHUB_OUTPUT" "$GITHUB_ENV" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+          payload = json.loads(sys.argv[1])
+          if set(payload) != {"deploy_ready", "target_sha", "snapshot_digest"}:
+              raise SystemExit(1)
+          target = payload["target_sha"]
+          digest = payload["snapshot_digest"]
+          if not isinstance(payload["deploy_ready"], bool) or re.fullmatch(r"[0-9a-f]{40}", target or "") is None or re.fullmatch(r"[0-9a-f]{64}", digest or "") is None:
+              raise SystemExit(1)
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"deploy_ready={'true' if payload['deploy_ready'] else 'false'}\nprovenance_digest={digest}\n")
+          with Path(sys.argv[3]).open("a", encoding="utf-8") as output:
+              output.write(f"TARGET_SHA={target}\n")
           PY
       - name: Serialize closed translation QA handoff
         shell: bash

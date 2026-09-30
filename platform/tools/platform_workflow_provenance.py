@@ -20,10 +20,13 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from typing import Any
+from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
 
@@ -543,6 +546,58 @@ def validate_auto_release_jobs(
     return call_job, final_job
 
 
+def validate_auto_noop_run(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    expected_run_url: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Accept only a successful, non-deployable auto run as a closed no-op."""
+
+    _validate_job_rows(jobs)
+    _validate_status_rows(statuses)
+    validate_workflow_run(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=expected_target_sha,
+        expected_event="workflow_run",
+        expected_branch="dev",
+        expected_path=AUTO_WORKFLOW_PATH,
+        expected_name=AUTO_WORKFLOW_NAME,
+    )
+    if expected_run_url is not None and run.get("html_url") != expected_run_url:
+        raise _fail("auto-deploy caller run URL does not match the event")
+    call_jobs = [job for job in jobs if job.get("name") == AUTO_CALL_JOB_NAME]
+    final_jobs = [job for job in jobs if job.get("name") == AUTO_FINAL_JOB_NAME]
+    if len(call_jobs) != 1 or len(final_jobs) != 1:
+        raise _fail("auto no-op job set is missing or ambiguous")
+    if (call_jobs[0].get("status"), call_jobs[0].get("conclusion")) != ("completed", "skipped"):
+        raise _fail("auto no-op native call is not skipped")
+    _job_state(final_jobs[0], expected_name=AUTO_FINAL_JOB_NAME)
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise _fail("auto no-op caller run did not succeed")
+    validate_status_collection(
+        statuses,
+        context=DEPLOY_STATUS_CONTEXT,
+        now=now,
+    )
+    attempt_url = canonical_attempt_url(
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+    )
+    if any(row.get("context") == DEPLOY_STATUS_CONTEXT and row.get("target_url") == attempt_url for row in statuses):
+        raise _fail("auto no-op has a deployment marker")
+
+
 def validate_auto_release_run(
     workflow: Mapping[str, Any],
     run: Mapping[str, Any],
@@ -939,6 +994,312 @@ def validate_deployment_event(
     return False
 
 
+def validate_downstream_snapshot(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    receipt: Mapping[str, Any],
+    *,
+    mode: str,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_run_url: str,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Bind one downstream snapshot to the closed release receipt.
+
+    The receipt supplies the deployment target.  The triggering run SHA is
+    used only to authenticate the workflow-run envelope and never becomes the
+    QA target.  ``False`` is reserved for a valid auto non-deployable no-op;
+    manual preflight is also returned false and has no marker authority.
+    """
+
+    try:
+        from platform_release_receipt import validate_receipt
+    except ImportError:  # pragma: no cover - direct runner execution
+        from .platform_release_receipt import validate_receipt
+
+    validated_receipt = validate_receipt(
+        receipt,
+        expected_mode="deploy",
+        expected_status_url=expected_run_url + f"/attempts/{expected_attempt}",
+    )
+    target_sha = validated_receipt["target_sha"]
+    caller = validated_receipt["caller"]
+    called = validated_receipt["called"]
+    if caller.get("run_id") != str(expected_run_id) or caller.get("run_attempt") != str(expected_attempt):
+        raise _fail("receipt caller does not match the exact source attempt")
+    if called.get("run_id") != str(expected_run_id) or called.get("run_attempt") != str(expected_attempt):
+        raise _fail("receipt called run does not match the exact source attempt")
+    if mode == "auto":
+        if caller.get("event") != "workflow_run" or called.get("event") != "workflow_run":
+            raise _fail("auto receipt entrypoint is not workflow_run")
+        validate_auto_release_run(
+            workflow,
+            run,
+            jobs,
+            statuses,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_target_sha=target_sha,
+            expected_called_workflow_ref=called["workflow_ref"],
+            expected_called_workflow_sha=called["workflow_sha"],
+            expected_run_url=expected_run_url,
+            now=now,
+        )
+        return True, target_sha
+    if mode == "manual":
+        if caller.get("event") != "workflow_dispatch" or called.get("event") != "workflow_dispatch":
+            raise _fail("manual receipt entrypoint is not workflow_dispatch")
+        if not validate_manual_deployment_run(
+            workflow,
+            run,
+            jobs,
+            statuses,
+            expected_run_id=expected_run_id,
+            expected_attempt=expected_attempt,
+            expected_target_sha=target_sha,
+            expected_run_url=expected_run_url,
+            now=now,
+        ):
+            raise _fail("manual receipt is not a successful deployment")
+        return True, target_sha
+    raise _fail("downstream mode is not canonical")
+
+
+def _api_get(api_url: str, token: str, path: str) -> object:
+    if not isinstance(token, str) or not token:
+        raise _fail("GitHub API authorization is unavailable")
+    request = Request(
+        f"{api_url.rstrip('/')}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            data = response.read(8 * 1024 * 1024 + 1)
+    except Exception as exc:  # pragma: no cover - network boundary
+        raise _fail("GitHub API snapshot failed") from exc
+    if len(data) > 8 * 1024 * 1024:
+        raise _fail("GitHub API snapshot is oversized")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise _fail("GitHub API snapshot is malformed") from exc
+
+
+def _api_get_bytes(api_url: str, token: str, path: str) -> bytes:
+    request = Request(
+        f"{api_url.rstrip('/')}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            data = response.read(8 * 1024 * 1024 + 1)
+    except Exception as exc:  # pragma: no cover - network boundary
+        raise _fail("GitHub artifact download failed") from exc
+    if len(data) > 8 * 1024 * 1024:
+        raise _fail("GitHub artifact is oversized")
+    return data
+
+
+def _api_paginate(api_url: str, token: str, path: str, key: str | None) -> list[Mapping[str, Any]]:
+    rows: list[Mapping[str, Any]] = []
+    seen: set[int] = set()
+    for page in range(1, 1001):
+        payload = _api_get(api_url, token, f"{path}?per_page=100&page={page}")
+        page_rows = payload if key is None else _as_mapping(payload, "paginated response").get(key)
+        if not isinstance(page_rows, list) or len(page_rows) > 100 or any(not isinstance(row, Mapping) for row in page_rows):
+            raise _fail("paginated response is malformed")
+        for row in page_rows:
+            row_id = row.get("id")
+            if type(row_id) is not int or row_id <= 0 or row_id in seen:
+                raise _fail("paginated rows are duplicate or malformed")
+            seen.add(row_id)
+            rows.append(row)
+        if len(page_rows) < 100:
+            return rows
+    raise _fail("pagination exceeded its bound")
+
+
+def _stable_api_snapshot(api_url: str, token: str, path: str, key: str | None) -> list[Mapping[str, Any]]:
+    first = _api_paginate(api_url, token, path, key)
+    second = _api_paginate(api_url, token, path, key)
+    if first != second:
+        raise _fail("API snapshot changed during validation")
+    return first
+
+
+def _stable_api_object(api_url: str, token: str, path: str, field: str) -> Mapping[str, Any]:
+    first = _as_mapping(_api_get(api_url, token, path), field)
+    second = _as_mapping(_api_get(api_url, token, path), field)
+    if first != second:
+        raise _fail("API object changed during validation")
+    return first
+
+
+def validate_downstream_api(
+    *,
+    api_url: str,
+    token: str,
+    mode: str,
+    run_id: int,
+    attempt: int,
+    run_url: str,
+) -> Mapping[str, Any]:
+    """Fetch and validate one exact auto/manual release attempt for consumers."""
+
+    try:
+        from platform_release_receipt import validate_closed_receipt_archive
+    except ImportError:  # pragma: no cover - package execution
+        from .platform_release_receipt import validate_closed_receipt_archive
+
+    def bind_receipt_identity(identity: Mapping[str, Any], api_run: Mapping[str, Any], *, expected_id: int, expected_attempt: int) -> None:
+        if (
+            identity.get("run_id") != str(expected_id)
+            or identity.get("run_attempt") != str(expected_attempt)
+            or identity.get("event") != api_run.get("event")
+            or identity.get("workflow_name") != api_run.get("name")
+            or identity.get("repository") != REPOSITORY_FULL_NAME
+            or identity.get("workflow_sha") != api_run.get("head_sha")
+        ):
+            raise _fail("receipt workflow reference does not match API run")
+        if api_run.get("workflow_ref") is not None and identity.get("workflow_ref") != api_run.get("workflow_ref"):
+            raise _fail("receipt workflow ref does not match API run")
+
+    if mode == "auto":
+        workflow_path = AUTO_WORKFLOW_PATH
+    elif mode == "manual":
+        workflow_path = DEPLOY_WORKFLOW_PATH
+    else:
+        raise _fail("downstream mode is not canonical")
+    workflow = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/workflows/{Path(workflow_path).name}", "workflow")
+    run = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}", "run")
+    jobs = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+    source_statuses = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/commits/{run.get('head_sha')}/statuses", None)
+    if mode == "auto":
+        try:
+            validate_auto_noop_run(
+                workflow, run, jobs, source_statuses,
+                expected_run_id=run_id, expected_attempt=attempt,
+                expected_target_sha=run.get("head_sha"), expected_run_url=run_url,
+            )
+        except ProvenanceError:
+            pass
+        else:
+            return {"deploy_ready": False, "target_sha": run.get("head_sha"), "snapshot_digest": deployment_snapshot_digest(workflow, run, jobs, source_statuses)}
+    elif mode == "manual":
+        if validate_manual_deployment_run(
+            workflow, run, jobs, source_statuses,
+            expected_run_id=run_id, expected_attempt=attempt,
+            expected_target_sha=run.get("head_sha"), expected_run_url=run_url,
+        ) is False:
+            return {"deploy_ready": False, "target_sha": run.get("head_sha"), "snapshot_digest": deployment_snapshot_digest(workflow, run, jobs, source_statuses)}
+
+    artifact_rows = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{run_id}/artifacts", "artifacts")
+    expected_name = f"platform-production-release-receipt-{run_id}-{attempt}"
+    matches = [row for row in artifact_rows if row.get("name") == expected_name and row.get("expired") is False]
+    if len(matches) != 1:
+        raise _fail("closed release receipt artifact is missing or ambiguous")
+    artifact = matches[0]
+    workflow_run = _as_mapping(artifact.get("workflow_run"), "receipt artifact workflow run")
+    if workflow_run.get("id") != run_id or workflow_run.get("run_attempt") not in (None, attempt):
+        raise _fail("receipt artifact is not bound to the exact attempt")
+    artifact_id = artifact.get("id")
+    if type(artifact_id) is not int or artifact_id <= 0:
+        raise _fail("receipt artifact ID is malformed")
+    data = _api_get_bytes(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/artifacts/{artifact_id}/zip")
+    with tempfile.TemporaryDirectory(prefix="platform-downstream-", dir=None) as directory:
+        archive = Path(directory) / "receipt.zip"
+        archive.write_bytes(data)
+        archive.chmod(0o600)
+        from platform_release_receipt import validate_artifact_metadata, validate_closed_receipt_archive, validate_single_member_archive
+        receipt = validate_closed_receipt_archive(
+            archive, artifact, expected_run_id=str(run_id), expected_run_attempt=str(attempt),
+            expected_status_url=run_url + f"/attempts/{attempt}", expected_mode="deploy",
+        )
+        content_artifact = receipt["artifact"]
+        content_metadata = _as_mapping(
+            _api_get(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/artifacts/{content_artifact['id']}"),
+            "receipt content artifact metadata",
+        )
+        validate_artifact_metadata(
+            content_metadata,
+            expected_id=content_artifact["id"],
+            expected_name=content_artifact["name"],
+            expected_run_id=str(run_id),
+            expected_run_attempt=str(attempt),
+            expected_digest=content_artifact["digest"],
+        )
+        content_bytes = _api_get_bytes(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/artifacts/{content_artifact['id']}/zip")
+        content_archive = Path(directory) / "receipt-content.zip"
+        content_archive.write_bytes(content_bytes)
+        content_archive.chmod(0o600)
+        if content_metadata.get("size_in_bytes") != len(content_bytes):
+            raise _fail("receipt content artifact size does not match download")
+        if hashlib.sha256(content_bytes).hexdigest() != content_artifact["digest"].removeprefix("sha256:"):
+            raise _fail("receipt content artifact ZIP digest does not match")
+        validate_single_member_archive(
+            content_archive,
+            expected_content_sha256=content_artifact["content_sha256"],
+        )
+        target_sha = receipt["target_sha"]
+        statuses = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/commits/{target_sha}/statuses", None)
+        result = validate_downstream_snapshot(
+            workflow, run, jobs, statuses, receipt, mode=mode,
+            expected_run_id=run_id, expected_attempt=attempt, expected_run_url=run_url, now=datetime.now(timezone.utc),
+        )
+        security = receipt["security"]
+        security_workflow = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/workflows/platform-security.yml", "security workflow")
+        security_run_id = parse_run_id(security["run_id"], "security run id")
+        security_attempt = parse_run_id(security["run_attempt"], "security run attempt")
+        security_run = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{security_run_id}", "security run")
+        bind_receipt_identity(security, security_run, expected_id=security_run_id, expected_attempt=security_attempt)
+        security_statuses = _stable_api_snapshot(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/commits/{target_sha}/statuses", None)
+        validate_security_marker(security_workflow, security_run, security_statuses, expected_run_id=security_run_id, expected_attempt=security_attempt, expected_target_sha=target_sha, now=datetime.now(timezone.utc))
+        classifier = receipt["classifier"]
+        classifier_run_id = parse_run_id(classifier["run_id"], "classifier run id")
+        classifier_attempt = parse_run_id(classifier["run_attempt"], "classifier run attempt")
+        classifier_run = _stable_api_object(api_url, token, f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{classifier_run_id}", "classifier run")
+        bind_receipt_identity(classifier, classifier_run, expected_id=classifier_run_id, expected_attempt=classifier_attempt)
+        validate_workflow_run(
+            security_workflow,
+            classifier_run,
+            expected_run_id=classifier_run_id,
+            expected_attempt=classifier_attempt,
+            expected_target_sha=target_sha,
+            expected_event="push",
+            expected_branch="dev",
+            expected_path=SECURITY_WORKFLOW_PATH,
+            expected_name=SECURITY_WORKFLOW_NAME,
+        )
+        classifier_artifacts = _stable_api_snapshot(
+            api_url,
+            token,
+            f"/repos/{REPOSITORY_FULL_NAME}/actions/runs/{classifier_run_id}/artifacts",
+            "artifacts",
+        )
+        classifier_name = f"platform-ci-route-{classifier_run_id}-{classifier_attempt}"
+        classifier_matches = [
+            row for row in classifier_artifacts
+            if row.get("name") == classifier_name and row.get("expired") is False
+        ]
+        if len(classifier_matches) != 1:
+            raise _fail("classifier artifact is missing or ambiguous")
+        classifier_workflow_run = _as_mapping(classifier_matches[0].get("workflow_run"), "classifier artifact workflow run")
+        if classifier_workflow_run.get("id") != classifier_run_id or classifier_workflow_run.get("run_attempt") not in (None, classifier_attempt) or classifier_workflow_run.get("head_sha") != target_sha:
+            raise _fail("classifier artifact is not bound to the receipt reference")
+        return {"deploy_ready": result[0], "target_sha": result[1], "snapshot_digest": deployment_snapshot_digest(workflow, run, jobs, statuses)}
+
+
 class _ProvenanceArgumentParser(argparse.ArgumentParser):
     """Keep malformed runner arguments free of attacker-controlled echoes."""
 
@@ -1011,11 +1372,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         description="Validate exact GitHub Actions workflow provenance"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("security", "deployment", "auto-release", "manual-release"):
+    for command in ("security", "deployment", "auto-release", "manual-release", "auto-noop", "downstream", "downstream-api"):
         command_parser = subparsers.add_parser(command)
-        command_parser.add_argument("--workflow", type=Path, required=True)
-        command_parser.add_argument("--run", type=Path, required=True)
-        command_parser.add_argument("--status", type=Path, required=True)
+        command_parser.add_argument("--workflow", type=Path, required=command != "downstream-api")
+        command_parser.add_argument("--run", type=Path, required=command != "downstream-api")
+        command_parser.add_argument("--status", type=Path, required=command != "downstream-api")
         command_parser.add_argument("--jobs", type=Path)
         command_parser.add_argument("--expected-run-id", required=True)
         command_parser.add_argument("--expected-attempt", required=True)
@@ -1029,8 +1390,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
                 help="accept an exact successful preflight as a non-mutating no-op",
             )
         if command == "auto-release":
-            command_parser.add_argument("--called-workflow-ref", required=True)
-            command_parser.add_argument("--called-workflow-sha", required=True)
+            command_parser.add_argument("--called-workflow-ref")
+            command_parser.add_argument("--called-workflow-sha")
+        if command == "auto-noop":
+            command_parser.add_argument("--expected-event", choices=("workflow_run",), default="workflow_run")
+        if command == "downstream":
+            command_parser.add_argument("--receipt", type=Path, required=True)
+            command_parser.add_argument("--mode", choices=("auto", "manual"), required=True)
+        if command == "downstream-api":
+            command_parser.add_argument("--mode", choices=("auto", "manual"), required=True)
+            command_parser.add_argument("--api-url", required=True)
+            command_parser.add_argument("--token-env", default="GH_TOKEN")
     return parser
 
 
@@ -1039,6 +1409,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         args = _build_cli_parser().parse_args(argv)
+        if args.command == "downstream-api":
+            expected_run_id = parse_run_id(args.expected_run_id, "expected run id")
+            expected_attempt = parse_run_id(args.expected_attempt, "expected run attempt")
+            result = validate_downstream_api(
+                api_url=args.api_url,
+                token=os.environ.get(args.token_env, ""),
+                mode=args.mode,
+                run_id=expected_run_id,
+                attempt=expected_attempt,
+                run_url=args.expected_run_url or f"{GITHUB_SERVER_URL}/{REPOSITORY_FULL_NAME}/actions/runs/{expected_run_id}",
+            )
+            print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+            return 0
         workflow = _read_json(args.workflow)
         run = _read_json(args.run)
         status_payload = _read_json(args.status)
@@ -1064,6 +1447,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 now=now,
             )
             context = SECURITY_STATUS_CONTEXT
+        elif args.command == "auto-noop":
+            if args.jobs is None:
+                raise _fail("auto no-op job payload is missing")
+            jobs = _payload_rows(_read_json(args.jobs), "jobs", "auto no-op job")
+            statuses = _payload_rows(status_payload, "statuses", "auto no-op status")
+            validate_auto_noop_run(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+                expected_target_sha=args.expected_target_sha,
+                expected_run_url=args.expected_run_url,
+                now=now,
+            )
+            attempt_url = canonical_attempt_url(run, expected_run_id=expected_run_id, expected_attempt=expected_attempt)
+            deploy_ready = False
+            context = DEPLOY_STATUS_CONTEXT
         elif args.command == "auto-release":
             if args.jobs is None:
                 raise _fail("auto-release job payload is missing")
@@ -1110,6 +1512,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_attempt=expected_attempt,
             )
             context = DEPLOY_STATUS_CONTEXT
+        elif args.command == "downstream":
+            if args.jobs is None:
+                raise _fail("downstream job payload is missing")
+            jobs = _payload_rows(_read_json(args.jobs), "jobs", "downstream job")
+            statuses = _payload_rows(status_payload, "statuses", "downstream status")
+            receipt = _read_json(args.receipt)
+            if not isinstance(receipt, Mapping):
+                raise _fail("downstream receipt is malformed")
+            deploy_ready, target_sha = validate_downstream_snapshot(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                receipt,
+                mode=args.mode,
+                expected_run_id=expected_run_id,
+                expected_attempt=expected_attempt,
+                expected_run_url=args.expected_run_url or canonical_run_url(run, expected_run_id=expected_run_id),
+                now=now,
+            )
+            attempt_url = canonical_attempt_url(run, expected_run_id=expected_run_id, expected_attempt=expected_attempt)
+            context = DEPLOY_STATUS_CONTEXT
         else:
             if args.jobs is None:
                 raise _fail("deployment job payload is missing")
@@ -1153,7 +1577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     now=now,
                 )
             context = DEPLOY_STATUS_CONTEXT
-        snapshot_jobs = jobs if args.command in {"deployment", "auto-release", "manual-release"} else []
+        snapshot_jobs = jobs if args.command in {"deployment", "auto-release", "manual-release", "auto-noop", "downstream"} else []
         marker = (
             _status_fingerprint(
                 statuses,
@@ -1167,7 +1591,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps(
                 {
                     "attempt_url": attempt_url,
-                    "deploy_ready": deploy_ready if args.command in {"deployment", "auto-release", "manual-release"} else True,
+                    "deploy_ready": deploy_ready if args.command in {"deployment", "auto-release", "manual-release", "auto-noop", "downstream"} else True,
                     "snapshot_digest": deployment_snapshot_digest(
                         workflow,
                         run,

@@ -584,7 +584,7 @@ and size-based rotation bounds text log files.
   resolves a release-independent, root-owned host-tools generation from the
   repository pin (`HOST_TOOLS_SHA`) before building or transferring a release;
   its one-time out-of-band provisioning and rollback contract is in the
-  [production host-tools provisioning ADR](adr/production-host-tools-provisioning.md).
+  [production host-tools provisioning ADR](adr/production-host-tools-provisioning.md); downstream QA is receipt-gated and skips valid auto no-ops/manual preflights.
 
 ## Deferred / operator-owned work
 

@@ -77,7 +77,14 @@ to `dev`. The chain is:
    environment approval still applies, while `workflow_call` cannot receive
    environment secrets from the caller. See [GitHub's reusable workflow secret
    semantics](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow).
-6. A secret-free prerequisite independently downloads and validates the exact classifier
+6. Downstream patch-translation and content-diagnostics runs listen to both
+   auto-deploy and manual deploy workflow runs. The shared validator accepts a
+   deploy only after the exact run-attempt receipt artifact has one canonical
+   member and matching API/ZIP/content digests, takes `TARGET_SHA` from that
+   receipt, and revalidates security/classifier plus caller/called refs, jobs
+   and the bot-authored attempt marker. Valid non-deployable auto runs and
+   manual preflights are markerless no-ops and never start QA.
+7. A secret-free prerequisite independently downloads and validates the exact classifier
    artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
    before its first production write, followed by the security/build check and

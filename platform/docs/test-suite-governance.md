@@ -434,6 +434,14 @@ The auto-deploy page assembler retains each row, including `creator`, and the sh
 requires the exact context/state, `github-actions[bot]` creator, attempt URL,
 run attempt and target SHA before a status can authorize release behavior.
 
+The downstream receipt contour is owned by
+`tests.test_platform_workflow_provenance` and
+`tests.test_platform_release_receipt`. It uses bounded paginated jobs,
+statuses and artifacts with adjacent-snapshot equality, requires one exact
+run-attempt receipt and matching digests, and fails closed on malformed,
+duplicate or missing rows. Auto no-deploy routes and manual preflights are
+explicit no-ops; neither may run QA or publish a deployment-success marker.
+
 ## Production and performance boundaries
 
 Deployment smoke runs only after immutable deployment activation and checks
