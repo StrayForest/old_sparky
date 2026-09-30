@@ -243,11 +243,14 @@ def _read_bytes(path: Path, *, maximum: int, description: str) -> bytes:
         raise CandidateError(f"{description} metadata is unsafe")
     descriptor: int | None = None
     try:
+        try:
+            close_on_exec = bundle._require_os_flag("O_CLOEXEC")
+            no_follow = bundle._require_os_flag("O_NOFOLLOW")
+        except bundle.HostToolsBundleError as exc:
+            raise CandidateError("candidate read filesystem primitive is unavailable") from exc
         descriptor = os.open(
             path,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | close_on_exec | no_follow,
         )
         opened = os.fstat(descriptor)
         if (
@@ -285,6 +288,121 @@ def _read_bytes(path: Path, *, maximum: int, description: str) -> bytes:
             try:
                 os.close(descriptor)
             except OSError:
+                pass
+
+
+def _write_exclusive(path: Path, data: bytes, *, mode: int) -> None:
+    """Create one bounded handoff file without overwrite or symlink follows."""
+
+    if not isinstance(path, Path) or not path.is_absolute() or ".." in path.parts:
+        raise CandidateError("candidate output path is invalid")
+    try:
+        parent = path.parent.lstat()
+    except OSError as exc:
+        raise CandidateError("candidate output parent is unavailable") from exc
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or parent.st_nlink < 2
+        or stat.S_IMODE(parent.st_mode) & 0o022
+    ):
+        raise CandidateError("candidate output parent metadata is unsafe")
+    try:
+        no_follow = bundle._require_os_flag("O_NOFOLLOW")
+        close_on_exec = bundle._require_os_flag("O_CLOEXEC")
+        directory = bundle._require_os_flag("O_DIRECTORY")
+        exclusive = bundle._require_os_flag("O_EXCL")
+    except bundle.HostToolsBundleError as exc:
+        raise CandidateError("candidate output filesystem primitive is unavailable") from exc
+    try:
+        bundle._require_fd_primitive("fchmod")
+        bundle._require_fd_primitive("fsync")
+    except bundle.HostToolsBundleError as exc:
+        raise CandidateError("candidate output filesystem primitive is unavailable") from exc
+    descriptor: int | None = None
+    parent_fd: int | None = None
+    identity: os.stat_result | None = None
+    created = False
+    complete = False
+    try:
+        parent_fd = os.open(parent, os.O_RDONLY | directory | close_on_exec | no_follow)
+        opened_parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(opened_parent.st_mode)
+            or opened_parent.st_dev != parent.st_dev
+            or opened_parent.st_ino != parent.st_ino
+            or opened_parent.st_nlink != parent.st_nlink
+        ):
+            raise CandidateError("candidate output parent changed")
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | exclusive
+            | close_on_exec
+            | no_follow,
+            mode,
+            dir_fd=parent_fd,
+        )
+        created = True
+        offset = 0
+        while offset < len(data):
+            written = os.write(descriptor, data[offset:])
+            if written <= 0:
+                raise CandidateError("candidate output write made no progress")
+            offset += written
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        identity = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(identity.st_mode)
+            or identity.st_dev != opened_parent.st_dev
+            or identity.st_nlink != 1
+            or identity.st_size != len(data)
+            or stat.S_IMODE(identity.st_mode) != mode
+        ):
+            raise CandidateError("candidate output metadata is unsafe")
+        pathname = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            pathname.st_dev != identity.st_dev
+            or pathname.st_ino != identity.st_ino
+            or pathname.st_nlink != identity.st_nlink
+            or pathname.st_uid != os.getuid()
+            or pathname.st_gid != os.getgid()
+            or stat.S_IMODE(pathname.st_mode) != mode
+        ):
+            raise CandidateError("candidate output identity changed")
+        complete = True
+        os.fsync(parent_fd)
+    except CandidateError:
+        raise
+    except OSError as exc:
+        raise CandidateError("candidate output could not be written") from exc
+    except BaseException:
+        raise
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+        if parent_fd is not None:
+            if created and not complete and identity is not None:
+                try:
+                    current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                    if (
+                        current.st_dev == identity.st_dev
+                        and current.st_ino == identity.st_ino
+                        and current.st_nlink == identity.st_nlink
+                    ):
+                        os.unlink(path.name, dir_fd=parent_fd)
+                        os.fsync(parent_fd)
+                except BaseException:
+                    pass
+            try:
+                os.close(parent_fd)
+            except BaseException:
                 pass
 
 
@@ -1610,12 +1728,19 @@ def write_evidence(
         expected_head_sha=trusted_commit,
         expected_head_ref=DEFAULT_BRANCH,
     )
-    _verify_closed_archive(
+    returned_bundle = _verify_closed_archive(
         artifact_archive_path,
         expected_member="platform-host-tools-bundle.zip",
         maximum_member_bytes=MAX_BUNDLE_BYTES,
         expected_member_digest=bundle_summary["bundle_sha256"],
     )
+    local_bundle = _read_bytes(
+        bundle_path, maximum=MAX_BUNDLE_BYTES, description="local candidate bundle"
+    )
+    if returned_bundle != local_bundle:
+        raise CandidateError(
+            "uploaded candidate artifact member differs from the local bundle bytes"
+        )
     security = _object(_read_json(security_evidence_path, description="security evidence"), "security evidence")
     if set(security) != {"schema", "context", "summary_artifact", "route_artifact", "route_manifest_digest", "summary"}:
         raise CandidateError("security evidence schema is not closed")
@@ -1738,17 +1863,7 @@ def write_evidence(
     encoded = (json.dumps(evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
     if len(encoded) > MAX_EVIDENCE_BYTES:
         raise CandidateError("candidate evidence exceeds its bound")
-    output.write_bytes(encoded)
-    os.chmod(output, 0o600)
-    metadata = output.lstat()
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or metadata.st_size != len(encoded)
-    ):
-        raise CandidateError("candidate evidence output metadata is unsafe")
+    _write_exclusive(output, encoded, mode=0o600)
     return evidence
 
 
@@ -1761,6 +1876,7 @@ def verify_uploaded_evidence(
     run_id: str,
     run_attempt: str,
     trusted_sha: str,
+    local_evidence: Path,
 ) -> str:
     """Verify the bounded evidence artifact envelope after upload."""
 
@@ -1781,11 +1897,18 @@ def verify_uploaded_evidence(
         expected_head_sha=_sha(trusted_sha, "trusted source SHA"),
         expected_head_ref=DEFAULT_BRANCH,
     )
-    _verify_closed_archive(
+    returned_evidence = _verify_closed_archive(
         archive_path,
         expected_member="platform-host-tools-candidate-evidence.json",
         maximum_member_bytes=MAX_EVIDENCE_BYTES,
     )
+    local_bytes = _read_bytes(
+        local_evidence, maximum=MAX_EVIDENCE_BYTES, description="local candidate evidence"
+    )
+    if returned_evidence != local_bytes:
+        raise CandidateError(
+            "uploaded evidence member differs from the local evidence bytes"
+        )
     return digest
 
 
@@ -1856,6 +1979,7 @@ def _parser() -> argparse.ArgumentParser:
     uploaded.add_argument("--run-id", required=True)
     uploaded.add_argument("--run-attempt", required=True)
     uploaded.add_argument("--trusted-sha", required=True)
+    uploaded.add_argument("--local-evidence", required=True, type=Path)
     return parser
 
 
@@ -1961,6 +2085,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_id=args.run_id,
                     run_attempt=args.run_attempt,
                     trusted_sha=args.trusted_sha,
+                    local_evidence=args.local_evidence,
                 )
             )
         else:  # pragma: no cover - argparse enforces the subcommand set.

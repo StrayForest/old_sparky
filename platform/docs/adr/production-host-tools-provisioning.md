@@ -47,11 +47,17 @@ substituted into the trusted generation.
 then checks out the pinned `HOST_TOOLS_SHA` and runs that pinned bundle helper
 on a secret-free runner. The bundle manifest/source/generation are therefore
 bound to `HOST_TOOLS_SHA`; the artifact API envelope remains bound to the
-workflow's application `TARGET_SHA`. The environment-approved capability job
-downloads the exact artifact ID and digest, verifies the closed manifest
-offline, and checks the already-installed `HOST_TOOLS_SHA` generation. It does
-not upload, install or execute any bundle member and it does not check out
-candidate source. The remote checks
+workflow's application `TARGET_SHA`. The separate secret-free
+`verify-host-tools` job downloads the raw GitHub artifact API ZIP, validates its
+API digest/size and exact one-member outer envelope, extracts the returned
+inner bytes with the pinned helper, verifies the closed inner bundle and
+regenerates contract sidecars from those verified bytes. It then verifies the
+external GitHub build attestation against the exact inner digest, workflow,
+issuer, ref and run/attempt. Only scalar results cross the environment
+approval boundary. The environment-approved capability job checks the
+already-installed `HOST_TOOLS_SHA` generation; it does not download, install or
+execute any bundle member and it does not check out candidate source. The
+remote checks
 use only fixed absolute `/usr/bin/id`, `/usr/bin/stat`, `/usr/bin/sha256sum`,
 `/usr/bin/test`, `/usr/bin/find` and `/usr/bin/base64` operations against the
 exact generation path. The SSH
@@ -114,13 +120,16 @@ from **E**, while **C** remains reachable only from the PR head. Malformed,
 unrelated or otherwise ambiguous pin history fails closed. The exact fixed
 closure and its digests remain required.
 
-The inner deterministic bundle is attested before upload.  Candidate and
+The inner deterministic bundle is attested before upload. Candidate and
 evidence artifact names bind the pull request, **C**, **E**, security run and
 attempt; each uploaded ZIP is read back through bounded metadata/digest checks
-and a closed one-member archive check.  The resulting evidence JSON is
-mode-0600, size-bounded and explicitly `deployable: false`.  Production
-workflows do not consume either candidate prefix, so this handoff can only
-produce review evidence; it cannot dispatch, provision, install or deploy.
+and a closed one-member archive check. The evidence verifier compares the
+returned evidence member byte-for-byte with the local JSON produced by the
+trusted validator, and rejects mutation, duplicate members or a mismatched
+artifact/API pairing. The resulting evidence JSON is mode-0600, size-bounded
+and explicitly `deployable: false`. Production workflows do not consume either
+candidate prefix, so this handoff can only produce review evidence; it cannot
+dispatch, provision, install or deploy.
 
 ### Closed source-versus-tested merge identity
 
@@ -166,14 +175,25 @@ separate approved, pinned attestation verifier. `platform_host_tools_bundle.py`
 does not claim cryptographic attestation verification: it requires that external
 receipt as an input gate and only checks its exact tuple.
 
-Before the root command, record the artifact ID, application/source-head SHA
-**E**, trusted packaging commit, pinned generation **C**, outer artifact SHA-256,
-inner bundle SHA-256, manifest SHA-256, capabilities SHA-256 and the external
-attestation receipt. The outer ZIP is bounded and must contain exactly one
-regular member named `platform-host-tools-bundle.zip`; the inner ZIP is bounded
-and must contain exactly the 15 flat `platform-host-tools/*` members. Traversal,
-backslashes, duplicate/ZIP64/special/link members, compression bombs and digest
-or identity changes fail closed.
+Before the root command, record the artifact ID/name, application/source-head
+SHA **E**, trusted default-branch source **T**, tested synthetic merge **M**,
+packaging commit, pinned generation **C**, outer artifact SHA-256, inner bundle
+SHA-256, manifest SHA-256, capabilities SHA-256 and the external attestation
+receipt. The outer ZIP is bounded and must contain exactly one regular member
+named `platform-host-tools-bundle.zip`; the inner ZIP is bounded and must
+contain exactly the 15 flat `platform-host-tools/*` members—no 16th member.
+Traversal, backslashes, duplicate/ZIP64/special/link members, compression
+bombs and digest or identity changes fail closed.
+
+The receipt is closed schema v2. It must contain exactly the allowlisted
+verifier ID, issuer `https://token.actions.githubusercontent.com`, repository,
+workflow name/path, `refs/heads/dev`, `workflow_dispatch`, production run and
+attempt, artifact ID/name, outer and inner subject digests, security run and
+attempt, and the exact **C/E/T/M** plus packaging tuple. The mandatory
+`--expected-receipt-sha256` is the SHA-256 of the raw receipt obtained through
+an independent trusted channel; it must not be copied from a field in the
+receipt or invented by this installer. The installer binds that raw receipt to
+the command arguments and does not claim to perform cryptographic attestation.
 
 Run this exact command from the reviewed checkout that contains the canonical
 helper (mutation: creates one new versioned generation; it does not touch
@@ -184,7 +204,11 @@ HOST_TOOLS_SHA='<40-lowercase-hex-C>'
 SOURCE_HEAD_SHA='<40-lowercase-hex-E>'
 PACKAGING_COMMIT='<40-lowercase-hex-packaging-commit>'
 ARTIFACT_ID='<positive-decimal-GitHub-artifact-id>'
+ARTIFACT_NAME='platform-host-tools-bundle-<run-id>-<run-attempt>'
+TRUSTED_SOURCE_SHA='<40-lowercase-hex-T>' TESTED_MERGE_SHA='<40-lowercase-hex-M>'
+SECURITY_RUN_ID='<positive-decimal-security-run-id>' SECURITY_RUN_ATTEMPT='<positive-decimal-security-run-attempt>'
 OUTER_SHA256='<64-lowercase-hex-outer-digest>' INNER_SHA256='<64-lowercase-hex-inner-digest>' MANIFEST_SHA256='<64-lowercase-hex-manifest-digest>' CAPABILITIES_SHA256='<64-lowercase-hex-capabilities-digest>'
+EXPECTED_RECEIPT_SHA256='<64-lowercase-hex-raw-receipt-digest>'
 OUTER_BUNDLE=/secure/handoff/platform-host-tools-artifact.zip
 ATTESTATION=/secure/handoff/attestation-gate.json
 INSTALL_EVIDENCE=/secure/handoff/host-tools-install-evidence.json
@@ -198,9 +222,15 @@ HOST_TOOLS_ROOT=/opt/oldsparky/platform/shared/host-tools
   --expected-manifest-sha256 "$MANIFEST_SHA256" \
   --expected-capabilities-sha256 "$CAPABILITIES_SHA256" \
   --artifact-id "$ARTIFACT_ID" \
+  --artifact-name "$ARTIFACT_NAME" \
   --attestation-evidence "$ATTESTATION" \
   --source-head-sha "$SOURCE_HEAD_SHA" \
   --packaging-commit "$PACKAGING_COMMIT" \
+  --trusted-source-sha "$TRUSTED_SOURCE_SHA" \
+  --tested-merge-sha "$TESTED_MERGE_SHA" \
+  --security-run-id "$SECURITY_RUN_ID" \
+  --security-run-attempt "$SECURITY_RUN_ATTEMPT" \
+  --expected-receipt-sha256 "$EXPECTED_RECEIPT_SHA256" \
   --evidence-output "$INSTALL_EVIDENCE"
 ```
 
@@ -215,8 +245,8 @@ Existing generations and `current`/`previous` are never modified. The helper
 runs both fixed self-tests (`host-capabilities` and `host-contract`) with
 `/usr/bin/python3.12 -I -B`, and rejects any `__pycache__`/`.pyc` or extra.
 
-The bounded mode-0600 evidence JSON contains the artifact ID, C/E/packaging
-tuple, all outer/inner/manifest/capability digests, exact inventory and both self-test
+The bounded mode-0600 evidence JSON contains the artifact ID, exact C/E/T/M/
+packaging tuple, all outer/inner/manifest/capability digests, exact inventory and both self-test
 results. A failed or interrupted operation cleans or quarantines only the
 identity-checked stage/generation it created; an identity mismatch is left for
 the operator rather than recursively deleting anything. Stop immediately on
@@ -224,6 +254,29 @@ any failure and investigate before release build, attestation status,
 artifact transfer, database migration, systemd action or production writes.
 The first deployment after successful provisioning remains the ordinary
 reviewed `dev` push/automatic chain.
+
+Evidence is never stored under `HOST_TOOLS_ROOT` or a generation directory.
+`INSTALL_EVIDENCE` must be a newly-created fixed handoff filename in a
+root-owned, non-symlink, mode-0700 secure directory (a root-owned sticky parent
+such as `/tmp` is allowed). The file is opened with `O_EXCL|O_NOFOLLOW`, fully
+written, fsynced and rechecked by pathname/device/inode/link-count/mode/owner;
+an existing file, symlink, hardlink, special file, partial write, missing
+primitive or cross-device stage is a hard failure. Parent directories are
+fsynced after unlink. Signals, `KeyboardInterrupt` and `SystemExit` retain
+their original exception and never trigger broad quarantine. `current`,
+`previous` and all pre-existing generations are outside the cleanup identity
+set.
+
+The trusted-root threat model is explicit: the reviewed helper and the
+independently supplied receipt digest are trusted inputs; artifact bytes,
+artifact paths, receipt contents, handoff paths and host-directory entries are
+attacker-controlled. The helper therefore rejects unavailable
+`O_DIRECTORY`/`O_CLOEXEC`/`O_NOFOLLOW`/`O_EXCL`, `dir_fd`, `pread`, `fchmod`,
+`fchown`, `fsync` or `renameat2(RENAME_NOREPLACE)` semantics rather than
+falling back to weaker operations. After byte/provenance verification it runs
+exact `/usr/bin/python3.12 -I -B` capability and host-contract self-tests in
+that new generation, then repeats the closed inventory check; failure removes
+only that new generation when its identity remains provable.
 
 ## Intentional host-tools bump lifecycle
 

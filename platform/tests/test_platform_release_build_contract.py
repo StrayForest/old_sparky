@@ -809,7 +809,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             workflow, "Verify exact host-tools artifact metadata"
         )
         host_preflight = self._workflow_step_run(
-            workflow, "Validate host-tools artifact envelope and bundle"
+            workflow, "Verify raw artifact and external attestation"
         )
         self.assertIn(
             "actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}",
@@ -827,7 +827,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('"sha256:${HOST_TOOLS_ARTIFACT_DIGEST}"', host_build)
         self.assertIn("sha256sum -c", host_build)
         self.assertNotIn("actions/checkout@", host_preflight)
-        self.assertNotIn("platform_host_tools_bundle.py", host_preflight)
+        self.assertIn("platform_host_tools_bundle.py", host_preflight)
+        self.assertIn("verify-outer", host_preflight)
+        self.assertIn("extract-outer", host_preflight)
+        self.assertIn("gh attestation verify", host_preflight)
         host_tool_source = (TOOLS_DIR / "platform_host_tools_bundle.py").read_text()
         self.assertIn("size_in_bytes", host_tool_source)
         self.assertIn("workflow_run.get(\"head_branch\")", host_tool_source)

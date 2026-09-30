@@ -95,35 +95,32 @@ to `dev`. The chain is:
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
 
 ### Out-of-band host-tools installation gate
-The approved pinned attestation verifier must first emit a bounded receipt for
-the exact **C/E/packaging-commit** tuple. The repository-owned installer does
-not perform or claim cryptographic attestation; it consumes that receipt and
-is operator-side, outside the installed 13-script closure.
+The approved pinned attestation verifier must first emit a bounded schema-v2 receipt for the exact **C/E/T/M/packaging-commit** tuple. The repository-owned installer does not perform or claim cryptographic attestation; it consumes that receipt and is operator-side, outside the installed 13-script closure. The raw receipt SHA-256 must arrive through an independent trusted channel.
 
 From the reviewed checkout, run the following exact root-only command (the
 only mutation is a new versioned generation; it stops before release, database
 or systemd work):
 
 ```bash
-HOST_TOOLS_SHA='<40-lowercase-hex-C>' SOURCE_HEAD_SHA='<40-lowercase-hex-E>' PACKAGING_COMMIT='<40-lowercase-hex-packaging-commit>' ARTIFACT_ID='<positive-decimal-artifact-id>' OUTER_SHA256='<64-lowercase-hex-outer>' INNER_SHA256='<64-lowercase-hex-inner>' MANIFEST_SHA256='<64-lowercase-hex-manifest>' CAPABILITIES_SHA256='<64-lowercase-hex-capabilities>'
+HOST_TOOLS_SHA='<40-lowercase-hex-C>' SOURCE_HEAD_SHA='<40-lowercase-hex-E>' PACKAGING_COMMIT='<40-lowercase-hex-packaging-commit>' ARTIFACT_ID='<positive-decimal-artifact-id>' ARTIFACT_NAME='platform-host-tools-bundle-<run-id>-<run-attempt>' TRUSTED_SOURCE_SHA='<40-lowercase-hex-T>' TESTED_MERGE_SHA='<40-lowercase-hex-M>' SECURITY_RUN_ID='<positive-decimal-security-run-id>' SECURITY_RUN_ATTEMPT='<positive-decimal-security-run-attempt>' OUTER_SHA256='<64-lowercase-hex-outer>' INNER_SHA256='<64-lowercase-hex-inner>' MANIFEST_SHA256='<64-lowercase-hex-manifest>' CAPABILITIES_SHA256='<64-lowercase-hex-capabilities>' EXPECTED_RECEIPT_SHA256='<64-lowercase-hex-raw-receipt>'
 /usr/bin/python3.12 -I -B platform/tools/platform_host_tools_bundle.py install \
   --outer-bundle /secure/handoff/platform-host-tools-artifact.zip \
   --host-tools-root /opt/oldsparky/platform/shared/host-tools \
   --expected-source-sha "$HOST_TOOLS_SHA" \
   --expected-outer-sha256 "$OUTER_SHA256" --expected-inner-sha256 "$INNER_SHA256" \
-  --expected-manifest-sha256 "$MANIFEST_SHA256" --expected-capabilities-sha256 "$CAPABILITIES_SHA256" --artifact-id "$ARTIFACT_ID" \
+  --expected-manifest-sha256 "$MANIFEST_SHA256" --expected-capabilities-sha256 "$CAPABILITIES_SHA256" --artifact-id "$ARTIFACT_ID" --artifact-name "$ARTIFACT_NAME" \
   --attestation-evidence /secure/handoff/attestation-gate.json \
   --source-head-sha "$SOURCE_HEAD_SHA" \
   --packaging-commit "$PACKAGING_COMMIT" \
+  --trusted-source-sha "$TRUSTED_SOURCE_SHA" --tested-merge-sha "$TESTED_MERGE_SHA" \
+  --security-run-id "$SECURITY_RUN_ID" --security-run-attempt "$SECURITY_RUN_ATTEMPT" --expected-receipt-sha256 "$EXPECTED_RECEIPT_SHA256" \
   --evidence-output /secure/handoff/host-tools-install-evidence.json
 ```
 
 The root-only command verifies bounded one-member/15-member ZIPs, requires a root-owned no-follow parent chain without untrusted write access, writes a
 same-filesystem no-follow stage, applies `root:root`/`0555`/`0444`, and uses
 `renameat2(RENAME_NOREPLACE)` while preserving generations and pointers. It
-runs both self-tests and emits bounded mode-0600 evidence. Any failure is a
-hard stop before release, artifact transfer, migration, systemd or production
-writes; cleanup is identity-scoped.
+runs both self-tests and emits bounded mode-0600 evidence in a separate root-owned secure handoff directory—not under the host-tools root or any generation. Evidence uses exclusive no-follow creation, full-write/fsync and post-write pathname/device/inode/link-count/mode/owner checks. Failures, missing primitives, device/link races, duplicate/unknown receipt fields or a 16th member fail closed; cleanup is identity-scoped and parent directories are fsynced after unlink. The fixed self-tests run as `/usr/bin/python3.12 -I -B` after verification and before evidence publication.
 
 ### Non-deployable pull-request host-tools candidate
 

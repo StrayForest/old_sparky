@@ -568,7 +568,8 @@ jobs:
             --artifact-name "$EVIDENCE_ARTIFACT_NAME" \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$PACKAGING_RUN_ATTEMPT" \
-            --trusted-sha "$TRUSTED_SHA"
+            --trusted-sha "$TRUSTED_SHA" \
+            --local-evidence "$RUNNER_TEMP/platform-host-tools-candidate-evidence.json"
 
       - name: Publish exact candidate and evidence receipt
         if: ${{ steps.eligibility.outputs.eligible == 'true' }}

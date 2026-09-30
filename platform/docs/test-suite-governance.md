@@ -552,6 +552,21 @@ the exact legacy-v2 no-systemd cleanup bridge. The
 workflow is evidence-only and non-deployable; live execution remains an
 explicit operator recovery action.
 
+The host-tools installer contour (`tests.test_platform_host_tools_installer`)
+is privileged and must run the real installer, including both fixed
+`/usr/bin/python3.12 -I -B` self-tests, inside a private mount namespace with
+a tmpfs mounted at the fixed `/opt/oldsparky/platform/shared/host-tools`
+root. `/usr/bin/unshare`, `/usr/bin/mount` and `/usr/bin/python3.12` are hard
+prerequisites; when a runner cannot provide them the contour is
+`LOCAL GATE BLOCKED`, never a silent skip. The tests cover real
+`RENAME_NOREPLACE` `EEXIST`, injected `EXDEV`/`ENOSYS`, device mismatch,
+symlink/hardlink/special-file races, unavailable filesystem primitives,
+partial writes, `KeyboardInterrupt`/`SystemExit` cleanup, closed schema-v2
+receipt mismatches (including duplicate/unknown/missing claims), evidence
+outside the host root, rollback preserving `current`/`previous`, exact
+15-member inventory and absence of pycache/extras. The namespace is private
+and is never allowed to touch the host's production `/opt`.
+
 The `docs` gate checks document shape, repository-local links and project skill
 frontmatter/interface metadata. `verification-contract` checks registry/CI
 membership, workflow gate names, classifier route ownership and artifact
