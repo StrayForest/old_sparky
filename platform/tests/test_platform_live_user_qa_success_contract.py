@@ -65,6 +65,22 @@ def _producer_harness(
     )
 
 
+def _workflow_capture_script() -> str:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    start = source.index("            <<'PY'\n") + len("            <<'PY'\n")
+    return textwrap.dedent(source[start : source.index("\n          PY", start)])
+
+
+def _workflow_sanitizer_script() -> str:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    marker = (
+        '/usr/bin/python3 - "$raw_report" "$report" "$ssh_status" '
+        '"${LIVE_USER_QA_REPORT_NONCE:-}" "$TARGET_SHA" "$capture_state" <<\'PY\'\n'
+    )
+    start = source.index(marker) + len(marker)
+    return textwrap.dedent(source[start : source.index("\n          PY", start)])
+
+
 class LiveUserQaSuccessContractTests(unittest.TestCase):
     def test_actual_producer_gate_requires_playwright_and_cleanup(self) -> None:
         for original_status, playwright_status, cleanup_status in (
@@ -222,11 +238,166 @@ class LiveUserQaSuccessContractTests(unittest.TestCase):
                 else:
                     os.environ["PLATFORM_LIVE_QA_REPORT_NONCE"] = old_nonce
 
+    def test_bounded_capture_drains_overflow_and_sanitizer_rejects_it(self) -> None:
+        capture_script = _workflow_capture_script()
+        sanitizer_script = _workflow_sanitizer_script()
+        valid_marker = {
+            "cleanup": "verified",
+            "kind": "live_user_qa_success",
+            "playwright": "passed",
+            "report_nonce": RUNNER_NONCE,
+            "schema": 1,
+            "source_sha": SOURCE_SHA,
+            "status": "passed",
+            "success": True,
+            "test_count": 1,
+        }
+        prefix = "live_user_qa_success " + json.dumps(valid_marker) + "\n"
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            raw_path = root / "raw.log"
+            state_path = root / "capture.json"
+            raw_path.touch(mode=0o600)
+            result = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-",
+                    str(raw_path),
+                    str(state_path),
+                    "--",
+                    "/usr/bin/python3",
+                    "-c",
+                    "import sys; sys.stdout.write(" + repr(prefix) + "); sys.stdout.write('x' * 300000); sys.stdout.flush()",
+                ],
+                input=capture_script,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            capture = json.loads(state_path.read_text(encoding="ascii"))
+            self.assertTrue(capture["truncated"])
+            self.assertEqual(capture["bytes_observed"], len(prefix.encode()) + 300000)
+            self.assertEqual(raw_path.stat().st_size, 262144)
+
+            report_path = root / "report.json"
+            sanitized = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-",
+                    str(raw_path),
+                    str(report_path),
+                    "0",
+                    RUNNER_NONCE,
+                    SOURCE_SHA,
+                    str(state_path),
+                ],
+                input=sanitizer_script,
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, "TARGET_SHA": SOURCE_SHA},
+            )
+            self.assertEqual(sanitized.returncode, 0, sanitized.stderr)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertFalse(report["success"])
+            self.assertTrue(report["truncated"])
+            self.assertEqual(report["error_class_counts"], {"transport": 1})
+
+    def test_bounded_capture_handles_long_no_newline_and_sigpipe_status(self) -> None:
+        capture_script = _workflow_capture_script()
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            raw_path = root / "raw.log"
+            state_path = root / "capture.json"
+            raw_path.touch(mode=0o600)
+            result = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-",
+                    str(raw_path),
+                    str(state_path),
+                    "--",
+                    "/usr/bin/python3",
+                    "-c",
+                    "import sys; sys.stdout.write('x' * 300000); sys.stdout.flush()",
+                ],
+                input=capture_script,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            capture = json.loads(state_path.read_text(encoding="ascii"))
+            self.assertTrue(capture["truncated"])
+            self.assertEqual(capture["bytes_observed"], 300000)
+            self.assertEqual(raw_path.stat().st_size, 262144)
+
+            sigpipe_raw = root / "sigpipe.log"
+            sigpipe_state = root / "sigpipe.json"
+            sigpipe_raw.touch(mode=0o600)
+            sigpipe = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-",
+                    str(sigpipe_raw),
+                    str(sigpipe_state),
+                    "--",
+                    "/bin/bash",
+                    "-c",
+                    "kill -13 $$",
+                ],
+                input=capture_script,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(sigpipe.returncode, 0, sigpipe.stderr)
+            self.assertEqual(
+                json.loads(sigpipe_state.read_text(encoding="ascii"))["ssh_exit_code"],
+                -13,
+            )
+
+    def test_bounded_capture_write_error_fails_closed_after_draining(self) -> None:
+        capture_script = _workflow_capture_script()
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            raw_path = root / "raw-directory"
+            raw_path.mkdir(mode=0o700)
+            state_path = root / "capture.json"
+            result = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-",
+                    str(raw_path),
+                    str(state_path),
+                    "--",
+                    "/usr/bin/python3",
+                    "-c",
+                    "import sys; sys.stdout.write('x' * 300000); sys.stdout.flush()",
+                ],
+                input=capture_script,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            capture = json.loads(state_path.read_text(encoding="ascii"))
+            self.assertEqual(capture["capture_error"], "open")
+            self.assertEqual(capture["bytes_observed"], 300000)
+            self.assertTrue(capture["truncated"])
+
     def test_workflow_sanitizer_accepts_only_one_strict_dispatcher_marker(self) -> None:
         source = WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("source.read_bytes()", source)
+        self.assertIn("source_file.read(", source)
         marker = (
             '/usr/bin/python3 - "$raw_report" "$report" "$ssh_status" '
-            '"${LIVE_USER_QA_REPORT_NONCE:-}" "$TARGET_SHA" <<\'PY\'\n'
+            '"${LIVE_USER_QA_REPORT_NONCE:-}" "$TARGET_SHA" "$capture_state" <<\'PY\'\n'
         )
         script = source.split(marker, 1)[1].split("\n          PY", 1)[0]
         script = textwrap.dedent(script)
@@ -243,12 +414,31 @@ class LiveUserQaSuccessContractTests(unittest.TestCase):
             "test_count": 1,
         }
 
-        def run(raw: str, status: str = "0") -> dict[str, object]:
+        def run(
+            raw: str,
+            status: str = "0",
+            capture_state: dict[str, object] | None = None,
+        ) -> dict[str, object]:
             with tempfile.TemporaryDirectory(dir="/root") as temporary:
                 root = Path(temporary)
                 raw_path = root / "raw.log"
                 report_path = root / "report.json"
+                capture_path = root / "capture.json"
                 raw_path.write_text(raw, encoding="utf-8")
+                capture_path.write_text(
+                    json.dumps(
+                        capture_state
+                        or {
+                            "schema": 1,
+                            "ssh_exit_code": int(status),
+                            "truncated": False,
+                            "bytes_observed": len(raw.encode("utf-8")),
+                            "retained_bytes": len(raw.encode("utf-8")),
+                            "capture_error": "",
+                        }
+                    ),
+                    encoding="ascii",
+                )
                 result = subprocess.run(
                     [
                         "/usr/bin/python3",
@@ -258,6 +448,7 @@ class LiveUserQaSuccessContractTests(unittest.TestCase):
                         status,
                         RUNNER_NONCE,
                         SOURCE_SHA,
+                        str(capture_path),
                     ],
                     input=script,
                     text=True,
@@ -272,6 +463,14 @@ class LiveUserQaSuccessContractTests(unittest.TestCase):
         self.assertTrue(passed["success"])
         self.assertEqual(passed["marker_count"], 1)
         self.assertNotIn(RUNNER_NONCE, json.dumps(passed))
+
+        failed_ssh = run(
+            "live_user_qa_success " + json.dumps(valid_marker) + "\n",
+            status="255",
+        )
+        self.assertFalse(failed_ssh["success"])
+        self.assertEqual(failed_ssh["ssh_exit_code"], 255)
+        self.assertEqual(failed_ssh["error_class_counts"], {"transport": 1})
 
         spoofed = dict(valid_marker, report_nonce="c" * 64)
         rejected = run("live_user_qa_success " + json.dumps(spoofed) + "\n")

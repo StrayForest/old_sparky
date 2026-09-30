@@ -159,35 +159,257 @@ jobs:
         run: |
           set -euo pipefail
           raw_report="$RUNNER_TEMP/live-user-qa-raw.log"
+          capture_state="$RUNNER_TEMP/live-user-qa-capture.json"
           report_nonce="$(/usr/bin/python3 -c 'import secrets; print(secrets.token_hex(32))')"
           [[ "$report_nonce" =~ ^[0-9a-f]{64}$ ]]
           printf 'LIVE_USER_QA_REPORT_NONCE=%s\n' "$report_nonce" >> "$GITHUB_ENV"
           umask 077
-          : > "$raw_report"
-          chmod 600 "$raw_report"
+          rm -f -- "$raw_report" "$capture_state"
+          install -m 600 /dev/null "$raw_report"
           set +e
-          # The fixed trusted wrapper enters through the active
-          # tools/platform_release_lock_exec.sh --expected-sha guard for the complete QA contour.
-          ssh \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=10 \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=3 \
-            -F "$SSH_DIR/config" \
-            -i "$SSH_DIR/id_ed25519" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/env \
-            PLATFORM_LIVE_QA_TARGET_SHA="$TARGET_SHA" \
-            PLATFORM_LIVE_QA_REPORT_NONCE="$report_nonce" \
-            PLATFORM_APP_DIR=/opt/oldsparky/platform \
-            PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
-            /root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh \
-            < /dev/null > "$raw_report" 2>&1
-          ssh_status="$?"
+          # Keep the SSH pipe draining after the 256 KiB evidence budget is
+          # full.  This is trusted workflow code, not candidate code: the
+          # command is fixed below and the helper never parses remote output.
+          /usr/bin/python3 - "$raw_report" "$capture_state" -- \
+            /usr/bin/ssh \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o ConnectTimeout=10 \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=3 \
+              -F "$SSH_DIR/config" \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              /usr/bin/env \
+              "PLATFORM_LIVE_QA_TARGET_SHA=$TARGET_SHA" \
+              "PLATFORM_LIVE_QA_REPORT_NONCE=$report_nonce" \
+              PLATFORM_APP_DIR=/opt/oldsparky/platform \
+              PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
+              /root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh \
+            <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          MAX_CAPTURE_BYTES = 262144
+          CHUNK_BYTES = 65536
+          CAPTURE_ERRORS = {"", "command", "spawn", "open", "read", "write", "drain", "wait", "state"}
+
+          raw_path = Path(sys.argv[1])
+          state_path = Path(sys.argv[2])
+          try:
+              separator = sys.argv.index("--", 3)
+              command = sys.argv[separator + 1 :]
+          except ValueError:
+              command = []
+
+          observed = 0
+          retained = 0
+          truncated = False
+          capture_error = ""
+          process = None
+          ssh_exit_code = 127
+          read_failed = False
+
+          def record_error(value):
+              global capture_error
+              if not capture_error:
+                  capture_error = value
+
+          def drain(sink, chunk):
+              if sink is None or not chunk:
+                  return
+              try:
+                  sink.write(chunk)
+              except OSError:
+                  record_error("drain")
+
+          if not command:
+              record_error("command")
+          else:
+              try:
+                  process = subprocess.Popen(
+                      command,
+                      stdin=subprocess.DEVNULL,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      bufsize=0,
+                      close_fds=True,
+                  )
+              except OSError:
+                  record_error("spawn")
+
+          try:
+              sink = open(os.devnull, "wb", buffering=0)
+          except OSError:
+              sink = None
+              record_error("drain")
+
+          raw_file = None
+          if process is not None:
+              descriptor = None
+              try:
+                  flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+                  descriptor = os.open(raw_path, flags, 0o600)
+                  os.fchmod(descriptor, 0o600)
+                  raw_file = os.fdopen(descriptor, "wb", buffering=0, closefd=True)
+                  descriptor = None
+              except OSError:
+                  if descriptor is not None:
+                      os.close(descriptor)
+                  record_error("open")
+
+              try:
+                  while process.stdout is not None:
+                      try:
+                          chunk = process.stdout.read(CHUNK_BYTES)
+                      except InterruptedError:
+                          continue
+                      except OSError:
+                          record_error("read")
+                          read_failed = True
+                          break
+                      if not chunk:
+                          break
+                      observed += len(chunk)
+                      if observed > MAX_CAPTURE_BYTES:
+                          truncated = True
+                      keep = max(0, min(len(chunk), MAX_CAPTURE_BYTES - retained))
+                      if keep:
+                          prefix = chunk[:keep]
+                          if raw_file is None:
+                              drain(sink, prefix)
+                          else:
+                              try:
+                                  offset = 0
+                                  while offset < len(prefix):
+                                      written = raw_file.write(prefix[offset:])
+                                      if not written:
+                                          raise OSError("short capture write")
+                                      offset += written
+                                  retained += offset
+                              except OSError:
+                                  record_error("write")
+                                  drain(sink, prefix[offset:] if "offset" in locals() else prefix)
+                      extra = chunk[keep:]
+                      if extra:
+                          truncated = True
+                          drain(sink, extra)
+              finally:
+                  if process.stdout is not None:
+                      try:
+                          process.stdout.close()
+                      except OSError:
+                          record_error("read")
+                  if raw_file is not None:
+                      try:
+                          raw_file.close()
+                      except OSError:
+                          record_error("write")
+          if sink is not None:
+              try:
+                  sink.close()
+              except OSError:
+                  record_error("drain")
+
+          if process is not None:
+              try:
+                  if read_failed:
+                      process.terminate()
+                      ssh_exit_code = process.wait(timeout=5)
+                  else:
+                      ssh_exit_code = process.wait()
+              except subprocess.TimeoutExpired:
+                  process.kill()
+                  ssh_exit_code = process.wait()
+              except OSError:
+                  record_error("wait")
+                  ssh_exit_code = 127
+
+          payload = {
+              "schema": 1,
+              "ssh_exit_code": ssh_exit_code,
+              "truncated": truncated,
+              "bytes_observed": observed,
+              "retained_bytes": retained,
+              "capture_error": capture_error if capture_error in CAPTURE_ERRORS else "state",
+          }
+          state_error = False
+          try:
+              flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(state_path, flags, 0o600)
+              os.fchmod(descriptor, 0o600)
+              with os.fdopen(descriptor, "wb", closefd=True) as destination:
+                  destination.write((json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
+                  destination.flush()
+                  os.fsync(destination.fileno())
+          except OSError:
+              state_error = True
+          if state_error:
+              raise SystemExit(1)
+          raise SystemExit(0 if not capture_error else 1)
+          PY
+          capture_status="$?"
           set -e
+          set +e
+          ssh_status="$(/usr/bin/python3 - "$capture_state" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          def strict_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError
+                  result[key] = value
+              return result
+
+          try:
+              with Path(sys.argv[1]).open("rb") as source:
+                  raw = source.read(4097)
+              payload = json.loads(raw.decode("ascii"), object_pairs_hook=strict_object)
+              if (
+                  len(raw) > 4096
+                  or not isinstance(payload, dict)
+                  or set(payload) != {"schema", "ssh_exit_code", "truncated", "bytes_observed", "retained_bytes", "capture_error"}
+                  or payload.get("schema") != 1
+                  or type(payload.get("ssh_exit_code")) is not int
+                  or type(payload.get("truncated")) is not bool
+                  or type(payload.get("bytes_observed")) is not int
+                  or type(payload.get("retained_bytes")) is not int
+                  or payload.get("capture_error") not in {"", "command", "spawn", "open", "read", "write", "drain", "wait", "state"}
+                  or payload.get("ssh_exit_code") < -255
+                  or payload.get("ssh_exit_code") > 255
+                  or payload.get("bytes_observed") < 0
+                  or payload.get("retained_bytes") < 0
+                  or payload.get("retained_bytes") > 262144
+              ):
+                  raise ValueError
+              print(payload["ssh_exit_code"])
+          except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+              raise SystemExit(1)
+          PY
+          )"
+          state_status="$?"
+          set -e
+          if [[ "$state_status" != 0 || ! "$ssh_status" =~ ^-?[0-9]+$ ]]; then
+            ssh_status=127
+          fi
           echo "ssh_status=$ssh_status" >> "$GITHUB_OUTPUT"
-          exit "$ssh_status"
+          echo "capture_status=$capture_status" >> "$GITHUB_OUTPUT"
+          if [[ "$capture_status" != 0 ]]; then
+            exit 1
+          fi
+          if [[ "$ssh_status" == 0 ]]; then
+            exit 0
+          fi
+          if [[ "$ssh_status" =~ ^[0-9]+$ ]] && (( ssh_status <= 255 )); then
+            exit "$ssh_status"
+          fi
+          exit 1
 
       - name: Sanitize live-user QA report
         id: sanitize_live_user_report
@@ -196,17 +418,20 @@ jobs:
         run: |
           set -euo pipefail
           raw_report="$RUNNER_TEMP/live-user-qa-raw.log"
+          capture_state="$RUNNER_TEMP/live-user-qa-capture.json"
           report="$RUNNER_TEMP/live-user-qa-report.json"
           test -e "$raw_report" || : > "$raw_report"
           chmod 600 "$raw_report"
           ssh_status="${{ steps.run_live_user_qa.outputs.ssh_status || '1' }}"
           set +e
-          /usr/bin/python3 - "$raw_report" "$report" "$ssh_status" "${LIVE_USER_QA_REPORT_NONCE:-}" "$TARGET_SHA" <<'PY'
+          /usr/bin/python3 - "$raw_report" "$report" "$ssh_status" "${LIVE_USER_QA_REPORT_NONCE:-}" "$TARGET_SHA" "$capture_state" <<'PY'
           import json
           from pathlib import Path
           import re
           import sys
 
+          MAX_CAPTURE_BYTES = 262144
+          MAX_LINE_BYTES = 65536
           source = Path(sys.argv[1])
           destination = Path(sys.argv[2])
           try:
@@ -215,24 +440,86 @@ jobs:
               exit_code = 1
           expected_nonce = sys.argv[4]
           target_sha = sys.argv[5]
-          try:
-              raw = source.read_bytes()
-          except OSError:
-              raw = b""
-          bounded = raw[:262144]
-          bounded_lines = bounded.splitlines()
-          lines = bounded_lines[:1000]
-          truncated = len(raw) > len(bounded) or len(bounded_lines) > len(lines)
-          marker_prefix = "live_user_qa_success "
-          valid_markers = []
+          capture_state = Path(sys.argv[6])
+
+          capture_fields = {
+              "schema",
+              "ssh_exit_code",
+              "truncated",
+              "bytes_observed",
+              "retained_bytes",
+              "capture_error",
+          }
+          capture_errors = {"", "command", "spawn", "open", "read", "write", "drain", "wait", "state"}
 
           def strict_object(pairs):
               result = {}
               for key, value in pairs:
                   if key in result:
-                      raise ValueError("duplicate marker key")
+                      raise ValueError("duplicate object key")
                   result[key] = value
               return result
+
+          try:
+              with capture_state.open("rb") as state_source:
+                  state_raw = state_source.read(4097)
+              capture = json.loads(
+                  state_raw.decode("ascii"),
+                  object_pairs_hook=strict_object,
+              )
+              if (
+                  len(state_raw) > 4096
+                  or not isinstance(capture, dict)
+                  or set(capture) != capture_fields
+                  or capture.get("schema") != 1
+                  or type(capture.get("ssh_exit_code")) is not int
+                  or type(capture.get("truncated")) is not bool
+                  or type(capture.get("bytes_observed")) is not int
+                  or type(capture.get("retained_bytes")) is not int
+                  or capture.get("capture_error") not in capture_errors
+                  or capture.get("ssh_exit_code") < -255
+                  or capture.get("ssh_exit_code") > 255
+                  or capture.get("bytes_observed") < 0
+                  or capture.get("retained_bytes") < 0
+                  or capture.get("retained_bytes") > MAX_CAPTURE_BYTES
+              ):
+                  raise ValueError("capture state is invalid")
+          except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+              capture = {
+                  "schema": 0,
+                  "ssh_exit_code": 127,
+                  "truncated": True,
+                  "bytes_observed": 0,
+                  "retained_bytes": 0,
+                  "capture_error": "state",
+              }
+
+          retained = bytearray()
+          raw_overflow = False
+          try:
+              with source.open("rb") as source_file:
+                  while len(retained) <= MAX_CAPTURE_BYTES:
+                      chunk = source_file.read(min(65536, MAX_CAPTURE_BYTES + 1 - len(retained)))
+                      if not chunk:
+                          break
+                      retained.extend(chunk)
+                      if len(retained) > MAX_CAPTURE_BYTES:
+                          raw_overflow = True
+                          del retained[MAX_CAPTURE_BYTES:]
+                          break
+          except OSError:
+              raw_overflow = True
+          bounded_lines = bytes(retained).splitlines()
+          lines = bounded_lines[:1000]
+          long_line = any(len(line) > MAX_LINE_BYTES for line in bounded_lines)
+          truncated = (
+              capture.get("truncated") is True
+              or raw_overflow
+              or len(bounded_lines) > len(lines)
+              or long_line
+          )
+          marker_prefix = "live_user_qa_success "
+          valid_markers = []
 
           expected_fields = {
               "cleanup",
@@ -246,6 +533,8 @@ jobs:
               "test_count",
           }
           for line in lines:
+              if len(line) > MAX_LINE_BYTES:
+                  continue
               text_line = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
               if not text_line.startswith(marker_prefix):
                   continue
@@ -272,6 +561,8 @@ jobs:
                   valid_markers.append(marker)
           passed = (
               exit_code == 0
+              and capture.get("ssh_exit_code") == exit_code
+              and capture.get("capture_error") == ""
               and truncated is False
               and re.fullmatch(r"[0-9a-f]{64}", expected_nonce) is not None
               and re.fullmatch(r"[0-9a-f]{40}", target_sha) is not None
@@ -284,6 +575,9 @@ jobs:
           elif exit_code:
               status = "failed"
               error_classes = {"transport": 1}
+          elif truncated or capture.get("capture_error") or capture.get("ssh_exit_code") != 0:
+              status = "failed"
+              error_classes = {"transport": 1}
           else:
               status = "failed"
               error_classes = {"protocol": 1}
@@ -291,10 +585,14 @@ jobs:
               "schema": 1,
               "status": status,
               "success": passed,
+              "ssh_exit_code": capture.get("ssh_exit_code", 127),
               "process_exit_code": exit_code if 0 <= exit_code <= 255 else 1,
               "line_count": len(lines),
               "retained_line_count": len(lines),
               "truncated": truncated,
+              "capture_error": capture.get("capture_error", "state"),
+              "capture_bytes_observed": capture.get("bytes_observed", 0),
+              "capture_bytes_retained": capture.get("retained_bytes", 0),
               "marker_count": len(valid_markers),
               "source_sha": marker["source_sha"] if marker else "",
               "test_count": 1 if passed else 0,
@@ -353,6 +651,8 @@ jobs:
           test ! -e "$handoff_dir" && test ! -L "$handoff_dir"
           rm -f -- "$RUNNER_TEMP/live-user-qa-input.json"
           test ! -e "$RUNNER_TEMP/live-user-qa-input.json"
+          rm -f -- "$RUNNER_TEMP/live-user-qa-capture.json"
+          test ! -e "$RUNNER_TEMP/live-user-qa-capture.json"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
@@ -382,10 +682,14 @@ jobs:
                   "schema",
                   "status",
                   "success",
+                  "ssh_exit_code",
                   "process_exit_code",
                   "line_count",
                   "retained_line_count",
                   "truncated",
+                  "capture_error",
+                  "capture_bytes_observed",
+                  "capture_bytes_retained",
                   "marker_count",
                   "source_sha",
                   "test_count",
@@ -394,8 +698,10 @@ jobs:
               }
               or report.get("schema") != 1
               or report.get("truncated") is not False
+              or report.get("capture_error") != ""
               or report.get("status") != "passed"
               or report.get("success") is not True
+              or report.get("ssh_exit_code") != 0
               or report.get("process_exit_code") != 0
               or report.get("marker_count") != 1
               or report.get("source_sha") != os.environ.get("TARGET_SHA")
