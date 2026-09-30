@@ -64,7 +64,10 @@ The release artifact keeps a separate owner lock:
 `requirements-platform.lock.txt` is the runtime/release wheelhouse contract;
 `requirements-ci.lock.txt` is the aggregate non-editable CI contract and adds
 quality/security tooling. They must not be silently substituted for one
-another.
+another. The canonical security gate audits both lock files independently in
+the one hash-locked CI virtualenv; it does not install the release lock into
+CI or merge the two requirement sets. Runtime-lock changes therefore require
+both the CI and release lock audits to pass.
 
 Web dependency security ownership is tracked independently from host-tools
 generation pins. The web lockfile's `brace-expansion` `5.0.12` entry is the

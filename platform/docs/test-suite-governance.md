@@ -411,8 +411,14 @@ The installer and generator sanitize ambient pip configuration through
 [`tools/platform_ci_pip_env.sh`](../tools/platform_ci_pip_env.sh), use only
 the canonical PyPI index, and never forward extra indexes, trusted hosts,
 find-links, certificate paths or proxy variables.
-The security dependency-audit gate also audits this complete lock, so the
-runtime, quality and security tool dependency sets are covered by one report.
+The security dependency-audit gate independently audits both
+`requirements-ci.lock.txt` and the release/runtime
+`requirements-platform.lock.txt` in the same already-installed CI virtualenv.
+Each invocation is strict, hash-locked and resolver-free
+(`--strict --disable-pip --require-hashes`); the two lock files are never
+combined into a duplicate requirement set. Both audits run even when the
+first reports a vulnerability, and any failure makes the security gate fail.
+No second dependency bootstrap or virtualenv is created for the runtime audit.
 
 Each job's setup-python cache is keyed by the lock path, so lock changes
 invalidate dependency artifacts without sharing a mutable virtualenv between

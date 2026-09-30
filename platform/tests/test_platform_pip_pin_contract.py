@@ -85,6 +85,10 @@ class PlatformPipPinContractTests(unittest.TestCase):
         self.assertEqual(locker["setuptools"], "84.0.0")
         self.assertEqual(locker["wheel"], "0.48.0")
 
+        runtime_lock = _ci_lock_pins(PLATFORM_ROOT / "requirements-platform.lock.txt")
+        self.assertEqual(runtime_lock["anyio"], "4.14.2")
+        self.assertEqual(runtime_lock["urllib3"], "2.8.0")
+
     def test_ci_input_and_generator_keep_one_canonical_source(self) -> None:
         ci_input = CI_INPUT.read_text(encoding="utf-8")
         self.assertIn("-r requirements-platform.txt", ci_input)
@@ -129,8 +133,12 @@ class PlatformPipPinContractTests(unittest.TestCase):
         self.assertIn("refusing to reuse an existing CI virtualenv", installer)
         self.assertNotIn("requirements-platform.txt", installer)
         self.assertNotIn("requirements-quality.txt", installer)
-        self.assertIn('"-r", "requirements-ci.lock.txt"', verifier)
-        self.assertNotIn('"-r", "requirements-platform.txt"', verifier)
+        self.assertIn('"pip_audit"', verifier)
+        self.assertIn('"requirements-ci.lock.txt"', verifier)
+        self.assertIn('"requirements-platform.lock.txt"', verifier)
+        self.assertIn('"--strict"', verifier)
+        self.assertIn('"--disable-pip"', verifier)
+        self.assertIn('"--require-hashes"', verifier)
         self.assertIn("platform_ci_pip_env.sh", installer)
         self.assertIn("platform_ci_pip_env.sh", generator)
         self.assertIn("PIP_CONFIG_FILE=/dev/null", pip_env)
@@ -308,7 +316,6 @@ class PlatformPipPinContractTests(unittest.TestCase):
             )
         self.assertNotIn("requirements-platform.txt", workflow)
         self.assertNotIn("requirements-quality.txt", workflow)
-        self.assertNotIn("requirements-platform.lock.txt", workflow)
         self.assertNotIn("python -m venv platform/.venv_platform", workflow)
         self.assertNotIn("python -m pip install", workflow)
 

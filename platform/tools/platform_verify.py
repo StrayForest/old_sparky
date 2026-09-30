@@ -21,6 +21,10 @@ from typing import Sequence
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = PLATFORM_ROOT / "tools"
 WEB_ROOT = PLATFORM_ROOT / "apps" / "platform_web"
+SECURITY_AUDIT_LOCKS: tuple[str, ...] = (
+    "requirements-ci.lock.txt",
+    "requirements-platform.lock.txt",
+)
 
 
 def _backend_catalog_module():
@@ -432,11 +436,23 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
             ],
         )
     if gate_id == "security":
-        commands = (
+        dependency_audits = tuple(
             (
-                "security/dependency-audit",
-                [_python(), "-m", "pip_audit", "-r", "requirements-ci.lock.txt"],
-            ),
+                f"security/dependency-audit/{lock_file}",
+                [
+                    _python(),
+                    "-m",
+                    "pip_audit",
+                    "--strict",
+                    "--disable-pip",
+                    "--require-hashes",
+                    "-r",
+                    lock_file,
+                ],
+            )
+            for lock_file in SECURITY_AUDIT_LOCKS
+        )
+        commands = (
             (
                 "security/bandit",
                 [
@@ -459,11 +475,12 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
                 [_python(), "tools/platform_secret_scan.py", "--root", ".."],
             ),
         )
-        for label, command in commands:
-            status = _run(label, command)
-            if status:
-                return status
-        return 0
+        status = 0
+        for label, command in (*dependency_audits, *commands):
+            command_status = _run(label, command)
+            if command_status and status == 0:
+                status = command_status
+        return status
     if gate_id == "migration":
         return _run(
             gate_id,
