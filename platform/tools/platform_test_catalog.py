@@ -452,12 +452,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 158,
     "module_digest": "a77d2cff5b4122f04ba7932d758aac60cd98e15405d3d09e4cb45da7c1207310",
-    "test_count": 1484,
-    "test_id_digest": "185c8277500c8914469efa60c06417bac20d629b13ad14b61f22f516543fa848",
-    "backend_test_count": 1440,
-    "backend_test_id_digest": "3b0227185027b296032627730b1a46ad9503bffb7a5078f4a2f3f039d29a3e7b",
-    "verification_test_count": 44,
-    "verification_test_id_digest": "d8873be495648857a31f012be4e6b1b1438b091214bc6fb046fa620f34debd32",
+    "test_count": 1482,
+    "test_id_digest": "b19a6988f480d506b0327a48b81f9b1be460d619230d8b564550cf07b29177d2",
+    "backend_test_count": 1439,
+    "backend_test_id_digest": "a302ce211f4e381379f55192aa1aab55289f6ec229c0ae0c40becd89fe1cd735",
+    "verification_test_count": 43,
+    "verification_test_id_digest": "96877f621915f8c64da8cce03023abf7f9e934df2858a41a4126b005ebcb0bc5",
     "verification_classifier_test_count": 23,
     "verification_classifier_test_id_digest": "9273fe85861db634d66f43be86290e9bc01540f43ad5a3dd357d845314b0227a",
 }
@@ -502,14 +502,14 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "performance-contract": {
         "module_count": 10,
         "module_digest": "5135af80b8695bc35d28c0670ce787c21f34ad541652cb9bedd2d3dd8ff17c4d",
-        "test_count": 131,
-        "test_id_digest": "98a0b1a8cdf1162756236f648eee202c89f2859b4e7987b83c6e8941afe9f0db",
+        "test_count": 130,
+        "test_id_digest": "051e436c7526bb61388f1ce545210ffd2674989aa54b7139b9ebcabf44f17740",
     },
     VERIFICATION_CONTOUR: {
         "module_count": 2,
         "module_digest": "b2a31b179b655a3aafcfd5c2ebc5dd0f09645024663d5985815355c2a2b984ee",
-        "test_count": 44,
-        "test_id_digest": "d8873be495648857a31f012be4e6b1b1438b091214bc6fb046fa620f34debd32",
+        "test_count": 43,
+        "test_id_digest": "96877f621915f8c64da8cce03023abf7f9e934df2858a41a4126b005ebcb0bc5",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])

@@ -993,9 +993,6 @@ except lock.VerificationLockError as exc:
             {
                 "ready-vote-slo-v2",
                 "ready-vote-capacity-ramp-v2",
-                "ready-vote-saturation-ramp-v1",
-                "ready-vote-saturation-ramp-v2",
-                "ready-vote-saturation-ramp-v3",
                 "ready-vote-saturation-ramp-v4",
                 "ready-vote-stress-15k-v2",
                 "ready-vote-stress-20k-v2",
@@ -1005,9 +1002,6 @@ except lock.VerificationLockError as exc:
                 "read-mix-concurrency-ramp-v1",
                 "authenticated-page-load-v1",
                 "authenticated-page-load-v2",
-                "tournament-lifecycle-capacity-v1",
-                "tournament-lifecycle-scale-v1",
-                "tournament-lifecycle-slo-v1",
             },
         )
         profile = get_profile("ready-vote-slo-v2")
@@ -1040,22 +1034,6 @@ except lock.VerificationLockError as exc:
             capacity["acceptance"]["capacity"]["target_logical_actions_per_second"],
             [20, 30, 40, 50, 60, 70, 80],
         )
-        saturation = get_profile("ready-vote-saturation-ramp-v1")
-        self.assertEqual(saturation["acceptance"]["kind"], "stress")
-        self.assertEqual(
-            [phase["target_logical_actions_per_second"] for phase in saturation["traffic"]["phases"]],
-            [80, 90, 100, 110, 120],
-        )
-        saturation_v2 = get_profile("ready-vote-saturation-ramp-v2")
-        self.assertEqual(
-            [phase["target_logical_actions_per_second"] for phase in saturation_v2["traffic"]["phases"]],
-            [120, 135, 150, 165],
-        )
-        saturation_v3 = get_profile("ready-vote-saturation-ramp-v3")
-        self.assertEqual(
-            [phase["target_logical_actions_per_second"] for phase in saturation_v3["traffic"]["phases"]],
-            [105, 110, 115, 120],
-        )
         saturation_v4 = get_profile("ready-vote-saturation-ramp-v4")
         self.assertEqual(
             [phase["target_logical_actions_per_second"] for phase in saturation_v4["traffic"]["phases"]],
@@ -1066,26 +1044,6 @@ except lock.VerificationLockError as exc:
             read_ramp["traffic"]["concurrency_stages"],
             [16, 32, 48, 64, 80, 96, 112, 128],
         )
-
-    def test_tournament_lifecycle_profiles_use_the_local_qa_harness(self) -> None:
-        for profile_id in (
-            "tournament-lifecycle-slo-v1",
-            "tournament-lifecycle-scale-v1",
-            "tournament-lifecycle-capacity-v1",
-        ):
-            profile = get_profile(profile_id)
-            self.assertEqual(profile["mode"], "tournament-lifecycle")
-            self.assertEqual(profile["fixture"]["tournament_count"], 20)
-            self.assertEqual(profile["fixture"]["users_per_tournament"], 500)
-            self.assertEqual(profile["execution"]["generator"], "platform_production_qa.py")
-            self.assertTrue(profile["execution"]["external_runner_forbidden"])
-
-        with self.assertRaisesRegex(LoadProfileError, "not dispatchable|external runner"):
-            run_profile(
-                get_profile("tournament-lifecycle-slo-v1"),
-                Path("/tmp/unused-lifecycle-manifest.json"),
-                Path("/tmp/unused-lifecycle-report.json"),
-            )
 
     def test_load_profile_rejects_missing_cleanup_contract(self) -> None:
         profile = get_profile("ready-vote-slo-v2")

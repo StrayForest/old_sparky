@@ -118,7 +118,11 @@ class PerformanceProfileContractTests(unittest.TestCase):
     def test_active_registry_exposes_bounded_portfolio_metadata(self) -> None:
         profiles = load_profiles()
 
-        self.assertEqual(len(profiles), 17)
+        self.assertEqual(len(profiles), 11)
+        self.assertEqual(
+            {profile["portfolio"]["status"] for profile in profiles.values()},
+            {"active"},
+        )
         for profile in profiles.values():
             portfolio = profile["portfolio"]
             self.assertIn(portfolio["class"], {"default", "diagnostic"})
@@ -139,12 +143,12 @@ class PerformanceProfileContractTests(unittest.TestCase):
     def test_runtime_budget_includes_retries_duplicates_and_state_reads(self) -> None:
         profiles = load_profiles()
         capacity = profiles["ready-vote-capacity-ramp-v2"]
-        saturation = profiles["ready-vote-saturation-ramp-v2"]
+        saturation = profiles["ready-vote-saturation-ramp-v4"]
 
         self.assertEqual(profile_contract(capacity)["planned_work"]["http_attempts"], 31_540)
         self.assertEqual(capacity["portfolio"]["request_budget"]["max_http_attempts"], 31_540)
-        self.assertEqual(profile_contract(saturation)["planned_work"]["http_attempts"], 51_340)
-        self.assertEqual(saturation["portfolio"]["request_budget"]["max_http_attempts"], 51_340)
+        self.assertEqual(profile_contract(saturation)["planned_work"]["http_attempts"], 45_940)
+        self.assertEqual(saturation["portfolio"]["request_budget"]["max_http_attempts"], 50_000)
         self.assertEqual(
             planned_http_attempts(
                 mode="ready-vote",
@@ -175,57 +179,51 @@ class PerformanceProfileContractTests(unittest.TestCase):
                 max_http_attempts=1,
             )
 
-    def test_dispatchability_excludes_deprecated_and_unbound_lifecycle_profiles(self) -> None:
+    def test_dispatchability_matches_active_registry_and_workflow_choices(self) -> None:
         profiles = load_profiles()
-        with self.assertRaises(LoadProfileError):
-            ensure_dispatchable(profiles["ready-vote-saturation-ramp-v1"])
+        for profile in profiles.values():
+            with self.subTest(profile=profile["profile_id"]):
+                self.assertEqual(profile["portfolio"]["status"], "active")
+                self.assertNotEqual(profile["mode"], "tournament-lifecycle")
+                ensure_dispatchable(profile)
+
+        retained_root = Path(__file__).resolve().parents[1] / "performance" / "profiles" / "retained-v1"
+        for profile_id in (
+            "ready-vote-saturation-ramp-v1",
+            "ready-vote-saturation-ramp-v2",
+            "ready-vote-saturation-ramp-v3",
+        ):
+            self.assertNotIn(profile_id, profiles)
+            self.assertTrue((retained_root / f"{profile_id}.json").is_file())
         for profile_id in (
             "tournament-lifecycle-slo-v1",
             "tournament-lifecycle-scale-v1",
             "tournament-lifecycle-capacity-v1",
         ):
-            profile = profiles[profile_id]
-            self.assertTrue(profile["execution"]["non_dispatchable"])
-            self.assertEqual(
-                profile["execution"]["profile_binding"],
-                "not-integrated-with-production-qa",
-            )
-            with self.assertRaises(LoadProfileError):
-                ensure_dispatchable(profile)
+            self.assertNotIn(profile_id, profiles)
+            self.assertFalse((Path(__file__).resolve().parents[1] / "performance" / "profiles" / f"{profile_id}.json").exists())
 
-        # A historical artifact may still be inspected, but evaluate is an
-        # authoritative boundary and must reject it before report evidence can
-        # be accepted or upgraded to PASS.
-        rejected_profile_ids = (
-            "ready-vote-saturation-ramp-v1",
-            "tournament-lifecycle-slo-v1",
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github"
+            / "workflows"
+            / "platform-production-external-load.yml"
+        ).read_text(encoding="utf-8")
+        options_match = re.search(
+            r"profile_id:\n(?P<options>.*?)(?:\n\npermissions:)",
+            workflow,
+            re.DOTALL,
         )
-        with (
-            patch.dict(
-                os.environ,
-                {"SOURCE_GIT_SHA": "a" * 40, "GITHUB_RUN_ID": "123"},
-                clear=False,
-            ),
-            tempfile.TemporaryDirectory() as directory,
-        ):
-            for profile_id in rejected_profile_ids:
-                profile = profiles[profile_id]
-                report_path = Path(directory) / f"{profile_id}.json"
-                report_path.write_text(
-                    json.dumps(self._bound_report(profile)),
-                    encoding="utf-8",
-                )
-                result = evaluate_report(profile, report_path, None)
-                evaluated = json.loads(report_path.read_text(encoding="utf-8"))
-                with self.subTest(non_dispatchable_profile=profile_id):
-                    self.assertEqual(result, 1)
-                    self.assertFalse(evaluated["authoritative"])
-                    self.assertFalse(evaluated["dispatchable"])
-                    self.assertFalse(evaluated["acceptance"]["passed"])
-                    self.assertEqual(
-                        evaluated["acceptance"]["decision"],
-                        "LOAD PROFILE NON-AUTHORITATIVE",
-                    )
+        self.assertIsNotNone(options_match)
+        assert options_match is not None
+        options = set(
+            re.findall(
+                r"^\s+-\s+([a-z0-9-]+-v[0-9]+)\s*$",
+                options_match.group("options"),
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(options, set(profiles))
 
     def test_portfolio_semantic_matrix_rejects_unowned_combinations(self) -> None:
         profile = get_profile("ready-vote-slo-v2")
@@ -1009,7 +1007,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
         self.assertEqual(len(signalled) + sum(reasons.values()), len(armed))
         pidfd_send.assert_called_once_with(1102, signal.SIGUSR2)
 
-    def test_supervisor_binds_observer_and_workflow_blocks_deprecated_profiles(self) -> None:
+    def test_supervisor_binds_observer_and_workflow_uses_current_profiles(self) -> None:
         root = Path(__file__).resolve().parents[1]
         supervisor = (root / "tools" / "platform_production_external_fixture_qa.sh").read_text(
             encoding="utf-8"
@@ -1026,12 +1024,6 @@ class PerformanceProfileContractTests(unittest.TestCase):
         self.assertLess(supervisor.index('--fixture-marker "$fixture_marker"'), supervisor.index(': > "$external_vote_ready"'))
         self.assertIn("pidfd_send_signal", observer)
         self.assertNotIn("os.kill(pid, signum)", observer)
-        for deprecated in (
-            "ready-vote-saturation-ramp-v1",
-            "ready-vote-saturation-ramp-v2",
-            "ready-vote-saturation-ramp-v3",
-        ):
-            self.assertNotIn(f"          - {deprecated}", workflow)
         self.assertIn("platform_load.py validate", workflow)
         self.assertIn('--profile "$PROFILE_ID" --dispatchable', workflow)
 
@@ -1113,19 +1105,6 @@ class PerformanceProfileContractTests(unittest.TestCase):
 
         with self.assertRaises(LoadProfileError):
             validate_profile(profile)
-
-    def test_deprecated_profile_is_retained_for_listing_but_not_runnable(self) -> None:
-        profiles = load_profiles()
-        deprecated_id = "ready-vote-saturation-ramp-v1"
-
-        self.assertIn(deprecated_id, profiles)
-        with self.assertRaises(LoadProfileError):
-            run_profile(
-                profiles[deprecated_id],
-                manifest_path=Path("/tmp/manifest.json"),
-                report_path=Path("/tmp/report.json"),
-            )
-
 
 if __name__ == "__main__":
     unittest.main()
