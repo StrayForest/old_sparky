@@ -148,6 +148,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         for name in (
             "platform_build_live_qa_runtime.py",
             "platform_live_qa_guard.py",
+            "platform_live_qa_runtime_inputs.py",
+            "platform_live_qa_runtime_inputs.json",
         ):
             destination = tools / name
             shutil.copyfile(TOOLS_DIR / name, destination)
@@ -278,7 +280,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         (node_home / "bin").mkdir(mode=0o755, parents=True)
         cls._write_fixture_file(node_home / "bin/node", b"#!/bin/sh\n", mode=0o755)
         for relative in (
+            "package.json",
             "playwright.live.config.ts",
+            "tests/smoke/live-launch.spec.ts",
             "tests/smoke/live-user-journey.spec.ts",
             "tests/support/live-qa-origin.ts",
             "tests/support/live-qa-sandbox.ts",
@@ -467,6 +471,14 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             spec.loader.exec_module(installer)
             installer.CHROMIUM_SANDBOX_SIZE = len(sandbox)
             installer.CHROMIUM_SANDBOX_SHA256 = hashlib.sha256(sandbox).hexdigest()
+            release_tools = output.parent / "tools"
+            release_tools.mkdir(mode=0o755)
+            shutil.copyfile(
+                TOOLS_DIR / "platform_live_qa_runtime_inputs.json",
+                release_tools / "platform_live_qa_runtime_inputs.json",
+            )
+            os.chown(release_tools / "platform_live_qa_runtime_inputs.json", 0, 0)
+            os.chmod(release_tools / "platform_live_qa_runtime_inputs.json", 0o644)
             installer._validate_runtime_source(output)
 
     def test_staged_live_qa_builder_output_passes_standalone_artifact_validator(
@@ -1086,7 +1098,6 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 "web-hermetic",
                 "verification-contract",
             ]
-
             def manifest_payload(runtime_sensitive: bool) -> dict[str, object]:
                 payload: dict[str, object] = {
                     "schema": 1,
@@ -1099,7 +1110,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                     "deployable": True,
                     "fallback": False,
                     "reason": "platform change requires full verification",
-                    "files": ["platform/tools/example.py"],
+                    "files": [
+                        (
+                            "platform/apps/platform_web/package.json"
+                            if runtime_sensitive
+                            else "platform/tools/example.py"
+                        )
+                    ],
                 }
                 payload["digest"] = hashlib.sha256(
                     json.dumps(

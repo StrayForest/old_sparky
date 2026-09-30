@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -74,57 +75,65 @@ CHROMIUM_SANDBOX_SHA256 = (
     "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
 )
 RUNTIME_MANIFEST_RELATIVE = PurePosixPath("runtime-manifest.json")
+
+
+def _load_runtime_inputs():
+    loader_path = Path(__file__).with_name("platform_live_qa_runtime_inputs.py")
+    manifest_path = Path(__file__).with_name("platform_live_qa_runtime_inputs.json")
+    spec = importlib.util.spec_from_file_location(
+        "platform_live_qa_runtime_inputs", loader_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("live-QA runtime input loader is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(spec.name, None)
+        else:
+            sys.modules[spec.name] = previous
+    return module, module.load_manifest(manifest_path)
+
+
+try:
+    _RUNTIME_INPUTS_MODULE, RUNTIME_INPUTS = _load_runtime_inputs()
+except Exception as exc:
+    _RUNTIME_INPUTS_MODULE = None
+    RUNTIME_INPUTS = None
+    _RUNTIME_INPUTS_LOAD_ERROR = exc
+else:
+    _RUNTIME_INPUTS_LOAD_ERROR = None
+
 RUNTIME_BROWSER_ROOTS = frozenset(
-    {
-        "chromium-1228",
-        "chromium_headless_shell-1228",
-        "webkit-2311",
-        "ffmpeg-1011",
-    }
+    RUNTIME_INPUTS.browser_roots if RUNTIME_INPUTS is not None else ()
 )
 RUNTIME_REQUIRED_FILES = (
-    "node/bin/node",
-    "web/package-lock.json",
-    "web/playwright.live.config.ts",
-    "web/tests/smoke/live-user-journey.spec.ts",
-    "web/tests/support/live-qa-origin.ts",
-    "web/tests/support/live-qa-sandbox.ts",
-    "web/node_modules/@playwright/test/package.json",
-    "web/node_modules/playwright/package.json",
-    "web/node_modules/playwright-core/package.json",
-    "browsers/chromium-1228/chrome-linux64/chrome_sandbox",
+    RUNTIME_INPUTS.required_runtime_files if RUNTIME_INPUTS is not None else ()
 )
+if RUNTIME_INPUTS is not None:
+    _sandbox_input = next(
+        (
+            relative
+            for relative in RUNTIME_INPUTS.required_runtime_files
+            if relative.endswith("/chrome_sandbox")
+        ),
+        None,
+    )
+    if _sandbox_input is None:
+        raise RuntimeError("live-QA runtime input contract has no sandbox")
+    RUNTIME_SANDBOX_RELATIVE = PurePosixPath(_sandbox_input)
+    CHROMIUM_SANDBOX_RELATIVE = PurePosixPath("runtime") / _sandbox_input
 
 # All executable/source files used by the trusted wrapper.  The API source
 # and platform package trees are copied into the payload so DB fixture tools
 # do not import a candidate release through current/tools or a checkout.
-TOOL_FILES = (
-    "platform_live_user_qa_trusted.sh",
-    "platform_live_launch_trusted.sh",
-    "platform_live_launch_supervisor.sh",
-    "platform_live_user_qa.sh",
-    "platform_live_browser_qa.sh",
-    "platform_install_live_qa_user.sh",
-    "platform_live_qa_guard.py",
-    "platform_live_user_qa_dispatch.py",
-    "platform_workflow_remote_dispatch.py",
-    "platform_workflow_input_guard.py",
-    "platform_release_lock_exec.sh",
-    "platform_release_lock.sh",
-    "platform_live_qa_runtime_install.py",
-    "platform_safe_env_exec.py",
-    "platform_live_qa_mailbox_helper.py",
-    "platform_provision_live_csp_qa.py",
-    "platform_recover_live_user_qa.py",
-    "platform_cleanup_live_user_qa.py",
-)
-SOURCE_TREES = (
-    "apps/platform_api",
-    "python_packages",
-)
-SOURCE_FILES = (
-    "deploy/apparmor/oldsparky-liveqa-chromium",
-)
+TOOL_FILES = RUNTIME_INPUTS.payload_tool_files if RUNTIME_INPUTS is not None else ()
+SOURCE_TREES = RUNTIME_INPUTS.payload_source_trees if RUNTIME_INPUTS is not None else ()
+SOURCE_FILES = RUNTIME_INPUTS.payload_source_files if RUNTIME_INPUTS is not None else ()
+INPUT_MANIFEST_SHA256 = RUNTIME_INPUTS.digest if RUNTIME_INPUTS is not None else ""
 SECRET_NAME_PATTERN = re.compile(
     r"(?:^|/)(?:\.env(?:\.|$)|.*\.(?:pem|key|p12|pfx|sqlite|db))$",
     re.IGNORECASE,
@@ -647,8 +656,17 @@ def _tree_digest(
 def _validate_runtime_source(root: Path) -> None:
     """Recheck the artifact member before any secret-bearing promotion."""
 
+    if _RUNTIME_INPUTS_LOAD_ERROR is not None or RUNTIME_INPUTS is None:
+        raise InstallerError("live-QA runtime input contract is unavailable")
     _directory(root, mode=0o555)
     _validate_source_tree(root.parent, root.name)
+    input_manifest_path = root.parent / "tools" / "platform_live_qa_runtime_inputs.json"
+    try:
+        release_inputs = _RUNTIME_INPUTS_MODULE.load_manifest(input_manifest_path)
+    except Exception as exc:
+        raise InstallerError("live-QA runtime input manifest is invalid") from exc
+    if release_inputs.digest != INPUT_MANIFEST_SHA256:
+        raise InstallerError("live-QA runtime input manifest digest is stale")
     required = [*RUNTIME_REQUIRED_FILES]
     for relative in required:
         path = root / relative
@@ -657,17 +675,23 @@ def _validate_runtime_source(root: Path) -> None:
         _directory(root / "browsers" / browser_root)
     allowed_top = {"node", "web", "browsers", RUNTIME_MANIFEST_RELATIVE.name}
     allowed_web_files = {
-        "web/package-lock.json",
-        "web/playwright.live.config.ts",
-        "web/tests/smoke/live-user-journey.spec.ts",
-        "web/tests/support/live-qa-origin.ts",
-        "web/tests/support/live-qa-sandbox.ts",
+        f"web/{relative}" for relative in RUNTIME_INPUTS.runtime_source_files
     }
-    allowed_package_roots = (
-        "web/node_modules/@playwright/test",
-        "web/node_modules/playwright",
-        "web/node_modules/playwright-core",
+    allowed_web_members = {"web"}
+    for relative in allowed_web_files:
+        parts = relative.split("/")
+        allowed_web_members.update(
+            "/".join(parts[:index]) for index in range(1, len(parts))
+        )
+    allowed_package_roots = tuple(
+        f"web/node_modules/{package}" for package in RUNTIME_INPUTS.runtime_packages
     )
+    allowed_package_members = {"web/node_modules"}
+    for package_root in allowed_package_roots:
+        parts = package_root.split("/")
+        allowed_package_members.update(
+            "/".join(parts[:index]) for index in range(1, len(parts) + 1)
+        )
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         top = relative.split("/", 1)[0]
@@ -681,13 +705,9 @@ def _validate_runtime_source(root: Path) -> None:
                 raise InstallerError("live-QA runtime contains an unreviewed browser")
         if relative.startswith("web/"):
             package_relative = relative.removeprefix("web/node_modules/")
-            if relative in allowed_web_files or relative in {
-                "web/tests",
-                "web/tests/smoke",
-                "web/tests/support",
-                "web/node_modules",
-                "web/node_modules/@playwright",
-            }:
+            if relative in allowed_web_files or relative in allowed_web_members:
+                continue
+            if relative in allowed_package_members:
                 continue
             if not any(
                 package_relative == package_root.removeprefix("web/node_modules/")
@@ -717,9 +737,18 @@ def _validate_runtime_source(root: Path) -> None:
         raise InstallerError("live-QA runtime manifest is invalid") from exc
     if (
         not isinstance(manifest, dict)
-        or set(manifest) != {"version", "node_version", "package_lock_sha256", "tree_sha256", "files"}
+        or set(manifest)
+        != {
+            "version",
+            "node_version",
+            "input_manifest_sha256",
+            "package_lock_sha256",
+            "tree_sha256",
+            "files",
+        }
         or manifest.get("version") != 1
         or manifest.get("node_version") != "26.3.1"
+        or manifest.get("input_manifest_sha256") != INPUT_MANIFEST_SHA256
         or not isinstance(manifest.get("package_lock_sha256"), str)
         or not re.fullmatch(r"[0-9a-f]{64}", manifest["package_lock_sha256"])
         or not isinstance(manifest.get("tree_sha256"), str)

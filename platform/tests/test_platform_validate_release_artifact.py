@@ -112,6 +112,14 @@ class ArchiveBuilder:
             f"{RELEASE_SLUG}/tools/platform_media_migration_diagnostics_summary.py",
             b"#!/usr/bin/env python3\nprint('media migration summary')\n",
         )
+        self.add_file(
+            f"{RELEASE_SLUG}/tools/platform_live_qa_runtime_inputs.json",
+            (REPO_ROOT / "platform/tools/platform_live_qa_runtime_inputs.json").read_bytes(),
+        )
+        self.add_file(
+            f"{RELEASE_SLUG}/tools/platform_live_qa_runtime_inputs.py",
+            (REPO_ROOT / "platform/tools/platform_live_qa_runtime_inputs.py").read_bytes(),
+        )
         self._add_liveqa_runtime()
 
     def _add_liveqa_runtime(self) -> None:
@@ -146,6 +154,7 @@ class ArchiveBuilder:
             "node/bin/node": b"node\n",
             "web/package-lock.json": b"{}\n",
             "web/playwright.live.config.ts": b"export default {};\n",
+            "web/tests/smoke/live-launch.spec.ts": b"test('launch', () => {});\n",
             "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
             "web/tests/support/live-qa-origin.ts": b"export {};\n",
             "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
@@ -249,9 +258,15 @@ class ArchiveBuilder:
                     file_digest = hashlib.sha256(content).hexdigest()
                     files[relative] = file_digest
                     digest.update(b"f\0" + bytes.fromhex(file_digest))
+            runtime_inputs = json.loads(
+                (
+                    REPO_ROOT / "platform/tools/platform_live_qa_runtime_inputs.json"
+                ).read_text(encoding="ascii")
+            )
             manifest = {
                 "version": 1,
                 "node_version": validator.PINNED_NODE_VERSION,
+                "input_manifest_sha256": runtime_inputs["digest"],
                 "package_lock_sha256": hashlib.sha256(b"{}\n").hexdigest(),
                 "tree_sha256": digest.hexdigest(),
                 "files": files,

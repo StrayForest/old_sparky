@@ -2212,6 +2212,15 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             delta_file_digest,
             RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST,
         )
+        def provenance(target_sha: str, branch: str) -> dict[str, object]:
+            return {
+                "complete": True,
+                "base": "b" * 40,
+                "head": target_sha,
+                "ref": f"refs/heads/{branch}",
+                "source": "github-event",
+            }
+
         paths = sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)
         for event, branch in (
             ("pull_request", "feature/recovery-bootstrap"),
@@ -2223,6 +2232,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     event=event,
                     target_sha="a" * 40,
                     branch=branch,
+                    provenance=provenance("a" * 40, branch),
                 )
                 self.assertEqual(set(manifest["files"]), RECOVERY_BOOTSTRAP_PATCH_FILES)
                 self.assertEqual(manifest["class"], "full")
@@ -2241,6 +2251,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     event=event,
                     target_sha="a" * 40,
                     branch=branch,
+                    provenance=provenance("a" * 40, branch),
                 )
                 self.assertEqual(set(manifest["files"]), RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)
                 self.assertEqual(manifest["class"], "full")
@@ -2253,6 +2264,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             event="push",
             target_sha="a" * 40,
             branch="dev",
+            provenance=provenance("a" * 40, "dev"),
         )
         self.assertEqual(mixed["class"], "full")
         self.assertTrue(mixed["deployable"])
@@ -2262,6 +2274,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             event="push",
             target_sha="a" * 40,
             branch="dev",
+            provenance=provenance("a" * 40, "dev"),
         )
         self.assertEqual(unknown["class"], "full")
         self.assertFalse(unknown["deployable"])

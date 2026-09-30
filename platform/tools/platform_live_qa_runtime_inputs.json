@@ -1,0 +1,89 @@
+{
+  "browser_roots": [
+    "chromium-1228",
+    "chromium_headless_shell-1228",
+    "ffmpeg-1011",
+    "webkit-2311"
+  ],
+  "build_input_files": [
+    "package.json"
+  ],
+  "classifier_sensitive_paths": [
+    "platform/apps/platform_web/package-lock.json",
+    "platform/apps/platform_web/package.json",
+    "platform/apps/platform_web/playwright.live.config.ts",
+    "platform/apps/platform_web/tests/smoke/live-launch.spec.ts",
+    "platform/apps/platform_web/tests/smoke/live-user-journey.spec.ts",
+    "platform/apps/platform_web/tests/support/live-qa-origin.ts",
+    "platform/apps/platform_web/tests/support/live-qa-sandbox.ts",
+    "platform/tests/test_platform_live_qa_guard.py",
+    "platform/tests/test_platform_live_qa_runtime_install.py",
+    "platform/tests/test_platform_release_build_contract.py",
+    "platform/tests/test_platform_validate_release_artifact.py",
+    "platform/tools/platform_build_live_qa_runtime.py",
+    "platform/tools/platform_build_release.sh",
+    "platform/tools/platform_live_qa_guard.py",
+    "platform/tools/platform_live_qa_runtime_inputs.json",
+    "platform/tools/platform_live_qa_runtime_inputs.py",
+    "platform/tools/platform_live_qa_runtime_install.py",
+    "platform/tools/platform_validate_release_artifact.py"
+  ],
+  "digest": "5505ad69e0220648fdb582439cfa8daf20c3a1ee3ebe954f37a53aba7a45eb63",
+  "payload_source_files": [
+    "deploy/apparmor/oldsparky-liveqa-chromium"
+  ],
+  "payload_source_trees": [
+    "apps/platform_api",
+    "python_packages"
+  ],
+  "payload_tool_files": [
+    "platform_cleanup_live_user_qa.py",
+    "platform_install_live_qa_user.sh",
+    "platform_live_browser_qa.sh",
+    "platform_live_launch_supervisor.sh",
+    "platform_live_launch_trusted.sh",
+    "platform_live_qa_guard.py",
+    "platform_live_qa_mailbox_helper.py",
+    "platform_live_qa_runtime_inputs.json",
+    "platform_live_qa_runtime_inputs.py",
+    "platform_live_qa_runtime_install.py",
+    "platform_live_user_qa.sh",
+    "platform_live_user_qa_dispatch.py",
+    "platform_live_user_qa_trusted.sh",
+    "platform_provision_live_csp_qa.py",
+    "platform_recover_live_user_qa.py",
+    "platform_release_lock.sh",
+    "platform_release_lock_exec.sh",
+    "platform_safe_env_exec.py",
+    "platform_workflow_input_guard.py",
+    "platform_workflow_remote_dispatch.py"
+  ],
+  "required_runtime_files": [
+    "browsers/chromium-1228/chrome-linux64/chrome_sandbox",
+    "node/bin/node",
+    "web/node_modules/@playwright/test/package.json",
+    "web/node_modules/playwright/package.json",
+    "web/node_modules/playwright-core/package.json",
+    "web/package-lock.json",
+    "web/playwright.live.config.ts",
+    "web/tests/smoke/live-launch.spec.ts",
+    "web/tests/smoke/live-user-journey.spec.ts",
+    "web/tests/support/live-qa-origin.ts",
+    "web/tests/support/live-qa-sandbox.ts"
+  ],
+  "runtime_packages": [
+    "@playwright/test",
+    "playwright",
+    "playwright-core"
+  ],
+  "runtime_source_files": [
+    "package-lock.json",
+    "playwright.live.config.ts",
+    "tests/smoke/live-launch.spec.ts",
+    "tests/smoke/live-user-journey.spec.ts",
+    "tests/support/live-qa-origin.ts",
+    "tests/support/live-qa-sandbox.ts"
+  ],
+  "schema": 1,
+  "version": 1
+}

@@ -189,8 +189,15 @@ event, route class, expected gates, deployability, fallback flag, reason and
 digest are validated by the downstream release workflows.
 
 The route class and fallback bit are both part of the exact classifier
-manifest. Known, complete repository state and a recognized event can produce
+manifest. The classifier also binds runtime-sensitive path ownership to the
+reviewed [`platform_live_qa_runtime_inputs.json`](../tools/platform_live_qa_runtime_inputs.json)
+contract; the builder, installer and artifact validator consume that same
+digest-bound contract instead of maintaining separate allowlists. Known,
+complete repository state and a recognized event can produce
 `class=full`, `fallback=false`; deployability is a separate authority bit. The
+range provenance used to prove that state is intentionally not persisted as a
+new classifier-manifest field: production consumers continue to validate the
+closed schema/version-1 artifact and its existing digest contract.
 trusted host-tools candidate packaging paths are deliberately full-coverage
 but CI-only, while application/runtime/migration/release paths retain normal
 trusted-push authority. The exact candidate allowlist is owned by the

@@ -30,6 +30,8 @@ PINNED_NODE_VERSION = "26.3.1"
 PINNED_NPM_VERSION = "11.16.0"
 LIVE_QA_RUNTIME_ROOT = "liveqa-runtime"
 LIVE_QA_RUNTIME_MANIFEST = "liveqa-runtime/runtime-manifest.json"
+RUNTIME_INPUT_MANIFEST = "tools/platform_live_qa_runtime_inputs.json"
+RUNTIME_INPUT_LOADER = "tools/platform_live_qa_runtime_inputs.py"
 LIVE_QA_SANDBOX_RELATIVE = (
     "liveqa-runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
 )
@@ -37,14 +39,31 @@ LIVE_QA_SANDBOX_SIZE = 15232
 LIVE_QA_SANDBOX_SHA256 = (
     "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
 )
-LIVE_QA_BROWSER_ROOTS = frozenset(
+RUNTIME_INPUT_KEYS = frozenset(
     {
-        "chromium-1228",
-        "chromium_headless_shell-1228",
-        "webkit-2311",
-        "ffmpeg-1011",
+        "schema",
+        "version",
+        "runtime_source_files",
+        "build_input_files",
+        "runtime_packages",
+        "payload_tool_files",
+        "payload_source_trees",
+        "payload_source_files",
+        "browser_roots",
+        "required_runtime_files",
+        "classifier_sensitive_paths",
+        "digest",
     }
 )
+RUNTIME_INPUT_SCHEMA = 1
+RUNTIME_INPUT_VERSION = 1
+MAX_RUNTIME_INPUT_ITEMS = 256
+MAX_RUNTIME_INPUT_ITEM_LENGTH = 512
+RUNTIME_INPUT_PACKAGE_RE = re.compile(
+    r"^(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$"
+)
+RUNTIME_INPUT_FORBIDDEN_CHARS = frozenset("*?[]{}")
+RUNTIME_INPUT_SANDBOX = "browsers/chromium-1228/chrome-linux64/chrome_sandbox"
 MAX_RELEASE_JSON_BYTES = 64 * 1024
 # Keep this standalone validator bound local: it runs with ``python -I`` while
 # validating an artifact and must not import the live-QA runtime bootstrap just
@@ -243,6 +262,150 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ArtifactError("RELEASE.json contains duplicate keys")
         result[key] = value
     return result
+
+
+def _runtime_input_path(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_RUNTIME_INPUT_ITEM_LENGTH
+        or not value.isascii()
+        or "\x00" in value
+        or "\\" in value
+        or value.startswith("/")
+        or value.startswith("./")
+        or any(character in RUNTIME_INPUT_FORBIDDEN_CHARS for character in value)
+    ):
+        raise ArtifactError(f"runtime input {label} contains an invalid path")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ArtifactError(f"runtime input {label} contains a non-canonical path")
+    if PurePosixPath(value).as_posix() != value or PurePosixPath(value).is_absolute():
+        raise ArtifactError(f"runtime input {label} contains a non-canonical path")
+    return value
+
+
+def _runtime_input_path_list(
+    value: object, *, label: str, max_items: int = MAX_RUNTIME_INPUT_ITEMS
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or len(value) > max_items:
+        raise ArtifactError(f"runtime input {label} is not a bounded list")
+    result = tuple(_runtime_input_path(item, label=label) for item in value)
+    if len(set(result)) != len(result):
+        raise ArtifactError(f"runtime input {label} contains duplicates")
+    if tuple(sorted(result, key=lambda item: PurePosixPath(item).parts)) != result:
+        raise ArtifactError(f"runtime input {label} is not deterministic")
+    return result
+
+
+def _runtime_input_package_list(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or len(value) > MAX_RUNTIME_INPUT_ITEMS:
+        raise ArtifactError("runtime input package list is not bounded")
+    packages: list[str] = []
+    for package in value:
+        if (
+            not isinstance(package, str)
+            or not package
+            or len(package) > MAX_RUNTIME_INPUT_ITEM_LENGTH
+            or not package.isascii()
+            or RUNTIME_INPUT_PACKAGE_RE.fullmatch(package) is None
+        ):
+            raise ArtifactError("runtime input package name is invalid")
+        packages.append(package)
+    if len(set(packages)) != len(packages) or tuple(sorted(packages)) != tuple(packages):
+        raise ArtifactError("runtime input package list is not deterministic")
+    return tuple(packages)
+
+
+def _runtime_input_digest(payload: dict[str, object]) -> str:
+    without_digest = {
+        key: value for key, value in payload.items() if key != "digest"
+    }
+    return hashlib.sha256(
+        json.dumps(
+            without_digest,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def _validate_runtime_input_payload(payload: object) -> dict[str, object]:
+    """Validate the artifact's data-only runtime contract without imports."""
+
+    if not isinstance(payload, dict) or set(payload) != RUNTIME_INPUT_KEYS:
+        raise ArtifactError("live-QA runtime input manifest schema is invalid")
+    if type(payload.get("schema")) is not int or payload["schema"] != RUNTIME_INPUT_SCHEMA:
+        raise ArtifactError("live-QA runtime input manifest schema is invalid")
+    if type(payload.get("version")) is not int or payload["version"] != RUNTIME_INPUT_VERSION:
+        raise ArtifactError("live-QA runtime input manifest version is invalid")
+    digest = payload.get("digest")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ArtifactError("live-QA runtime input manifest digest is invalid")
+    runtime_source_files = _runtime_input_path_list(
+        payload.get("runtime_source_files"), label="runtime source files"
+    )
+    build_input_files = _runtime_input_path_list(
+        payload.get("build_input_files"), label="build input files"
+    )
+    runtime_packages = _runtime_input_package_list(payload.get("runtime_packages"))
+    payload_tool_files = _runtime_input_path_list(
+        payload.get("payload_tool_files"), label="payload tool files"
+    )
+    payload_source_trees = _runtime_input_path_list(
+        payload.get("payload_source_trees"), label="payload source trees"
+    )
+    payload_source_files = _runtime_input_path_list(
+        payload.get("payload_source_files"), label="payload source files"
+    )
+    browser_roots = _runtime_input_path_list(
+        payload.get("browser_roots"), label="browser roots"
+    )
+    required_runtime_files = _runtime_input_path_list(
+        payload.get("required_runtime_files"), label="required runtime files"
+    )
+    classifier_sensitive_paths = _runtime_input_path_list(
+        payload.get("classifier_sensitive_paths"),
+        label="classifier-sensitive paths",
+    )
+    expected_required = tuple(
+        sorted(
+            (
+                "node/bin/node",
+                *(f"web/{relative}" for relative in runtime_source_files),
+                *(
+                    f"web/node_modules/{package}/package.json"
+                    for package in runtime_packages
+                ),
+                RUNTIME_INPUT_SANDBOX,
+            ),
+            key=lambda item: PurePosixPath(item).parts,
+        )
+    )
+    if required_runtime_files != expected_required:
+        raise ArtifactError("required runtime files do not match runtime inputs")
+    if "platform/tools/platform_live_qa_runtime_inputs.json" not in classifier_sensitive_paths:
+        raise ArtifactError("runtime input manifest is not classifier-sensitive")
+    if set(build_input_files) & set(runtime_source_files):
+        raise ArtifactError("runtime and build-only inputs overlap")
+    if _runtime_input_digest(payload) != digest:
+        raise ArtifactError("live-QA runtime input manifest digest is invalid")
+    # Return canonical values for callers so the archive policy cannot depend
+    # on mutable list aliases from an untrusted JSON object.
+    return {
+        **payload,
+        "runtime_source_files": runtime_source_files,
+        "build_input_files": build_input_files,
+        "runtime_packages": runtime_packages,
+        "payload_tool_files": payload_tool_files,
+        "payload_source_trees": payload_source_trees,
+        "payload_source_files": payload_source_files,
+        "browser_roots": browser_roots,
+        "required_runtime_files": required_runtime_files,
+        "classifier_sensitive_paths": classifier_sensitive_paths,
+    }
 
 
 def _parse_release_json(raw: bytes, *, release_slug: str) -> dict[str, object]:
@@ -468,24 +631,38 @@ def _validate_liveqa_runtime(
     root = by_name.get(prefix)
     if root is None or not root.isdir():
         raise ArtifactError("release archive is missing liveqa-runtime")
-    required = (
-        "node/bin/node",
-        "runtime-manifest.json",
-        "web/package-lock.json",
-        "web/playwright.live.config.ts",
-        "web/tests/smoke/live-user-journey.spec.ts",
-        "web/tests/support/live-qa-origin.ts",
-        "web/tests/support/live-qa-sandbox.ts",
-        "web/node_modules/@playwright/test/package.json",
-        "web/node_modules/playwright/package.json",
-        "web/node_modules/playwright-core/package.json",
-        "browsers/chromium-1228/chrome-linux64/chrome_sandbox",
-    )
+    input_member = by_name.get(f"{release_slug}/{RUNTIME_INPUT_MANIFEST}")
+    if input_member is None or not input_member.isfile():
+        raise ArtifactError("live-QA runtime input manifest is unavailable")
+    input_file = archive.extractfile(input_member)
+    if input_file is None:
+        raise ArtifactError("live-QA runtime input manifest is unavailable")
+    input_raw = input_file.read(MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES + 1)
+    input_file.close()
+    if len(input_raw) > MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES:
+        raise ArtifactError("live-QA runtime input manifest is too large")
+    try:
+        input_payload = json.loads(
+            input_raw.decode("ascii"),
+            object_pairs_hook=_strict_object,
+        )
+        input_contract = _validate_runtime_input_payload(input_payload)
+    except (UnicodeError, json.JSONDecodeError, ArtifactError) as exc:
+        if isinstance(exc, ArtifactError):
+            raise
+        raise ArtifactError("live-QA runtime input manifest is invalid") from exc
+
+    browser_roots = frozenset(input_contract["browser_roots"])
+    required_runtime_files = tuple(input_contract["required_runtime_files"])
+    runtime_source_files = tuple(input_contract["runtime_source_files"])
+    runtime_packages = tuple(input_contract["runtime_packages"])
+    input_manifest_digest = str(input_contract["digest"])
+    required = ("runtime-manifest.json", *required_runtime_files)
     for relative in required:
         member = by_name.get(f"{prefix}/{relative}")
         if member is None or not member.isfile():
             raise ArtifactError(f"liveqa-runtime is missing required file: {relative}")
-    for browser_root in LIVE_QA_BROWSER_ROOTS:
+    for browser_root in browser_roots:
         member = by_name.get(f"{prefix}/browsers/{browser_root}")
         if member is None or not member.isdir():
             raise ArtifactError(
@@ -493,18 +670,22 @@ def _validate_liveqa_runtime(
             )
     runtime_prefix = f"{prefix}/"
     allowed_top = {"node", "web", "browsers", "runtime-manifest.json"}
-    allowed_web_files = {
-        "web/package-lock.json",
-        "web/playwright.live.config.ts",
-        "web/tests/smoke/live-user-journey.spec.ts",
-        "web/tests/support/live-qa-origin.ts",
-        "web/tests/support/live-qa-sandbox.ts",
-    }
+    allowed_web_files = {f"web/{relative}" for relative in runtime_source_files}
+    allowed_web_members = {"web"}
+    for relative in allowed_web_files:
+        parts = relative.split("/")
+        allowed_web_members.update(
+            "/".join(parts[:index]) for index in range(1, len(parts))
+        )
     allowed_package_roots = {
-        "web/node_modules/@playwright/test",
-        "web/node_modules/playwright",
-        "web/node_modules/playwright-core",
+        f"web/node_modules/{package}" for package in runtime_packages
     }
+    allowed_package_members = {"web/node_modules"}
+    for package_root in allowed_package_roots:
+        parts = package_root.split("/")
+        allowed_package_members.update(
+            "/".join(parts[:index]) for index in range(1, len(parts) + 1)
+        )
     for name in by_name:
         if not name.startswith(runtime_prefix):
             continue
@@ -521,17 +702,13 @@ def _validate_liveqa_runtime(
         if relative == "node" or relative == "browsers" or relative.startswith("browsers/"):
             browser_parts = relative.split("/")
             if relative not in {"node", "browsers"} and browser_parts[0] == "browsers":
-                if len(browser_parts) < 2 or browser_parts[1] not in LIVE_QA_BROWSER_ROOTS:
+                if len(browser_parts) < 2 or browser_parts[1] not in browser_roots:
                     raise ArtifactError("liveqa-runtime contains an unreviewed browser")
         if relative.startswith("web/"):
             package_relative = relative.removeprefix("web/node_modules/")
-            if relative in allowed_web_files or relative in {
-                "web/tests",
-                "web/tests/smoke",
-                "web/tests/support",
-            }:
+            if relative in allowed_web_files or relative in allowed_web_members:
                 pass
-            elif relative in {"web/node_modules", "web/node_modules/@playwright"}:
+            elif relative in allowed_package_members:
                 pass
             elif any(
                 package_relative == package_root.removeprefix("web/node_modules/")
@@ -547,20 +724,28 @@ def _validate_liveqa_runtime(
         if name.endswith("chrome_sandbox") and name != f"{release_slug}/{LIVE_QA_SANDBOX_RELATIVE}":
             raise ArtifactError("liveqa-runtime contains an unexpected sandbox helper")
     package_root = f"{prefix}/web/node_modules/"
+    allowed_package_relative_members = {""}
+    for package_root_name in allowed_package_roots:
+        package_relative = package_root_name.removeprefix("web/node_modules/")
+        parts = package_relative.split("/")
+        allowed_package_relative_members.update(
+            "/".join(parts[:index]) for index in range(1, len(parts) + 1)
+        )
     for name, member in by_name.items():
         if not name.startswith(package_root):
             continue
         relative = name[len(package_root) :]
         if not relative:
             continue
-        first = relative.split("/", 1)[0]
-        if first not in {"@playwright", "playwright", "playwright-core"}:
+        if not any(
+            relative == allowed
+            or relative.startswith(allowed + "/")
+            for allowed in allowed_package_relative_members
+            if allowed
+        ):
             raise ArtifactError("liveqa-runtime contains an unreviewed node package")
-        if first == "@playwright" and relative not in {
-            "@playwright",
-            "@playwright/test",
-        } and not relative.startswith("@playwright/test/"):
-            raise ArtifactError("liveqa-runtime contains an unreviewed scoped package")
+        if "/node_modules/" in relative:
+            raise ArtifactError("liveqa-runtime contains nested node_modules")
         if member.issym() or member.islnk():
             raise ArtifactError("liveqa-runtime package contains a symlink")
 
@@ -578,9 +763,18 @@ def _validate_liveqa_runtime(
         raise ArtifactError("liveqa-runtime manifest is invalid") from exc
     if (
         not isinstance(manifest, dict)
-        or set(manifest) != {"version", "node_version", "package_lock_sha256", "tree_sha256", "files"}
+        or set(manifest)
+        != {
+            "version",
+            "node_version",
+            "input_manifest_sha256",
+            "package_lock_sha256",
+            "tree_sha256",
+            "files",
+        }
         or manifest.get("version") != 1
         or manifest.get("node_version") != PINNED_NODE_VERSION
+        or manifest.get("input_manifest_sha256") != input_manifest_digest
         or not isinstance(manifest.get("package_lock_sha256"), str)
         or re.fullmatch(r"[0-9a-f]{64}", manifest["package_lock_sha256"]) is None
         or not isinstance(manifest.get("tree_sha256"), str)
@@ -611,6 +805,8 @@ def _required_members(
         "requirements-platform.freeze.txt",
         "wheelhouse/WHEELHOUSE.sha256",
         "apps/platform_web/package-lock.json",
+        RUNTIME_INPUT_MANIFEST,
+        RUNTIME_INPUT_LOADER,
         "apps/platform_web/.next/standalone/server.js",
         *REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS,
     )
