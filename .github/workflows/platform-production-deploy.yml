@@ -1477,7 +1477,7 @@ jobs:
           test ! -e "$private_dir" && test ! -L "$private_dir"
           mkdir -- "$private_dir"
           chmod 0700 "$private_dir"
-          test "$(stat -c '%u:%g:%F:%h:%a' -- "$private_dir")" = "$(id -u):$(id -g):directory:1:700"
+          test "$(stat -c '%u:%g:%F:%h:%a' -- "$private_dir")" = "$(id -u):$(id -g):directory:2:700"
           test ! -e "$private_path" && test ! -L "$private_path"
           source_sha256="$(
             /usr/bin/python3 -I -B "$trusted_tool" materialize-deployment --input "$source_path" --output "$private_path" --mode deploy

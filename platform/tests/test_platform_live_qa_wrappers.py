@@ -116,6 +116,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             source.chmod(0o644)
             private_dir = root / "private"
             private_dir.mkdir(mode=0o700)
+            private_dir_metadata = private_dir.stat()
+            self.assertEqual(private_dir_metadata.st_mode & 0o777, 0o700)
+            self.assertEqual(private_dir_metadata.st_nlink, 2)
             private = private_dir / "platform-production-deploy-input.json"
 
             digest = platform_workflow_input_guard.materialize_downloaded_deployment_handoff(
@@ -995,6 +998,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         )
         self.assertIn("Normalize downloaded schema-1 deployment handoff", production)
         self.assertIn("materialize-deployment", production)
+        self.assertIn(
+            'test "$(stat -c \'%u:%g:%F:%h:%a\' -- "$private_dir")" = "$(id -u):$(id -g):directory:2:700"',
+            production,
+        )
         self.assertIn("cmp -s -- \"$source_path\" \"$private_path\"", production)
         self.assertIn(
             'test "$(stat -c \'%u:%g:%F:%h:%a\' -- "$private_path")" = "$(id -u):$(id -g):regular file:1:600"',
