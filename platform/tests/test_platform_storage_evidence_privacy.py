@@ -453,40 +453,58 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
     def test_legacy_deployed_retention_fixtures_normalize_byte_for_byte(self) -> None:
         self.assertEqual(LEGACY_RETENTION_0700_OUTPUT, LEGACY_RETENTION_87547_OUTPUT)
         for fixture in (LEGACY_RETENTION_0700_OUTPUT, LEGACY_RETENTION_87547_OUTPUT):
-            projected = summarize_retention(fixture.decode("utf-8"))
-            self.assertEqual(
-                projected["categories"]["live_qa_runtime"][
-                    "reclaimed_tombstone_count"
-                ],
-                1,
-            )
-            self.assertEqual(
-                projected["transient"],
-                {
-                    "failed_builds": {"count": 1, "reclaimable_bytes": 13},
-                    "browser_test_artifacts": {
-                        "count": 1,
-                        "reclaimable_bytes": 17,
+            with self.subTest(fixture=fixture[:12]):
+                projected = summarize_retention(fixture.decode("utf-8"))
+                self.assertEqual(
+                    projected["categories"]["live_qa_runtime"][
+                        "reclaimed_tombstone_count"
+                    ],
+                    1,
+                )
+                self.assertEqual(
+                    projected["transient"],
+                    {
+                        "failed_builds": {"count": 1, "reclaimable_bytes": 13},
+                        "browser_test_artifacts": {
+                            "count": 1,
+                            "reclaimable_bytes": 17,
+                        },
+                        "preprod_screenshots": {
+                            "count": 1,
+                            "reclaimable_bytes": 19,
+                        },
                     },
-                    "preprod_screenshots": {
-                        "count": 1,
-                        "reclaimable_bytes": 19,
+                )
+                self.assertEqual(
+                    projected["transient_reclaimable_bytes"],
+                    {
+                        "failed_builds": 13,
+                        "browser_test_artifacts": 17,
+                        "preprod_screenshots": 19,
                     },
-                },
-            )
-            self.assertEqual(
-                projected["transient_reclaimable_bytes"],
-                {
-                    "failed_builds": 13,
-                    "browser_test_artifacts": 17,
-                    "preprod_screenshots": 19,
-                },
-            )
+                )
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "report"
+                    stderr_path = root / "stderr"
+                    stderr_path.write_bytes(b"")
+                    report_path.write_bytes(legacy_storage_report(fixture))
+                    artifact = project_public_artifact(
+                        expected_sha="a" * 40,
+                        remote_exit_code=0,
+                        remote_stderr_bytes=0,
+                        report_path=report_path,
+                        stderr_path=stderr_path,
+                        report_present=True,
+                    )
+                    self.assertEqual(artifact["status"], "passed")
+                    self.assertTrue(diagnostics_contract.validate_artifact(artifact))
 
         item_payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
         item_payload["transient"]["failed_builds"] = [
-            {"name": ".build-old", "size_bytes": 5},
-            {"name": ".build-older", "size_bytes": 8},
+            {"size_bytes": 5},
+            {"size_bytes": 8},
         ]
         item_payload["transient"]["reclaimable_bytes"].pop("failed_builds")
         item_projected = summarize_retention(json.dumps(item_payload))
@@ -570,6 +588,68 @@ class PlatformStorageEvidencePrivacyTests(unittest.TestCase):
             )
             self.assertEqual(artifact["status"], "failed")
             self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+
+        extra_item_keys = (
+            {"size_bytes": 13, "name": ".build-old"},
+            {"unknown_bytes": 13},
+            {"size_bytes": 13, "bytes": 0},
+        )
+        for item in extra_item_keys:
+            with self.subTest(item=item):
+                payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+                payload["transient"]["failed_builds"] = [item]
+                payload["transient"]["reclaimable_bytes"].pop("failed_builds")
+                mutated = (json.dumps(payload, indent=2) + "\n").encode()
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "report"
+                    stderr_path = root / "stderr"
+                    stderr_path.write_bytes(b"")
+                    report_path.write_bytes(legacy_storage_report(mutated))
+                    artifact = project_public_artifact(
+                        expected_sha="a" * 40,
+                        remote_exit_code=0,
+                        remote_stderr_bytes=0,
+                        report_path=report_path,
+                        stderr_path=stderr_path,
+                        report_present=True,
+                    )
+                    self.assertEqual(artifact["status"], "failed")
+                    self.assertFalse(diagnostics_contract.validate_artifact(artifact))
+
+        empty_list_mutations = (
+            ("negative", -1),
+            ("nonfinite", float("nan")),
+            ("string", "0"),
+            ("missing", ...),
+            ("unknown", {"unknown_bytes": 0}),
+        )
+        for label, value in empty_list_mutations:
+            with self.subTest(empty_list=label):
+                payload = json.loads(LEGACY_RETENTION_0700_OUTPUT)
+                payload["transient"]["failed_builds"] = []
+                aggregate = payload["transient"]["reclaimable_bytes"]
+                if value is ...:
+                    aggregate.pop("failed_builds")
+                else:
+                    aggregate["failed_builds"] = value
+                mutated = (json.dumps(payload, indent=2) + "\n").encode()
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "report"
+                    stderr_path = root / "stderr"
+                    stderr_path.write_bytes(b"")
+                    report_path.write_bytes(legacy_storage_report(mutated))
+                    artifact = project_public_artifact(
+                        expected_sha="a" * 40,
+                        remote_exit_code=0,
+                        remote_stderr_bytes=0,
+                        report_path=report_path,
+                        stderr_path=stderr_path,
+                        report_present=True,
+                    )
+                    self.assertEqual(artifact["status"], "failed")
+                    self.assertFalse(diagnostics_contract.validate_artifact(artifact))
 
     def test_failure_schema_is_closed_and_success_validation_is_strict(self) -> None:
         failure_keys = {

@@ -170,7 +170,7 @@ def _legacy_item_bytes(value: list[Any]) -> int | None:
     total = 0
     for item in value:
         fields = [name for name in _LEGACY_ITEM_BYTE_FIELDS if name in item]
-        if len(fields) != 1:
+        if len(fields) != 1 or set(item) != set(fields):
             return None
         amount = _strict_legacy_bytes(item[fields[0]])
         if amount is None or total > MAX_RETENTION_BYTES - amount:
@@ -187,17 +187,20 @@ def _legacy_transient_bytes(
     count = _legacy_list_count(section)
     if count is None:
         return None, None
+    aggregate_bytes = _strict_legacy_bytes(aggregate)
     if not section:
-        return count, 0
+        # An empty legacy list still carries an aggregate byte claim.  Require
+        # the claim to be the known zero value instead of silently converting
+        # a missing, malformed, or nonzero value into zero.
+        return count, 0 if aggregate_bytes == 0 else None
     if all(isinstance(item, str) for item in section):
         # The deployed 0700/875 helper emits path-name lists.  Their measured
         # bytes live in the aggregate map, so a missing/invalid value is
         # unknown, not zero.
-        return count, _strict_legacy_bytes(aggregate)
+        return count, aggregate_bytes
     if not all(isinstance(item, dict) for item in section):
         return count, None
     item_bytes = _legacy_item_bytes(section)
-    aggregate_bytes = _strict_legacy_bytes(aggregate)
     if item_bytes is not None:
         if aggregate is not None and aggregate_bytes != item_bytes:
             return count, None
