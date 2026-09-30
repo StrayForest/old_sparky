@@ -3055,7 +3055,7 @@ jobs:
       CALLER_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && github.run_attempt || inputs.caller_run_attempt }}
       CALLER_WORKFLOW_REF: ${{ github.event_name == 'workflow_dispatch' && github.workflow_ref || inputs.caller_workflow_ref }}
       CALLER_WORKFLOW_SHA: ${{ github.event_name == 'workflow_dispatch' && github.workflow_sha || inputs.caller_workflow_sha }}
-      EXPECTED_CALLED_WORKFLOW_REF: ${{ github.event_name == 'workflow_dispatch' && github.ref || inputs.expected_called_workflow_ref }}
+      EXPECTED_CALLED_WORKFLOW_REF: ${{ github.event_name == 'workflow_dispatch' && github.workflow_ref || inputs.expected_called_workflow_ref }}
       EXPECTED_CALLED_WORKFLOW_SHA: ${{ github.event_name == 'workflow_dispatch' && github.workflow_sha || inputs.expected_called_workflow_sha }}
       STATUS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.run_id || inputs.caller_run_id }}
       STATUS_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && github.run_attempt || inputs.caller_run_attempt }}
@@ -3072,7 +3072,7 @@ jobs:
       RECEIPT_NAME: platform-production-release-receipt-${{ github.event_name == 'workflow_dispatch' && github.run_id || inputs.caller_run_id }}-${{ github.event_name == 'workflow_dispatch' && github.run_attempt || inputs.caller_run_attempt }}
     steps:
       - name: Checkout exact called workflow source
-        if: ${{ always() && inputs.mode == 'deploy' && env.CALLER_KIND == 'auto' && needs.production.result == 'success' }}
+        if: ${{ always() && inputs.mode == 'deploy' && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && needs.production.result == 'success' }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.sha }}
@@ -3138,7 +3138,7 @@ jobs:
 
       - name: Create canonical receipt content
         if: >-
-          always() && inputs.mode == 'deploy' && env.CALLER_KIND == 'auto' &&
+          always() && inputs.mode == 'deploy' && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') &&
           needs.production.result == 'success' &&
           needs.release-status-pending.result == 'success' &&
           needs.validate-security-provenance.result == 'success'
@@ -3156,6 +3156,10 @@ jobs:
           target = os.environ["TARGET_SHA"]
           caller_id = os.environ["CALLER_RUN_ID"]
           caller_attempt = os.environ["CALLER_RUN_ATTEMPT"]
+          caller_kind = os.environ["CALLER_KIND"]
+          caller_event = "workflow_run" if caller_kind == "auto" else "workflow_dispatch"
+          caller_name = "Platform production auto-deploy" if caller_kind == "auto" else "Platform production deploy"
+          caller_path = ".github/workflows/platform-production-autodeploy.yml" if caller_kind == "auto" else ".github/workflows/platform-production-deploy.yml"
           called_ref = os.environ["EXPECTED_CALLED_WORKFLOW_REF"]
           called_sha = os.environ["EXPECTED_CALLED_WORKFLOW_SHA"]
           content_name = os.environ["RECEIPT_CONTENT_NAME"]
@@ -3187,9 +3191,9 @@ jobs:
                   "run_attempt": os.environ["CLASSIFIER_RUN_ATTEMPT"],
               },
               "caller": {
-                  "event": "workflow_run",
-                  "workflow_name": "Platform production auto-deploy",
-                  "workflow_path": ".github/workflows/platform-production-autodeploy.yml",
+                  "event": caller_event,
+                  "workflow_name": caller_name,
+                  "workflow_path": caller_path,
                   "workflow_ref": os.environ["CALLER_WORKFLOW_REF"],
                   "workflow_sha": os.environ["CALLER_WORKFLOW_SHA"],
                   "repository": "StrayForest/old_sparky",
@@ -3197,7 +3201,7 @@ jobs:
                   "run_attempt": caller_attempt,
               },
               "called": {
-                  "event": "workflow_run",
+                  "event": caller_event,
                   "workflow_name": "Platform production deploy",
                   "workflow_path": ".github/workflows/platform-production-deploy.yml",
                   "workflow_ref": called_ref,
@@ -3236,7 +3240,7 @@ jobs:
       - name: Upload canonical receipt content
         id: upload-receipt-content
         if: >-
-          always() && inputs.mode == 'deploy' && env.CALLER_KIND == 'auto' &&
+          always() && inputs.mode == 'deploy' && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') &&
           needs.production.result == 'success' &&
           needs.release-status-pending.result == 'success' &&
           needs.validate-security-provenance.result == 'success'
@@ -3249,7 +3253,7 @@ jobs:
 
       - name: Bind exact receipt content artifact metadata
         id: receipt-metadata
-        if: ${{ success() && env.CALLER_KIND == 'auto' && steps.upload-receipt-content.outputs.artifact-id != '' }}
+        if: ${{ success() && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && steps.upload-receipt-content.outputs.artifact-id != '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -3290,7 +3294,7 @@ jobs:
           rm -f -- "$metadata"
 
       - name: Create immutable closed release receipt
-        if: ${{ success() && env.CALLER_KIND == 'auto' && steps.receipt-metadata.outputs.artifact_size != '' }}
+        if: ${{ success() && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && steps.receipt-metadata.outputs.artifact_size != '' }}
         shell: bash
         env:
           CONTENT_ARTIFACT_ID: ${{ steps.upload-receipt-content.outputs.artifact-id }}
@@ -3323,7 +3327,7 @@ jobs:
           test "$(stat -c '%F:%a:%h' "$RUNNER_TEMP/platform-release-receipt.json")" = "regular file:600:1"
 
       - name: Upload immutable closed release receipt
-        if: ${{ success() && env.CALLER_KIND == 'auto' && steps.receipt-metadata.outputs.artifact_size != '' }}
+        if: ${{ success() && (env.CALLER_KIND == 'auto' || env.CALLER_KIND == 'manual') && steps.receipt-metadata.outputs.artifact_size != '' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ env.RECEIPT_NAME }}

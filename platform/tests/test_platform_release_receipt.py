@@ -134,6 +134,17 @@ class ReleaseReceiptTests(unittest.TestCase):
             with self.assertRaises(ReceiptError):
                 inspect_single_member_archive(archive_path)
 
+    def test_manual_receipt_binds_dispatch_caller_and_called_workflow(self) -> None:
+        payload = self._payload()
+        for identity in ("caller", "called"):
+            payload[identity]["event"] = "workflow_dispatch"
+            payload[identity]["workflow_name"] = "Platform production deploy"
+            payload[identity]["workflow_path"] = ".github/workflows/platform-production-deploy.yml"
+        self.assertIs(validate_receipt(payload), payload)
+        payload["caller"]["workflow_name"] = "Platform production auto-deploy"
+        with self.assertRaises(ReceiptError):
+            validate_receipt(payload)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     deployment_snapshot_digest,
     latest_context_status,
     validate_auto_release_jobs,
+    validate_auto_noop_run,
     validate_deployment_event,
     validate_deployment_marker,
 )
@@ -565,6 +566,51 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_run_url=run["html_url"],
             )
         )
+
+    def test_non_deployable_auto_run_is_a_markerless_noop(self) -> None:
+        workflow, run, _jobs, statuses = self._payload()
+        workflow = {
+            "id": 88,
+            "path": ".github/workflows/platform-production-autodeploy.yml",
+            "name": "Platform production auto-deploy",
+        }
+        run.update({
+            "workflow_id": 88,
+            "name": "Platform production auto-deploy",
+            "path": ".github/workflows/platform-production-autodeploy.yml",
+            "event": "workflow_run",
+        })
+        jobs = [
+            {
+                "id": 9001,
+                "name": "Native production deployment",
+                "status": "completed",
+                "conclusion": "skipped",
+            },
+            {
+                "id": 9002,
+                "name": "Auto-deploy result",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+        validate_auto_noop_run(
+            workflow,
+            run,
+            jobs,
+            [],
+            expected_run_id=1234,
+            expected_attempt=2,
+            expected_target_sha=self.SHA,
+            expected_run_url=run["html_url"],
+        )
+        statuses.append({**statuses[0], "context": DEPLOY_STATUS_CONTEXT, "target_url": f"{run['html_url']}/attempts/2"})
+        with self.assertRaises(ProvenanceError):
+            validate_auto_noop_run(
+                workflow, run, jobs, statuses,
+                expected_run_id=1234, expected_attempt=2,
+                expected_target_sha=self.SHA, expected_run_url=run["html_url"],
+            )
 
     def test_job_row_ambiguity_and_malformed_api_ids_fail_closed(self) -> None:
         workflow, run, jobs, statuses = self._payload()

@@ -118,7 +118,10 @@ is not the CI or release reproducibility contract.
 8. `Platform security and build` always runs its fail-closed classifier. A strict `platform/docs/**` change runs only `docs` and `verification-contract`; an out-of-scope change runs the contract check; unknown/global/dependency/config/migration/workflow/registry changes use all deterministic gates. Trusted candidate-packaging-only changes also use all deterministic gates but set `deployable=false`; reduced and candidate CI-only routes never authorize production deployment.
 9. For production-bound work merged or pushed to `dev`, wait for the exact-SHA `Platform security and build` push run. When it succeeds for the current `dev` HEAD with `deployable=true`, `Platform production auto-deploy` downloads and validates the exact classifier artifact before dispatching the immutable `Platform production deploy` workflow automatically; valid CI-only full routes finish as no-ops.
 10. Follow the deployment runbook and the [release state machine](release-state-machine.md) through live validation. Do not manually dispatch production for the normal `dev` path and do not call the low-level release installer directly.
-11. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
+11. Downstream QA is receipt-gated: auto/manual deploy workflow-run events
+    require the exact receipt, bounded stable snapshots and marker checks;
+    successful auto no-ops and manual preflights intentionally skip QA.
+12. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
 
 The test-group ownership and runner contract is maintained in
 [`test-suite-governance.md`](test-suite-governance.md). Local and CI
