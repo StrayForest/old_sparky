@@ -553,7 +553,19 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("name: Conditional release runtime fixture", workflow)
         self.assertIn("name: Trusted dev immutable release runtime", workflow)
         self.assertIn(
-            "needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true'",
+            "needs.classifier.outputs.class != 'full' &&",
+            workflow,
+        )
+        self.assertIn(
+            "(needs.classifier.outputs.runtime_sensitive == 'true' ||",
+            workflow,
+        )
+        self.assertIn(
+            "needs.classifier.outputs.fallback == 'true')",
+            workflow,
+        )
+        self.assertNotIn(
+            "if: ${{ needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true' }}",
             workflow,
         )
         self.assertNotIn("schedule:", workflow)
@@ -1003,6 +1015,12 @@ class PlatformCiClassifierTests(unittest.TestCase):
             status_final,
         )
         self.assertIn(
+            'requires_release_runtime = (',
+            status_final,
+        )
+        self.assertIn('route_class != "full"', status_final)
+        self.assertIn('and (runtime_sensitive or raw_fallback == "true")', status_final)
+        self.assertNotIn(
             'requires_release_runtime = runtime_sensitive or raw_fallback == "true"',
             status_final,
         )
@@ -1011,6 +1029,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("RELEASE_RUNTIME_REAL_RESULT", status_final)
         self.assertIn("needs['release-runtime-real']", workflow)
         self.assertIn("requires_real_release_runtime", status_final)
+        self.assertIn('requires_real_release_runtime = (', status_final)
+        self.assertNotIn(
+            'requires_real_release_runtime = requires_release_runtime',
+            status_final,
+        )
 
         script_match = re.search(
             r"(?ms)^\s+/usr/bin/python3 - <<'PY'\n(?P<script>.*?)^\s+PY$",
@@ -1117,7 +1140,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "true",
                     "false",
-                    "success",
+                    "skipped",
                     "success",
                     True,
                     True,
@@ -1128,7 +1151,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "true",
                     "false",
-                    "success",
+                    "skipped",
                     "skipped",
                     False,
                     True,
@@ -1139,7 +1162,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "true",
                     "false",
-                    "success",
+                    "skipped",
                     "failure",
                     False,
                     True,
@@ -1150,7 +1173,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "true",
                     "false",
-                    "success",
+                    "skipped",
                     "success",
                     True,
                     True,
@@ -1161,7 +1184,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/dev",
                     "true",
                     "true",
-                    "success",
+                    "skipped",
                     "success",
                     True,
                     True,
@@ -1196,7 +1219,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/feature",
                     "true",
                     "false",
-                    "success",
+                    "skipped",
                     "skipped",
                     True,
                     False,
@@ -1207,7 +1230,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "refs/heads/gh-readonly-queue/main/pr-1-abc",
                     "true",
                     "false",
-                    "success",
+                    "skipped",
                     "skipped",
                     True,
                     False,
@@ -1252,6 +1275,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     summary = json.loads(
                         Path(environment["SUMMARY_PATH"]).read_text(encoding="utf-8")
                     )
+                    # Every trusted case below is a full route.  Its release
+                    # IDs are already owned by backend-privileged, so the
+                    # focused result must be treated as an intentional skip
+                    # even when runtime_sensitive/fallback is true.
+                    self.assertFalse(summary["requires_release_runtime"])
                     self.assertEqual(
                         summary["requires_real_release_runtime"], expected_requires_real
                     )

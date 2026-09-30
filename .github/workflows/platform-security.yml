@@ -634,7 +634,14 @@ jobs:
   release-runtime:
     name: Conditional release runtime fixture
     needs: classifier
-    if: ${{ needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true' }}
+    # Full routes already execute the release-runtime IDs through the
+    # root-owned backend-privileged contour.  Keep this focused fixture for a
+    # future reduced route only, so a full/fallback/merge-group run cannot pay
+    # for the same release tests twice.
+    if: >-
+      needs.classifier.outputs.class != 'full' &&
+      (needs.classifier.outputs.runtime_sensitive == 'true' ||
+      needs.classifier.outputs.fallback == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -1206,7 +1213,14 @@ jobs:
           ] if isinstance(expected, list) else ["classifier expected gates are malformed"]
           release_runtime_result = os.environ.get("RELEASE_RUNTIME_RESULT", "missing")
           real_runtime_result = os.environ.get("RELEASE_RUNTIME_REAL_RESULT", "skipped")
-          requires_release_runtime = runtime_sensitive or raw_fallback == "true"
+          # Full routes already own the release-runtime IDs through the
+          # root-only backend-privileged contour.  The focused fixture is
+          # therefore required only for a non-full route that is explicitly
+          # runtime-sensitive or fail-closed.
+          requires_release_runtime = (
+              route_class != "full"
+              and (runtime_sensitive or raw_fallback == "true")
+          )
           trusted_real_event = (
               (event_name == "push" and os.environ.get("WORKFLOW_REF") == "refs/heads/dev")
               or (
@@ -1214,7 +1228,13 @@ jobs:
                   and os.environ.get("WORKFLOW_REF") == "refs/heads/dev"
               )
           )
-          requires_real_release_runtime = requires_release_runtime and trusted_real_event
+          # The real trusted-dev builder has an independent route contract:
+          # it remains enabled for sensitive/fallback dev pushes even though
+          # the focused fixture is suppressed on full routes.
+          requires_real_release_runtime = (
+              (runtime_sensitive or raw_fallback == "true")
+              and trusted_real_event
+          )
           if requires_release_runtime:
               if release_runtime_result != "success":
                   missing_or_failed.append("release-runtime")
