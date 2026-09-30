@@ -742,7 +742,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
         ).read_text()
 
-        self.assertIn("Require successful platform security build", workflow)
+        production = workflow_job(workflow, "production")
+        pending = workflow_job(workflow, "release-status-pending")
+        self.assertIn("Require successful platform security build", production)
         self.assertIn("classifier_run_id is required for production deploy", workflow)
         self.assertIn("classifier_run_attempt is required for production deploy", workflow)
         self.assertIn(
@@ -776,10 +778,16 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn('item.get("context") == "platform-security-build"', workflow)
         self.assertNotIn('latest.get("state") != "success"', workflow)
         self.assertNotIn('latest.get("target_url") != attempt_url', workflow)
-        self.assertLess(
-            workflow.index("Require successful platform security build"),
-            workflow.index("Mark production deployment pending"),
+        self.assertIn("needs.validate-security-provenance.result == 'success'", production)
+        self.assertIn("needs.validate-security-provenance.result == 'success'", pending)
+        self.assertIn('STATUS_URL: ${{ github.server_url }}', pending)
+        self.assertIn('/attempts/${{', pending)
+        self.assertIn(
+            '[[ "$STATUS_URL" =~ ^https://github\\.com/StrayForest/old_sparky/actions/runs/',
+            pending,
         )
+        self.assertIn('"context": "platform-production-deploy"', pending)
+        self.assertIn('"target_url": sys.argv[1]', pending)
 
     def test_production_classifier_artifact_reader_is_data_only_and_bounded(self) -> None:
         workflow = (
@@ -2270,9 +2278,10 @@ cleanup
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
         ).read_text()
 
-        upload = self._workflow_step_run(workflow, "Upload verified CI artifact")
+        production = workflow_job(workflow, "production")
+        upload = self._workflow_step_run(production, "Upload verified CI artifact")
         activation = self._workflow_step_run(
-            workflow,
+            production,
             "Run production preflight or deployment",
         )
         # A separate YAML step is not a sufficient boundary: the first host
@@ -2312,19 +2321,25 @@ cleanup
         self.assertIn('production-deploy < "$input_path"', activation)
         self.assertNotIn("bash -s --", activation)
 
+        dispatch = workflow_job(workflow, "validate-dispatch")
         validation_step = self._workflow_step_run(
-            workflow, "Validate and create closed deployment handoff"
+            dispatch, "Validate and create closed deployment handoff"
         )
         self.assertIn("platform_workflow_input_guard.py deployment", validation_step)
-        self.assertLess(
-            workflow.index("Validate and create closed deployment handoff"),
-            workflow.index("curl --fail-with-body --silent --show-error"),
+        handoff_download = production.index(
+            "      - name: Download closed deployment handoff"
         )
+        first_production_curl = production.index(
+            "curl --fail-with-body --silent --show-error"
+        )
+        self.assertLess(handoff_download, first_production_curl)
+        self.assertIn("      - validate-dispatch", production)
+        self.assertIn("needs.validate-dispatch.result == 'success'", production)
 
-        upload_start = workflow.index("      - name: Upload verified CI artifact")
-        upload_next_step = workflow.find("\n      - name:", upload_start + 1)
-        upload_step = workflow[upload_start:upload_next_step]
-        self.assertIn("inputs.mode == 'deploy'", workflow_job(workflow, "production"))
+        upload_start = production.index("      - name: Upload verified CI artifact")
+        upload_next_step = production.find("\n      - name:", upload_start + 1)
+        upload_step = production[upload_start:upload_next_step]
+        self.assertIn("inputs.mode == 'deploy'", production)
         self.assertIn("GH_TOKEN: ${{ github.token }}", upload_step)
         self.assertIn("PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}", upload_step)
 
@@ -2345,9 +2360,13 @@ cleanup
         ]
         self.assertIn("actions: read", production_permissions)
         self.assertIn("contents: read", production_permissions)
-        self.assertIn("statuses: write", production_permissions)
+        self.assertNotIn("statuses: write", production_permissions)
         self.assertNotIn("id-token: write", production_permissions)
         self.assertNotIn("attestations: write", production_permissions)
+        pending_permissions = workflow_job(workflow, "release-status-pending")
+        finalizer_permissions = workflow_job(workflow, "release-finalizer")
+        self.assertIn("statuses: write", pending_permissions)
+        self.assertIn("statuses: write", finalizer_permissions)
         build_permissions = workflow[
             workflow.index("  build-release:") : workflow.index(
                 "    steps:", workflow.index("  build-release:")
