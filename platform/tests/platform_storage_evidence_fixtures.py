@@ -120,3 +120,93 @@ def valid_storage_report() -> bytes:
         )
     )
     return ("\n".join(lines) + "\n").encode()
+
+
+# The maintenance helper at both deployed source SHAs (0700b740 and the
+# deployment-record merge 87547df2) has the same pre-count JSON contract.  The
+# bytes below are a captured ``--json --skip-backup`` result with deterministic
+# clock/disk fixtures; keep the pretty-printed form because the remote command
+# writes it verbatim into the diagnostics frame.
+LEGACY_RETENTION_0700_OUTPUT = b'''{
+  "ok": true,
+  "mode": "dry-run",
+  "started_at_utc": "2026-09-30T12:34:56.123000Z",
+  "completed_at_utc": "2026-09-30T12:34:56.123000Z",
+  "duration_seconds": 0.0,
+  "backup": {
+    "status": "skipped"
+  },
+  "production_releases": {
+    "protected": [
+      "release-current",
+      "release-previous"
+    ],
+    "retained": [],
+    "deleted": [],
+    "reclaimable_bytes": 0
+  },
+  "source_release_artifacts": {
+    "protected": [],
+    "retained": [],
+    "deleted": [],
+    "reclaimable_bytes": 0
+  },
+  "live_qa_runtime_caches": {
+    "protected": [],
+    "retained": [],
+    "deleted": [],
+    "reclaimed_tombstones": [
+      "runtime-old"
+    ]
+  },
+  "transient": {
+    "failed_builds": [
+      ".build-old"
+    ],
+    "browser_test_artifacts": [
+      "test-results-old"
+    ],
+    "preprod_screenshots": [
+      "shot-old.png"
+    ],
+    "reclaimable_bytes": {
+      "failed_builds": 13,
+      "browser_test_artifacts": 17,
+      "preprod_screenshots": 19
+    }
+  },
+  "disk_before": {
+    "total_bytes": 1000000,
+    "used_bytes": 400000,
+    "free_bytes": 600000,
+    "used_percent": 40.0
+  },
+  "disk_after": {
+    "total_bytes": 1000000,
+    "used_bytes": 400000,
+    "free_bytes": 600000,
+    "used_percent": 40.0
+  },
+  "limits": {
+    "minimum_free_bytes": 0,
+    "maximum_used_percent": 100.0,
+    "live_qa_runtime_keep": 1
+  }
+}
+'''
+
+# The helper source at 87547df2 is byte-for-byte identical to the recorded
+# 0700b740 helper; retain a separately named fixture so both provenance checks
+# remain explicit in the regression tests.
+LEGACY_RETENTION_87547_OUTPUT = LEGACY_RETENTION_0700_OUTPUT
+
+
+def legacy_storage_report(retention_output: bytes) -> bytes:
+    """Frame one captured retention result as a complete diagnostics report."""
+
+    prefix, separator, suffix = valid_storage_report().partition(
+        b"=== storage_retention_dry_run ===\n"
+    )
+    if not separator:
+        raise AssertionError("storage fixture is missing the retention frame")
+    return prefix + separator + retention_output
