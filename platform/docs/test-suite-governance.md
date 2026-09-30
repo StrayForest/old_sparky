@@ -345,6 +345,18 @@ immutable build. Smoke and participant runs are separate and sequential; each
 starts fresh API/web processes with `reuseExistingServer: false`, so no
 ambient server, browser or database state is reused.
 
+The secret-bearing automated live-user contour has a separate success
+protocol. `platform_live_user_qa.sh` may write its root-only report only after
+the Playwright command and its exact cleanup both pass;
+`platform_live_user_qa_dispatch.py` validates that report before emitting the
+single nonce-bound `live_user_qa_success` marker. The workflow sanitizer
+accepts no candidate/browser stdout as proof and publishes only its bounded
+value-free projection. The runner drains remote stdout/stderr in fixed chunks,
+retains at most 256 KiB, records the exact SSH exit status and capture
+truncation/error state in a sidecar, and never treats an overflow or long line
+as success. Keep the producer/dispatcher/stream-capture/sanitizer contract
+tests in the platform test suite when this protocol changes.
+
 The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and
 `mobile-layout` viewports. Responsive specs run in that matrix; the explicit
 desktop-only list in the

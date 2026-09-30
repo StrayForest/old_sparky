@@ -9,6 +9,8 @@ SCRIPT_PATH="$TOOLS_DIR/platform_live_user_qa.sh"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 QA_PYTHON="$PLATFORM_ROOT/.venv_platform/bin/python"
 TRUSTED_INSTALL_ROOT="${PLATFORM_LIVE_QA_INSTALL_ROOT:-}"
+SUCCESS_REPORT_PATH="${PLATFORM_LIVE_QA_REPORT_PATH:-}"
+SUCCESS_REPORT_NONCE="${PLATFORM_LIVE_QA_REPORT_NONCE:-}"
 TRUSTED_MODE=0
 if [[ -n "$TRUSTED_INSTALL_ROOT" ]]; then
   TRUSTED_MODE=1
@@ -29,6 +31,12 @@ usage() {
 if [[ "$EUID" -ne 0 ]]; then
   echo "Live-user QA supervisor must run as root." >&2
   exit 1
+fi
+if [[ -n "$SUCCESS_REPORT_PATH" || -n "$SUCCESS_REPORT_NONCE" ]]; then
+  if [[ "$SUCCESS_REPORT_PATH" != /* || ! "$SUCCESS_REPORT_NONCE" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Live-user QA success report handoff is invalid." >&2
+    exit 1
+  fi
 fi
 if [[ "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != "$SCRIPT_PATH" ]]; then
   echo "Live-user QA must run from the fixed root-controlled checkout." >&2
@@ -180,6 +188,73 @@ MARKER="$(
     --state-dir "$QA_STATE_DIR"
 )"
 BROWSER_GATE=""
+PLAYWRIGHT_STATUS=1
+
+write_success_report() {
+  [[ -n "$SUCCESS_REPORT_PATH" ]] || return 0
+  "$SYSTEM_PYTHON" -I -B - "$SUCCESS_REPORT_PATH" "$SUCCESS_REPORT_NONCE" "$SOURCE_COMMIT" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+path = Path(sys.argv[1])
+nonce = sys.argv[2]
+source_sha = sys.argv[3]
+if (
+    not path.is_absolute()
+    or re.fullmatch(r"[0-9a-f]{64}", nonce) is None
+    or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+):
+    raise SystemExit("success report identity is invalid")
+parent = path.parent
+parent_metadata = parent.lstat()
+if (
+    not stat.S_ISDIR(parent_metadata.st_mode)
+    or parent_metadata.st_uid != 0
+    or parent_metadata.st_gid != 0
+    or parent_metadata.st_nlink < 2
+    or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+):
+    raise SystemExit("success report directory is unsafe")
+payload = {
+    "cleanup": "verified",
+    "kind": "live_user_qa_success",
+    "playwright": "passed",
+    "report_nonce": nonce,
+    "schema": 1,
+    "source_sha": source_sha,
+    "status": "passed",
+    "success": True,
+    "test_count": 1,
+}
+encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags, 0o600)
+try:
+    offset = 0
+    while offset < len(encoded):
+        written = os.write(descriptor, encoded[offset:])
+        if written <= 0:
+            raise OSError("success report write made no progress")
+        offset += written
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+metadata = path.lstat()
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != 0
+    or metadata.st_gid != 0
+    or metadata.st_nlink != 1
+    or stat.S_IMODE(metadata.st_mode) != 0o600
+    or metadata.st_size != len(encoded)
+):
+    raise SystemExit("success report metadata is unsafe")
+PY
+}
 
 cleanup() {
   local original_status=$?
@@ -212,6 +287,12 @@ cleanup() {
     echo "Run this exact recovery command after resolving the failure:" >&2
     printf '  PLATFORM_APP_DIR=/opt/oldsparky/platform PLATFORM_LIVE_CSP_QA_BUNDLE=%q %q recover %q\n' \
       "$PLATFORM_LIVE_CSP_QA_BUNDLE" "$SCRIPT_PATH" "$QA_STATE_DIR" >&2
+  fi
+  if (( original_status == 0 && PLAYWRIGHT_STATUS == 0 && cleanup_status == 0 )); then
+    if ! write_success_report; then
+      echo "Live-user QA success report could not be written; refusing success." >&2
+      cleanup_status=1
+    fi
   fi
   if (( original_status != 0 )); then
     exit "$original_status"
@@ -289,3 +370,5 @@ fi
       --config="$RUNTIME_CACHE/web/playwright.live.config.ts" \
       "$RUNTIME_CACHE/web/tests/smoke/live-user-journey.spec.ts" \
       --project=live-desktop
+
+PLAYWRIGHT_STATUS=0

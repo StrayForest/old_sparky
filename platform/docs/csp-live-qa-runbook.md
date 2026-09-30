@@ -199,6 +199,21 @@ Dispatch only after the exact deployed `dev` SHA is confirmed. The workflow
 creates no fixture until the release lock, active-SHA check, host-installed
 supervisor/helper, bundle and browser preflight checks pass.
 
+The automated workflow does not treat Playwright or candidate-process stdout as
+evidence of success. The trusted producer writes one root-only, nonce-bound
+success report only after the browser process exits successfully and exact
+fixture/browser cleanup has completed. The fixed dispatcher validates that
+closed report and emits the single `live_user_qa_success` JSON marker consumed
+by the runner. The runner drains the SSH stream in fixed chunks, retains at
+most 256 KiB, sends excess bytes to `/dev/null`, and records the exact SSH
+exit status plus a root-local capture sidecar. Its sanitizer reads only that
+bounded input and sidecar; write/read errors, a long line, truncation or an
+uncertain transport can never produce a passing report. It accepts exactly
+one marker for its target SHA and nonce, strips the nonce and all remote
+output, and publishes only the bounded sanitized report. A test failure,
+cleanup failure or report-write failure likewise cannot produce a passing
+report.
+
 The launch workflow validates `base_url`, `provision` and the optional marker
 with the canonical bounded-ASCII workflow-input parser before it creates any
 SSH key file or performs keyscan. It hands the accepted values to the remote
