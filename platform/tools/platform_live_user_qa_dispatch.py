@@ -12,11 +12,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+import subprocess
 import stat
 import sys
+import tempfile
 
 
 RUNTIME = Path("/opt/oldsparky/platform")
@@ -55,6 +58,21 @@ CHROMIUM_SANDBOX_RELATIVE = "runtime/browsers/chromium-1228/chrome-linux64/chrom
 CHROMIUM_SANDBOX_SIZE = 15232
 CHROMIUM_SANDBOX_SHA256 = (
     "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
+)
+SUCCESS_REPORT_MAX_BYTES = 8 * 1024
+SUCCESS_REPORT_NONCE_RE = re.compile(r"^[0-9a-f]{64}$")
+SUCCESS_REPORT_FIELDS = frozenset(
+    {
+        "cleanup",
+        "kind",
+        "playwright",
+        "report_nonce",
+        "schema",
+        "source_sha",
+        "status",
+        "success",
+        "test_count",
+    }
 )
 
 
@@ -551,6 +569,147 @@ def _validate_bundle_and_mailbox() -> None:
             raise RuntimeError("live-QA bundle roster password is invalid")
 
 
+def _read_success_report(
+    path: Path,
+    *,
+    target_sha: str,
+    expected_nonce: str,
+) -> dict[str, object]:
+    """Read the producer-owned success report, never the browser stdout.
+
+    The report lives in a root-only temporary directory created by this
+    dispatcher.  The producer writes it only after the Playwright process and
+    its exact database/browser cleanup both pass.  Keeping this as a separate
+    root-owned file means arbitrary candidate/browser output cannot turn into
+    a success signal.
+    """
+
+    if SUCCESS_REPORT_NONCE_RE.fullmatch(expected_nonce) is None:
+        raise RuntimeError("live-user QA success report nonce is invalid")
+    metadata = _regular(path, mode=0o600, maximum=SUCCESS_REPORT_MAX_BYTES)
+    try:
+        raw = _read_bounded_regular(
+            path,
+            metadata=metadata,
+            maximum=SUCCESS_REPORT_MAX_BYTES,
+            mode=0o600,
+        )
+        payload = json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=lambda pairs: _strict_object(pairs),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as exc:
+        raise RuntimeError("live-user QA success report is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != SUCCESS_REPORT_FIELDS
+        or payload.get("schema") != 1
+        or payload.get("kind") != "live_user_qa_success"
+        or payload.get("status") != "passed"
+        or payload.get("success") is not True
+        or payload.get("playwright") != "passed"
+        or payload.get("cleanup") != "verified"
+        or payload.get("test_count") != 1
+        or payload.get("source_sha") != target_sha
+        or payload.get("report_nonce") != expected_nonce
+    ):
+        raise RuntimeError("live-user QA success report contract is invalid")
+    return payload
+
+
+def _remove_success_report_artifacts(report_directory: Path, report_path: Path) -> None:
+    """Remove only the exact dispatcher-owned report objects."""
+
+    try:
+        metadata = report_path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None:
+        _validate_regular_metadata(
+            report_path,
+            metadata,
+            mode=0o600,
+            maximum=SUCCESS_REPORT_MAX_BYTES,
+        )
+        report_path.unlink()
+    try:
+        directory_metadata = report_directory.lstat()
+    except FileNotFoundError:
+        directory_metadata = None
+    if directory_metadata is not None:
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != 0
+            or directory_metadata.st_gid != 0
+            or directory_metadata.st_nlink < 2
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
+            raise RuntimeError("live-user QA success report directory is unsafe")
+        report_directory.rmdir()
+
+
+def _run_user_qa(
+    wrapper: Path,
+    *,
+    payload: Path,
+    target_sha: str,
+    arguments: list[str],
+) -> int:
+    """Run the trusted producer and publish only its closed success report."""
+
+    expected_nonce = os.environ.get("PLATFORM_LIVE_QA_REPORT_NONCE", "")
+    if SUCCESS_REPORT_NONCE_RE.fullmatch(expected_nonce) is None:
+        return 2
+    is_recovery = len(arguments) > 2
+    producer_nonce = secrets.token_hex(32)
+    _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
+    report_directory = Path(
+        tempfile.mkdtemp(prefix=".live-user-qa-report-", dir=TRUSTED_LIVE_QA_ROOT)
+    )
+    report_path = report_directory / "success.json"
+    try:
+        environment = {
+            "HOME": "/root",
+            "LANG": "C.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "PLATFORM_APP_DIR": str(RUNTIME),
+            "PLATFORM_LIVE_CSP_QA_BUNDLE": str(BUNDLE),
+            "PLATFORM_LIVE_QA_TARGET_SHA": target_sha,
+            "PLATFORM_LIVE_QA_INSTALL_ROOT": str(payload),
+            # Keep the runner nonce out of the producer/browser environment.
+            # The producer gets a separate one-time file-binding nonce; the
+            # dispatcher substitutes the runner nonce only after validation.
+            "PLATFORM_LIVE_QA_REPORT_NONCE": producer_nonce,
+            "PLATFORM_LIVE_QA_REPORT_PATH": str(report_path),
+            "PLAYWRIGHT_LIVE_BASE_URL": "https://old-sparky.com",
+        }
+        completed = subprocess.run(
+            [str(wrapper), *arguments[2:]],
+            env=environment,
+            check=False,
+        )
+        status = completed.returncode
+        if status != 0:
+            return status if 0 <= status <= 255 else 1
+        if is_recovery:
+            return 0
+        report = _read_success_report(
+            report_path,
+            target_sha=target_sha,
+            expected_nonce=producer_nonce,
+        )
+        # This is the sole success signal consumed by the runner.  It is
+        # emitted by the dispatcher only after the producer-owned report has
+        # been validated; browser/Playwright stdout is never parsed as proof.
+        marker = {**report, "report_nonce": expected_nonce}
+        print("live_user_qa_success " + json.dumps(marker, sort_keys=True, separators=(",", ":")))
+        return 0
+    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError):
+        return 1
+    finally:
+        _remove_success_report_artifacts(report_directory, report_path)
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     verify_only = len(arguments) == 2 and arguments[0] == "verify"
@@ -602,17 +761,12 @@ def main(argv: list[str] | None = None) -> int:
         _validate_bundle_and_mailbox()
         wrapper = payload / "platform/tools/platform_live_user_qa.sh"
         _regular(wrapper, mode=0o555, maximum=MAX_PAYLOAD_FILE_BYTES)
-        environment = {
-            "HOME": "/root",
-            "LANG": "C.UTF-8",
-            "PATH": "/usr/bin:/bin",
-            "PLATFORM_APP_DIR": str(RUNTIME),
-            "PLATFORM_LIVE_CSP_QA_BUNDLE": str(BUNDLE),
-            "PLATFORM_LIVE_QA_TARGET_SHA": target_sha,
-            "PLAYWRIGHT_LIVE_BASE_URL": "https://old-sparky.com",
-            "PLATFORM_LIVE_QA_INSTALL_ROOT": str(payload),
-        }
-        os.execve(str(wrapper), [str(wrapper), *arguments[2:]], environment)
+        return _run_user_qa(
+            wrapper,
+            payload=payload,
+            target_sha=target_sha,
+            arguments=arguments,
+        )
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError):
         return 1
     return 0
