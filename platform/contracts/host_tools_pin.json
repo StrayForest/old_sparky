@@ -63,10 +63,10 @@
     {
       "mode": 420,
       "path": "platform/tools/platform_storage_evidence_summary.py",
-      "sha256": "a1e3f0c237173f5765d30778891cdb288733b854712f55908f63f569b0e6b0b5"
+      "sha256": "5159625d2e78890804d4855f4da14d4dc7a73d781e9a4c79f27062b7abba6f20"
     }
   ],
-  "host_tools_sha": "f3893377a7b30b2ac59afcc96a33cb2feabd0a17",
+  "host_tools_sha": "d4d79261cb109c759d27d9a9b17abc24ec35d323",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }
