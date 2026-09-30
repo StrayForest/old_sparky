@@ -74,6 +74,14 @@ COMPONENT_FILES = {
     "prepare_artifact": PREPARE_ARTIFACT_FILES,
     "production_deploy_control": PRODUCTION_DEPLOY_CONTROL_FILES,
 }
+# The aggregate contract deliberately excludes ``manifest.json``.  The
+# manifest carries the member records that describe the other files, so
+# including it in the same aggregate would create a self-referential digest.
+# Keep the order canonical for both the sidecar producer and its shell
+# consumer; the complete installed generation adds the separately bound
+# manifest as the fifteenth member.
+HOST_TOOLS_CONTRACT_FILES = tuple(sorted((*HOST_TOOL_FILES, "capabilities.txt")))
+HOST_TOOLS_GENERATION_FILES = tuple(sorted((*HOST_TOOLS_CONTRACT_FILES, "manifest.json")))
 CAPABILITIES = (
     "artifact_prepare",
     "input_guard",
@@ -94,7 +102,7 @@ RENAME_NOREPLACE = 1
 AT_EMPTY_PATH = 0x1000
 AT_FDCWD = -100
 AT_SYMLINK_FOLLOW = 0x400
-HOST_TOOLS_INVENTORY = frozenset((*HOST_TOOL_FILES, "manifest.json", "capabilities.txt"))
+HOST_TOOLS_INVENTORY = frozenset(HOST_TOOLS_GENERATION_FILES)
 MAX_EVIDENCE_BYTES = 64 * 1024
 PROVENANCE_RECEIPT_MAX_BYTES = 64 * 1024
 ATTESTATION_ISSUER = "https://token.actions.githubusercontent.com"
@@ -889,9 +897,9 @@ def _validate_manifest(payload: object, expected_source_sha: str | None) -> dict
     ):
         raise HostToolsBundleError("host-tools limits are invalid")
     records = payload.get("files")
-    if not isinstance(records, list) or len(records) != len(HOST_TOOL_FILES) + 1:
+    if not isinstance(records, list) or len(records) != len(HOST_TOOLS_CONTRACT_FILES):
         raise HostToolsBundleError("host-tools manifest file count is invalid")
-    expected_paths = set(HOST_TOOL_FILES) | {"capabilities.txt"}
+    expected_paths = set(HOST_TOOLS_CONTRACT_FILES)
     actual_paths: set[str] = set()
     for record in records:
         if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
@@ -936,7 +944,7 @@ def _verify_bundle_bytes(
     try:
         with zipfile.ZipFile(BytesIO(bundle_bytes), mode="r", allowZip64=False) as archive:
             infos = archive.infolist()
-            expected_count = len(HOST_TOOL_FILES) + 2
+            expected_count = len(HOST_TOOLS_GENERATION_FILES)
             if len(infos) != expected_count or len(infos) > MAX_FILE_COUNT + 1:
                 raise HostToolsBundleError("host-tools archive member count is invalid")
             members: dict[str, bytes] = {}
@@ -957,7 +965,7 @@ def _verify_bundle_bytes(
     except (OSError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         raise HostToolsBundleError("host-tools archive is invalid") from exc
 
-    expected_members = set(HOST_TOOL_FILES) | {"capabilities.txt", "manifest.json"}
+    expected_members = set(HOST_TOOLS_GENERATION_FILES)
     if set(members) != expected_members:
         raise HostToolsBundleError("host-tools archive member allowlist is invalid")
     if modes.get("manifest.json") != DATA_MODE or modes.get("capabilities.txt") != DATA_MODE:
@@ -1156,6 +1164,8 @@ def _open_input_archive(path: Path) -> tuple[int, int, os.stat_result]:
     if not isinstance(path, Path) or not path.is_absolute() or ".." in path.parts:
         raise HostToolsBundleError("release artifact path is invalid")
     parent_fd, _ = _open_no_symlink_directory(path.parent)
+    descriptor: int | None = None
+    opened = False
     try:
         descriptor = os.open(
             path.name,
@@ -1173,15 +1183,17 @@ def _open_input_archive(path: Path) -> tuple[int, int, os.stat_result]:
             or metadata.st_size > MAX_RELEASE_ARTIFACT_BYTES
             or not _same_identity(metadata, current)
         ):
-            _close_quietly(descriptor)
-            _close_quietly(parent_fd)
             raise HostToolsBundleError("release artifact metadata is unsafe")
+        opened = True
         return parent_fd, descriptor, metadata
     except HostToolsBundleError:
         raise
     except OSError as exc:
-        _close_quietly(parent_fd)
         raise HostToolsBundleError("release artifact cannot be opened") from exc
+    finally:
+        if not opened:
+            _close_quietly(descriptor, scope="release input close")
+            _close_quietly(parent_fd, scope="release input parent close")
 
 
 def _snapshot_input_archive(path: Path) -> tuple[int, str, int]:
@@ -3142,7 +3154,9 @@ def install_bundle(
                 expected_device=host_metadata.st_dev,
             ) is None:
                 raise HostToolsBundleError("host-tools private stage identity changed")
+            _injection_point("install_before_stage_parent_fsync")
             os.fsync(host_fd)
+            _injection_point("install_after_stage_parent_fsync")
             _rename_noreplace(host_fd, stage_name, target_name, stage_identity)
             target_identity = _reconcile_renamed_directory(
                 host_fd,
@@ -3157,7 +3171,9 @@ def install_bundle(
             # The name is now the public generation; cleanup must never treat
             # it as a private stage even if evidence/self-tests fail.
             stage_name = None
+            _injection_point("install_before_parent_fsync")
             os.fsync(host_fd)
+            _injection_point("install_after_parent_fsync")
         else:
             # Existing target adoption is allowed only through the complete
             # verification below.  A foreign generation, symlink, or partial
@@ -3306,6 +3322,11 @@ def write_contract_files(summary: dict[str, object], output_dir: Path) -> None:
     records = manifest["files"]
     if not isinstance(records, list):
         raise HostToolsBundleError("host-tools file summary is invalid")
+    if [record.get("path") for record in records if isinstance(record, dict)] != list(
+        HOST_TOOLS_CONTRACT_FILES
+    ):
+        raise HostToolsBundleError("host-tools contract inventory is invalid")
+    records_by_path = {str(record["path"]): record for record in records}
     parent_fd, parent_metadata = _open_no_symlink_directory(output_dir.parent)
     contract_fd: int | None = None
     contract_metadata: os.stat_result | None = None
@@ -3314,7 +3335,8 @@ def write_contract_files(summary: dict[str, object], output_dir: Path) -> None:
         "manifest.sha256": f"{summary['manifest_sha256']}\n",
         "capabilities.sha256": f"{summary['capabilities_sha256']}\n",
         "files.sha256": "".join(
-            f"{record['sha256']}  {record['path']}\n" for record in records
+            f"{records_by_path[name]['sha256']}  {name}\n"
+            for name in HOST_TOOLS_CONTRACT_FILES
         ),
         "files.modes": "".join(
             # This sidecar is consumed by the shell preflight together with
@@ -3322,7 +3344,8 @@ def write_contract_files(summary: dict[str, object], output_dir: Path) -> None:
             # (444/555).  Keep the JSON manifest's numeric Unix-mode values
             # unchanged; only this line-oriented text contract is formatted
             # for its shell consumer.
-            f"{record['mode']:o}  {record['path']}\n" for record in records
+            f"{records_by_path[name]['mode']:o}  {name}\n"
+            for name in HOST_TOOLS_CONTRACT_FILES
         ),
         "source_sha": f"{manifest['source_sha']}\n",
         "toolset_version": f"{manifest['toolset_version']}\n",

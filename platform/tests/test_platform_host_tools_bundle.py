@@ -469,7 +469,12 @@ class HostToolsBundleTests(unittest.TestCase):
             )
             self.assertEqual(
                 len((contract / "files.sha256").read_text().splitlines()),
-                len(bundle.HOST_TOOL_FILES) + 1,
+                len(bundle.HOST_TOOLS_CONTRACT_FILES),
+            )
+            self.assertNotIn("manifest.json", (contract / "files.sha256").read_text())
+            self.assertEqual(
+                [line.split("  ", 1)[1] for line in (contract / "files.sha256").read_text().splitlines()],
+                list(bundle.HOST_TOOLS_CONTRACT_FILES),
             )
             for contract_file in (
                 "manifest.sha256",
@@ -525,6 +530,7 @@ class HostToolsBundleTests(unittest.TestCase):
             self.assertIsInstance(manifest, dict)
             modes = (contract / "files.modes").read_text(encoding="ascii").splitlines()
             self.assertIn("444  capabilities.txt", modes)
+            self.assertNotIn("manifest.json", modes)
             self.assertTrue(
                 all(
                     line.startswith("555  ")
@@ -1390,6 +1396,8 @@ raise SystemExit(module.main(["host-capabilities"]))
                     #!/usr/bin/env python3
                     import os
                     import hashlib
+                    from pathlib import Path
+                    import stat
                     import sys
 
                     args = sys.argv[1:]
@@ -1399,6 +1407,16 @@ raise SystemExit(module.main(["host-capabilities"]))
                     sys.stdin.buffer.read()
                     host_index = next(index for index, value in enumerate(args) if "@" in value)
                     command = args[host_index + 1:]
+                    remote_generation = os.environ["FAKE_REMOTE_GENERATION"]
+                    local_generation = Path(os.environ["FAKE_GENERATION"])
+
+                    def local_path(path):
+                        if path == remote_generation:
+                            return local_generation
+                        prefix = remote_generation + "/"
+                        assert path.startswith(prefix), path
+                        return local_generation / path.removeprefix(prefix)
+
                     with open(os.environ["FAKE_SSH_LOG"], "a", encoding="ascii") as log:
                         log.write(" ".join(command) + "\\n")
                     if command[:2] == ["/usr/bin/id", "-u"]:
@@ -1407,34 +1425,21 @@ raise SystemExit(module.main(["host-capabilities"]))
                         paths = command[command.index("--") + 1:]
                         format_arg = command[command.index("-c") + 1]
                         for path in paths:
+                            local = local_path(path)
+                            metadata = local.stat()
                             if "%a" in format_arg and "%n" in format_arg:
-                                mode = "444" if path.endswith(("capabilities.txt", "manifest.json")) else "555"
-                                print(mode + "  " + path)
-                            elif path.endswith(os.environ["HOST_TOOLS_SHA"]):
+                                print(f"{stat.S_IMODE(metadata.st_mode):o}  {path}")
+                            elif path == remote_generation:
                                 print("directory:0:0:2:555")
-                            elif path.endswith("capabilities.txt") or path.endswith("manifest.json"):
-                                print("regular file:0:0:1:444")
                             else:
-                                print("regular file:0:0:1:555")
+                                kind = "directory" if local.is_dir() else "regular file"
+                                print(f"{kind}:0:0:1:{stat.S_IMODE(metadata.st_mode):o}")
                     elif command and command[0] == "/usr/bin/sha256sum":
                         paths = command[command.index("--") + 1:]
                         for path in paths:
-                            print(hashlib.sha256(path.encode("ascii")).hexdigest() + "  " + path)
+                            print(hashlib.sha256(local_path(path).read_bytes()).hexdigest() + "  " + path)
                     elif command and command[0] == "/usr/bin/find":
-                        print("\\n".join(sorted([
-                            "capabilities.txt", "manifest.json",
-                            "platform_workflow_remote_dispatch.py",
-                            "platform_workflow_input_guard.py",
-                            "platform_prepare_artifact_dir.py",
-                            "platform_production_deploy_supervisor.sh",
-                            "platform_release_lock.sh", "platform_release_preflight.sh",
-                            "platform_validate_release_artifact.py",
-                            "platform_safe_env_exec.py", "platform_render_service_envs.py",
-                            "platform_validate_edge_policy.py",
-                            "platform_configure_shared_env.py",
-                            "platform_update_cloudflare_ips.py",
-                            "platform_storage_evidence_summary.py",
-                        ])))
+                        print("\\n".join(sorted(path.name for path in local_generation.iterdir())))
                     elif "host-capabilities" in command:
                         sha = os.environ["HOST_TOOLS_SHA"]
                         print(f"HOST_TOOLS schema=1 source_sha={sha} generation={sha} dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1")
@@ -1449,27 +1454,39 @@ raise SystemExit(module.main(["host-capabilities"]))
             fake_ssh.chmod(0o755)
             target_sha = "a" * 40
             host_tools_sha = "b" * 40
-            relative_files = [
-                "capabilities.txt", "manifest.json",
-                "platform_workflow_remote_dispatch.py", "platform_workflow_input_guard.py",
-                "platform_prepare_artifact_dir.py", "platform_production_deploy_supervisor.sh",
-                "platform_release_lock.sh", "platform_release_preflight.sh",
-                "platform_validate_release_artifact.py", "platform_safe_env_exec.py",
-                "platform_render_service_envs.py", "platform_validate_edge_policy.py",
-                "platform_configure_shared_env.py", "platform_update_cloudflare_ips.py",
-                "platform_storage_evidence_summary.py",
+            source = self._source_fixture(root)
+            archive = root / "bundle.zip"
+            bundle.build_bundle(source, host_tools_sha, archive)
+            verified = bundle.verify_bundle(archive, expected_source_sha=host_tools_sha)
+            contract = root / "contract"
+            bundle.write_contract_files(verified, contract)
+            generation = root / "generation"
+            generation.mkdir(mode=0o755)
+            members = verified["members"]
+            self.assertIsInstance(members, dict)
+            for name, data in members.items():
+                path = generation / str(name)
+                path.write_bytes(bytes(data))
+                path.chmod(
+                    bundle.DATA_MODE
+                    if name in {"capabilities.txt", "manifest.json"}
+                    else bundle.EXECUTABLE_MODE
+                )
+            relative_files = list(bundle.HOST_TOOLS_GENERATION_FILES)
+            contract_files = [
+                line.split("  ", 1)[1]
+                for line in (contract / "files.sha256")
+                .read_text(encoding="ascii")
+                .splitlines()
             ]
-            absolute_files = [f"/opt/oldsparky/platform/shared/host-tools/{host_tools_sha}/{name}" for name in relative_files]
-            file_lines = sorted(
-                f"{hashlib.sha256(path.encode('ascii')).hexdigest()}  {name}"
-                for path, name in zip(absolute_files, relative_files)
-            )
-            files_contract_sha = hashlib.sha256(("\n".join(file_lines) + "\n").encode("ascii")).hexdigest()
-            mode_lines = sorted(
-                f"{'444' if name in {'capabilities.txt', 'manifest.json'} else '555'}  {name}"
-                for name in relative_files
-            )
-            modes_contract_sha = hashlib.sha256(("\n".join(mode_lines) + "\n").encode("ascii")).hexdigest()
+            self.assertEqual(contract_files, list(bundle.HOST_TOOLS_CONTRACT_FILES))
+            self.assertNotIn("manifest.json", contract_files)
+            files_contract_sha = hashlib.sha256(
+                (contract / "files.sha256").read_bytes()
+            ).hexdigest()
+            modes_contract_sha = hashlib.sha256(
+                (contract / "files.modes").read_bytes()
+            ).hexdigest()
             environment = {
                 **os.environ,
                 "PATH": f"{fake_bin}:/usr/bin:/bin",
@@ -1483,10 +1500,14 @@ raise SystemExit(module.main(["host-capabilities"]))
                 "HOST_TOOLS_ATTESTATION_RUN_ID": "77",
                 "HOST_TOOLS_ATTESTATION_RUN_ATTEMPT": "1",
                 "HOST_TOOLS_BUNDLE_SHA256": "c" * 64,
-                "HOST_TOOLS_MANIFEST_SHA256": "d" * 64,
-                "HOST_TOOLS_CAPABILITIES_SHA256": "e" * 64,
+                "HOST_TOOLS_MANIFEST_SHA256": str(verified["manifest_sha256"]),
+                "HOST_TOOLS_CAPABILITIES_SHA256": str(verified["capabilities_sha256"]),
                 "HOST_TOOLS_FILES_CONTRACT_SHA256": files_contract_sha,
                 "HOST_TOOLS_MODES_CONTRACT_SHA256": modes_contract_sha,
+                "FAKE_GENERATION": str(generation),
+                "FAKE_REMOTE_GENERATION": (
+                    "/opt/oldsparky/platform/shared/host-tools/" + host_tools_sha
+                ),
                 "GITHUB_RUN_ID": "77",
                 "GITHUB_RUN_ATTEMPT": "1",
                 "FAKE_SSH_LOG": str(log),
@@ -1505,7 +1526,7 @@ raise SystemExit(module.main(["host-capabilities"]))
             self.assertGreaterEqual(sum("host-contract" in call for call in calls), 1)
             stat_calls = [call for call in calls if call.startswith("/usr/bin/stat ")]
             self.assertEqual(len(stat_calls), 17)  # root + 13 scripts + 2 data + mode contract
-            self.assertEqual(sum(call.startswith("/usr/bin/sha256sum ") for call in calls), 1)
+            self.assertEqual(sum(call.startswith("/usr/bin/sha256sum ") for call in calls), 2)
             self.assertEqual(
                 sum("-c %a  %n" in call for call in stat_calls),
                 1,
@@ -1559,7 +1580,11 @@ raise SystemExit(module.main(["host-capabilities"]))
         self.assertIn("test \"$(run_remote /usr/bin/id -u", preflight)
         self.assertIn("stat -c '%F:%u:%g:%h:%a' -- \"$generation\"", preflight)
         self.assertIn("expected_inventory=", preflight)
-        self.assertIn("for expected_file in capabilities.txt manifest.json", preflight)
+        self.assertIn('contract_files=(', preflight)
+        self.assertIn('generation_files=("${contract_files[@]}" manifest.json)', preflight)
+        self.assertIn('for expected_file in "${contract_files[@]}"', preflight)
+        self.assertIn('"$generation/manifest.json"', preflight)
+        self.assertNotIn("for expected_file in capabilities.txt manifest.json", preflight)
         self.assertIn("host-contract", preflight)
         self.assertNotIn("actions/download-artifact@", preflight)
         self.assertNotIn("platform_host_tools_bundle.py", preflight)

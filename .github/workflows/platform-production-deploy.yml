@@ -647,9 +647,18 @@ jobs:
           capabilities_sha256="$(tr -d '[:space:]' < "$contract/capabilities.sha256")"
           files_contract_sha256="$(sha256sum "$contract/files.sha256" | awk '{print $1}')"
           modes_contract_sha256="$(sha256sum "$contract/files.modes" | awk '{print $1}')"
+          test "$(wc -l < "$contract/files.sha256" | tr -d '[:space:]')" = 14
+          test "$(wc -l < "$contract/files.modes" | tr -d '[:space:]')" = 14
+          while read -r expected_digest expected_path; do
+            [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$ ]] || {
+              echo "host-tools files sidecar path is invalid" >&2
+              exit 1
+            }
+          done < "$contract/files.sha256"
           while read -r expected_mode expected_path; do
             [[ "$expected_mode" =~ ^(444|555)$ ]]
-            [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^(capabilities|manifest)\.json$|^(capabilities|manifest)\.txt$ ]] || {
+            [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$ ]] || {
               echo "host-tools mode sidecar path is invalid" >&2
               exit 1
             }
@@ -791,49 +800,46 @@ jobs:
           run_remote() { /usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s "${remote[@]}" "$@"; }
           test "$(run_remote /usr/bin/id -u | tr -d '\r\n')" = 0
           test "$(run_remote /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
-          for expected_file in \
-            platform_workflow_remote_dispatch.py platform_workflow_input_guard.py platform_prepare_artifact_dir.py \
-            platform_production_deploy_supervisor.sh platform_release_lock.sh platform_release_preflight.sh \
-            platform_validate_release_artifact.py platform_safe_env_exec.py platform_render_service_envs.py \
-            platform_validate_edge_policy.py platform_configure_shared_env.py platform_update_cloudflare_ips.py \
-            platform_storage_evidence_summary.py; do
-            remote_file="$generation/$expected_file"
-            test "$(run_remote /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_file")" = "regular file:0:0:1:555"
-          done
-          for expected_file in capabilities.txt manifest.json; do
-            remote_file="$generation/$expected_file"
-            test "$(run_remote /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_file")" = "regular file:0:0:1:444"
-          done
-          inventory="$(run_remote /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
-          expected_inventory="$(
-            printf '%s\n' \
-              platform_workflow_remote_dispatch.py platform_workflow_input_guard.py platform_prepare_artifact_dir.py \
-              platform_production_deploy_supervisor.sh platform_release_lock.sh platform_release_preflight.sh \
-              platform_validate_release_artifact.py platform_safe_env_exec.py platform_render_service_envs.py \
-              platform_validate_edge_policy.py platform_configure_shared_env.py platform_update_cloudflare_ips.py \
-              platform_storage_evidence_summary.py capabilities.txt manifest.json | LC_ALL=C sort
-          )"
-          test "$inventory" = "$expected_inventory"
-          remote_files=(
-            "$generation/capabilities.txt" "$generation/manifest.json"
-            "$generation/platform_workflow_remote_dispatch.py" "$generation/platform_workflow_input_guard.py"
-            "$generation/platform_prepare_artifact_dir.py" "$generation/platform_production_deploy_supervisor.sh"
-            "$generation/platform_release_lock.sh" "$generation/platform_release_preflight.sh"
-            "$generation/platform_validate_release_artifact.py" "$generation/platform_safe_env_exec.py"
-            "$generation/platform_render_service_envs.py" "$generation/platform_validate_edge_policy.py"
-            "$generation/platform_configure_shared_env.py" "$generation/platform_update_cloudflare_ips.py"
-            "$generation/platform_storage_evidence_summary.py"
+          # This is the canonical aggregate-contract inventory: the 13 host
+          # helpers plus capabilities.txt.  manifest.json is the fifteenth
+          # generation member, but its digest is separately bound and must
+          # not enter the aggregate (that would self-reference the manifest).
+          contract_files=(
+            capabilities.txt
+            platform_workflow_remote_dispatch.py platform_workflow_input_guard.py platform_prepare_artifact_dir.py
+            platform_production_deploy_supervisor.sh platform_release_lock.sh platform_release_preflight.sh
+            platform_validate_release_artifact.py platform_safe_env_exec.py platform_render_service_envs.py
+            platform_validate_edge_policy.py platform_configure_shared_env.py platform_update_cloudflare_ips.py
+            platform_storage_evidence_summary.py
           )
+          generation_files=("${contract_files[@]}" manifest.json)
+          for expected_file in "${contract_files[@]}"; do
+            remote_file="$generation/$expected_file"
+            expected_mode=555
+            [[ "$expected_file" = capabilities.txt ]] && expected_mode=444
+            test "$(run_remote /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_file")" = "regular file:0:0:1:$expected_mode"
+          done
+          test "$(run_remote /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/manifest.json")" = "regular file:0:0:1:444"
+          inventory="$(run_remote /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          expected_inventory="$(printf '%s\n' "${generation_files[@]}" | LC_ALL=C sort)"
+          test "$inventory" = "$expected_inventory"
+          remote_files=()
+          for expected_file in "${contract_files[@]}"; do
+            remote_files+=("$generation/$expected_file")
+          done
+          metadata_digests="$(run_remote /usr/bin/sha256sum -- "$generation/manifest.json" "$generation/capabilities.txt")"
+          test "$(printf '%s\n' "$metadata_digests" | awk -v path="$generation/manifest.json" '$2 == path {print $1}')" = "$HOST_TOOLS_MANIFEST_SHA256"
+          test "$(printf '%s\n' "$metadata_digests" | awk -v path="$generation/capabilities.txt" '$2 == path {print $1}')" = "$HOST_TOOLS_CAPABILITIES_SHA256"
           actual_files_contract="$(
             run_remote /usr/bin/sha256sum -- "${remote_files[@]}" |
               /usr/bin/awk -v prefix="$generation/" '{sub(prefix, "", $2); print $1 "  " $2}' |
-              LC_ALL=C /usr/bin/sort | /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
+              LC_ALL=C /usr/bin/sort -k2,2 | /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
           )"
           test "$actual_files_contract" = "$HOST_TOOLS_FILES_CONTRACT_SHA256"
           actual_modes_contract="$(
             run_remote /usr/bin/stat -c '%a  %n' -- "${remote_files[@]}" |
               /usr/bin/awk -v prefix="$generation/" '{sub(prefix, "", $2); print $1 "  " $2}' |
-              LC_ALL=C /usr/bin/sort | /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
+              LC_ALL=C /usr/bin/sort -k2,2 | /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
           )"
           test "$actual_modes_contract" = "$HOST_TOOLS_MODES_CONTRACT_SHA256"
           expected_capabilities="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"

@@ -1760,6 +1760,26 @@ class ReleaseHardeningContractTests(unittest.TestCase):
 
         self.assertGreater(expression_count, 0)
 
+    def test_storage_projector_ulimit_matches_512_kib_contract(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        limit_values = re.findall(r"ulimit -f ([0-9]+)", workflow)
+        self.assertEqual(limit_values, ["512", "512"])
+        self.assertEqual(int(limit_values[0]) * 1024, 512 * 1024)
+        bash = subprocess.run(
+            ["bash", "-c", "ulimit -f 512; ulimit -f"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(bash.stdout.strip(), "512")
+        self.assertIn(
+            "Bash's file-size limit uses 1024-byte blocks. 512 blocks bind",
+            workflow,
+        )
+        self.assertIn("exactly 512 KiB", workflow)
+
     def test_storage_diagnostics_are_read_only(self) -> None:
         workflow = (
             WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
@@ -1793,8 +1813,9 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("timeout --foreground 600s ssh", workflow)
         self.assertIn("--signal=TERM --kill-after=5s 600s ssh", workflow)
         self.assertIn("timeout --foreground --signal=TERM --kill-after=5s 90s", workflow)
-        self.assertIn("ulimit -f 1025", workflow)
-        self.assertIn('test "$(ulimit -f)" = 1025', workflow)
+        self.assertIn("ulimit -f 512", workflow)
+        self.assertIn('test "$(ulimit -f)" = 512', workflow)
+        self.assertNotIn("ulimit -f 1025", workflow)
         self.assertNotIn('exec 9>"$retained_load_lock"', workflow)
         self.assertIn("os.O_RDONLY | os.O_CLOEXEC | getattr(os, \"O_NOFOLLOW\", 0)", workflow)
         self.assertIn("os.O_EXCL", workflow)

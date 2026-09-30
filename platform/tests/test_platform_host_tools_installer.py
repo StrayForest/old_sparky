@@ -8,7 +8,9 @@ from pathlib import Path
 import shlex
 import shutil
 import stat
+import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -225,12 +227,22 @@ class HostToolsInstallerTests(unittest.TestCase):
             original_hook = bundle.INJECTION_HOOK
 
             def interrupt(point: str) -> None:
-                if point in {"linkat_after_success", "outer_extract_after_link"}:
+                if point in {
+                    "linkat_after_success",
+                    "outer_extract_after_link",
+                    "outer_extract_before_parent_fsync",
+                    "outer_extract_after_parent_fsync",
+                }:
                     raise KeyboardInterrupt(point)
 
             bundle.INJECTION_HOOK = interrupt
             try:
-                for point in ("linkat_after_success", "outer_extract_after_link"):
+                for point in (
+                    "linkat_after_success",
+                    "outer_extract_after_link",
+                    "outer_extract_before_parent_fsync",
+                    "outer_extract_after_parent_fsync",
+                ):
                     with self.subTest(point=point):
                         with self.assertRaises(KeyboardInterrupt):
                             bundle.extract_outer_bundle(
@@ -797,6 +809,34 @@ class HostToolsInstallerTests(unittest.TestCase):
             self.assertTrue(generation.is_dir())
             self.assertFalse(any(path.name.startswith(".host-tools-stage-") for path in host_root.iterdir()))
 
+    def test_install_parent_fsync_interrupt_retains_published_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            host_root = work / "host-tools"
+            host_root.mkdir()
+            original_hook = bundle.INJECTION_HOOK
+
+            def interrupt(point: str) -> None:
+                if point in {"install_before_parent_fsync", "install_after_parent_fsync"}:
+                    raise KeyboardInterrupt(point)
+
+            bundle.INJECTION_HOOK = interrupt
+            try:
+                for point in ("install_before_parent_fsync", "install_after_parent_fsync"):
+                    with self.subTest(point=point):
+                        with self.assertRaises(KeyboardInterrupt):
+                            self._install(host_root, work)
+                        generation = host_root / SOURCE_SHA
+                        self.assertTrue(generation.is_dir())
+                        self.assertFalse(
+                            any(path.name.startswith(".host-tools-stage-") for path in host_root.iterdir())
+                        )
+                        # Each subcase starts with the same exact generation;
+                        # remove it before the next fresh publication.
+                        shutil.rmtree(generation)
+            finally:
+                bundle.INJECTION_HOOK = original_hook
+
     def test_stage_name_replacement_is_quarantined_without_foreign_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
@@ -846,6 +886,157 @@ class HostToolsInstallerTests(unittest.TestCase):
             reopened_parent, reopened_lock = bundle._open_install_lock(root)
             bundle._close_quietly(reopened_lock)
             bundle._close_quietly(reopened_parent)
+
+    def test_install_lock_contention_and_release_are_process_level(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "host-tools"
+            root.mkdir()
+            ready_read, ready_write = os.pipe()
+            release_read, release_write = os.pipe()
+            code = """
+import os
+import sys
+from pathlib import Path
+from tools import platform_host_tools_bundle as bundle
+
+root = Path(sys.argv[1])
+ready = int(sys.argv[2])
+release = int(sys.argv[3])
+parent, lock = bundle._open_install_lock(root)
+os.write(ready, b"ready")
+os.read(release, 1)
+bundle._close_quietly(lock)
+bundle._close_quietly(parent)
+"""
+            child = subprocess.Popen(
+                [sys.executable, "-c", code, str(root), str(ready_write), str(release_read)],
+                cwd=Path(__file__).resolve().parents[2],
+                env={
+                    **os.environ,
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "platform"),
+                },
+                pass_fds=(ready_write, release_read),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            os.close(ready_write)
+            os.close(release_read)
+            try:
+                self.assertEqual(os.read(ready_read, len(b"ready")), b"ready")
+                with self.assertRaises(bundle.HostToolsBundleError):
+                    bundle._open_install_lock(root)
+                os.write(release_write, b"x")
+                stdout, stderr = child.communicate(timeout=10)
+                self.assertEqual(child.returncode, 0, stderr or stdout)
+                parent, lock = bundle._open_install_lock(root)
+                bundle._close_quietly(lock)
+                bundle._close_quietly(parent)
+            finally:
+                os.close(ready_read)
+                os.close(release_write)
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+
+    def test_real_rename_noreplace_race_has_one_winner_across_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stages = []
+            for label in ("stage-a", "stage-b"):
+                stage = root / label
+                stage.mkdir(mode=0o700)
+                (stage / "winner").write_text(label, encoding="ascii")
+                stages.append(stage)
+            target = root / "target"
+            start_read, start_write = os.pipe()
+            ready = []
+            results = []
+            code = """
+import os
+import sys
+from pathlib import Path
+from tools import platform_host_tools_bundle as bundle
+
+root, source, target = map(Path, sys.argv[1:4])
+start = int(sys.argv[4])
+ready_fd = int(sys.argv[5])
+result = int(sys.argv[6])
+parent = os.open(root, os.O_RDONLY | bundle._require_os_flag("O_DIRECTORY"))
+os.write(ready_fd, b"ready")
+os.read(start, 1)
+try:
+    bundle._rename_noreplace(parent, source.name, target.name)
+except BaseException as exc:
+    os.write(result, ("error:" + type(exc).__name__ + "\\n").encode("ascii"))
+else:
+    os.write(result, b"ok\\n")
+finally:
+    os.close(parent)
+"""
+            children = []
+            try:
+                for stage in stages:
+                    ready_read, ready_write = os.pipe()
+                    result_read, result_write = os.pipe()
+                    ready.append(ready_read)
+                    results.append(result_read)
+                    child = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            code,
+                            str(root),
+                            str(stage),
+                            str(target),
+                            str(start_read),
+                            str(ready_write),
+                            str(result_write),
+                        ],
+                        cwd=Path(__file__).resolve().parents[2],
+                        env={
+                            **os.environ,
+                            "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "platform"),
+                        },
+                        pass_fds=(start_read, ready_write, result_write),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    children.append(child)
+                    os.close(ready_write)
+                    os.close(result_write)
+                for descriptor in ready:
+                    self.assertEqual(os.read(descriptor, len(b"ready")), b"ready")
+                os.write(start_write, b"xx")
+                reports = [
+                    os.read(descriptor, 128).decode("ascii") for descriptor in results
+                ]
+                for child in children:
+                    stdout, stderr = child.communicate(timeout=10)
+                    self.assertEqual(child.returncode, 0, stderr or stdout)
+                self.assertEqual(sum(report == "ok\n" for report in reports), 1, reports)
+                self.assertEqual(sum(report.startswith("error:") for report in reports), 1, reports)
+                self.assertTrue(target.is_dir())
+                self.assertEqual(
+                    len(tuple(stage for stage in stages if stage.exists())), 1
+                )
+                self.assertEqual(
+                    (target / "winner").read_text(encoding="ascii"),
+                    next(stage.name for stage in stages if not stage.exists()),
+                )
+            finally:
+                os.close(start_read)
+                os.close(start_write)
+                for descriptor in ready + results:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=5)
 
     def test_missing_primitives_and_device_mismatch_fail_closed(self) -> None:
         for name in ("O_DIRECTORY", "O_CLOEXEC", "O_NOFOLLOW", "O_EXCL", "O_TMPFILE"):
@@ -1009,6 +1200,66 @@ class HostToolsTrustedOutputTests(unittest.TestCase):
 
 
 class ReleaseArtifactRawZipTests(unittest.TestCase):
+    def test_open_input_archive_closes_parent_and_input_on_all_open_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "input.zip"
+            archive.write_bytes(b"not a zip")
+            real_open = os.open
+            real_close = os.close
+
+            def exercise(failure: BaseException, *, stat_failure: bool) -> list[int]:
+                parent_fd = real_open(root, os.O_RDONLY | bundle._require_os_flag("O_DIRECTORY"))
+                source_fd = real_open(archive, os.O_RDONLY)
+                parent_metadata = os.fstat(parent_fd)
+                close_calls: list[int] = []
+
+                def fake_open(name: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+                    if name == archive.name and dir_fd == parent_fd:
+                        return source_fd
+                    return real_open(name, flags, mode, dir_fd=dir_fd)
+
+                def counted_close(descriptor: int) -> None:
+                    close_calls.append(descriptor)
+                    real_close(descriptor)
+
+                patches = [
+                    patch.object(
+                        bundle,
+                        "_open_no_symlink_directory",
+                        return_value=(parent_fd, parent_metadata),
+                    ),
+                    patch.object(bundle.os, "open", side_effect=fake_open),
+                    patch.object(bundle.os, "close", side_effect=counted_close),
+                ]
+                if stat_failure:
+                    patches.append(patch.object(bundle.os, "stat", side_effect=failure))
+                else:
+                    patches.append(patch.object(bundle.os, "fstat", side_effect=failure))
+                try:
+                    with patches[0], patches[1], patches[2], patches[3]:
+                        expected_error = (
+                            bundle.HostToolsBundleError
+                            if isinstance(failure, OSError)
+                            else type(failure)
+                        )
+                        with self.assertRaises(expected_error) as raised:
+                            bundle._open_input_archive(archive)
+                        if isinstance(failure, OSError):
+                            self.assertIs(raised.exception.__cause__, failure)
+                        else:
+                            self.assertIs(raised.exception, failure)
+                finally:
+                    # The helper owns both descriptors on every unsuccessful
+                    # path; do not close them a second time in the test.
+                    pass
+                self.assertEqual(sorted(close_calls), sorted([parent_fd, source_fd]))
+                return close_calls
+
+            exercise(OSError("fstat failure"), stat_failure=False)
+            exercise(OSError("stat failure"), stat_failure=True)
+            exercise(KeyboardInterrupt("interrupt"), stat_failure=False)
+
     def _zip_fixture(
         self,
         root: Path,
@@ -1024,6 +1275,50 @@ class ReleaseArtifactRawZipTests(unittest.TestCase):
                     info.create_system = 3
                     info.external_attr = external_attr
                 opened.writestr(info, data)
+        return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    def _mark_member_encrypted(self, archive: Path, member_name: str) -> None:
+        """Set the ZIP encryption flag in both local and central headers."""
+
+        payload = bytearray(archive.read_bytes())
+        for signature, flag_offset, name_offset in (
+            (b"PK\x03\x04", 6, 26),
+            (b"PK\x01\x02", 8, 28),
+        ):
+            cursor = 0
+            found = False
+            while True:
+                cursor = payload.find(signature, cursor)
+                if cursor < 0:
+                    break
+                name_size = struct.unpack_from("<H", payload, cursor + name_offset)[0]
+                name_start = cursor + (30 if signature == b"PK\x03\x04" else 46)
+                name = bytes(payload[name_start : name_start + name_size]).decode("utf-8")
+                if name == member_name:
+                    flags = struct.unpack_from("<H", payload, cursor + flag_offset)[0]
+                    struct.pack_into("<H", payload, cursor + flag_offset, flags | 0x1)
+                    found = True
+                    break
+                cursor += 4
+            self.assertTrue(found, (signature, member_name))
+        archive.write_bytes(payload)
+
+    def _zip64_fixture(self, root: Path, slug: str) -> tuple[Path, str]:
+        archive = root / "release-api-zip64.zip"
+        names = (
+            f"{slug}.tar.gz",
+            f"{slug}.tar.gz.sha256",
+            "RELEASE.provenance.json",
+        )
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=False) as opened:
+            for name in names:
+                info = zipfile.ZipInfo(name)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                if name == names[0]:
+                    # A ZIP64 extra field is explicit even though this small
+                    # fixture does not need ZIP64 sizes.
+                    info.extra = struct.pack("<HHQQ", 0x0001, 16, 0, 0)
+                opened.writestr(info, b"zip64 fixture")
         return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
 
     def test_raw_api_release_zip_round_trip_is_exact_three_member_output(self) -> None:
@@ -1062,6 +1357,39 @@ class ReleaseArtifactRawZipTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual(path.stat().st_uid, os.getuid())
                 self.assertEqual(path.stat().st_gid, os.getgid())
+
+    def test_raw_api_release_zip_rejects_explicit_zip64_and_encrypted_members(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            slug = "gha-777-1-abcdefabcdef"
+            zip64_archive, zip64_digest = self._zip64_fixture(root, slug)
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.extract_release_artifact(
+                    zip64_archive,
+                    root / "release-zip64",
+                    release_slug=slug,
+                    expected_archive_sha256=zip64_digest,
+                )
+
+            names = (
+                f"{slug}.tar.gz",
+                f"{slug}.tar.gz.sha256",
+                "RELEASE.provenance.json",
+            )
+            encrypted_archive, _ = self._zip_fixture(
+                root,
+                slug,
+                [(name, b"encrypted fixture", None) for name in names],
+            )
+            self._mark_member_encrypted(encrypted_archive, names[0])
+            encrypted_digest = hashlib.sha256(encrypted_archive.read_bytes()).hexdigest()
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.extract_release_artifact(
+                    encrypted_archive,
+                    root / "release-encrypted",
+                    release_slug=slug,
+                    expected_archive_sha256=encrypted_digest,
+                )
 
     def test_raw_api_snapshot_survives_same_inode_same_size_source_rewrite(self) -> None:
         """Parsing must consume the fsynced snapshot, never the mutable source fd."""
@@ -1191,24 +1519,35 @@ class ReleaseArtifactRawZipTests(unittest.TestCase):
             original_hook = bundle.INJECTION_HOOK
 
             def interrupt(point: str) -> None:
-                if point == "release_extract_after_rename":
-                    raise KeyboardInterrupt()
+                if point in {
+                    "release_extract_after_rename",
+                    "release_extract_before_parent_fsync",
+                    "release_extract_after_parent_fsync",
+                }:
+                    raise KeyboardInterrupt(point)
 
             bundle.INJECTION_HOOK = interrupt
             try:
-                with self.assertRaises(KeyboardInterrupt):
-                    bundle.extract_release_artifact(
-                        valid_archive,
-                        output,
-                        release_slug=slug,
-                        expected_archive_sha256=valid_digest,
-                    )
+                for point in (
+                    "release_extract_after_rename",
+                    "release_extract_before_parent_fsync",
+                    "release_extract_after_parent_fsync",
+                ):
+                    with self.subTest(point=point):
+                        with self.assertRaises(KeyboardInterrupt):
+                            bundle.extract_release_artifact(
+                                valid_archive,
+                                output,
+                                release_slug=slug,
+                                expected_archive_sha256=valid_digest,
+                            )
+                        self.assertTrue(output.is_dir())
+                        self.assertEqual(
+                            {path.name: path.read_bytes() for path in output.iterdir()}, expected
+                        )
+                        shutil.rmtree(output)
             finally:
                 bundle.INJECTION_HOOK = original_hook
-            self.assertTrue(output.is_dir())
-            self.assertEqual(
-                {path.name: path.read_bytes() for path in output.iterdir()}, expected
-            )
 
 
 class HostToolsOuterEnvelopeTests(unittest.TestCase):

@@ -260,6 +260,13 @@ winner under that lock. The trusted-root assumption covers the root-owned
 parent and lock; a malicious root is outside the helper's detection model,
 while replacement names and foreign inodes are always left untouched.
 
+The generated `files.sha256`/`files.modes` sidecars use one canonical ordered
+14-member aggregate: the 13 executable helpers plus `capabilities.txt`.
+`manifest.json` is the separately bound fifteenth generation member; its own
+digest and mode are checked independently, so the aggregate cannot
+self-reference it. Production preflight derives the same 14-member list for
+remote byte/mode projection and still requires the exact 15-member inventory.
+
 The bounded mode-0600 evidence JSON contains the artifact ID, exact C/E/T/M/
 packaging tuple, all outer/inner/manifest/capability digests, exact inventory and both self-test
 results. A failed or interrupted operation cleans or quarantines only the

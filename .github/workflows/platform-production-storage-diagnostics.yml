@@ -195,8 +195,10 @@ jobs:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
-          ulimit -f 1025 || { echo "Runner file-size limit is unavailable." >&2; exit 125; }
-          test "$(ulimit -f)" = 1025 || { echo "Runner file-size limit was not applied." >&2; exit 125; }
+          # Bash reports RLIMIT_FSIZE in 1024-byte blocks: 512 blocks is
+          # exactly the projector's 512 KiB bounded-input contract.
+          ulimit -f 512 || { echo "Runner file-size limit is unavailable." >&2; exit 125; }
+          test "$(ulimit -f)" = 512 || { echo "Runner file-size limit was not applied." >&2; exit 125; }
           ssh_dir="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh"
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
           mkdir -m 700 -- "$ssh_dir"
@@ -317,12 +319,11 @@ jobs:
           done
           set +e
           (
-            # 1025 filesystem blocks bound each private capture to 524800
-            # bytes. The projector reads one byte beyond its 512 KiB input
-            # limit, so a producer that reaches this ceiling is fail-closed
-            # as truncated instead of filling the runner disk.
-            ulimit -f 1025 || { echo "Runner file-size limit is unavailable." >&2; exit 125; }
-            test "$(ulimit -f)" = 1025 || { echo "Runner file-size limit was not applied." >&2; exit 125; }
+            # Bash's file-size limit uses 1024-byte blocks. 512 blocks bind
+            # each private capture to exactly 512 KiB; the projector reads
+            # one byte beyond that bound and fails closed on truncated JSON.
+            ulimit -f 512 || { echo "Runner file-size limit is unavailable." >&2; exit 125; }
+            test "$(ulimit -f)" = 512 || { echo "Runner file-size limit was not applied." >&2; exit 125; }
             set -o noclobber
             # The canonical bounded form is timeout --foreground 600s ssh;
             # TERM/kill-after options are placed before its duration below.

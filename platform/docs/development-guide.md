@@ -66,6 +66,12 @@ The release artifact keeps a separate owner lock:
 quality/security tooling. They must not be silently substituted for one
 another.
 
+Web dependency security ownership is tracked independently from host-tools
+generation pins. The web lockfile's `brace-expansion` `5.0.12` entry is the
+intentional PR [#130](https://github.com/StrayForest/old_sparky/pull/130)
+supersession and must remain in the final functional change when this work is
+rebased; it must not be split into a pin-only follow-up.
+
 The generator bootstraps its exact hash-locked pip-tools environment from
 [`requirements-ci-locker.lock.txt`](../requirements-ci-locker.lock.txt), so it
 does not depend on an ambient `pip-compile`. Its default mode is a freshness
