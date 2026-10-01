@@ -27,11 +27,16 @@ and are not hidden by an automatic service restart. The API and worker use
 
 The oneshot `Service` sections use an exact reviewed directive allow-list. They
 cannot add `SuccessExitStatus`, restart modifiers, or ignored (`-`) prefixes on
-`ExecStart`, `ExecStartPre`, `ExecStartPost` or `ExecCondition`; condition and
-assertion entries also cannot hide a failure. The contract loader reads each
-unit as a regular, owner/group-matched `0644` file with one hard link, using a
-stable `lstat`/`fstat` identity check. Symlinks, hard links, and replacement
-races are rejected before parsing.
+the effective `ExecStart` list, `ExecStartPre`, `ExecStartPost` or
+`ExecCondition`; an empty `ExecStart=` resets earlier entries, so the final
+effective list must still be non-empty and fail closed. Condition and assertion
+entries also cannot hide a failure. The contract loader holds the unit root by
+an `O_NOFOLLOW` directory descriptor, requires stable pre/post identity and
+enumeration, and opens each unit relative to that descriptor. Each unit must be
+a regular, owner/group-matched `0644` file with one hard link; descriptor
+`fstat` identity includes `mtime_ns` and `ctime_ns`, plus a same-fd digest
+confirmation. Symlinks, hard links, and replacement or in-place mutation races
+are rejected before parsing.
 
 The normal unit installer enables the API, worker and web services plus the
 Cloudflare, health, maintenance and logrotate timers. The maintenance

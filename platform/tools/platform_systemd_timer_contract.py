@@ -10,6 +10,7 @@ tracked unit files and never talks to a systemd manager.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -35,6 +36,23 @@ class UnitFile:
 
     def values(self, section: str, key: str) -> tuple[str, ...]:
         return self.sections.get(section, {}).get(key, ())
+
+    def effective_resettable_values(self, section: str, key: str) -> tuple[str, ...]:
+        """Apply systemd's empty-assignment reset semantics to a list.
+
+        An empty assignment clears all earlier assignments for directives such
+        as ``ExecStart``.  Keeping the raw values lossless while exposing the
+        effective ordered list lets the contract model the manager's behavior
+        instead of treating ``ExecStart=`` as a literal empty command.
+        """
+
+        effective: list[str] = []
+        for value in self.values(section, key):
+            if value == "":
+                effective.clear()
+            else:
+                effective.append(value)
+        return tuple(effective)
 
     def one(self, section: str, key: str) -> str:
         values = self.values(section, key)
@@ -289,12 +307,21 @@ def _metadata(path: Path) -> os.stat_result:
         raise SystemdContractError(f"{path.name}: cannot lstat unit file: {exc}") from exc
 
 
+def _metadata_at(directory_fd: int, path: Path) -> os.stat_result:
+    """Read one directory entry without following a symlink."""
+
+    try:
+        return os.lstat(path.name, dir_fd=directory_fd)
+    except OSError as exc:
+        raise SystemdContractError(f"{path.name}: cannot lstat unit file: {exc}") from exc
+
+
 def _validate_unit_metadata(
     path: Path,
     metadata: os.stat_result,
     root_metadata: os.stat_result,
     *,
-    expected_identity: tuple[int, int, int, int, int, int, int, int] | None = None,
+    expected_identity: tuple[int, ...] | None = None,
 ) -> None:
     """Apply the repository trust boundary to a tracked unit file."""
 
@@ -316,8 +343,8 @@ def _validate_unit_metadata(
         raise SystemdContractError(f"{path.name}: unit file changed while being read")
 
 
-def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int, int]:
-    """Return fields needed to detect replacement during a trusted read."""
+def _identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return fields needed to detect replacement or in-place mutation."""
 
     return (
         metadata.st_dev,
@@ -328,18 +355,23 @@ def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, i
         metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     )
 
 
-def _read_trusted_unit(path: Path, root_metadata: os.stat_result) -> str:
+def _read_trusted_unit(
+    path: Path,
+    root_metadata: os.stat_result,
+    directory_fd: int,
+) -> str:
     """Read one unit through a stable descriptor inside the trust boundary."""
 
-    before = _metadata(path)
+    before = _metadata_at(directory_fd, path)
     _validate_unit_metadata(path, before, root_metadata)
     expected_identity = _identity(before)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path.name, flags, dir_fd=directory_fd)
     except OSError as exc:
         raise SystemdContractError(f"{path.name}: cannot open trusted unit file: {exc}") from exc
     try:
@@ -352,10 +384,24 @@ def _read_trusted_unit(path: Path, root_metadata: os.stat_result) -> str:
                 expected_identity=expected_identity,
             )
             payload = stream.read()
+            payload_digest = hashlib.sha256(payload).digest()
             after_read = os.fstat(stream.fileno())
             _validate_unit_metadata(
                 path,
                 after_read,
+                root_metadata,
+                expected_identity=expected_identity,
+            )
+            stream.seek(0)
+            confirmation = stream.read()
+            if hashlib.sha256(confirmation).digest() != payload_digest:
+                raise SystemdContractError(
+                    f"{path.name}: unit content changed while being read"
+                )
+            after_confirmation = os.fstat(stream.fileno())
+            _validate_unit_metadata(
+                path,
+                after_confirmation,
                 root_metadata,
                 expected_identity=expected_identity,
             )
@@ -364,7 +410,7 @@ def _read_trusted_unit(path: Path, root_metadata: os.stat_result) -> str:
     except OSError as exc:
         raise SystemdContractError(f"{path.name}: cannot read trusted unit file: {exc}") from exc
 
-    after_close = _metadata(path)
+    after_close = _metadata_at(directory_fd, path)
     _validate_unit_metadata(
         path,
         after_close,
@@ -415,33 +461,69 @@ def parse_unit(path: Path, *, text: str | None = None) -> UnitFile:
 def load_units(systemd_root: Path = SYSTEMD_ROOT) -> dict[str, UnitFile]:
     """Load and validate the closed platform unit file set."""
 
-    root_metadata = _metadata(systemd_root)
-    if not stat.S_ISDIR(root_metadata.st_mode):
+    root_path_before = _metadata(systemd_root)
+    if not stat.S_ISDIR(root_path_before.st_mode):
         raise SystemdContractError("systemd unit root must be a directory")
-    paths = sorted(
-        path
-        for path in systemd_root.iterdir()
-        if path.suffix in {".service", ".timer"}
+    root_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
     )
-    names = tuple(path.name for path in paths)
-    expected = set(EXPECTED_UNITS)
-    actual = set(names)
-    if actual != expected:
-        missing = sorted(expected - actual)
-        unexpected = sorted(actual - expected)
+    try:
+        root_fd = os.open(systemd_root, root_flags)
+    except OSError as exc:
         raise SystemdContractError(
-            f"unit inventory mismatch: missing={missing!r} unexpected={unexpected!r}"
+            f"{systemd_root}: cannot open trusted unit root: {exc}"
+        ) from exc
+
+    try:
+        root_metadata = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise SystemdContractError("systemd unit root must be a directory")
+        if _identity(root_metadata) != _identity(root_path_before):
+            raise SystemdContractError("systemd unit root changed while being opened")
+
+        entries_before = tuple(sorted(os.listdir(root_fd)))
+        names = tuple(
+            name
+            for name in entries_before
+            if Path(name).suffix in {".service", ".timer"}
         )
-    if any(not _UNIT_NAME.fullmatch(name) for name in names):
-        raise SystemdContractError("unit inventory contains a non-platform name")
-    units = {
-        path.name: parse_unit(path, text=_read_trusted_unit(path, root_metadata))
-        for path in paths
-    }
-    for unit in units.values():
-        if _FORBIDDEN_MARKERS.search(unit.text):
-            raise SystemdContractError(f"{unit.name}: legacy/sparkydb marker found")
-    return units
+        expected = set(EXPECTED_UNITS)
+        actual = set(names)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            unexpected = sorted(actual - expected)
+            raise SystemdContractError(
+                f"unit inventory mismatch: missing={missing!r} unexpected={unexpected!r}"
+            )
+        if any(not _UNIT_NAME.fullmatch(name) for name in names):
+            raise SystemdContractError("unit inventory contains a non-platform name")
+        paths = tuple(systemd_root / name for name in names)
+        units = {
+            path.name: parse_unit(
+                path,
+                text=_read_trusted_unit(path, root_metadata, root_fd),
+            )
+            for path in paths
+        }
+        for unit in units.values():
+            if _FORBIDDEN_MARKERS.search(unit.text):
+                raise SystemdContractError(f"{unit.name}: legacy/sparkydb marker found")
+
+        root_metadata_after = os.fstat(root_fd)
+        if _identity(root_metadata_after) != _identity(root_metadata):
+            raise SystemdContractError("systemd unit root changed while being read")
+        entries_after = tuple(sorted(os.listdir(root_fd)))
+        if entries_after != entries_before:
+            raise SystemdContractError("systemd unit root enumeration changed while being read")
+        root_path_after = _metadata(systemd_root)
+        if _identity(root_path_after) != _identity(root_metadata):
+            raise SystemdContractError("systemd unit root was replaced while being read")
+        return units
+    finally:
+        os.close(root_fd)
 
 
 def _expect_values(unit: UnitFile, section: str, key: str, expected: Iterable[str]) -> None:
@@ -522,7 +604,10 @@ def validate_failure_policy(units: Mapping[str, UnitFile]) -> None:
                 f"{service_name}: oneshot service must not override SuccessExitStatus"
             )
         for key in _FAIL_HIDING_EXEC_DIRECTIVES:
-            values = service.values("Service", key)
+            if key == "ExecStart":
+                values = service.effective_resettable_values("Service", key)
+            else:
+                values = service.values("Service", key)
             if any(_has_ignored_exec_prefix(value) for value in values):
                 raise SystemdContractError(
                     f"{service_name}: {key} must fail closed (ignored '-' prefix forbidden)"
@@ -541,7 +626,7 @@ def validate_failure_policy(units: Mapping[str, UnitFile]) -> None:
                 f"{service_name}: unexpected oneshot Service directives "
                 f"{sorted(unexpected)!r}"
             )
-        exec_values = service.values("Service", "ExecStart")
+        exec_values = service.effective_resettable_values("Service", "ExecStart")
         if not exec_values or any(_has_ignored_exec_prefix(value) for value in exec_values):
             raise SystemdContractError(
                 f"{service_name}: oneshot ExecStart must fail closed"

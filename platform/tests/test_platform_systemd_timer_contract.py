@@ -144,6 +144,14 @@ class _SystemdInstallerHarness:
             "    raise SystemExit(0)\n"
             "active = state.setdefault('active', {})\n"
             "enabled = state.setdefault('enabled', {})\n"
+            "partial_after = int(os.environ.get('FAKE_SYSTEMCTL_PARTIAL_ENABLE_NOW_AFTER', '0'))\n"
+            "if action == 'enable' and '--now' in args and partial_after > 0:\n"
+            "    for index, unit in enumerate(units, 1):\n"
+            "        enabled[unit] = 'enabled'\n"
+            "        active[unit] = 'active'\n"
+            "        state_path.write_text(json.dumps(state, sort_keys=True))\n"
+            "        if index >= partial_after:\n"
+            "            raise SystemExit(int(os.environ.get('FAKE_SYSTEMCTL_FAIL_RC', '4')))\n"
             "if action == 'stop':\n"
             "    active[units[0]] = 'inactive'\n"
             "elif action == 'start':\n"
@@ -293,10 +301,12 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             replacement_done = False
             original_lstat = contract.os.lstat
 
-            def replace_after_lstat(path: Path) -> os.stat_result:
+            def replace_after_lstat(
+                path: object, *args: object, **kwargs: object
+            ) -> os.stat_result:
                 nonlocal replacement_done
-                metadata = original_lstat(path)
-                if Path(path) == target and not replacement_done:
+                metadata = original_lstat(path, *args, **kwargs)
+                if Path(path).name == target.name and not replacement_done:
                     replacement_done = True
                     target.unlink()
                     target.symlink_to(outside)
@@ -348,7 +358,11 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             def replace_after_open(*args: object, **kwargs: object) -> int:
                 nonlocal replacement_done
                 descriptor = original_open(*args, **kwargs)
-                if Path(args[0]) == target and not replacement_done:
+                if (
+                    Path(args[0]).name == target.name
+                    and kwargs.get("dir_fd") is not None
+                    and not replacement_done
+                ):
                     replacement_done = True
                     target.unlink()
                     target.symlink_to(outside)
@@ -359,6 +373,114 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
                     contract.SystemdContractError, "changed|symlink|hard-linked"
                 ):
                     contract.load_units(root)
+
+    def test_parser_rejects_root_directory_replacement_after_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = parent / "units"
+            root.mkdir()
+            for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                shutil.copy2(source, root / source.name)
+            for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                shutil.copy2(source, root / source.name)
+            replacement = parent / "replacement"
+            replacement.mkdir()
+            for source in root.iterdir():
+                shutil.copy2(source, replacement / source.name)
+
+            original_open = contract.os.open
+            replacement_done = False
+
+            def replace_root_after_open(*args: object, **kwargs: object) -> int:
+                nonlocal replacement_done
+                descriptor = original_open(*args, **kwargs)
+                if (
+                    not replacement_done
+                    and kwargs.get("dir_fd") is None
+                    and Path(args[0]) == root
+                ):
+                    replacement_done = True
+                    root.rename(parent / "original-units")
+                    replacement.rename(root)
+                return descriptor
+
+            with mock.patch.object(contract.os, "open", side_effect=replace_root_after_open):
+                with self.assertRaisesRegex(
+                    contract.SystemdContractError, "root.*replaced|root.*changed"
+                ):
+                    contract.load_units(root)
+
+    def test_parser_rejects_root_directory_enumeration_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                shutil.copy2(source, root / source.name)
+            for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                shutil.copy2(source, root / source.name)
+
+            original_listdir = contract.os.listdir
+            mutated = False
+
+            def mutate_after_first_enumeration(path: object) -> list[str]:
+                nonlocal mutated
+                entries = original_listdir(path)
+                if not mutated and isinstance(path, int):
+                    mutated = True
+                    (root / "transient-not-a-unit.txt").write_text("unexpected", encoding="ascii")
+                return entries
+
+            with mock.patch.object(
+                contract.os, "listdir", side_effect=mutate_after_first_enumeration
+            ):
+                with self.assertRaisesRegex(
+                    contract.SystemdContractError, "root.*(enumeration|changed)"
+                ):
+                    contract.load_units(root)
+
+    def test_parser_rejects_same_size_in_place_mutation_with_restored_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                shutil.copy2(source, root / source.name)
+            for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                shutil.copy2(source, root / source.name)
+
+            target = root / "deadlock-maintenance.timer"
+            before = os.stat(target, follow_symlinks=False)
+            original_open = contract.os.open
+            mutated = False
+
+            def mutate_after_open(*args: object, **kwargs: object) -> int:
+                nonlocal mutated
+                descriptor = original_open(*args, **kwargs)
+                if (
+                    not mutated
+                    and kwargs.get("dir_fd") is not None
+                    and Path(args[0]).name == target.name
+                ):
+                    mutated = True
+                    payload = target.read_bytes()
+                    replacement = payload.replace(b"04:15:00", b"04:16:00", 1)
+                    self.assertEqual(len(replacement), len(payload))
+                    target.write_bytes(replacement)
+                    os.utime(
+                        target,
+                        ns=(before.st_atime_ns, before.st_mtime_ns),
+                        follow_symlinks=False,
+                    )
+                    after = os.stat(target, follow_symlinks=False)
+                    self.assertEqual(after.st_size, before.st_size)
+                    self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+                    self.assertEqual(after.st_ino, before.st_ino)
+                    self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
+                return descriptor
+
+            with mock.patch.object(contract.os, "open", side_effect=mutate_after_open):
+                with self.assertRaisesRegex(
+                    contract.SystemdContractError, "changed while being read"
+                ):
+                    contract.load_units(root)
+            self.assertTrue(mutated)
 
     def test_failure_contract_rejects_oneshot_failure_hiding_mutations(self) -> None:
         mutations = (
@@ -424,6 +546,44 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
                     service.write_text(text, encoding="utf-8")
                     with self.assertRaisesRegex(contract.SystemdContractError, "fail closed"):
                         contract.validate_all(root)
+
+    def test_failure_contract_models_execstart_reset_and_order(self) -> None:
+        cases = (
+            ("ExecStart=\n", False),
+            ("ExecStart=/bin/true\nExecStart=/bin/false\n", True),
+            ("ExecStart=/bin/true\nExecStart=\n", False),
+            ("ExecStart=-/bin/false\nExecStart=\nExecStart=/bin/true\n", True),
+            ("ExecStart=\nExecStart=-/bin/false\n", False),
+        )
+        for addition, valid in cases:
+            with self.subTest(addition=addition, valid=valid):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                        shutil.copy2(source, root / source.name)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                        shutil.copy2(source, root / source.name)
+                    service = root / "deadlock-maintenance.service"
+                    service.write_text(
+                        service.read_text(encoding="utf-8") + addition,
+                        encoding="utf-8",
+                    )
+                    if valid:
+                        units = contract.validate_all(root)
+                        effective = units[service.name].effective_resettable_values(
+                            "Service", "ExecStart"
+                        )
+                        if addition == "ExecStart=/bin/true\nExecStart=/bin/false\n":
+                            self.assertEqual(
+                                effective[-2:], ("/bin/true", "/bin/false")
+                            )
+                        elif addition.startswith("ExecStart=-"):
+                            self.assertEqual(effective, ("/bin/true",))
+                        else:
+                            self.assertGreaterEqual(len(effective), 2)
+                    else:
+                        with self.assertRaisesRegex(contract.SystemdContractError, "ExecStart"):
+                            contract.validate_all(root)
 
     def test_installers_have_closed_enable_sets_and_offsite_is_not_enabled(self) -> None:
         systemd_installer = SYSTEMD_INSTALLER.read_text(encoding="utf-8")
@@ -531,6 +691,51 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
                 {unit: "enabled" for unit in EXPECTED_SYSTEMD_SERVICE_ENABLE},
             )
             self.assertEqual(state["active"], {})
+        finally:
+            harness.close()
+
+    def test_systemd_installer_partial_enable_now_is_fail_visible_and_rolls_back_retired(
+        self,
+    ) -> None:
+        harness = _SystemdInstallerHarness()
+        try:
+            retired = harness.destination / "deadlock-retired.service"
+            retired.write_text("[Unit]\nDescription=retired\n", encoding="ascii")
+            retired.chmod(0o644)
+            harness.state.write_text(
+                json.dumps(
+                    {
+                        "active": {retired.name: "active"},
+                        "enabled": {retired.name: "enabled"},
+                    }
+                ),
+                encoding="ascii",
+            )
+            result = harness.run_systemd(
+                allow_retired=True,
+                FAKE_SYSTEMCTL_PARTIAL_ENABLE_NOW_AFTER="1",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("Installed platform", result.stdout)
+            log = _read_lines(harness.systemctl_log)
+            self.assertIn(
+                ["enable", "--now", *EXPECTED_SYSTEMD_TIMER_ENABLE],
+                log,
+            )
+            self.assertIn(["start", retired.name], log)
+            self.assertIn(["enable", retired.name], log)
+            self.assertTrue(retired.exists())
+            state = json.loads(harness.state.read_text(encoding="utf-8"))
+            self.assertEqual(state["active"][retired.name], "active")
+            self.assertEqual(state["enabled"][retired.name], "enabled")
+            self.assertEqual(
+                state["active"][EXPECTED_SYSTEMD_TIMER_ENABLE[0]], "active"
+            )
+            self.assertEqual(
+                state["enabled"][EXPECTED_SYSTEMD_TIMER_ENABLE[0]], "enabled"
+            )
+            self.assertNotIn(EXPECTED_SYSTEMD_TIMER_ENABLE[1], state["active"])
+            self.assertNotIn(EXPECTED_SYSTEMD_TIMER_ENABLE[1], state["enabled"])
         finally:
             harness.close()
 
