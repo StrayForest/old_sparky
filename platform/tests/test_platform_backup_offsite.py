@@ -21,6 +21,24 @@ offsite = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = offsite
 SPEC.loader.exec_module(offsite)
 
+MANIFEST_SCRIPT_PATH = REPO_ROOT / "platform" / "tools" / "platform_backup_manifest.py"
+MANIFEST_SPEC = importlib.util.spec_from_file_location(
+    "platform_backup_manifest_for_tests", MANIFEST_SCRIPT_PATH
+)
+assert MANIFEST_SPEC is not None and MANIFEST_SPEC.loader is not None
+manifest_contract = importlib.util.module_from_spec(MANIFEST_SPEC)
+sys.modules[MANIFEST_SPEC.name] = manifest_contract
+MANIFEST_SPEC.loader.exec_module(manifest_contract)
+
+RESTORE_SCRIPT_PATH = REPO_ROOT / "platform" / "tools" / "platform_backup_restore_drill.py"
+RESTORE_SPEC = importlib.util.spec_from_file_location(
+    "platform_backup_restore_drill_for_offsite_tests", RESTORE_SCRIPT_PATH
+)
+assert RESTORE_SPEC is not None and RESTORE_SPEC.loader is not None
+backup_creator = importlib.util.module_from_spec(RESTORE_SPEC)
+sys.modules[RESTORE_SPEC.name] = backup_creator
+RESTORE_SPEC.loader.exec_module(backup_creator)
+
 
 FINGERPRINT = "A" * 40
 R2_ENDPOINT = f"https://{'a' * 32}.r2.cloudflarestorage.com"
@@ -62,21 +80,24 @@ def _platform_env(**overrides: str) -> str:
 
 def _create_verified_backup(directory: Path) -> tuple[Path, Path]:
     now = dt.datetime.now(dt.UTC)
-    dump = directory / f"platformdb-{now:%Y%m%dT%H%M%SZ}.dump"
+    run_id = "a" * 32
+    dump = directory / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{run_id}.dump"
     _write_private(dump, b"PGDMP restore-verified payload")
     manifest = dump.with_suffix(".json")
-    metadata = {
-        "format_version": 2,
-        "database": "platformdb",
-        "schema": "platform",
-        "dump_file": dump.name,
-        "size_bytes": dump.stat().st_size,
-        "sha256": hashlib.sha256(dump.read_bytes()).hexdigest(),
-        "completed_at_utc": now.isoformat().replace("+00:00", "Z"),
-        "restore_verified": True,
-        "alembic_revision_verified": True,
-    }
-    _write_private(manifest, json.dumps(metadata))
+    metadata = manifest_contract.build_manifest(
+        run_id=run_id,
+        dump_file=dump.name,
+        size_bytes=dump.stat().st_size,
+        sha256=hashlib.sha256(dump.read_bytes()).hexdigest(),
+        started_at_utc=now,
+        completed_at_utc=now,
+        duration_seconds=0,
+        restore_verified=True,
+        alembic_revision_verified=True,
+        restored_table_count=31,
+        restore_error=None,
+    )
+    _write_private(manifest, json.dumps(metadata, indent=2) + "\n")
     return dump, manifest
 
 
@@ -133,6 +154,92 @@ class RecordingStorageClient:
 
 
 class PlatformBackupOffsiteTests(unittest.TestCase):
+    def test_actual_creator_manifest_is_consumed_by_offsite_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            env_path = root / ".env.platform"
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            args = argparse.Namespace(
+                env_file=str(env_path),
+                output_dir=str(output_dir),
+                keep=2,
+                admin_database_url=None,
+                dump_only=False,
+            )
+
+            def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                if command[0] == "pg_dump":
+                    dump_path = Path(command[command.index("--file") + 1])
+                    dump_path.write_bytes(b"PGDMP creator output")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.dict(
+                    backup_creator.os.environ,
+                    {"PLATFORM_DATABASE_URL": "postgresql://platform_user@127.0.0.1/platformdb"},
+                    clear=False,
+                ),
+                mock.patch.object(backup_creator, "load_env", return_value={"PLATFORM_DATABASE_URL": "postgresql://platform_user@127.0.0.1/platformdb"}),
+                mock.patch.object(backup_creator, "require_commands"),
+                mock.patch.object(backup_creator, "run_command", side_effect=fake_run_command),
+                mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
+            ):
+                created = backup_creator.create_backup(args)
+
+            selected = offsite.select_verified_backup(
+                output_dir, None, max_age_hours=24, apply=False
+            )
+
+            self.assertTrue(created["restore_verified"])
+            self.assertEqual(created["schemas"], ["platform", "public"])
+            self.assertEqual(selected.dump_path.name, created["dump_file"])
+            self.assertEqual(selected.plaintext_sha256, created["sha256"])
+
+    def test_same_second_creator_runs_have_distinct_run_ids_and_archive_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            fixed_now = dt.datetime(2026, 10, 1, 12, 0, 0, tzinfo=dt.UTC)
+            args = argparse.Namespace(
+                env_file=str(root / ".env.platform"),
+                output_dir=str(output_dir),
+                keep=2,
+                admin_database_url=None,
+                dump_only=False,
+            )
+
+            def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                if command[0] == "pg_dump":
+                    Path(command[command.index("--file") + 1]).write_bytes(b"PGDMP same second")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.dict(
+                    backup_creator.os.environ,
+                    {"PLATFORM_DATABASE_URL": "postgresql://platform_user@127.0.0.1/platformdb"},
+                    clear=False,
+                ),
+                mock.patch.object(backup_creator, "load_env", return_value={"PLATFORM_DATABASE_URL": "postgresql://platform_user@127.0.0.1/platformdb"}),
+                mock.patch.object(backup_creator, "require_commands"),
+                mock.patch.object(backup_creator, "run_command", side_effect=fake_run_command),
+                mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
+                mock.patch.object(backup_creator, "utc_now", return_value=fixed_now),
+            ):
+                first = backup_creator.create_backup(args)
+                second = backup_creator.create_backup(args)
+
+            self.assertNotEqual(first["run_id"], second["run_id"])
+            self.assertEqual(len(tuple(output_dir.glob("*.dump"))), 2)
+            self.assertEqual(len(tuple(output_dir.glob("*.json"))), 2)
+            for result in (first, second):
+                dump = output_dir / result["dump_file"]
+                metadata = dump.with_suffix(".json")
+                self.assertTrue(dump.exists())
+                self.assertTrue(metadata.exists())
+                self.assertEqual(json.loads(metadata.read_text())["run_id"], result["run_id"])
+
     def test_load_config_requires_private_separate_r2_contour(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

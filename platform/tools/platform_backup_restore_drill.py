@@ -12,13 +12,46 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
+import uuid
 from typing import Any
+
+try:
+    from .platform_backup_manifest import (
+        BackupManifestError,
+        REQUIRED_EXTENSIONS,
+        build_manifest,
+        read_private_prefix,
+        read_manifest_file,
+        sha256_private_file,
+        write_manifest,
+    )
+except ImportError:  # Direct execution from the tools directory.
+    try:
+        from tools.platform_backup_manifest import (
+            BackupManifestError,
+            REQUIRED_EXTENSIONS,
+            build_manifest,
+            read_private_prefix,
+            read_manifest_file,
+            sha256_private_file,
+            write_manifest,
+        )
+    except ImportError:
+        from platform_backup_manifest import (  # type: ignore[no-redef]
+            BackupManifestError,
+            REQUIRED_EXTENSIONS,
+            build_manifest,
+            read_private_prefix,
+            read_manifest_file,
+            sha256_private_file,
+            write_manifest,
+        )
 
 
 DEFAULT_ENV_FILE = pathlib.Path("/opt/oldsparky/platform/shared/.env.platform")
 DEFAULT_OUTPUT_DIR = pathlib.Path("/opt/oldsparky/platform/shared/backups")
 LOCAL_DATABASE_HOSTS = {None, "", "127.0.0.1", "localhost", "::1"}
-REQUIRED_PLATFORM_EXTENSIONS = ("pg_trgm",)
+REQUIRED_PLATFORM_EXTENSIONS = REQUIRED_EXTENSIONS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -152,17 +185,24 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def _fsync_directory(path: pathlib.Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
 
 
-def parse_utc_timestamp(value: str) -> dt.datetime:
-    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.UTC)
-
-
 def newest_metadata(output_dir: pathlib.Path) -> pathlib.Path:
-    candidates = sorted(output_dir.glob("platformdb-*.json"), key=lambda path: path.stat().st_mtime)
+    candidates = sorted(
+        output_dir.glob("platformdb-*.json"),
+        key=lambda path: (path.stat().st_mtime_ns, path.name),
+    )
     if not candidates:
         raise RuntimeError(f"No retained platform backup metadata found in {output_dir}.")
     return candidates[-1]
@@ -172,37 +212,54 @@ def check_latest_backup(output_dir: pathlib.Path, *, max_age_hours: float) -> di
     if max_age_hours <= 0:
         raise ValueError("--max-age-hours must be positive.")
     metadata_path = newest_metadata(output_dir)
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if not metadata.get("restore_verified"):
+    try:
+        manifest_file = read_manifest_file(
+            metadata_path,
+            expected_owner=os.geteuid(),
+            expected_group=os.getegid(),
+            expected_dump_file=metadata_path.with_suffix(".dump").name,
+        )
+    except BackupManifestError as exc:
+        raise RuntimeError(
+            f"Latest platform backup manifest is invalid: {metadata_path}: {exc}"
+        ) from exc
+    manifest = manifest_file.manifest
+    if not manifest.restore_verified:
         raise RuntimeError(f"Latest platform backup was not restore-verified: {metadata_path}.")
-    if int(metadata.get("format_version") or 1) >= 2 and not metadata.get(
-        "alembic_revision_verified"
-    ):
+    if not manifest.alembic_revision_verified:
         raise RuntimeError(f"Latest platform backup did not verify Alembic state: {metadata_path}.")
-    completed_at = parse_utc_timestamp(str(metadata["completed_at_utc"]))
+    completed_at = manifest.completed_at_utc
     age_hours = (utc_now() - completed_at).total_seconds() / 3600
     if age_hours > max_age_hours:
         raise RuntimeError(
             f"Latest restore-verified platform backup is {age_hours:.2f} hours old; "
             f"maximum is {max_age_hours:.2f}."
         )
-    dump_path = output_dir / str(metadata["dump_file"])
-    if not dump_path.is_file():
-        raise RuntimeError(f"Backup archive referenced by metadata is missing: {dump_path}.")
-    actual_sha256 = sha256_file(dump_path)
-    if actual_sha256 != metadata.get("sha256"):
+    dump_path = output_dir / manifest.dump_file
+    try:
+        actual_sha256, dump_stat = sha256_private_file(
+            dump_path,
+            label="Platform backup dump",
+            expected_owner=os.geteuid(),
+            expected_group=os.getegid(),
+        )
+    except BackupManifestError as exc:
+        raise RuntimeError(f"Backup archive referenced by metadata is invalid: {dump_path}.") from exc
+    if actual_sha256 != manifest.sha256:
         raise RuntimeError(f"Backup archive checksum does not match metadata: {dump_path}.")
+    if dump_stat.st_size != manifest.size_bytes:
+        raise RuntimeError(f"Backup archive size does not match metadata: {dump_path}.")
     return {
         "ok": True,
         "metadata_file": str(metadata_path),
         "dump_file": str(dump_path),
         "age_hours": round(age_hours, 3),
-        "format_version": int(metadata.get("format_version") or 1),
+        "format_version": manifest.format_version,
         "restore_verified": True,
-        "alembic_revision_verified": bool(
-            metadata.get("alembic_revision_verified")
-        ),
-        "restored_table_count": metadata.get("restored_table_count"),
+        "alembic_revision_verified": manifest.alembic_revision_verified,
+        "restored_table_count": manifest.restored_table_count,
+        "run_id": manifest.run_id,
+        "schemas": list(manifest.schemas),
         "sha256": actual_sha256,
     }
 
@@ -256,17 +313,29 @@ def prune_unverified_backups(
         if metadata_path == preserve_metadata:
             continue
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            manifest_file = read_manifest_file(
+                metadata_path,
+                expected_owner=os.geteuid(),
+                expected_group=os.getegid(),
+                expected_dump_file=metadata_path.with_suffix(".dump").name,
+            )
+        except BackupManifestError:
             continue
-        if metadata.get("restore_verified"):
+        if manifest_file.manifest.restore_verified:
             continue
-        dump_file = metadata.get("dump_file")
-        if isinstance(dump_file, str):
-            dump_path = output_dir / dump_file
-            if dump_path.exists():
-                dump_path.unlink()
-                removed.append(str(dump_path))
+        dump_path = output_dir / manifest_file.manifest.dump_file
+        try:
+            read_private_prefix(
+                dump_path,
+                label="Unverified platform backup dump",
+                expected_owner=os.geteuid(),
+                expected_group=os.getegid(),
+                prefix_bytes=0,
+            )
+        except BackupManifestError:
+            continue
+        dump_path.unlink()
+        removed.append(str(dump_path))
         metadata_path.unlink()
         removed.append(str(metadata_path))
     return removed
@@ -414,6 +483,29 @@ def require_commands(*commands: str) -> None:
         raise RuntimeError(f"Missing required PostgreSQL command(s): {', '.join(missing)}")
 
 
+def _new_backup_identity(
+    output_dir: pathlib.Path,
+    timestamp_slug: str,
+) -> tuple[str, pathlib.Path, pathlib.Path]:
+    for _ in range(8):
+        run_id = uuid.uuid4().hex
+        dump_path = output_dir / f"platformdb-{timestamp_slug}-{run_id}.dump"
+        metadata_path = dump_path.with_suffix(".json")
+        try:
+            dump_path.lstat()
+            dump_exists = True
+        except FileNotFoundError:
+            dump_exists = False
+        try:
+            metadata_path.lstat()
+            metadata_exists = True
+        except FileNotFoundError:
+            metadata_exists = False
+        if not dump_exists and not metadata_exists:
+            return run_id, dump_path, metadata_path
+    raise RuntimeError("Could not allocate a unique platform backup run_id.")
+
+
 def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     env_file = pathlib.Path(args.env_file)
     output_dir = pathlib.Path(args.output_dir)
@@ -434,9 +526,11 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = utc_now()
     timestamp_slug = timestamp.strftime("%Y%m%dT%H%M%SZ")
-    dump_path = output_dir / f"platformdb-{timestamp_slug}.dump"
+    # The timestamp is human-readable ordering metadata only.  The run ID is
+    # the identity boundary that prevents same-second creators from sharing a
+    # dump or manifest path.
+    run_id, dump_path, metadata_path = _new_backup_identity(output_dir, timestamp_slug)
     temporary_dump_path = output_dir / f".{dump_path.name}.{os.getpid()}.tmp"
-    metadata_path = dump_path.with_suffix(".json")
     started_at = utc_now()
     restore_verified = False
     restored_table_count: int | None = None
@@ -460,8 +554,11 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         if not temporary_dump_path.is_file() or temporary_dump_path.stat().st_size <= 0:
             raise RuntimeError("pg_dump did not produce a non-empty archive.")
         run_command(["pg_restore", "--list", str(temporary_dump_path)], capture_output=True)
+        temporary_dump_path.chmod(0o600)
+        with temporary_dump_path.open("rb") as dump_handle:
+            os.fsync(dump_handle.fileno())
         temporary_dump_path.replace(dump_path)
-        dump_path.chmod(0o600)
+        _fsync_directory(output_dir)
 
         if not args.dump_only:
             try:
@@ -476,24 +573,20 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                 restore_error = str(exc)
 
         completed_at = utc_now()
-        metadata: dict[str, Any] = {
-            "format_version": 2,
-            "database": app_target.database,
-            "schemas": ["platform", "public"],
-            "required_extensions": list(REQUIRED_PLATFORM_EXTENSIONS),
-            "dump_file": dump_path.name,
-            "size_bytes": dump_path.stat().st_size,
-            "sha256": sha256_file(dump_path),
-            "started_at_utc": started_at.isoformat().replace("+00:00", "Z"),
-            "completed_at_utc": completed_at.isoformat().replace("+00:00", "Z"),
-            "duration_seconds": round((completed_at - started_at).total_seconds(), 3),
-            "restore_verified": restore_verified,
-            "alembic_revision_verified": restore_verified,
-            "restored_table_count": restored_table_count,
-            "restore_error": restore_error,
-        }
-        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-        metadata_path.chmod(0o600)
+        metadata = build_manifest(
+            run_id=run_id,
+            dump_file=dump_path.name,
+            size_bytes=dump_path.stat().st_size,
+            sha256=sha256_file(dump_path),
+            started_at_utc=started_at,
+            completed_at_utc=completed_at,
+            duration_seconds=round((completed_at - started_at).total_seconds(), 3),
+            restore_verified=restore_verified,
+            alembic_revision_verified=restore_verified,
+            restored_table_count=restored_table_count,
+            restore_error=restore_error,
+        )
+        write_manifest(metadata_path, metadata)
         removed: list[str] = []
         if restore_verified:
             removed.extend(prune_unverified_backups(output_dir, preserve_metadata=metadata_path))

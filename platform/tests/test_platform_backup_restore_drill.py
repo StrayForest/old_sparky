@@ -21,6 +21,15 @@ backup_drill = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = backup_drill
 SPEC.loader.exec_module(backup_drill)
 
+MANIFEST_SCRIPT_PATH = REPO_ROOT / "platform" / "tools" / "platform_backup_manifest.py"
+MANIFEST_SPEC = importlib.util.spec_from_file_location(
+    "platform_backup_manifest_for_restore_tests", MANIFEST_SCRIPT_PATH
+)
+assert MANIFEST_SPEC is not None and MANIFEST_SPEC.loader is not None
+manifest_contract = importlib.util.module_from_spec(MANIFEST_SPEC)
+sys.modules[MANIFEST_SPEC.name] = manifest_contract
+MANIFEST_SPEC.loader.exec_module(manifest_contract)
+
 
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def test_parse_database_url_accepts_platformdb_and_decodes_credentials(self) -> None:
@@ -94,21 +103,31 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
-            dump_path = output_dir / "platformdb-20260714T120000Z.dump"
+            now = dt.datetime.now(dt.UTC)
+            run_id = "b" * 32
+            dump_path = output_dir / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{run_id}.dump"
             dump_path.write_bytes(b"custom-format-backup")
+            dump_path.chmod(0o600)
             metadata_path = dump_path.with_suffix(".json")
             metadata_path.write_text(
                 json.dumps(
-                    {
-                        "dump_file": dump_path.name,
-                        "sha256": hashlib.sha256(dump_path.read_bytes()).hexdigest(),
-                        "completed_at_utc": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
-                        "restore_verified": True,
-                        "restored_table_count": 31,
-                    }
+                    manifest_contract.build_manifest(
+                        run_id=run_id,
+                        dump_file=dump_path.name,
+                        size_bytes=dump_path.stat().st_size,
+                        sha256=hashlib.sha256(dump_path.read_bytes()).hexdigest(),
+                        started_at_utc=now,
+                        completed_at_utc=now,
+                        duration_seconds=0,
+                        restore_verified=True,
+                        alembic_revision_verified=True,
+                        restored_table_count=31,
+                        restore_error=None,
+                    )
                 ),
                 encoding="utf-8",
             )
+            metadata_path.chmod(0o600)
 
             result = backup_drill.check_latest_backup(output_dir, max_age_hours=24)
 
@@ -118,19 +137,30 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def test_check_latest_cli_rejects_unverified_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
-            dump_path = output_dir / "platformdb-20260714T120000Z.dump"
+            now = dt.datetime.now(dt.UTC)
+            run_id = "c" * 32
+            dump_path = output_dir / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{run_id}.dump"
             dump_path.write_bytes(b"custom-format-backup")
+            dump_path.chmod(0o600)
             dump_path.with_suffix(".json").write_text(
                 json.dumps(
-                    {
-                        "dump_file": dump_path.name,
-                        "sha256": hashlib.sha256(dump_path.read_bytes()).hexdigest(),
-                        "completed_at_utc": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
-                        "restore_verified": False,
-                    }
+                    manifest_contract.build_manifest(
+                        run_id=run_id,
+                        dump_file=dump_path.name,
+                        size_bytes=dump_path.stat().st_size,
+                        sha256=hashlib.sha256(dump_path.read_bytes()).hexdigest(),
+                        started_at_utc=now,
+                        completed_at_utc=now,
+                        duration_seconds=0,
+                        restore_verified=False,
+                        alembic_revision_verified=False,
+                        restored_table_count=None,
+                        restore_error="restore not run",
+                    )
                 ),
                 encoding="utf-8",
             )
+            dump_path.with_suffix(".json").chmod(0o600)
 
             result = subprocess.run(
                 [
@@ -151,20 +181,37 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def test_prune_unverified_backups_keeps_verified_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
-            verified_dump = output_dir / "platformdb-verified.dump"
-            failed_dump = output_dir / "platformdb-failed.dump"
+            now = dt.datetime.now(dt.UTC)
+            verified_dump = output_dir / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{'e' * 32}.dump"
+            failed_dump = output_dir / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{'f' * 32}.dump"
             verified_dump.write_bytes(b"verified")
             failed_dump.write_bytes(b"failed")
+            for dump_path, run_id, restore_verified in (
+                (verified_dump, "e" * 32, True),
+                (failed_dump, "f" * 32, False),
+            ):
+                dump_path.chmod(0o600)
+                dump_path.with_suffix(".json").write_text(
+                    json.dumps(
+                        manifest_contract.build_manifest(
+                            run_id=run_id,
+                            dump_file=dump_path.name,
+                            size_bytes=dump_path.stat().st_size,
+                            sha256=hashlib.sha256(dump_path.read_bytes()).hexdigest(),
+                            started_at_utc=now,
+                            completed_at_utc=now,
+                            duration_seconds=0,
+                            restore_verified=restore_verified,
+                            alembic_revision_verified=restore_verified,
+                            restored_table_count=1 if restore_verified else None,
+                            restore_error=None if restore_verified else "restore failed",
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                dump_path.with_suffix(".json").chmod(0o600)
             verified_metadata = verified_dump.with_suffix(".json")
             failed_metadata = failed_dump.with_suffix(".json")
-            verified_metadata.write_text(
-                json.dumps({"dump_file": verified_dump.name, "restore_verified": True}),
-                encoding="utf-8",
-            )
-            failed_metadata.write_text(
-                json.dumps({"dump_file": failed_dump.name, "restore_verified": False}),
-                encoding="utf-8",
-            )
 
             removed = backup_drill.prune_unverified_backups(
                 output_dir,
