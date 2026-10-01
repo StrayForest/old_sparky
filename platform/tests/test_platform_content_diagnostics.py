@@ -8,7 +8,8 @@ import sys
 import tempfile
 import unittest
 
-from tools.platform_content_diagnostics import canonical_detail
+from tools import platform_content_diagnostics as diagnostics
+from tools.platform_content_diagnostics import canonical_detail, canonical_section_projection
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -99,6 +100,8 @@ class PlatformContentDiagnosticsTests(unittest.TestCase):
         self.assertIn("platform_workflow_input_guard.py sha", workflow)
         self.assertIn("trusted_source_sha", workflow)
         self.assertIn("--expected-sha \"$target_sha\"", workflow)
+        self.assertIn("helper_entries", workflow)
+        self.assertIn("test ! -L \"$helper_dir\"", workflow)
         self.assertNotIn("github.event_name == 'workflow_dispatch' && github.sha", workflow)
 
     def test_verify_subprocess_emits_one_closed_summary(self) -> None:
@@ -121,42 +124,125 @@ class PlatformContentDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_verify_fails_closed_on_stable_field_or_section_parity_mismatch(self) -> None:
-        for mutation in ("field", "order", "kind"):
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                changed = _detail()
-                if mutation == "field":
-                    changed["content"] = "secretly different content"
-                elif mutation == "order":
-                    changed["sections"] = list(reversed(changed["sections"]))
-                else:
-                    changed["sections"][1]["kind"] = "item"
-                    changed["sections"][1]["hero_name"] = None
-                    changed["sections"][1]["item_name"] = "Abrams"
-                    changed["sections"][1]["item_category"] = "weapon"
-                    changed["sections"][1]["abilities"] = []
-                self._write_inputs(root, details=[_detail(), changed, _detail()])
-                result = self._run(
-                    "verify",
-                    "--home",
-                    str(root / "home.json"),
-                    "--internal",
-                    str(root / "internal.json"),
-                    "--internal-api",
-                    str(root / "internal-api.json"),
-                    "--public-api",
-                    str(root / "public-api.json"),
+        for source_index in range(3):
+            for mutation in ("field", "order", "kind", "count"):
+                with self.subTest(source_index=source_index, mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    changed = _detail()
+                    if mutation == "field":
+                        if source_index == 0:
+                            changed["sections"][1]["title"] = "Different Abrams"
+                        else:
+                            changed["content"] = "secretly different content"
+                    elif mutation == "order":
+                        changed["sections"] = list(reversed(changed["sections"]))
+                    elif mutation == "kind":
+                        changed["sections"][1]["kind"] = "item"
+                        changed["sections"][1]["hero_name"] = None
+                        changed["sections"][1]["item_name"] = "Abrams"
+                        changed["sections"][1]["item_category"] = "weapon"
+                        changed["sections"][1]["abilities"] = []
+                    else:
+                        changed["sections"] = changed["sections"][:1]
+                    details = [_detail(), _detail(), _detail()]
+                    details[source_index] = changed
+                    self._write_inputs(root, details=details)
+                    result = self._run(
+                        "verify",
+                        "--home",
+                        str(root / "home.json"),
+                        "--internal",
+                        str(root / "internal.json"),
+                        "--internal-api",
+                        str(root / "internal-api.json"),
+                        "--public-api",
+                        str(root / "public-api.json"),
+                    )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [
+                        "PRODUCTION_PATCH_DISTRIBUTION schema=1 status=failed "
+                        "error_class=parity latest_patch_id=unavailable "
+                        "internal_section_count=0 internal_api_section_count=0 "
+                        "public_api_section_count=0"
+                    ],
                 )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(
-                result.stdout.splitlines(),
-                [
-                    "PRODUCTION_PATCH_DISTRIBUTION schema=1 status=failed "
-                    "error_class=parity latest_patch_id=unavailable "
-                    "internal_section_count=0 internal_api_section_count=0 "
-                    "public_api_section_count=0"
-                ],
+
+    def test_verify_rejects_unknown_fields_at_every_untrusted_projection_boundary(self) -> None:
+        cases: list[tuple[str, object]] = []
+        home = _home()
+        home["secret"] = "do-not-retain"
+        cases.append(("home", home))
+        detail = _detail()
+        detail["secret"] = "do-not-retain"
+        cases.append(("detail", detail))
+        section_detail = _detail()
+        section_detail["sections"][0]["secret"] = "do-not-retain"
+        cases.append(("section", section_detail))
+        ability_detail = _detail()
+        ability_detail["sections"][1]["abilities"][0]["secret"] = "do-not-retain"
+        cases.append(("ability", ability_detail))
+        for name, hostile in cases:
+            if name == "home":
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    self._write_inputs(root, home=hostile)
+                    result = self._run(
+                        "verify",
+                        "--home",
+                        str(root / "home.json"),
+                        "--internal",
+                        str(root / "internal.json"),
+                        "--internal-api",
+                        str(root / "internal-api.json"),
+                        "--public-api",
+                        str(root / "public-api.json"),
+                    )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("error_class=producer", result.stdout)
+                continue
+            for source_index in range(3):
+                with self.subTest(name=name, source_index=source_index), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    details = [_detail(), _detail(), _detail()]
+                    details[source_index] = hostile
+                    self._write_inputs(root, details=details)
+                    result = self._run(
+                        "verify",
+                        "--home",
+                        str(root / "home.json"),
+                        "--internal",
+                        str(root / "internal.json"),
+                        "--internal-api",
+                        str(root / "internal-api.json"),
+                        "--public-api",
+                        str(root / "public-api.json"),
+                    )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("error_class=producer", result.stdout)
+
+    def test_verify_allows_translation_only_cache_differences_but_keeps_api_parity(self) -> None:
+        translated = _detail(content="Damage increased")
+        translated["sections"][0]["changes"] = ["Урон увеличен"]
+        translated["sections"][1]["changes"] = ["Здоровье увеличено"]
+        translated["sections"][1]["abilities"][0]["changes"] = ["Перезарядка сокращена"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_inputs(root, details=[_detail(), translated, translated])
+            result = self._run(
+                "verify",
+                "--home",
+                str(root / "home.json"),
+                "--internal",
+                str(root / "internal.json"),
+                "--internal-api",
+                str(root / "internal-api.json"),
+                "--public-api",
+                str(root / "public-api.json"),
             )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [PASSING_SUMMARY])
 
     def test_verify_rejects_empty_false_status_and_malformed_latest_patch(self) -> None:
         for home in (
@@ -184,6 +270,7 @@ class PlatformContentDiagnosticsTests(unittest.TestCase):
     def test_summary_parser_rejects_duplicate_malformed_failed_and_nonzero(self) -> None:
         cases = (
             (PASSING_SUMMARY + "\n" + PASSING_SUMMARY, "malformed", 0),
+            (PASSING_SUMMARY + "\r\n", "malformed", 0),
             ("not a production summary", "malformed", 0),
             (PASSING_SUMMARY, "remote_or_transport", 7),
             (
@@ -322,8 +409,43 @@ class PlatformContentDiagnosticsTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("error_class=artifact", result.stdout)
 
+    def test_evidence_writer_rejects_open_artifact_schema(self) -> None:
+        payload = diagnostics.evidence_payload(
+            target_sha="a" * 40,
+            event="workflow_dispatch",
+            run_id="44",
+            run_attempt="1",
+            patch_outcome="success",
+            patch_summary=PASSING_SUMMARY,
+            content_outcome="success",
+        )
+        payload["secret"] = "must-not-be-retained"
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(diagnostics.DiagnosticsFailure) as context:
+                diagnostics._write_secure_json(Path(temporary) / "aggregate.json", payload)
+        self.assertEqual(context.exception.error_class, "artifact")
+
+    def test_translation_free_owner_is_explicit_and_workflow_does_not_use_normal_refresh(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-content-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("tools/platform_refresh_content_distribution.sh", workflow)
+        self.assertNotIn("tools/platform_refresh_home_content.sh", workflow)
+        self.assertNotIn("refresh_home_content(force=True)", workflow)
+        owner_tool = (
+            REPO_ROOT / "platform/tools/platform_refresh_content_distribution.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("home_content_security.refresh_content_distribution(force=True)", owner_tool)
+        self.assertNotIn("ensure_patch_translation_records", owner_tool)
+        self.assertNotIn("Celery", owner_tool)
+        self.assertNotIn("OpenAI", owner_tool)
+
     def test_canonical_projection_contains_all_stable_public_fields(self) -> None:
         projection = canonical_detail(_detail())
+        self.assertEqual(
+            canonical_section_projection(_detail()["sections"]),
+            projection["sections"],
+        )
         self.assertEqual(
             set(projection["sections"][0]),
             {

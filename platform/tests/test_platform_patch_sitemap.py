@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import builtins
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -189,6 +190,13 @@ class PatchSitemapProjectionTests(PlatformIsolatedAsyncioTestCase):
         register = AsyncMock(side_effect=AssertionError("diagnostics must not register translations"))
         request_openai = AsyncMock(side_effect=AssertionError("diagnostics must not call OpenAI"))
         enqueue = Mock(side_effect=AssertionError("diagnostics must not enqueue Celery work"))
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "celery" or name.startswith("openai"):
+                raise AssertionError("diagnostics must not import Celery/OpenAI")
+            return real_import(name, *args, **kwargs)
+
         with (
             patch.object(home_content_security, "redis_client", return_value=cache),
             patch.object(home_content_security, "get_settings", return_value=settings),
@@ -199,6 +207,7 @@ class PatchSitemapProjectionTests(PlatformIsolatedAsyncioTestCase):
             patch.object(patch_translation, "ensure_patch_translation_records", new=register),
             patch.object(patch_translation_runtime, "_enqueue_translation_task", new=enqueue),
             patch.object(patch_translation_runtime, "_request_openai", new=request_openai),
+            patch.object(builtins, "__import__", side_effect=guarded_import),
         ):
             payload = await home_content_security.refresh_content_distribution(force=True)
 

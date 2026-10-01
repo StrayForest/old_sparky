@@ -97,8 +97,13 @@ jobs:
           set -euo pipefail
           helper_dir="$RUNNER_TEMP/platform-content-diagnostics-helper"
           install -d -m 700 "$helper_dir"
+          test -f platform/tools/platform_content_diagnostics.py
+          test ! -L platform/tools/platform_content_diagnostics.py
           install -m 600 platform/tools/platform_content_diagnostics.py \
             "$helper_dir/platform_content_diagnostics.py"
+          test -f "$helper_dir/platform_content_diagnostics.py"
+          test ! -L "$helper_dir/platform_content_diagnostics.py"
+          test "$(stat -c '%a' "$helper_dir/platform_content_diagnostics.py")" = 600
           digest="$(sha256sum "$helper_dir/platform_content_diagnostics.py" | awk '{print $1}')"
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
@@ -295,6 +300,11 @@ jobs:
           EXPECTED_HELPER_DIGEST: ${{ needs.validate-content-provenance.outputs.trusted_helper_digest }}
         run: |
           set -euo pipefail
+          helper_dir="$RUNNER_TEMP/platform-content-diagnostics-helper"
+          test -d "$helper_dir" && test ! -L "$helper_dir"
+          mapfile -t helper_entries < <(find "$helper_dir" -mindepth 1 -maxdepth 1 -print)
+          test "${#helper_entries[@]}" -eq 1
+          test "${helper_entries[0]}" = "$DIAGNOSTICS_TOOL"
           test -f "$DIAGNOSTICS_TOOL" && test ! -L "$DIAGNOSTICS_TOOL"
           chmod 600 "$DIAGNOSTICS_TOOL"
           actual_digest="$(sha256sum "$DIAGNOSTICS_TOOL" | awk '{print $1}')"
@@ -586,7 +596,7 @@ jobs:
           PY
 
           echo '=== Forced home content refresh ==='
-          tools/platform_refresh_home_content.sh >/dev/null 2>/dev/null
+          tools/platform_refresh_content_distribution.sh >/dev/null 2>/dev/null
 
           echo '=== Local API home content and live page shape ==='
           "$python_bin" - <<'PY'

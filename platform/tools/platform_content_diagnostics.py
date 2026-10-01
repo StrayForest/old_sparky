@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
@@ -33,7 +33,6 @@ SUMMARY_RE = re.compile(
     r"internal_api_section_count=(?P<internal_api_section_count>[0-9]+) "
     r"public_api_section_count=(?P<public_api_section_count>[0-9]+)$"
 )
-STATUSES = frozenset({"passed", "failed"})
 ERROR_CLASSES = frozenset(
     {
         "none",
@@ -50,6 +49,57 @@ OUTCOMES = frozenset({"success", "failure", "cancelled", "skipped", "unknown"})
 SECTION_KINDS = frozenset({"general", "objective", "item", "hero"})
 ITEM_CATEGORIES = frozenset({"weapon", "vitality", "spirit"})
 OBJECTIVE_KEYS = frozenset({"urn", "unstable_rift"})
+HOME_FIELDS = frozenset(
+    {"patches", "videos", "generated_at", "patches_available", "videos_available"}
+)
+HOME_PATCH_FIELDS = frozenset({"id", "title", "excerpt", "published_at", "url"})
+DETAIL_FIELDS = frozenset(
+    {"id", "title", "published_at", "url", "content", "sections"}
+)
+SECTION_FIELDS = frozenset(
+    {
+        "kind",
+        "title",
+        "hero_name",
+        "item_name",
+        "item_category",
+        "item_icon_url",
+        "objective_key",
+        "objective_icon_url",
+        "changes",
+        "abilities",
+    }
+)
+ABILITY_FIELDS = frozenset({"name", "icon_url", "changes"})
+SECTION_STABLE_FIELDS = (
+    "kind",
+    "title",
+    "hero_name",
+    "item_name",
+    "item_category",
+    "item_icon_url",
+    "objective_key",
+    "objective_icon_url",
+)
+ABILITY_STABLE_FIELDS = ("name", "icon_url")
+EVIDENCE_FIELDS = frozenset(
+    {
+        "schema",
+        "kind",
+        "status",
+        "error_class",
+        "event",
+        "run_id",
+        "run_attempt",
+        "target_sha",
+        "patch_distribution_status",
+        "content_status",
+        "latest_patch_id",
+        "internal_section_count",
+        "internal_api_section_count",
+        "public_api_section_count",
+    }
+)
 
 
 class DiagnosticsFailure(ValueError):
@@ -69,6 +119,15 @@ def _mapping(value: object) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         _fail("producer")
     return value
+
+
+def _closed_mapping(value: object, allowed: frozenset[str]) -> Mapping[str, Any]:
+    """Accept only the fields owned by the diagnostic contract."""
+
+    source = _mapping(value)
+    if any(not isinstance(key, str) or key not in allowed for key in source):
+        _fail("producer")
+    return source
 
 
 def _required_string(
@@ -104,8 +163,19 @@ def _string_list(
     return list(candidate)
 
 
+def _canonical_published_at(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        _fail("producer")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC)
+        return parsed.isoformat().replace("+00:00", "Z")
+    return parsed.isoformat()
+
+
 def _canonical_ability(value: object) -> dict[str, Any]:
-    source = _mapping(value)
+    source = _closed_mapping(value, ABILITY_FIELDS)
     name = _required_string(source, "name", max_length=120)
     icon_url = _optional_string(source, "icon_url", max_length=1000)
     changes = _string_list(source, "changes", max_items=100, max_length=30_000)
@@ -113,7 +183,7 @@ def _canonical_ability(value: object) -> dict[str, Any]:
 
 
 def _canonical_section(value: object) -> dict[str, Any]:
-    source = _mapping(value)
+    source = _closed_mapping(value, SECTION_FIELDS)
     kind = source.get("kind")
     if not isinstance(kind, str) or kind not in SECTION_KINDS:
         _fail("producer")
@@ -179,10 +249,33 @@ def _canonical_section(value: object) -> dict[str, Any]:
     }
 
 
+def canonical_section_projection(value: object) -> list[dict[str, Any]]:
+    """Return the closed, ordered public projection of patch sections."""
+
+    if not isinstance(value, list) or not value or len(value) > 100:
+        _fail("producer")
+    return [_canonical_section(item) for item in value]
+
+
+def _stable_section_projection(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project non-translated section identity shared by cache and APIs."""
+
+    return [
+        {
+            **{field: section[field] for field in SECTION_STABLE_FIELDS},
+            "abilities": [
+                {field: ability[field] for field in ABILITY_STABLE_FIELDS}
+                for ability in section["abilities"]
+            ],
+        }
+        for section in sections
+    ]
+
+
 def canonical_detail(value: object, *, expected_id: str | None = None) -> dict[str, Any]:
     """Return the exact stable public projection of a patch detail."""
 
-    source = _mapping(value)
+    source = _closed_mapping(value, DETAIL_FIELDS)
     patch_id = _required_string(source, "id", max_length=32)
     if PATCH_ID_RE.fullmatch(patch_id) is None:
         _fail("producer")
@@ -190,16 +283,10 @@ def canonical_detail(value: object, *, expected_id: str | None = None) -> dict[s
         _fail("parity")
     title = _required_string(source, "title", max_length=180)
     published_at = _required_string(source, "published_at", max_length=128)
-    try:
-        datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        _fail("producer")
+    published_at = _canonical_published_at(published_at)
     url = _required_string(source, "url", max_length=1000, nonempty=False)
     content = _required_string(source, "content", max_length=30_000, nonempty=False)
-    sections_source = source.get("sections")
-    if not isinstance(sections_source, list) or not sections_source or len(sections_source) > 100:
-        _fail("producer")
-    sections = [_canonical_section(item) for item in sections_source]
+    sections = canonical_section_projection(source.get("sections"))
     return {
         "id": patch_id,
         "title": title,
@@ -211,13 +298,21 @@ def canonical_detail(value: object, *, expected_id: str | None = None) -> dict[s
 
 
 def _latest_patch_id(home_payload: object) -> str:
-    source = _mapping(home_payload)
+    source = _closed_mapping(home_payload, HOME_FIELDS)
     if source.get("patches_available") is not True:
         _fail("producer")
-    patches = source.get("patches")
-    if not isinstance(patches, list) or not patches:
+    if "videos" in source and not isinstance(source["videos"], list):
         _fail("producer")
-    latest = _mapping(patches[0])
+    if "generated_at" in source and not isinstance(source["generated_at"], str):
+        _fail("producer")
+    if "videos_available" in source and not isinstance(source["videos_available"], bool):
+        _fail("producer")
+    patches = source.get("patches")
+    if not isinstance(patches, list) or not patches or len(patches) > 4:
+        _fail("producer")
+    for patch in patches:
+        _closed_mapping(patch, HOME_PATCH_FIELDS)
+    latest = _closed_mapping(patches[0], HOME_PATCH_FIELDS)
     patch_id = latest.get("id")
     if not isinstance(patch_id, str) or PATCH_ID_RE.fullmatch(patch_id) is None:
         _fail("producer")
@@ -239,12 +334,9 @@ def validate_distribution(
     public_projection = canonical_detail(public_api_detail, expected_id=patch_id)
     if internal_projection != public_projection:
         _fail("parity")
-    section_counts = {
-        len(cached_projection["sections"]),
-        len(internal_projection["sections"]),
-        len(public_projection["sections"]),
-    }
-    if len(section_counts) != 1:
+    if _stable_section_projection(cached_projection["sections"]) != _stable_section_projection(
+        internal_projection["sections"]
+    ):
         _fail("parity")
     section_count = len(internal_projection["sections"])
     if section_count <= 0:
@@ -296,7 +388,7 @@ def parse_summary_line(line: str, *, require_passed: bool = False) -> dict[str, 
     }
     if record["status"] == "passed":
         if error_class != "none" or record["latest_patch_id"] == "unavailable" or any(
-            count <= 0 for count in counts.values()
+            count <= 0 or count > 100 for count in counts.values()
         ) or len(set(counts.values())) != 1:
             _fail("status")
     elif error_class == "none" or record["latest_patch_id"] != "unavailable" or any(
@@ -313,10 +405,15 @@ def parse_summary_text(
 ) -> str:
     """Validate one output line and its process status, returning canonical text."""
 
-    lines = text.splitlines()
-    if len(lines) != 1:
+    if not isinstance(text, str) or "\r" in text:
         _fail("malformed")
-    record = parse_summary_line(lines[0], require_passed=require_passed)
+    if text.endswith("\n"):
+        line = text[:-1]
+    else:
+        line = text
+    if not line or "\n" in line:
+        _fail("malformed")
+    record = parse_summary_line(line, require_passed=require_passed)
     if exit_code != 0:
         _fail("remote_or_transport")
     return _format_record(record)
@@ -358,10 +455,8 @@ def evidence_payload(
     safe_patch_outcome = patch_outcome if patch_outcome in OUTCOMES else "unknown"
     safe_content_outcome = content_outcome if content_outcome in OUTCOMES else "unknown"
     try:
-        summary_lines = patch_summary.splitlines()
-        if len(summary_lines) != 1:
-            _fail("malformed")
-        record = parse_summary_line(summary_lines[0], require_passed=False)
+        canonical_summary = parse_summary_text(patch_summary)
+        record = parse_summary_line(canonical_summary, require_passed=False)
     except DiagnosticsFailure:
         record = None
     passed = (
@@ -394,7 +489,74 @@ def evidence_payload(
 
 def _write_secure_json(path: Path, payload: Mapping[str, Any]) -> None:
     parent = path.parent
-    if not parent.is_dir() or parent.is_symlink():
+    try:
+        parent_info = os.lstat(parent)
+    except OSError:
+        _fail("artifact")
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        _fail("artifact")
+    if not isinstance(payload, Mapping) or set(payload) != EVIDENCE_FIELDS:
+        _fail("artifact")
+    if (
+        payload.get("schema") != SCHEMA
+        or payload.get("kind") != "platform_content_diagnostics"
+        or payload.get("status") not in {"passed", "failed"}
+        or payload.get("error_class") not in {"none", "diagnostic_failed"}
+        or (payload.get("status") == "passed") != (payload.get("error_class") == "none")
+        or payload.get("event") not in {"workflow_dispatch", "workflow_run", "unavailable"}
+        or payload.get("patch_distribution_status") not in OUTCOMES
+        or payload.get("content_status") not in OUTCOMES
+        or (
+            payload.get("target_sha") != "unavailable"
+            and re.fullmatch(r"[0-9a-f]{40}", str(payload.get("target_sha"))) is None
+        )
+        or (
+            payload.get("latest_patch_id") != "unavailable"
+            and PATCH_ID_RE.fullmatch(str(payload.get("latest_patch_id"))) is None
+        )
+    ):
+        _fail("artifact")
+    for field in (
+        "run_id",
+        "run_attempt",
+        "internal_section_count",
+        "internal_api_section_count",
+        "public_api_section_count",
+    ):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 10**32:
+            _fail("artifact")
+    if payload["status"] == "passed":
+        if (
+            payload["event"] == "unavailable"
+            or payload["target_sha"] == "unavailable"
+            or payload["run_id"] <= 0
+            or payload["run_attempt"] <= 0
+            or payload["patch_distribution_status"] != "success"
+            or payload["content_status"] != "success"
+            or payload["latest_patch_id"] == "unavailable"
+            or min(
+                payload["internal_section_count"],
+                payload["internal_api_section_count"],
+                payload["public_api_section_count"],
+            )
+            <= 0
+            or len(
+                {
+                    payload["internal_section_count"],
+                    payload["internal_api_section_count"],
+                    payload["public_api_section_count"],
+                }
+            )
+            != 1
+        ):
+            _fail("artifact")
+    elif (
+        payload["latest_patch_id"] != "unavailable"
+        or payload["internal_section_count"] != 0
+        or payload["internal_api_section_count"] != 0
+        or payload["public_api_section_count"] != 0
+    ):
         _fail("artifact")
     if os.path.lexists(path):
         info = os.lstat(path)
@@ -420,9 +582,14 @@ def _write_secure_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 def _read_json(path: Path) -> object:
     try:
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            _fail("artifact")
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         _fail("remote_or_transport")
+    except DiagnosticsFailure:
+        raise
     except (OSError, UnicodeError, ValueError):
         _fail("producer")
 
@@ -486,7 +653,8 @@ def main(argv: list[str] | None = None) -> int:
             print(line)
             return 0
         if args.command == "parse-summary":
-            text = args.file.read_text(encoding="utf-8")
+            with args.file.open("r", encoding="utf-8", newline="") as stream:
+                text = stream.read()
             print(
                 parse_summary_text(
                     text,
