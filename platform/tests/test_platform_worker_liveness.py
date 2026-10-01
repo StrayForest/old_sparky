@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -110,6 +111,25 @@ def _identity(root: Path) -> liveness.RunIdentity:
 
 
 class WorkerLivenessHelperTests(unittest.TestCase):
+    def test_spawn_guard_restores_signal_mask(self) -> None:
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        calls: list[int] = []
+        seen_mask: set[signal.Signals] = set()
+        real_pthread_sigmask = signal.pthread_sigmask
+
+        def record(how: int, mask: object):
+            calls.append(how)
+            return real_pthread_sigmask(how, mask)
+
+        with mock.patch.object(liveness.signal, "pthread_sigmask", side_effect=record):
+            with liveness._SpawnGuard():
+                seen_mask = real_pthread_sigmask(signal.SIG_BLOCK, set())
+        after = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        self.assertEqual(before, after)
+        self.assertEqual(calls, [signal.SIG_BLOCK, signal.SIG_SETMASK])
+        self.assertTrue(set(liveness.SPAWN_BLOCKED_SIGNALS).issubset(seen_mask))
+
     def test_task_ids_are_bounded_and_unique_under_concurrency(self) -> None:
         self.assertLessEqual(liveness.MAX_SECONDS, 15.0)
         self.assertLess(
@@ -250,7 +270,12 @@ class WorkerLivenessHelperTests(unittest.TestCase):
         encoded = json.dumps(events, separators=(",", ":"))
         holder: dict[str, object] = {}
 
-        def spawn(_identity: liveness.RunIdentity, _task_id: str, _deadline: float):
+        def spawn(
+            _identity: liveness.RunIdentity,
+            _task_id: str,
+            _deadline: float,
+            **spawn_kwargs: object,
+        ):
             read_fd, write_fd = os.pipe()
             os.set_inheritable(write_fd, True)
             script = textwrap.dedent(
@@ -283,13 +308,14 @@ class WorkerLivenessHelperTests(unittest.TestCase):
                 start_new_session=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                preexec_fn=spawn_kwargs.get("preexec_fn"),
             )
             os.close(write_fd)
             holder["process"] = process
             holder["pgid"] = os.getpgid(process.pid)
             return process, read_fd
 
-        return spawn, holder
+        return liveness._trusted_spawn_factory(spawn), holder
 
     def _spawn_cleanup_control_child(
         self,
@@ -313,10 +339,11 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             _key: str | bytes,
             _result_url: str,
             deadline: float,
+            **spawn_kwargs: object,
         ):
-            return spawn(_identity, "cleanup", deadline)
+            return spawn(_identity, "cleanup", deadline, **spawn_kwargs)
 
-        return cleanup_spawn, holder
+        return liveness._trusted_spawn_factory(cleanup_spawn), holder
 
     def test_parent_forgets_exact_key_and_proves_success(self) -> None:
         task_id = "platform-release-ping-" + "b" * 32
@@ -449,7 +476,7 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             mock.patch.dict(sys.modules, {"redis": redis_module}),
             mock.patch.dict(os.environ, self._parent_env(), clear=False),
             mock.patch.object(liveness, "_new_task_id", return_value=task_id),
-            mock.patch.object(liveness, "CHILD_WORK_SECONDS", 0.1),
+            mock.patch.object(liveness, "CHILD_WORK_SECONDS", 0.5),
             mock.patch.object(liveness, "CHILD_STOP_GRACE_SECONDS", 0.05),
             mock.patch.object(liveness, "CHILD_KILL_GRACE_SECONDS", 0.05),
         ):
@@ -487,7 +514,7 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             mock.patch.object(liveness, "_load_worker_environment"),
             mock.patch.dict(os.environ, self._parent_env(), clear=False),
             mock.patch.object(liveness, "_new_task_id", return_value=task_id),
-            mock.patch.object(liveness, "CHILD_WORK_SECONDS", 0.1),
+            mock.patch.object(liveness, "CHILD_WORK_SECONDS", 0.5),
             mock.patch.object(liveness, "CHILD_STOP_GRACE_SECONDS", 0.05),
             mock.patch.object(liveness, "CHILD_KILL_GRACE_SECONDS", 0.05),
         ):
@@ -669,6 +696,72 @@ class WorkerLivenessHelperTests(unittest.TestCase):
         self.assertIsNotNone(holder["process"].poll())
         self.assertIsNotNone(cleanup_holder["process"].poll())
         self.assertFalse(liveness._group_exists(holder["pgid"]))
+
+    def test_post_registration_cancellation_finalizes_group(self) -> None:
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exception_type=exception_type):
+                task_id = "platform-release-ping-" + "6" * 32
+                spawn, holder = self._spawn_control_child(
+                    [],
+                    fork_descendant=True,
+                )
+                cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
+
+                def cancel_after_registration(
+                    stage: str,
+                    _process: subprocess.Popen[bytes],
+                    _pgid: int | None,
+                ) -> None:
+                    if stage == "work":
+                        raise exception_type()
+
+                with (
+                    mock.patch.object(liveness, "validate_worker_execution"),
+                    mock.patch.object(liveness, "_load_worker_environment"),
+                    mock.patch.dict(os.environ, self._parent_env(), clear=False),
+                    mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+                ):
+                    payload = liveness.run_liveness(
+                        identity,
+                        spawn_child=spawn,
+                        spawn_cleanup=cleanup_spawn,
+                        post_spawn_hook=cancel_after_registration,
+                    )
+
+                self.assertEqual(payload["status"], "cleanup_unproven")
+                self.assertIsNotNone(holder["process"].poll())
+                self.assertIsNotNone(cleanup_holder["process"].poll())
+                self.assertFalse(liveness._group_exists(holder["pgid"]))
+
+    def test_spawn_constructor_failure_cannot_claim_success(self) -> None:
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
+
+        def constructor_failure(
+            _identity: liveness.RunIdentity,
+            _task_id: str,
+            _deadline: float,
+            **_kwargs: object,
+        ):
+            raise OSError("constructor failure")
+
+        constructor_failure = liveness._trusted_spawn_factory(constructor_failure)
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+        ):
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=constructor_failure,
+                spawn_cleanup=cleanup_spawn,
+            )
+
+        self.assertNotEqual(payload["status"], "passed")
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["cleanup"], "not_run")
+        self.assertNotIn("process", cleanup_holder)
 
     def test_malformed_child_control_is_redacted_and_cleanup_unproven(self) -> None:
         spawn, holder = self._spawn_control_child([])

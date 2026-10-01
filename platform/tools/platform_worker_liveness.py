@@ -61,6 +61,12 @@ CONTROL_MAX_BYTES = 16 * 1024
 CLEANUP_CONTROL_MAX_BYTES = 1024
 CLEANUP_RESULT_URL_ENV = "PLATFORM_LIVENESS_CLEANUP_RESULT_URL"
 CLEANUP_RESULT_KEY_ENV = "PLATFORM_LIVENESS_CLEANUP_RESULT_KEY"
+_SPAWN_SIGNAL_NAMES = ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT")
+SPAWN_BLOCKED_SIGNALS = frozenset(
+    getattr(signal, name)
+    for name in _SPAWN_SIGNAL_NAMES
+    if hasattr(signal, name)
+)
 
 CHECK_NAMES = (
     "worker_uid",
@@ -92,6 +98,68 @@ class RunIdentity:
     release: Path
     expected_source_sha: str
     worker_env: Path
+
+
+class _SpawnGuard:
+    """Own a newly created process before restoring interrupt signals."""
+
+    def __init__(self) -> None:
+        self._previous_mask: set[signal.Signals] | None = None
+        self.process: subprocess.Popen[bytes] | None = None
+        self.pgid: int | None = None
+        self.identity_proven = False
+
+    def __enter__(self) -> _SpawnGuard:
+        pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+        if not callable(pthread_sigmask) or not SPAWN_BLOCKED_SIGNALS:
+            raise LivenessFailure("spawn_signal_mask_unavailable")
+        self._previous_mask = pthread_sigmask(
+            signal.SIG_BLOCK,
+            SPAWN_BLOCKED_SIGNALS,
+        )
+        return self
+
+    def register(
+        self,
+        process: subprocess.Popen[bytes],
+    ) -> tuple[int | None, bool]:
+        # This is intentionally the first operation after the captured Popen
+        # returns.  No hook or unmasked cancellation point is permitted here.
+        self.process = process
+        self.pgid, self.identity_proven = _register_process_group(process)
+        return self.pgid, self.identity_proven
+
+    def child_preexec_fn(self) -> Callable[[], None]:
+        """Restore the caller's mask in the exec-bound child process."""
+
+        previous_mask = self._previous_mask
+
+        def restore() -> None:
+            if previous_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+        return restore
+
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> bool:
+        if self._previous_mask is not None:
+            pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+            if not callable(pthread_sigmask):
+                raise LivenessFailure("spawn_signal_mask_unavailable")
+            pthread_sigmask(signal.SIG_SETMASK, self._previous_mask)
+        return False
+
+
+def _trusted_spawn_factory(factory: Callable[..., object]) -> Callable[..., object]:
+    """Mark only factories that obey the Popen-and-return contract.
+
+    Production uses the real stdlib ``subprocess.Popen`` through the two
+    helper functions below.  Tests may inject a factory only when it has been
+    explicitly wrapped with this contract; arbitrary factories are rejected
+    before they can create an unowned process.
+    """
+
+    setattr(factory, "_platform_spawn_factory", True)
+    return factory
 
 
 def _new_result(status: str, checks: Mapping[str, str], cleanup: str) -> dict[str, object]:
@@ -531,11 +599,14 @@ def _cleanup_roundtrip(
     return 0 if ok else 1
 
 
+@_trusted_spawn_factory
 def _spawn_cleanup(
     identity: RunIdentity,
     key: str | bytes,
     result_url: str,
     deadline: float,
+    *,
+    preexec_fn: Callable[[], None] | None = None,
 ) -> tuple[subprocess.Popen[bytes], int]:
     """Start Redis cleanup in its own process group."""
 
@@ -570,9 +641,12 @@ def _spawn_cleanup(
             stderr=subprocess.PIPE,
             close_fds=True,
             pass_fds=(write_fd,),
+            preexec_fn=preexec_fn,
             start_new_session=True,
         )
     except BaseException:
+        # A real stdlib Popen constructor owns cleanup of any partial child;
+        # no synthetic handle is manufactured after a constructor failure.
         os.close(read_fd)
         raise
     finally:
@@ -762,10 +836,13 @@ def _validate_task_id(task_id: str) -> str:
     return task_id
 
 
+@_trusted_spawn_factory
 def _spawn_child(
     identity: RunIdentity,
     task_id: str,
     deadline: float,
+    *,
+    preexec_fn: Callable[[], None] | None = None,
 ) -> tuple[subprocess.Popen[bytes], int]:
     read_fd, write_fd = os.pipe()
     try:
@@ -791,9 +868,12 @@ def _spawn_child(
             stderr=subprocess.PIPE,
             close_fds=True,
             pass_fds=(write_fd,),
+            preexec_fn=preexec_fn,
             start_new_session=True,
         )
     except BaseException:
+        # A real stdlib Popen constructor owns cleanup of any partial child;
+        # no synthetic handle is manufactured after a constructor failure.
         os.close(read_fd)
         raise
     finally:
@@ -1436,12 +1516,9 @@ def run_liveness(
     identity: RunIdentity,
     *,
     clock: Callable[[], float] | None = None,
-    spawn_child: Callable[
-        [RunIdentity, str, float], tuple[subprocess.Popen[bytes], int]
-    ] | None = None,
-    spawn_cleanup: Callable[
-        [RunIdentity, str | bytes, str, float], tuple[subprocess.Popen[bytes], int]
-    ]
+    spawn_child: Callable[..., tuple[subprocess.Popen[bytes], int]] | None = None,
+    spawn_cleanup: Callable[..., tuple[subprocess.Popen[bytes], int]] | None = None,
+    post_spawn_hook: Callable[[str, subprocess.Popen[bytes], int | None], object]
     | None = None,
 ) -> dict[str, object]:
     """Supervise one roundtrip and isolated exact-key cleanup."""
@@ -1452,6 +1529,10 @@ def run_liveness(
         spawn_child = _spawn_child
     if spawn_cleanup is None:
         spawn_cleanup = _spawn_cleanup
+    if not getattr(spawn_child, "_platform_spawn_factory", False):
+        return _new_result("failed", {}, "not_run")
+    if not getattr(spawn_cleanup, "_platform_spawn_factory", False):
+        return _new_result("failed", {}, "not_run")
     checks: dict[str, str] = {}
     try:
         start = clock()
@@ -1501,8 +1582,16 @@ def run_liveness(
         )
         checks["release_identity"] = "passed"
         task_id = _new_task_id()
-        handle = spawn_child(identity, task_id, child_deadline)
-        child_pgid, child_group_identity = _register_process_group(handle[0])
+        with _SpawnGuard() as spawn_guard:
+            handle = spawn_child(
+                identity,
+                task_id,
+                child_deadline,
+                preexec_fn=spawn_guard.child_preexec_fn(),
+            )
+            child_pgid, child_group_identity = spawn_guard.register(handle[0])
+        if post_spawn_hook is not None:
+            post_spawn_hook("work", handle[0], child_pgid)
         child_collection = _collect_child(
             handle[0],
             handle[1],
@@ -1592,15 +1681,19 @@ def run_liveness(
                 try:
                     cleanup_key = _validate_result_key(cleanup_key, task_id)
                     _remaining(deadline, clock)
-                    cleanup_handle = spawn_cleanup(
-                        identity,
-                        cleanup_key,
-                        result_url,
-                        deadline,
-                    )
-                    cleanup_pgid, cleanup_group_identity = _register_process_group(
-                        cleanup_handle[0]
-                    )
+                    with _SpawnGuard() as cleanup_guard:
+                        cleanup_handle = spawn_cleanup(
+                            identity,
+                            cleanup_key,
+                            result_url,
+                            deadline,
+                            preexec_fn=cleanup_guard.child_preexec_fn(),
+                        )
+                        cleanup_pgid, cleanup_group_identity = cleanup_guard.register(
+                            cleanup_handle[0]
+                        )
+                    if post_spawn_hook is not None:
+                        post_spawn_hook("cleanup", cleanup_handle[0], cleanup_pgid)
                     cleanup_collection_deadline = max(
                         clock(),
                         deadline
