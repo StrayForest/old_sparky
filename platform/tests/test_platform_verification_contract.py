@@ -833,7 +833,10 @@ except lock.VerificationLockError as exc:
             )
         )
         self.assertEqual(release_runtime_workflow_issues(workflow_text), [])
-        missing_manual_route = workflow_text.replace(
+        real_runtime_start = workflow_text.index("  release-runtime-real:")
+        real_runtime_prefix = workflow_text[:real_runtime_start]
+        real_runtime_block = workflow_text[real_runtime_start:]
+        missing_manual_route = real_runtime_prefix + real_runtime_block.replace(
             "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&",
             "(github.event_name == 'push') &&",
             1,
@@ -844,7 +847,7 @@ except lock.VerificationLockError as exc:
                 for issue in release_runtime_workflow_issues(missing_manual_route)
             )
         )
-        missing_dev_route = workflow_text.replace(
+        missing_dev_route = real_runtime_prefix + real_runtime_block.replace(
             "github.ref == 'refs/heads/dev'",
             "github.ref == 'refs/heads/main'",
             1,

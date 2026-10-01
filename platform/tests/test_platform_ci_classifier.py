@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
+from collections.abc import Mapping
 from pathlib import Path
 import re
 import stat
@@ -32,6 +32,18 @@ from tools.platform_ci_classifier import (
 from tools.platform_ci_classifier import _write_github_output
 from tools.platform_safe_zip import UnsafeZipError, extract_single_manifest
 from tools.platform_workflow_provenance import ProvenanceError, validate_security_marker
+from tools.platform_security_status import (
+    FAIL_DESCRIPTION,
+    REPOSITORY,
+    ReconcilerError,
+    complete_workflow_run_keys,
+    evaluate_status,
+    has_newer_workflow_run,
+    publish_workflow_event,
+    reconcile_workflow_event,
+    status_reconciliation_needed,
+    terminal_failure_required,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -565,40 +577,30 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("workflows: [Platform security and build]", workflow)
         self.assertIn("types: [completed]", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
-        self.assertIn("permissions:\n      statuses: write", workflow)
-        self.assertNotIn("actions/checkout", workflow)
+        self.assertIn(
+            "permissions:\n      actions: read\n      contents: read\n      statuses: write",
+            workflow,
+        )
+        self.assertIn(
+            "group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
+            workflow,
+        )
+        self.assertIn("actions/checkout@", workflow)
+        self.assertIn("ref: ${{ steps.trusted_status.outputs.sha }}", workflow)
+        self.assertIn("path: trusted-status-source", workflow)
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertNotIn("github.event.workflow_run.head_sha", workflow)
+        self.assertNotIn("download-artifact", workflow)
+        self.assertNotIn("upload-artifact", workflow)
         self.assertNotIn("secrets.", workflow)
-        self.assertIn("TARGET_SHA: ${{ github.event.workflow_run.head_sha }}", workflow)
-        self.assertIn("statuses/${TARGET_SHA}", workflow)
-        self.assertIn("attempt_url=", workflow)
-        self.assertIn("SOURCE_RUN_URL", workflow)
-        self.assertIn("/attempts/{attempt}", workflow)
-        self.assertNotIn("commits/${TARGET_SHA}/statuses?per_page=100", workflow)
-        self.assertNotIn("preserve_success", workflow)
-        self.assertNotIn("updated_at", workflow)
-        self.assertNotIn("status_rows", workflow)
-        self.assertNotIn("pagination", workflow)
-        self.assertIn('case "$SOURCE_CONCLUSION" in', workflow)
-        self.assertIn("success)", workflow)
-        for conclusion in (
-            "cancelled",
-            "failure",
-            "skipped",
-            "timed_out",
-            "action_required",
-            "neutral",
-            "stale",
-            "startup_failure",
-        ):
-            self.assertIn(conclusion, workflow)
-        self.assertIn("state=failure", workflow)
-        self.assertIn('description="Platform security or build failed"', workflow)
-        self.assertIn('description="Platform security and build passed"', workflow)
-        self.assertIn('"context": "platform-security-build"', workflow)
-        self.assertIn("SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}", workflow)
+        self.assertIn("reconcile --event-file", workflow)
+        self.assertNotIn("urlopen", workflow)
+        self.assertNotIn("MAX_RUN_PAGES", workflow)
+        self.assertNotIn("candidate > run_key", workflow)
+        self.assertNotIn("/statuses/", workflow)
         self.assertLess(
             workflow.index("name: Platform security status finalizer"),
-            workflow.index("TARGET_SHA: ${{ github.event.workflow_run.head_sha }}"),
+            workflow.index("reconcile --event-file"),
         )
 
         pending_at = security.index("--data", security.index("Mark platform security build pending"))
@@ -611,7 +613,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
     def test_successful_reduced_routes_keep_canonical_status_and_noop_autodeploy(self) -> None:
         security = SECURITY_WORKFLOW.read_text(encoding="utf-8")
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn('description="Platform security and build passed"', security)
+        self.assertIn("STATUS_FINAL_RESULT: ${{ needs['status-final'].result }}", security)
         self.assertNotIn("Platform security passed; route=", security)
         self.assertNotIn("fail-closed fallback route", security)
         self.assertIn('"$ROUTE_DEPLOYABLE" != "true"', auto)
@@ -943,7 +945,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_status_final_is_fail_closed_for_published_statuses_and_routes(self) -> None:
         workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
-        status_final = workflow.split("  status-final:", 1)[1]
+        status_final = workflow.split("  status-final:", 1)[1].split("  status-publish:", 1)[0]
         for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
             self.assertRegex(workflow, rf"(?m)^  {event}:", msg=f"missing {event} trigger")
         self.assertGreaterEqual(workflow.count("TESTED_SHA: ${{ github.sha }}"), 3)
@@ -953,20 +955,39 @@ class PlatformCiClassifierTests(unittest.TestCase):
             '["git", "diff", "--name-only", "-z", base, source_head, "--"]',
             workflow,
         )
-        self.assertIn("route_target_sha != tested_sha", status_final)
-        self.assertIn('"tested_sha": os.environ.get("TESTED_SHA", "")', status_final)
+        self.assertIn("platform_security_status.py", workflow)
+        self.assertIn("group: ${{ github.workflow }}-${{ github.ref }}", workflow)
+        for job_id in ("status-start", "status-final", "status-publish"):
+            self.assertIn(f"  {job_id}:", workflow)
+        self.assertIn("expected_by_class", status_final)
+        self.assertIn("json.loads(os.environ.get(\"EXPECTED_GATES\")", status_final)
+        self.assertIn('export SUMMARY_PATH="$GITHUB_WORKSPACE/platform-security-summary.json"', status_final)
+        self.assertNotIn("--github-output \"$GITHUB_OUTPUT\"", status_final)
+        self.assertNotIn("id: evaluate_status", status_final)
+        self.assertIn("permissions:\n      contents: read", status_final)
+        self.assertNotIn("statuses: write", status_final)
+        self.assertNotIn("platform_security_status.py", status_final)
+        self.assertNotIn("actions/checkout", status_final)
         self.assertIn('statuses/${TESTED_SHA}', workflow)
         self.assertNotIn('statuses/${GITHUB_SHA}', workflow)
+        status_publish = workflow.split("  status-publish:", 1)[1]
         self.assertIn(
-            'published_event = os.environ.get("EVENT_NAME") in {"push", "workflow_dispatch"}',
-            status_final,
+            "if: ${{ always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/dev' }}",
+            status_publish,
         )
+        self.assertIn("needs: [status-final]", status_publish)
         self.assertIn(
-            'if [[ "$EVENT_NAME" == "push" || "$EVENT_NAME" == "workflow_dispatch" ]]; then',
-            status_final,
+            "permissions:\n      actions: read\n      contents: read\n      statuses: write",
+            status_publish,
         )
-        self.assertIn("passed=$(", status_final)
-        self.assertIn('if [[ "$passed" == "true" ]]; then', status_final)
+        self.assertIn("actions/checkout@", status_publish)
+        self.assertIn("ref: ${{ github.sha }}", status_publish)
+        self.assertIn("path: trusted-status-source", status_publish)
+        self.assertIn("persist-credentials: false", status_publish)
+        self.assertIn("platform_security_status.py", status_publish)
+        self.assertIn("publish --event-file", status_publish)
+        self.assertNotIn("/statuses/", status_publish)
+        self.assertIn("if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/dev' }}", workflow)
         self.assertNotIn("GITHUB_ENV", status_final)
         self.assertNotIn("ROUTE_PASSED", status_final)
 
@@ -982,43 +1003,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(pr_manifest["target_sha"], self.TARGET_SHA)
         self.assertEqual(pr_manifest["event"], "pull_request")
         self.assertIn("STATUS_START_RESULT", workflow)
-        self.assertIn("published_event", workflow)
-        self.assertIn("expected_by_class", workflow)
-        self.assertIn("A full route can be CI-only", workflow)
         self.assertIn("ROUTE_EVENT", workflow)
-        self.assertIn("classifier event does not match the workflow event", workflow)
-        self.assertIn("classifier expected gates do not match its class", workflow)
-        self.assertIn("classifier digest is missing", workflow)
-        self.assertIn("status-start did not succeed before status publication", workflow)
-        self.assertIn(
-            'raw_runtime_sensitive = os.environ.get("ROUTE_RUNTIME_SENSITIVE", "")',
-            status_final,
-        )
-        self.assertIn(
-            'raw_runtime_sensitive not in {"true", "false"}',
-            status_final,
-        )
-        self.assertIn(
-            "classifier runtime-sensitive output is missing or malformed",
-            status_final,
-        )
-        self.assertIn(
-            'requires_release_runtime = runtime_sensitive or raw_fallback == "true"',
-            status_final,
-        )
-        self.assertIn('release_runtime_result != "success"', status_final)
-        self.assertIn('release_runtime_result != "skipped"', status_final)
-        self.assertIn("RELEASE_RUNTIME_REAL_RESULT", status_final)
         self.assertIn("needs['release-runtime-real']", workflow)
-        self.assertIn("requires_real_release_runtime", status_final)
 
-        script_match = re.search(
-            r"(?ms)^\s+/usr/bin/python3 - <<'PY'\n(?P<script>.*?)^\s+PY$",
-            status_final,
-        )
-        self.assertIsNotNone(script_match)
-        assert script_match is not None
-        status_script = textwrap.dedent(script_match.group("script"))
         base_environment = {
             "CLASSIFIER_RESULT": "success",
             "EVENT_NAME": "pull_request",
@@ -1026,6 +1013,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "ROUTE_CLASS": "docs-only",
             "ROUTE_DEPLOYABLE": "false",
             "ROUTE_FALLBACK": "false",
+            "ROUTE_RUNTIME_SENSITIVE": "false",
             "ROUTE_REASON": "trusted docs route",
             "ROUTE_DIGEST": "a" * 64,
             "ROUTE_TARGET_SHA": self.TARGET_SHA,
@@ -1035,59 +1023,52 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "VERIFICATION_CONTRACT_RESULT": "success",
             "STATUS_START_RESULT": "skipped",
             "WORKFLOW_REF": "refs/heads/feature",
+            "RELEASE_RUNTIME_RESULT": "skipped",
             "RELEASE_RUNTIME_REAL_RESULT": "skipped",
         }
-        status_cases = (
-            ("missing", None, "false", "skipped", False),
-            ("empty", "", "false", "skipped", False),
-            ("uppercase", "TRUE", "false", "skipped", False),
-            ("sensitive success", "true", "false", "success", True),
-            ("sensitive skipped", "true", "false", "skipped", False),
-            ("fallback success", "false", "true", "success", True),
-            ("fallback skipped", "false", "true", "skipped", False),
-            ("ordinary skipped", "false", "false", "skipped", True),
-            ("ordinary success", "false", "false", "success", False),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            for label, raw_runtime, raw_fallback, release_result, expected_passed in status_cases:
-                with self.subTest(status_case=label):
-                    environment = os.environ.copy()
-                    environment.update(
-                        {
-                            **base_environment,
-                            "ROUTE_FALLBACK": raw_fallback,
-                            "RELEASE_RUNTIME_RESULT": release_result,
-                            "SUMMARY_PATH": str(Path(directory) / f"{label}.json"),
-                        }
-                    )
-                    if raw_runtime is not None:
-                        environment["ROUTE_RUNTIME_SENSITIVE"] = raw_runtime
-                    else:
-                        environment.pop("ROUTE_RUNTIME_SENSITIVE", None)
-                    completed = subprocess.run(
-                        ["/usr/bin/python3"],
-                        input=status_script,
-                        text=True,
-                        capture_output=True,
-                        env=environment,
-                        check=False,
-                    )
-                    self.assertEqual(completed.returncode, 0, completed.stderr)
-                    self.assertEqual(completed.stdout.strip(), str(expected_passed).lower())
-                    summary = json.loads(
-                        Path(environment["SUMMARY_PATH"]).read_text(encoding="utf-8")
-                    )
-                    self.assertEqual(
-                        summary["requires_release_runtime"],
-                        raw_runtime == "true" or raw_fallback == "true",
-                    )
 
-            trusted_base = {
-                **base_environment,
+        # Every classifier route remains a pure decision, including its exact
+        # gate order; a pull request does not publish a commit status.
+        for route_class, expected_gates in (
+            ("docs-only", ["docs", "verification-contract"]),
+            ("out-of-scope", ["verification-contract"]),
+            (
+                "full",
+                [
+                    "backend",
+                    "python-quality",
+                    "security",
+                    "migration",
+                    "docs",
+                    "web-quality",
+                    "web-hermetic",
+                    "verification-contract",
+                ],
+            ),
+        ):
+            with self.subTest(route=route_class):
+                environment = dict(base_environment)
+                environment.update(
+                    {
+                        "ROUTE_CLASS": route_class,
+                        "EXPECTED_GATES": json.dumps(expected_gates),
+                    }
+                )
+                for gate in expected_gates:
+                    environment[gate.upper().replace("-", "_") + "_RESULT"] = "success"
+                passed, summary = evaluate_status(environment)
+                self.assertTrue(passed)
+                self.assertEqual(summary["expected_gates"], expected_gates)
+                self.assertEqual(summary["gate_results"][expected_gates[0]], "success")
+
+        full_environment = dict(base_environment)
+        full_environment.update(
+            {
                 "EVENT_NAME": "push",
                 "ROUTE_EVENT": "push",
                 "ROUTE_CLASS": "full",
-                "ROUTE_FALLBACK": "false",
+                "WORKFLOW_REF": "refs/heads/dev",
+                "STATUS_START_RESULT": "success",
                 "ROUTE_RUNTIME_SENSITIVE": "true",
                 "EXPECTED_GATES": json.dumps(
                     [
@@ -1101,160 +1082,369 @@ class PlatformCiClassifierTests(unittest.TestCase):
                         "verification-contract",
                     ]
                 ),
-                "BACKEND_RESULT": "success",
-                "PYTHON_QUALITY_RESULT": "success",
-                "SECURITY_RESULT": "success",
-                "MIGRATION_RESULT": "success",
-                "WEB_QUALITY_RESULT": "success",
-                "WEB_HERMETIC_RESULT": "success",
-                "STATUS_START_RESULT": "success",
                 "RELEASE_RUNTIME_RESULT": "success",
+                "RELEASE_RUNTIME_REAL_RESULT": "success",
             }
-            trusted_cases = (
-                (
-                    "dev push real",
-                    "push",
-                    "refs/heads/dev",
-                    "true",
-                    "false",
-                    "success",
-                    "success",
-                    True,
-                    True,
-                ),
-                (
-                    "dev push real skipped",
-                    "push",
-                    "refs/heads/dev",
-                    "true",
-                    "false",
-                    "success",
-                    "skipped",
-                    False,
-                    True,
-                ),
-                (
-                    "dev push real failure",
-                    "push",
-                    "refs/heads/dev",
-                    "true",
-                    "false",
-                    "success",
-                    "failure",
-                    False,
-                    True,
-                ),
-                (
-                    "dev manual real",
-                    "workflow_dispatch",
-                    "refs/heads/dev",
-                    "true",
-                    "false",
-                    "success",
-                    "success",
-                    True,
-                    True,
-                ),
-                (
-                    "fallback dev real",
-                    "push",
-                    "refs/heads/dev",
-                    "true",
-                    "true",
-                    "success",
-                    "success",
-                    True,
-                    True,
-                ),
-                (
-                    "ordinary dev both skipped",
-                    "push",
-                    "refs/heads/dev",
-                    "false",
-                    "false",
-                    "skipped",
-                    "skipped",
-                    True,
-                    False,
-                ),
-                # Candidate packaging keeps the full gate class but is a
-                # successful CI-only push when deployable=false.
-                (
-                    "candidate packaging dev no-op",
-                    "push",
-                    "refs/heads/dev",
-                    "false",
-                    "false",
-                    "skipped",
-                    "skipped",
-                    True,
-                    False,
-                ),
-                (
-                    "non-dev manual fixture only",
-                    "workflow_dispatch",
-                    "refs/heads/feature",
-                    "true",
-                    "false",
-                    "success",
-                    "skipped",
-                    True,
-                    False,
-                ),
-                (
-                    "merge group fixture only",
-                    "merge_group",
-                    "refs/heads/gh-readonly-queue/main/pr-1-abc",
-                    "true",
-                    "false",
-                    "success",
-                    "skipped",
-                    True,
-                    False,
-                ),
+        )
+        for gate in (
+            "backend",
+            "python-quality",
+            "security",
+            "migration",
+            "docs",
+            "web-quality",
+            "web-hermetic",
+            "verification-contract",
+        ):
+            full_environment[gate.upper().replace("-", "_") + "_RESULT"] = "success"
+        passed, summary = evaluate_status(full_environment)
+        self.assertTrue(passed)
+        self.assertTrue(summary["requires_release_runtime"])
+        self.assertTrue(summary["requires_real_release_runtime"])
+
+        trusted_result_cases = (
+            ("dev push real skipped", "push", "refs/heads/dev", "true", "false", "success", "skipped", False),
+            ("dev push real failure", "push", "refs/heads/dev", "true", "false", "failure", "success", False),
+            ("dev manual real", "workflow_dispatch", "refs/heads/dev", "true", "false", "success", "success", True),
+            ("fallback dev real", "push", "refs/heads/dev", "true", "true", "success", "success", True),
+            ("ordinary dev both skipped", "push", "refs/heads/dev", "false", "false", "skipped", "skipped", True),
+            (
+                "non-dev manual fixture only",
+                "workflow_dispatch",
+                "refs/heads/feature",
+                "true",
+                "false",
+                "success",
+                "skipped",
+                True,
+            ),
+            (
+                "merge group fixture only",
+                "merge_group",
+                "refs/heads/queue",
+                "true",
+                "false",
+                "success",
+                "skipped",
+                True,
+            ),
+        )
+        for label, event, ref, runtime, fallback, fixture, real, expected_passed in trusted_result_cases:
+            with self.subTest(trusted_result=label):
+                environment = dict(full_environment)
+                environment.update(
+                    {
+                        "EVENT_NAME": event,
+                        "ROUTE_EVENT": event,
+                        "WORKFLOW_REF": ref,
+                        "ROUTE_RUNTIME_SENSITIVE": runtime,
+                        "ROUTE_FALLBACK": fallback,
+                        "RELEASE_RUNTIME_RESULT": fixture,
+                        "RELEASE_RUNTIME_REAL_RESULT": real,
+                        "STATUS_START_RESULT": "success"
+                        if event in {"push", "workflow_dispatch"} and ref == "refs/heads/dev"
+                        else "skipped",
+                    }
+                )
+                passed, summary = evaluate_status(environment)
+                self.assertEqual(passed, expected_passed)
+                self.assertEqual(
+                    summary["requires_real_release_runtime"],
+                    runtime == "true"
+                    and ref == "refs/heads/dev"
+                    and event in {"push", "workflow_dispatch"},
+                )
+
+        malformed_cases = {
+            "missing route": {"ROUTE_CLASS": ""},
+            "malformed expected gates": {"EXPECTED_GATES": "not-json"},
+            "malformed expected item": {"EXPECTED_GATES": "[{}]"},
+            "missing SHA": {"TESTED_SHA": ""},
+            "mismatched SHA": {"ROUTE_TARGET_SHA": "b" * 40},
+            "missing digest": {"ROUTE_DIGEST": ""},
+            "missing reason": {"ROUTE_REASON": ""},
+            "invalid deployable": {"ROUTE_DEPLOYABLE": "TRUE"},
+            "invalid fallback": {"ROUTE_FALLBACK": "TRUE"},
+            "invalid runtime sensitivity": {"ROUTE_RUNTIME_SENSITIVE": "TRUE"},
+        }
+        for label, updates in malformed_cases.items():
+            with self.subTest(malformed=label):
+                environment = dict(base_environment)
+                environment.update(updates)
+                passed, _summary = evaluate_status(environment)
+                self.assertFalse(passed)
+
+        for label, updates in (
+            ("missing gate", {"DOCS_RESULT": "missing"}),
+            ("skipped gate", {"DOCS_RESULT": "skipped"}),
+            ("cancelled gate", {"DOCS_RESULT": "cancelled"}),
+            ("failed classifier", {"CLASSIFIER_RESULT": "failure"}),
+        ):
+            with self.subTest(result=label):
+                environment = dict(base_environment)
+                environment.update(updates)
+                passed, summary = evaluate_status(environment)
+                self.assertFalse(passed)
+                self.assertIsInstance(summary["missing_or_failed"], list)
+
+        for label, updates in (
+            ("required fixture skipped", {"ROUTE_RUNTIME_SENSITIVE": "true"}),
+            ("required fallback fixture skipped", {"ROUTE_FALLBACK": "true"}),
+            ("unexpected fixture success", {"RELEASE_RUNTIME_RESULT": "success"}),
+            ("unexpected real result", {"RELEASE_RUNTIME_REAL_RESULT": "success"}),
+        ):
+            with self.subTest(conditional_result=label):
+                environment = dict(base_environment)
+                environment.update(updates)
+                passed, _summary = evaluate_status(environment)
+                self.assertFalse(passed)
+
+        push_without_start = dict(full_environment)
+        push_without_start["STATUS_START_RESULT"] = "skipped"
+        self.assertFalse(evaluate_status(push_without_start)[0])
+        for conclusion in (
+            "cancelled",
+            "failure",
+            "skipped",
+            "timed_out",
+            "action_required",
+            "neutral",
+            "stale",
+            "startup_failure",
+            None,
+        ):
+            with self.subTest(conclusion=conclusion):
+                self.assertTrue(terminal_failure_required("completed", conclusion))
+        self.assertTrue(terminal_failure_required("in_progress", None))
+        self.assertFalse(terminal_failure_required("completed", "success"))
+        self.assertEqual(
+            set(evaluate_status(base_environment)[1]),
+            {
+                "schema",
+                "tested_sha",
+                "event",
+                "route_event",
+                "class",
+                "reason",
+                "deployable",
+                "fallback",
+                "manifest_digest",
+                "expected_gates",
+                "gate_results",
+                "conditional_gate_results",
+                "runtime_sensitive",
+                "requires_release_runtime",
+                "requires_real_release_runtime",
+                "missing_or_failed",
+                "route_errors",
+                "status_start_result",
+                "passed",
+            },
+        )
+
+        run_sha = "c" * 40
+        def run_row(run_id: int, attempt: int = 1, event: str = "push") -> dict[str, object]:
+            return {
+                "id": run_id,
+                "run_attempt": attempt,
+                "head_sha": run_sha,
+                "head_branch": "dev",
+                "event": event,
+                "name": SECURITY_WORKFLOW_NAME,
+                "path": SECURITY_WORKFLOW_PATH,
+                "repository": {"full_name": REPOSITORY},
+                "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_id}",
+            }
+
+        pages = [
+            {"total_count": 2, "workflow_runs": [run_row(12)]},
+            {"total_count": 2, "workflow_runs": [run_row(11)]},
+        ]
+        self.assertEqual(
+            complete_workflow_run_keys(pages, expected_sha=run_sha),
+            ((12, 1), (11, 1)),
+        )
+        keys = complete_workflow_run_keys(pages, expected_sha=run_sha)
+        self.assertTrue(has_newer_workflow_run(11, 1, keys))
+        self.assertFalse(has_newer_workflow_run(12, 1, keys))
+        self.assertTrue(has_newer_workflow_run(12, 1, ((12, 2),)))
+        self.assertEqual(
+            complete_workflow_run_keys(
+                [{"total_count": 2, "workflow_runs": [run_row(12), run_row(13, event="pull_request")]}],
+                expected_sha=run_sha,
+            ),
+            ((12, 1),),
+        )
+        for malformed_pages in (
+            [{"total_count": 2, "workflow_runs": [run_row(12)]}],
+            [
+                {"total_count": 2, "workflow_runs": [run_row(12)]},
+                {"total_count": 3, "workflow_runs": [run_row(11)]},
+            ],
+            [{"total_count": 2, "workflow_runs": [run_row(12), run_row(12)]}],
+            [{"total_count": 1, "workflow_runs": [run_row(12, event="schedule")]}],
+        ):
+            with self.subTest(malformed_pages=malformed_pages):
+                with self.assertRaises(ReconcilerError):
+                    complete_workflow_run_keys(malformed_pages, expected_sha=run_sha)
+
+    def test_reconciler_injected_api_is_dev_only_idempotent_and_newer_safe(self) -> None:
+        run_sha = "d" * 40
+        run_id = 12
+        run_attempt = 1
+        target_url = f"https://github.com/{REPOSITORY}/actions/runs/{run_id}/attempts/{run_attempt}"
+
+        def run_row(
+            event: str = "push",
+            branch: str = "dev",
+            run_number: int = run_id,
+            attempt: int = run_attempt,
+        ) -> dict[str, object]:
+            return {
+                "id": run_number,
+                "run_attempt": attempt,
+                "head_sha": run_sha,
+                "head_branch": branch,
+                "event": event,
+                "name": SECURITY_WORKFLOW_NAME,
+                "path": SECURITY_WORKFLOW_PATH,
+                "repository": {"full_name": REPOSITORY},
+                "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_number}",
+            }
+
+        source_run = run_row()
+        source_run.update({"status": "completed", "conclusion": "cancelled"})
+        event = {"workflow_run": dict(source_run)}
+
+        class FakeClient:
+            def __init__(self, runs: list[dict[str, object]], statuses: list[dict[str, object]]) -> None:
+                self.runs = runs
+                self.statuses = statuses
+                self.calls: list[tuple[str, Mapping[str, object] | None]] = []
+                self.posts: list[tuple[str, Mapping[str, object]]] = []
+
+            def get_json(self, path: str, query: Mapping[str, object] | None = None) -> object:
+                self.calls.append((path, query))
+                if path.endswith(f"/actions/runs/{run_id}"):
+                    return source_run
+                if "/actions/workflows/" in path:
+                    page = int((query or {}).get("page", 1)) - 1
+                    return self.runs[page]
+                if path.endswith(f"/commits/{run_sha}/statuses"):
+                    return self.statuses
+                raise AssertionError(path)
+
+            def post_status(self, sha: str, payload: Mapping[str, object]) -> object:
+                self.posts.append((sha, payload))
+                return {"id": 99}
+
+        runs = [{"total_count": 1, "workflow_runs": [run_row()]}]
+        client = FakeClient(runs, [])
+        result = reconcile_workflow_event(event, client)
+        self.assertEqual(result.action, "publish")
+        self.assertEqual(client.posts, [(run_sha, result.payload)])
+        self.assertEqual(result.payload["state"], "failure")
+        self.assertEqual(result.payload["context"], "platform-security-build")
+        self.assertEqual(result.payload["description"], FAIL_DESCRIPTION)
+        self.assertEqual(result.payload["target_url"], target_url)
+
+        client = FakeClient(runs, [{"id": 99, "context": "platform-security-build", "state": "failure", "target_url": target_url}])
+        result = reconcile_workflow_event(event, client)
+        self.assertEqual(result.action, "skip")
+        self.assertEqual(client.posts, [])
+
+        client = FakeClient(runs, [{"id": 100, "context": "platform-security-build", "state": "success", "target_url": target_url}])
+        result = reconcile_workflow_event(event, client)
+        self.assertEqual(result.action, "publish")
+        self.assertEqual(result.payload["state"], "failure")
+
+        older_target = f"https://github.com/{REPOSITORY}/actions/runs/11/attempts/1"
+        client = FakeClient(
+            runs,
+            [{"id": 100, "context": "platform-security-build", "state": "success", "target_url": older_target}],
+        )
+        result = reconcile_workflow_event(event, client)
+        self.assertEqual(result.action, "publish")
+        self.assertEqual(result.payload["state"], "failure")
+
+        newer_runs = [{"total_count": 2, "workflow_runs": [run_row(), run_row(run_number=13)]}]
+        client = FakeClient(newer_runs, [])
+        result = reconcile_workflow_event(event, client)
+        self.assertEqual(result.action, "skip")
+        self.assertIn("newer", result.reason)
+        self.assertEqual(client.posts, [])
+
+        running_newer = run_row(run_number=13)
+        running_newer["status"] = "in_progress"
+        client = FakeClient(
+            [{"total_count": 2, "workflow_runs": [run_row(), running_newer]}],
+            [],
+        )
+        result = reconcile_workflow_event(event, client)
+        self.assertEqual(result.action, "skip")
+        self.assertIn("newer", result.reason)
+
+        publisher_event = {
+            "repository": {"full_name": REPOSITORY},
+            "ref": "refs/heads/dev",
+            "after": run_sha,
+        }
+        client = FakeClient(
+            runs,
+            [{"id": 101, "context": "platform-security-build", "state": "success", "target_url": target_url}],
+        )
+        result = publish_workflow_event(publisher_event, source_run, client, "success")
+        self.assertEqual(result.action, "skip")
+        self.assertEqual(client.posts, [])
+
+        class PublisherRaceClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__(runs, [])
+                self.workflow_calls = 0
+
+            def get_json(self, path: str, query: Mapping[str, object] | None = None) -> object:
+                if "/actions/workflows/" in path:
+                    self.workflow_calls += 1
+                    if self.workflow_calls == 1:
+                        return {"total_count": 1, "workflow_runs": [run_row()]}
+                    return {"total_count": 2, "workflow_runs": [run_row(), run_row(run_number=13)]}
+                return super().get_json(path, query)
+
+        race_client = PublisherRaceClient()
+        result = publish_workflow_event(publisher_event, source_run, race_client, "success")
+        self.assertEqual(result.action, "skip")
+        self.assertIn("race", result.reason)
+        self.assertEqual(race_client.posts, [])
+
+        mismatched_event = {"workflow_run": {**event["workflow_run"], "head_sha": "e" * 40}}
+        with self.assertRaises(ReconcilerError):
+            reconcile_workflow_event(mismatched_event, FakeClient(runs, []))
+
+        nondev_event = {"workflow_run": {**event["workflow_run"], "event": "workflow_dispatch", "head_branch": "feature"}}
+        client = FakeClient(runs, [])
+        result = reconcile_workflow_event(nondev_event, client)
+        self.assertEqual(result.action, "skip")
+        self.assertEqual(client.calls, [])
+
+        pull_request_event = {"workflow_run": {**event["workflow_run"], "event": "pull_request"}}
+        client = FakeClient(runs, [])
+        result = reconcile_workflow_event(pull_request_event, client)
+        self.assertEqual(result.action, "skip")
+        self.assertEqual(client.calls, [])
+
+        self.assertFalse(
+            status_reconciliation_needed(
+                [{"id": 1, "context": "platform-security-build", "state": "failure", "target_url": target_url}],
+                target_url=target_url,
+                source_key=(run_id, run_attempt),
+            )[0]
+        )
+        with self.assertRaises(ReconcilerError):
+            status_reconciliation_needed(
+                [{"id": 1, "context": "platform-security-build", "state": "unknown", "target_url": target_url}],
+                target_url=target_url,
+                source_key=(run_id, run_attempt),
             )
-            for (
-                label,
-                event_name,
-                workflow_ref,
-                raw_runtime_sensitive,
-                raw_fallback,
-                fixture_result,
-                real_result,
-                expected_passed,
-                expected_requires_real,
-            ) in trusted_cases:
-                with self.subTest(trusted_status_case=label):
-                    environment = os.environ.copy()
-                    environment.update(
-                        {
-                            **trusted_base,
-                            "EVENT_NAME": event_name,
-                            "ROUTE_EVENT": event_name,
-                            "WORKFLOW_REF": workflow_ref,
-                            "ROUTE_RUNTIME_SENSITIVE": raw_runtime_sensitive,
-                            "ROUTE_FALLBACK": raw_fallback,
-                            "RELEASE_RUNTIME_RESULT": fixture_result,
-                            "RELEASE_RUNTIME_REAL_RESULT": real_result,
-                            "SUMMARY_PATH": str(Path(directory) / f"trusted-{label}.json"),
-                        }
-                    )
-                    completed = subprocess.run(
-                        ["/usr/bin/python3"],
-                        input=status_script,
-                        text=True,
-                        capture_output=True,
-                        env=environment,
-                        check=False,
-                    )
-                    self.assertEqual(completed.returncode, 0, completed.stderr)
-                    self.assertEqual(completed.stdout.strip(), str(expected_passed).lower())
-                    summary = json.loads(
-                        Path(environment["SUMMARY_PATH"]).read_text(encoding="utf-8")
-                    )
-                    self.assertEqual(
-                        summary["requires_real_release_runtime"], expected_requires_real
-                    )
 
     def test_manifest_is_json_serializable_for_artifact_transport(self) -> None:
         manifest = classify(

@@ -26,6 +26,13 @@ approval for merge. It still protects the branch against deletion and
 force-push, and the exact-SHA security/build status plus automatic production
 deployment chain remain mandatory release gates.
 
+The exact-SHA status and classifier checks described below are enforced by
+checked-in workflow code and the release/production GitHub API validators.
+`platform-security-build` is not currently configured as a GitHub branch or
+ruleset required check; that platform setting remains operator-owned. This
+change makes no repository-settings mutation and does not treat a local pass
+or an unconfigured required-check rule as release evidence.
+
 ## Normal production deploy through GitHub Actions
 
 Normal production deployment is automatic after the reviewed commit is pushed
@@ -117,19 +124,43 @@ production workflows do not consume either `platform-host-tools-candidate-*`
 artifact prefix.  If this workflow fails, do not retry with a manual dispatch,
 host access or production release; investigate the exact run and PR state.
 
-The security workflow also has a separate `workflow_run` status finalizer. It
-uses only `statuses: write`, no checkout or secrets, and always overwrites the
-`platform-security-build` context for the completed run's exact `head_sha` and
-`/attempts/<run_attempt>` URL. Only a `success` conclusion publishes the fixed
-description `Platform security and build passed`; every other conclusion is a
-failure with the fixed description `Platform security or build failed`.
-Because the write is idempotent and does not inspect older statuses, repeated
-or superseded attempts cannot preserve a stale result. GitHub may suppress the
-`workflow_run` event during an outage or force-cancel; the bounded operator
-recovery is to wait five minutes, then inspect the exact run and commit status.
-If the status is still pending, an authorized repository maintainer may post a
-failure status for that exact SHA with `gh api
-repos/StrayForest/old_sparky/statuses/<sha> -f state=failure -f
+During the Phase B bootstrap, the read-only `status-final` job intentionally
+retains the existing inline evaluator as its authority. It does not check out
+or execute the new status tool from the PR/tested SHA, and this phase makes no
+claim that the evaluator is trusted implementation provenance. The separate
+`status-publish` job checks out only the exact trusted `github.sha` for a
+`push` or `workflow_dispatch` on `refs/heads/dev`; it owns the
+`statuses: write` token and invokes the reviewed
+[`platform_security_status.py`](../tools/platform_security_status.py) publisher.
+Both jobs preserve the `platform-security-build` context, exact `TESTED_SHA`
+target and fixed pass or fail descriptions. The separate default-branch
+`workflow_run` finalizer checks out only its resolved immutable default-branch
+tool and is an API-only recovery boundary with `actions: read`, `contents: read`
+and `statuses: write`; it never checks out source-run code or reads run
+artifacts.
+It ignores `pull_request` and `merge_group` source events, accepts only a
+`dev` push/dispatch with a well-formed exact head SHA, and validates the exact
+run URL and attempt through the API. It paginates all matching workflow runs
+with a bounded total and skips publication when a newer run or attempt owns
+the same workflow and SHA. A cancelled, timed-out, action-required, stale,
+unknown-conclusion or incomplete run can receive only the fixed terminal
+failure status, targeted at that exact attempt; a successful run leaves the
+success publication to `status-publish`. Before that write it inspects the
+same commit's status context and canonical target URL, skipping only a
+duplicate desired terminal state for that exact attempt. An older success or
+different target cannot suppress a current failure, and a newer run or
+attempt suppresses an older publisher/reconciler.
+
+TODO (Phase B2): after `platform_security_status.py` lands on trusted `dev`
+and receives a reviewed release, switch `status-final` to that helper while
+preserving its stable job name/read-only permissions. Required-check settings
+and observable repository rules are out of scope; no setting changes here.
+
+GitHub may suppress the `workflow_run` event during an outage or force-cancel;
+the bounded operator recovery is to wait five minutes, then inspect the exact
+run and commit status. If the status is still pending, an authorized
+repository maintainer may post a failure status for that exact SHA with
+`gh api repos/StrayForest/old_sparky/statuses/<sha> -f state=failure -f
 context=platform-security-build`; never post success manually.
 
 The dispatch `mode`, runtime profile, release slug, target SHA and artifact

@@ -95,6 +95,8 @@ CLASSIFIER_TOOL = PLATFORM_ROOT / "tools" / "platform_ci_classifier.py"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-deploy.yml"
 CANDIDATE_HOST_TOOLS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-host-tools-candidate.yml"
+STATUS_FINALIZER_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-security-status-finalizer.yml"
+STATUS_TOOL = PLATFORM_ROOT / "tools" / "platform_security_status.py"
 
 DIRECT_CANONICAL_COMMANDS = (
     "platform_run_tests.sh",
@@ -294,7 +296,7 @@ def _workflow_job_block(text: str, job_id: str) -> str:
 
 
 def security_status_permission_issues(security_text: str) -> list[str]:
-    """Keep the CI status token on the two jobs that publish its result."""
+    """Keep status authority split between the read-only evaluator and writers."""
 
     issues: list[str] = []
     job_blocks = {
@@ -306,7 +308,7 @@ def security_status_permission_issues(security_text: str) -> list[str]:
             re.MULTILINE | re.DOTALL,
         )
     }
-    expected_publishers = {"status-start", "status-final"}
+    expected_publishers = {"status-start", "status-publish"}
     for job_id in expected_publishers:
         block = job_blocks.get(job_id, "")
         if not block:
@@ -319,8 +321,10 @@ def security_status_permission_issues(security_text: str) -> list[str]:
             re.MULTILINE,
         ):
             issues.append(f"platform-security.yml {job_id} must have statuses: write")
-        if "/statuses/" not in block:
+        if job_id == "status-start" and "/statuses/" not in block:
             issues.append(f"platform-security.yml {job_id} must publish a commit status")
+        if job_id == "status-publish" and "platform_security_status.py" not in block:
+            issues.append("platform-security.yml status-publish must invoke the shared status tool")
     for job_id, block in job_blocks.items():
         if re.search(
             r"^    permissions:\n(?:(?:^      [^\n]+\n?))*?"
@@ -331,6 +335,94 @@ def security_status_permission_issues(security_text: str) -> list[str]:
             issues.append(
                 f"platform-security.yml job {job_id} must not receive statuses: write"
             )
+    status_start = job_blocks.get("status-start", "")
+    dev_status_predicate = "github.ref == 'refs/heads/dev'"
+    if dev_status_predicate not in status_start:
+        issues.append("platform-security.yml status-start must be limited to the dev ref")
+    status_final = job_blocks.get("status-final", "")
+    if "statuses: write" in status_final:
+        issues.append("platform-security.yml status-final must be read-only")
+    if "platform_security_status.py" in status_final or "actions/checkout" in status_final:
+        issues.append("platform-security.yml status-final must retain the inline evaluator during Phase B bootstrap")
+    if "expected_by_class" not in status_final or "passed=$(" not in status_final:
+        issues.append("platform-security.yml status-final must retain the baseline inline evaluator")
+    status_publish = job_blocks.get("status-publish", "")
+    if "github.event_name == 'push' || github.event_name == 'workflow_dispatch'" not in status_publish:
+        issues.append("platform-security.yml status-publish must be limited to push/dispatch")
+    if dev_status_predicate not in status_publish:
+        issues.append("platform-security.yml status-publish must be limited to the dev ref")
+    expected_publish_permissions = "permissions:\n      actions: read\n      contents: read\n      statuses: write"
+    if expected_publish_permissions not in status_publish:
+        issues.append("platform-security.yml status-publish must have actions/contents read and statuses write")
+    for marker in (
+        "actions/checkout@",
+        "ref: ${{ github.sha }}",
+        "path: trusted-status-source",
+        "persist-credentials: false",
+        "publish --event-file",
+    ):
+        if marker not in status_publish:
+            issues.append(f"platform-security.yml status-publish is missing trusted tool marker: {marker}")
+    if "/statuses/" in status_publish or "actions/download-artifact" in status_publish:
+        issues.append("platform-security.yml status-publish must not duplicate status API or consume artifacts")
+    return issues
+
+
+def status_finalizer_workflow_issues() -> list[str]:
+    """Keep the trusted-default-branch status reconciler fail-closed."""
+
+    if not STATUS_FINALIZER_WORKFLOW.is_file():
+        return ["platform security status finalizer workflow is missing"]
+    text = STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8")
+    issues: list[str] = []
+    if not STATUS_TOOL.is_file():
+        issues.append("platform security status tool is missing")
+    required_markers = (
+        "workflow_run:",
+        "workflows: [Platform security and build]",
+        "types: [completed]",
+        "group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
+        "  finalize-status:",
+        "if: ${{ always() }}",
+        "actions: read",
+        "contents: read",
+        "statuses: write",
+        "actions/checkout@",
+        "ref: ${{ steps.trusted_status.outputs.sha }}",
+        "path: trusted-status-source",
+        "persist-credentials: false",
+        "TRUSTED_BRANCH: dev",
+        "platform_security_status.py",
+        "reconcile --event-file",
+    )
+    for marker in required_markers:
+        if marker not in text:
+            issues.append(f"status finalizer is missing required marker: {marker}")
+    forbidden_markers = (
+        "actions/download-artifact",
+        "actions/upload-artifact",
+        "/actions/artifacts/",
+        "ref: ${{ github.event.workflow_run.head_sha }}",
+        "urlopen",
+        "MAX_RUN_PAGES",
+        "/statuses/",
+        "SOURCE_RUN_CODE",
+    )
+    for marker in forbidden_markers:
+        if marker in text:
+            issues.append(f"status finalizer must not use source/artifact execution marker: {marker}")
+    permissions = re.search(
+        r"^    permissions:\n(?P<body>(?:^      [^\n]+\n?)*)",
+        text,
+        re.MULTILINE,
+    )
+    if permissions is None:
+        issues.append("status finalizer must scope API permissions on finalize-status")
+    else:
+        body = permissions.group("body")
+        expected = "      actions: read\n      contents: read\n      statuses: write\n"
+        if body != expected:
+            issues.append("status finalizer permissions must be actions/contents read and statuses write")
     return issues
 
 
@@ -1669,6 +1761,7 @@ def collect_issues() -> list[str]:
 
     issues.extend(f"action pin: {issue}" for issue in action_pin_issues())
     issues.extend(workflow_level_permission_issues())
+    issues.extend(status_finalizer_workflow_issues())
     for workflow_path, workflow_text in _workflow_texts():
         if workflow_path in {SECURITY_WORKFLOW, PRODUCTION_WORKFLOW}:
             continue
@@ -1690,6 +1783,8 @@ def collect_issues() -> list[str]:
         issues.append("platform-security.yml must not use top-level path filters")
     if "merge_group:" not in security_text:
         issues.append("platform-security.yml must run for merge_group")
+    if "group: ${{ github.workflow }}-${{ github.ref }}" not in security_text:
+        issues.append("platform-security.yml must use the canonical workflow/ref concurrency group")
     if "platform_ci_classifier.py" not in security_text:
         issues.append("platform-security.yml must invoke the canonical CI classifier")
     if "classifier-manifest.json" not in security_text:

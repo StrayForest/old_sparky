@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: platform-security-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -152,7 +152,7 @@ jobs:
           retention-days: 14
 
   status-start:
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/dev' }}
     permissions:
       statuses: write
     runs-on: ubuntu-latest
@@ -1097,8 +1097,11 @@ jobs:
 
   status-final:
     if: ${{ always() }}
+    # Phase B bootstrap: keep the existing inline evaluator as authority.
+    # Phase B2 may move this pure decision into the trusted dev helper only
+    # after that helper has landed and received its own reviewed release.
     permissions:
-      statuses: write
+      contents: read
     needs: [classifier, status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract, release-runtime, release-runtime-real]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1106,7 +1109,6 @@ jobs:
       - name: Report platform security build result
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           TESTED_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
           CLASSIFIER_RESULT: ${{ needs.classifier.result }}
@@ -1188,7 +1190,10 @@ jobs:
           raw_fallback = os.environ.get("ROUTE_FALLBACK", "")
           if raw_fallback not in {"true", "false"}:
               route_errors.append("classifier fallback output is missing")
-          published_event = os.environ.get("EVENT_NAME") in {"push", "workflow_dispatch"}
+          published_event = (
+              os.environ.get("EVENT_NAME") in {"push", "workflow_dispatch"}
+              and os.environ.get("WORKFLOW_REF") == "refs/heads/dev"
+          )
           if published_event and os.environ.get("STATUS_START_RESULT") != "success":
               route_errors.append("status-start did not succeed before status publication")
           results = {
@@ -1268,26 +1273,6 @@ jobs:
             state=success
             description="Platform security and build passed"
           fi
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
-          if [[ "$EVENT_NAME" == "push" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            curl --fail-with-body --silent --show-error \
-              --request POST \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
-              --data "$(/usr/bin/python3 - "$state" "$description" "$run_url" <<'PY'
-          import json
-          import sys
-          print(json.dumps({
-              "state": sys.argv[1],
-              "context": "platform-security-build",
-              "description": sys.argv[2],
-              "target_url": sys.argv[3],
-          }))
-          PY
-              )"
-          fi
           [[ "$state" == "success" ]] || exit 1
 
       - name: Publish machine-readable CI summary
@@ -1298,3 +1283,36 @@ jobs:
           path: platform-security-summary.json
           if-no-files-found: error
           retention-days: 14
+
+  status-publish:
+    if: ${{ always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/dev' }}
+    needs: [status-final]
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted dev status publisher
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          path: trusted-status-source
+          persist-credentials: false
+      - name: Publish platform security build result
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS_FINAL_RESULT: ${{ needs['status-final'].result }}
+        run: |
+          set -euo pipefail
+          if [[ "$STATUS_FINAL_RESULT" == "success" ]]; then
+            STATUS_STATE=success
+          else
+            STATUS_STATE=failure
+          fi
+          /usr/bin/python3 -I -B \
+            "$GITHUB_WORKSPACE/trusted-status-source/platform/tools/platform_security_status.py" \
+            publish --event-file "$GITHUB_EVENT_PATH" --state "$STATUS_STATE"
