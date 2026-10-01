@@ -57,10 +57,12 @@ from tools.platform_verification_lock import (
 )
 from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
+    DRAFT_CLOUDFLARE_WORKFLOW,
     SECURITY_WORKFLOW,
     action_pin_issues,
     collect_issues,
     _ci_dependency_issues,
+    draft_cloudflare_workflow_issues,
     extract_gate_invocations,
     host_tools_pin_verification_issues,
     release_runtime_workflow_issues,
@@ -876,6 +878,74 @@ except lock.VerificationLockError as exc:
             any(
                 "must not publish" in issue
                 for issue in release_runtime_workflow_issues(release_publishing)
+            )
+        )
+        draft_text = DRAFT_CLOUDFLARE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(draft_cloudflare_workflow_issues(draft_text), [])
+        missing_draft_timeout = draft_text.replace(
+            "    timeout-minutes: 20\n",
+            "",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "verify-pr" in issue and "timeout" in issue
+                for issue in draft_cloudflare_workflow_issues(missing_draft_timeout)
+            )
+        )
+        floating_draft_checkout = draft_text.replace(
+            "ref: ${{ steps.resolve-target.outputs.target_sha }}",
+            "ref: dev",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "immutable target SHA" in issue or "floating dev" in issue
+                for issue in draft_cloudflare_workflow_issues(floating_draft_checkout)
+            )
+        )
+        non_dev_dispatch = draft_text.replace(
+            'test "$DISPATCH_REF" = "refs/heads/dev"',
+            'test "$DISPATCH_REF" = "refs/heads/main"',
+            1,
+        )
+        self.assertTrue(
+            any(
+                "dev-only dispatch guard" in issue
+                for issue in draft_cloudflare_workflow_issues(non_dev_dispatch)
+            )
+        )
+        unbounded_draft_curl = draft_text.replace(
+            "--connect-timeout 5",
+            "",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "--connect-timeout 5" in issue
+                for issue in draft_cloudflare_workflow_issues(unbounded_draft_curl)
+            )
+        )
+        hidden_draft_curl_failure = draft_text.replace(
+            '"$url")"; then',
+            '"$url" || true)"; then',
+            1,
+        )
+        self.assertTrue(
+            any(
+                "hidden" in issue
+                for issue in draft_cloudflare_workflow_issues(hidden_draft_curl_failure)
+            )
+        )
+        missing_draft_retry_bound = draft_text.replace(
+            "            local max_attempts=10\n",
+            "",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "bounded retry count" in issue
+                for issue in draft_cloudflare_workflow_issues(missing_draft_retry_bound)
             )
         )
         with tempfile.TemporaryDirectory() as directory:

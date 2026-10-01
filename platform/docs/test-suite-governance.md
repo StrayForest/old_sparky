@@ -427,6 +427,16 @@ implementation provenance. Manual commit statuses are published only for
 `push` and `workflow_dispatch`, and target `TESTED_SHA`. A local pass is
 neither necessary nor sufficient for deployment.
 
+The standalone `platform-draft-cloudflare.yml` workflow is a separate
+pre-release/manual contour. Its `workflow_dispatch` route is accepted only
+from `refs/heads/dev`; it resolves `github.sha` before checkout and checks out
+that exact immutable SHA. A dispatch from another ref fails before checkout,
+while the `workflow_run` route accepts only a successful `dev` push and its
+exact `head_sha`. Every job and every release-smoke request has an explicit
+deadline, and smoke retries are finite and visible rather than hidden in
+`curl` failure handling. This contour is not the production VPS release
+authority.
+
 The auto-deploy and production-deploy provenance gates read the exact
 commit's paginated raw status rows through GitHub's [list commit statuses
 endpoint](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference).

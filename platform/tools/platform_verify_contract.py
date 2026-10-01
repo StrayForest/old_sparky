@@ -95,6 +95,7 @@ CLASSIFIER_TOOL = PLATFORM_ROOT / "tools" / "platform_ci_classifier.py"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-deploy.yml"
 CANDIDATE_HOST_TOOLS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-host-tools-candidate.yml"
+DRAFT_CLOUDFLARE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-draft-cloudflare.yml"
 
 DIRECT_CANONICAL_COMMANDS = (
     "platform_run_tests.sh",
@@ -347,6 +348,213 @@ def _workflow_step_blocks(job_block: str) -> tuple[str, ...]:
         "".join(lines[start:end])
         for start, end in zip(starts, (*starts[1:], len(lines)))
     )
+
+
+def draft_cloudflare_workflow_issues(workflow_text: str | None = None) -> list[str]:
+    """Keep Draft Cloudflare release authority and request deadlines explicit."""
+
+    if workflow_text is None:
+        if not DRAFT_CLOUDFLARE_WORKFLOW.is_file():
+            return ["platform-draft-cloudflare.yml is missing"]
+        workflow_text = DRAFT_CLOUDFLARE_WORKFLOW.read_text(encoding="utf-8")
+
+    issues: list[str] = []
+    expected_timeouts = {
+        "verify-pr": 20,
+        "detect-release": 5,
+        "build-release": 25,
+        "release": 25,
+    }
+    blocks = {
+        job_id: _workflow_job_block(workflow_text, job_id)
+        for job_id in expected_timeouts
+    }
+    jobs_match = re.search(r"^jobs:\n(?P<body>.*)\Z", workflow_text, re.MULTILINE | re.DOTALL)
+    declared_job_ids = (
+        re.findall(r"^  ([A-Za-z0-9_-]+):\n", jobs_match.group("body"), re.MULTILINE)
+        if jobs_match is not None
+        else []
+    )
+    for job_id in declared_job_ids:
+        if job_id in expected_timeouts:
+            continue
+        block = _workflow_job_block(workflow_text, job_id)
+        matches = re.findall(
+            r"^    timeout-minutes:\s*(\d+)\s*$",
+            block,
+            re.MULTILINE,
+        )
+        if len(matches) != 1 or not 1 <= int(matches[0]) <= 60:
+            issues.append(
+                f"platform-draft-cloudflare.yml {job_id} must declare one reasonable "
+                "timeout-minutes budget"
+            )
+    for job_id, expected_minutes in expected_timeouts.items():
+        block = blocks[job_id]
+        if not block:
+            issues.append(f"platform-draft-cloudflare.yml is missing job {job_id}")
+            continue
+        matches = re.findall(
+            r"^    timeout-minutes:\s*(\d+)\s*$",
+            block,
+            re.MULTILINE,
+        )
+        if len(matches) != 1:
+            issues.append(
+                f"platform-draft-cloudflare.yml {job_id} must declare exactly one timeout-minutes"
+            )
+        elif int(matches[0]) != expected_minutes:
+            issues.append(
+                f"platform-draft-cloudflare.yml {job_id} timeout must be "
+                f"{expected_minutes} minutes"
+            )
+
+    detect = blocks["detect-release"]
+    if not detect:
+        return issues
+    if "  workflow_dispatch:" not in workflow_text:
+        issues.append("Draft Cloudflare workflow must declare workflow_dispatch")
+    for marker, description in (
+        ("github.event_name == 'workflow_dispatch'", "manual route condition"),
+        ("github.event.workflow_run.conclusion == 'success'", "successful workflow_run guard"),
+        ("github.event.workflow_run.event == 'push'", "workflow_run push guard"),
+        ("github.event.workflow_run.head_branch == 'dev'", "workflow_run dev branch guard"),
+    ):
+        if marker not in detect:
+            issues.append(f"Draft Cloudflare workflow is missing {description}")
+
+    steps = _workflow_step_blocks(detect)
+    resolve_indexes = [
+        index
+        for index, step in enumerate(steps)
+        if re.search(r"^      - name: Resolve and verify immutable release target\s*$", step, re.MULTILINE)
+    ]
+    checkout_indexes = [
+        index
+        for index, step in enumerate(steps)
+        if re.search(r"^\s*-\s*uses:\s*actions/checkout@", step, re.MULTILINE)
+    ]
+    if len(resolve_indexes) != 1:
+        issues.append("Draft Cloudflare detect job must have one immutable target resolver")
+    if len(checkout_indexes) != 1:
+        issues.append("Draft Cloudflare detect job must have one checkout step")
+    if len(resolve_indexes) == 1 and len(checkout_indexes) == 1:
+        resolve_index = resolve_indexes[0]
+        checkout_index = checkout_indexes[0]
+        if resolve_index != 0:
+            issues.append("Draft target resolver must be the first detect job step")
+        if resolve_index >= checkout_index:
+            issues.append("Draft target resolver must run before checkout")
+        resolve_step = steps[resolve_index]
+        for marker, description in (
+            ("DISPATCH_REF: ${{ github.ref }}", "dispatch ref expression"),
+            ("DISPATCH_SHA: ${{ github.sha }}", "dispatch SHA expression"),
+            ("WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}", "workflow_run branch expression"),
+            ("WORKFLOW_TARGET_SHA: ${{ github.event.workflow_run.head_sha }}", "workflow_run SHA expression"),
+            ('test "$DISPATCH_REF" = "refs/heads/dev"', "dev-only dispatch guard"),
+            ('test "$DISPATCH_SHA" = "$GITHUB_SHA"', "exact github.sha dispatch guard"),
+            ('[[ "$DISPATCH_SHA" =~ ^[0-9a-f]{40}$ ]]', "dispatch SHA format guard"),
+            ('[[ "$WORKFLOW_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]', "workflow_run SHA format guard"),
+        ):
+            if marker not in resolve_step:
+                issues.append(f"Draft target resolver is missing {description}")
+        checkout_step = steps[checkout_index]
+        if not re.search(
+            r"^\s+ref:\s*\$\{\{\s*steps\.resolve-target\.outputs\.target_sha\s*\}\}\s*$",
+            checkout_step,
+            re.MULTILINE,
+        ):
+            issues.append("Draft checkout must use the resolved immutable target SHA")
+    if re.search(r"\|\|\s*['\"]?dev['\"]?", detect) or re.search(
+        r"^\s*ref:\s*dev\s*$", detect, re.MULTILINE
+    ):
+        issues.append("Draft dispatch must not fall back to floating dev checkout")
+    if "target_sha=\"${WORKFLOW_TARGET_SHA:-" in detect:
+        issues.append("Draft path detection must not resolve a target from the checked-out HEAD")
+
+    target_check_indexes = [
+        index
+        for index, step in enumerate(steps)
+        if re.search(r"^      - name: Verify checked-out release target\s*$", step, re.MULTILINE)
+    ]
+    if len(target_check_indexes) != 1:
+        issues.append("Draft detect job must verify the checked-out target SHA")
+    elif len(resolve_indexes) == 1 and len(checkout_indexes) == 1:
+        target_check = steps[target_check_indexes[0]]
+        if target_check_indexes[0] <= checkout_indexes[0]:
+            issues.append("Draft checked-out target verification must run after checkout")
+        for marker in ('TARGET_SHA: ${{ steps.resolve-target.outputs.target_sha }}', 'git rev-parse HEAD', '"$TARGET_SHA"'):
+            if marker not in target_check:
+                issues.append(f"Draft checked-out target verification is missing {marker}")
+
+    path_steps = [
+        step
+        for step in steps
+        if re.search(r"^      - name: Detect Draft-related changes\s*$", step, re.MULTILINE)
+    ]
+    if len(path_steps) != 1:
+        issues.append("Draft detect job must have one path-detection step")
+    else:
+        path_step = path_steps[0]
+        for marker, description in (
+            ("TARGET_SHA: ${{ steps.resolve-target.outputs.target_sha }}", "resolved target output"),
+            ('target_sha="$TARGET_SHA"', "resolved target input"),
+        ):
+            if marker not in path_step:
+                issues.append(f"Draft path detection is missing {description}")
+        if "git rev-parse HEAD" in path_step:
+            issues.append("Draft path detection must not derive its target from HEAD")
+
+    release = blocks["release"]
+    smoke_steps = [
+        step
+        for step in _workflow_step_blocks(release)
+        if re.search(
+            r"^      - name: Smoke-check Draft page, assets, CDN and room creation\s*$",
+            step,
+            re.MULTILINE,
+        )
+    ]
+    if len(smoke_steps) != 1:
+        issues.append("Draft release job must have one release smoke step")
+        return issues
+
+    smoke = smoke_steps[0]
+    curl_commands: list[str] = []
+    lines = smoke.splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if "$(curl" not in line:
+            index += 1
+            continue
+        command = line
+        while line.rstrip().endswith("\\") and index + 1 < len(lines):
+            index += 1
+            line = lines[index]
+            command += line
+        curl_commands.append(command)
+        index += 1
+    if len(curl_commands) != 2:
+        issues.append(
+            "Draft release smoke must contain exactly two bounded curl request commands"
+        )
+    for option in ("--connect-timeout 5", "--max-time 15"):
+        if any(option not in command for command in curl_commands):
+            issues.append(f"Every Draft release smoke curl must set {option}")
+    if any(re.search(r"\|\|\s*true", command) for command in curl_commands):
+        issues.append("Draft release smoke curl failures must not be hidden with || true")
+    for marker, description in (
+        ("local max_attempts=10", "bounded retry count"),
+        ("local retry_delay_seconds=2", "bounded retry delay"),
+        ('for attempt in $(seq 1 "$max_attempts")', "bounded retry loop"),
+        ('sleep "$retry_delay_seconds"', "bounded retry sleep"),
+    ):
+        if marker not in smoke:
+            issues.append(f"Draft release smoke is missing {description}")
+    if "--retry" in smoke:
+        issues.append("Draft release smoke must use only the visible bounded retry loop")
+    return issues
 
 
 def host_tools_candidate_artifact_zip_curl_blocks(workflow_text: str) -> tuple[str, ...]:
@@ -1679,6 +1887,7 @@ def collect_issues() -> list[str]:
                     workflow_text,
                 )
             )
+    issues.extend(draft_cloudflare_workflow_issues())
     issues.extend(host_tools_candidate_workflow_issues())
 
     if not SECURITY_WORKFLOW.is_file():
