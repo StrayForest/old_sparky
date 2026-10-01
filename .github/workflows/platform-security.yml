@@ -622,6 +622,7 @@ jobs:
           .venv_platform/bin/python tools/platform_verify.py verification-contract \
             --manifest ci-backend/verification-contract/manifest.json \
             --summary ci-backend/verification-contract/summary.json --quiet
+          .venv_platform/bin/python tools/platform_actionlint.py
       - name: Upload verification contract evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
