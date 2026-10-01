@@ -158,9 +158,6 @@ _RESTART_DIRECTIVES = frozenset(
         "RestartMode",
     }
 )
-_FAIL_HIDING_EXEC_DIRECTIVES = frozenset(
-    {"ExecStart", "ExecStartPre", "ExecStartPost", "ExecCondition"}
-)
 _CANONICAL_EXECUTABLE = re.compile(r"^/[A-Za-z0-9_./-]+$")
 _CANONICAL_EXEC_ARGUMENT = re.compile(r"^[A-Za-z0-9_./=-]+$")
 
@@ -208,117 +205,425 @@ def _is_canonical_exec_value(value: str) -> bool:
         return False
     return all(_CANONICAL_EXEC_ARGUMENT.fullmatch(token) for token in tokens[1:])
 
-# A oneshot is an operational boundary: adding a new directive can change
-# whether a failed maintenance/backup run is visible or silently retried.  An
-# exact allow-list keeps that policy reviewable and makes accidental unit-file
-# drift fail in the repository contract test.
-_EXPECTED_ONESHOT_DIRECTIVES: Mapping[str, frozenset[str]] = {
-    "deadlock-maintenance.service": frozenset(
+# The tracked services are a closed host boundary.  Keep the inventory split
+# by runtime shape so a new long-running service cannot quietly inherit the
+# oneshot failure policy (or vice versa).  The section maps below are exact:
+# values, repeated Environment entries, dependency edges, conditions, cgroup
+# limits and sandbox directives are all part of the reviewed contract.
+LONG_RUNNING_SERVICES: tuple[str, ...] = (
+    "deadlock-api.service",
+    "deadlock-worker.service",
+    "deadlock-web.service",
+)
+ONESHOT_SERVICES: tuple[str, ...] = (
+    "deadlock-maintenance.service",
+    "deadlock-logrotate.service",
+    "deadlock-offsite-backup.service",
+    "deadlock-cloudflare-ips.service",
+    "deadlock-health-monitor.service",
+)
+EXPECTED_SERVICES: tuple[str, ...] = LONG_RUNNING_SERVICES + ONESHOT_SERVICES
+
+# An ignored command prefix is never accepted in the tracked inventory.  The
+# mapping is deliberately available as a named owner/rationale escape hatch,
+# but must remain empty until a narrowly scoped operational exception is
+# reviewed.  A bare boolean or a unit-wide exception would make a future
+# failure-hiding change invisible to the contract.
+IGNORED_EXEC_PREFIX_RATIONALES: Mapping[tuple[str, str, str], str] = {}
+
+_EXEC_DIRECTIVES = frozenset(
+    {
+        "ExecStart",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecStartReload",
+        "ExecStop",
+        "ExecStopPost",
+        "ExecCondition",
+    }
+)
+
+
+def _service_sections(
+    unit: Mapping[str, tuple[str, ...]],
+    service: Mapping[str, tuple[str, ...]],
+    install: Mapping[str, tuple[str, ...]] | None = None,
+) -> Mapping[str, Mapping[str, tuple[str, ...]]]:
+    sections: dict[str, Mapping[str, tuple[str, ...]]] = {
+        "Unit": unit,
+        "Service": service,
+    }
+    if install is not None:
+        sections["Install"] = install
+    return sections
+
+
+_EXPECTED_SERVICE_SECTIONS: Mapping[str, Mapping[str, Mapping[str, tuple[str, ...]]]] = {
+    "deadlock-api.service": _service_sections(
         {
-            "Type",
-            "User",
-            "Group",
-            "WorkingDirectory",
-            "Environment",
-            "ExecStart",
-            "Nice",
-            "IOSchedulingClass",
-            "CPUQuota",
-            "MemoryMax",
-            "TimeoutStartSec",
-            "UMask",
-            "PrivateTmp",
-            "ProtectSystem",
-            "LockPersonality",
-        }
-    ),
-    "deadlock-logrotate.service": frozenset(
+            "Description": ("Old Sparky Arena API",),
+            "After": ("network-online.target redis-server.service postgresql.service",),
+            "Wants": ("network-online.target redis-server.service",),
+        },
         {
-            "Type",
-            "User",
-            "Group",
-            "ExecStart",
-            "Nice",
-            "IOSchedulingClass",
-            "IOSchedulingPriority",
-            "PrivateTmp",
-            "ProtectSystem",
-            "ProtectHome",
-            "LockPersonality",
-            "MemoryDenyWriteExecute",
-            "TimeoutStartSec",
-        }
+            "Type": ("simple",),
+            "User": ("oldsparky-api",),
+            "Group": ("oldsparky-api",),
+            "SupplementaryGroups": ("oldsparky-media",),
+            "WorkingDirectory": ("/opt/oldsparky/platform/current",),
+            "Environment": (
+                "PLATFORM_RUNTIME_SERVICE=api",
+                "PLATFORM_SHARED_DIR=/opt/oldsparky/platform/shared",
+                "PLATFORM_ENV_FILE=/opt/oldsparky/platform/shared/env/api.env",
+                "PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python",
+                "PLATFORM_API_WORKERS=2",
+            ),
+            "RuntimeDirectory": ("oldsparky-ready-vote-cprofile",),
+            "RuntimeDirectoryMode": ("0700",),
+            "LogRateLimitIntervalSec": ("30s",),
+            "LogRateLimitBurst": ("5000",),
+            "ExecStart": ("/opt/oldsparky/platform/current/tools/platform_run_api.sh",),
+            "Restart": ("on-failure",),
+            "RestartSec": ("5",),
+            "UMask": ("0007",),
+            "LimitNOFILE": ("65535",),
+            "NoNewPrivileges": ("true",),
+            "PrivateTmp": ("true",),
+            "PrivateDevices": ("true",),
+            "ProtectSystem": ("strict",),
+            "ProtectHome": ("true",),
+            "ProtectProc": ("invisible",),
+            "ProtectKernelTunables": ("true",),
+            "ProtectKernelModules": ("true",),
+            "ProtectControlGroups": ("true",),
+            "ProtectClock": ("true",),
+            "ProtectHostname": ("true",),
+            "RestrictAddressFamilies": ("AF_UNIX AF_INET AF_INET6",),
+            "RestrictNamespaces": ("true",),
+            "RestrictRealtime": ("true",),
+            "RestrictSUIDSGID": ("true",),
+            "LockPersonality": ("true",),
+            "CapabilityBoundingSet": ("",),
+            "AmbientCapabilities": ("",),
+            "ReadWritePaths": ("/opt/oldsparky/platform/shared/media-staging",),
+            "TasksMax": ("128",),
+            "MemoryMax": ("1G",),
+        },
+        {"WantedBy": ("multi-user.target",)},
     ),
-    "deadlock-offsite-backup.service": frozenset(
+    "deadlock-worker.service": _service_sections(
         {
-            "Type",
-            "User",
-            "Group",
-            "WorkingDirectory",
-            "Environment",
-            "ExecStart",
-            "UMask",
-            "Nice",
-            "IOSchedulingClass",
-            "CPUQuota",
-            "MemoryMax",
-            "TimeoutStartSec",
-            "NoNewPrivileges",
-            "PrivateTmp",
-            "PrivateDevices",
-            "ProtectSystem",
-            "ProtectHome",
-            "ProtectKernelTunables",
-            "ProtectKernelModules",
-            "ProtectKernelLogs",
-            "ProtectControlGroups",
-            "ProtectClock",
-            "ProtectHostname",
-            "LockPersonality",
-            "RestrictSUIDSGID",
-            "RestrictRealtime",
-            "RestrictNamespaces",
-            "CapabilityBoundingSet",
-            "RestrictAddressFamilies",
-        }
-    ),
-    "deadlock-cloudflare-ips.service": frozenset(
+            "Description": ("Old Sparky Arena Worker",),
+            "After": ("network-online.target redis-server.service postgresql.service",),
+            "Wants": ("network-online.target redis-server.service",),
+        },
         {
-            "Type",
-            "TimeoutStartSec",
-            "User",
-            "Group",
-            "WorkingDirectory",
-            "Environment",
-            "ExecStart",
-            "UMask",
-            "NoNewPrivileges",
-            "PrivateTmp",
-            "ProtectSystem",
-            "ProtectHome",
-            "ReadWritePaths",
-            "LockPersonality",
-        }
+            "Type": ("simple",),
+            "User": ("oldsparky-worker",),
+            "Group": ("oldsparky-worker",),
+            "SupplementaryGroups": ("oldsparky-media",),
+            "WorkingDirectory": ("/opt/oldsparky/platform/current",),
+            "Environment": (
+                "PLATFORM_RUNTIME_SERVICE=worker",
+                "PLATFORM_SHARED_DIR=/opt/oldsparky/platform/shared",
+                "PLATFORM_ENV_FILE=/opt/oldsparky/platform/shared/env/worker.env",
+                "PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python",
+                "PLATFORM_WORKER_CONCURRENCY=2",
+            ),
+            "LogRateLimitIntervalSec": ("30s",),
+            "LogRateLimitBurst": ("2000",),
+            "ExecStart": ("/opt/oldsparky/platform/current/tools/platform_run_worker.sh",),
+            "Restart": ("on-failure",),
+            "RestartSec": ("5",),
+            "UMask": ("0007",),
+            "NoNewPrivileges": ("true",),
+            "PrivateTmp": ("true",),
+            "PrivateDevices": ("true",),
+            "ProtectSystem": ("strict",),
+            "ProtectHome": ("true",),
+            "ProtectProc": ("invisible",),
+            "ProtectKernelTunables": ("true",),
+            "ProtectKernelModules": ("true",),
+            "ProtectControlGroups": ("true",),
+            "ProtectClock": ("true",),
+            "ProtectHostname": ("true",),
+            "RestrictAddressFamilies": ("AF_UNIX AF_INET AF_INET6",),
+            "RestrictNamespaces": ("true",),
+            "RestrictRealtime": ("true",),
+            "RestrictSUIDSGID": ("true",),
+            "LockPersonality": ("true",),
+            "CapabilityBoundingSet": ("",),
+            "AmbientCapabilities": ("",),
+            "ReadWritePaths": (
+                "/opt/oldsparky/platform/shared/media-staging /opt/oldsparky/platform/shared/worker-state",
+            ),
+            "TasksMax": ("128",),
+            "MemoryMax": ("1G",),
+        },
+        {"WantedBy": ("multi-user.target",)},
     ),
-    "deadlock-health-monitor.service": frozenset(
+    "deadlock-web.service": _service_sections(
         {
-            "Type",
-            "User",
-            "Group",
-            "WorkingDirectory",
-            "ExecStart",
-            "Nice",
-            "CPUQuota",
-            "MemoryMax",
-            "TimeoutStartSec",
-            "UMask",
-            "PrivateTmp",
-            "ProtectSystem",
-            "ProtectHome",
-            "NoNewPrivileges",
-            "LockPersonality",
-        }
+            "Description": ("Old Sparky Arena Web",),
+            "After": ("network-online.target deadlock-api.service",),
+            "Wants": ("network-online.target",),
+            "StartLimitIntervalSec": ("300s",),
+            "StartLimitBurst": ("5",),
+        },
+        {
+            "Type": ("simple",),
+            "User": ("oldsparky-web",),
+            "Group": ("oldsparky-web",),
+            "WorkingDirectory": ("/opt/oldsparky/platform/current",),
+            "Environment": (
+                "NODE_ENV=production",
+                "PLATFORM_RUNTIME_SERVICE=web",
+                "PLATFORM_SHARED_DIR=/opt/oldsparky/platform/shared",
+                "PLATFORM_ENV_FILE=/opt/oldsparky/platform/shared/env/web.env",
+                "PLATFORM_NODE_BIN=/opt/oldsparky/platform/shared/node-v26.3.1/bin/node",
+            ),
+            "LogRateLimitIntervalSec": ("30s",),
+            "LogRateLimitBurst": ("2000",),
+            "ExecStart": ("/opt/oldsparky/platform/current/tools/platform_run_web.sh",),
+            "SuccessExitStatus": ("143",),
+            "Restart": ("always",),
+            "RestartSec": ("5",),
+            "UMask": ("0077",),
+            "NoNewPrivileges": ("true",),
+            "PrivateTmp": ("true",),
+            "PrivateDevices": ("true",),
+            "ProtectSystem": ("strict",),
+            "ProtectHome": ("true",),
+            "ProtectProc": ("invisible",),
+            "ProtectKernelTunables": ("true",),
+            "ProtectKernelModules": ("true",),
+            "ProtectControlGroups": ("true",),
+            "ProtectClock": ("true",),
+            "ProtectHostname": ("true",),
+            "RestrictAddressFamilies": ("AF_UNIX AF_INET AF_INET6",),
+            "RestrictNamespaces": ("true",),
+            "RestrictRealtime": ("true",),
+            "RestrictSUIDSGID": ("true",),
+            "LockPersonality": ("true",),
+            "CapabilityBoundingSet": ("",),
+            "AmbientCapabilities": ("",),
+            "ReadWritePaths": (
+                "/opt/oldsparky/platform/current/apps/platform_web/.next/standalone/.next/cache",
+            ),
+            "TasksMax": ("128",),
+            "MemoryMax": ("1G",),
+        },
+        {"WantedBy": ("multi-user.target",)},
     ),
+    "deadlock-maintenance.service": _service_sections(
+        {
+            "Description": ("Old Sparky Arena backup and storage maintenance",),
+            "After": ("postgresql.service",),
+            "Wants": ("postgresql.service",),
+            "ConditionPathIsSymbolicLink": ("/opt/oldsparky/platform/current",),
+        },
+        {
+            "Type": ("oneshot",),
+            "User": ("root",),
+            "Group": ("root",),
+            "WorkingDirectory": ("/opt/oldsparky/platform/current",),
+            "Environment": ("PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python",),
+            "ExecStart": (
+                "/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_storage_maintenance.py --apply --backup-keep 14 --release-keep 5 --test-artifact-max-age-days 7 --screenshot-max-age-days 30 --failed-build-max-age-days 1 --minimum-free-gib 5 --maximum-used-percent 85",
+            ),
+            "Nice": ("10",),
+            "IOSchedulingClass": ("idle",),
+            "CPUQuota": ("50%",),
+            "MemoryMax": ("512M",),
+            "TimeoutStartSec": ("30min",),
+            "UMask": ("0077",),
+            "PrivateTmp": ("true",),
+            "ProtectSystem": ("full",),
+            "LockPersonality": ("true",),
+        },
+    ),
+    "deadlock-logrotate.service": _service_sections(
+        {
+            "Description": ("Rotate Old Sparky platform logs by bounded size",),
+            "Documentation": ("man:logrotate(8)",),
+            "RequiresMountsFor": ("/var/log",),
+        },
+        {
+            "Type": ("oneshot",),
+            "User": ("root",),
+            "Group": ("root",),
+            "ExecStart": ("/usr/sbin/logrotate /etc/logrotate.conf",),
+            "Nice": ("19",),
+            "IOSchedulingClass": ("idle",),
+            "IOSchedulingPriority": ("7",),
+            "PrivateTmp": ("true",),
+            "ProtectSystem": ("full",),
+            "ProtectHome": ("true",),
+            "LockPersonality": ("true",),
+            "MemoryDenyWriteExecute": ("true",),
+            "TimeoutStartSec": ("5min",),
+        },
+    ),
+    "deadlock-offsite-backup.service": _service_sections(
+        {
+            "Description": ("Old Sparky encrypted off-site database backup",),
+            "Documentation": ("file:/opt/oldsparky/platform/current/docs/backup-restore-runbook.md",),
+            "After": ("network-online.target deadlock-maintenance.service",),
+            "Wants": ("network-online.target",),
+            "ConditionPathIsSymbolicLink": ("/opt/oldsparky/platform/current",),
+            "ConditionPathExists": ("/opt/oldsparky/platform/shared/.env.backup",),
+        },
+        {
+            "Type": ("oneshot",),
+            "User": ("root",),
+            "Group": ("root",),
+            "WorkingDirectory": ("/opt/oldsparky/platform/current",),
+            "Environment": ("PYTHONDONTWRITEBYTECODE=1",),
+            "ExecStart": (
+                "/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_backup_offsite.py --apply --env-file /opt/oldsparky/platform/shared/.env.backup --platform-env-file /opt/oldsparky/platform/shared/.env.platform --backup-dir /opt/oldsparky/platform/shared/backups --max-age-hours 30 --json",
+            ),
+            "UMask": ("0077",),
+            "Nice": ("10",),
+            "IOSchedulingClass": ("idle",),
+            "CPUQuota": ("50%",),
+            "MemoryMax": ("256M",),
+            "TimeoutStartSec": ("30min",),
+            "NoNewPrivileges": ("true",),
+            "PrivateTmp": ("true",),
+            "PrivateDevices": ("true",),
+            "ProtectSystem": ("strict",),
+            "ProtectHome": ("true",),
+            "ProtectKernelTunables": ("true",),
+            "ProtectKernelModules": ("true",),
+            "ProtectKernelLogs": ("true",),
+            "ProtectControlGroups": ("true",),
+            "ProtectClock": ("true",),
+            "ProtectHostname": ("true",),
+            "LockPersonality": ("true",),
+            "RestrictSUIDSGID": ("true",),
+            "RestrictRealtime": ("true",),
+            "RestrictNamespaces": ("true",),
+            "CapabilityBoundingSet": ("",),
+            "RestrictAddressFamilies": ("AF_UNIX AF_INET AF_INET6",),
+        },
+    ),
+    "deadlock-cloudflare-ips.service": _service_sections(
+        {
+            "Description": ("Validate and refresh Cloudflare origin IP ranges for Nginx",),
+            "After": ("network-online.target nginx.service",),
+            "Wants": ("network-online.target",),
+        },
+        {
+            "Type": ("oneshot",),
+            "TimeoutStartSec": ("210s",),
+            "User": ("root",),
+            "Group": ("root",),
+            "WorkingDirectory": ("/opt/oldsparky/platform/current",),
+            "Environment": ("PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python",),
+            "ExecStart": (
+                "/bin/bash /opt/oldsparky/platform/current/tools/platform_release_lock_exec.sh --app-dir /opt/oldsparky/platform -- /opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_update_cloudflare_ips.py --apply --reload",
+            ),
+            "UMask": ("0022",),
+            "NoNewPrivileges": ("true",),
+            "PrivateTmp": ("true",),
+            "ProtectSystem": ("strict",),
+            "ProtectHome": ("true",),
+            "ReadWritePaths": ("/etc/nginx /run /var/log/nginx",),
+            "LockPersonality": ("true",),
+        },
+    ),
+    "deadlock-health-monitor.service": _service_sections(
+        {
+            "Description": ("Old Sparky Arena lightweight production health gate",),
+            "After": ("network-online.target deadlock-api.service deadlock-worker.service deadlock-web.service nginx.service",),
+            "Wants": ("network-online.target",),
+            "ConditionPathIsSymbolicLink": ("/opt/oldsparky/platform/current",),
+        },
+        {
+            "Type": ("oneshot",),
+            "User": ("root",),
+            "Group": ("root",),
+            "WorkingDirectory": ("/opt/oldsparky/platform/current",),
+            "ExecStart": (
+                "/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_health_monitor.py --disk-min-free-gib 5 --disk-max-used-percent 85",
+            ),
+            "Nice": ("10",),
+            "CPUQuota": ("20%",),
+            "MemoryMax": ("128M",),
+            "TimeoutStartSec": ("90s",),
+            "UMask": ("0077",),
+            "PrivateTmp": ("true",),
+            "ProtectSystem": ("strict",),
+            "ProtectHome": ("true",),
+            "NoNewPrivileges": ("true",),
+            "LockPersonality": ("true",),
+        },
+    ),
+}
+
+_EXPECTED_TIMER_SECTIONS: Mapping[str, Mapping[str, Mapping[str, tuple[str, ...]]]] = {
+    "deadlock-maintenance.timer": {
+        "Unit": {"Description": ("Run Old Sparky Arena maintenance daily",)},
+        "Timer": {
+            "OnCalendar": ("*-*-* 04:15:00",),
+            "RandomizedDelaySec": ("30m",),
+            "Persistent": ("true",),
+            "AccuracySec": ("1m",),
+            "Unit": ("deadlock-maintenance.service",),
+        },
+        "Install": {"WantedBy": ("timers.target",)},
+    },
+    "deadlock-logrotate.timer": {
+        "Unit": {"Description": ("Check Old Sparky platform log sizes every 15 minutes",)},
+        "Timer": {
+            "OnBootSec": ("15m",),
+            "OnUnitActiveSec": ("15m",),
+            "RandomizedDelaySec": ("5m",),
+            "Persistent": ("true",),
+            "AccuracySec": ("1m",),
+            "Unit": ("deadlock-logrotate.service",),
+        },
+        "Install": {"WantedBy": ("timers.target",)},
+    },
+    "deadlock-offsite-backup.timer": {
+        "Unit": {"Description": ("Run encrypted Old Sparky off-site backup daily",)},
+        "Timer": {
+            "OnCalendar": ("*-*-* 05:15:00",),
+            "RandomizedDelaySec": ("30m",),
+            "Persistent": ("true",),
+            "AccuracySec": ("1m",),
+            "Unit": ("deadlock-offsite-backup.service",),
+        },
+        "Install": {"WantedBy": ("timers.target",)},
+    },
+    "deadlock-cloudflare-ips.timer": {
+        "Unit": {"Description": ("Refresh Cloudflare origin IP ranges daily",)},
+        "Timer": {
+            "OnCalendar": ("*-*-* 02:35:00",),
+            "RandomizedDelaySec": ("30m",),
+            "Persistent": ("true",),
+            "AccuracySec": ("5m",),
+            "Unit": ("deadlock-cloudflare-ips.service",),
+        },
+        "Install": {"WantedBy": ("timers.target",)},
+    },
+    "deadlock-health-monitor.timer": {
+        "Unit": {"Description": ("Run Old Sparky Arena health gate every five minutes",)},
+        "Timer": {
+            "OnBootSec": ("5m",),
+            "OnUnitActiveSec": ("5m",),
+            "RandomizedDelaySec": ("30s",),
+            "Persistent": ("true",),
+            "AccuracySec": ("15s",),
+            "Unit": ("deadlock-health-monitor.service",),
+        },
+        "Install": {"WantedBy": ("timers.target",)},
+    },
+}
+
+_EXPECTED_UNIT_SECTIONS: Mapping[str, Mapping[str, Mapping[str, tuple[str, ...]]]] = {
+    **_EXPECTED_SERVICE_SECTIONS,
+    **_EXPECTED_TIMER_SECTIONS,
 }
 
 
@@ -559,6 +864,85 @@ def _expect_values(unit: UnitFile, section: str, key: str, expected: Iterable[st
         )
 
 
+def _validate_exact_unit_directives(units: Mapping[str, UnitFile]) -> None:
+    """Reject unit, service and timer directive drift at the source boundary."""
+
+    for unit_name, expected_sections in _EXPECTED_UNIT_SECTIONS.items():
+        unit = units[unit_name]
+        expected_section_names = set(expected_sections)
+        actual_section_names = set(unit.sections)
+        if actual_section_names != expected_section_names:
+            unexpected = sorted(actual_section_names - expected_section_names)
+            missing = sorted(expected_section_names - actual_section_names)
+            raise SystemdContractError(
+                f"{unit_name}: section inventory mismatch: "
+                f"missing={missing!r} unexpected={unexpected!r}"
+            )
+        for section_name, expected_entries in expected_sections.items():
+            actual_entries = unit.sections[section_name]
+            expected_keys = set(expected_entries)
+            actual_keys = set(actual_entries)
+            if actual_keys != expected_keys:
+                unexpected = sorted(actual_keys - expected_keys)
+                missing = sorted(expected_keys - actual_keys)
+                restart_drift = sorted(
+                    _RESTART_DIRECTIVES.intersection(actual_keys - expected_keys)
+                )
+                if restart_drift and unit_name in ONESHOT_SERVICES:
+                    raise SystemdContractError(
+                        f"{unit_name}: oneshot service has unexpected restart "
+                        f"directives {restart_drift!r}"
+                    )
+                raise SystemdContractError(
+                    f"{unit_name}: {section_name} directive inventory mismatch: "
+                    f"missing={missing!r} unexpected={unexpected!r}"
+                )
+            for key, expected in expected_entries.items():
+                try:
+                    _expect_values(unit, section_name, key, expected)
+                except SystemdContractError as exc:
+                    if key in _EXEC_DIRECTIVES:
+                        raise SystemdContractError(
+                            f"{unit_name}: {section_name}.{key} must fail closed; {exc}"
+                        ) from exc
+                    raise
+
+
+def _validate_exec_failure_visibility(units: Mapping[str, UnitFile]) -> None:
+    """Reject failure-ignoring command/condition prefixes in every service."""
+
+    for service_name in EXPECTED_SERVICES:
+        service = units[service_name]
+        for section_name, entries in service.sections.items():
+            for key, values in entries.items():
+                if key in _EXEC_DIRECTIVES:
+                    # Empty assignments reset the effective systemd command
+                    # list.  Check only commands that the manager will run;
+                    # an ignored command hidden behind a reset is inert.
+                    effective_values = service.effective_resettable_values(
+                        section_name, key
+                    )
+                    for value in effective_values:
+                        rationale = IGNORED_EXEC_PREFIX_RATIONALES.get(
+                            (service_name, key, value)
+                        )
+                        if _has_ignored_exec_prefix(value) and not rationale:
+                            raise SystemdContractError(
+                                f"{service_name}: {section_name}.{key} must fail "
+                                "closed (ignored '-' prefix forbidden)"
+                            )
+                    continue
+                if key.startswith(("Condition", "Assert")):
+                    for value in values:
+                        # Conditions do not use the full command-prefix
+                        # grammar, but a leading '-' (or a combined prefix
+                        # that contains it) is still a failure-hiding input.
+                        if _has_ignored_exec_prefix(value):
+                            raise SystemdContractError(
+                                f"{service_name}: {key} must not hide a failure"
+                            )
+
+
 def validate_unit_graph(units: Mapping[str, UnitFile]) -> None:
     """Ensure every explicit Unit= reference resolves to a tracked unit."""
 
@@ -612,43 +996,14 @@ def validate_timer_policy(units: Mapping[str, UnitFile]) -> None:
 def validate_failure_policy(units: Mapping[str, UnitFile]) -> None:
     """Keep oneshot failures visible and continuous services restartable."""
 
-    oneshot_services = tuple(policy.unit for policy in EXPECTED_TIMERS.values())
-    for service_name in oneshot_services:
+    # Scan before the exact-value check so an unsafe prefix receives the
+    # failure-visibility diagnostic even when it also changes the reviewed
+    # command value.  The exact map then closes every other drift boundary.
+    _validate_exec_failure_visibility(units)
+    _validate_exact_unit_directives(units)
+
+    for service_name in ONESHOT_SERVICES:
         service = units[service_name]
-        _expect_values(service, "Service", "Type", ("oneshot",))
-        service_entries = service.sections.get("Service", {})
-        restart_directives = sorted(_RESTART_DIRECTIVES.intersection(service_entries))
-        if restart_directives:
-            raise SystemdContractError(
-                f"{service_name}: oneshot service has unexpected restart directives "
-                f"{restart_directives!r}"
-            )
-        if service.values("Service", "SuccessExitStatus"):
-            raise SystemdContractError(
-                f"{service_name}: oneshot service must not override SuccessExitStatus"
-            )
-        for key in _FAIL_HIDING_EXEC_DIRECTIVES:
-            if key == "ExecStart":
-                continue
-            values = service.values("Service", key)
-            if any(_has_ignored_exec_prefix(value) for value in values):
-                raise SystemdContractError(
-                    f"{service_name}: {key} must fail closed (ignored '-' prefix forbidden)"
-                )
-        for section_name, entries in service.sections.items():
-            for key, values in entries.items():
-                if (key.startswith("Condition") or key.startswith("Assert")) and any(
-                    value.startswith("-") for value in values
-                ):
-                    raise SystemdContractError(
-                        f"{service_name}: {key} must not hide a failure"
-                    )
-        unexpected = set(service_entries) - _EXPECTED_ONESHOT_DIRECTIVES[service_name]
-        if unexpected:
-            raise SystemdContractError(
-                f"{service_name}: unexpected oneshot Service directives "
-                f"{sorted(unexpected)!r}"
-            )
         exec_values = service.effective_resettable_values("Service", "ExecStart")
         if not exec_values or any(
             _has_ignored_exec_prefix(value) or not _is_canonical_exec_value(value)
@@ -658,21 +1013,6 @@ def validate_failure_policy(units: Mapping[str, UnitFile]) -> None:
                 f"{service_name}: oneshot ExecStart must fail closed "
                 "(canonical absolute command syntax required)"
             )
-
-    for service_name, restart in {
-        "deadlock-api.service": "on-failure",
-        "deadlock-worker.service": "on-failure",
-        "deadlock-web.service": "always",
-    }.items():
-        service = units[service_name]
-        _expect_values(service, "Service", "Type", ("simple",))
-        _expect_values(service, "Service", "Restart", (restart,))
-        _expect_values(service, "Service", "RestartSec", ("5",))
-
-    web = units["deadlock-web.service"]
-    _expect_values(web, "Service", "SuccessExitStatus", ("143",))
-    _expect_values(web, "Unit", "StartLimitIntervalSec", ("300s",))
-    _expect_values(web, "Unit", "StartLimitBurst", ("5",))
 
 
 def validate_all(systemd_root: Path = SYSTEMD_ROOT) -> dict[str, UnitFile]:

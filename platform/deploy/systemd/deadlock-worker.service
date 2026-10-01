@@ -17,7 +17,6 @@ Environment=PLATFORM_WORKER_CONCURRENCY=2
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=2000
 ExecStart=/opt/oldsparky/platform/current/tools/platform_run_worker.sh
-ExecStartPost=-/opt/oldsparky/platform/current/tools/platform_refresh_home_content.sh
 Restart=on-failure
 RestartSec=5
 UMask=0007
