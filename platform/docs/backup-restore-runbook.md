@@ -6,11 +6,19 @@
 
 ## Local verified backup
 
-`platform_backup_restore_drill.py` is the only DB-backup owner. It dumps
+`platform_backup_supervisor.py` is the sole production DB-backup owner. Its
+low-level `platform_backup_restore_drill.py` primitive dumps
 `platformdb.platform` plus `public.alembic_version`, writes a private checksum
 manifest, restores into a new temporary database, validates tables,
 extensions/Alembic and drops the drill database. Daily maintenance retains 14
 verified copies.
+
+Production source-release retention is rooted at
+`/opt/oldsparky/platform/dist/releases`; apply entrypoints pass this path
+explicitly and fail closed if it is unavailable. The restore drill binds the
+database to the exact single Alembic head derived from the deployed
+`alembic/versions` graph; a missing, branched or mismatched graph is not a
+successful verification.
 
 The manifest is the closed, versioned v2 contract implemented by
 [`platform_backup_manifest.py`](../tools/platform_backup_manifest.py). It
@@ -30,29 +38,62 @@ through a held mode-`0600` descriptor, verifies that descriptor and pathname
 identity before publication, and removes the reserved pair on any publication
 or directory-fsync failure.
 
-Residual Phase A risk: a same-owner writer with access to the backup directory
-can still replace the published dump pathname after its final identity/hash
-check and before the manifest publication (or during a later consumer
-operation). Consumers fail closed when that replacement is observed, but the
-window itself is not yet serialized. Phase B must add the backup operation
-lock/supervisor across dump, manifest, retention and offsite selection, then
-revalidate the published pair before timer enablement or merge readiness.
-The offsite timer remains disabled until that gate is complete.
+Phase B closes the same-owner writer window with the canonical backup
+supervisor and `/run/lock/oldsparky-platform-backup.lock`. The lock is a
+root-owned, single-link regular file with mode `0600`; it is opened with a
+held descriptor, validated against the pathname, and protected by a
+non-blocking kernel `flock` plus a fixed Linux abstract-namespace AF_UNIX
+singleton. Replacing the lock filename therefore cannot create a second
+owner. A stale filename is safe to reuse, while a symlink, hardlink, pathname
+replacement or active owner fails closed. The production API has no
+caller-selected lock path; only private tests inject a temporary backend.
+
+All mutating operations use one lock order:
+`release -> retained-load -> source/build -> live-QA -> backup`. Local create,
+restore-drill and prune use the complete order; off-site select/encrypt/upload
+and HeadObject verification use the backup lock as the final suffix. No
+operation acquires an earlier lock after the backup lock, and a caller that
+already holds predecessors passes an in-process supervisor capability instead
+of re-acquiring them.
+
+`platform_backup_supervisor.py` is the sole production mutation owner. It
+revalidates the exact dump/manifest pair identity, SHA-256 and size both
+before and after consumer work. Off-site selection holds both `O_NOFOLLOW`
+descriptors for the complete select/encrypt/HeadObject/PUT transaction; GPG
+reads the held dump descriptor and uploads read from a held ciphertext
+descriptor, never a reopened pathname. Its private evidence record is written as
+`started` before mutation and published atomically after completion. The
+closed schema permits `started`, `passed`, `failed`, `blocked`, `cancelled`
+and `unknown`; stale/interrupted `.inprogress` records become `unknown`, never
+green. A final publication or directory-fsync failure removes the final
+receipt and retains an unknown `.inprogress` record; readers reject a final
+receipt while any matching in-progress record exists. Evidence contains only bounded release/manifest/checksum, lock,
+Alembic, recovery and remote-transport fields—never credentials, raw stderr,
+private paths or PIDs.
+
+The offsite timer remains disabled. Enabling it requires a separate reviewed
+operator gate after the offline recovery drill. Destructive production restore
+is intentionally disabled in the supervisor; routine restore drills use a
+new temporary database, and the documented production recovery gate remains
+the only future owner.
 
 The read-only health monitor uses this same parser and archive checksum path;
 legacy, minimal, extra-key or malformed metadata therefore fails the backup
 health check closed.
 
-The low-level create/restore drill is invoked by storage maintenance; do not
-run its mutating mode directly on the production host because it does not
-acquire the host-wide operation locks. Create a production backup through the
-lock-aware backup-only mode:
+The low-level create/restore drill is invoked in-process by the supervisor; do
+not run its mutating primitive directly on the production host because it does
+not acquire the host-wide operation locks. Its mutating create and prune
+functions require an unforgeable in-process supervisor capability and refuse
+direct calls. Create a production backup through
+the lock-aware backup-only mode:
 
 ```bash
 cd /opt/oldsparky/platform/current
 /opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_storage_maintenance.py \
+  tools/platform_backup_supervisor.py maintenance \
   --app-dir /opt/oldsparky/platform \
+  --source-release-dir /opt/oldsparky/platform/dist/releases \
   --backup-keep 14 --backup-max-age-hours 24 \
   --backup-only --apply --json
 ```
@@ -69,10 +110,10 @@ gh workflow run platform-production-backup.yml \
 Wait for the `Platform production backup` workflow to pass before observing
 or repeating the automatic production deployment. It invokes the same
 lock-aware backup-only mode and acquires locks in the fixed order
-release -> retained-load -> build -> live-QA. Backup-only does not apply
+release -> retained-load -> build -> live-QA -> backup. Backup-only does not apply
 production-release, source-artifact, transient-browser or live-QA retention.
-After the backup is restore/Alembic/checksum/freshness verified, the backup
-owner may rotate only its own archive/metadata set, bounded to 14 retained
+After the supervisor has restore/Alembic/checksum/freshness verified the exact
+pair, it may rotate only its own archive/metadata set, bounded to 14 retained
 copies. A create or restore failure exits before rotation or any other
 pruning path, and leaves all existing backup archives untouched.
 
@@ -100,17 +141,21 @@ Off-host backup remains incomplete until all of these are evidenced:
    recovery drill.
 
 `platform_backup_offsite.py` validates and encrypts locally by default, deletes
-its temporary ciphertext and makes no remote write. `--apply` uploads only the
-newest canonical v2 restore-verified archive and verifies size/SHA/metadata.
-It consumes the same manifest parser as the creator and never deletes remote
-objects.
+its temporary ciphertext and makes no remote write. Supervisor `--apply`
+uploads only the newest canonical v2 restore-verified archive and verifies
+size/SHA/metadata. It consumes the same manifest parser as the creator and
+never deletes remote objects.
 
 ```bash
 cd /opt/oldsparky/platform/current
 /opt/oldsparky/platform/shared/venv/bin/python \
   tools/platform_backup_offsite.py --json
 /opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_backup_offsite.py --apply --json
+  tools/platform_backup_supervisor.py offsite \
+  --app-dir /opt/oldsparky/platform --apply --env-file \
+  /opt/oldsparky/platform/shared/.env.backup --platform-env-file \
+  /opt/oldsparky/platform/shared/.env.platform --backup-dir \
+  /opt/oldsparky/platform/shared/backups --max-age-hours 30 --json
 ```
 
 The `deadlock-offsite-backup.timer` remains disabled in this phase. Run only

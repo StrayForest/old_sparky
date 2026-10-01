@@ -7,17 +7,96 @@ path that was replaced while it was running.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import os
 from pathlib import Path
 import stat
+import threading
+from typing import Any
+from unittest import mock
 from uuid import uuid4
 
 
 TEST_LOCK_ROOT = Path("/run/lock")
 TEST_LOCK_PREFIX = f"oldsparky-platform-test-{os.getpid()}-"
 PRODUCTION_RELEASE_LOCK = Path("/run/lock/oldsparky-platform-release.lock")
+
+
+_BACKUP_METADATA_PATCH_GUARD = threading.RLock()
+_BACKUP_METADATA_PATCH_STATE: dict[str, object] = {"count": 0, "patchers": None}
+
+
+def _root_owned_stat(metadata: os.stat_result) -> os.stat_result:
+    """Model root ownership without changing a non-root temp directory."""
+
+    values = list(metadata)
+    values[4] = 0  # st_uid
+    values[5] = 0  # st_gid
+    return os.stat_result(values)
+
+
+@contextmanager
+def root_owned_backup_lock(supervisor: Any, path: Path):
+    """Hold a real backup lock while faking only privileged metadata in tests.
+
+    The AF_UNIX singleton, kernel ``flock``, descriptors, identity checks, and
+    supervisor provenance all remain real.  Only the ownership fields supplied
+    to the lock validators are modeled as root-owned, because ordinary CI
+    workers cannot create root-owned files in temporary directories.
+    """
+
+    def validate_root(root: Path) -> os.stat_result:
+        metadata = root.lstat()
+        resolved = root.resolve(strict=True)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            resolved != root
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (mode & 0o022 and not mode & stat.S_ISVTX)
+        ):
+            raise supervisor.BackupLockError("backup lock root metadata is unsafe")
+        return _root_owned_stat(metadata)
+
+    def validate_stat(metadata: os.stat_result) -> os.stat_result:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise supervisor.BackupLockError(
+                "backup lock file must be root-owned regular 0600"
+            )
+        return _root_owned_stat(metadata)
+
+    with _BACKUP_METADATA_PATCH_GUARD:
+        if _BACKUP_METADATA_PATCH_STATE["count"] == 0:
+            root_patcher = mock.patch.object(
+                supervisor, "_validate_lock_root", side_effect=validate_root
+            )
+            stat_patcher = mock.patch.object(
+                supervisor, "_validate_lock_stat", side_effect=validate_stat
+            )
+            root_patcher.start()
+            stat_patcher.start()
+            _BACKUP_METADATA_PATCH_STATE["patchers"] = (root_patcher, stat_patcher)
+        _BACKUP_METADATA_PATCH_STATE["count"] = (
+            int(_BACKUP_METADATA_PATCH_STATE["count"]) + 1
+        )
+    try:
+        with supervisor._exclusive_backup_lock_for_test(path) as lock:
+            yield lock
+    finally:
+        with _BACKUP_METADATA_PATCH_GUARD:
+            _BACKUP_METADATA_PATCH_STATE["count"] = (
+                int(_BACKUP_METADATA_PATCH_STATE["count"]) - 1
+            )
+            if _BACKUP_METADATA_PATCH_STATE["count"] == 0:
+                root_patcher, stat_patcher = _BACKUP_METADATA_PATCH_STATE["patchers"]
+                stat_patcher.stop()
+                root_patcher.stop()
+                _BACKUP_METADATA_PATCH_STATE["patchers"] = None
 
 
 def _metadata(st: os.stat_result) -> tuple[int, int, int, int, int, int]:

@@ -12,7 +12,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/oldsparky/platform/current
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_backup_offsite.py --apply --env-file /opt/oldsparky/platform/shared/.env.backup --platform-env-file /opt/oldsparky/platform/shared/.env.platform --backup-dir /opt/oldsparky/platform/shared/backups --max-age-hours 30 --json
+ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_backup_supervisor.py offsite --apply --env-file /opt/oldsparky/platform/shared/.env.backup --platform-env-file /opt/oldsparky/platform/shared/.env.platform --backup-dir /opt/oldsparky/platform/shared/backups --max-age-hours 30 --json
 UMask=0077
 Nice=10
 IOSchedulingClass=idle
@@ -36,4 +36,3 @@ RestrictRealtime=true
 RestrictNamespaces=true
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-

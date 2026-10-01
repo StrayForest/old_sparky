@@ -97,7 +97,10 @@ jobs:
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           python_bin="$runtime/shared/venv/bin/python"
-          maintenance_tool="$current/tools/platform_storage_maintenance.py"
+          # The historical platform_storage_maintenance.py wrapper remains
+          # read-only/library compatibility; this production path enters the
+          # single supervisor directly.
+          maintenance_tool="$current/tools/platform_backup_supervisor.py"
           summary_tool="$current/tools/platform_storage_evidence_summary.py"
           umask 077
           backup_report_file="$(mktemp)"
@@ -116,8 +119,9 @@ jobs:
           test -f "$summary_tool" && test ! -L "$summary_tool" \
             || { echo "Storage evidence summary helper is missing or unsafe" >&2; exit 1; }
 
-          if ! "$python_bin" "$maintenance_tool" \
+          if ! "$python_bin" "$maintenance_tool" maintenance \
             --app-dir "$runtime" \
+            --source-release-dir "$runtime/dist/releases" \
             --backup-keep 14 \
             --backup-max-age-hours 24 \
             --backup-only \

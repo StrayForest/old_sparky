@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import dataclasses
 import datetime as dt
 import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import stat
 import subprocess
@@ -53,6 +55,75 @@ DEFAULT_ENV_FILE = pathlib.Path("/opt/oldsparky/platform/shared/.env.platform")
 DEFAULT_OUTPUT_DIR = pathlib.Path("/opt/oldsparky/platform/shared/backups")
 LOCAL_DATABASE_HOSTS = {None, "", "127.0.0.1", "localhost", "::1"}
 REQUIRED_PLATFORM_EXTENSIONS = REQUIRED_EXTENSIONS
+ALEMBIC_REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
+def _trusted_alembic_head(source_root: pathlib.Path | None = None) -> str:
+    """Resolve the one trusted migration head shipped in the deployed source.
+
+    The release contract currently keeps provenance in ``RELEASE.json`` but
+    does not duplicate migration metadata there.  Parsing the immutable
+    deployed ``alembic/versions`` graph avoids treating any arbitrary single
+    database row as the expected state and fails closed on a branch/missing
+    migration graph.
+    """
+
+    root = pathlib.Path(source_root or "/opt/oldsparky/platform/current")
+    try:
+        versions = root.resolve(strict=True) / "alembic" / "versions"
+        files = sorted(versions.glob("*.py"))
+    except OSError as exc:
+        raise RuntimeError("Trusted deployed Alembic source is unavailable.") from exc
+    revisions: dict[str, set[str]] = {}
+    for path in files:
+        if path.name == "__init__.py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError, UnicodeError) as exc:
+            raise RuntimeError("Trusted deployed Alembic source is invalid.") from exc
+        revision: str | None = None
+        parents: set[str] = set()
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name) or target.id not in {"revision", "down_revision"}:
+                continue
+            try:
+                value = ast.literal_eval(node.value)
+            except (ValueError, SyntaxError):
+                raise RuntimeError("Trusted deployed Alembic source has invalid revision metadata.")
+            if target.id == "revision":
+                if not isinstance(value, str) or ALEMBIC_REVISION_RE.fullmatch(value) is None:
+                    raise RuntimeError("Trusted deployed Alembic revision is invalid.")
+                revision = value
+            elif value is None:
+                continue
+            elif isinstance(value, str):
+                parents.add(value)
+            elif isinstance(value, (tuple, list)) and all(isinstance(item, str) for item in value):
+                parents.update(value)
+            else:
+                raise RuntimeError("Trusted deployed Alembic parent metadata is invalid.")
+        if revision is None or revision in revisions:
+            raise RuntimeError("Trusted deployed Alembic graph has duplicate or missing revisions.")
+        revisions[revision] = parents
+    if not revisions:
+        raise RuntimeError("Trusted deployed Alembic graph is empty.")
+    referenced = {parent for parents in revisions.values() for parent in parents}
+    if referenced - set(revisions):
+        raise RuntimeError("Trusted deployed Alembic graph references a missing parent.")
+    heads = sorted(set(revisions) - referenced)
+    if len(heads) != 1:
+        raise RuntimeError("Trusted deployed Alembic graph does not have exactly one head.")
+    return heads[0]
+
+
+def expected_alembic_head(source_root: pathlib.Path | None = None) -> str:
+    """Public read-only helper for the exact trusted migration head."""
+
+    return _trusted_alembic_head(source_root)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -420,7 +491,13 @@ def remote_admin_command(
     raise ValueError(f"Unsupported database admin action: {action}")
 
 
-def prune_backups(output_dir: pathlib.Path, *, keep: int) -> list[str]:
+def prune_backups(
+    output_dir: pathlib.Path,
+    *,
+    keep: int,
+    capability: object | None = None,
+) -> list[str]:
+    _require_supervisor_capability(capability)
     if keep < 1:
         raise ValueError("--keep must be at least 1.")
     dumps = sorted(output_dir.glob("platformdb-*.dump"), key=lambda path: path.stat().st_mtime)
@@ -439,7 +516,9 @@ def prune_unverified_backups(
     output_dir: pathlib.Path,
     *,
     preserve_metadata: pathlib.Path,
+    capability: object | None = None,
 ) -> list[str]:
+    _require_supervisor_capability(capability)
     removed: list[str] = []
     for metadata_path in output_dir.glob("platformdb-*.json"):
         if metadata_path == preserve_metadata:
@@ -473,13 +552,50 @@ def prune_unverified_backups(
     return removed
 
 
+def _require_supervisor_capability(capability: object | None) -> None:
+    if capability is None:
+        raise RuntimeError("backup pruning is supervisor-owned and requires a capability")
+    try:
+        import tools.platform_backup_supervisor as supervisor
+    except ImportError:
+        try:
+            from . import platform_backup_supervisor as supervisor
+        except ImportError:
+            import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+    supervisor.require_mutation_capability(capability, "maintenance")
+
+
 def perform_restore_drill(
     dump_path: pathlib.Path,
     *,
     app_target: DatabaseTarget,
     admin_target: DatabaseTarget | None,
     timestamp_slug: str,
+    trusted_alembic_head: object | None = None,
+    expected_alembic_head: str | None = None,
+    source_root: pathlib.Path | None = None,
 ) -> int:
+    if trusted_alembic_head is not None:
+        try:
+            import tools.platform_backup_supervisor as supervisor
+        except ImportError:
+            try:
+                from . import platform_backup_supervisor as supervisor
+            except ImportError:
+                import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+        trusted = supervisor.require_trusted_alembic_head(
+            trusted_alembic_head,
+            source_root=source_root,
+            expected=expected_alembic_head,
+        )
+        expected_head = trusted.value
+    else:
+        trusted_head = _trusted_alembic_head(source_root)
+        if expected_alembic_head is not None and expected_alembic_head != trusted_head:
+            raise RuntimeError(
+                "Expected Alembic head does not match the trusted deployed source graph."
+            )
+        expected_head = trusted_head
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
         admin_target is None
@@ -586,8 +702,10 @@ def perform_restore_drill(
             capture_output=True,
         )
         revisions = [line.strip() for line in revision_result.stdout.splitlines() if line.strip()]
-        if len(revisions) != 1:
-            raise RuntimeError("Restore drill did not recover exactly one Alembic revision.")
+        if revisions != [expected_head]:
+            raise RuntimeError(
+                "Restore drill Alembic revision does not match the trusted deployed head."
+            )
         extension_count_result = run_command(
             [
                 "psql",
@@ -653,7 +771,37 @@ def _new_backup_identity(
     raise RuntimeError("Could not allocate a unique platform backup run_id.")
 
 
-def create_backup(args: argparse.Namespace) -> dict[str, Any]:
+def create_backup(
+    args: argparse.Namespace,
+    *,
+    prune: bool = True,
+    capability: object | None = None,
+    trusted_alembic_head: object | None = None,
+) -> dict[str, Any]:
+    """Create one archive/manifest pair.
+
+    Every mutating call requires the supervisor's private in-process
+    capability, including the legacy ``prune=True`` default.  The command-line
+    mutation path is routed by :func:`main` through the supervisor; focused
+    producer tests inject the same private capability explicitly.
+    """
+    if capability is None:
+        capability = getattr(args, "_supervisor_capability", None)
+    if capability is None:
+        raise RuntimeError(
+            "supervisor-owned backup creation requires an in-process capability"
+        )
+    try:
+        import tools.platform_backup_supervisor as supervisor
+    except ImportError:
+        try:
+            from . import platform_backup_supervisor as supervisor
+        except ImportError:
+            import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+    supervisor.require_mutation_capability(capability, "maintenance")
+    trusted_head = None
+    if not args.dump_only:
+        trusted_head = supervisor.require_trusted_alembic_head(trusted_alembic_head)
     env_file = pathlib.Path(args.env_file)
     output_dir = pathlib.Path(args.output_dir)
     file_env = load_env(env_file)
@@ -690,6 +838,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     started_at = utc_now()
     restore_verified = False
     restored_table_count: int | None = None
+    alembic_revision: str | None = None
     restore_error: str | None = None
     temporary_dump_fd: int | None = None
     temporary_dump_created = False
@@ -795,8 +944,11 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                     app_target=app_target,
                     admin_target=admin_target,
                     timestamp_slug=timestamp_slug,
+                    trusted_alembic_head=trusted_head,
                 )
                 restore_verified = True
+                assert trusted_head is not None
+                alembic_revision = trusted_head.value
             except Exception as exc:
                 restore_error = str(exc)
 
@@ -817,10 +969,22 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         write_manifest(metadata_path, metadata)
         metadata_written = True
         removed: list[str] = []
-        if restore_verified:
-            removed.extend(prune_unverified_backups(output_dir, preserve_metadata=metadata_path))
-            removed.extend(prune_backups(output_dir, keep=args.keep))
-        result = {"ok": restore_error is None, **metadata, "metadata_file": str(metadata_path), "removed": removed}
+        if restore_verified and prune:
+            removed.extend(
+                prune_unverified_backups(
+                    output_dir,
+                    preserve_metadata=metadata_path,
+                    capability=capability,
+                )
+            )
+            removed.extend(prune_backups(output_dir, keep=args.keep, capability=capability))
+        result = {
+            "ok": restore_error is None,
+            **metadata,
+            "metadata_file": str(metadata_path),
+            "removed": removed,
+            "alembic_revision": alembic_revision or "unknown",
+        }
         if restore_error is not None:
             raise RuntimeError(f"Platform backup was created but restore verification failed: {restore_error}")
         return result
@@ -889,11 +1053,34 @@ def main() -> int:
         if selected_modes > 1:
             raise ValueError("--dump-only, --check-latest, and --verify-dump are mutually exclusive.")
         if args.verify_dump is not None:
-            result = verify_existing_dump(args)
+            # A production restore drill is a supervisor-owned mutation.  The
+            # read-only ``--check-latest`` path below remains available to
+            # health/preflight diagnostics.
+            raise RuntimeError(
+                "--verify-dump is a supervisor-owned restore drill; use platform_backup_supervisor"
+            )
         elif args.check_latest:
             result = check_latest_backup(pathlib.Path(args.output_dir), max_age_hours=args.max_age_hours)
         else:
-            result = create_backup(args)
+            try:
+                from . import platform_backup_supervisor as supervisor
+            except ImportError:
+                import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+            # No environment variable or numeric FD is accepted as a
+            # capability.  The supervisor calls ``create_backup`` in-process.
+            result = supervisor.run_backup_entrypoint(
+                argparse.Namespace(
+                    app_dir=pathlib.Path(args.output_dir).resolve().parents[1],
+                    source_release_dir=pathlib.Path("/opt/oldsparky/platform/dist/releases"),
+                    keep=args.keep,
+                    max_age_hours=args.max_age_hours,
+                    env_file=pathlib.Path(args.env_file),
+                    output_dir=pathlib.Path(args.output_dir),
+                    admin_database_url=args.admin_database_url,
+                    as_json=args.as_json,
+                ),
+                app_dir=pathlib.Path(args.output_dir).resolve().parents[1],
+            )
         print_result(result, as_json=args.as_json)
         return 0
     except Exception as exc:

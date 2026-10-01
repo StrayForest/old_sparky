@@ -2841,14 +2841,22 @@ def prune_runtime_cache_release_lock_held(
     keep: int,
     root: Path = RUNNER_CACHE_ROOT,
     app_dir: Path = APP_DIR,
+    machine_lock_fd: int | None = None,
 ) -> RuntimeCacheRetentionPlan:
-    """Prune while the caller holds the platform release-operation lock."""
+    """Prune while the caller holds the platform release-operation lock.
+
+    The backup/maintenance supervisor may pass the already-held machine lock
+    descriptor.  This keeps the global release -> retained-load -> build ->
+    live-QA -> backup order one-way; the old standalone API still acquires its
+    own live-QA lock when no descriptor is supplied.
+    """
 
     if keep < 1 or keep > 100:
         raise GuardError("runtime cache keep must be between 1 and 100")
     if not os.path.lexists(root):
         return RuntimeCacheRetentionPlan((), (), (), ())
-    descriptor = _open_machine_lock()
+    descriptor = machine_lock_fd if machine_lock_fd is not None else _open_machine_lock()
+    owns_descriptor = machine_lock_fd is None
     try:
         assert_liveqa_idle()
         protected_commits = _protected_release_commits(app_dir)
@@ -2864,10 +2872,11 @@ def prune_runtime_cache_release_lock_held(
             apply_runtime_cache_retention_plan(plan, root=root)
         return plan
     finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+        if owns_descriptor:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def prune_runtime_cache(

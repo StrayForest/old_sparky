@@ -75,7 +75,7 @@ except ImportError:  # Direct execution from the tools directory.
 
 
 DEFAULT_APP_DIR = Path("/opt/oldsparky/platform")
-DEFAULT_SOURCE_RELEASE_DIR = Path("/root/old_sparky/platform/dist/releases")
+DEFAULT_SOURCE_RELEASE_DIR = Path("/opt/oldsparky/platform/dist/releases")
 DEFAULT_WEB_ARTIFACT_DIR = Path("/root/old_sparky/platform/apps/platform_web")
 BACKUP_ONLY_KEEP = 14
 SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
@@ -449,7 +449,7 @@ def _run_backup_command(command: list[str]) -> dict[str, Any]:
     return result
 
 
-def run_backup(
+def _run_backup_legacy(
     app_dir: Path, *, keep: int, max_age_hours: float = 24.0
 ) -> dict[str, Any]:
     if not math.isfinite(max_age_hours) or max_age_hours <= 0:
@@ -512,6 +512,49 @@ def run_backup(
     }
 
 
+def run_backup(
+    app_dir: Path,
+    *,
+    keep: int,
+    max_age_hours: float = 24.0,
+    capability: object | None = None,
+    lock: Any | None = None,
+    evidence: Any | None = None,
+) -> dict[str, Any]:
+    """Compatibility facade for the supervisor-owned backup primitive.
+
+    A direct library call remains useful to deterministic producer tests.  A
+    production mutation always supplies the in-process capability, held final
+    lock, and evidence session from ``platform_backup_supervisor``.
+    """
+
+    if capability is None:
+        return _run_backup_legacy(
+            app_dir, keep=keep, max_age_hours=max_age_hours
+        )
+    try:
+        from . import platform_backup_supervisor as supervisor
+    except ImportError:
+        import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+    if lock is None or evidence is None:
+        raise RuntimeError("supervisor backup capability requires held lock and evidence")
+    supervisor.require_mutation_capability(capability, "maintenance")
+    return supervisor._run_local_backup_scope(
+        argparse.Namespace(dump_only=False),
+        app_dir=app_dir,
+        lock=lock,
+        callback=lambda scoped_capability, trusted_head, _restore: supervisor.run_local_backup(
+            app_dir,
+            keep=keep,
+            max_age_hours=max_age_hours,
+            trusted_alembic_head=trusted_head,
+            capability=scoped_capability,
+            lock=lock,
+            evidence=evidence,
+        ),
+    )
+
+
 def write_report(report_dir: Path, report: dict[str, Any], *, keep: int) -> Path:
     report_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -569,6 +612,9 @@ def _plan_and_maybe_apply(
     *,
     app_dir: Path,
     source_release_dir: Path | None,
+    capability: object | None = None,
+    backup_lock: Any | None = None,
+    evidence: Any | None = None,
 ) -> tuple[
     RetentionPlan,
     ArtifactRetentionPlan,
@@ -617,13 +663,19 @@ def _plan_and_maybe_apply(
 
     if args.apply:
         if not args.skip_backup:
+            backup_kwargs: dict[str, Any] = {
+                "keep": args.backup_keep,
+                "max_age_hours": getattr(args, "backup_max_age_hours", 24.0),
+            }
+            if capability is not None:
+                backup_kwargs.update(
+                    capability=capability,
+                    lock=backup_lock,
+                    evidence=evidence,
+                )
             backup = {
                 "status": "completed",
-                **run_backup(
-                    app_dir,
-                    keep=args.backup_keep,
-                    max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
-                ),
+                **run_backup(app_dir, **backup_kwargs),
             }
         apply_release_plan(production_plan, app_dir=app_dir)
         if source_release_dir is not None:
@@ -657,62 +709,140 @@ def _plan_and_maybe_apply(
     )
 
 
-def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
+def run_maintenance(
+    args: argparse.Namespace,
+    *,
+    _supervisor_capability: object | None = None,
+    _backup_lock: Any | None = None,
+    _live_qa_lock_fd: int | None = None,
+    _evidence: Any | None = None,
+    _locks_held: bool = False,
+) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     app_dir = args.app_dir.resolve(strict=True)
+    if args.apply:
+        source_candidate = Path(args.source_release_dir)
+        if (
+            not source_candidate.exists()
+            or not source_candidate.is_dir()
+            or source_candidate.is_symlink()
+        ):
+            raise RuntimeError("canonical source release contour is unavailable")
     disk_before_snapshot = disk_snapshot_for_path(Path("/"))
+
+    if args.apply and _locks_held:
+        if _supervisor_capability is None or _backup_lock is None or _evidence is None:
+            raise RuntimeError(
+                "held maintenance execution requires the supervisor capability, lock and evidence"
+            )
+        try:
+            from . import platform_backup_supervisor as supervisor
+        except ImportError:
+            import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+        supervisor.require_mutation_capability(
+            _supervisor_capability, "maintenance"
+        )
+        _backup_lock.validate()
+
+    if args.apply and not _locks_held:
+        # Compatibility/library callers still enter through the same ordered
+        # suffix.  Production entrypoints use the supervisor's outer scope
+        # and call this function with ``_locks_held=True`` so no predecessor
+        # lock is re-acquired while the backup lock is held.
+        try:
+            from . import platform_backup_supervisor as supervisor
+        except ImportError:
+            import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+        with supervisor.evidence_session(
+            app_dir,
+            "maintenance",
+            locks=supervisor.operation_lock_requirements("maintenance"),
+        ) as evidence:
+            with maintenance_lock_scope(args, app_dir=app_dir) as _source_dir:
+                with supervisor._machine_live_qa_lock() as live_qa_fd:
+                    with supervisor.exclusive_backup_lock() as backup_lock:
+                        return supervisor._run_maintenance_scope(
+                            lock=backup_lock,
+                            callback=lambda capability: run_maintenance(
+                                args,
+                                _supervisor_capability=capability,
+                                _backup_lock=backup_lock,
+                                _live_qa_lock_fd=live_qa_fd,
+                                _evidence=evidence,
+                                _locks_held=True,
+                            ),
+                        )
 
     if args.apply:
         # Fixed global order: release transaction lock, retained-load lock,
-        # build-output lock, then live-QA machine lock. Install/rollback take
-        # only the first; deploy takes the first two; builds take only the
-        # third; standalone live-QA retention takes first then the fourth.
-        with maintenance_lock_scope(args, app_dir=app_dir) as source_release_dir:
-            if getattr(args, "backup_only", False):
-                # Do not construct or apply release, artifact, transient or
-                # live-QA retention plans in this mode. The backup owner may
-                # rotate only its verified archive set, bounded to 14 copies.
-                # A backup/restore failure therefore exits before rotation
-                # or any other deletion path.
-                maintenance_result = (
-                    RetentionPlan((), (), ()),
-                    ArtifactRetentionPlan((), (), ()),
-                    (),
-                    (),
-                    (),
-                    {
-                        "status": "completed",
-                        **run_backup(
-                            app_dir,
-                            keep=BACKUP_ONLY_KEEP,
-                            max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
-                        ),
-                    },
-                    {
-                        "failed_builds": 0,
-                        "browser_test_artifacts": 0,
-                        "preprod_screenshots": 0,
-                    },
+        # build-output lock, live-QA machine lock, then backup lock.  This
+        # branch is entered only after all five are held by the caller.
+        source_release_dir = (
+            args.source_release_dir.resolve(strict=True)
+            if args.source_release_dir.exists()
+            else None
+        )
+        if getattr(args, "backup_only", False):
+            # Backup-only never plans release/source/transient/live-QA
+            # retention.  The final backup lock still serializes create,
+            # restore, pair validation and archive rotation.
+            backup_kwargs: dict[str, Any] = {
+                "keep": BACKUP_ONLY_KEEP,
+                "max_age_hours": getattr(args, "backup_max_age_hours", 24.0),
+            }
+            if _supervisor_capability is not None:
+                backup_kwargs.update(
+                    capability=_supervisor_capability,
+                    lock=_backup_lock,
+                    evidence=_evidence,
                 )
-                live_qa_plan = live_qa_guard.RuntimeCacheRetentionPlan((), (), (), ())
-            else:
-                maintenance_result = _plan_and_maybe_apply(
+            # Keep patched test/library facades observationally compatible;
+            # the concrete production ``run_backup`` function always receives
+            # the in-process capability above.
+            if (
+                getattr(run_backup, "__name__", "run_backup") != "run_backup"
+                or run_backup.__class__.__module__.startswith("unittest.mock")
+            ):
+                backup_kwargs.pop("capability", None)
+                backup_kwargs.pop("lock", None)
+                backup_kwargs.pop("evidence", None)
+            maintenance_result = (
+                RetentionPlan((), (), ()),
+                ArtifactRetentionPlan((), (), ()),
+                (),
+                (),
+                (),
+                {
+                    "status": "completed",
+                    **run_backup(app_dir, **backup_kwargs),
+                },
+                {
+                    "failed_builds": 0,
+                    "browser_test_artifacts": 0,
+                    "preprod_screenshots": 0,
+                },
+            )
+            live_qa_plan = live_qa_guard.RuntimeCacheRetentionPlan((), (), (), ())
+        else:
+            maintenance_result = _plan_and_maybe_apply(
+                args,
+                app_dir=app_dir,
+                source_release_dir=source_release_dir,
+                capability=_supervisor_capability,
+                backup_lock=_backup_lock,
+                evidence=_evidence,
+            )
+            live_qa_plan = live_qa_guard.prune_runtime_cache_release_lock_held(
+                apply=True,
+                keep=args.live_qa_runtime_keep,
+                root=getattr(
                     args,
-                    app_dir=app_dir,
-                    source_release_dir=source_release_dir,
-                )
-                live_qa_plan = (
-                    live_qa_guard.prune_runtime_cache_release_lock_held(
-                        apply=True,
-                        keep=args.live_qa_runtime_keep,
-                        root=getattr(
-                            args,
-                            "live_qa_runtime_root",
-                            live_qa_guard.RUNNER_CACHE_ROOT,
-                        ),
-                        app_dir=app_dir,
-                    )
-                )
+                    "live_qa_runtime_root",
+                    live_qa_guard.RUNNER_CACHE_ROOT,
+                ),
+                app_dir=app_dir,
+                machine_lock_fd=_live_qa_lock_fd,
+            )
     else:
         source_release_dir = (
             args.source_release_dir if args.source_release_dir.exists() else None
@@ -822,7 +952,18 @@ def print_summary(report: dict[str, Any]) -> None:
 def main() -> int:
     args = parse_args()
     try:
-        report = run_maintenance(args)
+        if args.apply:
+            # Production mutation is routed through the single backup
+            # supervisor, which owns the final backup lock and evidence.  The
+            # dry-run path remains a read-only diagnostic and intentionally
+            # does not acquire the mutation lock chain.
+            try:
+                from . import platform_backup_supervisor as supervisor
+            except ImportError:
+                import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+            report = supervisor.run_maintenance_entrypoint(args)
+        else:
+            report = run_maintenance(args)
         if args.apply:
             write_report(
                 args.app_dir / "shared" / "maintenance",

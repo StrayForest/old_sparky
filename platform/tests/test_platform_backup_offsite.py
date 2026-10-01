@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -12,6 +13,9 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+
+from tests import platform_test_lock_support as lock_support
+from tools import platform_backup_supervisor
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,8 +45,26 @@ sys.modules[RESTORE_SPEC.name] = backup_creator
 RESTORE_SPEC.loader.exec_module(backup_creator)
 
 
+@contextmanager
+def _held_test_lock():
+    with tempfile.TemporaryDirectory() as temporary_dir:
+        path = Path(temporary_dir) / platform_backup_supervisor.BACKUP_LOCK_PATH.name
+        with lock_support.root_owned_backup_lock(platform_backup_supervisor, path) as lock:
+            yield lock
+
+
 FINGERPRINT = "A" * 40
 R2_ENDPOINT = f"https://{'a' * 32}.r2.cloudflarestorage.com"
+
+
+def _trusted_source(source_root: Path) -> Path:
+    versions = source_root / "alembic" / "versions"
+    versions.mkdir(parents=True)
+    (versions / "001.py").write_text(
+        "revision = '20260913_0053'\ndown_revision = None\n",
+        encoding="utf-8",
+    )
+    return source_root
 
 
 def _write_private(path: Path, content: str | bytes) -> None:
@@ -155,12 +177,34 @@ class RecordingStorageClient:
 
 
 class PlatformBackupOffsiteTests(unittest.TestCase):
+    def _create_backup(
+        self,
+        args: argparse.Namespace,
+        *,
+        app_dir: Path,
+        source_root: Path,
+    ) -> dict[str, object]:
+        with _held_test_lock() as lock:
+            return platform_backup_supervisor._run_local_backup_scope(
+                args,
+                app_dir=app_dir,
+                source_root=source_root,
+                _restore_module=backup_creator,
+                lock=lock,
+                callback=lambda capability, trusted_head, _restore: backup_creator.create_backup(
+                    args,
+                    capability=capability,
+                    trusted_alembic_head=trusted_head,
+                ),
+            )
+
     def test_actual_creator_manifest_is_consumed_by_offsite_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             env_path = root / ".env.platform"
             output_dir = root / "backups"
             output_dir.mkdir()
+            trusted_source = _trusted_source(root / "trusted-source")
             args = argparse.Namespace(
                 env_file=str(env_path),
                 output_dir=str(output_dir),
@@ -189,7 +233,11 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 mock.patch.object(backup_creator, "run_command", side_effect=fake_run_command),
                 mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
             ):
-                created = backup_creator.create_backup(args)
+                created = self._create_backup(
+                    args,
+                    app_dir=root,
+                    source_root=trusted_source,
+                )
 
             selected = offsite.select_verified_backup(
                 output_dir, None, max_age_hours=24, apply=False
@@ -205,6 +253,7 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
             root = Path(temporary_dir)
             output_dir = root / "backups"
             output_dir.mkdir()
+            trusted_source = _trusted_source(root / "trusted-source")
             fixed_now = dt.datetime(2026, 10, 1, 12, 0, 0, tzinfo=dt.UTC)
             args = argparse.Namespace(
                 env_file=str(root / ".env.platform"),
@@ -235,8 +284,16 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
                 mock.patch.object(backup_creator, "utc_now", return_value=fixed_now),
             ):
-                first = backup_creator.create_backup(args)
-                second = backup_creator.create_backup(args)
+                first = self._create_backup(
+                    args,
+                    app_dir=root,
+                    source_root=trusted_source,
+                )
+                second = self._create_backup(
+                    args,
+                    app_dir=root,
+                    source_root=trusted_source,
+                )
 
             self.assertNotEqual(first["run_id"], second["run_id"])
             self.assertEqual(len(tuple(output_dir.glob("*.dump"))), 2)

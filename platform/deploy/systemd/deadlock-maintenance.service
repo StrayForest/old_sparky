@@ -10,7 +10,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/oldsparky/platform/current
 Environment=PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python
-ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_storage_maintenance.py --apply --backup-keep 14 --release-keep 5 --test-artifact-max-age-days 7 --screenshot-max-age-days 30 --failed-build-max-age-days 1 --minimum-free-gib 5 --maximum-used-percent 85
+ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_backup_supervisor.py maintenance --app-dir /opt/oldsparky/platform --source-release-dir /opt/oldsparky/platform/dist/releases --apply --backup-keep 14 --release-keep 5 --test-artifact-max-age-days 7 --screenshot-max-age-days 30 --failed-build-max-age-days 1 --minimum-free-gib 5 --maximum-used-percent 85
 Nice=10
 IOSchedulingClass=idle
 CPUQuota=50%
@@ -20,4 +20,3 @@ UMask=0077
 PrivateTmp=true
 ProtectSystem=full
 LockPersonality=true
-
