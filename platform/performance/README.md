@@ -51,12 +51,13 @@ with every retained result.
 
 ### Runtime deadlines and kill boundary
 
-`portfolio.request_budget.max_duration_seconds` is the absolute measurement
-deadline. `portfolio.cost_budget.max_runner_minutes` is a separate whole-runner
-ceiling that includes worker startup, imports, report publication and the
-supervisor grace window; profile validation requires the measurement budget to
-finish strictly before that outer ceiling. Both deadlines are monotonic and
-start before the trace and first measured I/O.
+`portfolio.request_budget.max_duration_seconds` and
+`portfolio.cost_budget.max_runner_minutes` select one absolute monotonic wall
+deadline. A bounded reserve inside that deadline covers worker startup,
+wrapper wait, TERM/KILL, captured-chain and namespace reaping, report
+read/validation/publication and the final acceptance gate; no teardown phase
+extends the budget. The deadline starts before the trace and first measured
+I/O.
 
 `platform_load.py run` is only a supervisor. On the pinned `ubuntu-24.04`
 runner it first probes the mandatory Linux PID-namespace contour, then starts
@@ -70,20 +71,27 @@ namespace PID 1. The probe and entry check all real/effective/saved UID/GID
 values, groups, PID 1/PPID 0, all capability fields and `NoNewPrivs=1`; the
 stdio READY/ACK handshake does not depend on inherited descriptors that sudo
 could close. A failed probe is non-authoritative and there is no unsafe
-process-group fallback. The supervisor passes the same absolute deadlines to
-the worker and sends `TERM` followed by `KILL` after a bounded grace period.
+process-group fallback; the runtime rejects before mkdir/stale cleanup/config
+write/temp-directory creation and returns only an in-memory error/exit on a
+root/local runner. The supervisor passes the same absolute deadlines to the
+worker and sends `TERM` followed by `KILL` after only the remaining grace.
 It tracks wrapper and namespace identities by pidfd/start-time, waits for the
 wrapper, reaps a zombie namespace PID 1 when needed, and verifies closure
 before publishing the report. Every report has mandatory boolean
 `namespace_closed`; only the parent sets it true after closure. A killed,
 malformed or incomplete worker produces a failed report with
 `partial_work=true` and `inflight_unknown=true`; a missing child report cannot
-replace the primary timeout or containment reason. The finalizer blocks all
+replace the primary timeout or containment reason. A teardown, report-parser
+or publication overrun is always a failed envelope and never `reason=none` or
+success. The finalizer blocks all
 cleanup on missing/false `namespace_closed` and exposes a separate manual
 emergency barrier. Linux namespace workers set `PR_SET_PDEATHSIG=SIGKILL` as
 an orphan guard. A non-root pidfd watchdog additionally reclaims the complete
 sudo/setpriv/unshare descendant chain when the supervisor disappears, because
-a setuid sudo exec may clear the signal across that transition.
+a setuid sudo exec may clear the signal across that transition. The hosted
+canary creates a TERM-ignoring setsid/double-fork/nested descendant tree,
+records outer PID/start-time identities and proves heartbeat plus every
+captured identity stop after closure.
 
 DNS resolution, TCP connect, TLS, request writes, response headers/body,
 retry backoff and executor futures all consume the same absolute budget. The

@@ -2067,7 +2067,17 @@ def collect_issues() -> list[str]:
         issues.append("load containment canary workflow is missing")
     else:
         canary_text = canary_workflow.read_text(encoding="utf-8")
-        for marker in ("runs-on: ubuntu-24.04", "probe_pid_namespace_capability", "run_supervised", "namespace_closed"):
+        for marker in (
+            "runs-on: ubuntu-24.04",
+            "probe_pid_namespace_capability",
+            "run_supervised",
+            "namespace_closed",
+            "os.fork()",
+            "os.setsid()",
+            "nested-descendant",
+            "starttime",
+            "heartbeat",
+        ):
             if marker not in canary_text:
                 issues.append(f"load containment canary is missing marker: {marker}")
         for forbidden in ("secrets.", "platform_load.py run", "manifest", "fixture"):

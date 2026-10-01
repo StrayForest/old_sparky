@@ -1797,8 +1797,40 @@ def run_profile(
     work.  A valid worker report is copied atomically only after the child has
     exited and the namespace is closed; a killed, malformed or missing child
     report becomes a closed failed report so the independent fixture finalizer
-    can still run.
+    can still run. A rejected capability preflight returns a pure exit/error
+    channel before it touches the caller's report path.
     """
+
+    # This is intentionally the first side-effect boundary in the run path.
+    # A root/local runner must receive a pure stderr/exit failure; it must not
+    # create report directories, remove stale reports, or create the worker
+    # TemporaryDirectory before the mandatory non-root namespace probe passes.
+    try:
+        from tools.platform_load_runtime import (
+            NamespaceCapabilityError,
+            require_pid_namespace_capability,
+        )
+    except ModuleNotFoundError:  # Direct execution from platform/tools.
+        from platform_load_runtime import (  # type: ignore[no-redef]
+            NamespaceCapabilityError,
+            require_pid_namespace_capability,
+        )
+    try:
+        require_pid_namespace_capability()
+    except NamespaceCapabilityError as exc:
+        print(
+            json.dumps(
+                {
+                    "decision": "LOAD ISOLATION UNAVAILABLE",
+                    "passed": False,
+                    "error_class": safe_error_class(type(exc).__name__),
+                    "reason": str(exc),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
 
     ensure_dispatchable(profile)
     contract = profile_contract(profile)

@@ -15,6 +15,7 @@ from unittest.mock import patch
 from tools.platform_load_runtime import (
     LoadRuntimeBudget,
     LoadRuntimeBudgetExceeded,
+    NamespaceCapabilityError,
     NamespaceIntegrityError,
     WORKER_REPORT_SCHEMA,
     _closed_failure_report,
@@ -26,6 +27,7 @@ from tools.platform_load_runtime import (
     _read_closed_report,
     _read_process_starttime,
     _read_process_state,
+    _reap_after_signal,
     _verify_expected_parent,
     probe_pid_namespace_capability,
     run_supervised,
@@ -178,6 +180,203 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             worker_config=config,
             term_grace_seconds=0.05,
             poll_seconds=0.01,
+        )
+
+    def test_namespace_preflight_rejects_before_any_filesystem_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_parent = root / "new-report-parent"
+            report_path = report_parent / "final.json"
+            worker_report_path = report_parent / "child.json"
+            stale_parent = root / "existing"
+            stale_parent.mkdir()
+            stale_report = stale_parent / "stale.json"
+            stale_report.write_text("keep-me", encoding="ascii")
+
+            with patch(
+                "tools.platform_load_runtime.require_pid_namespace_capability",
+                side_effect=NamespaceCapabilityError("runner_must_be_nonroot"),
+            ):
+                result = run_supervised(
+                    worker_command=("/usr/bin/python3", "/checkout/worker.py"),
+                    report_path=report_path,
+                    worker_report_path=worker_report_path,
+                    max_duration_seconds=10,
+                    max_runner_minutes=1,
+                    worker_config={},
+                )
+
+            self.assertEqual(result.reason, "namespace_unavailable")
+            self.assertFalse(result.namespace_closed)
+            self.assertFalse(report_parent.exists())
+            self.assertFalse(report_path.exists())
+            self.assertFalse(worker_report_path.exists())
+            self.assertEqual(stale_report.read_text(encoding="ascii"), "keep-me")
+
+    def test_run_profile_preflight_uses_pure_error_channel(self) -> None:
+        from tools.platform_load import run_profile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_parent = root / "existing-report-parent"
+            report_parent.mkdir()
+            report_path = report_parent / "final.json"
+            report_path.write_text("keep-me", encoding="ascii")
+            with patch(
+                "tools.platform_load_runtime.require_pid_namespace_capability",
+                side_effect=NamespaceCapabilityError("runner_must_be_nonroot"),
+            ):
+                status = run_profile({}, root / "manifest.json", report_path)
+            self.assertEqual(status, 2)
+            self.assertTrue(report_path.parent.exists())
+            self.assertEqual(report_path.read_text(encoding="ascii"), "keep-me")
+
+    def test_reap_grace_is_bounded_by_absolute_deadline(self) -> None:
+        from unittest.mock import Mock
+
+        now = [100.0]
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("fake", 0)
+
+        def monotonic() -> float:
+            return now[0]
+
+        def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        with (
+            patch("tools.platform_load_runtime.time.monotonic", side_effect=monotonic),
+            patch("tools.platform_load_runtime.time.sleep", side_effect=advance),
+        ):
+            result, killed = _reap_after_signal(
+                process,
+                grace_seconds=10,
+                poll_seconds=1,
+                deadline=101.0,
+            )
+
+        self.assertIsNone(result)
+        self.assertTrue(killed)
+        self.assertEqual(now[0], 101.0)
+        process.kill.assert_called_once()
+
+    def _run_fake_success_with_deadline_hook(
+        self,
+        *,
+        delay_report_read: bool = False,
+        delay_report_publish: bool = False,
+    ) -> tuple[object, dict[str, object]]:
+        """Exercise final report gates without requiring a root-owned namespace."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_report = root / "final.json"
+            worker_report = root / "child.json"
+            worker_payload = {
+                "worker_report_schema": 2,
+                "report_complete": True,
+                "namespace_closed": False,
+                "passed": True,
+                "acceptance": {"passed": True, "decision": "PASS"},
+            }
+            now = [1000.0]
+
+            class FakeStream:
+                def write(self, _value: object) -> None:
+                    return None
+
+                def flush(self) -> None:
+                    return None
+
+                def close(self) -> None:
+                    return None
+
+            class FakeProcess:
+                pid = 1001
+                returncode = 0
+                stdin = FakeStream()
+                stdout = FakeStream()
+
+                def poll(self) -> int:
+                    return 0
+
+                def wait(self, *args: object, **kwargs: object) -> int:
+                    return 0
+
+                def send_signal(self, _signum: int) -> None:
+                    return None
+
+                def kill(self) -> None:
+                    return None
+
+            process = FakeProcess()
+
+            def monotonic() -> float:
+                return now[0]
+
+            def read_report(_path: Path) -> tuple[dict[str, object], None]:
+                if delay_report_read:
+                    now[0] = 1002.0
+                return dict(worker_payload), None
+
+            from tools import platform_load_runtime as runtime
+
+            real_write = runtime._write_json_atomic
+
+            def write_report(path: Path, payload: object) -> None:
+                real_write(path, payload)  # type: ignore[arg-type]
+                if delay_report_publish and Path(path).name == "final.json":
+                    now[0] = 1002.0
+
+            with (
+                patch("tools.platform_load_runtime.require_pid_namespace_capability"),
+                patch("tools.platform_load_runtime._runner_identity", return_value=(65534, 65534)),
+                patch("tools.platform_load_runtime._set_child_subreaper", return_value=None),
+                patch("tools.platform_load_runtime._read_process_starttime", return_value=1),
+                patch("tools.platform_load_runtime._capture_namespace_pid", return_value=1002),
+                patch("tools.platform_load_runtime._read_process_descendants", return_value=()),
+                patch("tools.platform_load_runtime._await_namespace_ready", return_value=True),
+                patch("tools.platform_load_runtime._namespace_closed", return_value=True),
+                patch("tools.platform_load_runtime._reap_namespace_init", return_value=True),
+                patch("tools.platform_load_runtime._reap_captured_chain", return_value=True),
+                patch("tools.platform_load_runtime._pidfd_is_live", return_value=False),
+                patch("tools.platform_load_runtime.os.pidfd_open", return_value=11),
+                patch("tools.platform_load_runtime.time.monotonic", side_effect=monotonic),
+                patch("tools.platform_load_runtime.subprocess.Popen", return_value=process),
+                patch("tools.platform_load_runtime._read_closed_report", side_effect=read_report),
+                patch("tools.platform_load_runtime._write_json_atomic", side_effect=write_report),
+            ):
+                result = run_supervised(
+                    worker_command=("/usr/bin/python3", "/checkout/worker.py"),
+                    report_path=final_report,
+                    worker_report_path=worker_report,
+                    max_duration_seconds=1,
+                    max_runner_minutes=1,
+                    worker_config={},
+                    term_grace_seconds=0.05,
+                    poll_seconds=0.01,
+                )
+            return result, json.loads(final_report.read_text(encoding="utf-8"))
+
+    def test_report_read_overrun_cannot_publish_success_envelope(self) -> None:
+        result, payload = self._run_fake_success_with_deadline_hook(delay_report_read=True)
+        self.assertEqual(result.reason, "max_duration_seconds")
+        self.assertFalse(payload["passed"])
+        self.assertNotEqual(payload["runtime_supervisor"]["reason"], "none")
+        self.assertEqual(
+            payload["runtime_supervisor"]["report_error"],
+            "wall_deadline_during_report_read",
+        )
+
+    def test_report_publication_overrun_cannot_publish_success_envelope(self) -> None:
+        result, payload = self._run_fake_success_with_deadline_hook(delay_report_publish=True)
+        self.assertEqual(result.reason, "max_duration_seconds")
+        self.assertFalse(payload["passed"])
+        self.assertNotEqual(payload["runtime_supervisor"]["reason"], "none")
+        self.assertEqual(
+            payload["runtime_supervisor"]["report_error"],
+            "wall_deadline_during_report_publication",
         )
 
     def test_success_report_publishes_only_after_child_exit(self) -> None:

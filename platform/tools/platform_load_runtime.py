@@ -9,9 +9,10 @@ timeout is not used as a kill boundary; it cannot reclaim a blocked syscall.
 
 The worker-facing :class:`LoadRuntimeBudget` is deliberately small.  It is
 used to cap ordinary I/O and to stop before a new phase/retry, while the
-parent-side :func:`run_supervised` remains the final authority that can TERM
-then KILL the namespace wrapper, wait for PID 1 and reap it.  There is no
-process-group containment fallback.
+parent-side :func:`run_supervised` selects one wall deadline from the scenario
+and runner ceilings, reserves teardown/report time inside it, and remains the
+final authority that can TERM then KILL the namespace wrapper, wait for PID 1
+and reap it.  There is no process-group containment fallback.
 """
 
 from __future__ import annotations
@@ -49,6 +50,32 @@ DEFAULT_NAMESPACE_CAPTURE_TIMEOUT_SECONDS = 5.0
 MAX_CHILD_REPORT_BYTES = 16 * 1024 * 1024
 MAX_REASON_LENGTH = 96
 _SAFE_REASON = frozenset({"none", "max_duration_seconds", "max_runner_minutes"})
+
+
+def _deadline_reason_at(
+    now: float,
+    *,
+    scenario_deadline: float,
+    runner_deadline: float,
+    effective_deadline: float | None = None,
+) -> str | None:
+    """Return the primary absolute-budget reason at one monotonic instant.
+
+    ``effective_deadline`` is the point at which the supervisor must begin
+    bounded teardown so that teardown/report publication still fit inside the
+    original wall deadline.  It never changes which authored budget owns the
+    diagnosis: the earlier scenario/runner deadline remains primary.
+    """
+
+    earliest = min(scenario_deadline, runner_deadline)
+    if effective_deadline is not None:
+        if now < effective_deadline:
+            return None
+    elif now < earliest:
+        return None
+    if scenario_deadline <= runner_deadline:
+        return "max_duration_seconds"
+    return "max_runner_minutes"
 
 
 class NamespaceCapabilityError(RuntimeError):
@@ -1017,6 +1044,7 @@ def _reap_namespace_init(
     namespace_pidfd: int | None,
     timeout_seconds: float,
     poll_seconds: float,
+    deadline: float | None = None,
 ) -> bool:
     """Reap the namespace init after the unshare wrapper has exited.
 
@@ -1036,8 +1064,12 @@ def _reap_namespace_init(
         return False
     if not _pidfd_is_valid(namespace_pidfd):
         return False
-    deadline = time.monotonic() + timeout_seconds
+    phase_deadline = time.monotonic() + timeout_seconds
+    if deadline is not None:
+        phase_deadline = min(phase_deadline, deadline)
     while True:
+        if time.monotonic() >= phase_deadline:
+            return False
         state = _read_process_state(namespace_pid)
         if state is None:
             return not _pidfd_is_live(namespace_pidfd)
@@ -1074,9 +1106,9 @@ def _reap_namespace_init(
             # waitable zombie; the bounded deadline still fails closed if it
             # never becomes reapable.
             pass
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= phase_deadline:
             return False
-        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+        time.sleep(min(poll_seconds, max(0.0, phase_deadline - time.monotonic())))
 
 
 def _reap_captured_chain(
@@ -1084,6 +1116,7 @@ def _reap_captured_chain(
     *,
     timeout_seconds: float,
     poll_seconds: float,
+    deadline: float | None = None,
 ) -> bool:
     """Reap wrapper zombies adopted by the supervisor subreaper.
 
@@ -1095,8 +1128,12 @@ def _reap_captured_chain(
 
     if not identities:
         return True
-    deadline = time.monotonic() + timeout_seconds
+    phase_deadline = time.monotonic() + timeout_seconds
+    if deadline is not None:
+        phase_deadline = min(phase_deadline, deadline)
     while True:
+        if time.monotonic() >= phase_deadline:
+            return False
         pending = False
         for pid, (starttime, pidfd) in identities.items():
             if not _pidfd_is_valid(pidfd) or _pidfd_is_live(pidfd):
@@ -1127,9 +1164,9 @@ def _reap_captured_chain(
             pending = True
         if not pending:
             return True
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= phase_deadline:
             return False
-        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+        time.sleep(min(poll_seconds, max(0.0, phase_deadline - time.monotonic())))
 
 
 def _reap_after_signal(
@@ -1137,14 +1174,17 @@ def _reap_after_signal(
     *,
     grace_seconds: float,
     poll_seconds: float,
+    deadline: float | None = None,
 ) -> tuple[int | None, bool]:
-    deadline = time.monotonic() + grace_seconds
+    phase_deadline = time.monotonic() + grace_seconds
+    if deadline is not None:
+        phase_deadline = min(phase_deadline, deadline)
     result: int | None = process.poll()
-    while time.monotonic() < deadline:
+    while time.monotonic() < phase_deadline:
         result = process.poll()
         if result is not None:
             return result, False
-        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+        time.sleep(min(poll_seconds, max(0.0, phase_deadline - time.monotonic())))
     killed = False
     if process.poll() is None:
         try:
@@ -1153,7 +1193,11 @@ def _reap_after_signal(
         except ProcessLookupError:
             pass
     try:
-        result = process.wait(timeout=max(1.0, grace_seconds))
+        if deadline is None:
+            wait_timeout = max(1.0, grace_seconds)
+        else:
+            wait_timeout = max(0.0, phase_deadline - time.monotonic())
+        result = process.wait(timeout=wait_timeout)
     except subprocess.TimeoutExpired:
         # ``unshare --kill-child=SIGKILL`` is the authoritative descendant
         # containment boundary.  If its wrapper does not reap, fail closed.
@@ -1214,21 +1258,40 @@ def run_supervised(
     if not Path(str(worker_command[0])).is_absolute():
         raise ValueError("worker interpreter must be an absolute path")
 
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    worker_report_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale_path in (report_path, worker_report_path):
-        if stale_path.is_symlink() or stale_path.exists():
-            if stale_path.is_dir():
-                raise ValueError("runtime report path must not be a directory")
-            stale_path.unlink()
-
     started = time.monotonic()
     scenario_deadline = started + duration
     runner_deadline = started + runner_minutes * 60.0
+    wall_deadline = min(scenario_deadline, runner_deadline)
+
+    # Reserve a bounded slice of the single wall budget for TERM/KILL, pidfd
+    # reaping, report validation and the final atomic envelope.  The reserve
+    # is inside the authored deadline; it is not an extension or a second
+    # timeout.  Without it, a worker that reaches the deadline would leave no
+    # budget in which to prove namespace closure.
+    teardown_reserve = min(
+        max(grace + max(0.1, poll * 4.0), 0.25),
+        max(duration, runner_minutes * 60.0),
+    )
+    worker_deadline = wall_deadline - teardown_reserve
+
+    def primary_deadline_reason(*, effective: bool = False) -> str | None:
+        return _deadline_reason_at(
+            time.monotonic(),
+            scenario_deadline=scenario_deadline,
+            runner_deadline=runner_deadline,
+            effective_deadline=worker_deadline if effective else None,
+        )
 
     def early_failure(reason: str, error: str) -> SupervisorResult:
+        selected_reason = reason
+        deadline_reason = primary_deadline_reason()
+        if deadline_reason is not None and reason in {
+            "namespace_unavailable",
+            "namespace_start_failed",
+        }:
+            selected_reason = deadline_reason
         payload = _closed_failure_report(
-            reason=reason,
+            reason=selected_reason,
             signal_number=None,
             returncode=None,
             partial_work=False,
@@ -1242,15 +1305,21 @@ def run_supervised(
                 "actual_runner_minutes": _number_for_report((time.monotonic() - started) / 60.0),
                 "within_duration_budget": time.monotonic() < scenario_deadline,
                 "within_runner_budget": time.monotonic() < runner_deadline,
-                "budget_exceeded": False,
+                "budget_exceeded": selected_reason in {
+                    "max_duration_seconds",
+                    "max_runner_minutes",
+                },
                 "phase": "namespace_probe",
-                "reason": "none",
-                "descendants_reaped": True,
+                "reason": selected_reason,
+                "descendants_reaped": False,
             },
-            descendants_reaped=True,
+            descendants_reaped=False,
             namespace_closed=False,
         )
-        _write_json_atomic(report_path, payload)
+        # Pure preflight failures deliberately return an in-memory error
+        # envelope.  The caller must not be allowed to create a directory,
+        # remove a stale report, or write a misleading report before the
+        # mandatory non-root capability boundary has been proven.
         return SupervisorResult(
             returncode=None,
             report=payload,
@@ -1258,10 +1327,10 @@ def run_supervised(
             worker_exited=False,
             killed=False,
             signal=None,
-            reason=reason,
+            reason=selected_reason,
             partial_work=False,
             inflight_unknown=False,
-            descendants_reaped=True,
+            descendants_reaped=False,
             isolation=PID_NAMESPACE_ISOLATION,
             namespace_closed=False,
             namespace_init_pid=None,
@@ -1272,6 +1341,27 @@ def run_supervised(
         runner_uid, runner_gid = _runner_identity()
     except NamespaceCapabilityError as exc:
         return early_failure("namespace_unavailable", type(exc).__name__)
+
+    # Capability probing is pure with respect to the caller's filesystem, but
+    # the resulting load budget is not allowed to be spent by setup.  Refuse
+    # before any report directory/stale-file/config side effect if preflight
+    # itself exhausted the one wall deadline.
+    preflight_deadline_reason = primary_deadline_reason()
+    if preflight_deadline_reason is not None:
+        return early_failure(preflight_deadline_reason, "preflight_deadline_exceeded")
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    worker_report_path.parent.mkdir(parents=True, exist_ok=True)
+    for stale_path in (report_path, worker_report_path):
+        if stale_path.is_symlink() or stale_path.exists():
+            if stale_path.is_dir():
+                raise ValueError("runtime report path must not be a directory")
+            stale_path.unlink()
+        if primary_deadline_reason() is not None:
+            return early_failure(
+                primary_deadline_reason() or "max_duration_seconds",
+                "preflight_setup_deadline_exceeded",
+            )
 
     try:
         parent_pidfd = os.pidfd_open(os.getpid(), 0)
@@ -1287,6 +1377,8 @@ def run_supervised(
             "started_at_monotonic": started,
             "scenario_deadline_monotonic": scenario_deadline,
             "runner_deadline_monotonic": runner_deadline,
+            "supervisor_wall_deadline_monotonic": wall_deadline,
+            "supervisor_worker_deadline_monotonic": worker_deadline,
             "worker_report_path": str(worker_report_path),
             "namespace_required": True,
             "worker_command": [str(value) for value in worker_command],
@@ -1295,6 +1387,13 @@ def run_supervised(
         }
     )
     _write_json_atomic(config_path, config)
+    setup_deadline_reason = primary_deadline_reason()
+    if setup_deadline_reason is not None:
+        try:
+            config_path.unlink()
+        except FileNotFoundError:
+            pass
+        return early_failure(setup_deadline_reason, "setup_deadline_exceeded")
     process: subprocess.Popen[bytes] | None = None
     wrapper_pidfd: int | None = None
     wrapper_starttime: int | None = None
@@ -1306,7 +1405,9 @@ def run_supervised(
     killed = False
     signal_number: int | None = None
     reason = "worker_failed"
+    worker_budget_reason: str | None = None
     returncode: int | None = None
+    report_error: str | None = None
     namespace_closed = False
     namespace_reaped = False
     external_signal: int | None = None
@@ -1376,10 +1477,9 @@ def run_supervised(
         try:
             wrapper_pidfd = os.pidfd_open(process.pid, 0)
             wrapper_starttime = _read_process_starttime(process.pid)
-            capture_budget_deadline = min(scenario_deadline, runner_deadline)
             capture_deadline = time.monotonic() + min(
                 DEFAULT_NAMESPACE_CAPTURE_TIMEOUT_SECONDS,
-                max(poll, capture_budget_deadline - time.monotonic()),
+                max(poll, worker_deadline - time.monotonic()),
             )
             if process.stdout is None or process.stdin is None:
                 raise NamespaceIntegrityError("namespace stdio protocol is unavailable")
@@ -1395,11 +1495,10 @@ def run_supervised(
                         "external supervisor signal during namespace start"
                     )
                 now = time.monotonic()
-                if now >= capture_deadline:
-                    if now >= scenario_deadline:
-                        reason = "max_duration_seconds"
-                    elif now >= runner_deadline:
-                        reason = "max_runner_minutes"
+                effective_reason = primary_deadline_reason(effective=True)
+                if now >= capture_deadline or effective_reason is not None:
+                    if effective_reason is not None:
+                        reason = effective_reason
                     raise NamespaceIntegrityError("namespace PID 1 identity is unavailable")
                 candidate = _capture_namespace_pid(process.pid)
                 if candidate is not None:
@@ -1432,27 +1531,25 @@ def run_supervised(
                 )
             process.stdin.write(NAMESPACE_ACK)
             process.stdin.flush()
+            if primary_deadline_reason(effective=True) is not None:
+                raise NamespaceIntegrityError("namespace handshake exceeded wall deadline")
         except (AttributeError, OSError, NamespaceIntegrityError) as exc:
             if external_signal is not None:
                 reason = "external_signal"
                 signal_number = external_signal
             elif reason not in {"max_duration_seconds", "max_runner_minutes"}:
-                now = time.monotonic()
-                if now >= scenario_deadline:
-                    reason = "max_duration_seconds"
-                elif now >= runner_deadline:
-                    reason = "max_runner_minutes"
-                else:
-                    reason = "namespace_start_failed"
+                reason = primary_deadline_reason(effective=True) or "namespace_start_failed"
             report_error = type(exc).__name__
             # Keep the non-root watchdog alive long enough to reclaim the
             # exact sudo/setpriv/unshare chain.  Killing the watchdog directly
             # would bypass its pidfd-driven descendant cleanup and could
             # strand a partially-started namespace.
+            terminate_wrapper()
             returncode, killed = _reap_after_signal(
                 process,
                 grace_seconds=grace,
                 poll_seconds=poll,
+                deadline=wall_deadline,
             )
             if killed:
                 force_kill_captured_chain()
@@ -1467,33 +1564,44 @@ def run_supervised(
                         process,
                         grace_seconds=grace,
                         poll_seconds=poll,
+                        deadline=wall_deadline,
                     )
                     break
                 now = time.monotonic()
-                if now >= scenario_deadline:
-                    reason = "max_duration_seconds"
+                budget_reason = primary_deadline_reason(effective=True)
+                if budget_reason is not None:
+                    reason = budget_reason
+                    worker_budget_reason = budget_reason
                     terminate_wrapper()
                     returncode, killed = _reap_after_signal(
                         process,
                         grace_seconds=grace,
                         poll_seconds=poll,
-                    )
-                    break
-                if now >= runner_deadline:
-                    reason = "max_runner_minutes"
-                    terminate_wrapper()
-                    returncode, killed = _reap_after_signal(
-                        process,
-                        grace_seconds=grace,
-                        poll_seconds=poll,
+                        deadline=wall_deadline,
                     )
                     break
                 try:
-                    process.wait(timeout=min(poll, scenario_deadline - now, runner_deadline - now))
+                    process.wait(timeout=min(poll, max(0.0, worker_deadline - now)))
                 except subprocess.TimeoutExpired:
                     continue
             if returncode is None:
-                returncode = process.wait(timeout=max(1.0, grace))
+                try:
+                    returncode = process.wait(
+                        timeout=max(0.0, wall_deadline - time.monotonic())
+                    )
+                except subprocess.TimeoutExpired:
+                    reason = primary_deadline_reason() or reason
+                    terminate_wrapper()
+                    returncode, killed = _reap_after_signal(
+                        process,
+                        grace_seconds=grace,
+                        poll_seconds=poll,
+                        deadline=wall_deadline,
+                    )
+            if reason == "worker_failed":
+                worker_budget_reason = primary_deadline_reason(effective=True)
+                if worker_budget_reason is not None:
+                    reason = worker_budget_reason
             if killed or _pidfd_is_live(namespace_init_pidfd or -1):
                 force_kill_captured_chain()
         # The unshare wrapper can exit before its PID-namespace init is
@@ -1509,11 +1617,13 @@ def run_supervised(
                 namespace_pidfd=namespace_init_pidfd,
                 timeout_seconds=max(1.0, grace),
                 poll_seconds=poll,
+                deadline=wall_deadline,
             )
             _reap_captured_chain(
                 wrapper_chain_identities,
                 timeout_seconds=max(1.0, grace),
                 poll_seconds=poll,
+                deadline=wall_deadline,
             )
             namespace_closed = _namespace_closed(
                 process,
@@ -1527,12 +1637,13 @@ def run_supervised(
             )
     except BaseException:
         if process is not None and process.poll() is None:
-            reason = "supervisor_error"
+            reason = primary_deadline_reason() or "supervisor_error"
             terminate_wrapper()
             returncode, killed = _reap_after_signal(
                 process,
                 grace_seconds=grace,
                 poll_seconds=poll,
+                deadline=wall_deadline,
             )
             if killed:
                 force_kill_captured_chain()
@@ -1543,11 +1654,13 @@ def run_supervised(
                 namespace_pidfd=namespace_init_pidfd,
                 timeout_seconds=max(1.0, grace),
                 poll_seconds=poll,
+                deadline=wall_deadline,
             )
             _reap_captured_chain(
                 wrapper_chain_identities,
                 timeout_seconds=max(1.0, grace),
                 poll_seconds=poll,
+                deadline=wall_deadline,
             )
             namespace_closed = _namespace_closed(
                 process,
@@ -1602,6 +1715,15 @@ def run_supervised(
             signal_number = signal.SIGKILL
         elif returncode is not None and returncode < 0:
             signal_number = -returncode
+    # A teardown phase, report parser or post-processing hook may consume the
+    # final reserved wall slice.  Once that happens the authored deadline is
+    # the primary reason; it is never legal to turn the overrun into a
+    # successful/``none`` envelope.
+    overrun_reason = primary_deadline_reason()
+    if overrun_reason is not None and reason not in {"external_signal"}:
+        reason = overrun_reason
+        report_error = report_error or "wall_deadline_exceeded"
+
     # Once the worker's ordinary exit/signal status is known, an unclosed
     # namespace is the primary containment diagnosis unless an earlier
     # absolute timeout or externally delivered supervisor signal already owns
@@ -1609,12 +1731,28 @@ def run_supervised(
     # into a generic report error.
     if not namespace_closed and reason in {"worker_failed", "worker_signal"}:
         reason = "namespace_unclosed"
-    worker_report, report_error = _read_closed_report(worker_report_path)
+    report_gate_reason = primary_deadline_reason()
+    if report_gate_reason is not None:
+        if reason != "external_signal":
+            reason = report_gate_reason
+        report_error = report_error or "wall_deadline_before_report_read"
+        worker_report = None
+    else:
+        worker_report, report_error = _read_closed_report(worker_report_path)
+        after_report_reason = primary_deadline_reason()
+        if after_report_reason is not None and reason != "external_signal":
+            reason = after_report_reason
+            report_error = report_error or "wall_deadline_during_report_read"
+    acceptance_gate_reason = primary_deadline_reason()
+    if acceptance_gate_reason is not None and reason != "external_signal":
+        reason = acceptance_gate_reason
+        report_error = report_error or "wall_deadline_before_acceptance"
     successful_worker = (
         worker_report is not None
         and reason == "worker_failed"
         and not killed
         and namespace_closed
+        and acceptance_gate_reason is None
     )
     if successful_worker:
         final_payload = dict(worker_report)
@@ -1632,22 +1770,37 @@ def run_supervised(
             "descendants_reaped": True,
             "report_error": None,
         }
-        _write_json_atomic(report_path, final_payload)
-        return SupervisorResult(
-            returncode=returncode,
-            report=final_payload,
-            worker_started=worker_started,
-            worker_exited=True,
-            killed=False,
-            signal=None,
-            reason="none",
-            partial_work=bool(final_payload.get("partial_work", False)),
-            inflight_unknown=bool(final_payload.get("inflight_unknown", False)),
-            descendants_reaped=True,
-            isolation=PID_NAMESPACE_ISOLATION,
-            namespace_closed=True,
-            namespace_init_pid=namespace_init_pid,
-        )
+        # Final acceptance gate: this is intentionally adjacent to the
+        # atomic publication.  A report parser or serializer that overruns
+        # the one wall deadline is converted to a closed failure envelope.
+        final_gate_reason = primary_deadline_reason()
+        if final_gate_reason is not None:
+            reason = final_gate_reason
+            report_error = "wall_deadline_before_report_publication"
+            successful_worker = False
+        else:
+            _write_json_atomic(report_path, final_payload)
+            post_publish_reason = primary_deadline_reason()
+            if post_publish_reason is not None:
+                reason = post_publish_reason
+                report_error = "wall_deadline_during_report_publication"
+                successful_worker = False
+            else:
+                return SupervisorResult(
+                    returncode=returncode,
+                    report=final_payload,
+                    worker_started=worker_started,
+                    worker_exited=True,
+                    killed=False,
+                    signal=None,
+                    reason="none",
+                    partial_work=bool(final_payload.get("partial_work", False)),
+                    inflight_unknown=bool(final_payload.get("inflight_unknown", False)),
+                    descendants_reaped=True,
+                    isolation=PID_NAMESPACE_ISOLATION,
+                    namespace_closed=True,
+                    namespace_init_pid=namespace_init_pid,
+                )
 
     partial_work = worker_started
     inflight_unknown = killed or reason in {

@@ -44,24 +44,56 @@ jobs:
               raise SystemExit("containment probe did not prove the exact stdio/system chain")
 
           synthetic = """
-          import json, os, signal, subprocess, sys, time
+          import json, os, signal, time
           from pathlib import Path
           config = json.loads(Path(os.environ['PLATFORM_LOAD_WORKER_CONFIG']).read_text())
           report = Path(config['worker_report_path'])
           heartbeat = Path(config['heartbeat'])
+          identities = Path(config['identities'])
           signal.signal(signal.SIGTERM, signal.SIG_IGN)
-          child = subprocess.Popen([
-              sys.executable, '-c',
-              "import os,signal,sys,time; os.setsid(); signal.signal(signal.SIGTERM,signal.SIG_IGN); p=sys.argv[1]; "
-              "open(p,'w').write(str(time.monotonic_ns()))\\n"
-              "while True:\\n"
-              "    open(p,'w').write(str(time.monotonic_ns()))\\n"
-              "    time.sleep(.01)",
-              str(heartbeat),
-          ])
+
+          def host_pid_and_starttime():
+              nspid = None
+              for line in Path('/proc/self/status').read_text(encoding='ascii').splitlines():
+                  if line.startswith('NSpid:'):
+                      values = line.split()[1:]
+                      if values:
+                          nspid = int(values[0])
+                      break
+              fields = Path('/proc/self/stat').read_text(encoding='ascii').rsplit(')', 1)[1].split()
+              return nspid or os.getpid(), int(fields[19])
+
+          def record(role):
+              pid, starttime = host_pid_and_starttime()
+              with identities.open('a', encoding='ascii') as handle:
+                  handle.write(json.dumps({'role': role, 'pid': pid, 'starttime': starttime}) + '\\n')
+
+          def nested_heartbeat():
+              signal.signal(signal.SIGTERM, signal.SIG_IGN)
+              record('nested-descendant')
+              while True:
+                  heartbeat.write_text(str(time.monotonic_ns()), encoding='ascii')
+                  time.sleep(.01)
+
+          record('worker-pid1')
+          first = os.fork()
+          if first == 0:
+              os.setsid()
+              record('setsid-intermediate')
+              second = os.fork()
+              if second != 0:
+                  os._exit(0)
+              record('double-fork-grandchild')
+              nested = os.fork()
+              if nested != 0:
+                  os._exit(0)
+              nested_heartbeat()
+              os._exit(0)
           deadline = time.monotonic() + 3
           while not heartbeat.exists() and time.monotonic() < deadline:
               time.sleep(.01)
+          if not heartbeat.exists() or not identities.exists():
+              raise SystemExit('nested descendant did not start')
           report.write_text(json.dumps({
               'worker_report_schema': 2,
               'report_complete': True,
@@ -77,13 +109,14 @@ jobs:
               worker = root / "synthetic_worker.py"
               worker.write_text(synthetic, encoding="utf-8")
               heartbeat = root / "heartbeat"
+              identities = root / "identities.jsonl"
               result = run_supervised(
                   worker_command=("/usr/bin/python3", str(worker)),
                   report_path=root / "final.json",
                   worker_report_path=root / "child.json",
                   max_duration_seconds=2.0,
                   max_runner_minutes=0.1,
-                  worker_config={"heartbeat": str(heartbeat)},
+                  worker_config={"heartbeat": str(heartbeat), "identities": str(identities)},
                   term_grace_seconds=0.1,
                   poll_seconds=0.01,
               )
@@ -95,5 +128,27 @@ jobs:
               time.sleep(0.15)
               if heartbeat.read_text(encoding="ascii") != before:
                   raise SystemExit("synthetic descendant survived containment teardown")
-              print(json.dumps({"probe": probe, "reason": result.reason, "namespace_closed": result.namespace_closed}, sort_keys=True))
+              records = [
+                  json.loads(line)
+                  for line in identities.read_text(encoding="ascii").splitlines()
+                  if line
+              ]
+              roles = {record.get("role") for record in records}
+              required_roles = {
+                  "worker-pid1",
+                  "setsid-intermediate",
+                  "double-fork-grandchild",
+                  "nested-descendant",
+              }
+              if not required_roles.issubset(roles):
+                  raise SystemExit(f"descendant identity chain incomplete: {roles}")
+              for record in records:
+                  pid = int(record["pid"])
+                  expected_starttime = int(record["starttime"])
+                  stat_path = Path(f"/proc/{pid}/stat")
+                  if stat_path.exists():
+                      fields = stat_path.read_text(encoding="ascii").rsplit(")", 1)[1].split()
+                      if len(fields) > 19 and int(fields[19]) == expected_starttime:
+                          raise SystemExit(f"captured descendant still alive: {record}")
+              print(json.dumps({"probe": probe, "reason": result.reason, "namespace_closed": result.namespace_closed, "descendants": sorted(roles)}, sort_keys=True))
           PY

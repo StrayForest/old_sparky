@@ -67,18 +67,27 @@ clears groups, applies `--no-new-privs`, and clears inheritable, ambient and
 bounding capabilities before it execs the Python worker as PID 1. A validation
 preflight on the pinned `ubuntu-24.04` runner probes that exact non-root,
 stdin/stdout contour before any production fixture setup, and the load runner
-repeats the probe before candidate execution; probe failure is a closed
-non-authoritative result and never falls back to a process group or an
-uncontained worker. The probe and namespace entry machine-check real/effective/
-saved UID/GID, supplementary groups, PID 1/PPID 0, all capability fields and
-`NoNewPrivs=1`.
+repeats the probe before candidate execution. The runtime also performs the
+same pure preflight before it creates report directories, removes stale paths,
+writes config, or creates its worker temporary directory; a root/local
+rejection is an in-memory error/exit and cannot mutate the caller's report
+path. Probe failure is a closed non-authoritative result and never falls back
+to a process group or an uncontained worker. The probe and namespace entry
+machine-check real/effective/saved UID/GID, supplementary groups, PID 1/PPID 0,
+all capability fields and `NoNewPrivs=1`.
 
-The scenario deadline and whole-runner deadline are absolute monotonic budgets;
-a blocked DNS/socket/body read or future is terminated with `TERM`, then `KILL`
-after a short grace period. The supervisor tracks the complete wrapper chain
-and namespace PID by pidfd/start-time, waits for the wrapper, reaps a zombie
-namespace PID 1 when necessary, and requires namespace closure before
-publishing the final report. Every report has mandatory boolean
+The scenario deadline and whole-runner deadline select one absolute monotonic
+wall deadline. A bounded reserve inside that deadline covers wrapper wait,
+`TERM`/`KILL`, captured-chain and namespace reaping, child-report read/validation
+and atomic publication; every phase checks the deadline before and after its
+bounded work. A blocked DNS/socket/body read or future is terminated with
+`TERM`, then `KILL` after only the remaining grace. The supervisor tracks the
+complete wrapper chain and namespace PID by pidfd/start-time, waits for the
+wrapper, reaps a zombie namespace PID 1 when necessary, and requires namespace
+closure before publishing the final report. The final acceptance gate is
+adjacent to atomic publication: a teardown, parser or write overrun always
+preserves the primary deadline reason and can never produce `reason=none` or a
+success envelope. Every report has mandatory boolean
 `namespace_closed`; only the parent may set it true after closure. A malformed
 or killed worker is represented by a failed report with partial/in-flight-
 unknown flags; the primary timeout/containment reason remains intact even when
@@ -89,7 +98,10 @@ upload is independent of the client exit code, so a runtime timeout cannot
 skip cleanup or leave a background load mutating the fixture while cleanup
 begins.
 
-Because a setuid sudo exec may clear a parent-death signal, the non-root
+The hosted containment canary itself creates a TERM-ignoring `setsid`/double-
+fork/nested descendant tree, records each outer PID and `/proc` start-time, and
+proves heartbeat and every captured identity stop after closure. Because a
+setuid sudo exec may clear a parent-death signal, the non-root
 watchdog keeps the supervisor pidfd outside the privileged chain and
 identity-signals the entire captured sudo/setpriv/unshare descendant chain if
 that pidfd closes. This is a reclaim guard, not a process-group fallback; the
