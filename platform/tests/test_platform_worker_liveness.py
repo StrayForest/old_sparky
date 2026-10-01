@@ -243,6 +243,8 @@ class WorkerLivenessHelperTests(unittest.TestCase):
         events: list[dict[str, object]],
         *,
         sleep_seconds: float = 0.0,
+        exit_code: int = 0,
+        ignore_term: bool = False,
     ) -> tuple[callable, dict[str, subprocess.Popen[bytes]]]:
         encoded = json.dumps(events, separators=(",", ":"))
         holder: dict[str, subprocess.Popen[bytes]] = {}
@@ -254,10 +256,14 @@ class WorkerLivenessHelperTests(unittest.TestCase):
                 f"""
                 import json, os, sys, time
                 fd = int(sys.argv[1])
+                if {ignore_term!r}:
+                    import signal
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
                 for event in json.loads({encoded!r}):
                     os.write(fd, (json.dumps(event, separators=(',', ':')) + '\\n').encode('ascii'))
                 time.sleep({sleep_seconds!r})
                 os.close(fd)
+                raise SystemExit({exit_code!r})
                 """
             )
             process = subprocess.Popen(
@@ -273,6 +279,31 @@ class WorkerLivenessHelperTests(unittest.TestCase):
 
         return spawn, holder
 
+    def _spawn_cleanup_control_child(
+        self,
+        *,
+        ok: bool = True,
+        sleep_seconds: float = 0.0,
+        exit_code: int = 0,
+        ignore_term: bool = False,
+    ) -> tuple[callable, dict[str, subprocess.Popen[bytes]]]:
+        spawn, holder = self._spawn_control_child(
+            [{"event": "cleanup", "ok": ok}],
+            sleep_seconds=sleep_seconds,
+            exit_code=exit_code,
+            ignore_term=ignore_term,
+        )
+
+        def cleanup_spawn(
+            _identity: liveness.RunIdentity,
+            _key: str | bytes,
+            _result_url: str,
+            deadline: float,
+        ):
+            return spawn(_identity, "cleanup", deadline)
+
+        return cleanup_spawn, holder
+
     def test_parent_forgets_exact_key_and_proves_success(self) -> None:
         task_id = "platform-release-ping-" + "b" * 32
         key = b"celery-task-meta-" + task_id.encode("ascii")
@@ -283,6 +314,7 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             {"event": "terminal", "ok": True, "forget_ok": True, "key": base64.b64encode(key).decode("ascii")},
         ]
         spawn, holder = self._spawn_control_child(events)
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
         redis_client = _FakeRedisClient()
         redis_module = types.SimpleNamespace(
             Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
@@ -295,13 +327,18 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             mock.patch.dict(os.environ, self._parent_env(), clear=False),
             mock.patch.object(liveness, "_new_task_id", return_value=task_id),
         ):
-            payload = liveness.run_liveness(identity, spawn_child=spawn)
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
 
         self.assertEqual(payload["status"], "passed")
         self.assertEqual(payload["cleanup"], "proven")
-        self.assertEqual(redis_client.delete_calls, [key])
-        self.assertEqual(redis_client.exists_calls, [key])
+        self.assertEqual(redis_client.delete_calls, [])
+        self.assertEqual(redis_client.exists_calls, [])
         self.assertIsNotNone(holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
 
     def test_forget_failure_cannot_claim_a_successful_roundtrip(self) -> None:
         task_id = "platform-release-ping-" + "e" * 32
@@ -318,6 +355,7 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             },
         ]
         spawn, holder = self._spawn_control_child(events)
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
         redis_client = _FakeRedisClient()
         redis_module = types.SimpleNamespace(
             Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
@@ -330,12 +368,17 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             mock.patch.dict(os.environ, self._parent_env(), clear=False),
             mock.patch.object(liveness, "_new_task_id", return_value=task_id),
         ):
-            payload = liveness.run_liveness(identity, spawn_child=spawn)
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
 
         self.assertEqual(payload["status"], "cleanup_unproven")
         self.assertEqual(payload["cleanup"], "unproven")
-        self.assertEqual(redis_client.delete_calls, [key])
+        self.assertEqual(redis_client.delete_calls, [])
         self.assertIsNotNone(holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
 
     def test_late_child_result_is_cleanup_unproven_even_when_key_is_absent(self) -> None:
         task_id = "platform-release-ping-" + "c" * 32
@@ -346,6 +389,7 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             {"event": "published", "key": base64.b64encode(key).decode("ascii")},
         ]
         spawn, holder = self._spawn_control_child(events, sleep_seconds=5.0)
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
         redis_client = _FakeRedisClient()
         redis_module = types.SimpleNamespace(
             Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
@@ -361,18 +405,135 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             mock.patch.object(liveness, "CHILD_STOP_GRACE_SECONDS", 0.05),
             mock.patch.object(liveness, "CHILD_KILL_GRACE_SECONDS", 0.05),
         ):
-            payload = liveness.run_liveness(identity, spawn_child=spawn)
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
 
         self.assertEqual(payload["status"], "cleanup_unproven")
         self.assertEqual(payload["cleanup"], "unproven")
-        self.assertEqual(redis_client.delete_calls, [key])
+        self.assertEqual(redis_client.delete_calls, [])
         self.assertIsNotNone(holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
         self.assertNotIn("pong", json.dumps(payload))
+
+    def test_terminal_payload_then_hang_is_cleanup_unproven(self) -> None:
+        task_id = "platform-release-ping-" + "f" * 32
+        key = b"celery-task-meta-" + task_id.encode("ascii")
+        events = [
+            {"event": "route", "ok": True},
+            {"event": "published", "key": base64.b64encode(key).decode("ascii")},
+            {
+                "event": "terminal",
+                "ok": True,
+                "forget_ok": True,
+                "key": base64.b64encode(key).decode("ascii"),
+            },
+        ]
+        spawn, holder = self._spawn_control_child(events, sleep_seconds=5.0)
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+            mock.patch.object(liveness, "CHILD_WORK_SECONDS", 0.1),
+            mock.patch.object(liveness, "CHILD_STOP_GRACE_SECONDS", 0.05),
+            mock.patch.object(liveness, "CHILD_KILL_GRACE_SECONDS", 0.05),
+        ):
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
+
+        self.assertEqual(payload["status"], "cleanup_unproven")
+        self.assertEqual(payload["cleanup"], "unproven")
+        self.assertEqual(payload["checks"]["task_result"], "failed")
+        self.assertIsNotNone(holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
+
+    def test_terminal_payload_then_nonzero_is_cleanup_unproven(self) -> None:
+        task_id = "platform-release-ping-" + "1" * 32
+        key = b"celery-task-meta-" + task_id.encode("ascii")
+        events = [
+            {"event": "route", "ok": True},
+            {"event": "published", "key": base64.b64encode(key).decode("ascii")},
+            {
+                "event": "terminal",
+                "ok": True,
+                "forget_ok": True,
+                "key": base64.b64encode(key).decode("ascii"),
+            },
+        ]
+        spawn, holder = self._spawn_control_child(events, exit_code=7)
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+        ):
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
+
+        self.assertEqual(payload["status"], "cleanup_unproven")
+        self.assertEqual(payload["cleanup"], "unproven")
+        self.assertEqual(payload["checks"]["task_result"], "failed")
+        self.assertIsNotNone(holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
+
+    def test_blocking_cleanup_is_killed_and_reaped_within_parent_deadline(self) -> None:
+        task_id = "platform-release-ping-" + "2" * 32
+        key = b"celery-task-meta-" + task_id.encode("ascii")
+        events = [
+            {"event": "route", "ok": True},
+            {"event": "published", "key": base64.b64encode(key).decode("ascii")},
+            {
+                "event": "terminal",
+                "ok": True,
+                "forget_ok": True,
+                "key": base64.b64encode(key).decode("ascii"),
+            },
+        ]
+        spawn, child_holder = self._spawn_control_child(events)
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child(
+            sleep_seconds=5.0,
+            ignore_term=True,
+        )
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        started = time.monotonic()
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+            mock.patch.object(liveness, "MAX_SECONDS", 0.6),
+        ):
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(payload["status"], "cleanup_unproven")
+        self.assertEqual(payload["cleanup"], "unproven")
+        self.assertIsNotNone(child_holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
 
     def test_parent_cancellation_reaps_child_and_emits_no_exception(self) -> None:
         task_id = "platform-release-ping-" + "d" * 32
         key = b"celery-task-meta-" + task_id.encode("ascii")
         spawn, holder = self._spawn_control_child([], sleep_seconds=5.0)
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
         redis_client = _FakeRedisClient()
         redis_module = types.SimpleNamespace(
             Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
@@ -386,15 +547,21 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             mock.patch.object(liveness, "_new_task_id", return_value=task_id),
             mock.patch.object(liveness, "_collect_child", side_effect=KeyboardInterrupt),
         ):
-            payload = liveness.run_liveness(identity, spawn_child=spawn)
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
 
         self.assertEqual(payload["status"], "cleanup_unproven")
         self.assertEqual(payload["cleanup"], "unproven")
         self.assertIsNotNone(holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
         self.assertNotIn("KeyboardInterrupt", json.dumps(payload))
 
     def test_malformed_child_control_is_redacted_and_cleanup_unproven(self) -> None:
         spawn, holder = self._spawn_control_child([])
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
         identity = _identity(Path("/opt/oldsparky/platform"))
         redis_client = _FakeRedisClient()
         redis_module = types.SimpleNamespace(
@@ -406,12 +573,17 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             mock.patch.dict(sys.modules, {"redis": redis_module}),
             mock.patch.dict(os.environ, self._parent_env(), clear=False),
         ):
-            payload = liveness.run_liveness(identity, spawn_child=spawn)
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
 
         self.assertEqual(payload["status"], "cleanup_unproven")
         self.assertNotIn("redis://", json.dumps(payload))
         self.assertNotIn("platform-release-ping-", json.dumps(payload))
         self.assertIsNotNone(holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
 
     def test_helper_has_no_global_destructive_or_control_plane_operations(self) -> None:
         source = (TOOLS_ROOT / "platform_worker_liveness.py").read_text(encoding="utf-8")

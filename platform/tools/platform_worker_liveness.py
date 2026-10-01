@@ -40,6 +40,8 @@ MAX_SECONDS = 15.0
 CHILD_WORK_SECONDS = 11.0
 CHILD_STOP_GRACE_SECONDS = 0.75
 CHILD_KILL_GRACE_SECONDS = 0.75
+CLEANUP_STOP_GRACE_SECONDS = 0.20
+CLEANUP_KILL_GRACE_SECONDS = 0.20
 DEFAULT_EXPIRES_SECONDS = 10.0
 WORKER_USER = "oldsparky-worker"
 WORKER_RUNTIME_SERVICE = "worker"
@@ -53,6 +55,9 @@ REDIS_SCHEME = "redis"
 REDIS_PORT = 6379
 RESULT_KEY_PREFIX = b"celery-task-meta-"
 CONTROL_MAX_BYTES = 16 * 1024
+CLEANUP_CONTROL_MAX_BYTES = 1024
+CLEANUP_RESULT_URL_ENV = "PLATFORM_LIVENESS_CLEANUP_RESULT_URL"
+CLEANUP_RESULT_KEY_ENV = "PLATFORM_LIVENESS_CLEANUP_RESULT_KEY"
 
 CHECK_NAMES = (
     "worker_uid",
@@ -435,6 +440,22 @@ def _validate_result_key(key: object, task_id: str) -> str | bytes:
     return key
 
 
+def _validate_cleanup_key(key: object) -> str | bytes:
+    if not isinstance(key, (str, bytes)):
+        raise LivenessFailure("result_key_invalid", cleanup_unproven=True)
+    encoded = key.encode("utf-8") if isinstance(key, str) else key
+    if (
+        not encoded
+        or len(encoded) > 512
+        or not encoded.startswith(RESULT_KEY_PREFIX)
+        or b"\x00" in encoded
+        or b"\r" in encoded
+        or b"\n" in encoded
+    ):
+        raise LivenessFailure("result_key_invalid", cleanup_unproven=True)
+    return key
+
+
 def _cleanup_key(
     key: str | bytes,
     result_url: str,
@@ -442,7 +463,7 @@ def _cleanup_key(
     *,
     clock: Callable[[], float] | None = None,
 ) -> bool:
-    """Delete and prove absence of exactly one reported result key."""
+    """Delete and prove absence of exactly one key inside the cleanup child."""
 
     try:
         _remaining(deadline, clock)
@@ -472,6 +493,88 @@ def _cleanup_key(
         raise
     except BaseException as exc:
         raise LivenessFailure("result_cleanup_unproven", cleanup_unproven=True) from exc
+
+
+def _cleanup_roundtrip(
+    key: str | bytes,
+    result_url: str,
+    deadline: float,
+    control_fd: int,
+) -> int:
+    """Run Redis cleanup in the disposable cleanup process."""
+
+    ok = False
+    try:
+        _redis_namespace(
+            result_url,
+            expected_database="14",
+            credentials_required=_url_has_credentials(
+                os.environ.get("PLATFORM_CELERY_RESULT_BACKEND")
+            ),
+        )
+        _cleanup_key(key, result_url, deadline)
+        ok = True
+    except BaseException:
+        # Only the fixed event below crosses the process boundary.  The parent
+        # decides whether a missing/invalid event is cleanup_unproven.
+        ok = False
+    try:
+        _child_send(control_fd, {"event": "cleanup", "ok": ok})
+    finally:
+        try:
+            os.close(control_fd)
+        except BaseException:
+            pass
+    return 0 if ok else 1
+
+
+def _spawn_cleanup(
+    identity: RunIdentity,
+    key: str | bytes,
+    result_url: str,
+    deadline: float,
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Start Redis cleanup in its own process group."""
+
+    read_fd, write_fd = os.pipe()
+    encoded_key = base64.b64encode(
+        key.encode("utf-8") if isinstance(key, str) else key
+    ).decode("ascii")
+    environment = dict(os.environ)
+    # Keep the URL and exact key out of argv and out of the emitted evidence.
+    # The child is disposable and is stopped as part of this parent's
+    # monotonic deadline supervision.
+    environment[CLEANUP_RESULT_URL_ENV] = result_url
+    environment[CLEANUP_RESULT_KEY_ENV] = encoded_key
+    try:
+        os.set_inheritable(write_fd, True)
+        python_bin = os.environ.get("PLATFORM_PYTHON_BIN") or sys.executable
+        command = [
+            python_bin,
+            str(Path(__file__).resolve()),
+            "--cleanup-child",
+            "--deadline",
+            f"{deadline:.9f}",
+            "--control-fd",
+            str(write_fd),
+        ]
+        process = subprocess.Popen(
+            command,
+            cwd=str(identity.release),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            pass_fds=(write_fd,),
+            start_new_session=True,
+        )
+    except BaseException:
+        os.close(read_fd)
+        raise
+    finally:
+        os.close(write_fd)
+    return process, read_fd
 
 
 def _backlog_evidence(
@@ -731,6 +834,15 @@ def _stop_child_now(
             pass
 
 
+@dataclass(slots=True)
+class _ChildCollection:
+    events: list[dict[str, object]]
+    valid: bool
+    returncode: int | None
+    forced_termination: bool
+    natural_exit_before_deadline: bool
+
+
 def _collect_child(
     process: subprocess.Popen[bytes],
     control_fd: int,
@@ -738,13 +850,15 @@ def _collect_child(
     child_deadline: float,
     supervise_deadline: float,
     clock: Callable[[], float],
-) -> tuple[list[dict[str, object]], bool, int | None]:
+) -> _ChildCollection:
     """Drain all child pipes while owning stop, kill, wait and EOF bounds."""
 
     selector = selectors.DefaultSelector()
     control = bytearray()
     control_overflow = False
     open_fds: set[int] = set()
+    forced_termination = False
+    natural_exit_before_deadline = False
     try:
         for fd in (control_fd, process.stdout.fileno() if process.stdout else None,
                    process.stderr.fileno() if process.stderr else None):
@@ -757,10 +871,19 @@ def _collect_child(
         kill_sent = False
         while open_fds or process.poll() is None:
             now = clock()
+            returncode = process.poll()
+            if (
+                returncode is not None
+                and not forced_termination
+                and now < child_deadline
+            ):
+                natural_exit_before_deadline = True
             if process.poll() is None and stop_at is None and now >= child_deadline:
+                forced_termination = True
                 _signal_child_group(process, signal.SIGTERM)
                 stop_at = now + CHILD_STOP_GRACE_SECONDS
             elif process.poll() is None and stop_at is not None and not kill_sent and now >= stop_at:
+                forced_termination = True
                 _signal_child_group(process, signal.SIGKILL)
                 kill_sent = True
             if now >= supervise_deadline:
@@ -768,6 +891,7 @@ def _collect_child(
                 # one of the inherited log/control pipes.  Kill the whole
                 # disposable group before closing those descriptors so no
                 # late writer can survive the parent deadline.
+                forced_termination = True
                 _signal_child_group(process, signal.SIGKILL)
                 break
             timeout = min(0.05, max(0.0, supervise_deadline - now))
@@ -793,6 +917,12 @@ def _collect_child(
                     if available:
                         control.extend(chunk[:available])
                 # Child stdout/stderr are intentionally drained and discarded.
+        if (
+            process.poll() is not None
+            and not forced_termination
+            and clock() < child_deadline
+        ):
+            natural_exit_before_deadline = True
         if process.poll() is None:
             _stop_child_now(process, clock=clock)
         else:
@@ -837,7 +967,218 @@ def _collect_child(
             valid = False
             continue
         events.append(value)
-    return events, valid and bool(open_fds) is False, process.returncode
+    return _ChildCollection(
+        events=events,
+        valid=valid and bool(open_fds) is False,
+        returncode=process.returncode,
+        forced_termination=forced_termination,
+        natural_exit_before_deadline=natural_exit_before_deadline,
+    )
+
+
+@dataclass(slots=True)
+class _CleanupCollection:
+    ok: bool
+    valid: bool
+    returncode: int | None
+    forced_termination: bool
+    natural_exit_before_deadline: bool
+
+
+def _stop_cleanup_now(
+    process: subprocess.Popen[bytes],
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+) -> bool:
+    """TERM, KILL, wait and reap one cleanup process within ``deadline``."""
+
+    forced = False
+    try:
+        if process.poll() is None:
+            forced = True
+            _signal_child_group(process, signal.SIGTERM)
+            stop_deadline = min(deadline, clock() + CLEANUP_STOP_GRACE_SECONDS)
+            while process.poll() is None and clock() < stop_deadline:
+                time.sleep(min(0.01, max(0.0, stop_deadline - clock())))
+            if process.poll() is None:
+                forced = True
+                _signal_child_group(process, signal.SIGKILL)
+        else:
+            # A leader can have exited while a descendant still owns one of
+            # the inherited protocol/log pipes.  Always close that group when
+            # cleanup collection was interrupted.
+            forced = True
+            _signal_child_group(process, signal.SIGKILL)
+        remaining = max(0.0, deadline - clock())
+        try:
+            process.wait(timeout=remaining)
+        except BaseException:
+            if process.poll() is None:
+                forced = True
+                _signal_child_group(process, signal.SIGKILL)
+            remaining = max(0.0, deadline - clock())
+            try:
+                process.wait(timeout=remaining)
+            except BaseException:
+                pass
+    except BaseException:
+        forced = True
+        try:
+            _signal_child_group(process, signal.SIGKILL)
+            process.wait(timeout=max(0.0, deadline - clock()))
+        except BaseException:
+            pass
+    return forced
+
+
+def _collect_cleanup(
+    process: subprocess.Popen[bytes],
+    control_fd: int,
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+) -> _CleanupCollection:
+    """Supervise cleanup, including protocol EOF and process-group reaping."""
+
+    selector = selectors.DefaultSelector()
+    control = bytearray()
+    control_overflow = False
+    open_fds: set[int] = set()
+    forced_termination = False
+    natural_exit_before_deadline = False
+    term_at = max(
+        clock(),
+        deadline - CLEANUP_STOP_GRACE_SECONDS - CLEANUP_KILL_GRACE_SECONDS,
+    )
+    stop_at: float | None = None
+    kill_sent = False
+    try:
+        for fd in (
+            control_fd,
+            process.stdout.fileno() if process.stdout else None,
+            process.stderr.fileno() if process.stderr else None,
+        ):
+            if fd is None:
+                continue
+            os.set_blocking(fd, False)
+            selector.register(fd, selectors.EVENT_READ)
+            open_fds.add(fd)
+        while open_fds or process.poll() is None:
+            now = clock()
+            returncode = process.poll()
+            if (
+                returncode is not None
+                and not forced_termination
+                and now < deadline
+            ):
+                natural_exit_before_deadline = True
+            if process.poll() is None and stop_at is None and now >= term_at:
+                forced_termination = True
+                _signal_child_group(process, signal.SIGTERM)
+                stop_at = min(deadline, now + CLEANUP_STOP_GRACE_SECONDS)
+            elif process.poll() is None and stop_at is not None and not kill_sent and now >= stop_at:
+                forced_termination = True
+                _signal_child_group(process, signal.SIGKILL)
+                kill_sent = True
+            if now >= deadline:
+                forced_termination = True
+                _signal_child_group(process, signal.SIGKILL)
+                kill_sent = True
+                break
+            timeout = min(0.05, max(0.0, deadline - now))
+            for selected, _ in selector.select(timeout):
+                fd = selected.fd
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                except BaseException:
+                    chunk = b""
+                if not chunk:
+                    try:
+                        selector.unregister(fd)
+                    except BaseException:
+                        pass
+                    open_fds.discard(fd)
+                    continue
+                if fd == control_fd:
+                    available = max(0, CLEANUP_CONTROL_MAX_BYTES - len(control))
+                    if len(chunk) > available:
+                        control_overflow = True
+                    if available:
+                        control.extend(chunk[:available])
+        if (
+            process.poll() is not None
+            and not forced_termination
+            and clock() < deadline
+        ):
+            natural_exit_before_deadline = True
+        if process.poll() is None:
+            forced_termination = _stop_cleanup_now(
+                process,
+                deadline=deadline,
+                clock=clock,
+            ) or forced_termination
+        else:
+            try:
+                process.wait(timeout=max(0.0, deadline - clock()))
+            except BaseException:
+                forced_termination = True
+    finally:
+        for fd in tuple(open_fds):
+            try:
+                selector.unregister(fd)
+            except BaseException:
+                pass
+            try:
+                os.close(fd)
+            except BaseException:
+                pass
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
+
+    valid = (
+        not control_overflow
+        and len(control) <= CLEANUP_CONTROL_MAX_BYTES
+        and bool(control)
+        and control.endswith(b"\n")
+    )
+    ok = False
+    if valid:
+        lines = bytes(control).splitlines()
+        if len(lines) != 1:
+            valid = False
+        else:
+            try:
+                event = json.loads(
+                    lines[0].decode("ascii"),
+                    object_pairs_hook=_strict_object,
+                )
+            except (UnicodeError, json.JSONDecodeError, ValueError):
+                valid = False
+            else:
+                if (
+                    not isinstance(event, dict)
+                    or set(event) != {"event", "ok"}
+                    or event.get("event") != "cleanup"
+                    or not isinstance(event.get("ok"), bool)
+                ):
+                    valid = False
+                else:
+                    ok = event["ok"]
+    return _CleanupCollection(
+        ok=ok,
+        valid=valid and not open_fds,
+        returncode=process.returncode,
+        forced_termination=forced_termination,
+        natural_exit_before_deadline=natural_exit_before_deadline,
+    )
 
 
 def _decode_event_key(event: Mapping[str, object], task_id: str) -> str | bytes | None:
@@ -913,13 +1254,19 @@ def run_liveness(
     spawn_child: Callable[
         [RunIdentity, str, float], tuple[subprocess.Popen[bytes], int]
     ] | None = None,
+    spawn_cleanup: Callable[
+        [RunIdentity, str | bytes, str, float], tuple[subprocess.Popen[bytes], int]
+    ]
+    | None = None,
 ) -> dict[str, object]:
-    """Supervise one release roundtrip and then clean only its exact key."""
+    """Supervise one roundtrip and isolated exact-key cleanup."""
 
     if clock is None:
         clock = time.monotonic
     if spawn_child is None:
         spawn_child = _spawn_child
+    if spawn_cleanup is None:
+        spawn_cleanup = _spawn_cleanup
     checks: dict[str, str] = {}
     try:
         start = clock()
@@ -933,8 +1280,9 @@ def run_liveness(
     result_url: str | None = None
     handle: tuple[subprocess.Popen[bytes], int] | None = None
     collection_completed = False
+    cleanup_handle: tuple[subprocess.Popen[bytes], int] | None = None
+    cleanup_collection_completed = False
     outcome = _ChildOutcome(uncertain=True)
-    child_valid = False
     cleanup_status = "not_run"
     status = "failed"
     try:
@@ -965,7 +1313,7 @@ def run_liveness(
         checks["release_identity"] = "passed"
         task_id = _new_task_id()
         handle = spawn_child(identity, task_id, child_deadline)
-        events, child_valid, _returncode = _collect_child(
+        child_collection = _collect_child(
             handle[0],
             handle[1],
             child_deadline=child_deadline,
@@ -973,7 +1321,24 @@ def run_liveness(
             clock=clock,
         )
         collection_completed = True
-        outcome = _summarize_child(events, valid=child_valid, task_id=task_id)
+        outcome = _summarize_child(
+            child_collection.events,
+            valid=child_collection.valid,
+            task_id=task_id,
+        )
+        # A terminal payload is not enough: a forced stop, signal, nonzero
+        # return, or exit observed after the child deadline is an uncertain
+        # publish and must remain cleanup_unproven.
+        if not (
+            child_collection.valid
+            and child_collection.natural_exit_before_deadline
+            and child_collection.returncode == 0
+            and not child_collection.forced_termination
+        ):
+            outcome.uncertain = True
+            outcome.success = False
+            if outcome.terminal:
+                outcome.result_state = "failed"
         checks["task_route"] = outcome.route_state
         checks["task_result"] = outcome.result_state
     except BaseException:
@@ -1011,18 +1376,60 @@ def run_liveness(
                 # fallback cleanup is attempted, but an uncertain child can
                 # never be reported as proven merely because this key is gone.
                 cleanup_key = RESULT_KEY_PREFIX + task_id.encode("ascii")
-            try:
-                cleanup_ok = (
-                    cleanup_key is not None
-                    and _cleanup_key(
-                    _validate_result_key(cleanup_key, task_id),
-                    result_url,
-                    deadline,
-                    clock=clock,
-                )
-                )
-            except BaseException:
-                cleanup_ok = False
+            cleanup_ok = False
+            if cleanup_key is not None:
+                try:
+                    cleanup_key = _validate_result_key(cleanup_key, task_id)
+                    _remaining(deadline, clock)
+                    cleanup_handle = spawn_cleanup(
+                        identity,
+                        cleanup_key,
+                        result_url,
+                        deadline,
+                    )
+                    cleanup_collection = _collect_cleanup(
+                        cleanup_handle[0],
+                        cleanup_handle[1],
+                        deadline=deadline,
+                        clock=clock,
+                    )
+                    cleanup_collection_completed = True
+                    cleanup_ok = (
+                        cleanup_collection.valid
+                        and cleanup_collection.ok
+                        and cleanup_collection.returncode == 0
+                        and cleanup_collection.natural_exit_before_deadline
+                        and not cleanup_collection.forced_termination
+                    )
+                except BaseException:
+                    cleanup_ok = False
+                finally:
+                    cleanup_running = cleanup_handle is not None and not cleanup_collection_completed
+                    if cleanup_handle is not None:
+                        try:
+                            cleanup_running = cleanup_running or cleanup_handle[0].poll() is None
+                        except BaseException:
+                            cleanup_running = True
+                            cleanup_ok = False
+                    if cleanup_handle is not None and cleanup_running:
+                        try:
+                            _stop_cleanup_now(
+                                cleanup_handle[0],
+                                deadline=deadline,
+                                clock=clock,
+                            )
+                        except BaseException:
+                            cleanup_ok = False
+                    if cleanup_handle is not None:
+                        for stream in (
+                            cleanup_handle[0].stdout,
+                            cleanup_handle[0].stderr,
+                        ):
+                            if stream is not None:
+                                try:
+                                    stream.close()
+                                except BaseException:
+                                    pass
             if cleanup_ok and (outcome.terminal or not outcome.attempted) and not outcome.uncertain:
                 cleanup_status = "proven"
             elif cleanup_key is not None:
@@ -1059,6 +1466,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--release", type=Path)
     parser.add_argument("--expected-source-sha")
     parser.add_argument("--child", action="store_true")
+    parser.add_argument("--cleanup-child", action="store_true")
     parser.add_argument("--task-id")
     parser.add_argument("--deadline", type=float)
     parser.add_argument("--control-fd", type=int)
@@ -1077,6 +1485,25 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 return 1
             return _child_roundtrip(args.task_id, args.deadline, args.control_fd)
+        if args.cleanup_child:
+            if args.deadline is None or args.control_fd is None:
+                return 1
+            result_url = os.environ.get(CLEANUP_RESULT_URL_ENV)
+            encoded_key = os.environ.get(CLEANUP_RESULT_KEY_ENV)
+            if not isinstance(result_url, str) or not isinstance(encoded_key, str):
+                return 1
+            try:
+                key = _validate_cleanup_key(
+                    base64.b64decode(encoded_key.encode("ascii"), validate=True)
+                )
+            except (ValueError, UnicodeError, binascii.Error, LivenessFailure):
+                return 1
+            return _cleanup_roundtrip(
+                key,
+                result_url,
+                args.deadline,
+                args.control_fd,
+            )
         if args.app_dir is None or args.release is None or args.expected_source_sha is None:
             raise LivenessFailure("arguments_invalid")
         identity = validate_release_identity(
