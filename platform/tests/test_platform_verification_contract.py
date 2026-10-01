@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import io
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import unittest
 from pathlib import Path
 import tempfile
@@ -15,6 +19,7 @@ from unittest.mock import patch
 
 import yaml
 
+from tools import platform_actionlint
 from tools.platform_test_catalog import (
     BACKEND_CONTOURS,
     CONTOUR_METADATA,
@@ -60,9 +65,14 @@ from tools.platform_verification_lock import (
 )
 from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
+    ACTIONLINT_CHECKSUM_FIXTURE,
+    ACTIONLINT_TOOL,
     DRAFT_CLOUDFLARE_WORKFLOW,
     SECURITY_WORKFLOW,
     action_pin_issues,
+    actionlint_release_fixture_issues,
+    actionlint_tool_contract_issues,
+    actionlint_workflow_issues,
     collect_issues,
     _ci_dependency_issues,
     draft_cloudflare_workflow_issues,
@@ -72,6 +82,45 @@ from tools.platform_verify_contract import (
     security_status_permission_issues,
     workflow_level_permission_issues,
 )
+
+
+# Independent release fixtures: these values are copied from the upstream
+# v1.7.12 tarball/checksum asset rather than imported from the installer.
+_EXPECTED_ACTIONLINT_ARCHIVE_MODES = {
+    "LICENSE.txt": 0o644,
+    "README.md": 0o644,
+    "docs/README.md": 0o644,
+    "docs/api.md": 0o644,
+    "docs/checks.md": 0o644,
+    "docs/config.md": 0o644,
+    "docs/install.md": 0o644,
+    "docs/reference.md": 0o644,
+    "docs/usage.md": 0o644,
+    "man/actionlint.1": 0o644,
+    "actionlint": 0o755,
+}
+_EXPECTED_ACTIONLINT_ASSETS = {
+    ("linux", "amd64"): (
+        "actionlint_1.7.12_linux_amd64.tar.gz",
+        "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+    ),
+    ("linux", "arm64"): (
+        "actionlint_1.7.12_linux_arm64.tar.gz",
+        "325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6",
+    ),
+    ("darwin", "amd64"): (
+        "actionlint_1.7.12_darwin_amd64.tar.gz",
+        "5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644",
+    ),
+    ("darwin", "arm64"): (
+        "actionlint_1.7.12_darwin_arm64.tar.gz",
+        "aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f",
+    ),
+}
+_EXPECTED_ACTIONLINT_CHECKSUM_FIXTURE_SHA256 = (
+    "433028cf0ba3c42163ea1a668dedce30fcdbe84fe912b1a5e288c006eab8a4f5"
+)
+_EXPECTED_ACTIONLINT_MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
 
 
 def _write_backend_component_fixture(root: Path) -> None:
@@ -163,6 +212,51 @@ def _draft_current_dev_parser_script() -> str:
         '\"$CANONICAL_REPOSITORY\" <<\'PY\'\n'
     )
     return textwrap.dedent(run.split(marker, 1)[1].split("\nPY", 1)[0])
+
+
+def _write_actionlint_archive(path: Path, mutation: str | None = None) -> bytes:
+    """Build a tiny offline archive from independent upstream fixtures."""
+
+    members = sorted(_EXPECTED_ACTIONLINT_ARCHIVE_MODES)
+    with tarfile.open(path, "w:gz") as archive:
+        for name in members:
+            if mutation == "subset" and name == "docs/api.md":
+                continue
+            payload = (
+                b"fake actionlint binary\n"
+                if name == "actionlint"
+                else f"fixture:{name}\n".encode("utf-8")
+            )
+            member = tarfile.TarInfo(name)
+            member.size = len(payload)
+            member.mode = _EXPECTED_ACTIONLINT_ARCHIVE_MODES[name]
+            if mutation == "traversal" and name == "README.md":
+                member.name = "../README.md"
+            elif mutation == "symlink" and name == "actionlint":
+                member.type = tarfile.SYMTYPE
+                member.linkname = "README.md"
+                member.size = 0
+                payload = b""
+            elif mutation == "setuid" and name == "actionlint":
+                member.mode = 0o4755
+            elif mutation == "mode" and name == "README.md":
+                member.mode = 0o664
+            elif mutation == "mode-0600" and name == "docs/api.md":
+                member.mode = 0o600
+            elif mutation == "binary-mode" and name == "actionlint":
+                member.mode = 0o754
+            archive.addfile(member, io.BytesIO(payload))
+        if mutation == "duplicate":
+            duplicate = tarfile.TarInfo("actionlint")
+            duplicate.size = 1
+            duplicate.mode = 0o755
+            archive.addfile(duplicate, io.BytesIO(b"x"))
+        if mutation == "evil":
+            evil = tarfile.TarInfo("evil.txt")
+            evil.size = 1
+            evil.mode = 0o644
+            archive.addfile(evil, io.BytesIO(b"x"))
+    return path.read_bytes()
 
 
 class PlatformVerificationContractTests(unittest.TestCase):
@@ -811,6 +905,257 @@ except lock.VerificationLockError as exc:
             extract_gate_invocations(text),
             ["backend", "no-such-gate"],
         )
+
+    def test_actionlint_pinned_installer_and_workflow_contract(self) -> None:
+        self.assertEqual(actionlint_tool_contract_issues(), [])
+        self.assertEqual(actionlint_release_fixture_issues(), [])
+        self.assertEqual(ACTIONLINT_CHECKSUM_FIXTURE.name, "actionlint_1.7.12_checksums.txt")
+        self.assertEqual(
+            {
+                key: (asset.filename, asset.sha256)
+                for key, asset in platform_actionlint.ACTIONLINT_ASSETS.items()
+            },
+            _EXPECTED_ACTIONLINT_ASSETS,
+        )
+        self.assertEqual(
+            platform_actionlint.ACTIONLINT_ARCHIVE_MODES,
+            _EXPECTED_ACTIONLINT_ARCHIVE_MODES,
+        )
+        self.assertEqual(
+            hashlib.sha256(ACTIONLINT_CHECKSUM_FIXTURE.read_bytes()).hexdigest(),
+            _EXPECTED_ACTIONLINT_CHECKSUM_FIXTURE_SHA256,
+        )
+
+        supported = {
+            ("Linux", "x86_64"): "actionlint_1.7.12_linux_amd64.tar.gz",
+            ("Linux", "aarch64"): "actionlint_1.7.12_linux_arm64.tar.gz",
+            ("Darwin", "x86_64"): "actionlint_1.7.12_darwin_amd64.tar.gz",
+            ("Darwin", "arm64"): "actionlint_1.7.12_darwin_arm64.tar.gz",
+        }
+        for platform_key, expected_filename in supported.items():
+            with self.subTest(platform=platform_key):
+                self.assertEqual(
+                    platform_actionlint.select_asset(*platform_key).filename,
+                    expected_filename,
+                )
+        for platform_key in (("Windows", "amd64"), ("Linux", "armv7"), ("FreeBSD", "amd64")):
+            with self.subTest(unsupported=platform_key):
+                with self.assertRaises(platform_actionlint.ActionlintError):
+                    platform_actionlint.select_asset(*platform_key)
+
+        asset = platform_actionlint.select_asset("Linux", "x86_64")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / asset.filename
+            with (
+                patch.object(platform_actionlint.shutil, "which", return_value="/usr/bin/curl"),
+                patch.object(
+                    platform_actionlint.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0),
+                ) as download,
+            ):
+                self.assertEqual(
+                    platform_actionlint._download_archive(asset, destination),
+                    destination,
+                )
+            download_command = download.call_args.args[0]
+            self.assertEqual(download_command[0], "/usr/bin/curl")
+            self.assertEqual(download_command[-1], asset.url)
+            self.assertEqual(_EXPECTED_ACTIONLINT_MAX_ARCHIVE_BYTES, 8388608)
+            self.assertEqual(download_command.count("--max-filesize"), 1)
+            max_filesize_index = download_command.index("--max-filesize")
+            self.assertLess(max_filesize_index + 1, len(download_command) - 1)
+            self.assertEqual(
+                download_command[max_filesize_index : max_filesize_index + 2],
+                ["--max-filesize", "8388608"],
+            )
+            for flag in (
+                ["--fail"],
+                ["--location"],
+                ["--connect-timeout", "5"],
+                ["--max-time", "60"],
+                ["--retry", "0"],
+                ["--output", str(destination)],
+            ):
+                with self.subTest(curl_flag=flag):
+                    start = download_command.index(flag[0])
+                    self.assertEqual(download_command[start : start + len(flag)], flag)
+
+        wrapper_source = ACTIONLINT_TOOL.read_text(encoding="utf-8")
+        tool_mutations = {
+            "implementation-one-gib": wrapper_source.replace(
+                "MAX_ARCHIVE_BYTES = 8 * 1024 * 1024",
+                "MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024",
+                1,
+            ),
+            "curl-one-gib": wrapper_source.replace(
+                "str(MAX_ARCHIVE_BYTES)",
+                "str(1024 * 1024 * 1024)",
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for mutation, mutated_source in tool_mutations.items():
+                with self.subTest(actionlint_size_mutation=mutation):
+                    mutated_tool = Path(directory) / f"{mutation}.py"
+                    mutated_tool.write_text(mutated_source, encoding="utf-8")
+                    with patch("tools.platform_verify_contract.ACTIONLINT_TOOL", mutated_tool):
+                        self.assertTrue(actionlint_tool_contract_issues())
+
+        workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(actionlint_workflow_issues(workflow), [])
+        missing_invocation = workflow.replace(
+            "          .venv_platform/bin/python tools/platform_actionlint.py\n",
+            "",
+            1,
+        )
+        self.assertTrue(
+            any("invoke platform_actionlint.py exactly once" in issue
+                for issue in actionlint_workflow_issues(missing_invocation))
+        )
+        separate_job = workflow + "\n  actionlint:\n    runs-on: ubuntu-latest\n"
+        self.assertTrue(
+            any("separate CI job" in issue for issue in actionlint_workflow_issues(separate_job))
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "fixture.tar.gz"
+            archive_bytes = _write_actionlint_archive(archive_path)
+            fixture_asset = platform_actionlint.ActionlintAsset(
+                "linux",
+                "amd64",
+                archive_path.name,
+                hashlib.sha256(archive_bytes).hexdigest(),
+            )
+            binary_path = Path(directory) / "actionlint"
+            extracted = platform_actionlint.extract_verified_binary(
+                archive_path,
+                fixture_asset,
+                binary_path,
+            )
+            self.assertEqual(extracted.read_bytes(), b"fake actionlint binary\n")
+            self.assertTrue(extracted.stat().st_mode & stat.S_IXUSR)
+            wrong_digest = platform_actionlint.ActionlintAsset(
+                "linux", "amd64", archive_path.name, "0" * 64
+            )
+            with self.assertRaisesRegex(platform_actionlint.ActionlintError, "digest mismatch"):
+                platform_actionlint.extract_verified_binary(
+                    archive_path,
+                    wrong_digest,
+                    Path(directory) / "wrong",
+                )
+            self.assertFalse((Path(directory) / "wrong").exists())
+            oversized_path = Path(directory) / "oversized.tar.gz"
+            with oversized_path.open("wb") as stream:
+                stream.truncate(_EXPECTED_ACTIONLINT_MAX_ARCHIVE_BYTES + 1)
+            with self.assertRaisesRegex(platform_actionlint.ActionlintError, "bounded"):
+                platform_actionlint.verify_archive_digest(oversized_path, fixture_asset)
+            for mutation in (
+                "traversal",
+                "symlink",
+                "setuid",
+                "duplicate",
+                "evil",
+                "subset",
+                "mode",
+                "mode-0600",
+                "binary-mode",
+            ):
+                with self.subTest(archive_mutation=mutation):
+                    mutated_path = Path(directory) / f"{mutation}.tar.gz"
+                    mutated_bytes = _write_actionlint_archive(mutated_path, mutation)
+                    mutated_asset = platform_actionlint.ActionlintAsset(
+                        "linux",
+                        "amd64",
+                        mutated_path.name,
+                        hashlib.sha256(mutated_bytes).hexdigest(),
+                    )
+                    with self.assertRaises(platform_actionlint.ActionlintError):
+                        platform_actionlint.extract_verified_binary(
+                            mutated_path,
+                            mutated_asset,
+                            Path(directory) / f"{mutation}-binary",
+                        )
+                    self.assertFalse((Path(directory) / f"{mutation}-binary").exists())
+
+        repository_root = Path(__file__).resolve().parents[2]
+        independent_listing = subprocess.run(
+            ["git", "-C", str(repository_root), "ls-files", "-z", "--", ".github/workflows"],
+            check=True,
+            capture_output=True,
+        )
+        expected_workflows = {
+            Path(raw.decode("utf-8"))
+            for raw in independent_listing.stdout.split(b"\0")
+            if raw and Path(raw.decode("utf-8")).suffix.lower() in {".yml", ".yaml"}
+        }
+        tracked = platform_actionlint.tracked_workflow_paths(repository_root)
+        tracked_relative = tuple(path.relative_to(repository_root) for path in tracked)
+        self.assertEqual(set(tracked_relative), expected_workflows)
+        self.assertEqual(len(tracked_relative), len(set(tracked_relative)))
+        self.assertEqual(tracked_relative, tuple(sorted(tracked_relative)))
+        self.assertEqual(len(tracked_relative), 29)
+
+        def assert_exact_workflow_listing(candidate: tuple[Path, ...]) -> None:
+            candidate_relative = tuple(path.relative_to(repository_root) for path in candidate)
+            self.assertEqual(len(candidate_relative), len(set(candidate_relative)))
+            self.assertEqual(set(candidate_relative), expected_workflows)
+            self.assertEqual(candidate_relative, tuple(sorted(candidate_relative)))
+
+        mutation_cases = {
+            "duplicate": tracked + (tracked[0],),
+            "subset": tracked[:-1],
+            "addition": tracked + (repository_root / ".github/workflows/evil.yml",),
+            "space": tracked + (repository_root / ".github/workflows/name with spaces.yml",),
+            "newline": tracked + (repository_root / ".github/workflows/name\nwith.yml",),
+        }
+        for mutation, candidate in mutation_cases.items():
+            with self.subTest(workflow_listing_mutation=mutation):
+                with self.assertRaises(AssertionError):
+                    assert_exact_workflow_listing(candidate)
+
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            workflow_root = temporary_root / ".github" / "workflows"
+            workflow_root.mkdir(parents=True)
+            named_paths = (
+                Path(".github/workflows/name with spaces.yml"),
+                Path(".github/workflows/name\nwith.yml"),
+            )
+            for relative in named_paths:
+                (temporary_root / relative).write_text("name: fixture\n", encoding="utf-8")
+            listing = b"\0".join(str(path).encode("utf-8") for path in named_paths) + b"\0"
+            with patch.object(
+                platform_actionlint.subprocess,
+                "run",
+                return_value=SimpleNamespace(stdout=listing),
+            ):
+                parsed_named_paths = platform_actionlint.tracked_workflow_paths(temporary_root)
+            self.assertEqual(
+                tuple(path.relative_to(temporary_root) for path in parsed_named_paths),
+                tuple(sorted(named_paths)),
+            )
+            duplicate_listing = listing + str(named_paths[0]).encode("utf-8") + b"\0"
+            with patch.object(
+                platform_actionlint.subprocess,
+                "run",
+                return_value=SimpleNamespace(stdout=duplicate_listing),
+            ):
+                with self.assertRaisesRegex(platform_actionlint.ActionlintError, "duplicate"):
+                    platform_actionlint.tracked_workflow_paths(temporary_root)
+
+        with (
+            patch.object(platform_actionlint, "tracked_workflow_paths", return_value=tracked),
+            patch.object(
+                platform_actionlint.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=17),
+            ) as runner,
+        ):
+            self.assertEqual(platform_actionlint.run_actionlint(Path("/tmp/actionlint"), repository_root), 17)
+        command = runner.call_args.args[0]
+        self.assertEqual(command[1:3], ["-shellcheck", ""])
+        self.assertEqual(command[3:], [str(path) for path in tracked])
 
     def test_contract_self_test_is_clean(self) -> None:
         self.assertEqual(ALLOWED_ACTION_OWNERS, frozenset({"actions"}))

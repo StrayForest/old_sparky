@@ -144,7 +144,10 @@ GATES: tuple[Gate, ...] = (
     ),
     Gate(
         id="verification-contract",
-        description="Self-test for registry, workflow, suite and load-profile ownership.",
+        description=(
+            "Self-test for registry, workflow, suite and load-profile ownership; "
+            "CI also runs the pinned actionlint workflow contract in this gate."
+        ),
         deterministic=True,
         local_safe=True,
         ci_required=True,

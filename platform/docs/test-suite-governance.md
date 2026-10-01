@@ -571,4 +571,14 @@ guards, direct command duplication, exclusion bypasses, backend discovery,
 hermetic suite registration, production reachability from `ci`, documentation
 gate IDs, load-profile schema/deduplication, workflow-owned load budgets and
 the external-generator topology. Keep it deterministic and small enough to
-run on every CI change.
+run on every CI change. The same `verification-contract` job then invokes
+`tools/platform_actionlint.py` over every tracked `.github/workflows/*.yml` or
+`.yaml` file with `actionlint -shellcheck ""`; its output and non-zero status
+remain visible to CI. The wrapper is standard-library-only, downloads only the
+official immutable actionlint `v1.7.12` Linux/macOS amd64/arm64 assets with
+bounded curl flags, verifies the committed SHA-256 map and archive member
+allowlist, exact member modes and response-size cap before extraction, and
+fails closed on unsupported hosts. The
+committed checksum fixture is checked offline by this contour; network
+installation and actionlint runtime latency are measured separately and are
+not substituted with a fixture pass or a new CI job.

@@ -45,6 +45,15 @@ try:
         _backend_contour_command,
         _verification_contract_commands,
     )
+    from tools.platform_actionlint import (
+        ActionlintError,
+        ACTIONLINT_ASSETS,
+        ACTIONLINT_CHECKSUMS_FILENAME,
+        ACTIONLINT_CHECKSUMS_SHA256,
+        ACTIONLINT_RELEASE_BASE_URL,
+        ACTIONLINT_VERSION,
+        parse_official_checksums,
+    )
 except ModuleNotFoundError:  # Direct execution from platform/tools.
     from platform_test_catalog import (
         BACKEND_CONTOURS,
@@ -72,6 +81,15 @@ except ModuleNotFoundError:  # Direct execution from platform/tools.
         _backend_command,
         _backend_contour_command,
         _verification_contract_commands,
+    )
+    from platform_actionlint import (
+        ActionlintError,
+        ACTIONLINT_ASSETS,
+        ACTIONLINT_CHECKSUMS_FILENAME,
+        ACTIONLINT_CHECKSUMS_SHA256,
+        ACTIONLINT_RELEASE_BASE_URL,
+        ACTIONLINT_VERSION,
+        parse_official_checksums,
     )
 
 
@@ -105,6 +123,10 @@ DRAFT_CANONICAL_REPOSITORY = "StrayForest/old_sparky"
 DRAFT_SECURITY_WORKFLOW_ID = 339062797
 DRAFT_SECURITY_WORKFLOW_NAME = "Platform security and build"
 DRAFT_SECURITY_WORKFLOW_PATH = ".github/workflows/platform-security.yml"
+ACTIONLINT_TOOL = PLATFORM_ROOT / "tools" / "platform_actionlint.py"
+ACTIONLINT_CHECKSUM_FIXTURE = (
+    PLATFORM_ROOT / "tests" / "fixtures" / ACTIONLINT_CHECKSUMS_FILENAME
+)
 
 DIRECT_CANONICAL_COMMANDS = (
     "platform_run_tests.sh",
@@ -210,6 +232,135 @@ def action_pin_issues(
                 issues.append(
                     f"{location}: remote action ref must be a lower-case 40-character commit SHA"
                 )
+    return issues
+
+
+def actionlint_tool_contract_issues() -> list[str]:
+    """Keep the pinned actionlint installer bounded and non-mutable."""
+
+    issues: list[str] = []
+    if not ACTIONLINT_TOOL.is_file() or ACTIONLINT_TOOL.is_symlink():
+        return ["platform actionlint wrapper is missing or unsafe"]
+    try:
+        tool_text = ACTIONLINT_TOOL.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return [f"platform actionlint wrapper is unreadable: {exc}"]
+
+    expected_markers = (
+        f'ACTIONLINT_VERSION = "{ACTIONLINT_VERSION}"',
+        'ACTIONLINT_RELEASE_TAG = f"v{ACTIONLINT_VERSION}"',
+        'ACTIONLINT_RELEASE_BASE_URL = (',
+        '"https://github.com/rhysd/actionlint/releases/download/"',
+        'ACTIONLINT_CHECKSUMS_FILENAME = f"actionlint_{ACTIONLINT_VERSION}_checksums.txt"',
+        'ACTIONLINT_CHECKSUMS_SHA256 = (',
+        'ACTIONLINT_ARCHIVE_MODES: Mapping[str, int] = {',
+        'MAX_ARCHIVE_BYTES = 8 * 1024 * 1024',
+        '"https://github.com/rhysd/actionlint/releases/download/',
+        'subprocess.run(command, cwd=repository_root, check=False)',
+        '"--fail",',
+        '"--location",',
+        '"--connect-timeout",',
+        '"5",',
+        '"--max-time",',
+        '"60",',
+        '"--max-filesize",',
+        'str(MAX_ARCHIVE_BYTES),',
+        '"--retry",',
+        '"0",',
+        '"--output",',
+        'hashlib.sha256(data).hexdigest()',
+        'tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")',
+        'member.isreg()',
+        'member.issym()',
+        'member.islnk()',
+        'member.mode != ACTIONLINT_ARCHIVE_MODES[member.name]',
+        'PurePosixPath(name)',
+        'TemporaryDirectory(prefix="platform-actionlint-")',
+        '[str(binary), "-shellcheck", "",',
+        '"git", "-C", str(repository_root), "ls-files", "-z", "--", ".github/workflows"',
+    )
+    for marker in expected_markers:
+        if marker not in tool_text:
+            issues.append(f"platform actionlint wrapper is missing marker: {marker}")
+    for forbidden in (
+        "latest/download",
+        "latest",
+        "/main",
+        "/main/",
+        "cache",
+        "curl |",
+        "curl|",
+        "extractall(",
+        "--retry-all-errors",
+    ):
+        if forbidden in tool_text:
+            issues.append(f"platform actionlint wrapper contains forbidden marker: {forbidden}")
+    expected_assets = {
+        ("linux", "amd64"),
+        ("linux", "arm64"),
+        ("darwin", "amd64"),
+        ("darwin", "arm64"),
+    }
+    if set(ACTIONLINT_ASSETS) != expected_assets:
+        issues.append("platform actionlint wrapper must map exactly four supported platforms")
+    return issues
+
+
+def actionlint_release_fixture_issues() -> list[str]:
+    """Compare the committed map with the independently captured release list."""
+
+    issues: list[str] = []
+    if not ACTIONLINT_CHECKSUM_FIXTURE.is_file() or ACTIONLINT_CHECKSUM_FIXTURE.is_symlink():
+        return ["official actionlint checksum fixture is missing or unsafe"]
+    try:
+        checksum_bytes = ACTIONLINT_CHECKSUM_FIXTURE.read_bytes()
+        checksum_text = checksum_bytes.decode("utf-8")
+        parsed = parse_official_checksums(checksum_text)
+    except (ActionlintError, OSError, UnicodeError, ValueError) as exc:
+        return [f"official actionlint checksum fixture is unreadable: {exc}"]
+    if hashlib.sha256(checksum_bytes).hexdigest() != ACTIONLINT_CHECKSUMS_SHA256:
+        issues.append("official actionlint checksum fixture digest changed")
+    for asset in ACTIONLINT_ASSETS.values():
+        if parsed.get(asset.filename) != asset.sha256:
+            issues.append(
+                f"actionlint digest map does not match official checksum for {asset.filename}"
+            )
+        if asset.url != f"{ACTIONLINT_RELEASE_BASE_URL}/{asset.filename}":
+            issues.append(f"actionlint URL is not immutable for {asset.filename}")
+    return issues
+
+
+def actionlint_workflow_issues(security_text: str) -> list[str]:
+    """Keep actionlint in the existing verification-contract job and command."""
+
+    issues: list[str] = []
+    block = _workflow_job_block(security_text, "verification-contract")
+    if not block:
+        return ["platform-security.yml is missing verification-contract job"]
+    invocation_count = security_text.count("tools/platform_actionlint.py")
+    if invocation_count != 1:
+        issues.append(
+            "platform-security.yml must invoke platform_actionlint.py exactly once"
+        )
+    if "tools/platform_actionlint.py" not in block:
+        issues.append(
+            "platform actionlint must run inside the existing verification-contract job"
+        )
+    if re.search(r"^  actionlint(?:-|_|:)", security_text, re.MULTILINE):
+        issues.append("platform actionlint must not add a separate CI job")
+    if "platform_verify.py verification-contract" not in block:
+        issues.append(
+            "verification-contract job must retain its canonical registry command"
+        )
+    actionlint_lines = [
+        line
+        for line in block.splitlines()
+        if "platform_actionlint.py" in line
+    ]
+    if len(actionlint_lines) != 1:
+        issues.append("platform actionlint invocation must remain one workflow command")
+    elif "|| true" in actionlint_lines[0] or "continue-on-error" in block:
+        issues.append("platform actionlint failure must not be hidden")
     return issues
 
 
@@ -2046,6 +2197,8 @@ def collect_issues() -> list[str]:
     issues: list[str] = []
 
     issues.extend(f"action pin: {issue}" for issue in action_pin_issues())
+    issues.extend(actionlint_tool_contract_issues())
+    issues.extend(actionlint_release_fixture_issues())
     issues.extend(workflow_level_permission_issues())
     for workflow_path, workflow_text in _workflow_texts():
         if workflow_path in {SECURITY_WORKFLOW, PRODUCTION_WORKFLOW}:
@@ -2078,6 +2231,7 @@ def collect_issues() -> list[str]:
     if "platform-ci-summary-" not in security_text:
         issues.append("platform-security.yml must publish a machine-readable summary")
     issues.extend(_checkout_credential_issues("platform-security.yml", security_text))
+    issues.extend(actionlint_workflow_issues(security_text))
     issues.extend(_ci_dependency_issues(security_text))
     invocations = extract_gate_invocations(security_text)
     missing = sorted(set(CI_GATE_IDS) - set(invocations))
