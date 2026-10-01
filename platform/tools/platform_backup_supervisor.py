@@ -1391,6 +1391,7 @@ def run_local_backup(
     env_file: Path | None = None,
     output_dir: Path | None = None,
     admin_database_url: str | None = None,
+    expected_alembic_head: str | None = None,
     capability: object,
     lock: BackupLockHandle,
     evidence: EvidenceSession,
@@ -1406,10 +1407,13 @@ def run_local_backup(
         # in that mode its sibling directory, rather than the repository
         # package root, is on sys.path.
         restore = importlib.import_module("platform_backup_restore_drill")
-    expected_head = getattr(args, "expected_alembic_head", None)
+    # The supervisor API carries the trusted expected head explicitly.  When a
+    # caller does not provide one, derive it from the deployed source graph;
+    # never read hidden state from a CLI Namespace that has not been built yet.
+    expected_head = expected_alembic_head
     if expected_head is None:
         expected_head = restore.expected_alembic_head(Path(app_dir) / "current")
-    args = _restore_args(
+    restore_args = _restore_args(
         app_dir,
         keep=keep,
         env_file=env_file,
@@ -1421,8 +1425,8 @@ def run_local_backup(
     # The supervisor, not the low-level producer, owns rotation.  Existing
     # callers retain the primitive's default behavior, while this path passes
     # the in-process capability and explicitly disables nested pruning.
-    created = restore.create_backup(args, prune=False, capability=capability)
-    output_dir = Path(args.output_dir)
+    created = restore.create_backup(restore_args, prune=False, capability=capability)
+    output_dir = Path(restore_args.output_dir)
     dump = output_dir / str(created["dump_file"])
     manifest = dump.with_suffix(".json")
     pair = snapshot_backup_pair(dump, manifest)

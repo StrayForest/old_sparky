@@ -177,6 +177,33 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         with self.assertRaises(supervisor.ProductionRestoreDisabled):
             supervisor.run_production_restore()
 
+    def test_local_backup_passes_explicit_expected_head_before_pg_dump(self) -> None:
+        """The supervisor must build restore args without hidden CLI state."""
+
+        restore = mock.Mock()
+        restore.create_backup.side_effect = RuntimeError("pg_dump sentinel")
+        app_dir = Path("/tmp/oldsparky-supervisor-head-regression")
+        lock = mock.Mock()
+        evidence = mock.Mock()
+
+        with mock.patch.object(
+            supervisor.importlib, "import_module", return_value=restore
+        ):
+            with self.assertRaisesRegex(RuntimeError, "pg_dump sentinel"):
+                supervisor.run_local_backup(
+                    app_dir,
+                    expected_alembic_head="20260913_0053",
+                    capability=supervisor._capability("maintenance"),
+                    lock=lock,
+                    evidence=evidence,
+                )
+
+        lock.validate.assert_called_once_with()
+        restore.expected_alembic_head.assert_not_called()
+        restore.create_backup.assert_called_once()
+        restore_args = restore.create_backup.call_args.args[0]
+        self.assertEqual(restore_args.expected_alembic_head, "20260913_0053")
+
     def test_capability_and_nested_evidence_schema_fail_closed(self) -> None:
         with self.assertRaises(supervisor.BackupSupervisorError):
             supervisor.require_mutation_capability(object(), "maintenance")
