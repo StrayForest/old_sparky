@@ -13,6 +13,11 @@ import sys
 from typing import Iterable
 
 try:
+    import yaml
+except ModuleNotFoundError:  # The CI lock owns this verification dependency.
+    yaml = None
+
+try:
     from tools.platform_test_catalog import (
         BACKEND_CONTOURS,
         BACKEND_AGGREGATE,
@@ -95,6 +100,11 @@ CLASSIFIER_TOOL = PLATFORM_ROOT / "tools" / "platform_ci_classifier.py"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-deploy.yml"
 CANDIDATE_HOST_TOOLS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-host-tools-candidate.yml"
+DRAFT_CLOUDFLARE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-draft-cloudflare.yml"
+DRAFT_CANONICAL_REPOSITORY = "StrayForest/old_sparky"
+DRAFT_SECURITY_WORKFLOW_ID = 339062797
+DRAFT_SECURITY_WORKFLOW_NAME = "Platform security and build"
+DRAFT_SECURITY_WORKFLOW_PATH = ".github/workflows/platform-security.yml"
 
 DIRECT_CANONICAL_COMMANDS = (
     "platform_run_tests.sh",
@@ -347,6 +357,374 @@ def _workflow_step_blocks(job_block: str) -> tuple[str, ...]:
         "".join(lines[start:end])
         for start, end in zip(starts, (*starts[1:], len(lines)))
     )
+
+
+def _normalize_workflow_expression(value: object) -> str | None:
+    """Normalize one explicit GitHub expression without changing its operators."""
+
+    if not isinstance(value, str):
+        return None
+    expression = value.strip()
+    if not expression.startswith("${{") or not expression.endswith("}}"):
+        return None
+    return " ".join(expression[3:-2].split())
+
+
+def _draft_yaml_contract_issues(workflow_text: str) -> list[str]:
+    """Validate security-sensitive Draft semantics from the parsed YAML tree."""
+
+    if yaml is None:
+        return ["Draft Cloudflare parsed-YAML contract requires the locked PyYAML dependency"]
+    try:
+        document = yaml.safe_load(workflow_text)
+    except yaml.YAMLError as exc:
+        return [f"Draft Cloudflare workflow YAML is invalid: {exc}"]
+    if not isinstance(document, dict):
+        return ["Draft Cloudflare workflow YAML must be a mapping"]
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return ["Draft Cloudflare workflow YAML must declare a jobs mapping"]
+
+    issues: list[str] = []
+    detect = jobs.get("detect-release")
+    build = jobs.get("build-release")
+    release = jobs.get("release")
+    for job_id, job in (
+        ("detect-release", detect),
+        ("build-release", build),
+        ("release", release),
+    ):
+        if not isinstance(job, dict):
+            issues.append(f"Draft Cloudflare parsed YAML is missing job {job_id}")
+
+    expected_detect = (
+        f"github.repository == '{DRAFT_CANONICAL_REPOSITORY}' && "
+        "(github.event_name == 'workflow_dispatch' || "
+        "(github.event_name == 'workflow_run' && "
+        "github.event.workflow_run.status == 'completed' && "
+        "github.event.workflow_run.conclusion == 'success' && "
+        "github.event.workflow_run.event == 'push' && "
+        "github.event.workflow_run.head_branch == 'dev' && "
+        f"github.event.workflow_run.repository.full_name == '{DRAFT_CANONICAL_REPOSITORY}' && "
+        f"github.event.workflow_run.head_repository.full_name == '{DRAFT_CANONICAL_REPOSITORY}' && "
+        f"github.event.workflow_run.workflow_id == {DRAFT_SECURITY_WORKFLOW_ID} && "
+        f"github.event.workflow_run.name == '{DRAFT_SECURITY_WORKFLOW_NAME}' && "
+        f"github.event.workflow_run.path == '{DRAFT_SECURITY_WORKFLOW_PATH}' && "
+        "github.event.workflow_run.head_sha != ''))"
+    )
+    if isinstance(detect, dict) and _normalize_workflow_expression(detect.get("if")) != expected_detect:
+        issues.append(
+            "Draft detect-release if must be the exact canonical trigger identity expression"
+        )
+
+    expected_build = (
+        "needs.detect-release.result == 'success' && "
+        "needs.detect-release.outputs.changed == 'true'"
+    )
+    if isinstance(build, dict):
+        if _normalize_workflow_expression(build.get("if")) != expected_build:
+            issues.append(
+                "Draft build-release if must require successful detect-release and its changed output"
+            )
+        if build.get("needs") != ["detect-release"]:
+            issues.append("Draft build-release must need only detect-release")
+
+    expected_release = (
+        "needs.detect-release.result == 'success' && "
+        "needs.detect-release.outputs.changed == 'true' && "
+        "needs.build-release.result == 'success'"
+    )
+    if isinstance(release, dict):
+        if _normalize_workflow_expression(release.get("if")) != expected_release:
+            issues.append(
+                "Draft release if must require successful detect-release, changed output and build-release"
+            )
+        if release.get("needs") != ["detect-release", "build-release"]:
+            issues.append("Draft release must need detect-release and build-release")
+
+    concurrency = document.get("concurrency")
+    expected_group = (
+        "platform-draft-cloudflare-${{ github.event_name == 'workflow_run' && "
+        "github.event.workflow_run.head_sha || github.sha }}"
+    )
+    if not isinstance(concurrency, dict):
+        issues.append("Draft Cloudflare workflow must declare top-level concurrency")
+    else:
+        if concurrency.get("group") != expected_group:
+            issues.append(
+                "Draft Cloudflare concurrency must use one immutable target SHA for every trigger"
+            )
+        if concurrency.get("cancel-in-progress") is not False:
+            issues.append(
+                "Draft Cloudflare concurrency must not cancel an in-flight release"
+            )
+
+    if not isinstance(detect, dict):
+        return issues
+    steps = detect.get("steps")
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+        issues.append("Draft detect-release steps must be a list of mappings")
+        return issues
+    resolver_indexes = [
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Resolve and verify immutable release target"
+    ]
+    checkout_indexes = [
+        index
+        for index, step in enumerate(steps)
+        if isinstance(step.get("uses"), str)
+        and step["uses"].startswith("actions/checkout@")
+    ]
+    if len(resolver_indexes) != 1:
+        issues.append("Draft parsed YAML must have one immutable target resolver")
+        return issues
+    if len(checkout_indexes) != 1:
+        issues.append("Draft parsed YAML must have one detect checkout step")
+    resolver_index = resolver_indexes[0]
+    if resolver_index != 0:
+        issues.append("Draft parsed target resolver must be the first detect step")
+    if checkout_indexes and resolver_index >= checkout_indexes[0]:
+        issues.append("Draft parsed target resolver must precede checkout")
+    resolver = steps[resolver_index]
+    resolver_run = resolver.get("run")
+    if not isinstance(resolver_run, str):
+        issues.append("Draft parsed target resolver must have a shell script")
+        return issues
+    resolver_env = resolver.get("env")
+    if not isinstance(resolver_env, dict) or resolver_env.get("GH_TOKEN") != "${{ github.token }}":
+        issues.append("Draft target resolver must use the read-only GitHub token")
+    if not isinstance(resolver_env, dict) or resolver_env.get("CANONICAL_REPOSITORY") != "${{ github.repository }}":
+        issues.append("Draft target resolver must bind the canonical repository context")
+    shell_lines = {line.strip() for line in resolver_run.splitlines() if line.strip()}
+    for marker, description in (
+        ('test -n "$GH_TOKEN"', "non-empty GitHub token guard"),
+        ('test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"', "canonical shell repository guard"),
+        ('test "$CANONICAL_REPOSITORY" = "StrayForest/old_sparky"', "canonical expression repository guard"),
+        ('test "$GITHUB_API_URL" = "https://api.github.com"', "canonical GitHub API host guard"),
+        ('test "$DISPATCH_SHA" = "$GITHUB_SHA"', "exact dispatch SHA equality guard"),
+        ('--fail-with-body', "fail-closed GitHub ref request"),
+        ('--connect-timeout 5', "bounded GitHub ref connect timeout"),
+        ('--max-time 10', "bounded GitHub ref total timeout"),
+        ('--header "Authorization: Bearer $GH_TOKEN"', "authenticated GitHub ref request"),
+        ('"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/dev"', "canonical dev ref endpoint"),
+        ('payload.get("ref") != "refs/heads/dev"', "parsed dev ref identity"),
+        ('obj.get("type") != "commit"', "parsed commit object type"),
+        ('json.JSONDecodeError', "malformed GitHub ref response rejection"),
+        ('re.fullmatch(r"[0-9a-f]{40}", current_sha)', "current dev SHA format rejection"),
+        ('current_sha != target_sha', "current dev SHA equality"),
+    ):
+        if marker.startswith("test ") or marker in shell_lines:
+            found = marker in shell_lines
+        else:
+            found = marker in resolver_run
+        if not found:
+            issues.append(f"Draft target resolver is missing {description}")
+    if "--retry" in resolver_run:
+        issues.append("Draft current dev ref request must not retry an unsafe provenance read")
+    if "|| true" in resolver_run:
+        issues.append("Draft target resolver must not hide provenance failures with || true")
+    return issues
+
+
+def draft_cloudflare_workflow_issues(workflow_text: str | None = None) -> list[str]:
+    """Keep Draft Cloudflare release authority and request deadlines explicit."""
+
+    if workflow_text is None:
+        if not DRAFT_CLOUDFLARE_WORKFLOW.is_file():
+            return ["platform-draft-cloudflare.yml is missing"]
+        workflow_text = DRAFT_CLOUDFLARE_WORKFLOW.read_text(encoding="utf-8")
+
+    issues: list[str] = []
+    issues.extend(_draft_yaml_contract_issues(workflow_text))
+    expected_timeouts = {
+        "verify-pr": 20,
+        "detect-release": 5,
+        "build-release": 25,
+        "release": 25,
+    }
+    blocks = {
+        job_id: _workflow_job_block(workflow_text, job_id)
+        for job_id in expected_timeouts
+    }
+    jobs_match = re.search(r"^jobs:\n(?P<body>.*)\Z", workflow_text, re.MULTILINE | re.DOTALL)
+    declared_job_ids = (
+        re.findall(r"^  ([A-Za-z0-9_-]+):\n", jobs_match.group("body"), re.MULTILINE)
+        if jobs_match is not None
+        else []
+    )
+    for job_id in declared_job_ids:
+        if job_id in expected_timeouts:
+            continue
+        block = _workflow_job_block(workflow_text, job_id)
+        matches = re.findall(
+            r"^    timeout-minutes:\s*(\d+)\s*$",
+            block,
+            re.MULTILINE,
+        )
+        if len(matches) != 1 or not 1 <= int(matches[0]) <= 60:
+            issues.append(
+                f"platform-draft-cloudflare.yml {job_id} must declare one reasonable "
+                "timeout-minutes budget"
+            )
+    for job_id, expected_minutes in expected_timeouts.items():
+        block = blocks[job_id]
+        if not block:
+            issues.append(f"platform-draft-cloudflare.yml is missing job {job_id}")
+            continue
+        matches = re.findall(
+            r"^    timeout-minutes:\s*(\d+)\s*$",
+            block,
+            re.MULTILINE,
+        )
+        if len(matches) != 1:
+            issues.append(
+                f"platform-draft-cloudflare.yml {job_id} must declare exactly one timeout-minutes"
+            )
+        elif int(matches[0]) != expected_minutes:
+            issues.append(
+                f"platform-draft-cloudflare.yml {job_id} timeout must be "
+                f"{expected_minutes} minutes"
+            )
+
+    detect = blocks["detect-release"]
+    if not detect:
+        return issues
+    if "  workflow_dispatch:" not in workflow_text:
+        issues.append("Draft Cloudflare workflow must declare workflow_dispatch")
+
+    steps = _workflow_step_blocks(detect)
+    resolve_indexes = [
+        index
+        for index, step in enumerate(steps)
+        if re.search(r"^      - name: Resolve and verify immutable release target\s*$", step, re.MULTILINE)
+    ]
+    checkout_indexes = [
+        index
+        for index, step in enumerate(steps)
+        if re.search(r"^\s*-\s*uses:\s*actions/checkout@", step, re.MULTILINE)
+    ]
+    if len(resolve_indexes) != 1:
+        issues.append("Draft Cloudflare detect job must have one immutable target resolver")
+    if len(checkout_indexes) != 1:
+        issues.append("Draft Cloudflare detect job must have one checkout step")
+    if len(resolve_indexes) == 1 and len(checkout_indexes) == 1:
+        resolve_index = resolve_indexes[0]
+        checkout_index = checkout_indexes[0]
+        if resolve_index != 0:
+            issues.append("Draft target resolver must be the first detect job step")
+        if resolve_index >= checkout_index:
+            issues.append("Draft target resolver must run before checkout")
+        resolve_step = steps[resolve_index]
+        for marker, description in (
+            ("DISPATCH_REF: ${{ github.ref }}", "dispatch ref expression"),
+            ("DISPATCH_SHA: ${{ github.sha }}", "dispatch SHA expression"),
+            ("WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}", "workflow_run branch expression"),
+            ("WORKFLOW_TARGET_SHA: ${{ github.event.workflow_run.head_sha }}", "workflow_run SHA expression"),
+            ('test "$DISPATCH_REF" = "refs/heads/dev"', "dev-only dispatch guard"),
+            ('test "$DISPATCH_SHA" = "$GITHUB_SHA"', "exact github.sha dispatch guard"),
+            ('[[ "$DISPATCH_SHA" =~ ^[0-9a-f]{40}$ ]]', "dispatch SHA format guard"),
+            ('[[ "$WORKFLOW_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]', "workflow_run SHA format guard"),
+        ):
+            if marker not in resolve_step:
+                issues.append(f"Draft target resolver is missing {description}")
+        checkout_step = steps[checkout_index]
+        if not re.search(
+            r"^\s+ref:\s*\$\{\{\s*steps\.resolve-target\.outputs\.target_sha\s*\}\}\s*$",
+            checkout_step,
+            re.MULTILINE,
+        ):
+            issues.append("Draft checkout must use the resolved immutable target SHA")
+    if re.search(r"\|\|\s*['\"]?dev['\"]?", detect) or re.search(
+        r"^\s*ref:\s*dev\s*$", detect, re.MULTILINE
+    ):
+        issues.append("Draft dispatch must not fall back to floating dev checkout")
+    if "target_sha=\"${WORKFLOW_TARGET_SHA:-" in detect:
+        issues.append("Draft path detection must not resolve a target from the checked-out HEAD")
+
+    target_check_indexes = [
+        index
+        for index, step in enumerate(steps)
+        if re.search(r"^      - name: Verify checked-out release target\s*$", step, re.MULTILINE)
+    ]
+    if len(target_check_indexes) != 1:
+        issues.append("Draft detect job must verify the checked-out target SHA")
+    elif len(resolve_indexes) == 1 and len(checkout_indexes) == 1:
+        target_check = steps[target_check_indexes[0]]
+        if target_check_indexes[0] <= checkout_indexes[0]:
+            issues.append("Draft checked-out target verification must run after checkout")
+        for marker in ('TARGET_SHA: ${{ steps.resolve-target.outputs.target_sha }}', 'git rev-parse HEAD', '"$TARGET_SHA"'):
+            if marker not in target_check:
+                issues.append(f"Draft checked-out target verification is missing {marker}")
+
+    path_steps = [
+        step
+        for step in steps
+        if re.search(r"^      - name: Detect Draft-related changes\s*$", step, re.MULTILINE)
+    ]
+    if len(path_steps) != 1:
+        issues.append("Draft detect job must have one path-detection step")
+    else:
+        path_step = path_steps[0]
+        for marker, description in (
+            ("TARGET_SHA: ${{ steps.resolve-target.outputs.target_sha }}", "resolved target output"),
+            ('target_sha="$TARGET_SHA"', "resolved target input"),
+        ):
+            if marker not in path_step:
+                issues.append(f"Draft path detection is missing {description}")
+        if "git rev-parse HEAD" in path_step:
+            issues.append("Draft path detection must not derive its target from HEAD")
+
+    release = blocks["release"]
+    smoke_steps = [
+        step
+        for step in _workflow_step_blocks(release)
+        if re.search(
+            r"^      - name: Smoke-check Draft page, assets, CDN and room creation\s*$",
+            step,
+            re.MULTILINE,
+        )
+    ]
+    if len(smoke_steps) != 1:
+        issues.append("Draft release job must have one release smoke step")
+        return issues
+
+    smoke = smoke_steps[0]
+    curl_commands: list[str] = []
+    lines = smoke.splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if "$(curl" not in line:
+            index += 1
+            continue
+        command = line
+        while line.rstrip().endswith("\\") and index + 1 < len(lines):
+            index += 1
+            line = lines[index]
+            command += line
+        curl_commands.append(command)
+        index += 1
+    if len(curl_commands) != 2:
+        issues.append(
+            "Draft release smoke must contain exactly two bounded curl request commands"
+        )
+    for option in ("--connect-timeout 5", "--max-time 15"):
+        if any(option not in command for command in curl_commands):
+            issues.append(f"Every Draft release smoke curl must set {option}")
+    if any(re.search(r"\|\|\s*true", command) for command in curl_commands):
+        issues.append("Draft release smoke curl failures must not be hidden with || true")
+    for marker, description in (
+        ("local max_attempts=10", "bounded retry count"),
+        ("local retry_delay_seconds=2", "bounded retry delay"),
+        ('for attempt in $(seq 1 "$max_attempts")', "bounded retry loop"),
+        ('sleep "$retry_delay_seconds"', "bounded retry sleep"),
+    ):
+        if marker not in smoke:
+            issues.append(f"Draft release smoke is missing {description}")
+    if "--retry" in smoke:
+        issues.append("Draft release smoke must use only the visible bounded retry loop")
+    return issues
 
 
 def host_tools_candidate_artifact_zip_curl_blocks(workflow_text: str) -> tuple[str, ...]:
@@ -1679,6 +2057,7 @@ def collect_issues() -> list[str]:
                     workflow_text,
                 )
             )
+    issues.extend(draft_cloudflare_workflow_issues())
     issues.extend(host_tools_candidate_workflow_issues())
 
     if not SECURITY_WORKFLOW.is_file():

@@ -427,6 +427,25 @@ implementation provenance. Manual commit statuses are published only for
 `push` and `workflow_dispatch`, and target `TESTED_SHA`. A local pass is
 neither necessary nor sufficient for deployment.
 
+The standalone `platform-draft-cloudflare.yml` workflow is a separate
+pre-release/manual contour. Its `workflow_dispatch` route is accepted only
+from `refs/heads/dev`; it resolves `github.sha` before checkout and checks out
+that exact immutable SHA. A dispatch from another ref fails before checkout,
+while the `workflow_run` route accepts only a successful completed `dev` push
+from the canonical `StrayForest/old_sparky` repository, whose exact source workflow ID, name and path
+are `339062797`, `Platform security and build` and
+`.github/workflows/platform-security.yml`; its exact lower-case `head_sha` is
+validated before checkout. Before either release route can check out source,
+the read-only GitHub API must return the immutable commit at
+`refs/heads/dev`, and it must equal the selected target SHA; missing, malformed,
+stale or failed API responses stop the contour. Manual dispatch and
+`workflow_run` resolve the same immutable target-SHA concurrency key, and an
+active release is never cancelled by a newer run for that SHA. Build and
+publication require successful upstream job results rather than an
+`always()` override. Every job and every release-smoke request has an explicit
+deadline, and smoke retries are finite and visible rather than hidden in `curl`
+failure handling. This contour is not the production VPS release authority.
+
 The auto-deploy and production-deploy provenance gates read the exact
 commit's paginated raw status rows through GitHub's [list commit statuses
 endpoint](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference).

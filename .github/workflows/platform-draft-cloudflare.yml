@@ -19,14 +19,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: platform-draft-cloudflare-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
-  cancel-in-progress: true
+  group: platform-draft-cloudflare-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
 
 jobs:
   verify-pr:
     name: Draft static and state checks
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -68,30 +69,114 @@ jobs:
     name: Detect Draft release
     if: >-
       ${{
-        github.event_name == 'workflow_dispatch' ||
+        github.repository == 'StrayForest/old_sparky' &&
+        (github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.status == 'completed' &&
          github.event.workflow_run.conclusion == 'success' &&
          github.event.workflow_run.event == 'push' &&
-         github.event.workflow_run.head_branch == 'dev')
+         github.event.workflow_run.head_branch == 'dev' &&
+         github.event.workflow_run.repository.full_name == 'StrayForest/old_sparky' &&
+         github.event.workflow_run.head_repository.full_name == 'StrayForest/old_sparky' &&
+         github.event.workflow_run.workflow_id == 339062797 &&
+         github.event.workflow_run.name == 'Platform security and build' &&
+         github.event.workflow_run.path == '.github/workflows/platform-security.yml' &&
+         github.event.workflow_run.head_sha != ''))
       }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       changed: ${{ steps.paths.outputs.changed }}
       target_sha: ${{ steps.paths.outputs.target_sha }}
     steps:
+      - name: Resolve and verify immutable release target
+        id: resolve-target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANONICAL_REPOSITORY: ${{ github.repository }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$CANONICAL_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_API_URL" = "https://api.github.com"
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch)
+              test "$DISPATCH_REF" = "refs/heads/dev"
+              test "$DISPATCH_SHA" = "$GITHUB_SHA"
+              [[ "$DISPATCH_SHA" =~ ^[0-9a-f]{40}$ ]]
+              target_sha="$DISPATCH_SHA"
+              ;;
+            workflow_run)
+              test "$WORKFLOW_HEAD_BRANCH" = "dev"
+              [[ "$WORKFLOW_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+              target_sha="$WORKFLOW_TARGET_SHA"
+              ;;
+            *)
+              echo "Unsupported release trigger: $GITHUB_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          current_dev_ref="$RUNNER_TEMP/platform-draft-current-dev-ref.json"
+          trap 'rm -f -- "$current_dev_ref"' EXIT
+          curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 10 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/dev" \
+            --output "$current_dev_ref"
+          /usr/bin/python3 - "$current_dev_ref" "$target_sha" "$CANONICAL_REPOSITORY" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          ref_path, target_sha, repository = sys.argv[1:]
+          if repository != "StrayForest/old_sparky":
+              raise SystemExit("canonical repository is invalid")
+          try:
+              payload = json.loads(Path(ref_path).read_text(encoding="utf-8"))
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+              raise SystemExit("current dev ref response is not valid JSON") from exc
+          if not isinstance(payload, dict) or payload.get("ref") != "refs/heads/dev":
+              raise SystemExit("current dev ref response is malformed")
+          obj = payload.get("object")
+          if not isinstance(obj, dict) or obj.get("type") != "commit":
+              raise SystemExit("current dev ref is not an immutable commit")
+          current_sha = obj.get("sha")
+          if not isinstance(current_sha, str) or re.fullmatch(r"[0-9a-f]{40}", current_sha) is None:
+              raise SystemExit("current dev commit SHA is malformed")
+          if current_sha != target_sha:
+              raise SystemExit("target SHA is not current dev")
+          PY
+          printf 'target_sha=%s\n' "$target_sha" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'dev' }}
+          ref: ${{ steps.resolve-target.outputs.target_sha }}
           fetch-depth: 2
           persist-credentials: false
+      - name: Verify checked-out release target
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.resolve-target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
       - name: Detect Draft-related changes
         id: paths
         shell: bash
         env:
-          WORKFLOW_TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
+          TARGET_SHA: ${{ steps.resolve-target.outputs.target_sha }}
         run: |
           set -euo pipefail
-          target_sha="${WORKFLOW_TARGET_SHA:-$(git rev-parse HEAD)}"
+          target_sha="$TARGET_SHA"
           echo "target_sha=${target_sha}" >> "$GITHUB_OUTPUT"
 
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
@@ -114,7 +199,7 @@ jobs:
 
   build-release:
     name: Build digest-bound Draft bundle without Cloudflare credentials
-    if: ${{ needs.detect-release.outputs.changed == 'true' }}
+    if: ${{ needs.detect-release.result == 'success' && needs.detect-release.outputs.changed == 'true' }}
     needs: [detect-release]
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -266,7 +351,12 @@ jobs:
 
   release:
     name: Publish Draft edge runtime
-    if: ${{ needs.detect-release.outputs.changed == 'true' }}
+    if: >-
+      ${{
+        needs.detect-release.result == 'success' &&
+        needs.detect-release.outputs.changed == 'true' &&
+        needs.build-release.result == 'success'
+      }}
     needs: [detect-release, build-release]
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -471,13 +561,22 @@ jobs:
             local output="$3"
             local headers="${output}.headers"
             local status=""
-            for attempt in $(seq 1 10); do
-              status="$(curl --silent --show-error --output "$output" --dump-header "$headers" --write-out '%{http_code}' "$url" || true)"
+            local max_attempts=10
+            local retry_delay_seconds=2
+            for attempt in $(seq 1 "$max_attempts"); do
+              if status="$(curl --silent --show-error --connect-timeout 5 --max-time 15 --output "$output" --dump-header "$headers" --write-out '%{http_code}' "$url")"; then
+                :
+              else
+                status=""
+                echo "${name}: curl request failed (attempt ${attempt})" >&2
+              fi
               echo "${name}: HTTP ${status} (attempt ${attempt})"
               if [[ "$status" == "200" ]]; then
                 return 0
               fi
-              sleep 2
+              if [[ "$attempt" -lt "$max_attempts" ]]; then
+                sleep "$retry_delay_seconds"
+              fi
             done
             echo "${name} failed with HTTP ${status}" >&2
             cat "$headers" >&2 || true
@@ -538,14 +637,20 @@ jobs:
           get_200 "Hero CDN" "https://cdn.old-sparky.com/draft/heroes/v1/abrams.webp" /tmp/abrams.webp
           test -s /tmp/abrams.webp
 
-          room_status="$(curl --silent --show-error \
+          room_status=""
+          if room_status="$(curl --silent --show-error \
+            --connect-timeout 5 --max-time 15 \
             --output /tmp/draft-room.json \
             --write-out '%{http_code}' \
             --request POST \
             --header 'Origin: https://old-sparky.com' \
             --header 'Content-Type: application/json' \
             --data '{"presetId":"6v6-no-bans","timerSeconds":30}' \
-            https://old-sparky.com/draft/api/rooms || true)"
+            https://old-sparky.com/draft/api/rooms)"; then
+            :
+          else
+            echo "Draft room create curl failed" >&2
+          fi
           echo "Draft room create: HTTP ${room_status}"
           test "$room_status" = "201"
           python - <<'PY'
