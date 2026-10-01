@@ -6,11 +6,13 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import unittest
+import time
 from pathlib import Path
 import tempfile
 import textwrap
@@ -62,6 +64,18 @@ from tools.platform_verification_lock import (
     default_lock_path,
     provision_verification_lock,
     verification_resource_lock,
+)
+from tests import subprocess_containment as containment
+from tests.subprocess_containment import (
+    BoundedChild,
+    ChildTimeoutError,
+    _ProcRecord,
+    _ProcObservation,
+    _ProcSnapshot,
+    _PROC_UNKNOWN,
+    _ReadyScanner,
+    _SpawnDeadlineAlarm,
+    run_bounded,
 )
 from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
@@ -560,22 +574,14 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 return
             holder_code = """
 from pathlib import Path
+import os
 import sys
 import tools.platform_verification_lock as lock
 lock.LOCK_PATH = Path(sys.argv[1])
 with lock.verification_resource_lock("backend-integration"):
     print("ready", flush=True)
-    sys.stdin.readline()
+    os.read(0, 1)
 """
-            holder = subprocess.Popen(
-                [sys.executable, "-c", holder_code, str(lock_path)],
-                cwd=Path(__file__).resolve().parents[1],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            self.assertEqual(holder.stdout.readline().strip(), "ready")
             contender_code = """
 from pathlib import Path
 import sys
@@ -588,24 +594,34 @@ except lock.VerificationLockError as exc:
     print(exc)
     raise SystemExit(75)
 """
-            contender = subprocess.run(
-                [sys.executable, "-c", contender_code, str(lock_path)],
+            with BoundedChild(
+                [sys.executable, "-c", holder_code, str(lock_path)],
                 cwd=Path(__file__).resolve().parents[1],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(contender.returncode, 75, contender.stderr)
-            self.assertIn("contention", contender.stdout)
-            assert holder.stdin is not None
-            holder.stdin.write("release\n")
-            holder.stdin.close()
-            holder.wait(timeout=5)
-            stdout = holder.stdout.read()
-            stderr = holder.stderr.read()
-            holder.stdout.close()
-            holder.stderr.close()
-            self.assertEqual(holder.returncode, 0, stderr or stdout)
+                stdin_mode="pipe",
+                ready_marker="ready",
+                deadline_seconds=10,
+            ) as holder:
+                self.assertEqual(holder.wait_for_ready(), "ready")
+                # The parent already owns the test-only supervisor lifecycle
+                # lock for the holder.  Launch this short-lived contender
+                # directly so the non-reentrant helper is never nested.
+                contender = subprocess.run(
+                    [sys.executable, "-c", contender_code, str(lock_path)],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(contender.returncode, 75, contender.stderr)
+                self.assertIn("contention", contender.stdout)
+                holder.send_line("release")
+                completed = holder.wait()
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr or completed.stdout,
+                )
             self.assertEqual(lock_path.read_text(encoding="utf-8"), "")
 
     def test_shared_resource_lock_rejects_wrong_mode_and_symlink(self) -> None:
@@ -661,36 +677,15 @@ except lock.VerificationLockError as exc:
             )
             holder_code = """
 from pathlib import Path
+import os
 import sys
 import tools.platform_verification_lock as lock
 lock.LOCK_PATH = Path(sys.argv[1])
 with lock.verification_resource_lock("backend-integration"):
     info = lock.os.stat(lock.LOCK_PATH, follow_symlinks=False)
     print(f"ready:{info.st_dev}:{info.st_ino}", flush=True)
-    sys.stdin.readline()
+    os.read(0, 1)
 """
-            holder = subprocess.Popen(
-                [
-                    shutil.which("runuser") or "/usr/bin/runuser",
-                    "-u",
-                    "nobody",
-                    "--",
-                    "/usr/bin/python3",
-                    "-c",
-                    holder_code,
-                    str(lock_path),
-                ],
-                cwd=module_dir,
-                env={"PYTHONPATH": str(module_dir), "PATH": os.environ.get("PATH", "")},
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            assert holder.stdout is not None
-            ready = holder.stdout.readline().strip()
-            self.assertTrue(ready.startswith("ready:"), ready)
-            _tag, holder_device, holder_inode = ready.split(":")
             contender_code = """
 from pathlib import Path
 import sys
@@ -703,32 +698,492 @@ except lock.VerificationLockError as exc:
     print(exc)
     raise SystemExit(75)
 """
-            contender = subprocess.run(
+            with BoundedChild(
                 [
-                    sys.executable,
+                    shutil.which("runuser") or "/usr/bin/runuser",
+                    "-u",
+                    "nobody",
+                    "--",
+                    "/usr/bin/python3",
                     "-c",
-                    contender_code,
+                    holder_code,
                     str(lock_path),
                 ],
                 cwd=module_dir,
                 env={"PYTHONPATH": str(module_dir), "PATH": os.environ.get("PATH", "")},
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(contender.returncode, 75, contender.stderr)
-            self.assertIn("contention", contender.stdout)
-            assert holder.stdin is not None
-            holder.stdin.write("release\n")
-            holder.stdin.close()
-            holder.wait(timeout=5)
-            holder_stderr = holder.stderr.read()
-            holder.stdout.close()
-            holder.stderr.close()
-            self.assertEqual(holder.returncode, 0, holder_stderr)
+                stdin_mode="pipe",
+                ready_marker="ready:",
+                deadline_seconds=10,
+            ) as holder:
+                ready = holder.wait_for_ready()
+                self.assertTrue(ready.startswith("ready:"), ready)
+                _tag, holder_device, holder_inode = ready.split(":")
+                # See the sibling lock test: only the holder needs the
+                # containment supervisor while it owns the shared lock.
+                contender = subprocess.run(
+                    [sys.executable, "-c", contender_code, str(lock_path)],
+                    cwd=module_dir,
+                    env={"PYTHONPATH": str(module_dir), "PATH": os.environ.get("PATH", "")},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(contender.returncode, 75, contender.stderr)
+                self.assertIn("contention", contender.stdout)
+                holder.send_line("release")
+                completed = holder.wait()
+                self.assertEqual(completed.returncode, 0, completed.stderr)
             current = os.stat(lock_path)
             self.assertEqual(int(holder_device), current.st_dev)
             self.assertEqual(int(holder_inode), current.st_ino)
+
+    def test_bounded_child_contains_hostile_groups_and_caps_diagnostics(self) -> None:
+        """Every hostile lock-holder shape gets a finite, proven cleanup."""
+
+        hostile = {
+            "never-ready": "import os; os.read(0, 1)",
+            "stderr-flood": (
+                "import os, sys; "
+                "[os.write(2, b'x' * 65536) for _ in range(16)]; "
+                "os.read(0, 1)"
+            ),
+            "fork-descendant": (
+                "import os; "
+                "os.read(0, 1) if os.fork() == 0 else os.read(0, 1)"
+            ),
+            "term-ignore": (
+                "import os, signal; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); os.read(0, 1)"
+            ),
+            "detached-term-ignore": (
+                "import os, signal; "
+                "(os.setsid(), signal.signal(signal.SIGTERM, signal.SIG_IGN), "
+                "os.read(0, 1)) if os.fork() == 0 else os.read(0, 1)"
+            ),
+            "double-fork-detached-term-ignore": (
+                "import os, signal\n"
+                "if os.fork() == 0:\n"
+                "    os.setsid()\n"
+                "    if os.fork() == 0:\n"
+                "        signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "        os.read(0, 1)\n"
+                "    os._exit(0)\n"
+                "os.read(0, 1)\n"
+            ),
+        }
+        for name, code in hostile.items():
+            with self.subTest(hostile=name):
+                child = None
+                with self.assertRaises(ChildTimeoutError) as raised:
+                    with BoundedChild(
+                        [sys.executable, "-c", code],
+                        deadline_seconds=0.2,
+                        stdin_mode="pipe",
+                        ready_marker="ready",
+                        diagnostic_bytes=4096,
+                    ) as active:
+                        child = active
+                        active.wait_for_ready()
+                self.assertIsNotNone(child)
+                assert child is not None
+                self.assertEqual(raised.exception.reason, "timeout")
+                self.assertTrue(raised.exception.cleanup_proven)
+                self.assertTrue(child.cleanup_proven)
+                self.assertNotIn("xxxxxxxxxx", str(raised.exception))
+                if name == "stderr-flood":
+                    self.assertGreaterEqual(raised.exception.diagnostics.stderr_bytes, 4096)
+                    self.assertTrue(raised.exception.diagnostics.stderr_truncated)
+
+        # A ready token is a complete line prefix, not a substring, and the
+        # parser retains a marker split across pipe reads.
+        scanner = _ReadyScanner(b"ready")
+        self.assertIsNone(scanner.feed(b"notready\n"))
+        self.assertIsNone(scanner.feed(b"re"))
+        self.assertEqual(scanner.feed(b"ady\n"), "ready")
+
+        # The spawn file-actions allow-list closes unrelated inheritable FDs.
+        with tempfile.NamedTemporaryFile() as fd_target:
+            extra_fd = os.open(fd_target.name, os.O_RDONLY)
+            try:
+                os.set_inheritable(extra_fd, True)
+                fd_probe = run_bounded(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os; p='/proc/self/fd/%s'; print(os.path.exists(p) and os.path.samefile(p, %r), flush=True)"
+                            % (extra_fd, fd_target.name)
+                        ),
+                    ],
+                    capture_output=True,
+                    deadline_seconds=2,
+                )
+                self.assertEqual(fd_probe.stdout.strip(), "False")
+            finally:
+                os.close(extra_fd)
+
+        # A reused/unverified PGID must never be signalled by numeric value.
+        with BoundedChild(
+            [sys.executable, "-c", "import os; print('ready', flush=True); os.read(0, 1)"],
+            deadline_seconds=2,
+            stdin_mode="pipe",
+            ready_marker="ready",
+        ) as active:
+            self.assertEqual(active.wait_for_ready(), "ready")
+            with patch.object(active, "_leader_identity_matches", return_value=False), patch(
+                "tests.subprocess_containment.os.killpg"
+            ) as killpg:
+                self.assertFalse(active._signal_group(signal.SIGTERM))
+                killpg.assert_not_called()
+            active.send_line("release")
+            self.assertEqual(active.wait().returncode, 0)
+
+        # A direct child that existed before the supervisor is foreign and
+        # must remain alive; the subreaper cannot use broad process killing.
+        foreign_read, foreign_write = os.pipe()
+        foreign_pid = os.fork()
+        if foreign_pid == 0:
+            os.close(foreign_write)
+            os.read(foreign_read, 1)
+            os._exit(0)
+        os.close(foreign_read)
+        try:
+            with self.assertRaises(ChildTimeoutError):
+                with BoundedChild(
+                    [sys.executable, "-c", "import os; os.read(0, 1)"],
+                    deadline_seconds=0.35,
+                    stdin_mode="pipe",
+                    ready_marker="ready",
+                ) as active:
+                    active.wait_for_ready()
+            self.assertEqual(os.waitpid(foreign_pid, os.WNOHANG), (0, 0))
+        finally:
+            try:
+                os.kill(foreign_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.close(foreign_write)
+            os.waitpid(foreign_pid, 0)
+
+        # Permission, I/O, parse and disappearance races are all unknown
+        # observations, never evidence that a live descendant is absent.
+        descendant_code = (
+            "import os; "
+            "print('ready', flush=True); "
+            "os.fork(); "
+            "os.read(0, 1)"
+        )
+        with BoundedChild(
+            [sys.executable, "-c", descendant_code],
+            deadline_seconds=2,
+            stdin_mode="pipe",
+            ready_marker="ready",
+        ) as active:
+            self.assertEqual(active.wait_for_ready(), "ready")
+            active._discover_descendants()
+            descendant_pids = [
+                pid for pid in active._tracked if pid != active._leader_pid
+            ]
+            self.assertTrue(descendant_pids)
+            target_pid = descendant_pids[0]
+            original_read = containment._read_proc_record
+            for reason in ("permission", "io", "parse", "disappeared"):
+                with self.subTest(procfs_reason=reason):
+                    def uncertain_read(
+                        pid: int,
+                        *,
+                        _reason: str = reason,
+                    ) -> _ProcObservation:
+                        if pid == target_pid:
+                            return _ProcObservation(_PROC_UNKNOWN, reason=_reason)
+                        return original_read(pid)
+
+                    with patch.object(
+                        containment,
+                        "_read_proc_record",
+                        side_effect=uncertain_read,
+                    ):
+                        self.assertFalse(active._proof())
+                    active._procfs_unknown.clear()
+            with (
+                patch.object(containment.os, "pidfd_open", return_value=None),
+                patch.object(containment.signal, "pidfd_send_signal", None),
+                patch.object(containment.os, "kill") as numeric_kill,
+            ):
+                self.assertFalse(
+                    active._signal_identity(
+                        active._tracked[target_pid],
+                        signal.SIGTERM,
+                    )
+                )
+                numeric_kill.assert_not_called()
+            self.assertTrue(active._signal_unproven)
+            active._signal_unproven = False
+            active.send_line("release")
+            self.assertEqual(active.wait().returncode, 0)
+
+        # A procfs entry which appears after the previous adoption scan but
+        # cannot be read is sticky ambiguity, not evidence of absence.  A
+        # disappearing entry is the one positive absence race which remains
+        # safe to ignore.
+        with BoundedChild(
+            [sys.executable, "-c", "import os; print('ready', flush=True); os.read(0, 1)"],
+            deadline_seconds=1,
+            stdin_mode="pipe",
+            ready_marker="ready",
+        ) as active:
+            self.assertEqual(active.wait_for_ready(), "ready")
+            late_pid = 2**30 + 17
+            late_snapshot = _ProcSnapshot(
+                {},
+                frozenset({late_pid}),
+                unknown_reasons={late_pid: "PermissionError"},
+            )
+            with patch.object(containment, "_proc_snapshot", return_value=late_snapshot):
+                self.assertFalse(active._proof())
+            self.assertIn(late_pid, active._procfs_unknown)
+            active._procfs_unknown.clear()
+            active.send_line("release")
+            self.assertEqual(active.wait().returncode, 0)
+
+        # An unreadable ownership token on a newly adopted direct child is
+        # likewise unclaimable.  The supervisor must not signal by PID or
+        # later claim that its tree was proven clean.
+        with BoundedChild(
+            [sys.executable, "-c", "import os; print('ready', flush=True); os.read(0, 1)"],
+            deadline_seconds=1,
+            stdin_mode="pipe",
+            ready_marker="ready",
+        ) as active:
+            self.assertEqual(active.wait_for_ready(), "ready")
+            candidate_pid = 2**30 + 19
+            candidate = _ProcRecord(
+                pid=candidate_pid,
+                ppid=os.getpid(),
+                pgrp=candidate_pid,
+                session=candidate_pid,
+                start_time_ticks=1,
+                state="S",
+            )
+            candidate_snapshot = _ProcSnapshot(
+                {candidate_pid: candidate},
+                frozenset(),
+            )
+            with (
+                patch.object(containment, "_proc_snapshot", return_value=candidate_snapshot),
+                patch.object(active, "_proc_has_ownership_token", return_value=None),
+            ):
+                self.assertFalse(active._proof())
+            self.assertIn(candidate_pid, active._procfs_unknown)
+            active._procfs_unknown.clear()
+            active.send_line("release")
+            self.assertEqual(active.wait().returncode, 0)
+
+    def test_bounded_child_reaps_on_base_exception_and_contender_timeout(self) -> None:
+        """Assertions and a hanging contender cannot leave a lock holder behind."""
+
+        child = None
+        with self.assertRaises(KeyboardInterrupt):
+            with BoundedChild(
+                [sys.executable, "-c", "import os; os.read(0, 1)"],
+                deadline_seconds=2,
+                stdin_mode="pipe",
+            ) as active:
+                child = active
+                raise KeyboardInterrupt
+        self.assertIsNotNone(child)
+        assert child is not None
+        self.assertTrue(child.cleanup_proven)
+
+        # The non-reentrant lifecycle lock rejects same-thread nesting before
+        # a second supervisor can own subreaper or SIGALRM state.
+        with BoundedChild(
+            [sys.executable, "-c", "import os; os.read(0, 1)"],
+            deadline_seconds=1,
+            stdin_mode="pipe",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "nested bounded child"):
+                BoundedChild(
+                    [sys.executable, "-c", "raise SystemExit(99)"],
+                    deadline_seconds=0.2,
+                ).__enter__()
+
+        with self.assertRaises(ChildTimeoutError) as raised:
+            run_bounded(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os, signal; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); os.read(0, 1)",
+                ],
+                deadline_seconds=0.35,
+                stdin_mode="pipe",
+                capture_output=True,
+            )
+        self.assertEqual(raised.exception.reason, "timeout")
+        self.assertTrue(raised.exception.cleanup_proven)
+
+        # Lock contention consumes the same absolute budget and must refuse
+        # before subreaper setup or spawn when no budget remains.
+        class NeverAcquiredLock:
+            def __init__(self) -> None:
+                self.timeout: float | None = None
+
+            def acquire(self, *, timeout: float) -> bool:
+                self.timeout = timeout
+                return False
+
+            def release(self) -> None:
+                raise AssertionError("the unacquired lifecycle lock was released")
+
+        lifecycle_lock = NeverAcquiredLock()
+        with (
+            patch.object(containment, "_LIFECYCLE_LOCK", lifecycle_lock),
+            patch.object(containment.BoundedChild, "_spawn") as spawn,
+        ):
+            with self.assertRaises(ChildTimeoutError):
+                BoundedChild(
+                    [sys.executable, "-c", "raise SystemExit(99)"],
+                    deadline_seconds=0.2,
+                ).__enter__()
+        self.assertIsNotNone(lifecycle_lock.timeout)
+        assert lifecycle_lock.timeout is not None
+        self.assertGreater(lifecycle_lock.timeout, 0.0)
+        self.assertLessEqual(lifecycle_lock.timeout, 0.2)
+        spawn.assert_not_called()
+
+        # If setting subreaper state mutates and then raises, the raw prior
+        # value is still available to the unconditional restoration path.
+        subreaper_state = 0
+        set_calls: list[int] = []
+
+        def get_subreaper() -> int:
+            return subreaper_state
+
+        def set_subreaper(value: int) -> None:
+            nonlocal subreaper_state
+            set_calls.append(value)
+            subreaper_state = value
+            if len(set_calls) == 1:
+                raise RuntimeError("set mutated before raising")
+
+        with (
+            patch.object(containment, "_get_subreaper", side_effect=get_subreaper),
+            patch.object(containment, "_set_subreaper", side_effect=set_subreaper),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "mutated"):
+                BoundedChild(
+                    [sys.executable, "-c", "raise SystemExit(99)"],
+                    deadline_seconds=1,
+                ).__enter__()
+        self.assertEqual(set_calls, [1, 0])
+        self.assertEqual(subreaper_state, 0)
+
+        # SIGALRM and its prior timer/handler are restored around both a
+        # delayed pre-spawn call and a child-created-then-interrupted call.
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+
+        def marker(_signum: int, _frame: object) -> None:
+            return None
+
+        real_spawn = containment.os.posix_spawnp
+        try:
+            signal.signal(signal.SIGALRM, marker)
+            signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
+
+            def delayed_spawn(*args: object, **kwargs: object) -> int:
+                time.sleep(2.0)
+                return real_spawn(*args, **kwargs)
+
+            with patch.object(containment.os, "posix_spawnp", side_effect=delayed_spawn):
+                with self.assertRaises(ChildTimeoutError):
+                    BoundedChild(
+                        [sys.executable, "-c", "raise SystemExit(99)"],
+                        deadline_seconds=0.4,
+                    ).__enter__()
+            self.assertIs(signal.getsignal(signal.SIGALRM), marker)
+            self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+            spawned_pids: list[int] = []
+
+            def spawn_then_delay(*args: object, **kwargs: object) -> int:
+                pid = real_spawn(*args, **kwargs)
+                spawned_pids.append(pid)
+                time.sleep(2.0)
+                return pid
+
+            interrupted_child = BoundedChild(
+                [sys.executable, "-c", "import os; os.read(0, 1)"],
+                deadline_seconds=0.8,
+                stdin_mode="pipe",
+            )
+            with patch.object(
+                containment.os,
+                "posix_spawnp",
+                side_effect=spawn_then_delay,
+            ):
+                with self.assertRaises(ChildTimeoutError):
+                    interrupted_child.__enter__()
+            self.assertTrue(interrupted_child.cleanup_proven)
+            self.assertEqual(len(spawned_pids), 1)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+        # Timer restoration is phase-preserving.  These deterministic checks
+        # avoid sleeping while covering one-shot, crossed-deadline and
+        # periodic prior timers (including their exact final interval).
+        sentinel_handler = object()
+        clock = [100.0]
+        timer_calls: list[tuple[object, float, float]] = []
+
+        def fake_setitimer(which: object, delay: float, interval: float = 0.0) -> None:
+            timer_calls.append((which, delay, interval))
+
+        with (
+            patch.object(containment.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(containment.signal, "getsignal", return_value=sentinel_handler),
+            patch.object(containment.signal, "getitimer", return_value=(1.0, 0.0)),
+            patch.object(containment.signal, "signal"),
+            patch.object(containment.signal, "setitimer", side_effect=fake_setitimer),
+        ):
+            with _SpawnDeadlineAlarm(0.5):
+                clock[0] = 100.25
+        self.assertEqual(timer_calls[0], (signal.ITIMER_REAL, 0.5, 0.0))
+        self.assertEqual(timer_calls[1], (signal.ITIMER_REAL, 0.0, 0.0))
+        self.assertAlmostEqual(timer_calls[2][1], 0.75, delta=0.001)
+        self.assertEqual(timer_calls[2][2], 0.0)
+
+        timer_calls.clear()
+        clock[:] = [200.0]
+        with (
+            patch.object(containment.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(containment.signal, "getsignal", return_value=sentinel_handler),
+            patch.object(containment.signal, "getitimer", return_value=(0.2, 0.0)),
+            patch.object(containment.signal, "signal"),
+            patch.object(containment.signal, "setitimer", side_effect=fake_setitimer),
+        ):
+            with _SpawnDeadlineAlarm(0.5):
+                clock[0] = 200.5
+        self.assertGreaterEqual(timer_calls[2][1], _SpawnDeadlineAlarm._TIMER_EPSILON_SECONDS)
+        self.assertEqual(timer_calls[2][2], 0.0)
+
+        timer_calls.clear()
+        clock[:] = [300.0]
+        with (
+            patch.object(containment.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(containment.signal, "getsignal", return_value=sentinel_handler),
+            patch.object(containment.signal, "getitimer", return_value=(0.2, 0.1)),
+            patch.object(containment.signal, "signal"),
+            patch.object(containment.signal, "setitimer", side_effect=fake_setitimer),
+        ):
+            with _SpawnDeadlineAlarm(0.5):
+                clock[0] = 300.26
+        self.assertAlmostEqual(timer_calls[2][1], 0.04, delta=0.001)
+        self.assertAlmostEqual(timer_calls[2][2], 0.1, delta=0.000001)
 
     def test_global_lock_fails_closed_on_missing_or_unsafe_parent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
