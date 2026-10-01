@@ -2608,6 +2608,7 @@ cleanup
             "platform_web_runtime_diagnostics_summary.py",
             "platform_storage_evidence_summary.py",
             "platform_media_migration_diagnostics_summary.py",
+            "platform_worker_liveness.py",
         )
         with tempfile.TemporaryDirectory() as temporary:
             fixture = Path(temporary) / "source"

@@ -4770,6 +4770,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "    [[ \"${PATH:-}\" == /usr/sbin:/usr/bin:/sbin:/bin ]]\n"
             "    [[ \"${PYTHONNOUSERSITE:-}\" == 1 && \"${PYTHONDONTWRITEBYTECODE:-}\" == 1 ]]\n"
             "    printf '%s\\n' liveness-probe >> \"$3/shared/.test-worker-liveness.log\"\n"
+            "    printf '%s\\n' '{\"schema\":1,\"kind\":\"platform_worker_liveness\",\"status\":\"passed\",\"checks\":{\"worker_uid\":\"passed\",\"worker_env\":\"passed\",\"release_identity\":\"passed\",\"broker_namespace\":\"passed\",\"result_namespace\":\"passed\",\"task_route\":\"passed\",\"task_result\":\"passed\"},\"backlog\":{\"high\":\"redacted\",\"default\":\"redacted\",\"low\":\"redacted\"},\"cleanup\":\"proven\"}'\n"
             "    ;;\n"
             "esac\n"
         )

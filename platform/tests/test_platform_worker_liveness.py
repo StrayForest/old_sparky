@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import base64
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 import types
 import unittest
 from unittest import mock
@@ -38,39 +43,8 @@ class _FakeResult:
         self.forgotten = True
 
 
-class _FakeRedisClient:
-    def __init__(self, *, present: bool = False) -> None:
-        self.present = present
-        self.exists_calls: list[object] = []
-        self.llen_calls: list[str] = []
-        self.closed = False
-
-    def exists(self, key: object) -> int:
-        self.exists_calls.append(key)
-        return int(self.present)
-
-    def llen(self, queue: str) -> int:
-        self.llen_calls.append(queue)
-        return 0
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _FakeTask:
-    name = liveness.PING_TASK_NAME
-
-    def __init__(self, result: _FakeResult) -> None:
-        self.result = result
-        self.apply_calls: list[dict[str, object]] = []
-
-    def apply_async(self, **kwargs: object) -> _FakeResult:
-        self.apply_calls.append(kwargs)
-        return self.result
-
-
 class _FakeApp:
-    def __init__(self, task: _FakeTask, result: _FakeResult) -> None:
+    def __init__(self, task: object, result: _FakeResult) -> None:
         self.conf = types.SimpleNamespace(
             broker_url="redis://127.0.0.1:6379/13",
             result_backend="redis://127.0.0.1:6379/14",
@@ -88,6 +62,43 @@ class _FakeApp:
         return self._result
 
 
+class _FakeTask:
+    name = liveness.PING_TASK_NAME
+
+    def __init__(self, result: _FakeResult) -> None:
+        self.result = result
+        self.apply_calls: list[dict[str, object]] = []
+
+    def apply_async(self, **kwargs: object) -> _FakeResult:
+        self.apply_calls.append(kwargs)
+        return self.result
+
+
+class _FakeRedisClient:
+    def __init__(self, *, present: bool = False) -> None:
+        self.present = present
+        self.delete_calls: list[object] = []
+        self.exists_calls: list[object] = []
+        self.llen_calls: list[str] = []
+        self.closed = False
+
+    def delete(self, key: object) -> int:
+        self.delete_calls.append(key)
+        self.present = False
+        return 1
+
+    def exists(self, key: object) -> int:
+        self.exists_calls.append(key)
+        return int(self.present)
+
+    def llen(self, queue: str) -> int:
+        self.llen_calls.append(queue)
+        return 0
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _identity(root: Path) -> liveness.RunIdentity:
     release = root / "releases" / "release-a"
     return liveness.RunIdentity(
@@ -100,6 +111,13 @@ def _identity(root: Path) -> liveness.RunIdentity:
 
 class WorkerLivenessHelperTests(unittest.TestCase):
     def test_task_ids_are_bounded_and_unique_under_concurrency(self) -> None:
+        self.assertLessEqual(liveness.MAX_SECONDS, 15.0)
+        self.assertLess(
+            liveness.CHILD_WORK_SECONDS
+            + liveness.CHILD_STOP_GRACE_SECONDS
+            + liveness.CHILD_KILL_GRACE_SECONDS,
+            liveness.MAX_SECONDS,
+        )
         with ThreadPoolExecutor(max_workers=8) as executor:
             task_ids = list(executor.map(lambda _: liveness._new_task_id(), range(128)))
 
@@ -112,9 +130,24 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             "redis://127.0.0.1:6379/13",
             expected_database="13",
         )
+        liveness._redis_namespace(
+            "redis://worker:secret@127.0.0.1:6379/13",
+            expected_database="13",
+            credentials_required=True,
+        )
         for value in (
             "redis://127.0.0.1:6379/12",
+            "rediss://127.0.0.1:6379/13",
+            "REDIS://127.0.0.1:6379/13",
+            "redis://127.0.0.1/13",
+            "redis://127.0.0.1:/13",
+            "redis://127.0.0.1:06379/13",
+            "redis://127.0.0.1:6380/13",
+            "redis://127.0.0.1:abc/13",
+            "redis://127.0.0.1:6379/13?db=0",
+            "redis://127.0.0.1:6379/13#fragment",
             "redis://worker:secret@127.0.0.1:6379/13",
+            "redis://127.0.0.1:6379/13\x01",
             "redis://redis.example.test:6379/13",
             "redis://127.0.0.1:6379/013",
         ):
@@ -166,74 +199,219 @@ class WorkerLivenessHelperTests(unittest.TestCase):
         self.assertNotIn("source_git_commit", rendered)
         self.assertNotIn("b" * 40, rendered)
 
-    def test_roundtrip_uses_fixed_route_no_retry_and_proves_cleanup(self) -> None:
+    def test_child_roundtrip_uses_fixed_route_no_retry_and_forgets(self) -> None:
         result = _FakeResult()
         task = _FakeTask(result)
         app = _FakeApp(task, result)
-        redis_client = _FakeRedisClient()
-        redis_module = types.SimpleNamespace(
-            Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
-        )
-        identity = _identity(Path("/opt/oldsparky/platform"))
+        control_read, control_write = os.pipe()
 
         with (
-            mock.patch.object(liveness, "validate_worker_execution"),
-            mock.patch.object(liveness, "_load_worker_environment"),
             mock.patch.object(
                 liveness.importlib,
                 "import_module",
                 return_value=types.SimpleNamespace(celery_app=app),
             ),
-            mock.patch.dict(sys.modules, {"redis": redis_module}),
         ):
-            payload = liveness.run_liveness(identity)
+            status = liveness._child_roundtrip(
+                "platform-release-ping-" + "a" * 32,
+                time.monotonic() + 5.0,
+                control_write,
+            )
+        events = [json.loads(line) for line in os.read(control_read, 16_384).splitlines()]
+        os.close(control_read)
 
-        self.assertEqual(payload["status"], "passed")
-        self.assertEqual(payload["cleanup"], "proven")
+        self.assertEqual(status, 0)
+        self.assertTrue(any(event["event"] == "terminal" and event["ok"] for event in events))
+        self.assertTrue(result.forgotten)
         self.assertEqual(task.apply_calls[0]["task_id"].startswith("platform-release-ping-"), True)
         self.assertEqual(task.apply_calls[0]["queue"], liveness.DEFAULT_QUEUE)
         self.assertEqual(task.apply_calls[0]["routing_key"], liveness.DEFAULT_QUEUE)
         self.assertIs(task.apply_calls[0]["retry"], False)
         self.assertIn("expires", task.apply_calls[0])
         self.assertLessEqual(task.apply_calls[0]["expires"], liveness.DEFAULT_EXPIRES_SECONDS)
-        self.assertEqual(
-            redis_client.exists_calls[0],
-            f"celery-task-meta-{task.apply_calls[0]['task_id']}",
-        )
         self.assertEqual(result.get_calls[0]["propagate"], False)
-        self.assertTrue(result.forgotten)
-        self.assertEqual(len(redis_client.exists_calls), 1)
-        rendered = json.dumps(payload, sort_keys=True)
-        self.assertNotIn("pong", rendered)
-        self.assertNotIn("platform-release-ping-", rendered)
-        self.assertNotIn("redis://", rendered)
 
-    def test_cleanup_unproven_is_distinct_and_non_sensitive(self) -> None:
-        result = _FakeResult()
-        redis_client = _FakeRedisClient(present=True)
+    def _parent_env(self) -> dict[str, str]:
+        return {
+            "PLATFORM_CELERY_BROKER_URL": "redis://127.0.0.1:6379/13",
+            "PLATFORM_CELERY_RESULT_BACKEND": "redis://127.0.0.1:6379/14",
+            "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+        }
+
+    def _spawn_control_child(
+        self,
+        events: list[dict[str, object]],
+        *,
+        sleep_seconds: float = 0.0,
+    ) -> tuple[callable, dict[str, subprocess.Popen[bytes]]]:
+        encoded = json.dumps(events, separators=(",", ":"))
+        holder: dict[str, subprocess.Popen[bytes]] = {}
+
+        def spawn(_identity: liveness.RunIdentity, _task_id: str, _deadline: float):
+            read_fd, write_fd = os.pipe()
+            os.set_inheritable(write_fd, True)
+            script = textwrap.dedent(
+                f"""
+                import json, os, sys, time
+                fd = int(sys.argv[1])
+                for event in json.loads({encoded!r}):
+                    os.write(fd, (json.dumps(event, separators=(',', ':')) + '\\n').encode('ascii'))
+                time.sleep({sleep_seconds!r})
+                os.close(fd)
+                """
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(write_fd)],
+                pass_fds=(write_fd,),
+                start_new_session=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            os.close(write_fd)
+            holder["process"] = process
+            return process, read_fd
+
+        return spawn, holder
+
+    def test_parent_forgets_exact_key_and_proves_success(self) -> None:
+        task_id = "platform-release-ping-" + "b" * 32
+        key = b"celery-task-meta-" + task_id.encode("ascii")
+        events = [
+            {"event": "route", "ok": True},
+            {"event": "prepared", "key": base64.b64encode(key).decode("ascii")},
+            {"event": "published", "key": base64.b64encode(key).decode("ascii")},
+            {"event": "terminal", "ok": True, "forget_ok": True, "key": base64.b64encode(key).decode("ascii")},
+        ]
+        spawn, holder = self._spawn_control_child(events)
+        redis_client = _FakeRedisClient()
         redis_module = types.SimpleNamespace(
             Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
         )
         identity = _identity(Path("/opt/oldsparky/platform"))
-        now = iter((0.0, 1.0, 16.0, 16.0))
         with (
             mock.patch.object(liveness, "validate_worker_execution"),
             mock.patch.object(liveness, "_load_worker_environment"),
-            mock.patch.object(
-                liveness.importlib,
-                "import_module",
-                return_value=types.SimpleNamespace(
-                    celery_app=_FakeApp(_FakeTask(result), result)
-                ),
-            ),
             mock.patch.dict(sys.modules, {"redis": redis_module}),
-            mock.patch.object(liveness.time, "sleep"),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
         ):
-            payload = liveness.run_liveness(identity, clock=lambda: next(now))
+            payload = liveness.run_liveness(identity, spawn_child=spawn)
+
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(payload["cleanup"], "proven")
+        self.assertEqual(redis_client.delete_calls, [key])
+        self.assertEqual(redis_client.exists_calls, [key])
+        self.assertIsNotNone(holder["process"].poll())
+
+    def test_forget_failure_cannot_claim_a_successful_roundtrip(self) -> None:
+        task_id = "platform-release-ping-" + "e" * 32
+        key = b"celery-task-meta-" + task_id.encode("ascii")
+        events = [
+            {"event": "route", "ok": True},
+            {"event": "prepared", "key": base64.b64encode(key).decode("ascii")},
+            {"event": "published", "key": base64.b64encode(key).decode("ascii")},
+            {
+                "event": "terminal",
+                "ok": True,
+                "forget_ok": False,
+                "key": base64.b64encode(key).decode("ascii"),
+            },
+        ]
+        spawn, holder = self._spawn_control_child(events)
+        redis_client = _FakeRedisClient()
+        redis_module = types.SimpleNamespace(
+            Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
+        )
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(sys.modules, {"redis": redis_module}),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+        ):
+            payload = liveness.run_liveness(identity, spawn_child=spawn)
 
         self.assertEqual(payload["status"], "cleanup_unproven")
         self.assertEqual(payload["cleanup"], "unproven")
+        self.assertEqual(redis_client.delete_calls, [key])
+        self.assertIsNotNone(holder["process"].poll())
+
+    def test_late_child_result_is_cleanup_unproven_even_when_key_is_absent(self) -> None:
+        task_id = "platform-release-ping-" + "c" * 32
+        key = b"celery-task-meta-" + task_id.encode("ascii")
+        events = [
+            {"event": "route", "ok": True},
+            {"event": "prepared", "key": base64.b64encode(key).decode("ascii")},
+            {"event": "published", "key": base64.b64encode(key).decode("ascii")},
+        ]
+        spawn, holder = self._spawn_control_child(events, sleep_seconds=5.0)
+        redis_client = _FakeRedisClient()
+        redis_module = types.SimpleNamespace(
+            Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
+        )
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(sys.modules, {"redis": redis_module}),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+            mock.patch.object(liveness, "CHILD_WORK_SECONDS", 0.1),
+            mock.patch.object(liveness, "CHILD_STOP_GRACE_SECONDS", 0.05),
+            mock.patch.object(liveness, "CHILD_KILL_GRACE_SECONDS", 0.05),
+        ):
+            payload = liveness.run_liveness(identity, spawn_child=spawn)
+
+        self.assertEqual(payload["status"], "cleanup_unproven")
+        self.assertEqual(payload["cleanup"], "unproven")
+        self.assertEqual(redis_client.delete_calls, [key])
+        self.assertIsNotNone(holder["process"].poll())
         self.assertNotIn("pong", json.dumps(payload))
+
+    def test_parent_cancellation_reaps_child_and_emits_no_exception(self) -> None:
+        task_id = "platform-release-ping-" + "d" * 32
+        key = b"celery-task-meta-" + task_id.encode("ascii")
+        spawn, holder = self._spawn_control_child([], sleep_seconds=5.0)
+        redis_client = _FakeRedisClient()
+        redis_module = types.SimpleNamespace(
+            Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
+        )
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(sys.modules, {"redis": redis_module}),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+            mock.patch.object(liveness, "_collect_child", side_effect=KeyboardInterrupt),
+        ):
+            payload = liveness.run_liveness(identity, spawn_child=spawn)
+
+        self.assertEqual(payload["status"], "cleanup_unproven")
+        self.assertEqual(payload["cleanup"], "unproven")
+        self.assertIsNotNone(holder["process"].poll())
+        self.assertNotIn("KeyboardInterrupt", json.dumps(payload))
+
+    def test_malformed_child_control_is_redacted_and_cleanup_unproven(self) -> None:
+        spawn, holder = self._spawn_control_child([])
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        redis_client = _FakeRedisClient()
+        redis_module = types.SimpleNamespace(
+            Redis=types.SimpleNamespace(from_url=lambda *_args, **_kwargs: redis_client)
+        )
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(sys.modules, {"redis": redis_module}),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+        ):
+            payload = liveness.run_liveness(identity, spawn_child=spawn)
+
+        self.assertEqual(payload["status"], "cleanup_unproven")
+        self.assertNotIn("redis://", json.dumps(payload))
+        self.assertNotIn("platform-release-ping-", json.dumps(payload))
+        self.assertIsNotNone(holder["process"].poll())
 
     def test_helper_has_no_global_destructive_or_control_plane_operations(self) -> None:
         source = (TOOLS_ROOT / "platform_worker_liveness.py").read_text(encoding="utf-8")
@@ -287,6 +465,15 @@ class WorkerLivenessReleaseWiringTests(unittest.TestCase):
         self.assertIn('PLATFORM_ENV_FILE="$worker_env"', worker_block)
         self.assertIn('PYTHONPATH="$CANDIDATE"', worker_block)
         self.assertIn("--expected-source-sha", worker_block)
+        self.assertIn(
+            'evidence_file="$(mktemp "$SHARED_DIR/.worker-liveness.XXXXXX")"',
+            worker_block,
+        )
+        self.assertIn('noise_file="${evidence_file}.stderr"', worker_block)
+        self.assertIn("run_bounded_command 25 /usr/sbin/runuser", worker_block)
+        self.assertIn("Path(sys.argv[1]).read_bytes()", worker_block)
+        self.assertIn("WORKER_LIVENESS schema=1 evidence=", worker_block)
+        self.assertNotIn(">/dev/null", worker_block)
         self.assertNotIn("PUBLIC_EDGE_ORIGIN", worker_block)
         self.assertIn(
             'smoke_source_args=(--expected-source-sha "$EXPECTED_SOURCE_SHA")',

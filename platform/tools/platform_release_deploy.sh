@@ -370,9 +370,16 @@ run_worker_liveness_smoke() {
   [[ -n "$EXPECTED_SOURCE_SHA" ]] || return 1
   local worker_env="$SHARED_DIR/env/worker.env"
   local helper="$CANDIDATE/tools/platform_worker_liveness.py"
+  local evidence_file noise_file evidence="" worker_status
   [[ -f "$helper" && ! -L "$helper" && -x "$helper" \
     && -f "$worker_env" && ! -L "$worker_env" ]] || return 1
-  run_bounded_command 15 /usr/sbin/runuser -u oldsparky-worker -- /usr/bin/env -i \
+  evidence_file="$(mktemp "$SHARED_DIR/.worker-liveness.XXXXXX")" || return 1
+  noise_file="${evidence_file}.stderr"
+  if ! (umask 077; : >"$noise_file"); then
+    rm -f -- "$evidence_file" "$noise_file"
+    return 1
+  fi
+  if run_bounded_command 25 /usr/sbin/runuser -u oldsparky-worker -- /usr/bin/env -i \
     LANG=C.UTF-8 \
     HOME=/nonexistent \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
@@ -388,7 +395,89 @@ run_worker_liveness_smoke() {
       --app-dir "$APP_DIR" \
       --release "$CANDIDATE" \
       --expected-source-sha "$EXPECTED_SOURCE_SHA" \
-    >/dev/null 2>/dev/null
+    >"$evidence_file" 2>"$noise_file"; then
+    worker_status=0
+  else
+    worker_status=$?
+  fi
+  if evidence="$(/usr/bin/python3 -I - "$evidence_file" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+CHECKS = (
+    "worker_uid",
+    "worker_env",
+    "release_identity",
+    "broker_namespace",
+    "result_namespace",
+    "task_route",
+    "task_result",
+)
+BACKLOG = ("high", "default", "low")
+
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+try:
+    raw = Path(sys.argv[1]).read_bytes()
+    if len(raw) > 16 * 1024:
+        raise ValueError
+    lines = raw.decode("ascii").splitlines()
+    if len(lines) != 1:
+        raise ValueError
+    payload = json.loads(lines[0], object_pairs_hook=strict_object)
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema", "kind", "status", "checks", "backlog", "cleanup"
+    }:
+        raise ValueError
+    if (
+        type(payload["schema"]) is not int
+        or payload["schema"] != 1
+        or payload["kind"] != "platform_worker_liveness"
+    ):
+        raise ValueError
+    checks = payload["checks"]
+    backlog = payload["backlog"]
+    if (
+        not isinstance(checks, dict)
+        or set(checks) != set(CHECKS)
+        or any(checks[name] not in {"not_run", "passed", "failed"} for name in CHECKS)
+        or not isinstance(backlog, dict)
+        or set(backlog) != set(BACKLOG)
+        or any(backlog[name] != "redacted" for name in BACKLOG)
+        or payload["status"] not in {"passed", "failed", "cleanup_unproven"}
+        or payload["cleanup"] not in {"proven", "unproven", "not_run"}
+    ):
+        raise ValueError
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+    raise SystemExit(1)
+PY
+)"; then
+    printf 'WORKER_LIVENESS schema=1 evidence=%s\n' "$evidence" >&2
+    if printf '%s\n' "$evidence" | /usr/bin/python3 -I -c '
+import json, sys
+payload = json.load(sys.stdin)
+checks = payload["checks"]
+expected = {
+    "worker_uid", "worker_env", "release_identity", "broker_namespace",
+    "result_namespace", "task_route", "task_result",
+}
+raise SystemExit(0 if payload["status"] == "passed" and payload["cleanup"] == "proven" and set(checks) == expected and all(value == "passed" for value in checks.values()) else 1)
+'; then
+      rm -f -- "$evidence_file" "$noise_file"
+      [[ "$worker_status" -eq 0 ]]
+      return $?
+    fi
+  fi
+  rm -f -- "$evidence_file" "$noise_file"
+  return 1
 }
 
 systemd_now_ns() {

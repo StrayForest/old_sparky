@@ -462,7 +462,7 @@ for runtime_helper in \
   "tools/platform_media_migration_diagnostics_summary.py" \
   "tools/platform_worker_liveness.py"; do
   if [[ ! -s "$STAGING_DIR/$runtime_helper" || -L "$STAGING_DIR/$runtime_helper" ]]; then
-    echo "Release build refused: tracked runtime helper is missing: $runtime_helper" >&2
+    echo "Release build refused: tracked runtime diagnostic helper is missing: $runtime_helper" >&2
     exit 1
   fi
 done

@@ -14,6 +14,8 @@ URLs, task IDs, task values, exception text or Redis key names.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from collections.abc import Mapping
 from dataclasses import dataclass
 import importlib
@@ -24,13 +26,20 @@ from pathlib import Path
 import pwd
 import re
 import secrets
+import selectors
+import signal
 import stat
+import subprocess
+import sys
 import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
 
 MAX_SECONDS = 15.0
+CHILD_WORK_SECONDS = 11.0
+CHILD_STOP_GRACE_SECONDS = 0.75
+CHILD_KILL_GRACE_SECONDS = 0.75
 DEFAULT_EXPIRES_SECONDS = 10.0
 WORKER_USER = "oldsparky-worker"
 WORKER_RUNTIME_SERVICE = "worker"
@@ -40,7 +49,10 @@ WORKER_ENV_NAME = "worker.env"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 RELEASE_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 TASK_ID_PATTERN = re.compile(r"^platform-release-ping-[0-9a-f]{32}$")
-REDIS_SCHEMES = frozenset({"redis", "rediss"})
+REDIS_SCHEME = "redis"
+REDIS_PORT = 6379
+RESULT_KEY_PREFIX = b"celery-task-meta-"
+CONTROL_MAX_BYTES = 16 * 1024
 
 CHECK_NAMES = (
     "worker_uid",
@@ -284,32 +296,81 @@ def _load_worker_environment(identity: RunIdentity) -> None:
     os.environ.update(values)
 
 
-def _redis_namespace(url: object, *, expected_database: str) -> None:
-    if not isinstance(url, str):
+def _url_has_credentials(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parts = urlsplit(value)
+        return parts.username is not None or parts.password is not None or "@" in parts.netloc
+    except ValueError:
+        return False
+
+
+def _redis_namespace(
+    url: object,
+    *,
+    expected_database: str,
+    credentials_required: bool = False,
+) -> None:
+    """Validate the one local Redis URL shape used by the deployed worker."""
+
+    if not isinstance(url, str) or not url or url != url.strip():
+        raise LivenessFailure("redis_url_invalid")
+    # Keep the scheme and authority in the exact canonical form used by the
+    # generated worker environment.  ``urlsplit`` lower-cases schemes and
+    # accepts a leading-zero port, neither of which is the contract we want to
+    # bind the release smoke to.
+    if not url.startswith(f"{REDIS_SCHEME}://"):
+        raise LivenessFailure("redis_url_invalid")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in url):
+        raise LivenessFailure("redis_url_invalid")
+    if re.search(r"%(?![0-9A-Fa-f]{2})", url) or "?" in url or "#" in url:
         raise LivenessFailure("redis_url_invalid")
     try:
         parts = urlsplit(url)
+        hostname = parts.hostname
+        port = parts.port
     except ValueError as exc:
+        # ``SplitResult.port`` raises for malformed, empty or out-of-range
+        # ports; do not let that parser exception escape or render.
         raise LivenessFailure("redis_url_invalid") from exc
     if (
-        parts.scheme not in REDIS_SCHEMES
+        parts.scheme != REDIS_SCHEME
+        or not parts.netloc
+        or hostname is None
+        or port != REDIS_PORT
         or parts.path != f"/{expected_database}"
-        or parts.username is not None
-        or parts.password is not None
         or parts.query
         or parts.fragment
-        or parts.hostname is None
     ):
         raise LivenessFailure("redis_namespace_mismatch")
+    if any(delimiter in parts.netloc for delimiter in (",", ";")):
+        raise LivenessFailure("redis_host_invalid")
+    if parts.netloc.count("@") > 1:
+        raise LivenessFailure("redis_url_invalid")
+    authority = parts.netloc.rsplit("@", 1)[-1]
+    if not authority.endswith(f":{REDIS_PORT}"):
+        raise LivenessFailure("redis_namespace_mismatch")
+    has_credentials = (
+        parts.username is not None
+        or parts.password is not None
+        or "@" in parts.netloc
+    )
+    if has_credentials:
+        # Local production Redis is normally unauthenticated.  Preserve a
+        # deployed credential only when the generated worker env explicitly
+        # requires one; it is never copied into evidence or diagnostics.
+        if not credentials_required or not parts.username or not parts.password:
+            raise LivenessFailure("redis_credentials_invalid")
     # Production Redis is loopback-only.  Reject names that could resolve to a
     # remote host even when they happen to use the expected logical database.
     try:
         import ipaddress
 
-        host = ipaddress.ip_address(parts.hostname)
+        host = ipaddress.ip_address(hostname)
     except (ValueError, TypeError) as exc:
         raise LivenessFailure("redis_host_invalid") from exc
-    if not host.is_loopback or "%" in parts.hostname:
+    if not host.is_loopback or "%" in hostname:
         raise LivenessFailure("redis_host_invalid")
 
 
@@ -358,31 +419,46 @@ def _result_key(result: Any, task_id: str) -> object:
     return key
 
 
-def _cleanup_result(
-    result: Any,
-    task_id: str,
+def _validate_result_key(key: object, task_id: str) -> str | bytes:
+    if not isinstance(key, (str, bytes)):
+        raise LivenessFailure("result_key_unavailable", cleanup_unproven=True)
+    encoded = key.encode("utf-8") if isinstance(key, str) else key
+    if (
+        not encoded
+        or len(encoded) > 512
+        or b"\x00" in encoded
+        or b"\r" in encoded
+        or b"\n" in encoded
+        or task_id.encode("ascii") not in encoded
+    ):
+        raise LivenessFailure("result_key_invalid", cleanup_unproven=True)
+    return key
+
+
+def _cleanup_key(
+    key: str | bytes,
     result_url: str,
     deadline: float,
     *,
     clock: Callable[[], float] | None = None,
 ) -> bool:
-    """Forget and prove absence of exactly one result key before the deadline."""
+    """Delete and prove absence of exactly one reported result key."""
 
     try:
-        key = _result_key(result, task_id)
         _remaining(deadline, clock)
-        result.forget()
-        # Importing redis is deliberately delayed until after the worker app
-        # has passed all identity checks.  The key is never scanned or logged.
         import redis
 
+        timeout = min(1.0, _remaining(deadline, clock))
         client = redis.Redis.from_url(
             result_url,
             decode_responses=False,
-            socket_connect_timeout=min(1.0, _remaining(deadline, clock)),
-            socket_timeout=min(1.0, _remaining(deadline, clock)),
+            socket_connect_timeout=timeout,
+            socket_timeout=timeout,
+            retry_on_timeout=False,
         )
         try:
+            _remaining(deadline, clock)
+            client.delete(key)
             while True:
                 _remaining(deadline, clock)
                 if not client.exists(key):
@@ -394,7 +470,7 @@ def _cleanup_result(
                 close()
     except LivenessFailure:
         raise
-    except Exception as exc:
+    except BaseException as exc:
         raise LivenessFailure("result_cleanup_unproven", cleanup_unproven=True) from exc
 
 
@@ -414,6 +490,7 @@ def _backlog_evidence(
             decode_responses=False,
             socket_connect_timeout=min(0.25, _remaining(deadline, clock)),
             socket_timeout=min(0.25, _remaining(deadline, clock)),
+            retry_on_timeout=False,
         )
         try:
             for queue in (
@@ -427,55 +504,95 @@ def _backlog_evidence(
             close = getattr(client, "close", None)
             if callable(close):
                 close()
-    except Exception:
+    except BaseException:
         # The JSON contract deliberately keeps this evidence redacted and
         # never turns a best-effort backlog read into a liveness failure.
         return
 
 
-def run_liveness(
-    identity: RunIdentity,
-    *,
-    clock: Callable[[], float] | None = None,
-) -> dict[str, object]:
-    """Execute the release-only roundtrip under one absolute deadline."""
+@dataclass(slots=True)
+class _ChildOutcome:
+    key: str | bytes | None = None
+    attempted: bool = False
+    uncertain: bool = False
+    terminal: bool = False
+    success: bool = False
+    route_state: str = "not_run"
+    result_state: str = "not_run"
 
-    if clock is None:
-        clock = time.monotonic
-    checks: dict[str, str] = {}
-    deadline = clock() + MAX_SECONDS
-    result: Any | None = None
-    task_id: str | None = None
-    result_url: str | None = None
-    cleanup_status = "not_run"
-    status = "failed"
+
+def _child_send(control_fd: int, payload: Mapping[str, object]) -> bool:
     try:
-        validate_worker_execution(identity)
-        checks["worker_uid"] = "passed"
-        checks["worker_env"] = "passed"
-        _load_worker_environment(identity)
+        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        if len(raw) > CONTROL_MAX_BYTES:
+            return False
+        raw += b"\n"
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(control_fd, raw[offset:])
+        return True
+    except BaseException:
+        return False
 
+
+def _encoded_key(key: str | bytes | None) -> str | None:
+    if key is None:
+        return None
+    raw = key.encode("utf-8") if isinstance(key, str) else key
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _child_roundtrip(task_id: str, deadline: float, control_fd: int) -> int:
+    """Run the potentially blocking Celery work in the disposable child."""
+
+    result: Any | None = None
+    key: str | bytes | None = None
+    publish_attempted = False
+    terminal = False
+    success = False
+    stage = "worker_app"
+    try:
+        if TASK_ID_PATTERN.fullmatch(task_id) is None:
+            raise LivenessFailure("task_id_invalid")
         worker_module = importlib.import_module("apps.platform_worker.worker")
         app = getattr(worker_module, "celery_app", None)
         if app is None:
             raise LivenessFailure("worker_app_unavailable")
+        stage = "namespace"
         broker_url = app.conf.broker_url
         result_url = app.conf.result_backend
-        _redis_namespace(broker_url, expected_database="13")
-        checks["broker_namespace"] = "passed"
-        _redis_namespace(result_url, expected_database="14")
-        checks["result_namespace"] = "passed"
-        checks["release_identity"] = "passed"
-
+        _redis_namespace(
+            broker_url,
+            expected_database="13",
+            credentials_required=_url_has_credentials(
+                os.environ.get("PLATFORM_CELERY_BROKER_URL")
+            ),
+        )
+        _redis_namespace(
+            result_url,
+            expected_database="14",
+            credentials_required=_url_has_credentials(
+                os.environ.get("PLATFORM_CELERY_RESULT_BACKEND")
+            ),
+        )
+        stage = "task_route"
         queue_name = _task_queue(app)
-        checks["task_route"] = "passed"
-        task_id = _new_task_id()
+        _child_send(control_fd, {"event": "route", "ok": True})
+        stage = "result_key"
+        task_id = _validate_task_id(task_id)
         result = app.AsyncResult(task_id)
-        _remaining(deadline, clock)
+        key = _validate_result_key(_result_key(result, task_id), task_id)
+        _child_send(
+            control_fd,
+            {"event": "prepared", "key": _encoded_key(key)},
+        )
+        _remaining(deadline)
         task = app.tasks[PING_TASK_NAME]
-        expires = min(DEFAULT_EXPIRES_SECONDS, _remaining(deadline, clock))
+        expires = min(DEFAULT_EXPIRES_SECONDS, _remaining(deadline))
         if expires <= 0:
             raise LivenessFailure("deadline_exceeded", cleanup_unproven=True)
+        stage = "publish"
+        publish_attempted = True
         result = task.apply_async(
             args=(),
             kwargs={},
@@ -485,48 +602,448 @@ def run_liveness(
             retry=False,
             expires=expires,
         )
-        _remaining(deadline, clock)
-        value = result.get(timeout=_remaining(deadline, clock), propagate=False)
+        key = _validate_result_key(_result_key(result, task_id), task_id)
+        _child_send(
+            control_fd,
+            {"event": "published", "key": _encoded_key(key)},
+        )
+        stage = "result"
+        value = result.get(timeout=_remaining(deadline), propagate=False)
         state = result.state
-        if state != "SUCCESS" or value != "pong":
-            raise LivenessFailure("task_result_invalid")
-        checks["task_result"] = "passed"
-        _backlog_evidence(broker_url, deadline, clock=clock)
-        status = "passed"
-        cleanup_status = "proven"
-    except LivenessFailure as exc:
-        if exc.cleanup_unproven:
-            cleanup_status = "unproven"
-        checks.setdefault("release_identity", "not_run")
-        status = "cleanup_unproven" if exc.cleanup_unproven else "failed"
-    except Exception:
-        status = "failed"
+        terminal = True
+        success = state == "SUCCESS" and value == "pong"
+    except BaseException:
+        # The parent receives only the closed event vocabulary.  In
+        # particular, never send an exception or result value through the
+        # control pipe.
+        _child_send(
+            control_fd,
+            {
+                "event": "failure",
+                "published": publish_attempted,
+                "stage": stage,
+                "key": _encoded_key(key),
+            },
+        )
     finally:
-        # Cleanup is deliberately handled in a second bounded path below.  It
-        # is invoked even for result validation/publish failures when a task ID
-        # was allocated, and never renders the caught exception.
-        if task_id is not None and (result is None or result_url is None):
-            # A task identity was allocated but no exact Celery result object
-            # survived to the cleanup boundary.  There is no safe way to
-            # derive/forget that backend key here, so fail closed.
-            cleanup_status = "unproven"
-        elif result is not None and task_id is not None and result_url is not None:
+        forget_ok = False
+        if result is not None:
             try:
-                cleanup_ok = _cleanup_result(
-                    result,
-                    task_id,
+                result.forget()
+                forget_ok = True
+            except BaseException:
+                forget_ok = False
+        if terminal:
+            _child_send(
+                control_fd,
+                {
+                    "event": "terminal",
+                    "ok": success,
+                    "forget_ok": forget_ok,
+                    "key": _encoded_key(key),
+                },
+            )
+        try:
+            os.close(control_fd)
+        except BaseException:
+            pass
+    return 0 if terminal and success else 1
+
+
+def _validate_task_id(task_id: str) -> str:
+    if not isinstance(task_id, str) or TASK_ID_PATTERN.fullmatch(task_id) is None:
+        raise LivenessFailure("task_id_invalid")
+    return task_id
+
+
+def _spawn_child(
+    identity: RunIdentity,
+    task_id: str,
+    deadline: float,
+) -> tuple[subprocess.Popen[bytes], int]:
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_inheritable(write_fd, True)
+        python_bin = os.environ.get("PLATFORM_PYTHON_BIN") or sys.executable
+        command = [
+            python_bin,
+            str(Path(__file__).resolve()),
+            "--child",
+            "--task-id",
+            task_id,
+            "--deadline",
+            f"{deadline:.9f}",
+            "--control-fd",
+            str(write_fd),
+        ]
+        process = subprocess.Popen(
+            command,
+            cwd=str(identity.release),
+            env=dict(os.environ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            pass_fds=(write_fd,),
+            start_new_session=True,
+        )
+    except BaseException:
+        os.close(read_fd)
+        raise
+    finally:
+        os.close(write_fd)
+    return process, read_fd
+
+
+def _signal_child_group(process: subprocess.Popen[bytes], signal_number: int) -> None:
+    try:
+        os.killpg(process.pid, signal_number)
+    except ProcessLookupError:
+        pass
+    except BaseException:
+        try:
+            process.send_signal(signal_number)
+        except BaseException:
+            pass
+
+
+def _stop_child_now(
+    process: subprocess.Popen[bytes],
+    *,
+    clock: Callable[[], float],
+) -> None:
+    if process.poll() is None:
+        _signal_child_group(process, signal.SIGTERM)
+        stop_deadline = clock() + CHILD_STOP_GRACE_SECONDS
+        attempts = 0
+        while process.poll() is None and clock() < stop_deadline and attempts < 100:
+            time.sleep(0.01)
+            attempts += 1
+        if process.poll() is None:
+            _signal_child_group(process, signal.SIGKILL)
+    try:
+        process.wait(timeout=CHILD_KILL_GRACE_SECONDS)
+    except BaseException:
+        _signal_child_group(process, signal.SIGKILL)
+        try:
+            process.wait(timeout=CHILD_KILL_GRACE_SECONDS)
+        except BaseException:
+            pass
+
+
+def _collect_child(
+    process: subprocess.Popen[bytes],
+    control_fd: int,
+    *,
+    child_deadline: float,
+    supervise_deadline: float,
+    clock: Callable[[], float],
+) -> tuple[list[dict[str, object]], bool, int | None]:
+    """Drain all child pipes while owning stop, kill, wait and EOF bounds."""
+
+    selector = selectors.DefaultSelector()
+    control = bytearray()
+    control_overflow = False
+    open_fds: set[int] = set()
+    try:
+        for fd in (control_fd, process.stdout.fileno() if process.stdout else None,
+                   process.stderr.fileno() if process.stderr else None):
+            if fd is None:
+                continue
+            os.set_blocking(fd, False)
+            selector.register(fd, selectors.EVENT_READ)
+            open_fds.add(fd)
+        stop_at: float | None = None
+        kill_sent = False
+        while open_fds or process.poll() is None:
+            now = clock()
+            if process.poll() is None and stop_at is None and now >= child_deadline:
+                _signal_child_group(process, signal.SIGTERM)
+                stop_at = now + CHILD_STOP_GRACE_SECONDS
+            elif process.poll() is None and stop_at is not None and not kill_sent and now >= stop_at:
+                _signal_child_group(process, signal.SIGKILL)
+                kill_sent = True
+            if now >= supervise_deadline:
+                # The leader may have exited while a descendant still holds
+                # one of the inherited log/control pipes.  Kill the whole
+                # disposable group before closing those descriptors so no
+                # late writer can survive the parent deadline.
+                _signal_child_group(process, signal.SIGKILL)
+                break
+            timeout = min(0.05, max(0.0, supervise_deadline - now))
+            for selected, _ in selector.select(timeout):
+                fd = selected.fd
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                except BaseException:
+                    chunk = b""
+                if not chunk:
+                    try:
+                        selector.unregister(fd)
+                    except BaseException:
+                        pass
+                    open_fds.discard(fd)
+                    continue
+                if fd == control_fd:
+                    available = max(0, CONTROL_MAX_BYTES - len(control))
+                    if len(chunk) > available:
+                        control_overflow = True
+                    if available:
+                        control.extend(chunk[:available])
+                # Child stdout/stderr are intentionally drained and discarded.
+        if process.poll() is None:
+            _stop_child_now(process, clock=clock)
+        else:
+            try:
+                process.wait(timeout=CHILD_KILL_GRACE_SECONDS)
+            except BaseException:
+                _stop_child_now(process, clock=clock)
+    finally:
+        for fd in tuple(open_fds):
+            try:
+                selector.unregister(fd)
+            except BaseException:
+                pass
+            try:
+                os.close(fd)
+            except BaseException:
+                pass
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
+    events: list[dict[str, object]] = []
+    valid = (
+        not control_overflow
+        and len(control) <= CONTROL_MAX_BYTES
+        and (not control or control.endswith(b"\n"))
+    )
+    for line in bytes(control).splitlines():
+        if not line:
+            continue
+        try:
+            value = json.loads(line.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError):
+            valid = False
+            continue
+        if not isinstance(value, dict) or value.get("event") not in {
+            "route", "prepared", "published", "terminal", "failure"
+        }:
+            valid = False
+            continue
+        events.append(value)
+    return events, valid and bool(open_fds) is False, process.returncode
+
+
+def _decode_event_key(event: Mapping[str, object], task_id: str) -> str | bytes | None:
+    encoded = event.get("key")
+    if encoded is None:
+        return None
+    if not isinstance(encoded, str) or len(encoded) > 2048:
+        raise LivenessFailure("result_key_invalid", cleanup_unproven=True)
+    try:
+        key = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (ValueError, UnicodeError, binascii.Error) as exc:
+        raise LivenessFailure("result_key_invalid", cleanup_unproven=True) from exc
+    return _validate_result_key(key, task_id)
+
+
+def _summarize_child(
+    events: list[dict[str, object]],
+    *,
+    valid: bool,
+    task_id: str,
+) -> _ChildOutcome:
+    outcome = _ChildOutcome(uncertain=not valid or not events)
+    for event in events:
+        name = event.get("event")
+        try:
+            event_key = _decode_event_key(event, task_id)
+        except LivenessFailure:
+            outcome.uncertain = True
+            continue
+        if event_key is not None:
+            outcome.key = event_key
+        if name == "route":
+            outcome.route_state = "passed" if event.get("ok") is True else "failed"
+        elif name == "prepared":
+            if event_key is None:
+                outcome.uncertain = True
+        elif name == "published":
+            outcome.attempted = True
+        elif name == "failure":
+            outcome.attempted = outcome.attempted or event.get("published") is True
+            if event.get("stage") in {"result_key", "publish", "result"}:
+                # An AsyncResult may already have reserved or published a
+                # task even when the child could not report a valid key.
+                outcome.uncertain = True
+            if event.get("stage") == "task_route":
+                outcome.route_state = "failed"
+        elif name == "terminal":
+            outcome.terminal = True
+            outcome.success = event.get("ok") is True
+            outcome.result_state = "passed" if outcome.success else "failed"
+            if event.get("forget_ok") is not True:
+                # A successful Celery value is not a successful probe until
+                # the child has completed its own forget path.  The parent
+                # still performs the exact-key deletion and absence proof,
+                # but must not claim a clean roundtrip when forget failed.
+                outcome.success = False
+                outcome.result_state = "failed"
+                outcome.uncertain = True
+            if event_key is None:
+                outcome.uncertain = True
+            if outcome.route_state == "not_run":
+                outcome.route_state = "passed"
+            outcome.attempted = True
+    if not outcome.terminal and outcome.attempted:
+        outcome.uncertain = True
+    return outcome
+
+
+def run_liveness(
+    identity: RunIdentity,
+    *,
+    clock: Callable[[], float] | None = None,
+    spawn_child: Callable[
+        [RunIdentity, str, float], tuple[subprocess.Popen[bytes], int]
+    ] | None = None,
+) -> dict[str, object]:
+    """Supervise one release roundtrip and then clean only its exact key."""
+
+    if clock is None:
+        clock = time.monotonic
+    if spawn_child is None:
+        spawn_child = _spawn_child
+    checks: dict[str, str] = {}
+    try:
+        start = clock()
+    except BaseException:
+        return _new_result("failed", checks, "not_run")
+    deadline = start + MAX_SECONDS
+    child_deadline = min(deadline, start + CHILD_WORK_SECONDS)
+    supervise_deadline = min(deadline, child_deadline + CHILD_STOP_GRACE_SECONDS + CHILD_KILL_GRACE_SECONDS)
+    task_id: str | None = None
+    broker_url: str | None = None
+    result_url: str | None = None
+    handle: tuple[subprocess.Popen[bytes], int] | None = None
+    collection_completed = False
+    outcome = _ChildOutcome(uncertain=True)
+    child_valid = False
+    cleanup_status = "not_run"
+    status = "failed"
+    try:
+        validate_worker_execution(identity)
+        checks["worker_uid"] = "passed"
+        checks["worker_env"] = "passed"
+        _load_worker_environment(identity)
+        broker_url = os.environ.get("PLATFORM_CELERY_BROKER_URL")
+        result_url = os.environ.get("PLATFORM_CELERY_RESULT_BACKEND")
+        app_redis_url = os.environ.get("PLATFORM_REDIS_URL")
+        _redis_namespace(
+            broker_url,
+            expected_database="13",
+            credentials_required=_url_has_credentials(broker_url),
+        )
+        checks["broker_namespace"] = "passed"
+        _redis_namespace(
+            result_url,
+            expected_database="14",
+            credentials_required=_url_has_credentials(result_url),
+        )
+        checks["result_namespace"] = "passed"
+        _redis_namespace(
+            app_redis_url,
+            expected_database="15",
+            credentials_required=_url_has_credentials(app_redis_url),
+        )
+        checks["release_identity"] = "passed"
+        task_id = _new_task_id()
+        handle = spawn_child(identity, task_id, child_deadline)
+        events, child_valid, _returncode = _collect_child(
+            handle[0],
+            handle[1],
+            child_deadline=child_deadline,
+            supervise_deadline=supervise_deadline,
+            clock=clock,
+        )
+        collection_completed = True
+        outcome = _summarize_child(events, valid=child_valid, task_id=task_id)
+        checks["task_route"] = outcome.route_state
+        checks["task_result"] = outcome.result_state
+    except BaseException:
+        # A cancellation, keyboard interrupt, or child-start failure never
+        # escapes with a traceback or an assertion of successful cleanup.
+        outcome = _ChildOutcome(uncertain=handle is not None)
+    finally:
+        child_running = False
+        if handle is not None:
+            try:
+                child_running = handle[0].poll() is None
+            except BaseException:
+                child_running = True
+                outcome.uncertain = True
+        if handle is not None and (child_running or not collection_completed):
+            try:
+                if child_running:
+                    _stop_child_now(handle[0], clock=clock)
+                else:
+                    _signal_child_group(handle[0], signal.SIGKILL)
+            except BaseException:
+                # Cancellation can arrive while the parent is in its TERM /
+                # KILL reserve.  Never let it bypass exact-key cleanup or
+                # render a traceback; make the outcome unproven instead.
+                outcome.uncertain = True
+                try:
+                    _signal_child_group(handle[0], signal.SIGKILL)
+                    handle[0].wait(timeout=CHILD_KILL_GRACE_SECONDS)
+                except BaseException:
+                    pass
+        if task_id is not None and result_url is not None:
+            cleanup_key = outcome.key
+            if cleanup_key is None and (outcome.attempted or outcome.uncertain):
+                # The deployed Redis backend uses this fixed key prefix.  A
+                # fallback cleanup is attempted, but an uncertain child can
+                # never be reported as proven merely because this key is gone.
+                cleanup_key = RESULT_KEY_PREFIX + task_id.encode("ascii")
+            try:
+                cleanup_ok = (
+                    cleanup_key is not None
+                    and _cleanup_key(
+                    _validate_result_key(cleanup_key, task_id),
                     result_url,
                     deadline,
                     clock=clock,
                 )
-            except LivenessFailure:
+                )
+            except BaseException:
                 cleanup_ok = False
-            except Exception:
-                cleanup_ok = False
-            if not cleanup_ok:
+            if cleanup_ok and (outcome.terminal or not outcome.attempted) and not outcome.uncertain:
+                cleanup_status = "proven"
+            elif cleanup_key is not None:
                 cleanup_status = "unproven"
-    if cleanup_status == "unproven":
-        status = "cleanup_unproven"
+            elif outcome.terminal or outcome.attempted or outcome.uncertain:
+                cleanup_status = "unproven"
+        if cleanup_status == "unproven":
+            status = "cleanup_unproven"
+        elif outcome.terminal and outcome.success and outcome.result_state == "passed":
+            status = "passed"
+        else:
+            status = "failed"
+        if status == "passed" and broker_url and cleanup_status == "proven":
+            _backlog_evidence(broker_url, deadline, clock=clock)
+        if handle is not None:
+            for stream in (handle[0].stdout, handle[0].stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except BaseException:
+                        pass
     return _new_result(status, checks, cleanup_status)
 
 
@@ -538,9 +1055,13 @@ def _run(identity: RunIdentity) -> tuple[dict[str, object], int]:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the release worker liveness smoke.")
-    parser.add_argument("--app-dir", type=Path, required=True)
-    parser.add_argument("--release", type=Path, required=True)
-    parser.add_argument("--expected-source-sha", required=True)
+    parser.add_argument("--app-dir", type=Path)
+    parser.add_argument("--release", type=Path)
+    parser.add_argument("--expected-source-sha")
+    parser.add_argument("--child", action="store_true")
+    parser.add_argument("--task-id")
+    parser.add_argument("--deadline", type=float)
+    parser.add_argument("--control-fd", type=int)
     return parser.parse_args(argv)
 
 
@@ -548,6 +1069,16 @@ def main(argv: list[str] | None = None) -> int:
     checks: dict[str, str] = {}
     try:
         args = _parse_args(argv)
+        if args.child:
+            if (
+                not isinstance(args.task_id, str)
+                or args.deadline is None
+                or args.control_fd is None
+            ):
+                return 1
+            return _child_roundtrip(args.task_id, args.deadline, args.control_fd)
+        if args.app_dir is None or args.release is None or args.expected_source_sha is None:
+            raise LivenessFailure("arguments_invalid")
         identity = validate_release_identity(
             args.app_dir,
             args.release,
@@ -558,7 +1089,7 @@ def main(argv: list[str] | None = None) -> int:
     except LivenessFailure:
         payload = _new_result("failed", checks, "not_run")
         status = 1
-    except Exception:
+    except BaseException:
         payload = _new_result("failed", checks, "not_run")
         status = 1
     _emit_result(payload)
