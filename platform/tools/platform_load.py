@@ -1835,8 +1835,8 @@ def run_profile(
     ensure_dispatchable(profile)
     contract = profile_contract(profile)
     try:
-        source_git_sha = _source_git_sha()
-        external_run_id = _external_run_id()
+        _source_git_sha()
+        _external_run_id()
     except LoadProfileError as exc:
         _write_failed_report(
             profile,

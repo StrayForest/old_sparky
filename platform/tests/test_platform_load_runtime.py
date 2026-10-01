@@ -351,7 +351,10 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                     worker_command=("/usr/bin/python3", "/checkout/worker.py"),
                     report_path=final_report,
                     worker_report_path=worker_report,
-                    max_duration_seconds=1,
+                    # Keep enough authored wall time for the hosted sudo
+                    # reparent/reap reserve while still letting the hooks
+                    # advance the final report gates beyond the deadline.
+                    max_duration_seconds=2,
                     max_runner_minutes=1,
                     worker_config={},
                     term_grace_seconds=0.05,
@@ -572,10 +575,24 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 textwrap.dedent(
                     f"""
                     import sys
+                    import os
                     sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
                     from pathlib import Path
-                    from tools.platform_load_runtime import run_supervised
-                    run_supervised(
+                    from tools import platform_load_runtime as runtime
+                    if os.getuid() == 0:
+                        # Model the hosted runner's non-root worker while the
+                        # local test process remains the documented UID0
+                        # fail-closed environment.  The config/report paths
+                        # stay runner-readable after atomic writes.
+                        os.chown({str(root)!r}, 65534, 65534)
+                        runtime._runner_identity = lambda: (65534, 65534)
+                        real_write = runtime._write_json_atomic
+                        def write_runner_owned(path, payload):
+                            real_write(path, payload)
+                            os.chown(path, 65534, 65534)
+                            os.chown(path.parent, 65534, 65534)
+                        runtime._write_json_atomic = write_runner_owned
+                    runtime.run_supervised(
                         worker_command=(sys.executable, {str(script)!r}),
                         report_path=Path({str(root / 'final.json')!r}),
                         worker_report_path=Path({str(root / 'child.json')!r}),
@@ -599,7 +616,6 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 while time.monotonic() < deadline and not (root / 'worker.started').exists():
                     time.sleep(0.01)
                 self.assertTrue((root / 'pdeath.heartbeat').exists())
-                heartbeat_before = (root / 'pdeath.heartbeat').read_text()
                 os.kill(process.pid, signal.SIGKILL)
                 process.wait(timeout=3)
                 time.sleep(0.25)
@@ -614,14 +630,16 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
     def test_namespace_probe_is_explicit_and_has_no_unsafe_fallback(self) -> None:
         with patch.dict('os.environ', {'PLATFORM_LOAD_UNSHARE': '/definitely/missing'}, clear=False):
             result = probe_pid_namespace_capability(timeout_seconds=0.2)
-        self.assertFalse(result['available'])
-        # The path override is intentionally ignored.  Root callers are a
-        # local capability-test block, never an unsafe fallback to a root
-        # worker; hosted non-root runners exercise the exact sudo chain.
+        # The path override is intentionally ignored. Root callers fail closed
+        # before probing, while supported hosted non-root runners prove the
+        # exact sudo/setpriv/unshare chain and return the canonical contract.
         if os.getuid() == 0:
+            self.assertFalse(result['available'])
             self.assertEqual(result['reason'], 'runner_must_be_nonroot')
         else:
-            self.assertNotEqual(result['reason'], 'unshare_unavailable')
+            self.assertTrue(result['available'])
+            self.assertEqual(result['protocol'], 'stdio')
+            self.assertEqual(result['unshare'], '/usr/bin/unshare')
 
     def test_namespace_command_is_exact_root_drop_without_user_namespace(self) -> None:
         command = _namespace_command(
@@ -646,6 +664,12 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             "--pdeathsig=SIGKILL", "--", "/usr/bin/python3",
             "/checkout/platform_load_namespace.py", "--mode", "namespace-worker",
         ])
+        watchdog_source = (
+            Path(__file__).resolve().parents[1] / "tools/platform_load_namespace.py"
+        )
+        source = watchdog_source.read_text(encoding="utf-8")
+        self.assertIn("SYSTEM_SETPRIV", source)
+        self.assertIn('"--pdeathsig"', source)
 
     def test_report_schema_requires_namespace_closed_and_timeout_reason_is_primary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -79,8 +79,11 @@ all capability fields and `NoNewPrivs=1`.
 The scenario deadline and whole-runner deadline select one absolute monotonic
 wall deadline. A bounded reserve inside that deadline covers wrapper wait,
 `TERM`/`KILL`, captured-chain and namespace reaping, child-report read/validation
-and atomic publication; every phase checks the deadline before and after its
-bounded work. A blocked DNS/socket/body read or future is terminated with
+and atomic publication; it includes a one-second post-watchdog-KILL reap
+interval for the hosted sudo monitor to reparent and for PID1/captured-chain
+reap, in addition to the configured TERM grace. Every phase checks the
+deadline before and after its bounded work; a short authored window fails
+closed rather than borrowing time from teardown. A blocked DNS/socket/body read or future is terminated with
 `TERM`, then `KILL` after only the remaining grace. The supervisor tracks the
 complete wrapper chain and namespace PID by pidfd/start-time, waits for the
 wrapper, reaps a zombie namespace PID 1 when necessary, and requires namespace
@@ -105,7 +108,11 @@ setuid sudo exec may clear a parent-death signal, the non-root
 watchdog keeps the supervisor pidfd outside the privileged chain and
 identity-signals the entire captured sudo/setpriv/unshare descendant chain if
 that pidfd closes. This is a reclaim guard, not a process-group fallback; the
-namespace worker and inner setpriv also arm `SIGKILL` parent-death handling.
+watchdog wraps sudo in the absolute system `setpriv --pdeathsig SIGKILL`
+where the system implementation preserves that signal. PID1 pidfd signalling,
+start-time checks and bounded full-chain reap remain mandatory proofs when
+setuid sudo clears it; the namespace worker and inner setpriv also arm
+`SIGKILL` parent-death handling.
 
 Load/QA evidence is a fixed, privacy-bounded set: route classes/templates,
 numeric timings/counts/statuses and allowlisted error/backend/wait classes. It

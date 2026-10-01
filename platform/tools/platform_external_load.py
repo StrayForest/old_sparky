@@ -33,7 +33,6 @@ try:
     from tools.platform_http_transport import HTTP11KeepAliveClient
     from tools.platform_load_runtime import (
         LoadRuntimeBudget,
-        LoadRuntimeBudgetExceeded,
     )
     from tools.platform_load_acceptance import (
         derive_expected_phase_plan,
@@ -42,7 +41,7 @@ try:
     )
 except ModuleNotFoundError:  # Direct execution from platform/tools.
     from platform_http_transport import HTTP11KeepAliveClient
-    from platform_load_runtime import LoadRuntimeBudget, LoadRuntimeBudgetExceeded
+    from platform_load_runtime import LoadRuntimeBudget
     from platform_load_acceptance import (
         derive_expected_phase_plan,
         evaluate_acceptance,

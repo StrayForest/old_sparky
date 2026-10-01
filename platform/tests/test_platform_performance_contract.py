@@ -35,7 +35,6 @@ from tools.platform_load import (
     get_profile,
     load_profiles,
     profile_contract,
-    run_profile,
     run_profile_worker,
     validate_profile,
     _run_external_load_or_report,

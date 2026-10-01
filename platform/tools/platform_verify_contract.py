@@ -2075,8 +2075,12 @@ def collect_issues() -> list[str]:
             "os.fork()",
             "os.setsid()",
             "nested-descendant",
+            "double-fork-grandchild",
             "starttime",
             "heartbeat",
+            "descendants_reaped",
+            "runtime_supervisor",
+            "max_duration_seconds=8.0",
         ):
             if marker not in canary_text:
                 issues.append(f"load containment canary is missing marker: {marker}")

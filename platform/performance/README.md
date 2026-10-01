@@ -56,8 +56,12 @@ with every retained result.
 deadline. A bounded reserve inside that deadline covers worker startup,
 wrapper wait, TERM/KILL, captured-chain and namespace reaping, report
 read/validation/publication and the final acceptance gate; no teardown phase
-extends the budget. The deadline starts before the trace and first measured
-I/O.
+extends the budget. The reserve includes a one-second post-watchdog-KILL reap
+interval for the hosted-runner sudo monitor to reparent and for the supervisor
+to reap the namespace PID1 and captured chain, in addition to the configured
+TERM grace; short profiles therefore fail closed rather than spending their
+entire wall budget on measured work. The deadline starts before the trace and
+first measured I/O.
 
 `platform_load.py run` is only a supervisor. On the pinned `ubuntu-24.04`
 runner it first probes the mandatory Linux PID-namespace contour, then starts
@@ -89,9 +93,13 @@ emergency barrier. Linux namespace workers set `PR_SET_PDEATHSIG=SIGKILL` as
 an orphan guard. A non-root pidfd watchdog additionally reclaims the complete
 sudo/setpriv/unshare descendant chain when the supervisor disappears, because
 a setuid sudo exec may clear the signal across that transition. The hosted
-canary creates a TERM-ignoring setsid/double-fork/nested descendant tree,
-records outer PID/start-time identities and proves heartbeat plus every
-captured identity stop after closure.
+canary uses an eight-second synthetic window with teardown margin, creates a
+TERM-ignoring setsid/double-fork/nested descendant tree, records outer
+PID/start-time identities and proves heartbeat plus every captured identity
+stop after closure. The non-root watchdog wraps sudo in the absolute system
+`setpriv --pdeathsig SIGKILL` where the system implementation preserves that
+signal; PID1 pidfd signalling and the bounded full-chain reap remain the
+authoritative closure proof when setuid sudo clears it.
 
 DNS resolution, TCP connect, TLS, request writes, response headers/body,
 retry backoff and executor futures all consume the same absolute budget. The

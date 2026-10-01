@@ -21,6 +21,7 @@ import time
 try:
     from tools.platform_load_runtime import (
         NamespaceIntegrityError,
+        SYSTEM_SETPRIV,
         _assert_namespace_worker_identity,
         _namespace_command,
         _pidfd_is_live,
@@ -32,6 +33,7 @@ try:
 except ModuleNotFoundError:  # Direct execution from platform/tools.
     from platform_load_runtime import (  # type: ignore[no-redef]
         NamespaceIntegrityError,
+        SYSTEM_SETPRIV,
         _assert_namespace_worker_identity,
         _namespace_command,
         _pidfd_is_live,
@@ -124,6 +126,18 @@ def _wrapper_watchdog(args: argparse.Namespace) -> int:
         expected_uid=int(payload["runner_uid"]),
         expected_gid=int(payload["runner_gid"]),
     )
+    # Keep a non-root setpriv process between the checkout watchdog and sudo.
+    # The setuid sudo exec is allowed to clear PDEATHSIG; this outer system
+    # setpriv therefore cannot be the final proof by itself, but it preserves
+    # the requested signal contract for sudo implementations that exec in
+    # place.  The PID1 pidfd and bounded chain reap remain authoritative.
+    command = [
+        SYSTEM_SETPRIV,
+        "--pdeathsig",
+        "SIGKILL",
+        "--",
+        *command,
+    ]
     child_pid = os.fork()
     if child_pid == 0:
         try:

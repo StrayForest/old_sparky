@@ -27,7 +27,6 @@ from tools.platform_load import (
     get_profile,
     load_profiles,
     profile_digest,
-    run_profile,
     run_profile_worker,
     validate_profile,
 )

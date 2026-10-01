@@ -47,6 +47,12 @@ DEFAULT_TERM_GRACE_SECONDS = 1.0
 DEFAULT_POLL_SECONDS = 0.02
 DEFAULT_NAMESPACE_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_NAMESPACE_CAPTURE_TIMEOUT_SECONDS = 5.0
+# GitHub-hosted sudo is a monitor process.  After the non-root watchdog is
+# terminated, the root sudo/setpriv/unshare chain can need a bounded
+# reparent-and-reap interval before its pidfd/start-time records close. Keep a
+# full second *after* watchdog KILL inside the authored wall deadline; never
+# extend the deadline.
+MIN_NAMESPACE_REAP_GRACE_SECONDS = 1.0
 MAX_CHILD_REPORT_BYTES = 16 * 1024 * 1024
 MAX_REASON_LENGTH = 96
 _SAFE_REASON = frozenset({"none", "max_duration_seconds", "max_runner_minutes"})
@@ -346,16 +352,22 @@ def _assert_namespace_worker_identity(expected_uid: int, expected_gid: int) -> N
     if os.getgroups() != []:
         raise NamespaceIntegrityError("namespace worker supplementary groups remain")
     status = _read_proc_status()
-    for field in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
-        value = status.get(field)
+    for capability_field in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
+        value = status.get(capability_field)
         if value is None:
-            raise NamespaceIntegrityError(f"namespace worker capability field missing: {field}")
+            raise NamespaceIntegrityError(
+                f"namespace worker capability field missing: {capability_field}"
+            )
         try:
             zero = int(value, 16) == 0
         except ValueError as exc:
-            raise NamespaceIntegrityError(f"namespace worker capability field malformed: {field}") from exc
+            raise NamespaceIntegrityError(
+                f"namespace worker capability field malformed: {capability_field}"
+            ) from exc
         if not zero:
-            raise NamespaceIntegrityError(f"namespace worker capability field is non-zero: {field}")
+            raise NamespaceIntegrityError(
+                f"namespace worker capability field is non-zero: {capability_field}"
+            )
     if status.get("NoNewPrivs") != "1":
         raise NamespaceIntegrityError("namespace worker NoNewPrivs is not 1")
 
@@ -1269,7 +1281,10 @@ def run_supervised(
     # timeout.  Without it, a worker that reaches the deadline would leave no
     # budget in which to prove namespace closure.
     teardown_reserve = min(
-        max(grace + max(0.1, poll * 4.0), 0.25),
+        max(
+            grace + max(0.1, poll * 4.0),
+            grace + MIN_NAMESPACE_REAP_GRACE_SECONDS,
+        ),
         max(duration, runner_minutes * 60.0),
     )
     worker_deadline = wall_deadline - teardown_reserve

@@ -114,25 +114,48 @@ jobs:
                   worker_command=("/usr/bin/python3", str(worker)),
                   report_path=root / "final.json",
                   worker_report_path=root / "child.json",
-                  max_duration_seconds=2.0,
-                  max_runner_minutes=0.1,
+                  max_duration_seconds=8.0,
+                  max_runner_minutes=1.0,
                   worker_config={"heartbeat": str(heartbeat), "identities": str(identities)},
-                  term_grace_seconds=0.1,
+                  term_grace_seconds=0.5,
                   poll_seconds=0.01,
               )
               if result.reason != "max_duration_seconds":
                   raise SystemExit(f"unexpected canary reason: {result.reason}")
+              final_report = root / "final.json"
+              records = []
+              identity_parse_errors = []
+              if identities.exists():
+                  for line_number, line in enumerate(
+                      identities.read_text(encoding="ascii").splitlines(), 1
+                  ):
+                      if not line:
+                          continue
+                      try:
+                          records.append(json.loads(line))
+                      except json.JSONDecodeError:
+                          identity_parse_errors.append(line_number)
               if result.namespace_closed is not True:
-                  raise SystemExit("synthetic descendants did not reach namespace_closed=true")
+                  diagnostics = {
+                      "reason": result.reason,
+                      "returncode": result.returncode,
+                      "namespace_closed": result.namespace_closed,
+                      "namespace_init_pid": result.namespace_init_pid,
+                      "descendants_reaped": result.descendants_reaped,
+                      "runtime_supervisor": result.report.get("runtime_supervisor"),
+                      "runtime_budget": result.report.get("runtime_budget"),
+                      "final_report_exists": final_report.is_file(),
+                      "identities": records,
+                      "identity_parse_errors": identity_parse_errors,
+                  }
+                  raise SystemExit(
+                      "synthetic descendants did not reach namespace_closed=true: "
+                      + json.dumps(diagnostics, sort_keys=True)
+                  )
               before = heartbeat.read_text(encoding="ascii")
               time.sleep(0.15)
               if heartbeat.read_text(encoding="ascii") != before:
                   raise SystemExit("synthetic descendant survived containment teardown")
-              records = [
-                  json.loads(line)
-                  for line in identities.read_text(encoding="ascii").splitlines()
-                  if line
-              ]
               roles = {record.get("role") for record in records}
               required_roles = {
                   "worker-pid1",
