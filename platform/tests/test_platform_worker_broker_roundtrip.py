@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import ipaddress
 import json
 import os
@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from typing import TypeVar
 from unittest.mock import patch
@@ -67,6 +68,9 @@ class CleanupFailure(AssertionError):
 
 
 MAX_CLEANUP_EVIDENCE = 64
+_ALLOWED_SYSTEM_EXIT_CODES = frozenset({0, 1, 2})
+_SAFE_SYSTEM_EXIT_CODE = 1
+_SAFE_KEYBOARD_INTERRUPT_MESSAGE = "cleanup cancellation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,10 +92,31 @@ class _CleanupEvidence:
 
 @dataclass(frozen=True, slots=True)
 class _CleanupReport:
-    """All bounded cleanup evidence, including a fatal cancellation if any."""
+    """All bounded cleanup evidence, including safe fatal metadata."""
 
     evidence: tuple[_CleanupEvidence, ...]
-    fatal_exception: BaseException | None = None
+    fatal_kind: str | None = None
+    fatal_exit_code: int | None = None
+
+    def __post_init__(self) -> None:
+        # Keep the report safe even if a future caller constructs it directly:
+        # only the two static cancellation kinds and conventional numeric exit
+        # statuses are representable, never an exception object or its text.
+        safe_kind = (
+            self.fatal_kind
+            if isinstance(self.fatal_kind, str)
+            and self.fatal_kind in {"keyboard-interrupt", "system-exit"}
+            else None
+        )
+        safe_exit_code = (
+            self.fatal_exit_code
+            if safe_kind == "system-exit"
+            and type(self.fatal_exit_code) is int
+            and self.fatal_exit_code in _ALLOWED_SYSTEM_EXIT_CODES
+            else None
+        )
+        object.__setattr__(self, "fatal_kind", safe_kind)
+        object.__setattr__(self, "fatal_exit_code", safe_exit_code)
 
     def __iter__(self):
         return iter(self.evidence)
@@ -100,7 +125,7 @@ class _CleanupReport:
         return len(self.evidence)
 
     def __bool__(self) -> bool:
-        return bool(self.evidence) or self.fatal_exception is not None
+        return bool(self.evidence) or self.fatal_kind is not None
 
 
 _CLEANUP_STAGE_ALLOWLIST = frozenset(
@@ -126,6 +151,39 @@ _CLEANUP_STAGE_ALLOWLIST = frozenset(
         "shielded worker log state",
     }
 )
+
+def _fatal_exception_metadata(
+    exc: BaseException,
+) -> tuple[str, int | None] | None:
+    """Return only allowlisted cancellation metadata, never the exception."""
+
+    if isinstance(exc, KeyboardInterrupt):
+        return ("keyboard-interrupt", None)
+    if isinstance(exc, SystemExit):
+        code = exc.code
+        if type(code) is int and code in _ALLOWED_SYSTEM_EXIT_CODES:
+            return ("system-exit", code)
+        return ("system-exit", None)
+    return None
+
+
+def _new_safe_fatal_exception(
+    fatal_kind: str,
+    fatal_exit_code: int | None,
+) -> BaseException:
+    """Construct a cancellation without copying any attacker-controlled text."""
+
+    if fatal_kind == "keyboard-interrupt":
+        return KeyboardInterrupt(_SAFE_KEYBOARD_INTERRUPT_MESSAGE)
+    if fatal_kind == "system-exit":
+        code = (
+            fatal_exit_code
+            if type(fatal_exit_code) is int
+            and fatal_exit_code in _ALLOWED_SYSTEM_EXIT_CODES
+            else _SAFE_SYSTEM_EXIT_CODE
+        )
+        return SystemExit(code)
+    return CleanupFailure("cleanup cancellation")
 
 
 def _cleanup_exception_code(exc: BaseException) -> str:
@@ -161,6 +219,14 @@ def _cleanup_evidence(
         safe_code = _cleanup_exception_code(exc)
     else:
         safe_code = code if code in {
+            "keyboard-interrupt",
+            "system-exit",
+            "foreign-redis-key",
+            "timeout",
+            "cleanup-failure",
+            "process-lookup",
+            "runtime-error",
+            "base-exception",
             "process-group-missing",
             "process-live",
             "postcondition-unproven",
@@ -849,7 +915,7 @@ def _shielded_worker_finalizer(
 
     send_signal = send_signal or os.killpg
     errors: list[_CleanupEvidence] = []
-    fatal_exception: BaseException | None = None
+    fatal_metadata: tuple[str, int | None] | None = None
 
     def attempt(
         label: str,
@@ -857,6 +923,7 @@ def _shielded_worker_finalizer(
         *,
         ignore_process_lookup: bool = False,
     ) -> object | None:
+        nonlocal fatal_metadata
         try:
             return _best_effort_bounded_call(
                 operation,
@@ -868,8 +935,8 @@ def _shielded_worker_finalizer(
                 errors.append(_cleanup_evidence(label, code="process-group-missing"))
         except BaseException as exc:
             errors.append(_cleanup_evidence(label, exc=exc))
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)) and fatal_exception is None:
-                fatal_exception = exc
+            if fatal_metadata is None:
+                fatal_metadata = _fatal_exception_metadata(exc)
         return None
 
     if process is not None:
@@ -924,14 +991,16 @@ def _shielded_worker_finalizer(
                 errors.append(_cleanup_evidence("shielded worker log state", code="drain-error"))
         except BaseException as exc:
             errors.append(_cleanup_evidence("shielded worker log state", exc=exc))
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)) and fatal_exception is None:
-                fatal_exception = exc
+            if fatal_metadata is None:
+                fatal_metadata = _fatal_exception_metadata(exc)
     elif process is not None and process.stdout is not None:
         attempt("shielded worker stdout close", process.stdout.close)
 
+    fatal_kind, fatal_exit_code = fatal_metadata or (None, None)
     return _CleanupReport(
         evidence=_dedupe_cleanup_evidence(errors),
-        fatal_exception=fatal_exception,
+        fatal_kind=fatal_kind,
+        fatal_exit_code=fatal_exit_code,
     )
 
 
@@ -990,13 +1059,13 @@ def _cleanup_roundtrip_resources(
     """Run shielded process, Redis and temporary-state cleanup phases."""
 
     errors: list[_CleanupEvidence] = []
-    fatal_exception: BaseException | None = None
+    fatal_metadata: tuple[str, int | None] | None = None
 
     def note_error(label: str, exc: BaseException) -> None:
-        nonlocal fatal_exception
+        nonlocal fatal_metadata
         errors.append(_cleanup_evidence(label, exc=exc))
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)) and fatal_exception is None:
-            fatal_exception = exc
+        if fatal_metadata is None:
+            fatal_metadata = _fatal_exception_metadata(exc)
 
     process_cleanup_failed = False
     if process is not None:
@@ -1046,8 +1115,11 @@ def _cleanup_roundtrip_resources(
                 send_signal=send_signal,
             )
             errors.extend(finalizer_report.evidence)
-            if finalizer_report.fatal_exception is not None and fatal_exception is None:
-                fatal_exception = finalizer_report.fatal_exception
+            if fatal_metadata is None and finalizer_report.fatal_kind is not None:
+                fatal_metadata = (
+                    finalizer_report.fatal_kind,
+                    finalizer_report.fatal_exit_code,
+                )
         except BaseException as exc:
             note_error("worker finalizer", exc)
 
@@ -1113,9 +1185,11 @@ def _cleanup_roundtrip_resources(
             except BaseException as exc:
                 note_error("temporary-directory cleanup", exc)
 
+    fatal_kind, fatal_exit_code = fatal_metadata or (None, None)
     return _CleanupReport(
         evidence=_dedupe_cleanup_evidence(errors),
-        fatal_exception=fatal_exception,
+        fatal_kind=fatal_kind,
+        fatal_exit_code=fatal_exit_code,
     )
 
 
@@ -1146,32 +1220,42 @@ def _finish_roundtrip_cleanup(
         evidence.append(_cleanup_evidence("cleanup", exc=cleanup_exception))
     evidence = list(_dedupe_cleanup_evidence(evidence))
 
-    if cleanup_report.fatal_exception is not None and not any(
-        item.code == _cleanup_exception_code(cleanup_report.fatal_exception)
-        for item in evidence
+    if cleanup_report.fatal_kind is not None and not any(
+        item.code == cleanup_report.fatal_kind for item in evidence
     ):
         evidence.append(
-            _cleanup_evidence("cleanup", exc=cleanup_report.fatal_exception)
+            _cleanup_evidence("cleanup", code=cleanup_report.fatal_kind)
         )
         evidence = list(_dedupe_cleanup_evidence(evidence))
+
+    fatal_kind = cleanup_report.fatal_kind
+    fatal_exit_code = cleanup_report.fatal_exit_code
+    if fatal_kind is None and cleanup_exception is not None:
+        fatal_metadata = _fatal_exception_metadata(cleanup_exception)
+        if fatal_metadata is not None:
+            fatal_kind, fatal_exit_code = fatal_metadata
 
     if evidence:
         evidence_note = _render_cleanup_evidence(evidence)
         if primary_exception is not None:
             primary_exception.add_note(evidence_note)
-        elif cleanup_exception is not None:
-            cleanup_exception.add_note(evidence_note)
-        elif cleanup_report.fatal_exception is not None:
-            cleanup_report.fatal_exception.add_note(evidence_note)
-        else:
-            raise CleanupFailure(evidence_note)
+    else:
+        evidence_note = "roundtrip cleanup evidence: cleanup [cleanup-failure]"
 
     if primary_exception is not None:
         return
-    if cleanup_report.fatal_exception is not None:
-        raise cleanup_report.fatal_exception
+    if fatal_kind is not None:
+        safe_exception = _new_safe_fatal_exception(fatal_kind, fatal_exit_code)
+        safe_exception.add_note(evidence_note)
+        raise safe_exception from None
     if cleanup_exception is not None:
-        raise cleanup_exception
+        safe_exception = CleanupFailure("roundtrip cleanup failed")
+        safe_exception.add_note(evidence_note)
+        raise safe_exception from None
+    if evidence:
+        safe_exception = CleanupFailure("roundtrip cleanup failed")
+        safe_exception.add_note(evidence_note)
+        raise safe_exception from None
 
 
 def _assert_safe_redis_mutation_targets(
@@ -2228,8 +2312,18 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
         self.assertFalse(run_root.exists())
 
     def test_cleanup_reraises_keyboard_interrupt_after_shielded_finalization(self) -> None:
-        for fatal_type in (KeyboardInterrupt, SystemExit):
-            with self.subTest(fatal_type=fatal_type.__name__):
+        fatal_cases = (
+            KeyboardInterrupt("SUPERSECRET/PRIVATE-LOG"),
+            SystemExit("SUPERSECRET/PRIVATE-LOG"),
+            SystemExit(2),
+            SystemExit(99),
+        )
+        for fatal_exception in fatal_cases:
+            fatal_type = type(fatal_exception)
+            with self.subTest(
+                fatal_type=fatal_type.__name__,
+                fatal_code=getattr(fatal_exception, "code", None),
+            ):
                 process = _FakeProcess()
                 broker = _MemoryRedis({b"owned"})
                 run_root = Path(tempfile.mkdtemp(prefix="platform-celery-primary-"))
@@ -2237,9 +2331,9 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
                 try:
                     with patch(
                         __name__ + "._terminate_worker_process",
-                        side_effect=fatal_type("operator cancellation"),
+                        side_effect=fatal_exception,
                     ):
-                        with self.assertRaises(fatal_type):
+                        with self.assertRaises(fatal_type) as raised:
                             _finish_roundtrip_cleanup(
                                 lambda: _cleanup_roundtrip_resources(
                                     process=process,
@@ -2257,6 +2351,28 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
                                 ),
                                 primary_exception=None,
                             )
+
+                    if fatal_type is KeyboardInterrupt:
+                        self.assertEqual(str(raised.exception), "cleanup cancellation")
+                    else:
+                        expected_code = (
+                            fatal_exception.code
+                            if type(fatal_exception.code) is int
+                            and fatal_exception.code in _ALLOWED_SYSTEM_EXIT_CODES
+                            else _SAFE_SYSTEM_EXIT_CODE
+                        )
+                        self.assertEqual(raised.exception.code, expected_code)
+                    self.assertIsNot(raised.exception, fatal_exception)
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertIsNone(raised.exception.__context__)
+                    self.assertTrue(raised.exception.__suppress_context__)
+                    formatted = "".join(traceback.format_exception(raised.exception))
+                    self.assertNotIn("SUPERSECRET", repr(raised.exception))
+                    self.assertNotIn("PRIVATE-LOG", repr(raised.exception))
+                    self.assertNotIn("SUPERSECRET", str(raised.exception))
+                    self.assertNotIn("PRIVATE-LOG", str(raised.exception))
+                    self.assertNotIn("SUPERSECRET", formatted)
+                    self.assertNotIn("PRIVATE-LOG", formatted)
 
                     self.assertFalse(process.running)
                     self.assertEqual(broker.keys, set())
@@ -2400,8 +2516,13 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
         second_evidence = tuple(item.render() for item in second_report.evidence)
 
         self.assertEqual(first_evidence, second_evidence)
-        self.assertEqual(type(first_report.fatal_exception).__name__, "KeyboardInterrupt")
-        self.assertEqual(type(second_report.fatal_exception).__name__, "KeyboardInterrupt")
+        self.assertEqual(first_report.fatal_kind, "keyboard-interrupt")
+        self.assertIsNone(first_report.fatal_exit_code)
+        self.assertEqual(second_report.fatal_kind, "keyboard-interrupt")
+        self.assertIsNone(second_report.fatal_exit_code)
+        serialized = repr(first_report) + str(first_report) + repr(asdict(first_report))
+        self.assertNotIn("SUPERSECRET", serialized)
+        self.assertNotIn("PRIVATE-LOG", serialized)
         self.assertEqual(len(first_evidence), len(set(first_evidence)))
         self.assertLessEqual(len(first_evidence), MAX_CLEANUP_EVIDENCE)
         self.assertTrue(
