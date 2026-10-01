@@ -161,12 +161,18 @@ they do not derive expected ownership from production code.
 The `backend-integration` contour additionally runs one ephemeral Celery
 worker with the official CLI, `pool=solo`, concurrency `1`, no embedded beat
 and no schedule/state file. It proves broker DB13 -> worker -> safe
-`platform.ping` -> result DB14 roundtrips on each high/default/low queue and
-checks the registered task and active queue control-plane views. The pure
-test-resource validator requires application Redis DB15, broker DB13 and
-result DB14 on loopback; these are namespace conventions only, not a Redis
-security boundary. The worker subprocess has a bounded readiness/roundtrip
-window and is always TERM/KILL/reaped with exact temporary-state cleanup.
+test-only liveness probe -> result DB14 roundtrips on each high/default/low
+route and checks the registered task and active queue control-plane views.
+The probe routes through Celery's router into cryptographically unique
+per-run queues; broker evidence observes Kombu Redis priority-step keys, not
+just a base-queue length. The pure test-resource validator requires
+application Redis DB15, broker DB13 and result DB14 on loopback; these are
+namespace conventions only, not a Redis security boundary. DB13/14 must be
+empty before a run, and cleanup deletes only observed or exact run-allowlisted
+queue, priority, binding, unacked, pidbox and result keys; it never uses
+`FLUSHDB` and refuses foreign-key sentinels. The worker subprocess has a
+bounded readiness/roundtrip window and is always TERM/KILL/reaped with exact
+temporary-state cleanup.
 Pull-request evidence for this contour is attributed to the workflow's tested
 merge-candidate SHA (the PR merge run), not to the source-head SHA. Exact
 source identity remains enforced by the existing checkout/tree/digest
