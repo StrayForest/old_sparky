@@ -5,6 +5,26 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SYSTEMD_SRC_DIR="$ROOT_DIR/deploy/systemd"
 SYSTEMD_DEST_DIR="${PLATFORM_SYSTEMD_DIR:-/etc/systemd/system}"
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
+SYSTEMCTL_BIN="${PLATFORM_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
+JOURNALCTL_BIN="${PLATFORM_JOURNALCTL_BIN:-/usr/bin/journalctl}"
+SYSTEMD_TIMEOUT_BIN="/usr/bin/timeout"
+SYSTEMD_TIMEOUT_SECONDS=30
+
+# Keep maintenance manager calls under the same bounded helper contract as the
+# normal unit installer.  A wedged systemd/journald manager must fail the
+# installation promptly and leave the caller's durable release state intact.
+run_systemd_command() {
+  "$SYSTEMD_TIMEOUT_BIN" --signal=TERM --kill-after=5s \
+    "${SYSTEMD_TIMEOUT_SECONDS}s" "$@"
+}
+
+run_systemctl() {
+  run_systemd_command "$SYSTEMCTL_BIN" "$@"
+}
+
+run_journalctl() {
+  run_systemd_command "$JOURNALCTL_BIN" "$@"
+}
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Platform maintenance installation must run as root." >&2
@@ -30,11 +50,11 @@ if [[ -f "$APP_DIR/shared/.env.platform" ]]; then
   chmod 0600 "$APP_DIR/shared/.env.platform"
 fi
 
-systemctl daemon-reload
-systemctl enable --now deadlock-maintenance.timer deadlock-logrotate.timer
-journalctl --rotate
-journalctl --vacuum-time=30d
-journalctl --vacuum-size=256M
+run_systemctl daemon-reload
+run_systemctl enable --now deadlock-maintenance.timer deadlock-logrotate.timer
+run_journalctl --rotate
+run_journalctl --vacuum-time=30d
+run_journalctl --vacuum-size=256M
 
 cat <<EOF
 Platform maintenance installed.

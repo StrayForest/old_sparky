@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from itertools import permutations
 import os
 from pathlib import Path
 import shutil
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tools import platform_release_systemd_state as release_state
 from tools import platform_systemd_timer_contract as contract
 
 
@@ -191,6 +193,7 @@ class _SystemdInstallerHarness:
             "PLATFORM_SYSTEMD_DIR": str(self.destination),
             "PLATFORM_APP_DIR": str(self.app),
             "PLATFORM_SYSTEMCTL_BIN": str(self.systemctl),
+            "PLATFORM_JOURNALCTL_BIN": str(self.journalctl),
             "PLATFORM_JOURNALD_DIR": str(self.root / "etc" / "systemd" / "journald.conf.d"),
             "PLATFORM_RSYSLOG_DIR": str(self.root / "etc" / "rsyslog.d"),
             "PLATFORM_LOGROTATE_DIR": str(self.root / "etc" / "logrotate.d"),
@@ -247,11 +250,74 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
     def test_unit_graph_schedule_and_failure_policy(self) -> None:
         units = contract.validate_all()
         self.assertEqual(set(units), set(contract.EXPECTED_UNITS))
+        self.assertEqual(
+            contract.EXPECTED_SERVICES,
+            contract.LONG_RUNNING_SERVICES + contract.ONESHOT_SERVICES,
+        )
+        self.assertEqual(
+            set(contract.LONG_RUNNING_SERVICES),
+            {
+                "deadlock-api.service",
+                "deadlock-worker.service",
+                "deadlock-web.service",
+            },
+        )
+        self.assertEqual(
+            set(contract.ONESHOT_SERVICES),
+            {
+                "deadlock-maintenance.service",
+                "deadlock-logrotate.service",
+                "deadlock-offsite-backup.service",
+                "deadlock-cloudflare-ips.service",
+                "deadlock-health-monitor.service",
+            },
+        )
         self.assertNotIn(contract.OFFSITE_TIMER, contract.EXPECTED_SYSTEMD_INSTALL_ENABLE[1])
         self.assertNotRegex(
             "\n".join(unit.text for unit in units.values()),
             contract._FORBIDDEN_MARKERS,
         )
+
+    def test_service_contract_is_explicit_and_worker_has_no_startup_refresh_hook(self) -> None:
+        units = contract.validate_all()
+        self.assertEqual(
+            set(contract._EXPECTED_SERVICE_SECTIONS),
+            set(contract.EXPECTED_SERVICES),
+        )
+        self.assertEqual(
+            units["deadlock-worker.service"].values("Service", "ExecStartPost"),
+            (),
+        )
+        for service_name in contract.LONG_RUNNING_SERVICES:
+            service = units[service_name]
+            self.assertEqual(service.one("Service", "Type"), "simple")
+            self.assertEqual(len(service.values("Service", "ExecStart")), 1)
+            self.assertEqual(
+                len(service.values("Service", "Environment")),
+                5,
+            )
+            self.assertEqual(service.one("Service", "RestartSec"), "5")
+        for service_name in contract.ONESHOT_SERVICES:
+            self.assertEqual(
+                units[service_name].one("Service", "Type"),
+                "oneshot",
+            )
+
+    def test_inventory_matches_release_state_and_both_installers(self) -> None:
+        self.assertEqual(tuple(release_state.OWNED_UNITS), contract.EXPECTED_UNITS)
+        systemd_installer = SYSTEMD_INSTALLER.read_text(encoding="utf-8")
+        maintenance_installer = MAINTENANCE_INSTALLER.read_text(encoding="utf-8")
+        for unit_name in contract.EXPECTED_UNITS:
+            self.assertIn(unit_name, systemd_installer)
+        for unit_name in (
+            "deadlock-maintenance.service",
+            "deadlock-maintenance.timer",
+            "deadlock-offsite-backup.service",
+            "deadlock-offsite-backup.timer",
+            "deadlock-logrotate.service",
+            "deadlock-logrotate.timer",
+        ):
+            self.assertIn(unit_name, maintenance_installer)
 
     def test_parser_rejects_missing_target_and_schedule_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -547,6 +613,72 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
                     with self.assertRaisesRegex(contract.SystemdContractError, "fail closed"):
                         contract.validate_all(root)
 
+    def test_ignored_exec_prefix_detector_covers_all_systemd_combinations(self) -> None:
+        markers = ("@", ":", "+", "!", "!!", "-")
+        prefixes = {
+            "".join(parts)
+            for length in range(1, len(markers) + 1)
+            for parts in permutations(markers, length)
+            if "-" in parts
+        }
+        self.assertGreater(len(prefixes), 100)
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                self.assertTrue(
+                    contract._has_ignored_exec_prefix(prefix + "/bin/true")
+                )
+        for prefix in ("", "@", ":", "+", "!", "!!", "@:+!!"):
+            with self.subTest(prefix=prefix, no_ignore=True):
+                self.assertFalse(
+                    contract._has_ignored_exec_prefix(prefix + "/bin/true")
+                )
+
+    def test_failure_contract_scans_every_exec_lifecycle_directive(self) -> None:
+        directives = (
+            "ExecStartPre",
+            "ExecStartPost",
+            "ExecStartReload",
+            "ExecStop",
+            "ExecStopPost",
+            "ExecCondition",
+        )
+        for directive in directives:
+            with self.subTest(directive=directive):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                        shutil.copy2(source, root / source.name)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                        shutil.copy2(source, root / source.name)
+                    service = root / "deadlock-maintenance.service"
+                    with service.open("a", encoding="utf-8") as stream:
+                        stream.write(f"{directive}=+-/bin/true\n")
+                    with self.assertRaisesRegex(
+                        contract.SystemdContractError,
+                        "must fail closed",
+                    ):
+                        contract.validate_all(root)
+
+    def test_failure_contract_scans_condition_prefix_combinations(self) -> None:
+        for prefix in ("-", "+-", "@-", ":-", "!-", "!!-"):
+            with self.subTest(prefix=prefix):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                        shutil.copy2(source, root / source.name)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                        shutil.copy2(source, root / source.name)
+                    service = root / "deadlock-maintenance.service"
+                    with service.open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            f"ConditionPathIsSymbolicLink={prefix}/tmp/not-current\n"
+                        )
+                    with self.assertRaisesRegex(
+                        contract.SystemdContractError,
+                        "must not hide a failure",
+                    ):
+                        contract.validate_all(root)
+
     def test_failure_contract_rejects_encoded_or_ambiguous_execstart_values(self) -> None:
         # systemd decodes these forms before applying command prefixes.  The
         # contract intentionally rejects them instead of maintaining a partial
@@ -586,16 +718,32 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
                     ):
                         contract.validate_all(root)
 
-    def test_failure_contract_models_execstart_reset_and_order(self) -> None:
-        cases = (
-            ("ExecStart=\n", False),
-            ("ExecStart=/bin/true\nExecStart=/bin/false\n", True),
-            ("ExecStart=/bin/true\nExecStart=\n", False),
-            ("ExecStart=-/bin/false\nExecStart=\nExecStart=/bin/true\n", True),
-            ("ExecStart=\nExecStart=-/bin/false\n", False),
+    def test_parser_models_execstart_reset_and_order_before_exact_policy(self) -> None:
+        parsed = contract.parse_unit(
+            Path("deadlock-maintenance.service"),
+            text=(
+                "[Service]\n"
+                "ExecStart=/bin/true\n"
+                "ExecStart=-/bin/false\n"
+                "ExecStart=\n"
+                "ExecStart=/bin/echo ok\n"
+            ),
         )
-        for addition, valid in cases:
-            with self.subTest(addition=addition, valid=valid):
+        self.assertEqual(
+            parsed.effective_resettable_values("Service", "ExecStart"),
+            ("/bin/echo ok",),
+        )
+
+    def test_failure_contract_rejects_execstart_drift(self) -> None:
+        mutations = (
+            "ExecStart=\n",
+            "ExecStart=/bin/true\nExecStart=/bin/false\n",
+            "ExecStart=/bin/true\nExecStart=\n",
+            "ExecStart=-/bin/false\nExecStart=\nExecStart=/bin/true\n",
+            "ExecStart=\nExecStart=-/bin/false\n",
+        )
+        for addition in mutations:
+            with self.subTest(addition=addition):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
                     for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
@@ -607,22 +755,10 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
                         service.read_text(encoding="utf-8") + addition,
                         encoding="utf-8",
                     )
-                    if valid:
-                        units = contract.validate_all(root)
-                        effective = units[service.name].effective_resettable_values(
-                            "Service", "ExecStart"
-                        )
-                        if addition == "ExecStart=/bin/true\nExecStart=/bin/false\n":
-                            self.assertEqual(
-                                effective[-2:], ("/bin/true", "/bin/false")
-                            )
-                        elif addition.startswith("ExecStart=-"):
-                            self.assertEqual(effective, ("/bin/true",))
-                        else:
-                            self.assertGreaterEqual(len(effective), 2)
-                    else:
-                        with self.assertRaisesRegex(contract.SystemdContractError, "ExecStart"):
-                            contract.validate_all(root)
+                    with self.assertRaisesRegex(
+                        contract.SystemdContractError, "ExecStart"
+                    ):
+                        contract.validate_all(root)
 
     def test_installers_have_closed_enable_sets_and_offsite_is_not_enabled(self) -> None:
         systemd_installer = SYSTEMD_INSTALLER.read_text(encoding="utf-8")
@@ -636,9 +772,12 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             systemd_installer,
         )
         self.assertIn(
-            "systemctl enable --now deadlock-maintenance.timer deadlock-logrotate.timer",
+            "run_systemctl enable --now deadlock-maintenance.timer deadlock-logrotate.timer",
             maintenance_installer,
         )
+        self.assertIn("run_journalctl --rotate", maintenance_installer)
+        self.assertIn('SYSTEMD_TIMEOUT_SECONDS=30', maintenance_installer)
+        self.assertIn('--kill-after=5s', maintenance_installer)
         self.assertNotIn(
             f"run_systemctl enable {contract.OFFSITE_TIMER}",
             systemd_installer,
@@ -924,6 +1063,35 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(_read_lines(harness.journalctl_log), [])
+        finally:
+            harness.close()
+
+    def test_maintenance_installer_fails_closed_on_systemctl_timeout(self) -> None:
+        harness = _SystemdInstallerHarness()
+        try:
+            result = harness.run_maintenance(
+                FAKE_SYSTEMCTL_FAIL_ACTION="daemon-reload",
+                FAKE_SYSTEMCTL_FAIL_RC="124",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(_read_lines(harness.systemctl_log), [["daemon-reload"]])
+            self.assertEqual(_read_lines(harness.journalctl_log), [])
+        finally:
+            harness.close()
+
+    def test_maintenance_installer_fails_closed_on_journalctl_timeout(self) -> None:
+        harness = _SystemdInstallerHarness()
+        try:
+            result = harness.run_maintenance(FAKE_JOURNALCTL_RC="124")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                _read_lines(harness.systemctl_log),
+                [
+                    ["daemon-reload"],
+                    ["enable", "--now", *EXPECTED_MAINTENANCE_TIMER_ENABLE],
+                ],
+            )
+            self.assertEqual(_read_lines(harness.journalctl_log), [["--rotate"]])
         finally:
             harness.close()
 
