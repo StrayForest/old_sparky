@@ -48,7 +48,7 @@ jobs:
   validate-external-inputs:
     name: Validate external-load dispatch
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -80,6 +80,37 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Probe mandatory load PID-namespace containment before fixture setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd platform
+          # The runtime probe enforces the exact absolute chain:
+          # /usr/bin/sudo -n /usr/bin/setpriv --pdeathsig SIGKILL --
+          # /usr/bin/unshare --pid --fork --mount-proc --kill-child=SIGKILL,
+          # followed by inner setpriv --no-new-privs --inh-caps=-all
+          # --ambient-caps=-all --bounding-set=-all.
+          env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            /usr/bin/python3 - <<'PY'
+          from tools.platform_load_runtime import probe_pid_namespace_capability
+
+          result = probe_pid_namespace_capability(timeout_seconds=5)
+          if result.get("available") is not True:
+              raise SystemExit(f"mandatory load containment probe failed: {result.get('reason', 'unknown')}")
+          if (
+              result.get("sudo") != "/usr/bin/sudo"
+              or result.get("setpriv") != "/usr/bin/setpriv"
+              or result.get("unshare") != "/usr/bin/unshare"
+              or result.get("protocol") != "stdio"
+              or not isinstance(result.get("runner_uid"), int)
+              or result.get("runner_uid") == 0
+              or not isinstance(result.get("runner_gid"), int)
+              or result.get("runner_gid") == 0
+          ):
+              raise SystemExit("mandatory load containment probe did not prove the exact non-root system chain")
+          print("mandatory load PID namespace containment: available")
+          PY
 
       - name: Validate explicit external production load
         shell: bash
@@ -151,7 +182,7 @@ jobs:
     name: Prepare external fixture with ephemeral SSH
     needs: validate-external-inputs
     if: needs.validate-external-inputs.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     environment: production
     permissions:
@@ -406,8 +437,11 @@ jobs:
       needs.fixture-setup.result == 'success' &&
       needs.fixture-setup.outputs.setup_status == '0' &&
       needs.fixture-setup.outputs.manifest_ready == '1'
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
+    runs-on: ubuntu-24.04
+    # The largest canonical worker budget is 240 minutes.  Keep a 30-minute
+    # runner margin for the mandatory namespace probe, teardown/reap and
+    # atomic report publication before Actions enforces its outer deadline.
+    timeout-minutes: 270
     permissions:
       actions: read
       contents: read
@@ -490,6 +524,33 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+      - name: Probe mandatory load PID-namespace containment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd platform
+          # Repeat the exact sudo/setpriv/unshare capability probe immediately
+          # before candidate execution; there is no unsafe fallback.
+          env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            /usr/bin/python3 - <<'PY'
+          from tools.platform_load_runtime import probe_pid_namespace_capability
+
+          result = probe_pid_namespace_capability(timeout_seconds=5)
+          if result.get("available") is not True:
+              raise SystemExit(f"mandatory load containment probe failed: {result.get('reason', 'unknown')}")
+          if (
+              result.get("sudo") != "/usr/bin/sudo"
+              or result.get("setpriv") != "/usr/bin/setpriv"
+              or result.get("unshare") != "/usr/bin/unshare"
+              or result.get("protocol") != "stdio"
+              or not isinstance(result.get("runner_uid"), int)
+              or result.get("runner_uid") == 0
+              or not isinstance(result.get("runner_gid"), int)
+              or result.get("runner_gid") == 0
+          ):
+              raise SystemExit("mandatory load containment probe did not prove the exact non-root system chain")
+          print("mandatory load PID namespace containment: available")
+          PY
       - name: Validate load manifest before candidate execution
         shell: bash
         run: |
@@ -619,14 +680,106 @@ jobs:
   # Finalization and cleanup use a new approved runner.  They consume only the
   # exact input and a bounded diagnostic-id list; no candidate script runs in
   # this secret-bearing job.
+  namespace-containment-barrier:
+    name: Verify closed external-load namespace boundary
+    needs:
+      - validate-external-inputs
+      - fixture-setup
+      - load-client
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      namespace_closed_status: ${{ steps.namespace-barrier.outputs.namespace_closed_status }}
+      manual_required: ${{ steps.namespace-barrier.outputs.manual_required }}
+    steps:
+      - name: Download candidate report for closure barrier
+        if: ${{ always() && needs.load-client.outputs.candidate_artifact_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-client
+      - name: Enforce mandatory namespace closure before finalizer
+        id: namespace-barrier
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -u
+          status=1
+          report="$RUNNER_TEMP/external-client/external-load.json"
+          if /usr/bin/python3 - "$report" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+              raise SystemExit("candidate report is missing or unsafe")
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          supervisor = payload.get("runtime_supervisor")
+          if (
+              not isinstance(payload, dict)
+              or payload.get("worker_report_schema") != 2
+              or payload.get("report_complete") is not True
+              or type(payload.get("namespace_closed")) is not bool
+              or payload.get("namespace_closed") is not True
+              or not isinstance(supervisor, dict)
+              or supervisor.get("isolation") != "pid_namespace"
+              or supervisor.get("namespace_closed") is not True
+          ):
+              raise SystemExit("candidate report does not prove namespace closure")
+          PY
+          then status=0; fi
+          echo "namespace_closed_status=$status" >> "$GITHUB_OUTPUT"
+          if [[ "$status" == 0 ]]; then
+            echo 'manual_required=0' >> "$GITHUB_OUTPUT"
+            echo 'mandatory namespace closure barrier: PASS'
+          else
+            echo 'manual_required=1' >> "$GITHUB_OUTPUT"
+            echo 'mandatory namespace closure barrier: FAIL; cleanup is blocked and manual emergency handling is required' >&2
+          fi
+          exit 0
+
+  namespace-containment-manual-barrier:
+    name: Expose namespace containment manual barrier
+    needs: namespace-containment-barrier
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      manual_required: ${{ steps.manual-barrier.outputs.manual_required }}
+    steps:
+      - name: Fail visibly when namespace closure is not proven
+        id: manual-barrier
+        shell: bash
+        run: |
+          set -u
+          required='${{ needs.namespace-containment-barrier.outputs.manual_required }}'
+          if [[ "$required" == 0 ]]; then
+            echo 'manual_required=0' >> "$GITHUB_OUTPUT"
+            echo 'namespace containment manual barrier: clear'
+            exit 0
+          fi
+          echo 'manual_required=1' >> "$GITHUB_OUTPUT"
+          echo 'BLOCKED: namespace_closed is missing/false; do not begin or assume fixture cleanup. Follow the emergency/manual retained-fixture abort runbook.' >&2
+          exit 1
+
   fixture-finalize:
     name: Signal fixture completion and collect origin evidence
     needs:
       - validate-external-inputs
       - fixture-setup
       - load-client
+      - namespace-containment-barrier
+      - namespace-containment-manual-barrier
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     environment: production
     permissions:
@@ -643,6 +796,7 @@ jobs:
       cleanup_identity_status: ${{ steps.revalidate-finalizer.outputs.cleanup_identity_status }}
       handoff_status: ${{ steps.revalidate-finalizer.outputs.handoff_status }}
       candidate_artifact_status: ${{ steps.revalidate-finalizer.outputs.candidate_artifact_status }}
+      namespace_closed_status: ${{ needs.namespace-containment-barrier.outputs.namespace_closed_status }}
       origin_artifact_id: ${{ steps.publish-origin.outputs.artifact-id }}
       origin_artifact_digest: ${{ steps.publish-origin.outputs.artifact-digest }}
     env:
@@ -668,7 +822,7 @@ jobs:
           path: ${{ runner.temp }}/external-client
       - name: Revalidate finalizer handoffs
         id: revalidate-finalizer
-        if: ${{ always() }}
+        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -833,7 +987,7 @@ jobs:
           exit 0
 
       - name: Configure finalizer SSH
-        if: ${{ always() }}
+        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -861,7 +1015,7 @@ jobs:
 
       - name: Signal fixture completion and collect origin evidence
         id: external-finalize
-        if: ${{ always() }}
+        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -906,7 +1060,7 @@ jobs:
 
       - name: Exact cleanup of external fixture
         id: cleanup
-        if: ${{ always() }}
+        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -1065,7 +1219,7 @@ jobs:
           exit 0
 
       - name: Remove untrusted origin transport logs
-        if: ${{ always() }}
+        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1121,7 +1275,7 @@ jobs:
 
       - name: Publish origin evidence
         id: publish-origin
-        if: ${{ success() && steps.cleanup_ssh.outcome == 'success' && steps.external-finalize.outputs.remote_status == '0' && steps.external-finalize.outputs.observer_ready == '1' && steps.external-finalize.outputs.finalize_status == '0' && steps.cleanup.outputs.cleanup_status == '0' && steps.cleanup.outputs.cleanup_exports_status == '0' && steps.cleanup_ssh.outputs.ssh_cleanup_status == '0' && steps.revalidate-finalizer.outputs.cleanup_identity_status == '0' }}
+        if: ${{ success() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' && steps.cleanup_ssh.outcome == 'success' && steps.external-finalize.outputs.remote_status == '0' && steps.external-finalize.outputs.observer_ready == '1' && steps.external-finalize.outputs.finalize_status == '0' && steps.cleanup.outputs.cleanup_status == '0' && steps.cleanup.outputs.cleanup_exports_status == '0' && steps.cleanup_ssh.outputs.ssh_cleanup_status == '0' && steps.revalidate-finalizer.outputs.cleanup_identity_status == '0' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-production-external-load-origin-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1143,8 +1297,10 @@ jobs:
       - fixture-setup
       - fixture-finalize
       - load-client
+      - namespace-containment-barrier
+      - namespace-containment-manual-barrier
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       actions: read
@@ -1247,6 +1403,10 @@ jobs:
             && "${{ needs.fixture-setup.outputs.setup_status }}" == 0 \
             && "${{ needs.fixture-setup.outputs.ssh_cleanup_status }}" == 0 \
             && "${{ needs.load-client.outputs.report_ready }}" == 1 \
+            && "${{ needs.namespace-containment-barrier.result }}" == success \
+            && "${{ needs.namespace-containment-barrier.outputs.namespace_closed_status }}" == 0 \
+            && "${{ needs.namespace-containment-manual-barrier.result }}" == success \
+            && "${{ needs.namespace-containment-manual-barrier.outputs.manual_required }}" == 0 \
             && "${{ needs.fixture-finalize.result }}" == success \
             && "${{ needs.fixture-finalize.outputs.remote_status }}" == 0 \
             && "${{ needs.fixture-finalize.outputs.observer_ready }}" == 1 \
@@ -1362,6 +1522,10 @@ jobs:
           needs.fixture-setup.outputs.ssh_cleanup_status == '0' &&
           needs.load-client.result == 'success' &&
           needs.load-client.outputs.report_ready == '1' &&
+          needs.namespace-containment-barrier.result == 'success' &&
+          needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' &&
+          needs.namespace-containment-manual-barrier.result == 'success' &&
+          needs.namespace-containment-manual-barrier.outputs.manual_required == '0' &&
           needs.fixture-finalize.result == 'success' &&
           needs.fixture-finalize.outputs.remote_status == '0' &&
           needs.fixture-finalize.outputs.observer_ready == '1' &&
@@ -1400,6 +1564,10 @@ jobs:
           test "${{ needs.load-client.result }}" = success || { echo "External load-client job failed." >&2; exit 1; }
           test "${{ needs.load-client.outputs.load_status }}" = 0 || { echo "Authoritative external load-status failed." >&2; exit 1; }
           test "${{ needs.load-client.outputs.report_ready }}" = 1 || { echo "External load report is missing." >&2; exit 1; }
+          test "${{ needs.namespace-containment-barrier.result }}" = success || { echo "Namespace containment barrier job failed." >&2; exit 1; }
+          test "${{ needs.namespace-containment-barrier.outputs.namespace_closed_status }}" = 0 || { echo "namespace_closed is not proven; cleanup is blocked and manual emergency handling is required." >&2; exit 1; }
+          test "${{ needs.namespace-containment-manual-barrier.result }}" = success || { echo "Namespace containment manual barrier is active." >&2; exit 1; }
+          test "${{ needs.namespace-containment-manual-barrier.outputs.manual_required }}" = 0 || { echo "Namespace containment manual barrier requires operator action." >&2; exit 1; }
           test "${{ needs.fixture-finalize.result }}" = success || { echo "External fixture-finalize job failed." >&2; exit 1; }
           test "${{ needs.fixture-finalize.outputs.remote_status }}" = 0 || { echo "Origin external-load supervisor failed." >&2; exit 1; }
           test "${{ needs.fixture-finalize.outputs.observer_ready }}" = 1 || { echo "Origin observer barrier was not reached." >&2; exit 1; }

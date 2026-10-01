@@ -1791,12 +1791,13 @@ def run_profile(
     *,
     timeout_diagnostics_run_id: str | None = None,
 ) -> int:
-    """Run the external generator behind the process-group deadline guard.
+    """Run the external generator behind the mandatory PID-namespace guard.
 
     The parent owns both absolute budgets and never executes measured HTTP
     work.  A valid worker report is copied atomically only after the child has
-    exited; a killed, malformed or missing child report becomes a closed
-    failed report so the independent fixture finalizer can still run.
+    exited and the namespace is closed; a killed, malformed or missing child
+    report becomes a closed failed report so the independent fixture finalizer
+    can still run.
     """
 
     ensure_dispatchable(profile)

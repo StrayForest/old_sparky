@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-09-30
+- Last reviewed: 2026-10-01
 
 The top-level JSON files in `profiles/` are the only authored canonical load
 contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
@@ -58,21 +58,38 @@ supervisor grace window; profile validation requires the measurement budget to
 finish strictly before that outer ceiling. Both deadlines are monotonic and
 start before the trace and first measured I/O.
 
-`platform_load.py run` is only a supervisor. It starts the complete load
-engine in a new process group, passes the same absolute deadlines to the
-worker, and sends `TERM` followed by `KILL` after a bounded grace period. The
-worker report is private and is copied to the final report atomically only
-after the worker and all group descendants have exited. A killed, malformed or
-incomplete worker produces a closed failed report with `partial_work=true` and
-`inflight_unknown=true`; it can therefore be uploaded for diagnosis without
-being mistaken for a passing measurement. Linux workers also set
-`PR_SET_PDEATHSIG` as a second orphan guard.
+`platform_load.py run` is only a supervisor. On the pinned `ubuntu-24.04`
+runner it first probes the mandatory Linux PID-namespace contour, then starts
+the complete load engine through the absolute system chain
+`/usr/bin/sudo -n /usr/bin/setpriv --pdeathsig SIGKILL --
+/usr/bin/unshare --pid --fork --mount-proc --kill-child=SIGKILL`. No
+checkout-controlled helper runs as root. The inner absolute `setpriv` drops to
+the original runner UID/GID, clears groups, sets `--no-new-privs`, and clears
+inheritable/ambient/bounding capabilities before it execs the Python worker as
+namespace PID 1. The probe and entry check all real/effective/saved UID/GID
+values, groups, PID 1/PPID 0, all capability fields and `NoNewPrivs=1`; the
+stdio READY/ACK handshake does not depend on inherited descriptors that sudo
+could close. A failed probe is non-authoritative and there is no unsafe
+process-group fallback. The supervisor passes the same absolute deadlines to
+the worker and sends `TERM` followed by `KILL` after a bounded grace period.
+It tracks wrapper and namespace identities by pidfd/start-time, waits for the
+wrapper, reaps a zombie namespace PID 1 when needed, and verifies closure
+before publishing the report. Every report has mandatory boolean
+`namespace_closed`; only the parent sets it true after closure. A killed,
+malformed or incomplete worker produces a failed report with
+`partial_work=true` and `inflight_unknown=true`; a missing child report cannot
+replace the primary timeout or containment reason. The finalizer blocks all
+cleanup on missing/false `namespace_closed` and exposes a separate manual
+emergency barrier. Linux namespace workers set `PR_SET_PDEATHSIG=SIGKILL` as
+an orphan guard. A non-root pidfd watchdog additionally reclaims the complete
+sudo/setpriv/unshare descendant chain when the supervisor disappears, because
+a setuid sudo exec may clear the signal across that transition.
 
 DNS resolution, TCP connect, TLS, request writes, response headers/body,
 retry backoff and executor futures all consume the same absolute budget. The
 HTTP/1.1 candidate keeps one connection per load-worker thread and does not
 spawn a subprocess per request; a blocked resolver or socket remains
-reclaimable because the entire engine is inside the killable group.
+reclaimable because the entire engine is inside the killable PID namespace.
 
 The external-load workflow publishes a closed candidate report whenever one is
 available, regardless of the client exit status. Its independent finalizer

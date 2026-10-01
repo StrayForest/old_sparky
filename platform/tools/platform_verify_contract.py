@@ -2033,10 +2033,61 @@ def collect_issues() -> list[str]:
             issues.append("canonical load profile registry must contain the four baseline profiles")
 
     external_text = EXTERNAL_LOAD_WORKFLOW.read_text(encoding="utf-8")
-    if "runs-on: ubuntu-latest" not in external_text:
-        issues.append("external load workflow must use an external GitHub runner")
+    if "runs-on: ubuntu-24.04" not in external_text:
+        issues.append("external load workflow must pin the GitHub runner to ubuntu-24.04")
+    if "runs-on: ubuntu-latest" in external_text:
+        issues.append("external load workflow must not use the floating ubuntu-latest runner")
     if "platform_load.py" not in external_text:
         issues.append("external load workflow must dispatch platform_load.py")
+    if "Probe mandatory load PID-namespace containment" not in external_text:
+        issues.append("external load workflow must run the mandatory PID-namespace capability probe")
+    for marker in (
+        "/usr/bin/sudo",
+        "/usr/bin/setpriv",
+        "/usr/bin/unshare",
+        "--pdeathsig",
+        "--no-new-privs",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
+        "--pid",
+        "--mount-proc",
+        "--kill-child=SIGKILL",
+        "namespace_closed",
+        "namespace-containment-barrier",
+        "namespace-containment-manual-barrier",
+    ):
+        if marker not in external_text:
+            issues.append(f"external load workflow is missing containment marker: {marker}")
+    for forbidden in (r"--user(?:\s|=|$)", r"--map-root-user(?:\s|=|$)"):
+        if re.search(forbidden, external_text):
+            issues.append(f"external load workflow must not use unsafe user-namespace flag: {forbidden}")
+    canary_workflow = REPO_ROOT / ".github" / "workflows" / "platform-load-containment-canary.yml"
+    if not canary_workflow.is_file():
+        issues.append("load containment canary workflow is missing")
+    else:
+        canary_text = canary_workflow.read_text(encoding="utf-8")
+        for marker in ("runs-on: ubuntu-24.04", "probe_pid_namespace_capability", "run_supervised", "namespace_closed"):
+            if marker not in canary_text:
+                issues.append(f"load containment canary is missing marker: {marker}")
+        for forbidden in ("secrets.", "platform_load.py run", "manifest", "fixture"):
+            if forbidden in canary_text:
+                issues.append(f"load containment canary must not contain production marker: {forbidden}")
+    load_client_block = _workflow_job_block(external_text, "load-client")
+    load_timeout = re.search(r"^    timeout-minutes:\s*(\d+)\s*$", load_client_block, re.MULTILINE)
+    if load_timeout is None:
+        issues.append("external load-client job must declare an explicit timeout-minutes margin")
+    elif "profiles" in locals():
+        max_runner_minutes = max(
+            int(profile["portfolio"]["cost_budget"]["max_runner_minutes"])
+            for profile in profiles.values()
+            if profile.get("portfolio", {}).get("status") == "active"
+            and profile.get("portfolio", {}).get("class") in {"default", "diagnostic"}
+        )
+        if int(load_timeout.group(1)) < max_runner_minutes + 30:
+            issues.append(
+                "external load-client timeout must leave at least 30 minutes after the largest worker budget"
+            )
     profile_options_match = re.search(
         r"profile_id:\n(?P<options>.*?)(?:\n\npermissions:)",
         external_text,

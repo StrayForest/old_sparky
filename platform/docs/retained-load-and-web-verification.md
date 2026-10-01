@@ -2,7 +2,7 @@
 
 - Status: Active reference and operator how-to
 - Owner: Performance and web verification owners
-- Last reviewed: 2026-09-30
+- Last reviewed: 2026-10-01
 
 This document owns the detailed retained-load cleanup, hermetic web verification,
 external-load workflow barrier and evidence-projection contracts. The
@@ -57,15 +57,43 @@ The evidence artifact is published only after every row passes; missing or
 mismatched artifacts and remote, projection, sanitizer or cleanup failures
 cannot be hidden by the evaluator.
 
-The measured client is supervised in a separate process group. Its scenario
-deadline and whole-runner deadline are absolute monotonic budgets; a blocked
-DNS/socket/body read or future is terminated with `TERM`, then `KILL` after a
-short grace period, and the parent waits for the group before publishing the
-final report. A malformed or killed worker is represented by a closed failed
-report with partial/in-flight-unknown flags. Candidate report upload and the
-`always()` fixture finalizer are independent of the client exit code, so a
-runtime timeout cannot skip cleanup or leave a background load mutating the
-fixture while cleanup begins.
+The measured client is supervised in a mandatory Linux PID namespace. The only
+privileged chain is the absolute system path `/usr/bin/sudo -n
+/usr/bin/setpriv --pdeathsig SIGKILL -- /usr/bin/unshare --pid --fork
+--mount-proc --kill-child=SIGKILL`; no checkout-controlled helper is executed
+as root and user-namespace flags are deliberately absent. Inside the namespace
+a second absolute `setpriv` immediately drops to the original runner UID/GID,
+clears groups, applies `--no-new-privs`, and clears inheritable, ambient and
+bounding capabilities before it execs the Python worker as PID 1. A validation
+preflight on the pinned `ubuntu-24.04` runner probes that exact non-root,
+stdin/stdout contour before any production fixture setup, and the load runner
+repeats the probe before candidate execution; probe failure is a closed
+non-authoritative result and never falls back to a process group or an
+uncontained worker. The probe and namespace entry machine-check real/effective/
+saved UID/GID, supplementary groups, PID 1/PPID 0, all capability fields and
+`NoNewPrivs=1`.
+
+The scenario deadline and whole-runner deadline are absolute monotonic budgets;
+a blocked DNS/socket/body read or future is terminated with `TERM`, then `KILL`
+after a short grace period. The supervisor tracks the complete wrapper chain
+and namespace PID by pidfd/start-time, waits for the wrapper, reaps a zombie
+namespace PID 1 when necessary, and requires namespace closure before
+publishing the final report. Every report has mandatory boolean
+`namespace_closed`; only the parent may set it true after closure. A malformed
+or killed worker is represented by a failed report with partial/in-flight-
+unknown flags; the primary timeout/containment reason remains intact even when
+the child report is absent. The `always()` fixture finalizer has a separate
+fail-visible namespace barrier: cleanup never begins when the field is missing
+or false and a manual emergency action is required instead. Candidate report
+upload is independent of the client exit code, so a runtime timeout cannot
+skip cleanup or leave a background load mutating the fixture while cleanup
+begins.
+
+Because a setuid sudo exec may clear a parent-death signal, the non-root
+watchdog keeps the supervisor pidfd outside the privileged chain and
+identity-signals the entire captured sudo/setpriv/unshare descendant chain if
+that pidfd closes. This is a reclaim guard, not a process-group fallback; the
+namespace worker and inner setpriv also arm `SIGKILL` parent-death handling.
 
 Load/QA evidence is a fixed, privacy-bounded set: route classes/templates,
 numeric timings/counts/statuses and allowlisted error/backend/wait classes. It

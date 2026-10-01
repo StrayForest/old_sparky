@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-27
+- Last reviewed: 2026-10-01
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -597,4 +597,4 @@ and size-based rotation bounds text log files.
   also have fresh API/live evidence; see the AUD-02 archive.
 - Real-user CSP follow-up and classification of new enforcement reports.
 - Physical removal of persisted legacy media URL fields and migration-only helpers after production data and external-consumer inventory confirms that no migration or compatibility dependency remains; this requires a reviewed API/schema migration.
-- Non-security feature expansion that does not remove a launch or production blocker. For priorities and backlog, use [`platform-roadmap.md`](platform-roadmap.md); for evidence and details, follow [`README.md`](README.md).
+- Containment corrective review (2026-10-01) uses a mandatory hosted non-root absolute `sudo -n` → `setpriv` → `unshare` chain and an isolated `ubuntu-24.04` canary; it is not production evidence, and the local UID-0 environment is a `LOCAL BLOCK` until hosted canary and independent review pass. Non-security feature expansion that does not remove a launch or production blocker remains deferred; use [`platform-roadmap.md`](platform-roadmap.md) for priorities and [`README.md`](README.md) for evidence.
