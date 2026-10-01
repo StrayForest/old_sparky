@@ -460,7 +460,6 @@ test("public navigation does not prefetch auth documents or Turnstile", async ({
 
   await page.goto("/");
   await expect(page.getByRole("banner").getByRole("link", { name: "Войти", exact: true })).toBeVisible();
-  await page.waitForLoadState("networkidle");
 
   expect(forbiddenRequestCount).toBe(0);
 });

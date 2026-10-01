@@ -10,7 +10,9 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import Mock, patch
 
@@ -132,10 +134,29 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertNotIn("npm ci", source)
         self.assertNotIn("npm run test:live", source)
         self.assertNotIn('bash -s -- "$LIVE_BASE_URL"', source)
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', source)
         self.assertLess(
             source.index("platform_workflow_input_guard.py live"),
             source.index('printf \'%s\\n\' "$PROD_SSH_KEY"'),
         )
+        self.assertLess(
+            source.index('test "$GITHUB_REF" = "refs/heads/dev"'),
+            source.index("actions/checkout@"),
+        )
+        self.assertLess(
+            source.index('test "$GITHUB_REF" = "refs/heads/dev"'),
+            source.index("secrets.PROD_SSH_KEY"),
+        )
+        self.assertIn(
+            'expected_marker = f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}"',
+            source,
+        )
+        self.assertIn(
+            "valid_marker_count = sum(line == expected_marker for line in marker_lines)",
+            source,
+        )
+        self.assertIn("invalid_success_marker_count", source)
+        self.assertNotIn('"live_browser_qa_success" in lower', source)
 
         # OpenSSH concatenates command arguments into a remote shell command,
         # so every workflow SSH command must end at a fixed dispatcher mode.
@@ -1052,6 +1073,123 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("platform_live_user_qa_trusted.sh", dispatcher)
         self.assertIn("platform_live_qa_mailbox_helper.py", dispatcher)
         self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", dispatcher)
+
+    def test_live_launch_accepts_only_exact_target_sha_success_evidence(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(
+            encoding="utf-8"
+        )
+        invocation = "/usr/bin/python3 - \"$raw_report\" \"$safe_report\" \"$SUPERVISOR_STATUS\" \"$TARGET_SHA\" <<'PY'"
+        start = workflow.index(invocation)
+        script_start = workflow.index("          import json\n", start)
+        script_end = workflow.index("          PY\n", script_start)
+        script = textwrap.dedent(workflow[script_start:script_end])
+        target_sha = "a" * 40
+        fixtures = (
+            (
+                "exact marker",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n",
+                0,
+                True,
+                1,
+                0,
+            ),
+            (
+                "duplicate exact markers from wrapper and supervisor",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n" * 2,
+                0,
+                True,
+                2,
+                0,
+            ),
+            ("marker only", "LIVE_BROWSER_QA_SUCCESS\n", 0, False, 0, 1),
+            (
+                "wrong full SHA",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={'b' * 40}\n",
+                0,
+                False,
+                0,
+                1,
+            ),
+            (
+                "mixed target markers",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n"
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={'b' * 40}\n",
+                0,
+                False,
+                1,
+                1,
+            ),
+            (
+                "truncated SHA",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha[:-1]}\n",
+                0,
+                False,
+                0,
+                1,
+            ),
+            (
+                "embedded marker",
+                f"prefix LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n",
+                0,
+                False,
+                0,
+                0,
+            ),
+            (
+                "nonzero supervisor evidence",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n",
+                1,
+                False,
+                1,
+                0,
+            ),
+            (
+                "bounded log truncation",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n" + "x" * 262144,
+                0,
+                False,
+                1,
+                0,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for (
+                name,
+                log,
+                exit_code,
+                expected_success,
+                expected_marker_count,
+                expected_invalid_marker_count,
+            ) in fixtures:
+                with self.subTest(evidence=name):
+                    slug = name.replace(" ", "-")
+                    raw = root / f"{slug}.log"
+                    report_path = root / f"{slug}.json"
+                    raw.write_text(log, encoding="utf-8")
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            script,
+                            str(raw),
+                            str(report_path),
+                            str(exit_code),
+                            target_sha,
+                        ],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    report = json.loads(report_path.read_text(encoding="utf-8"))
+                    self.assertEqual(report["success"], expected_success)
+                    self.assertEqual(report["success_marker_count"], expected_marker_count)
+                    self.assertEqual(
+                        report["invalid_success_marker_count"],
+                        expected_invalid_marker_count,
+                    )
 
     def test_all_wrappers_disable_xtrace_before_any_work(self) -> None:
         for wrapper in WRAPPERS:
