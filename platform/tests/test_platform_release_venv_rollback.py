@@ -989,7 +989,10 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         freeze.chmod(0o444)
         wheelhouse = release / "wheelhouse"
         wheelhouse.mkdir()
-        for relative in platform_validate_release_artifact.REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS:
+        for relative in (
+            *platform_validate_release_artifact.REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS,
+            *platform_validate_release_artifact.REQUIRED_RELEASE_HELPERS,
+        ):
             helper = release / relative
             helper.parent.mkdir(parents=True, exist_ok=True)
             helper.write_text("# aggregate-only runtime helper fixture\n")

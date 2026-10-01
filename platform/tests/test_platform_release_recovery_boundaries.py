@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import shlex
 import shutil
 import stat
@@ -33,6 +35,10 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
+        # Normal release-smoke fixtures execute the fake shared interpreter via
+        # the real oldsparky-worker runuser boundary.  The temporary root must
+        # therefore be traversable by that service account.
+        self.root.chmod(0o755)
         self._release_lock = None
         try:
             self._release_lock = lock_support.create_test_lock("recovery")
@@ -1991,6 +1997,46 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual((self.app_dir / "previous").resolve(), current)
         self.assertFalse((self.shared / STATE_NAME).exists())
 
+    def test_rollback_no_restart_skips_liveness_when_helper_is_absent(self) -> None:
+        current, previous = self.prepare_rollback_state()
+        for release in (current, previous):
+            (release / "tools/platform_worker_liveness.py").unlink()
+        probe_log = self.shared / ".test-worker-liveness.log"
+        probe_log.unlink()
+        units_state = self.root / "units-no-liveness.state"
+        nginx_state = self.root / "nginx-no-liveness.state"
+        units_state.write_text("current\n", encoding="ascii")
+        nginx_state.write_text("current\n", encoding="ascii")
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "active",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        rollback = self.copy_rollback_with_systemctl(systemctl)
+
+        result = self.run_script(
+            rollback,
+            "--app-dir",
+            str(self.app_dir),
+            "--no-restart",
+            env={
+                "PLATFORM_TEST_UNITS_STATE": str(units_state),
+                "PLATFORM_TEST_UNITS_LABEL": "previous",
+                "PLATFORM_TEST_NGINX_STATE": str(nginx_state),
+                "PLATFORM_TEST_NGINX_LABEL": "previous",
+            },
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(probe_log.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), previous)
+        self.assertEqual((self.app_dir / "previous").resolve(), current)
+
     def test_rollback_crash_after_systemd_clear_retries_transaction_completion(self) -> None:
         current, previous = self.prepare_rollback_state()
         units_state = self.root / "units.state"
@@ -2214,6 +2260,12 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertFalse((self.shared / STATE_NAME).exists())
         self.assertEqual((self.app_dir / "current").resolve(), candidate)
         self.assertEqual((self.app_dir / "previous").resolve(), current)
+        self.assertEqual(
+            (self.shared / ".test-worker-liveness.log")
+            .read_text(encoding="ascii")
+            .splitlines(),
+            ["liveness-probe", "liveness-probe"],
+        )
 
     def test_deploy_fault_after_activation_commit_resumes_cleanup(self) -> None:
         current, _previous, candidate = self.prepare_deploy_state("smoke-passed")
@@ -4004,6 +4056,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "phase", "--expected", "venv-transitioned", "--phase", "staged"
         )
         self.add_runtime_stubs(candidate)
+        self.write_fake_python(self.shared / "venv/bin/python")
         systemctl = self.write_initial_systemctl()
         self.run_transaction("capture-initial-systemd", "--systemctl", str(systemctl))
         self.run_transaction(
@@ -4068,6 +4121,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "PLATFORM_TEST_UNITS_LABEL": label,
             "PLATFORM_TEST_NGINX_STATE": str(self.root / "nginx.state"),
             "PLATFORM_TEST_NGINX_LABEL": label,
+            "PLATFORM_RELEASE_EXPECTED_SOURCE_SHA": "a" * 40,
         }
 
     def write_fake_systemctl(self) -> Path:
@@ -4294,6 +4348,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "platform_install_systemd_units.sh",
             "platform_install_nginx.py",
             "platform_deploy_smoke.py",
+            "platform_worker_liveness.py",
             "platform_live_qa_runtime_install.py",
             "platform_install_logging.sh",
             "platform_prepare_service_user.sh",
@@ -4325,7 +4380,13 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             helper.chmod(0o755)
         (release / "RELEASE.json").write_text(
-            json.dumps({"source_git_commit": "a" * 40}) + "\n",
+            json.dumps(
+                {
+                    "release_slug": release.name,
+                    "source_git_commit": "a" * 40,
+                }
+            )
+            + "\n",
             encoding="ascii",
         )
 
@@ -4570,6 +4631,9 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             helper = tools / name
             helper.write_text("# test stub\n")
             helper.chmod(0o755)
+        liveness = tools / "platform_worker_liveness.py"
+        liveness.write_text("# test-only liveness boundary consumed by fake Python\n")
+        liveness.chmod(0o755)
         runtime_installer = tools / "platform_live_qa_runtime_install.py"
         runtime_installer.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n")
         runtime_installer.chmod(0o755)
@@ -4587,6 +4651,32 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             helper = tools / name
             helper.write_text("#!/usr/bin/env bash\nexit 0\n" if name.endswith(".sh") else "# test stub\n")
             helper.chmod(0o755)
+        (release / "RELEASE.json").write_text(
+            json.dumps(
+                {
+                    "release_slug": release.name,
+                    "source_git_commit": "a" * 40,
+                }
+            )
+            + "\n",
+            encoding="ascii",
+        )
+        env_dir = self.shared / "env"
+        env_dir.mkdir(exist_ok=True)
+        worker_env = env_dir / "worker.env"
+        if not worker_env.exists():
+            worker_env.write_text(
+                "PLATFORM_CELERY_BROKER_URL=redis://127.0.0.1:6379/13\n"
+                "PLATFORM_CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14\n"
+                "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15\n",
+                encoding="ascii",
+            )
+            worker_env.chmod(0o640)
+            os.chown(worker_env, 0, grp.getgrnam("oldsparky-worker").gr_gid)
+        probe_log = self.shared / ".test-worker-liveness.log"
+        if not probe_log.exists():
+            probe_log.write_text("", encoding="ascii")
+            probe_log.chmod(0o666)
 
     def install_live_qa_reconcile_fixture(
         self, release: Path, mode_path: Path, log_path: Path
@@ -4606,9 +4696,28 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             encoding="utf-8",
         )
         python = self.shared / "venv/bin/python"
+        worker_uid = pwd.getpwnam("oldsparky-worker").pw_uid
         python.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
+            f"if [[ \"${{1:-}}\" == *platform_worker_liveness.py ]]; then\n"
+            f"  [[ \"$(id -u)\" == {worker_uid} ]]\n"
+            "  [[ \"$#\" -eq 7 ]]\n"
+            "  [[ \"$2\" == --app-dir && \"$4\" == --release ]]\n"
+            "  [[ \"$6\" == --expected-source-sha && \"$7\" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]\n"
+            "  [[ \"${PLATFORM_RUNTIME_SERVICE:-}\" == worker ]]\n"
+            "  [[ \"${PLATFORM_APP_DIR:-}\" == \"$3\" ]]\n"
+            "  [[ \"${PLATFORM_SHARED_DIR:-}\" == \"$3/shared\" ]]\n"
+            "  [[ \"${PLATFORM_ENV_FILE:-}\" == \"$3/shared/env/worker.env\" ]]\n"
+            "  [[ \"${PLATFORM_PYTHON_BIN:-}\" == \"$0\" ]]\n"
+            "  [[ \"${PYTHONPATH:-}\" == \"$5\" ]]\n"
+            "  [[ \"${LANG:-}\" == C.UTF-8 && \"${HOME:-}\" == /nonexistent ]]\n"
+            "  [[ \"${PATH:-}\" == /usr/sbin:/usr/bin:/sbin:/bin ]]\n"
+            "  [[ \"${PYTHONNOUSERSITE:-}\" == 1 && \"${PYTHONDONTWRITEBYTECODE:-}\" == 1 ]]\n"
+            "  printf '%s\\n' liveness-probe >> \"$3/shared/.test-worker-liveness.log\"\n"
+            "  printf '%s\\n' '{\"schema\":1,\"kind\":\"platform_worker_liveness\",\"status\":\"passed\",\"checks\":{\"worker_uid\":\"passed\",\"worker_env\":\"passed\",\"release_identity\":\"passed\",\"broker_namespace\":\"passed\",\"result_namespace\":\"passed\",\"task_route\":\"passed\",\"task_result\":\"passed\"},\"backlog\":{\"high\":\"redacted\",\"default\":\"redacted\",\"low\":\"redacted\"},\"cleanup\":\"proven\"}'\n"
+            "  exit 0\n"
+            "fi\n"
             "if [[ \"${1:-}\" == \"-I\" && \"${2:-}\" == *platform_live_qa_runtime_install.py ]]; then\n"
             "  exec /usr/bin/python3 \"$@\"\n"
             "fi\n"
@@ -4658,6 +4767,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         (venv / "deps-version").write_text(f"{marker}\n")
 
     def write_fake_python(self, path: Path) -> None:
+        worker_uid = pwd.getpwnam("oldsparky-worker").pw_uid
         path.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
@@ -4666,6 +4776,23 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "    if [[ \"${2:-}\" == \"--apply\" ]]; then\n"
             "      printf '%s\\n' \"$PLATFORM_TEST_NGINX_LABEL\" > \"$PLATFORM_TEST_NGINX_STATE\"\n"
             "    fi\n"
+            "    ;;\n"
+            "  *platform_worker_liveness.py)\n"
+            f"    [[ \"$(id -u)\" == {worker_uid} ]]\n"
+            "    [[ \"$#\" -eq 7 ]]\n"
+            "    [[ \"$2\" == --app-dir && \"$4\" == --release ]]\n"
+            "    [[ \"$6\" == --expected-source-sha && \"$7\" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]\n"
+            "    [[ \"${PLATFORM_RUNTIME_SERVICE:-}\" == worker ]]\n"
+            "    [[ \"${PLATFORM_APP_DIR:-}\" == \"$3\" ]]\n"
+            "    [[ \"${PLATFORM_SHARED_DIR:-}\" == \"$3/shared\" ]]\n"
+            "    [[ \"${PLATFORM_ENV_FILE:-}\" == \"$3/shared/env/worker.env\" ]]\n"
+            "    [[ \"${PLATFORM_PYTHON_BIN:-}\" == \"$0\" ]]\n"
+            "    [[ \"${PYTHONPATH:-}\" == \"$5\" ]]\n"
+            "    [[ \"${LANG:-}\" == C.UTF-8 && \"${HOME:-}\" == /nonexistent ]]\n"
+            "    [[ \"${PATH:-}\" == /usr/sbin:/usr/bin:/sbin:/bin ]]\n"
+            "    [[ \"${PYTHONNOUSERSITE:-}\" == 1 && \"${PYTHONDONTWRITEBYTECODE:-}\" == 1 ]]\n"
+            "    printf '%s\\n' liveness-probe >> \"$3/shared/.test-worker-liveness.log\"\n"
+            "    printf '%s\\n' '{\"schema\":1,\"kind\":\"platform_worker_liveness\",\"status\":\"passed\",\"checks\":{\"worker_uid\":\"passed\",\"worker_env\":\"passed\",\"release_identity\":\"passed\",\"broker_namespace\":\"passed\",\"result_namespace\":\"passed\",\"task_route\":\"passed\",\"task_result\":\"passed\"},\"backlog\":{\"high\":\"redacted\",\"default\":\"redacted\",\"low\":\"redacted\"},\"cleanup\":\"proven\"}'\n"
             "    ;;\n"
             "esac\n"
         )

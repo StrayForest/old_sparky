@@ -451,15 +451,16 @@ if [[ -n "$(find "$STAGING_DIR" -type l -print -quit)" ]]; then
   echo "Release build refused: tracked source contains a symlink." >&2
   exit 1
 fi
-# The read-only outage diagnostics workflow executes these tools from the
-# immutable current release.  Keep the dependency explicit so a future
-# archive/pruning change cannot publish a release that silently loses its
-# aggregate-only evidence path.
+# Release smoke and the read-only outage diagnostics workflow execute these
+# tools from the immutable current release. Keep the dependency explicit so a
+# future archive/pruning change cannot publish a release that silently loses
+# either governed runtime path.
 for runtime_helper in \
   "tools/platform_nginx_error_summary.py" \
   "tools/platform_web_runtime_diagnostics_summary.py" \
   "tools/platform_storage_evidence_summary.py" \
-  "tools/platform_media_migration_diagnostics_summary.py"; do
+  "tools/platform_media_migration_diagnostics_summary.py" \
+  "tools/platform_worker_liveness.py"; do
   if [[ ! -s "$STAGING_DIR/$runtime_helper" || -L "$STAGING_DIR/$runtime_helper" ]]; then
     echo "Release build refused: tracked runtime diagnostic helper is missing: $runtime_helper" >&2
     exit 1

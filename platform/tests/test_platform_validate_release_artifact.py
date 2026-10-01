@@ -112,6 +112,10 @@ class ArchiveBuilder:
             f"{RELEASE_SLUG}/tools/platform_media_migration_diagnostics_summary.py",
             b"#!/usr/bin/env python3\nprint('media migration summary')\n",
         )
+        self.add_file(
+            f"{RELEASE_SLUG}/tools/platform_worker_liveness.py",
+            b"#!/usr/bin/env python3\nprint('worker liveness')\n",
+        )
         self._add_liveqa_runtime()
 
     def _add_liveqa_runtime(self) -> None:
@@ -745,8 +749,12 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(validator.ArtifactError, "runtime cache"):
             validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
 
-    def test_runtime_diagnostic_helpers_require_nonempty_tracked_content(self) -> None:
-        for index, relative in enumerate(validator.REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS):
+    def test_release_helpers_require_nonempty_tracked_content(self) -> None:
+        required_helpers = (
+            *validator.REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS,
+            *validator.REQUIRED_RELEASE_HELPERS,
+        )
+        for index, relative in enumerate(required_helpers):
             artifact = self.root / f"empty-runtime-helper-{index}.tar.gz"
             builder = ArchiveBuilder(artifact)
             helper_name = f"{RELEASE_SLUG}/{relative}"

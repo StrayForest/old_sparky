@@ -2,7 +2,7 @@
 
 - Status: Active release design
 - Owner: Production operator and platform maintainers
-- Last reviewed: 2026-09-29
+- Last reviewed: 2026-10-01
 
 This document owns the end-to-end release transaction. The normal production
 path is `tools/platform_release_deploy.sh`; the low-level installer is a
@@ -29,6 +29,15 @@ candidate artifact
     -> systemd-activated (initial install only)
     -> activation-committed
 ```
+
+For a normal candidate deployment, `nginx-applied` enters smoke in this
+order: restart/readiness has already passed, then the loopback B1 worker
+roundtrip, then the existing loopback HTTP smoke, then public smoke, and only
+then `release_preflight` and the `smoke-passed` receipt transition. The
+supervisor propagates its exact trusted source SHA to the candidate deploy;
+the deploy and both HTTP smoke invocations compare `current` and
+`RELEASE.json` before publishing or performing network smoke. Recovery
+`--no-restart` paths do not enter this sequence.
 
 The deploy wrapper acquires the release-independent lock before preflight and
 holds that one lock through pre-quiesce receipt creation, quiesce, staging,
