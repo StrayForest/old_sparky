@@ -161,6 +161,8 @@ _RESTART_DIRECTIVES = frozenset(
 _FAIL_HIDING_EXEC_DIRECTIVES = frozenset(
     {"ExecStart", "ExecStartPre", "ExecStartPost", "ExecCondition"}
 )
+_CANONICAL_EXECUTABLE = re.compile(r"^/[A-Za-z0-9_./-]+$")
+_CANONICAL_EXEC_ARGUMENT = re.compile(r"^[A-Za-z0-9_./=-]+$")
 
 
 def _has_ignored_exec_prefix(value: str) -> bool:
@@ -183,6 +185,28 @@ def _has_ignored_exec_prefix(value: str) -> bool:
             continue
         break
     return "-" in value[:prefix_end]
+
+
+def _is_canonical_exec_value(value: str) -> bool:
+    """Accept only the closed command syntax used by tracked oneshot units.
+
+    systemd decodes quotes, C escapes and command prefixes before it decides
+    whether the executable ignores a failure.  Reimplementing that grammar
+    incompletely would leave another bypass, so this contract accepts only the
+    deliberately smaller syntax used by the reviewed units: an absolute
+    executable, optional single-space-separated arguments, and a restricted
+    argument alphabet.  Any quoting, escaping, control character, prefix or
+    ambiguous whitespace is rejected instead of normalized.
+    """
+
+    if not value or any(character in value for character in "\t\r\n\v\f"):
+        return False
+    tokens = value.split(" ")
+    if any(not token for token in tokens):
+        return False
+    if not _CANONICAL_EXECUTABLE.fullmatch(tokens[0]):
+        return False
+    return all(_CANONICAL_EXEC_ARGUMENT.fullmatch(token) for token in tokens[1:])
 
 # A oneshot is an operational boundary: adding a new directive can change
 # whether a failed maintenance/backup run is visible or silently retried.  An
@@ -605,9 +629,8 @@ def validate_failure_policy(units: Mapping[str, UnitFile]) -> None:
             )
         for key in _FAIL_HIDING_EXEC_DIRECTIVES:
             if key == "ExecStart":
-                values = service.effective_resettable_values("Service", key)
-            else:
-                values = service.values("Service", key)
+                continue
+            values = service.values("Service", key)
             if any(_has_ignored_exec_prefix(value) for value in values):
                 raise SystemdContractError(
                     f"{service_name}: {key} must fail closed (ignored '-' prefix forbidden)"
@@ -627,9 +650,13 @@ def validate_failure_policy(units: Mapping[str, UnitFile]) -> None:
                 f"{sorted(unexpected)!r}"
             )
         exec_values = service.effective_resettable_values("Service", "ExecStart")
-        if not exec_values or any(_has_ignored_exec_prefix(value) for value in exec_values):
+        if not exec_values or any(
+            _has_ignored_exec_prefix(value) or not _is_canonical_exec_value(value)
+            for value in exec_values
+        ):
             raise SystemdContractError(
-                f"{service_name}: oneshot ExecStart must fail closed"
+                f"{service_name}: oneshot ExecStart must fail closed "
+                "(canonical absolute command syntax required)"
             )
 
     for service_name, restart in {

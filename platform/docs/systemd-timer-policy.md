@@ -29,9 +29,13 @@ The oneshot `Service` sections use an exact reviewed directive allow-list. They
 cannot add `SuccessExitStatus`, restart modifiers, or ignored (`-`) prefixes on
 the effective `ExecStart` list, `ExecStartPre`, `ExecStartPost` or
 `ExecCondition`; an empty `ExecStart=` resets earlier entries, so the final
-effective list must still be non-empty and fail closed. Condition and assertion
-entries also cannot hide a failure. The contract loader holds the unit root by
-an `O_NOFOLLOW` directory descriptor, requires stable pre/post identity and
+effective list must still be non-empty and fail closed. Each effective oneshot
+command uses the closed canonical form: an absolute executable, single-space
+tokenization, and a restricted argument alphabet. Quotes, backslashes/C
+escapes, control characters, ambiguous whitespace and command prefixes are
+rejected rather than partially decoded. Condition and assertion entries also
+cannot hide a failure. The contract loader holds the unit root by an
+`O_NOFOLLOW` directory descriptor, requires stable pre/post identity and
 enumeration, and opens each unit relative to that descriptor. Each unit must be
 a regular, owner/group-matched `0644` file with one hard link; descriptor
 `fstat` identity includes `mtime_ns` and `ctime_ns`, plus a same-fd digest

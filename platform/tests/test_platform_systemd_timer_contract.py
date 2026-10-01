@@ -547,6 +547,45 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
                     with self.assertRaisesRegex(contract.SystemdContractError, "fail closed"):
                         contract.validate_all(root)
 
+    def test_failure_contract_rejects_encoded_or_ambiguous_execstart_values(self) -> None:
+        # systemd decodes these forms before applying command prefixes.  The
+        # contract intentionally rejects them instead of maintaining a partial
+        # quote/C-escape parser that could drift from the manager.
+        mutations = (
+            'ExecStart="!!-/bin/false"\n',
+            'ExecStart="+-/bin/false"\n',
+            "ExecStart=@/bin/false\n",
+            "ExecStart=:/bin/false\n",
+            "ExecStart=+/bin/false\n",
+            "ExecStart=!/bin/false\n",
+            "ExecStart=!!/bin/false\n",
+            "ExecStart=!!-/bin/false\n",
+            "ExecStart=+-/bin/false\n",
+            "ExecStart=\\x2d/bin/false\n",
+            "ExecStart=\\055/bin/false\n",
+            "ExecStart='/bin/true'\n",
+            "ExecStart=\"/bin/true\"\n",
+            "ExecStart=/bin/true  --flag\n",
+            "ExecStart=/bin/true\t--flag\n",
+        )
+        for addition in mutations:
+            with self.subTest(addition=addition):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                        shutil.copy2(source, root / source.name)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                        shutil.copy2(source, root / source.name)
+                    service = root / "deadlock-maintenance.service"
+                    service.write_text(
+                        service.read_text(encoding="utf-8") + addition,
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        contract.SystemdContractError, "fail closed"
+                    ):
+                        contract.validate_all(root)
+
     def test_failure_contract_models_execstart_reset_and_order(self) -> None:
         cases = (
             ("ExecStart=\n", False),
