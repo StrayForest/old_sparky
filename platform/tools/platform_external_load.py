@@ -1129,7 +1129,8 @@ def _response_json_projection(
 
     is_vote = method == "POST" and path.endswith("/deadlock/ready-check/vote")
     is_state = method == "GET" and path.endswith("/deadlock/ready-check")
-    if not body or not (is_vote or is_state):
+    is_authenticated_read = _is_authenticated_read_route(method, path)
+    if not body or not (is_vote or is_state or is_authenticated_read):
         return None
     try:
         payload = json.loads(body.decode("utf-8"))
@@ -1146,16 +1147,23 @@ def _response_json_projection(
         if type(retryable) is bool:
             projection["retryable"] = retryable
         retry_after_ms = payload.get("retry_after_ms")
-        if (
-            isinstance(retry_after_ms, (int, float))
-            and not isinstance(retry_after_ms, bool)
-            and math.isfinite(float(retry_after_ms))
+        if isinstance(retry_after_ms, (int, float)) and not isinstance(
+            retry_after_ms, bool
         ):
-            projection["retry_after_ms"] = retry_after_ms
+            try:
+                retry_after_numeric = float(retry_after_ms)
+            except (ValueError, TypeError, OverflowError):
+                retry_after_numeric = None
+            if retry_after_numeric is not None and math.isfinite(retry_after_numeric):
+                projection["retry_after_ms"] = retry_after_ms
         changed = payload.get("changed")
         if type(changed) is bool:
             projection["changed"] = changed
         return projection or None
+    if is_authenticated_read:
+        if payload.get("code") == "AUTHENTICATED_READ_OVERLOADED":
+            return {"code": "AUTHENTICATED_READ_OVERLOADED"}
+        return None
     active_round = payload.get("active_round")
     if not isinstance(active_round, dict):
         return None
@@ -1169,10 +1177,26 @@ def _response_json_projection(
     return None
 
 
+def _is_authenticated_read_route(method: str, path: str) -> bool:
+    """Identify API/page GET paths that can emit read-admission overloads."""
+
+    return (
+        method == "GET"
+        and not path.endswith("/deadlock/ready-check")
+        and (
+            path == "/users/me"
+            or path == "/tournaments"
+            or path.startswith("/tournaments/")
+        )
+    )
+
+
 def _response_requires_json_projection(method: str, path: str) -> bool:
     return (
         method == "POST" and path.endswith("/deadlock/ready-check/vote")
-    ) or (method == "GET" and path.endswith("/deadlock/ready-check"))
+    ) or (method == "GET" and path.endswith("/deadlock/ready-check")) or (
+        _is_authenticated_read_route(method, path)
+    )
 
 
 def _read_bounded_response(

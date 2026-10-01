@@ -261,11 +261,11 @@ class ExternalLoadTests(unittest.TestCase):
 
     def test_request_projects_only_route_correctness_fields(self) -> None:
         class FakeResponse:
-            status = 200
             headers = {"etag": '"etag-1"'}
 
-            def __init__(self, body: bytes) -> None:
+            def __init__(self, body: bytes, status: int = 200) -> None:
                 self.body = body
+                self.status = status
 
             def __enter__(self):
                 return self
@@ -278,10 +278,16 @@ class ExternalLoadTests(unittest.TestCase):
                 return chunk
 
         user = VirtualUser("user-00000001", "qa-tournament", "s" * 64, "c" * 64)
-        def request_with(body: bytes, *, method: str, path: str) -> RequestResult:
+        def request_with(
+            body: bytes,
+            *,
+            method: str,
+            path: str,
+            status: int = 200,
+        ) -> RequestResult:
             with patch(
                 "tools.platform_external_load.urlopen",
-                return_value=FakeResponse(body),
+                return_value=FakeResponse(body, status),
             ):
                 return _request(
                     "https://old-sparky.com",
@@ -301,6 +307,36 @@ class ExternalLoadTests(unittest.TestCase):
         )
         self.assertIsNone(read.response_json)
         self.assertEqual(read.response_etag, '"etag-1"')
+        read_overload = request_with(
+            json.dumps(
+                {
+                    "code": "AUTHENTICATED_READ_OVERLOADED",
+                    "detail": "must-not-survive",
+                }
+            ).encode(),
+            method="GET",
+            path="/tournaments/qa-tournament/workspace",
+            status=503,
+        )
+        self.assertEqual(
+            read_overload.response_json,
+            {"code": "AUTHENTICATED_READ_OVERLOADED"},
+        )
+        unrelated = request_with(
+            json.dumps(
+                {"code": "OTHER_503", "detail": "must-not-survive"}
+            ).encode(),
+            method="GET",
+            path="/tournaments/qa-tournament/workspace",
+            status=503,
+        )
+        self.assertIsNone(unrelated.response_json)
+        overload_summary = summarize_results([read_overload])
+        self.assertEqual(overload_summary["temporary_overload_responses"], 1)
+        self.assertEqual(overload_summary["unexpected_statuses"], 0)
+        unrelated_summary = summarize_results([unrelated])
+        self.assertEqual(unrelated_summary["temporary_overload_responses"], 0)
+        self.assertEqual(unrelated_summary["unexpected_statuses"], 1)
         vote = request_with(
             json.dumps(
                 {
@@ -324,6 +360,20 @@ class ExternalLoadTests(unittest.TestCase):
             },
         )
         self.assertNotIn("secret", json.dumps(vote.response_json))
+        huge_retry = request_with(
+            json.dumps(
+                {
+                    "code": "READY_VOTE_OVERLOADED",
+                    "retry_after_ms": 10**4000,
+                }
+            ).encode(),
+            method="POST",
+            path="/tournaments/qa-tournament/deadlock/ready-check/vote",
+        )
+        self.assertEqual(
+            huge_retry.response_json,
+            {"code": "READY_VOTE_OVERLOADED"},
+        )
 
     def test_read_mix_uses_the_current_tournament_page_request(self) -> None:
         route = _route_for_read(0, "qa-tournament")

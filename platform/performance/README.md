@@ -233,10 +233,21 @@ phase accumulator keeps counters and compact eight-byte numeric sample arrays;
 the historical sorted linear-interpolation percentile algorithm is unchanged.
 Its sample population is bounded by the selected profile's planned attempt
 count, and the report is rendered only after those accounted samples are
-reduced. Completed request objects, response bodies and parsed payloads are
-released immediately. Read/page routes retain only status, ETag, byte count
-and timing; Ready Vote retains only `code`, `retryable`, `retry_after_ms`,
-`changed` and the state-read `active_round.ready_count` correctness fields.
+reduced. The former submit-all implementation had a theoretical body-retention
+ceiling of about 332 GiB at the 170,000-attempt envelope (170,000 × the 2 MiB
+body cap), before parsed-JSON and object overhead. Standard API projection
+buffers now retain at most about 8 MiB at concurrency 128 or 32 MiB at
+concurrency 512 (64 KiB per live capture), plus an estimated 30 MiB of compact
+numeric arrays at the largest accounted sample population. The exact unique
+`cf_rays` counter remains bounded by the completed action/attempt count, not by
+concurrency, because preserving its report-compatible uniqueness requires
+retaining one bounded identity per observed ray. These are static bounds;
+real-RSS CI evidence is still pending. Completed request objects, response
+bodies and parsed payloads are released immediately. Read/page routes retain
+only status, ETag, byte count, timing and the allowlisted
+`AUTHENTICATED_READ_OVERLOADED` code; Ready Vote retains only `code`,
+`retryable`, `retry_after_ms`, `changed` and the state-read
+`active_round.ready_count` correctness fields.
 
 `error_samples` and `timeout_diagnostics` retain the deterministic first 25
 rows per summary. The corresponding `*_total` and `*_truncated` counters make
