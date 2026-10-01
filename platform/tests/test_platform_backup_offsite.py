@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -41,6 +42,14 @@ assert RESTORE_SPEC is not None and RESTORE_SPEC.loader is not None
 backup_creator = importlib.util.module_from_spec(RESTORE_SPEC)
 sys.modules[RESTORE_SPEC.name] = backup_creator
 RESTORE_SPEC.loader.exec_module(backup_creator)
+
+
+@contextmanager
+def _held_test_lock():
+    with tempfile.TemporaryDirectory() as temporary_dir:
+        path = Path(temporary_dir) / platform_backup_supervisor.BACKUP_LOCK_PATH.name
+        with platform_backup_supervisor._exclusive_backup_lock_for_test(path) as lock:
+            yield lock
 
 
 FINGERPRINT = "A" * 40
@@ -174,18 +183,19 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
         app_dir: Path,
         source_root: Path,
     ) -> dict[str, object]:
-        return platform_backup_supervisor._run_local_backup_scope(
-            args,
-            app_dir=app_dir,
-            source_root=source_root,
-            _restore_module=backup_creator,
-            lock=mock.Mock(),
-            callback=lambda capability, trusted_head, _restore: backup_creator.create_backup(
+        with _held_test_lock() as lock:
+            return platform_backup_supervisor._run_local_backup_scope(
                 args,
-                capability=capability,
-                trusted_alembic_head=trusted_head,
-            ),
-        )
+                app_dir=app_dir,
+                source_root=source_root,
+                _restore_module=backup_creator,
+                lock=lock,
+                callback=lambda capability, trusted_head, _restore: backup_creator.create_backup(
+                    args,
+                    capability=capability,
+                    trusted_alembic_head=trusted_head,
+                ),
+            )
 
     def test_actual_creator_manifest_is_consumed_by_offsite_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

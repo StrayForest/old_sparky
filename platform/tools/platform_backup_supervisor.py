@@ -120,7 +120,7 @@ class LockIdentity:
     mode: int
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, weakref_slot=True)
 class BackupLockHandle:
     """A held descriptor and the inode identity it proved before ``flock``."""
 
@@ -130,32 +130,30 @@ class BackupLockHandle:
     _closed: bool = False
 
     def validate(self) -> None:
-        if self._closed:
-            raise BackupLockError("backup lock descriptor is closed")
-        try:
-            opened = os.fstat(self.fd)
-            current = self.path.lstat()
-        except OSError as exc:
-            raise BackupLockError("backup lock pathname disappeared") from exc
-        _validate_lock_stat(opened)
-        _validate_lock_stat(current)
-        if _identity(opened) != self.identity or _identity(current) != self.identity:
-            raise BackupLockError("backup lock pathname was replaced while held")
+        _lock_boundary_validate(self)
 
     def close(self) -> None:
         if self._closed:
             return
+        validation_error: BaseException | None = None
         try:
             # A replacement is a correctness failure, not a reason to unlock a
             # different inode.  The descriptor remains the only object passed
             # to the kernel.
-            self.validate()
+            _lock_boundary_validate(self)
+        except BaseException as exc:
+            validation_error = exc
         finally:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_UN)
             finally:
-                os.close(self.fd)
-                self._closed = True
+                try:
+                    os.close(self.fd)
+                finally:
+                    self._closed = True
+                    _lock_boundary_validate(self, release=True)
+        if validation_error is not None:
+            raise validation_error
 
 
 def _identity(metadata: os.stat_result) -> LockIdentity:
@@ -256,80 +254,149 @@ def _bind_backup_singleton(name: bytes = _BACKUP_SINGLETON_NAME) -> socket.socke
         raise BackupLockError("backup kernel singleton could not be acquired") from exc
 
 
-@contextmanager
-def _exclusive_backup_lock_backend(
-    lock_path: Path,
-    *,
-    singleton_name: bytes,
-) -> Iterator[BackupLockHandle]:
-    """Acquire the root-owned canonical lock without waiting or trusting mtime.
+def _build_lock_boundary():
+    """Build the canonical lock backend and its closure-owned provenance check."""
 
-    ``flock(2)`` is non-blocking by design.  A stale filename is harmless: the
-    current inode is validated and a stale file with no kernel owner is simply
-    reused.  A same-owner replacement is rejected by the descriptor/path
-    identity checks before and after the operation.
-    """
+    lock_handle_type = BackupLockHandle
+    live: dict[
+        int,
+        tuple[weakref.ReferenceType[BackupLockHandle], Path, int, LockIdentity],
+    ] = {}
+    active: set[int] = set()
 
-    lock_path, lock_root = _lock_path_for(
-        lock_path, allow_test_path=singleton_name != _BACKUP_SINGLETON_NAME
-    )
-    singleton = _bind_backup_singleton(singleton_name)
-    try:
-        parent_fd, _ = _open_lock_parent(lock_root)
-    except BaseException:
-        singleton.close()
-        raise
-    descriptor: int | None = None
-    handle: BackupLockHandle | None = None
-    try:
+    def discard(reference: weakref.ReferenceType[BackupLockHandle]) -> None:
+        key = next(
+            (
+                candidate
+                for candidate, current in live.items()
+                if current[0] is reference
+            ),
+            None,
+        )
+        if key is not None:
+            live.pop(key, None)
+            active.discard(key)
+
+    def register(handle: BackupLockHandle) -> None:
+        key = id(handle)
+        current = live.get(key)
+        if current is not None and current[0]() is not None:
+            raise BackupLockError("backup lock identity is already live")
         try:
-            descriptor = os.open(
-                lock_path.name,
-                os.O_RDWR
-                | os.O_CREAT
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-                dir_fd=parent_fd,
-            )
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.EMLINK}:
-                raise BackupLockError("backup lock pathname is a symlink or link") from exc
-            raise BackupLockError("backup lock file could not be opened") from exc
-        opened = os.fstat(descriptor)
+            reference = weakref.ref(handle, discard)
+        except TypeError as exc:  # pragma: no cover - dataclass stays weakrefable
+            raise BackupLockError("backup lock identity cannot be registered") from exc
+        live[key] = (reference, Path(handle.path), handle.fd, handle.identity)
+        active.add(key)
+
+    def validate(handle: object, *, release: bool = False) -> None:
+        if type(handle) is not lock_handle_type:
+            raise BackupLockError("backup operation requires a supervisor lock handle")
+        key = id(handle)
+        current = live.get(key)
+        if current is None or current[0]() is not handle:
+            raise BackupLockError("backup lock handle has no live supervisor provenance")
+        if release:
+            live.pop(key, None)
+            active.discard(key)
+            return
+        if key not in active or handle._closed:
+            raise BackupLockError("backup lock descriptor is closed")
+        _, expected_path, expected_fd, expected_identity = current
+        if (
+            handle.path != expected_path
+            or handle.fd != expected_fd
+            or handle.identity != expected_identity
+        ):
+            raise BackupLockError("backup lock handle identity was replaced")
         try:
-            current = os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)
+            opened = os.fstat(expected_fd)
+            current_path = expected_path.lstat()
         except OSError as exc:
-            raise BackupLockError("backup lock pathname could not be validated") from exc
+            raise BackupLockError("backup lock pathname disappeared") from exc
         _validate_lock_stat(opened)
-        _validate_lock_stat(current)
-        if _identity(opened) != _identity(current):
-            raise BackupLockError("backup lock pathname changed while opening")
+        _validate_lock_stat(current_path)
+        if (
+            _identity(opened) != expected_identity
+            or _identity(current_path) != expected_identity
+        ):
+            raise BackupLockError("backup lock pathname was replaced while held")
+
+    @contextmanager
+    def backend(
+        lock_path: Path,
+        *,
+        singleton_name: bytes,
+    ) -> Iterator[BackupLockHandle]:
+        """Acquire the root-owned lock and register its live provenance."""
+
+        lock_path, lock_root = _lock_path_for(
+            lock_path, allow_test_path=singleton_name != _BACKUP_SINGLETON_NAME
+        )
+        singleton = _bind_backup_singleton(singleton_name)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in {errno.EACCES, errno.EAGAIN}:
-                raise BackupLockConflict(
-                    "another backup operation holds the canonical lock"
-                ) from exc
-            raise BackupLockError("backup lock could not be acquired") from exc
-        handle = BackupLockHandle(lock_path, descriptor, _identity(opened))
-        handle.validate()
-        yield handle
-    finally:
+            parent_fd, _ = _open_lock_parent(lock_root)
+        except BaseException:
+            singleton.close()
+            raise
+        descriptor: int | None = None
+        handle: BackupLockHandle | None = None
         try:
-            if handle is not None:
-                handle.close()
-            elif descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+            try:
+                descriptor = os.open(
+                    lock_path.name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                    raise BackupLockError("backup lock pathname is a symlink or link") from exc
+                raise BackupLockError("backup lock file could not be opened") from exc
+            opened = os.fstat(descriptor)
+            try:
+                current = os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise BackupLockError("backup lock pathname could not be validated") from exc
+            _validate_lock_stat(opened)
+            _validate_lock_stat(current)
+            if _identity(opened) != _identity(current):
+                raise BackupLockError("backup lock pathname changed while opening")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise BackupLockConflict(
+                        "another backup operation holds the canonical lock"
+                    ) from exc
+                raise BackupLockError("backup lock could not be acquired") from exc
+            handle = lock_handle_type(lock_path, descriptor, _identity(opened))
+            register(handle)
+            handle.validate()
+            yield handle
         finally:
             try:
-                os.close(parent_fd)
+                if handle is not None:
+                    handle.close()
+                elif descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
             finally:
-                singleton.close()
+                try:
+                    os.close(parent_fd)
+                finally:
+                    singleton.close()
+
+    return backend, validate
+
+
+_exclusive_backup_lock_backend, _lock_boundary_validate = _build_lock_boundary()
+del _build_lock_boundary
 
 
 @contextmanager
@@ -395,6 +462,30 @@ def _build_authority_broker():
     over module globals cannot obtain a raw issuer or registry.
     """
 
+    capability_type = _MutationCapability
+    head_type = _TrustedAlembicHead
+
+    @dataclass(frozen=True, slots=True)
+    class CapabilityRecord:
+        operation: str
+        scope: object | None
+
+    @dataclass(frozen=True, slots=True)
+    class HeadRecord:
+        value: str
+        source_root: Path
+        scope: object | None
+
+    active_scopes: set[object] = set()
+
+    def begin_scope() -> object:
+        marker = object()
+        active_scopes.add(marker)
+        return marker
+
+    def end_scope(marker: object) -> None:
+        active_scopes.discard(marker)
+
     def identity_registry():
         records: dict[int, tuple[weakref.ReferenceType[Any], object]] = {}
 
@@ -426,39 +517,76 @@ def _build_authority_broker():
     register_capability, lookup_capability = identity_registry()
     register_head, lookup_head = identity_registry()
 
-    def capability_record(instance: object) -> object | None:
-        return lookup_capability(instance)
-
-    def head_record(instance: object) -> object | None:
-        return lookup_head(instance)
-
     def make_capability(
         operation: str,
-        scope_state: dict[str, bool] | None = None,
+        scope_state: object | None = None,
     ) -> _MutationCapability:
         if operation not in {"maintenance", "offsite"}:
             raise BackupSupervisorError(f"unknown backup mutation operation: {operation}")
-        instance = object.__new__(_MutationCapability)
-        register_capability(instance, (operation, scope_state))
+        instance = object.__new__(capability_type)
+        register_capability(instance, CapabilityRecord(operation, scope_state))
         return instance
 
     def make_head(
         value: str,
         source_root: Path,
-        scope_state: dict[str, bool] | None = None,
+        scope_state: object | None = None,
     ) -> _TrustedAlembicHead:
         if not isinstance(value, str) or ALEMBIC_HEAD_RE.fullmatch(value) is None:
             raise BackupSupervisorError("trusted Alembic head is invalid")
         if not isinstance(source_root, Path) or not source_root.is_absolute():
             raise BackupSupervisorError("trusted Alembic source root is invalid")
-        instance = object.__new__(_TrustedAlembicHead)
-        register_head(instance, (value, source_root, scope_state))
+        instance = object.__new__(head_type)
+        register_head(instance, HeadRecord(value, source_root, scope_state))
         return instance
+
+    def validate_capability(instance: object, operation: str | None = None) -> str:
+        if type(instance) is not capability_type:
+            raise BackupSupervisorError("backup mutation capability is invalid")
+        record = lookup_capability(instance)
+        if not isinstance(record, CapabilityRecord):
+            raise BackupSupervisorError("backup mutation capability is invalid")
+        if record.scope is not None and record.scope not in active_scopes:
+            raise BackupSupervisorError("backup mutation capability is no longer active")
+        if record.operation not in {"maintenance", "offsite"}:
+            raise BackupSupervisorError("backup mutation capability is invalid")
+        if operation is not None and record.operation != operation:
+            raise BackupSupervisorError("backup mutation capability is invalid")
+        return record.operation
+
+    def validate_head(
+        instance: object,
+        *,
+        source_root: Path | None = None,
+        expected: str | None = None,
+    ) -> tuple[str, Path]:
+        if type(instance) is not head_type:
+            raise BackupSupervisorError("trusted Alembic head is invalid")
+        record = lookup_head(instance)
+        if not isinstance(record, HeadRecord):
+            raise BackupSupervisorError("trusted Alembic head is invalid")
+        if record.scope is not None and record.scope not in active_scopes:
+            raise BackupSupervisorError("trusted Alembic head is no longer active")
+        if not isinstance(record.value, str) or ALEMBIC_HEAD_RE.fullmatch(record.value) is None:
+            raise BackupSupervisorError("trusted Alembic head is invalid")
+        if source_root is not None:
+            try:
+                resolved_root = Path(source_root).resolve(strict=False)
+            except OSError as exc:
+                raise BackupSupervisorError("trusted Alembic source root is invalid") from exc
+            if resolved_root != record.source_root:
+                raise BackupSupervisorError("trusted Alembic source root changed")
+        if expected is not None and expected != record.value:
+            raise BackupSupervisorError(
+                "requested Alembic head does not match the trusted deployed source graph"
+            )
+        # Return copies of immutable public values; never expose the broker record.
+        return record.value, Path(str(record.source_root))
 
     def contains_authority(value: object, seen: set[int] | None = None) -> bool:
         """Prevent a scoped callback from smuggling authority out in a result."""
 
-        if type(value) in {_MutationCapability, _TrustedAlembicHead}:
+        if type(value) in {capability_type, head_type}:
             return True
         if seen is None:
             seen = set()
@@ -481,11 +609,10 @@ def _build_authority_broker():
         return value
 
     def validate_scope_lock(lock: object) -> None:
-        validator = getattr(lock, "validate", None)
-        if not callable(validator):
-            raise BackupSupervisorError("backup operation requires a held backup lock")
+        if type(lock) is not BackupLockHandle:
+            raise BackupSupervisorError("backup operation requires a supervisor lock handle")
         try:
-            validator()
+            _lock_boundary_validate(lock)
         except BackupSupervisorError:
             raise
         except Exception as exc:
@@ -503,7 +630,7 @@ def _build_authority_broker():
         source_root: Path,
         *,
         restore: Any | None = None,
-        scope_state: dict[str, bool] | None = None,
+        scope_state: object | None = None,
     ) -> _TrustedAlembicHead:
         """Derive and pin the exact head from the trusted source graph."""
 
@@ -541,7 +668,7 @@ def _build_authority_broker():
         """Issue fixed local-backup authorities only inside a held lock scope."""
 
         validate_scope_lock(lock)
-        scope_state = {"active": True}
+        scope_state = begin_scope()
         try:
             restore = _restore_module if _restore_module is not None else load_restore_module()
             trusted_source = Path(source_root or (Path(app_dir) / "current"))
@@ -555,7 +682,7 @@ def _build_authority_broker():
             capability = make_capability("maintenance", scope_state)
             return public_result(callback(capability, trusted_head, restore))
         finally:
-            scope_state["active"] = False
+            end_scope(scope_state)
 
     def offsite_scope(
         args: argparse.Namespace,
@@ -568,7 +695,7 @@ def _build_authority_broker():
         """Issue the fixed off-site authority after graph validation."""
 
         validate_scope_lock(lock)
-        scope_state = {"active": True}
+        scope_state = begin_scope()
         try:
             restore = _restore_module if _restore_module is not None else load_restore_module()
             trusted_head = resolve_trusted_head(
@@ -579,21 +706,21 @@ def _build_authority_broker():
             capability = make_capability("offsite", scope_state)
             return public_result(callback(capability, trusted_head, restore))
         finally:
-            scope_state["active"] = False
+            end_scope(scope_state)
 
     def maintenance_scope(*, lock: BackupLockHandle, callback: Any) -> Any:
         """Issue the fixed maintenance authority under the held backup lock."""
 
         validate_scope_lock(lock)
-        scope_state = {"active": True}
+        scope_state = begin_scope()
         try:
             return public_result(callback(make_capability("maintenance", scope_state)))
         finally:
-            scope_state["active"] = False
+            end_scope(scope_state)
 
     return (
-        capability_record,
-        head_record,
+        validate_capability,
+        validate_head,
         trusted_head_for_source,
         local_backup_scope,
         offsite_scope,
@@ -618,41 +745,14 @@ class _MutationCapability:
 
     @property
     def operation(self) -> str:
-        record = _authority_capability_record(self)
-        if (
-            not isinstance(record, tuple)
-            or len(record) != 2
-            or record[0] not in {"maintenance", "offsite"}
-            or (
-                record[1] is not None
-                and (
-                    not isinstance(record[1], dict)
-                    or record[1].get("active") is not True
-                )
-            )
-        ):
-            raise BackupSupervisorError("backup mutation capability is invalid")
-        return record[0]
+        return _authority_validate_capability(self)
 
     def prove(self, operation: str) -> None:
         if type(self) is not _MutationCapability:
             raise BackupSupervisorError("backup mutation capability is invalid")
         if operation not in {"maintenance", "offsite"}:
             raise BackupSupervisorError("backup mutation capability is invalid")
-        record = _authority_capability_record(self)
-        if (
-            not isinstance(record, tuple)
-            or len(record) != 2
-            or record[0] != operation
-            or (
-                record[1] is not None
-                and (
-                    not isinstance(record[1], dict)
-                    or record[1].get("active") is not True
-                )
-            )
-        ):
-            raise BackupSupervisorError("backup mutation capability is invalid")
+        _authority_validate_capability(self, operation)
 
     def __copy__(self) -> None:
         raise TypeError("backup mutation capability cannot be copied")
@@ -700,37 +800,11 @@ class _TrustedAlembicHead:
 
     @property
     def value(self) -> str:
-        record = _authority_head_record(self)
-        if (
-            not isinstance(record, tuple)
-            or len(record) != 3
-            or (
-                record[2] is not None
-                and (
-                    not isinstance(record[2], dict)
-                    or record[2].get("active") is not True
-                )
-            )
-        ):
-            raise BackupSupervisorError("trusted Alembic head is invalid")
-        return record[0]
+        return _authority_validate_head(self)[0]
 
     @property
     def source_root(self) -> Path:
-        record = _authority_head_record(self)
-        if (
-            not isinstance(record, tuple)
-            or len(record) != 3
-            or (
-                record[2] is not None
-                and (
-                    not isinstance(record[2], dict)
-                    or record[2].get("active") is not True
-                )
-            )
-        ):
-            raise BackupSupervisorError("trusted Alembic head is invalid")
-        return record[1]
+        return _authority_validate_head(self)[1]
 
     def __copy__(self) -> None:
         raise TypeError("trusted Alembic head cannot be copied")
@@ -757,37 +831,13 @@ def require_trusted_alembic_head(
         raise BackupSupervisorError(
             "backup restore requires a supervisor-resolved trusted Alembic head"
         )
-    record = _authority_head_record(value)
-    if not isinstance(record, tuple) or len(record) != 3:
-        raise BackupSupervisorError(
-            "backup restore requires a supervisor-resolved trusted Alembic head"
-        )
-    head_value, head_source_root, scope_state = record
-    if scope_state is not None and (
-        not isinstance(scope_state, dict) or scope_state.get("active") is not True
-    ):
-        raise BackupSupervisorError("trusted Alembic head is no longer active")
-    if not isinstance(head_value, str) or ALEMBIC_HEAD_RE.fullmatch(head_value) is None:
-        raise BackupSupervisorError("trusted Alembic head is invalid")
-    if not isinstance(head_source_root, Path) or not head_source_root.is_absolute():
-        raise BackupSupervisorError("trusted Alembic source root is invalid")
-    if source_root is not None:
-        try:
-            resolved_root = Path(source_root).resolve(strict=False)
-        except OSError as exc:
-            raise BackupSupervisorError("trusted Alembic source root is invalid") from exc
-        if resolved_root != head_source_root:
-            raise BackupSupervisorError("trusted Alembic source root changed")
-    if expected is not None and expected != head_value:
-        raise BackupSupervisorError(
-            "requested Alembic head does not match the trusted deployed source graph"
-        )
+    _authority_validate_head(value, source_root=source_root, expected=expected)
     return value
 
 
 (
-    _authority_capability_record,
-    _authority_head_record,
+    _authority_validate_capability,
+    _authority_validate_head,
     _trusted_head_for_source,
     _run_local_backup_scope,
     _run_offsite_scope,
@@ -1783,7 +1833,7 @@ def run_local_backup(
 ) -> dict[str, Any]:
     """Create, verify, and prune one local backup under the final lock."""
 
-    lock.validate()
+    _lock_boundary_validate(lock)
     require_mutation_capability(capability, "maintenance")
     try:
         restore = importlib.import_module("tools.platform_backup_restore_drill")
@@ -1859,7 +1909,7 @@ def run_local_backup(
     # The selected pair must remain intact even if pruning saw a malformed
     # unrelated archive.  This also proves no writer replaced it during prune.
     assert_backup_pair_unchanged(pair, dump, manifest)
-    lock.validate()
+    _lock_boundary_validate(lock)
     return {
         "status": "completed",
         "size_bytes": pair.size_bytes,
@@ -1888,7 +1938,7 @@ def run_offsite(
 ) -> dict[str, Any]:
     """Select/encrypt/upload/head-verify one exact pair under backup lock."""
 
-    lock.validate()
+    _lock_boundary_validate(lock)
     require_mutation_capability(capability, "offsite")
     try:
         offsite = importlib.import_module("tools.platform_backup_offsite")
@@ -1963,7 +2013,7 @@ def run_offsite(
             if not args.apply:
                 evidence.update_remote(attempted=False, object=key)
                 held.validate()
-                lock.validate()
+                _lock_boundary_validate(lock)
                 return result
             storage_client = (
                 client
@@ -1997,7 +2047,7 @@ def run_offsite(
                     "remote_operations": 4 if uploaded else 2,
                 }
             )
-            lock.validate()
+            _lock_boundary_validate(lock)
             return result
     finally:
         if encrypted is not None and getattr(encrypted, "fd", None) is not None:

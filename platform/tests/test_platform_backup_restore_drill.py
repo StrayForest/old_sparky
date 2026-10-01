@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import datetime as dt
 import hashlib
 import importlib.util
@@ -37,6 +37,14 @@ sys.modules[MANIFEST_SPEC.name] = manifest_contract
 MANIFEST_SPEC.loader.exec_module(manifest_contract)
 
 
+@contextmanager
+def _held_test_lock():
+    with tempfile.TemporaryDirectory() as temporary_dir:
+        path = pathlib.Path(temporary_dir) / platform_backup_supervisor.BACKUP_LOCK_PATH.name
+        with platform_backup_supervisor._exclusive_backup_lock_for_test(path) as lock:
+            yield lock
+
+
 def _trusted_source(source_root: pathlib.Path) -> pathlib.Path:
     versions = source_root / "alembic" / "versions"
     versions.mkdir(parents=True)
@@ -63,18 +71,19 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         *,
         source_root: pathlib.Path | None = None,
     ) -> dict[str, object]:
-        return platform_backup_supervisor._run_local_backup_scope(
-            args,
-            app_dir=pathlib.Path(args.output_dir),
-            source_root=source_root,
-            _restore_module=backup_drill,
-            lock=mock.Mock(),
-            callback=lambda capability, trusted_head, _restore: backup_drill.create_backup(
+        with _held_test_lock() as lock:
+            return platform_backup_supervisor._run_local_backup_scope(
                 args,
-                capability=capability,
-                trusted_alembic_head=trusted_head,
-            ),
-        )
+                app_dir=pathlib.Path(args.output_dir),
+                source_root=source_root,
+                _restore_module=backup_drill,
+                lock=lock,
+                callback=lambda capability, trusted_head, _restore: backup_drill.create_backup(
+                    args,
+                    capability=capability,
+                    trusted_alembic_head=trusted_head,
+                ),
+            )
 
     def _creator_environment(self) -> dict[str, str]:
         return {
@@ -304,14 +313,15 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             verified_metadata = verified_dump.with_suffix(".json")
             failed_metadata = failed_dump.with_suffix(".json")
 
-            removed = platform_backup_supervisor._run_maintenance_scope(
-                lock=mock.Mock(),
-                callback=lambda capability: backup_drill.prune_unverified_backups(
-                    output_dir,
-                    preserve_metadata=verified_metadata,
-                    capability=capability,
-                ),
-            )
+            with _held_test_lock() as lock:
+                removed = platform_backup_supervisor._run_maintenance_scope(
+                    lock=lock,
+                    callback=lambda capability: backup_drill.prune_unverified_backups(
+                        output_dir,
+                        preserve_metadata=verified_metadata,
+                        capability=capability,
+                    ),
+                )
 
             self.assertTrue(verified_dump.exists())
             self.assertTrue(verified_metadata.exists())

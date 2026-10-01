@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import json
 from datetime import UTC, datetime
 import hashlib
@@ -12,6 +13,14 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 from tools import platform_backup_supervisor as supervisor
+
+
+@contextmanager
+def _held_test_lock():
+    with tempfile.TemporaryDirectory() as temporary_dir:
+        path = Path(temporary_dir) / supervisor.BACKUP_LOCK_PATH.name
+        with supervisor._exclusive_backup_lock_for_test(path) as lock:
+            yield lock
 
 
 class PlatformBackupSupervisorTests(unittest.TestCase):
@@ -187,53 +196,69 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         restore.expected_alembic_head.return_value = "20260913_0053"
         restore.create_backup.side_effect = RuntimeError("pg_dump sentinel")
         app_dir = Path("/tmp/oldsparky-supervisor-head-regression")
-        lock = mock.Mock()
         evidence = mock.Mock()
         args = SimpleNamespace(dump_only=False)
         observed_head: dict[str, object] = {}
+        captured_head: list[object] = []
 
-        def invoke(
-            capability: object,
-            trusted_head: object,
-            _restore: object,
-        ) -> object:
-            assert trusted_head is not None
-            observed_head["value"] = trusted_head.value
-            observed_head["source"] = trusted_head.source_root
-            with self.assertRaises(TypeError):
-                trusted_head.value = "not-current-head"
-            with self.assertRaises(TypeError):
-                trusted_head.source_root = Path("/tmp/forged-source")
-            with self.assertRaises(TypeError):
-                copy.copy(trusted_head)
-            with self.assertRaises(TypeError):
-                pickle.dumps(trusted_head)
-            with self.assertRaises(AttributeError):
-                object.__setattr__(trusted_head, "_value", "stolen-head")
-            return supervisor.run_local_backup(
-                app_dir,
-                trusted_alembic_head=trusted_head,
-                capability=capability,
-                lock=lock,
-                evidence=evidence,
-            )
-
-        with mock.patch.object(
-            supervisor.importlib, "import_module", return_value=restore
-        ):
-            with self.assertRaisesRegex(RuntimeError, "pg_dump sentinel"):
-                supervisor._run_local_backup_scope(
-                    args,
-                    app_dir=app_dir,
+        with _held_test_lock() as lock:
+            def invoke(
+                capability: object,
+                trusted_head: object,
+                _restore: object,
+            ) -> object:
+                assert trusted_head is not None
+                captured_head.append(trusted_head)
+                observed_head["value"] = trusted_head.value
+                observed_head["source"] = trusted_head.source_root
+                self.assertEqual(
+                    supervisor._authority_validate_capability(capability, "maintenance"),
+                    "maintenance",
+                )
+                validated_value, validated_source = supervisor._authority_validate_head(
+                    trusted_head
+                )
+                self.assertEqual(validated_value, "20260913_0053")
+                self.assertIsInstance(validated_source, Path)
+                with self.assertRaises(TypeError):
+                    trusted_head.value = "not-current-head"
+                with self.assertRaises(TypeError):
+                    trusted_head.source_root = Path("/tmp/forged-source")
+                with self.assertRaises(TypeError):
+                    copy.copy(trusted_head)
+                with self.assertRaises(TypeError):
+                    pickle.dumps(trusted_head)
+                with self.assertRaises(AttributeError):
+                    object.__setattr__(trusted_head, "_value", "stolen-head")
+                return supervisor.run_local_backup(
+                    app_dir,
+                    trusted_alembic_head=trusted_head,
+                    capability=capability,
                     lock=lock,
-                    callback=invoke,
+                    evidence=evidence,
                 )
 
-        self.assertGreaterEqual(lock.validate.call_count, 2)
+            with mock.patch.object(
+                supervisor.importlib, "import_module", return_value=restore
+            ):
+                with self.assertRaisesRegex(RuntimeError, "pg_dump sentinel"):
+                    supervisor._run_local_backup_scope(
+                        args,
+                        app_dir=app_dir,
+                        lock=lock,
+                        callback=invoke,
+                    )
+
         restore.expected_alembic_head.assert_called_once_with(app_dir / "current")
         restore.create_backup.assert_called_once()
         self.assertEqual(observed_head["value"], "20260913_0053")
         self.assertEqual(observed_head["source"], (app_dir / "current").resolve(strict=False))
+        with self.assertRaises(supervisor.BackupSupervisorError):
+            captured_head[0].value
+        with self.assertRaises(supervisor.BackupSupervisorError):
+            supervisor.require_trusted_alembic_head(captured_head[0])
+        with self.assertRaises(supervisor.BackupSupervisorError):
+            supervisor._authority_validate_head(captured_head[0])
         with self.assertRaises(TypeError):
             supervisor._TrustedAlembicHead(
                 object(),
@@ -248,37 +273,37 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         restore = mock.Mock()
         restore.expected_alembic_head.return_value = "20260913_0053"
         app_dir = Path("/tmp/oldsparky-supervisor-head-mismatch")
-        lock = mock.Mock()
 
-        with mock.patch.object(
-            supervisor.importlib, "import_module", return_value=restore
-        ):
-            with self.assertRaisesRegex(
-                supervisor.BackupSupervisorError, "trusted Alembic head"
+        with _held_test_lock() as lock:
+            with mock.patch.object(
+                supervisor.importlib, "import_module", return_value=restore
             ):
-                supervisor._run_local_backup_scope(
-                    SimpleNamespace(dump_only=False),
-                    app_dir=app_dir,
-                    lock=lock,
-                    callback=lambda capability, _trusted_head, _restore: supervisor.run_local_backup(
-                        app_dir,
-                        trusted_alembic_head=object(),
-                        capability=capability,
+                with self.assertRaisesRegex(
+                    supervisor.BackupSupervisorError, "trusted Alembic head"
+                ):
+                    supervisor._run_local_backup_scope(
+                        SimpleNamespace(dump_only=False),
+                        app_dir=app_dir,
                         lock=lock,
-                        evidence=mock.Mock(),
-                    ),
-                )
-            with self.assertRaisesRegex(
-                supervisor.BackupSupervisorError, "mutation capability"
-            ):
-                supervisor._run_local_backup_scope(
-                    SimpleNamespace(dump_only=False),
-                    app_dir=app_dir,
-                    lock=lock,
-                    callback=lambda capability, _trusted_head, _restore: supervisor.require_mutation_capability(
-                        capability, "offsite"
-                    ),
-                )
+                        callback=lambda capability, _trusted_head, _restore: supervisor.run_local_backup(
+                            app_dir,
+                            trusted_alembic_head=object(),
+                            capability=capability,
+                            lock=lock,
+                            evidence=mock.Mock(),
+                        ),
+                    )
+                with self.assertRaisesRegex(
+                    supervisor.BackupSupervisorError, "mutation capability"
+                ):
+                    supervisor._run_local_backup_scope(
+                        SimpleNamespace(dump_only=False),
+                        app_dir=app_dir,
+                        lock=lock,
+                        callback=lambda capability, _trusted_head, _restore: supervisor.require_mutation_capability(
+                            capability, "offsite"
+                        ),
+                    )
 
         restore.create_backup.assert_not_called()
 
@@ -290,10 +315,12 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         evidence = mock.Mock()
         evidence_context = mock.MagicMock()
         evidence_context.__enter__.return_value = evidence
-        lock = mock.Mock()
-        scope_context = mock.MagicMock()
-        scope_context.__enter__.return_value = (lock, None)
         observed_head: dict[str, object] = {}
+
+        @contextmanager
+        def real_ordered_scope(*_args: object, **_kwargs: object):
+            with _held_test_lock() as lock:
+                yield lock, None
 
         def run_local_with_observation(
             *_args: object, **kwargs: object
@@ -316,7 +343,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                 supervisor, "evidence_session", return_value=evidence_context
             ),
             mock.patch.object(
-                supervisor, "ordered_backup_lock_scope", return_value=scope_context
+                supervisor, "ordered_backup_lock_scope", side_effect=real_ordered_scope
             ),
             mock.patch.object(supervisor, "_source_sha_from_release", return_value="unknown"),
             mock.patch.object(
@@ -362,20 +389,25 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                 supervisor.require_mutation_capability(uninitialized, "maintenance")
             return "completed"
 
-        result = supervisor._run_maintenance_scope(
-            lock=mock.Mock(),
-            callback=inspect_capability,
-        )
+        with _held_test_lock() as lock:
+            result = supervisor._run_maintenance_scope(
+                lock=lock,
+                callback=inspect_capability,
+            )
         self.assertEqual(result, "completed")
         capability = captured[0]
         with self.assertRaisesRegex(
             supervisor.BackupSupervisorError, "cannot escape"
         ):
-            supervisor._run_maintenance_scope(
-                lock=mock.Mock(), callback=lambda scoped_capability: scoped_capability
-            )
+            with _held_test_lock() as lock:
+                supervisor._run_maintenance_scope(
+                    lock=lock,
+                    callback=lambda scoped_capability: scoped_capability,
+                )
         with self.assertRaises(supervisor.BackupSupervisorError):
             supervisor.require_mutation_capability(capability, "maintenance")
+        with self.assertRaises(supervisor.BackupSupervisorError):
+            supervisor._authority_validate_capability(capability, "maintenance")
 
         class NoOpProve:
             operation = "maintenance"
@@ -390,35 +422,82 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         self.assertFalse(hasattr(supervisor, "_capability"))
         self.assertFalse(hasattr(supervisor, "_authority_issue_capability"))
         self.assertFalse(hasattr(supervisor, "_authority_issue_head"))
+        self.assertFalse(hasattr(supervisor, "_authority_capability_record"))
+        self.assertFalse(hasattr(supervisor, "_authority_head_record"))
+        self.assertFalse(hasattr(supervisor, "_build_authority_broker"))
         for name, value in vars(supervisor).items():
             if any(fragment in name.lower() for fragment in ("issue", "register", "mutate")):
                 self.assertFalse(callable(value), name)
 
-        blocked_lock = mock.Mock()
-        blocked_lock.validate.side_effect = supervisor.BackupSupervisorError("no lock")
         callback = mock.Mock()
+        class FakeLock:
+            def validate(self) -> None:
+                return None
+
         with mock.patch.object(supervisor.importlib, "import_module") as import_module:
             with self.assertRaises(supervisor.BackupSupervisorError):
                 supervisor._run_local_backup_scope(
                     SimpleNamespace(dump_only=False),
                     app_dir=Path("/tmp/oldsparky-no-lock"),
-                    lock=blocked_lock,
+                    lock=FakeLock(),
                     callback=callback,
                 )
         callback.assert_not_called()
         import_module.assert_not_called()
 
-        restore = mock.Mock()
-        restore.expected_alembic_head.side_effect = RuntimeError("missing graph")
-        producer = mock.Mock()
-        with mock.patch.object(supervisor.importlib, "import_module", return_value=restore):
+        forged_lock = object.__new__(supervisor.BackupLockHandle)
+        with mock.patch.object(supervisor.importlib, "import_module") as import_module:
             with self.assertRaises(supervisor.BackupSupervisorError):
                 supervisor._run_local_backup_scope(
                     SimpleNamespace(dump_only=False),
-                    app_dir=Path("/tmp/oldsparky-missing-source"),
-                    lock=mock.Mock(),
-                    callback=producer,
+                    app_dir=Path("/tmp/oldsparky-forged-lock"),
+                    lock=forged_lock,
+                    callback=callback,
                 )
+        callback.assert_not_called()
+        import_module.assert_not_called()
+
+        with _held_test_lock() as released_lock:
+            released_lock.close()
+            with self.assertRaises(supervisor.BackupSupervisorError):
+                supervisor._run_local_backup_scope(
+                    SimpleNamespace(dump_only=False),
+                    app_dir=Path("/tmp/oldsparky-released-lock"),
+                    lock=released_lock,
+                    callback=callback,
+                )
+        callback.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            lock_root = Path(temporary_dir)
+            lock_path = lock_root / supervisor.BACKUP_LOCK_PATH.name
+            with self.assertRaises(supervisor.BackupLockError):
+                with supervisor._exclusive_backup_lock_for_test(lock_path) as replaced_lock:
+                    replacement = lock_root / "replacement"
+                    replacement.write_bytes(b"")
+                    replacement.chmod(0o600)
+                    os.replace(replacement, lock_path)
+                    with self.assertRaises(supervisor.BackupSupervisorError):
+                        supervisor._run_local_backup_scope(
+                            SimpleNamespace(dump_only=False),
+                            app_dir=Path("/tmp/oldsparky-replaced-lock"),
+                            lock=replaced_lock,
+                            callback=callback,
+                        )
+            callback.assert_not_called()
+
+        restore = mock.Mock()
+        restore.expected_alembic_head.side_effect = RuntimeError("missing graph")
+        producer = mock.Mock()
+        with _held_test_lock() as lock:
+            with mock.patch.object(supervisor.importlib, "import_module", return_value=restore):
+                with self.assertRaises(supervisor.BackupSupervisorError):
+                    supervisor._run_local_backup_scope(
+                        SimpleNamespace(dump_only=False),
+                        app_dir=Path("/tmp/oldsparky-missing-source"),
+                        lock=lock,
+                        callback=producer,
+                    )
         producer.assert_not_called()
         payload = supervisor._empty_evidence(
             operation="offsite",
