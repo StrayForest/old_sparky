@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tests import platform_test_lock_support as lock_support
 from tools import platform_backup_supervisor
 
 
@@ -48,7 +49,7 @@ RESTORE_SPEC.loader.exec_module(backup_creator)
 def _held_test_lock():
     with tempfile.TemporaryDirectory() as temporary_dir:
         path = Path(temporary_dir) / platform_backup_supervisor.BACKUP_LOCK_PATH.name
-        with platform_backup_supervisor._exclusive_backup_lock_for_test(path) as lock:
+        with lock_support.root_owned_backup_lock(platform_backup_supervisor, path) as lock:
             yield lock
 
 

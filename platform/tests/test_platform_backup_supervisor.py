@@ -12,6 +12,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from tests import platform_test_lock_support as lock_support
 from tools import platform_backup_supervisor as supervisor
 
 
@@ -19,7 +20,7 @@ from tools import platform_backup_supervisor as supervisor
 def _held_test_lock():
     with tempfile.TemporaryDirectory() as temporary_dir:
         path = Path(temporary_dir) / supervisor.BACKUP_LOCK_PATH.name
-        with supervisor._exclusive_backup_lock_for_test(path) as lock:
+        with lock_support.root_owned_backup_lock(supervisor, path) as lock:
             yield lock
 
 
@@ -63,6 +64,21 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                     replacement.write_bytes(b"")
                     replacement.chmod(0o600)
                     os.replace(replacement, path)
+
+            foreign_owner = list(os.stat(path))
+            foreign_owner[4] = 1 if foreign_owner[4] != 1 else 2
+            foreign_owner[5] = 1 if foreign_owner[5] != 1 else 2
+            with self.assertRaises(supervisor.BackupLockError):
+                supervisor._validate_lock_stat(os.stat_result(foreign_owner))
+
+            unsafe_root = root / "unsafe-root"
+            unsafe_root.mkdir()
+            unsafe_root.chmod(0o777)
+            with self.assertRaises(supervisor.BackupLockError):
+                with supervisor._exclusive_backup_lock_for_test(
+                    unsafe_root / supervisor.BACKUP_LOCK_PATH.name
+                ):
+                    pass
 
     def test_kernel_singleton_blocks_after_lock_inode_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
