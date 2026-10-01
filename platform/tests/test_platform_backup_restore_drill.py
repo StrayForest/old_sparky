@@ -37,6 +37,19 @@ sys.modules[MANIFEST_SPEC.name] = manifest_contract
 MANIFEST_SPEC.loader.exec_module(manifest_contract)
 
 
+def _trusted_head(source_root: pathlib.Path) -> object:
+    versions = source_root / "alembic" / "versions"
+    versions.mkdir(parents=True)
+    (versions / "001.py").write_text(
+        "revision = '20260913_0053'\ndown_revision = None\n",
+        encoding="utf-8",
+    )
+    return platform_backup_supervisor._trusted_head_for_source(
+        source_root,
+        restore=backup_drill,
+    )
+
+
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def _creator_args(self, output_dir: pathlib.Path, *, dump_only: bool = True) -> argparse.Namespace:
         return argparse.Namespace(
@@ -512,6 +525,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 dump_only=False,
                 _supervisor_capability=platform_backup_supervisor._capability("maintenance"),
             )
+            trusted_head = _trusted_head(output_dir / "trusted-source")
+
+            with self.assertRaisesRegex(
+                platform_backup_supervisor.BackupSupervisorError,
+                "trusted Alembic head",
+            ):
+                backup_drill.create_backup(args)
 
             def fake_run_command(
                 command: list[str], *, stdout: int | None = None, **_: object
@@ -551,7 +571,10 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(RuntimeError, "restore verification failed"):
-                    backup_drill.create_backup(args)
+                    backup_drill.create_backup(
+                        args,
+                        trusted_alembic_head=trusted_head,
+                    )
 
             self.assertTrue(old_dump.exists())
             self.assertTrue(old_metadata.exists())

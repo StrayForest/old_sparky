@@ -47,6 +47,19 @@ FINGERPRINT = "A" * 40
 R2_ENDPOINT = f"https://{'a' * 32}.r2.cloudflarestorage.com"
 
 
+def _trusted_head(source_root: Path) -> object:
+    versions = source_root / "alembic" / "versions"
+    versions.mkdir(parents=True)
+    (versions / "001.py").write_text(
+        "revision = '20260913_0053'\ndown_revision = None\n",
+        encoding="utf-8",
+    )
+    return platform_backup_supervisor._trusted_head_for_source(
+        source_root,
+        restore=backup_creator,
+    )
+
+
 def _write_private(path: Path, content: str | bytes) -> None:
     if isinstance(content, bytes):
         path.write_bytes(content)
@@ -163,6 +176,7 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
             env_path = root / ".env.platform"
             output_dir = root / "backups"
             output_dir.mkdir()
+            trusted_head = _trusted_head(root / "trusted-source")
             args = argparse.Namespace(
                 env_file=str(env_path),
                 output_dir=str(output_dir),
@@ -192,7 +206,10 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 mock.patch.object(backup_creator, "run_command", side_effect=fake_run_command),
                 mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
             ):
-                created = backup_creator.create_backup(args)
+                created = backup_creator.create_backup(
+                    args,
+                    trusted_alembic_head=trusted_head,
+                )
 
             selected = offsite.select_verified_backup(
                 output_dir, None, max_age_hours=24, apply=False
@@ -208,6 +225,7 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
             root = Path(temporary_dir)
             output_dir = root / "backups"
             output_dir.mkdir()
+            trusted_head = _trusted_head(root / "trusted-source")
             fixed_now = dt.datetime(2026, 10, 1, 12, 0, 0, tzinfo=dt.UTC)
             args = argparse.Namespace(
                 env_file=str(root / ".env.platform"),
@@ -239,8 +257,14 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
                 mock.patch.object(backup_creator, "utc_now", return_value=fixed_now),
             ):
-                first = backup_creator.create_backup(args)
-                second = backup_creator.create_backup(args)
+                first = backup_creator.create_backup(
+                    args,
+                    trusted_alembic_head=trusted_head,
+                )
+                second = backup_creator.create_backup(
+                    args,
+                    trusted_alembic_head=trusted_head,
+                )
 
             self.assertNotEqual(first["run_id"], second["run_id"])
             self.assertEqual(len(tuple(output_dir.glob("*.dump"))), 2)

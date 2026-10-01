@@ -571,15 +571,31 @@ def perform_restore_drill(
     app_target: DatabaseTarget,
     admin_target: DatabaseTarget | None,
     timestamp_slug: str,
+    trusted_alembic_head: object | None = None,
     expected_alembic_head: str | None = None,
     source_root: pathlib.Path | None = None,
 ) -> int:
-    trusted_head = _trusted_alembic_head(source_root)
-    if expected_alembic_head is not None and expected_alembic_head != trusted_head:
-        raise RuntimeError(
-            "Expected Alembic head does not match the trusted deployed source graph."
+    if trusted_alembic_head is not None:
+        try:
+            import tools.platform_backup_supervisor as supervisor
+        except ImportError:
+            try:
+                from . import platform_backup_supervisor as supervisor
+            except ImportError:
+                import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+        trusted = supervisor.require_trusted_alembic_head(
+            trusted_alembic_head,
+            source_root=source_root,
+            expected=expected_alembic_head,
         )
-    expected_head = trusted_head
+        expected_head = trusted.value
+    else:
+        trusted_head = _trusted_alembic_head(source_root)
+        if expected_alembic_head is not None and expected_alembic_head != trusted_head:
+            raise RuntimeError(
+                "Expected Alembic head does not match the trusted deployed source graph."
+            )
+        expected_head = trusted_head
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
         admin_target is None
@@ -760,6 +776,7 @@ def create_backup(
     *,
     prune: bool = True,
     capability: object | None = None,
+    trusted_alembic_head: object | None = None,
 ) -> dict[str, Any]:
     """Create one archive/manifest pair.
 
@@ -782,6 +799,9 @@ def create_backup(
         except ImportError:
             import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
     supervisor.require_mutation_capability(capability, "maintenance")
+    trusted_head = None
+    if not args.dump_only:
+        trusted_head = supervisor.require_trusted_alembic_head(trusted_alembic_head)
     env_file = pathlib.Path(args.env_file)
     output_dir = pathlib.Path(args.output_dir)
     file_env = load_env(env_file)
@@ -924,13 +944,11 @@ def create_backup(
                     app_target=app_target,
                     admin_target=admin_target,
                     timestamp_slug=timestamp_slug,
-                    expected_alembic_head=getattr(args, "expected_alembic_head", None),
-                    source_root=getattr(args, "source_root", None),
+                    trusted_alembic_head=trusted_head,
                 )
                 restore_verified = True
-                alembic_revision = getattr(args, "expected_alembic_head", None) or _trusted_alembic_head(
-                    getattr(args, "source_root", None)
-                )
+                assert trusted_head is not None
+                alembic_revision = trusted_head.value
             except Exception as exc:
                 restore_error = str(exc)
 

@@ -203,8 +203,12 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         lock.validate.assert_called_once_with()
         restore.expected_alembic_head.assert_called_once_with(app_dir / "current")
         restore.create_backup.assert_called_once()
-        restore_args = restore.create_backup.call_args.args[0]
-        self.assertEqual(restore_args.expected_alembic_head, "20260913_0053")
+        trusted_head = restore.create_backup.call_args.kwargs["trusted_alembic_head"]
+        self.assertEqual(trusted_head.value, "20260913_0053")
+        self.assertEqual(
+            trusted_head.source_root,
+            (app_dir / "current").resolve(strict=False),
+        )
 
     def test_local_backup_rejects_untrusted_explicit_expected_head(self) -> None:
         restore = mock.Mock()
@@ -265,8 +269,11 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         restore.expected_alembic_head.assert_called_once_with(app_dir / "current")
+        trusted_head = run_local.call_args.kwargs["trusted_alembic_head"]
+        self.assertEqual(trusted_head.value, expected_head)
         self.assertEqual(
-            run_local.call_args.kwargs["expected_alembic_head"], expected_head
+            trusted_head.source_root,
+            (app_dir / "current").resolve(strict=False),
         )
 
     def test_capability_and_nested_evidence_schema_fail_closed(self) -> None:

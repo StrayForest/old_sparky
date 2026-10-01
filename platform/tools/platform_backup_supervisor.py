@@ -75,6 +75,7 @@ STATUS_EXIT_CODES = {
 SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+ALEMBIC_HEAD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 SAFE_EVIDENCE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 SAFE_ERROR_RE = re.compile(r"^[a-z0-9_.-]{1,80}$")
@@ -410,6 +411,87 @@ def require_mutation_capability(value: object, operation: str) -> _MutationCapab
             "backup mutation requires an in-process supervisor capability"
         )
     value.prove(operation)
+    return value
+
+
+class _TrustedAlembicHead:
+    """An exact migration head resolved once by the supervisor boundary.
+
+    The token is deliberately private so a low-level backup helper cannot be
+    handed an arbitrary revision string.  The source root travels with the
+    value, allowing tests to use an isolated trusted graph without changing
+    the production ``app_dir/current`` resolution rule.
+    """
+
+    __slots__ = ("_token", "value", "source_root")
+
+    def __init__(self, token: object, value: str, source_root: Path) -> None:
+        if token is not _TRUSTED_HEAD_TOKEN:
+            raise TypeError("trusted Alembic head is supervisor-owned")
+        self._token = token
+        self.value = value
+        self.source_root = source_root
+
+
+_TRUSTED_HEAD_TOKEN = object()
+
+
+def _trusted_head_for_source(
+    source_root: Path,
+    *,
+    restore: Any | None = None,
+) -> _TrustedAlembicHead:
+    """Resolve and pin the trusted Alembic graph for one supervisor run.
+
+    ``restore`` is private dependency injection for hermetic tests.  Normal
+    production callers always resolve the sibling restore helper and the
+    deployed ``current`` release path.
+    """
+
+    root = Path(source_root)
+    if not root.is_absolute():
+        raise BackupSupervisorError("trusted Alembic source root must be absolute")
+    try:
+        resolved_root = root.resolve(strict=False)
+    except OSError as exc:
+        raise BackupSupervisorError("trusted Alembic source root is invalid") from exc
+    if restore is None:
+        try:
+            restore = importlib.import_module("tools.platform_backup_restore_drill")
+        except ImportError:
+            restore = importlib.import_module("platform_backup_restore_drill")
+    try:
+        value = restore.expected_alembic_head(root)
+    except Exception as exc:
+        raise BackupSupervisorError("trusted deployed Alembic source graph is unavailable") from exc
+    if not isinstance(value, str) or ALEMBIC_HEAD_RE.fullmatch(value) is None:
+        raise BackupSupervisorError("trusted deployed Alembic head is invalid")
+    return _TrustedAlembicHead(_TRUSTED_HEAD_TOKEN, value, resolved_root)
+
+
+def require_trusted_alembic_head(
+    value: object,
+    *,
+    source_root: Path | None = None,
+    expected: str | None = None,
+) -> _TrustedAlembicHead:
+    """Validate the supervisor-only head passed to a mutating primitive."""
+
+    if not isinstance(value, _TrustedAlembicHead) or value._token is not _TRUSTED_HEAD_TOKEN:
+        raise BackupSupervisorError(
+            "backup restore requires a supervisor-resolved trusted Alembic head"
+        )
+    if source_root is not None:
+        try:
+            resolved_root = Path(source_root).resolve(strict=False)
+        except OSError as exc:
+            raise BackupSupervisorError("trusted Alembic source root is invalid") from exc
+        if resolved_root != value.source_root:
+            raise BackupSupervisorError("trusted Alembic source root changed")
+    if expected is not None and expected != value.value:
+        raise BackupSupervisorError(
+            "requested Alembic head does not match the trusted deployed source graph"
+        )
     return value
 
 
@@ -1368,8 +1450,6 @@ def _restore_args(
     env_file: Path | None = None,
     output_dir: Path | None = None,
     admin_database_url: str | None = None,
-    expected_alembic_head: str | None = None,
-    source_root: Path | None = None,
 ) -> argparse.Namespace:
     shared = Path(app_dir) / "shared"
     return SimpleNamespace(
@@ -1377,8 +1457,6 @@ def _restore_args(
         output_dir=str(output_dir or (shared / "backups")),
         keep=keep,
         admin_database_url=admin_database_url,
-        expected_alembic_head=expected_alembic_head,
-        source_root=source_root,
         dump_only=False,
     )
 
@@ -1392,6 +1470,8 @@ def run_local_backup(
     output_dir: Path | None = None,
     admin_database_url: str | None = None,
     expected_alembic_head: str | None = None,
+    trusted_alembic_head: object | None = None,
+    source_root: Path | None = None,
     capability: object,
     lock: BackupLockHandle,
     evidence: EvidenceSession,
@@ -1407,28 +1487,39 @@ def run_local_backup(
         # in that mode its sibling directory, rather than the repository
         # package root, is on sys.path.
         restore = importlib.import_module("platform_backup_restore_drill")
-    # The deployed source graph is authoritative.  An explicit value is only
-    # accepted when it is the same value proven by that graph; otherwise an
-    # in-process caller could weaken the exact-head restore check.
-    trusted_head = restore.expected_alembic_head(Path(app_dir) / "current")
-    if expected_alembic_head is not None and expected_alembic_head != trusted_head:
-        raise BackupSupervisorError(
-            "requested Alembic head does not match the trusted deployed source graph"
+    trusted_source = Path(source_root or (Path(app_dir) / "current"))
+    if trusted_alembic_head is None:
+        trusted_alembic_head = _trusted_head_for_source(
+            trusted_source,
+            restore=restore,
         )
-    expected_head = trusted_head
+    else:
+        trusted_alembic_head = require_trusted_alembic_head(
+            trusted_alembic_head,
+            source_root=trusted_source,
+            expected=expected_alembic_head,
+        )
+    if expected_alembic_head is not None:
+        require_trusted_alembic_head(
+            trusted_alembic_head,
+            expected=expected_alembic_head,
+        )
     restore_args = _restore_args(
         app_dir,
         keep=keep,
         env_file=env_file,
         output_dir=output_dir,
         admin_database_url=admin_database_url,
-        expected_alembic_head=expected_head,
-        source_root=Path(app_dir) / "current",
     )
     # The supervisor, not the low-level producer, owns rotation.  Existing
     # callers retain the primitive's default behavior, while this path passes
     # the in-process capability and explicitly disables nested pruning.
-    created = restore.create_backup(restore_args, prune=False, capability=capability)
+    created = restore.create_backup(
+        restore_args,
+        prune=False,
+        capability=capability,
+        trusted_alembic_head=trusted_alembic_head,
+    )
     output_dir = Path(restore_args.output_dir)
     dump = output_dir / str(created["dump_file"])
     manifest = dump.with_suffix(".json")
@@ -1545,8 +1636,12 @@ def run_offsite(
                 restore = importlib.import_module("tools.platform_backup_restore_drill")
             except ImportError:
                 restore = importlib.import_module("platform_backup_restore_drill")
+            trusted_head = _trusted_head_for_source(
+                Path(app_dir) / "current",
+                restore=restore,
+            )
             evidence.payload["alembic"] = {
-                "revision": restore.expected_alembic_head(Path(app_dir) / "current"),
+                "revision": trusted_head.value,
                 "verified": True,
             }
             config = offsite.load_config(
@@ -1675,7 +1770,6 @@ def run_backup_entrypoint(
                 restore = importlib.import_module("tools.platform_backup_restore_drill")
             except ImportError:
                 restore = importlib.import_module("platform_backup_restore_drill")
-            expected_alembic_head = restore.expected_alembic_head(Path(app_dir) / "current")
             return run_local_backup(
                 app_dir,
                 keep=int(getattr(args, "keep", 14)),
@@ -1683,7 +1777,10 @@ def run_backup_entrypoint(
                 env_file=getattr(args, "env_file", None),
                 output_dir=getattr(args, "output_dir", None),
                 admin_database_url=getattr(args, "admin_database_url", None),
-                expected_alembic_head=expected_alembic_head,
+                trusted_alembic_head=_trusted_head_for_source(
+                    Path(app_dir) / "current",
+                    restore=restore,
+                ),
                 capability=capability,
                 lock=lock,
                 evidence=evidence,
