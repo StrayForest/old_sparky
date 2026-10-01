@@ -706,6 +706,138 @@ def _delete_owned_redis_keys(
         raise CleanupFailure(f"{label} Redis DB retained keys after owned-key cleanup")
 
 
+def _shielded_worker_finalizer(
+    process: subprocess.Popen[bytes] | None,
+    log: _BoundedWorkerLog | None,
+    *,
+    deadline: float,
+    send_signal: Callable[[int, signal.Signals], None] | None = None,
+) -> list[str]:
+    """Best-effort parent-owned finalization after cancellation/error.
+
+    The ordinary terminator is deliberately injectable in contract tests and
+    may be interrupted before it reaches escalation.  This finalizer has no
+    dependency on that helper: it always attempts process-group TERM, KILL,
+    wait/reap and log-pipe EOF in that order.  Every operation is independently
+    guarded by the same absolute deadline, and failures are collected so a
+    later Redis or temporary-directory postcondition still runs.
+    """
+
+    send_signal = send_signal or os.killpg
+    errors: list[str] = []
+
+    def attempt(
+        label: str,
+        operation: Callable[[], object],
+        *,
+        ignore_process_lookup: bool = False,
+    ) -> object | None:
+        try:
+            return _best_effort_bounded_call(
+                operation,
+                deadline=deadline,
+                label=label,
+            )
+        except ProcessLookupError:
+            if not ignore_process_lookup:
+                errors.append(f"{label}: process group does not exist")
+        except BaseException as exc:
+            errors.append(f"{label}: {exc}")
+        return None
+
+    if process is not None:
+        attempt(
+            "shielded worker TERM",
+            lambda: send_signal(process.pid, signal.SIGTERM),
+            ignore_process_lookup=True,
+        )
+        remaining = max(0.0, deadline - time.monotonic())
+        attempt(
+            "shielded worker TERM wait",
+            lambda: process.wait(timeout=min(PROCESS_TERM_TIMEOUT_SECONDS, remaining)),
+        )
+        attempt(
+            "shielded worker KILL",
+            lambda: send_signal(process.pid, signal.SIGKILL),
+            ignore_process_lookup=True,
+        )
+        remaining = max(0.0, deadline - time.monotonic())
+        attempt(
+            "shielded worker KILL wait",
+            lambda: process.wait(timeout=min(PROCESS_KILL_TIMEOUT_SECONDS, remaining)),
+        )
+        remaining = max(0.0, deadline - time.monotonic())
+        attempt(
+            "shielded worker final reap",
+            lambda: process.wait(timeout=min(PROCESS_KILL_TIMEOUT_SECONDS, remaining)),
+        )
+        final_status = attempt("shielded worker final poll", process.poll)
+        if final_status is None:
+            errors.append("shielded worker remained live after TERM/KILL cleanup")
+
+        stdin = getattr(process, "stdin", None)
+        if stdin is not None:
+            attempt("shielded worker stdin close", stdin.close)
+
+    if log is not None:
+        stream = getattr(log, "_stream", None)
+        if stream is None and process is not None:
+            stream = getattr(process, "stdout", None)
+        if stream is not None:
+            attempt("shielded worker stdout close", stream.close)
+        attempt("shielded worker log EOF join", lambda: log.join(deadline))
+        try:
+            if log.thread_alive:
+                errors.append("shielded worker log-drain thread remained live")
+            eof = getattr(log, "eof", None)
+            if eof is not None and not eof.is_set():
+                errors.append("shielded worker log-drain did not reach EOF")
+            drain_error = getattr(log, "drain_error", None)
+            if drain_error is not None:
+                errors.append(f"shielded worker log drain: {drain_error}")
+        except BaseException as exc:
+            errors.append(f"shielded worker log state: {exc}")
+    elif process is not None and process.stdout is not None:
+        attempt("shielded worker stdout close", process.stdout.close)
+
+    return errors
+
+
+def _cleanup_temporary_directory(run_root: Path, *, deadline: float) -> None:
+    """Check, remove and recheck one exact temporary run directory."""
+
+    if not _bounded_call(
+        run_root.exists,
+        deadline=deadline,
+        label="temporary-directory existence check",
+    ):
+        return
+    leftovers = _bounded_call(
+        lambda: tuple(run_root.iterdir()),
+        deadline=deadline,
+        label="temporary-directory listing",
+    )
+    leftover_error: str | None = None
+    if leftovers:
+        leftover_error = (
+            "ephemeral worker left schedule/state files: "
+            + ", ".join(str(path) for path in leftovers)
+        )
+    _bounded_call(
+        lambda: shutil.rmtree(run_root),
+        deadline=deadline,
+        label="temporary-directory removal",
+    )
+    if _bounded_call(
+        run_root.exists,
+        deadline=deadline,
+        label="temporary-directory post-cleanup existence check",
+    ):
+        raise CleanupFailure("temporary directory remained after cleanup")
+    if leftover_error is not None:
+        raise CleanupFailure(leftover_error)
+
+
 def _cleanup_roundtrip_resources(
     *,
     process: subprocess.Popen[bytes] | None,
@@ -721,62 +853,94 @@ def _cleanup_roundtrip_resources(
     result_allow_prefixes: Iterable[bytes] = (),
     run_root: Path | None,
     deadline: float,
+    send_signal: Callable[[int, signal.Signals], None] | None = None,
 ) -> list[str]:
-    """Run idempotent nested cleanup and return every bounded failure."""
+    """Run shielded process, Redis and temporary-state cleanup phases."""
 
     errors: list[str] = []
-    try:
-        if process is not None:
-            try:
-                _best_effort_bounded_call(
-                    lambda: _terminate_worker_process(process, log, deadline=deadline),
+    fatal_exception: BaseException | None = None
+
+    def note_error(label: str, exc: BaseException) -> None:
+        nonlocal fatal_exception
+        errors.append(f"{label}: {exc}")
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)) and fatal_exception is None:
+            fatal_exception = exc
+
+    process_cleanup_failed = False
+    if process is not None:
+        try:
+            _best_effort_bounded_call(
+                lambda: _terminate_worker_process(
+                    process,
+                    log,
                     deadline=deadline,
-                    label="worker TERM/KILL/reap cleanup",
-                )
-            except BaseException as exc:
-                errors.append(f"worker cleanup: {exc}")
-        elif log is not None:
-            try:
-                stream = getattr(log, "_stream", None)
-                if stream is not None:
-                    _best_effort_bounded_call(
-                        stream.close,
-                        deadline=deadline,
-                        label="worker stdout close",
-                    )
+                    send_signal=send_signal,
+                ),
+                deadline=deadline,
+                label="worker TERM/KILL/reap cleanup",
+            )
+        except BaseException as exc:
+            note_error("worker cleanup", exc)
+            process_cleanup_failed = True
+    elif log is not None:
+        try:
+            stream = getattr(log, "_stream", None)
+            if stream is not None:
                 _best_effort_bounded_call(
-                    lambda: log.join(deadline),
+                    stream.close,
                     deadline=deadline,
-                    label="worker log EOF join",
+                    label="worker stdout close",
                 )
-                if log.thread_alive:
-                    errors.append("worker log-drain thread remained live")
-                eof = getattr(log, "eof", None)
-                if eof is not None and not eof.is_set():
-                    errors.append("worker log-drain did not reach EOF")
-            except BaseException as exc:
-                errors.append(f"worker log cleanup: {exc}")
-    finally:
-        for client, label, initially_empty, owned_keys, prefixes, fragments in (
-            (
-                broker_client,
-                "Celery broker",
-                broker_initially_empty,
-                broker_owned_keys,
-                broker_allow_prefixes,
-                (),
-            ),
-            (
-                result_client,
-                "Celery result",
-                result_initially_empty,
-                result_owned_keys,
-                result_allow_prefixes,
-                result_allow_fragments,
-            ),
-        ):
-            if client is None:
-                continue
+            _best_effort_bounded_call(
+                lambda: log.join(deadline),
+                deadline=deadline,
+                label="worker log EOF join",
+            )
+            if log.thread_alive:
+                raise CleanupFailure("worker log-drain thread remained live")
+            eof = getattr(log, "eof", None)
+            if eof is not None and not eof.is_set():
+                raise CleanupFailure("worker log-drain did not reach EOF")
+        except BaseException as exc:
+            note_error("worker log cleanup", exc)
+            process_cleanup_failed = True
+
+    if process_cleanup_failed:
+        try:
+            errors.extend(
+                f"worker finalizer: {error}"
+                for error in _shielded_worker_finalizer(
+                    process,
+                    log,
+                    deadline=deadline,
+                    send_signal=send_signal,
+                )
+            )
+        except BaseException as exc:
+            note_error("worker finalizer", exc)
+
+    for client, label, initially_empty, owned_keys, prefixes, fragments in (
+        (
+            broker_client,
+            "Celery broker",
+            broker_initially_empty,
+            broker_owned_keys,
+            broker_allow_prefixes,
+            (),
+        ),
+        (
+            result_client,
+            "Celery result",
+            result_initially_empty,
+            result_owned_keys,
+            result_allow_prefixes,
+            result_allow_fragments,
+        ),
+    ):
+        if client is None:
+            continue
+        delete_succeeded = False
+        for _attempt in range(2):
             try:
                 _delete_owned_redis_keys(
                     client,
@@ -787,53 +951,33 @@ def _cleanup_roundtrip_resources(
                     allow_fragments=fragments,
                     deadline=deadline,
                 )
+                delete_succeeded = True
+                break
             except BaseException as exc:
-                errors.append(f"{label} Redis cleanup: {exc}")
-            finally:
-                try:
-                    _best_effort_bounded_call(
-                        client.close,
-                        deadline=deadline,
-                        label=f"{label} Redis close",
-                    )
-                except BaseException as exc:
-                    errors.append(f"{label} Redis close: {exc}")
-
-        if run_root is not None:
+                note_error(f"{label} Redis cleanup", exc)
+        for _attempt in range(2):
             try:
-                if _bounded_call(
-                    run_root.exists,
+                _best_effort_bounded_call(
+                    client.close,
                     deadline=deadline,
-                    label="temporary-directory existence check",
-                ):
-                    leftovers = _bounded_call(
-                        lambda: tuple(run_root.iterdir()),
-                        deadline=deadline,
-                        label="temporary-directory listing",
-                    )
-                    if leftovers:
-                        errors.append(
-                            "ephemeral worker left schedule/state files: "
-                            + ", ".join(str(path) for path in leftovers)
-                        )
-                    if time.monotonic() >= deadline:
-                        errors.append(
-                            "temporary-directory cleanup exceeded its absolute deadline"
-                        )
-                    else:
-                        _bounded_call(
-                            lambda: shutil.rmtree(run_root),
-                            deadline=deadline,
-                            label="temporary-directory removal",
-                        )
-                        if _bounded_call(
-                            run_root.exists,
-                            deadline=deadline,
-                            label="temporary-directory post-cleanup existence check",
-                        ):
-                            errors.append("temporary directory remained after cleanup")
+                    label=f"{label} Redis close",
+                )
+                break
             except BaseException as exc:
-                errors.append(f"temporary-directory cleanup: {exc}")
+                note_error(f"{label} Redis close", exc)
+        if not delete_succeeded:
+            errors.append(f"{label} Redis owned-key postcondition was not proven")
+
+    if run_root is not None:
+        for _attempt in range(2):
+            try:
+                _cleanup_temporary_directory(run_root, deadline=deadline)
+                break
+            except BaseException as exc:
+                note_error("temporary-directory cleanup", exc)
+
+    if fatal_exception is not None:
+        raise fatal_exception
     return errors
 
 
@@ -1716,6 +1860,215 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
         self.assertTrue(any("worker cleanup" in error for error in errors))
         self.assertTrue(broker.closed)
         self.assertTrue(result.closed)
+
+    def test_shielded_finalizer_reaps_after_process_cleanup_cancellation(self) -> None:
+        process = _FakeProcess()
+        broker = _MemoryRedis({b"owned"})
+        run_root = Path(tempfile.mkdtemp(prefix="platform-celery-shielded-"))
+
+        class InjectedCancellation(BaseException):
+            pass
+
+        with patch(
+            __name__ + "._terminate_worker_process",
+            side_effect=InjectedCancellation("cancelled"),
+        ):
+            errors = _cleanup_roundtrip_resources(
+                process=process,
+                log=_FakeLog(),
+                broker_client=broker,
+                result_client=None,
+                broker_initially_empty=True,
+                result_initially_empty=False,
+                broker_owned_keys={b"owned"},
+                result_owned_keys=set(),
+                broker_allow_prefixes=(),
+                result_allow_fragments=(),
+                run_root=run_root,
+                deadline=time.monotonic() + 2,
+            )
+
+        self.assertTrue(any("worker cleanup" in error for error in errors))
+        self.assertFalse(process.running)
+        self.assertEqual(broker.keys, set())
+        self.assertFalse(run_root.exists())
+
+    def test_shielded_finalizer_retries_log_eof_after_cancellation(self) -> None:
+        class CancelOnceLog(_FakeLog):
+            thread_alive = True
+
+            def join(self, deadline: float) -> None:
+                self.join_calls += 1
+                if self.join_calls == 1:
+                    class InjectedCancellation(BaseException):
+                        pass
+
+                    raise InjectedCancellation("cancelled log join")
+                self.thread_alive = False
+
+        log = CancelOnceLog()
+        broker = _MemoryRedis({b"owned"})
+        errors = _cleanup_roundtrip_resources(
+            process=None,
+            log=log,
+            broker_client=broker,
+            result_client=None,
+            broker_initially_empty=True,
+            result_initially_empty=False,
+            broker_owned_keys={b"owned"},
+            result_owned_keys=set(),
+            broker_allow_prefixes=(),
+            result_allow_fragments=(),
+            run_root=None,
+            deadline=time.monotonic() + 2,
+        )
+
+        self.assertTrue(any("worker log cleanup" in error for error in errors))
+        self.assertEqual(log.join_calls, 2)
+        self.assertFalse(log.thread_alive)
+        self.assertEqual(broker.keys, set())
+
+    def test_shielded_process_cleanup_preserves_foreign_sentinel(self) -> None:
+        process = _FakeProcess()
+        broker = _MemoryRedis({b"owned", b"foreign-sentinel"})
+
+        class InjectedCancellation(BaseException):
+            pass
+
+        with patch(
+            __name__ + "._terminate_worker_process",
+            side_effect=InjectedCancellation("cancelled"),
+        ):
+            errors = _cleanup_roundtrip_resources(
+                process=process,
+                log=_FakeLog(),
+                broker_client=broker,
+                result_client=None,
+                broker_initially_empty=False,
+                result_initially_empty=False,
+                broker_owned_keys={b"owned"},
+                result_owned_keys=set(),
+                broker_allow_prefixes=(),
+                result_allow_fragments=(),
+                run_root=None,
+                deadline=time.monotonic() + 2,
+            )
+
+        self.assertTrue(any("worker cleanup" in error for error in errors))
+        self.assertFalse(process.running)
+        self.assertEqual(broker.keys, {b"owned", b"foreign-sentinel"})
+        self.assertEqual(broker.delete_calls, [])
+
+    def test_shielded_cleanup_retries_owned_redis_postcondition_after_cancellation(self) -> None:
+        broker = _MemoryRedis({b"owned"})
+        original_delete = _delete_owned_redis_keys
+        calls = 0
+
+        class InjectedCancellation(BaseException):
+            pass
+
+        def delete_once_then_continue(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise InjectedCancellation("cancelled Redis cleanup")
+            original_delete(*args, **kwargs)
+
+        with patch(
+            __name__ + "._delete_owned_redis_keys",
+            side_effect=delete_once_then_continue,
+        ):
+            errors = _cleanup_roundtrip_resources(
+                process=None,
+                log=None,
+                broker_client=broker,
+                result_client=None,
+                broker_initially_empty=True,
+                result_initially_empty=False,
+                broker_owned_keys={b"owned"},
+                result_owned_keys=set(),
+                broker_allow_prefixes=(),
+                result_allow_fragments=(),
+                run_root=None,
+                deadline=time.monotonic() + 2,
+            )
+
+        self.assertTrue(any("Redis cleanup" in error for error in errors))
+        self.assertEqual(calls, 2)
+        self.assertEqual(broker.keys, set())
+        self.assertTrue(broker.closed)
+
+    def test_shielded_cleanup_retries_temporary_removal_after_cancellation(self) -> None:
+        run_root = Path(tempfile.mkdtemp(prefix="platform-celery-shielded-"))
+        original_rmtree = shutil.rmtree
+        calls = 0
+
+        class InjectedCancellation(BaseException):
+            pass
+
+        def rmtree_once_then_continue(path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise InjectedCancellation("cancelled temporary cleanup")
+            original_rmtree(path)
+
+        try:
+            with patch(
+                __name__ + ".shutil.rmtree",
+                side_effect=rmtree_once_then_continue,
+            ):
+                errors = _cleanup_roundtrip_resources(
+                    process=None,
+                    log=None,
+                    broker_client=None,
+                    result_client=None,
+                    broker_initially_empty=False,
+                    result_initially_empty=False,
+                    broker_owned_keys=set(),
+                    result_owned_keys=set(),
+                    broker_allow_prefixes=(),
+                    result_allow_fragments=(),
+                    run_root=run_root,
+                    deadline=time.monotonic() + 2,
+                )
+        finally:
+            if run_root.exists():
+                original_rmtree(run_root)
+
+        self.assertTrue(any("temporary-directory cleanup" in error for error in errors))
+        self.assertEqual(calls, 2)
+        self.assertFalse(run_root.exists())
+
+    def test_cleanup_reraises_keyboard_interrupt_after_shielded_finalization(self) -> None:
+        for fatal_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(fatal_type=fatal_type.__name__):
+                process = _FakeProcess()
+                broker = _MemoryRedis({b"owned"})
+
+                with patch(
+                    __name__ + "._terminate_worker_process",
+                    side_effect=fatal_type("operator cancellation"),
+                ):
+                    with self.assertRaises(fatal_type):
+                        _cleanup_roundtrip_resources(
+                            process=process,
+                            log=_FakeLog(),
+                            broker_client=broker,
+                            result_client=None,
+                            broker_initially_empty=True,
+                            result_initially_empty=False,
+                            broker_owned_keys={b"owned"},
+                            result_owned_keys=set(),
+                            broker_allow_prefixes=(),
+                            result_allow_fragments=(),
+                            run_root=None,
+                            deadline=time.monotonic() + 2,
+                        )
+
+                self.assertFalse(process.running)
+                self.assertEqual(broker.keys, set())
+                self.assertTrue(broker.closed)
 
     def test_cleanup_catches_hung_redis_scan_without_skipping_close(self) -> None:
         broker = _ScanFailureRedis()
