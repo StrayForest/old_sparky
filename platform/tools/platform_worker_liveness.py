@@ -16,9 +16,11 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import ctypes
 from collections.abc import Mapping
 from dataclasses import dataclass
 import errno
+import fcntl
 import importlib
 import importlib.util
 import json
@@ -30,8 +32,8 @@ import secrets
 import selectors
 import signal
 import stat
-import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -59,6 +61,10 @@ REDIS_PORT = 6379
 RESULT_KEY_PREFIX = b"celery-task-meta-"
 CONTROL_MAX_BYTES = 16 * 1024
 CLEANUP_CONTROL_MAX_BYTES = 1024
+CONTROL_FD = 198
+SPAWN_ACK_FD = 197
+SPAWN_ACK_MAX_BYTES = 64
+SPAWN_ACK_TIMEOUT_SECONDS = 1.0
 CLEANUP_RESULT_URL_ENV = "PLATFORM_LIVENESS_CLEANUP_RESULT_URL"
 CLEANUP_RESULT_KEY_ENV = "PLATFORM_LIVENESS_CLEANUP_RESULT_KEY"
 _SPAWN_SIGNAL_NAMES = ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT")
@@ -100,66 +106,127 @@ class RunIdentity:
     worker_env: Path
 
 
-class _SpawnGuard:
-    """Own a newly created process before restoring interrupt signals."""
+class _SignalShield:
+    """Record interrupts while the helper owns disposable process groups."""
 
     def __init__(self) -> None:
-        self._previous_mask: set[signal.Signals] | None = None
-        self.process: subprocess.Popen[bytes] | None = None
-        self.pgid: int | None = None
-        self.identity_proven = False
+        self.first_signal: int | None = None
+        self._previous: dict[int, Any] = {}
 
-    def __enter__(self) -> _SpawnGuard:
-        pthread_sigmask = getattr(signal, "pthread_sigmask", None)
-        if not callable(pthread_sigmask) or not SPAWN_BLOCKED_SIGNALS:
-            raise LivenessFailure("spawn_signal_mask_unavailable")
-        self._previous_mask = pthread_sigmask(
-            signal.SIG_BLOCK,
-            SPAWN_BLOCKED_SIGNALS,
-        )
-        return self
+    def _record(self, signum: int, _frame: Any) -> None:
+        if self.first_signal is None:
+            self.first_signal = signum
 
-    def register(
-        self,
-        process: subprocess.Popen[bytes],
-    ) -> tuple[int | None, bool]:
-        # This is intentionally the first operation after the captured Popen
-        # returns.  No hook or unmasked cancellation point is permitted here.
-        self.process = process
-        self.pgid, self.identity_proven = _register_process_group(process)
-        return self.pgid, self.identity_proven
+    def install(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            raise LivenessFailure("main_thread_required")
+        try:
+            for signum in sorted(SPAWN_BLOCKED_SIGNALS):
+                self._previous[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._record)
+        except BaseException:
+            try:
+                self.restore()
+            except BaseException:
+                pass
+            raise
 
-    def child_preexec_fn(self) -> Callable[[], None]:
-        """Restore the caller's mask in the exec-bound child process."""
-
-        previous_mask = self._previous_mask
-
-        def restore() -> None:
-            if previous_mask is not None:
-                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-
-        return restore
-
-    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> bool:
-        if self._previous_mask is not None:
-            pthread_sigmask = getattr(signal, "pthread_sigmask", None)
-            if not callable(pthread_sigmask):
-                raise LivenessFailure("spawn_signal_mask_unavailable")
-            pthread_sigmask(signal.SIG_SETMASK, self._previous_mask)
-        return False
+    def restore(self) -> None:
+        errors = False
+        for signum, previous in self._previous.items():
+            try:
+                signal.signal(signum, previous)
+            except BaseException:
+                errors = True
+        self._previous.clear()
+        if errors:
+            raise LivenessFailure("signal_handler_restore_failed", cleanup_unproven=True)
 
 
-def _trusted_spawn_factory(factory: Callable[..., object]) -> Callable[..., object]:
-    """Mark only factories that obey the Popen-and-return contract.
+@dataclass(slots=True)
+class _ProcessHandle:
+    """A posix_spawn leader kept unreaped until its process group is final."""
 
-    Production uses the real stdlib ``subprocess.Popen`` through the two
-    helper functions below.  Tests may inject a factory only when it has been
-    explicitly wrapped with this contract; arbitrary factories are rejected
-    before they can create an unowned process.
-    """
+    pid: int
+    pgid: int
+    control_fd: int
+    identity_proven: bool = False
+    pidfd: int | None = None
+    returncode: int | None = None
+    reaped: bool = False
 
-    setattr(factory, "_platform_spawn_factory", True)
-    return factory
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        if self.reaped:
+            return self.returncode
+        try:
+            info = os.waitid(
+                os.P_PID,
+                self.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError:
+            self.reaped = True
+            return self.returncode
+        if info is None:
+            return None
+        code = getattr(info, "si_code", None)
+        status = int(getattr(info, "si_status", 0))
+        if code == getattr(os, "CLD_EXITED", 1):
+            self.returncode = status
+        elif code in {
+            getattr(os, "CLD_KILLED", 2),
+            getattr(os, "CLD_DUMPED", 3),
+        }:
+            self.returncode = -status
+        else:
+            return None
+        return self.returncode
+
+class _ChildSubreaper:
+    """Temporarily adopt descendants and restore the caller's state."""
+
+    _PR_SET_CHILD_SUBREAPER = 36
+    _PR_GET_CHILD_SUBREAPER = 37
+
+    def __init__(self) -> None:
+        self._prctl: Any | None = None
+        self.previous: int | None = None
+        self.changed = False
+
+    def _load_prctl(self) -> Any:
+        if self._prctl is None:
+            libc = ctypes.CDLL(None, use_errno=True)
+            prctl = libc.prctl
+            prctl.restype = ctypes.c_int
+            self._prctl = prctl
+        return self._prctl
+
+    def enter(self) -> None:
+        if sys.platform != "linux":
+            return
+        prctl = self._load_prctl()
+        state = ctypes.c_int()
+        if prctl(self._PR_GET_CHILD_SUBREAPER, ctypes.byref(state), 0, 0, 0) != 0:
+            raise LivenessFailure("subreaper_state_unavailable")
+        self.previous = int(state.value)
+        if self.previous == 1:
+            return
+        if prctl(self._PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            raise LivenessFailure("subreaper_unavailable")
+        self.changed = True
+
+    def restore(self) -> None:
+        if sys.platform != "linux" or not self.changed:
+            return
+        previous = self.previous
+        if previous is None:
+            raise LivenessFailure("subreaper_state_unavailable", cleanup_unproven=True)
+        prctl = self._load_prctl()
+        if prctl(self._PR_SET_CHILD_SUBREAPER, previous, 0, 0, 0) != 0:
+            raise LivenessFailure("subreaper_restore_failed", cleanup_unproven=True)
+        self.changed = False
 
 
 def _new_result(status: str, checks: Mapping[str, str], cleanup: str) -> dict[str, object]:
@@ -599,59 +666,259 @@ def _cleanup_roundtrip(
     return 0 if ok else 1
 
 
-@_trusted_spawn_factory
+def _spawn_fd_close_actions(keep: set[int]) -> list[tuple[int, ...]]:
+    """Close every parent FD not explicitly allowlisted in the child."""
+
+    try:
+        open_fds = {
+            int(entry)
+            for entry in os.listdir("/proc/self/fd")
+            if entry.isdecimal()
+        }
+    except BaseException as exc:
+        raise LivenessFailure("spawn_fd_allowlist_unavailable") from exc
+    return [
+        (os.POSIX_SPAWN_CLOSE, fd)
+        for fd in sorted(open_fds - keep)
+        if fd > 2
+    ]
+
+
+def _capture_spawned_process(pid: int, control_fd: int) -> _ProcessHandle:
+    """Capture PID, pidfd and session identity before any child hook."""
+
+    handle: _ProcessHandle | None = None
+    try:
+        handle = _ProcessHandle(pid=int(pid), pgid=int(pid), control_fd=control_fd)
+        if hasattr(os, "pidfd_open"):
+            try:
+                handle.pidfd = os.pidfd_open(handle.pid, 0)
+            except OSError:
+                handle.pidfd = None
+        try:
+            handle.identity_proven = os.getpgid(handle.pid) == handle.pid
+        except BaseException:
+            handle.identity_proven = False
+        return handle
+    except BaseException:
+        if handle is not None and handle.pidfd is not None:
+            try:
+                os.close(handle.pidfd)
+            except OSError:
+                pass
+            handle.pidfd = None
+        raise
+
+
+def _reap_pid_bounded(pid: int, deadline: float) -> None:
+    """Reap an owned leader without introducing an unbounded wait call."""
+
+    while time.monotonic() < deadline:
+        try:
+            child_pid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except OSError as exc:
+            if exc.errno == errno.ECHILD:
+                return
+            return
+        if child_pid == pid:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.01, remaining))
+
+
+def _read_spawn_ack(
+    ack_fd: int,
+    *,
+    expected_pid: int | None,
+    deadline: float,
+) -> int | None:
+    """Boundedly recover the child PID even if a hostile spawn wrapper raises."""
+
+    selector = selectors.DefaultSelector()
+    data = bytearray()
+    try:
+        os.set_blocking(ack_fd, False)
+        selector.register(ack_fd, selectors.EVENT_READ)
+        wait_until = min(deadline, time.monotonic() + SPAWN_ACK_TIMEOUT_SECONDS)
+        while len(data) < SPAWN_ACK_MAX_BYTES and time.monotonic() < wait_until:
+            remaining = max(0.0, wait_until - time.monotonic())
+            for _key, _mask in selector.select(min(0.02, remaining)):
+                try:
+                    chunk = os.read(ack_fd, SPAWN_ACK_MAX_BYTES - len(data))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if b"\n" in data:
+                    line = bytes(data).split(b"\n", 1)[0]
+                    if not line.isdigit():
+                        return None
+                    value = int(line)
+                    if value <= 1 or (expected_pid is not None and value != expected_pid):
+                        return None
+                    return value
+    except BaseException:
+        return None
+    finally:
+        selector.close()
+    return None
+
+
+def _spawn_posix(
+    command: list[str],
+    environment: Mapping[str, str],
+    *,
+    deadline: float,
+    require_ack: bool = False,
+) -> tuple[_ProcessHandle, int]:
+    """Spawn a session leader with explicit descriptors and immediate ownership.
+
+    The production command includes a pre-import PID acknowledgement.  That
+    handshake lets the parent recover and reap a child even when a hostile
+    wrapper raises after the real ``posix_spawn`` has already created it.
+    """
+
+    if threading.current_thread() is not threading.main_thread():
+        raise LivenessFailure("main_thread_required")
+    read_fd = write_fd = devnull_fd = ack_read_fd = ack_write_fd = -1
+    pid: int | None = None
+    handle: _ProcessHandle | None = None
+    try:
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+        if require_ack:
+            ack_read_fd, ack_write_fd = os.pipe2(os.O_CLOEXEC)
+        devnull_fd = os.open(os.devnull, os.O_RDWR | os.O_CLOEXEC)
+        # Keep all source descriptors out of stdio and fixed protocol FDs.
+        for name, fd in (
+            ("read", read_fd),
+            ("write", write_fd),
+            ("ack-read", ack_read_fd),
+            ("ack-write", ack_write_fd),
+            ("devnull", devnull_fd),
+        ):
+            if fd < 0:
+                continue
+            moved = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 256)
+            os.close(fd)
+            if name == "read":
+                read_fd = moved
+            elif name == "write":
+                write_fd = moved
+            elif name == "ack-read":
+                ack_read_fd = moved
+            elif name == "ack-write":
+                ack_write_fd = moved
+            else:
+                devnull_fd = moved
+        actions: list[tuple[int, ...]] = [
+            (os.POSIX_SPAWN_DUP2, write_fd, CONTROL_FD),
+            *[(os.POSIX_SPAWN_DUP2, devnull_fd, target) for target in (0, 1, 2)],
+        ]
+        keep = {0, 1, 2, CONTROL_FD}
+        if require_ack:
+            actions.append((os.POSIX_SPAWN_DUP2, ack_write_fd, SPAWN_ACK_FD))
+            keep.add(SPAWN_ACK_FD)
+        actions.extend(_spawn_fd_close_actions(keep))
+        executable = command[0]
+        spawn = os.posix_spawn if os.path.isabs(executable) else os.posix_spawnp
+        pid = spawn(
+            executable,
+            command,
+            dict(environment),
+            file_actions=actions,
+            setsid=True,
+            setsigmask=(),
+            setsigdef=tuple(SPAWN_BLOCKED_SIGNALS),
+        )
+        # This is deliberately the first parent operation after PID return.
+        handle = _capture_spawned_process(int(pid), read_fd)
+        if require_ack:
+            acknowledged = _read_spawn_ack(
+                ack_read_fd,
+                expected_pid=handle.pid,
+                deadline=deadline,
+            )
+            if acknowledged != handle.pid:
+                raise LivenessFailure("spawn_ack_invalid", cleanup_unproven=True)
+        return handle, read_fd
+    except BaseException:
+        # A hostile/interrupting wrapper can raise before returning its PID.
+        # Recover it from the child-written ack before closing descriptors.
+        if handle is None and pid is None and require_ack and ack_read_fd >= 0:
+            recovered_pid = _read_spawn_ack(
+                ack_read_fd,
+                expected_pid=None,
+                deadline=deadline,
+            )
+            if recovered_pid is not None:
+                pid = recovered_pid
+                try:
+                    handle = _capture_spawned_process(recovered_pid, read_fd)
+                except BaseException:
+                    handle = None
+        if handle is not None:
+            try:
+                _emergency_finalize(handle, deadline=deadline, clock=time.monotonic)
+            except BaseException:
+                pass
+        elif pid is not None:
+            try:
+                captured_pgid = os.getpgid(int(pid))
+                if captured_pgid == int(pid):
+                    _signal_group_id(int(pid), signal.SIGKILL)
+                else:
+                    os.kill(int(pid), signal.SIGKILL)
+            except BaseException:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except BaseException:
+                    pass
+            try:
+                _reap_pid_bounded(int(pid), deadline)
+            except BaseException:
+                pass
+        raise
+    finally:
+        for fd in (read_fd, write_fd, devnull_fd, ack_read_fd, ack_write_fd):
+            if fd >= 0 and (handle is None or fd != handle.control_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
 def _spawn_cleanup(
     identity: RunIdentity,
     key: str | bytes,
     result_url: str,
     deadline: float,
-    *,
-    preexec_fn: Callable[[], None] | None = None,
-) -> tuple[subprocess.Popen[bytes], int]:
-    """Start Redis cleanup in its own process group."""
+) -> tuple[_ProcessHandle, int]:
+    """Start Redis cleanup in its own posix_spawn process group."""
 
-    read_fd, write_fd = os.pipe()
     encoded_key = base64.b64encode(
         key.encode("utf-8") if isinstance(key, str) else key
     ).decode("ascii")
     environment = dict(os.environ)
-    # Keep the URL and exact key out of argv and out of the emitted evidence.
-    # The child is disposable and is stopped as part of this parent's
-    # monotonic deadline supervision.
     environment[CLEANUP_RESULT_URL_ENV] = result_url
     environment[CLEANUP_RESULT_KEY_ENV] = encoded_key
-    try:
-        os.set_inheritable(write_fd, True)
-        python_bin = os.environ.get("PLATFORM_PYTHON_BIN") or sys.executable
-        command = [
-            python_bin,
-            str(Path(__file__).resolve()),
-            "--cleanup-child",
-            "--deadline",
-            f"{deadline:.9f}",
-            "--control-fd",
-            str(write_fd),
-        ]
-        process = subprocess.Popen(
-            command,
-            cwd=str(identity.release),
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            pass_fds=(write_fd,),
-            preexec_fn=preexec_fn,
-            start_new_session=True,
-        )
-    except BaseException:
-        # A real stdlib Popen constructor owns cleanup of any partial child;
-        # no synthetic handle is manufactured after a constructor failure.
-        os.close(read_fd)
-        raise
-    finally:
-        os.close(write_fd)
-    return process, read_fd
+    python_bin = environment.get("PLATFORM_PYTHON_BIN") or sys.executable
+    command = [
+        python_bin,
+        str(Path(__file__).resolve()),
+        "--cleanup-child",
+        "--deadline",
+        f"{deadline:.9f}",
+        "--control-fd",
+        str(CONTROL_FD),
+        "--spawn-ack-fd",
+        str(SPAWN_ACK_FD),
+    ]
+    return _spawn_posix(command, environment, deadline=deadline, require_ack=True)
 
 
 def _backlog_evidence(
@@ -715,6 +982,24 @@ def _child_send(control_fd: int, payload: Mapping[str, object]) -> bool:
         return False
 
 
+def _child_send_spawn_ack(ack_fd: int) -> bool:
+    """Publish the leader PID before any application import or broker work."""
+
+    try:
+        raw = f"{os.getpid()}\n".encode("ascii")
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(ack_fd, raw[offset:])
+        return True
+    except BaseException:
+        return False
+    finally:
+        try:
+            os.close(ack_fd)
+        except BaseException:
+            pass
+
+
 def _encoded_key(key: str | bytes | None) -> str | None:
     if key is None:
         return None
@@ -738,6 +1023,12 @@ def _child_roundtrip(task_id: str, deadline: float, control_fd: int) -> int:
         app = getattr(worker_module, "celery_app", None)
         if app is None:
             raise LivenessFailure("worker_app_unavailable")
+        # A release smoke must exercise the deployed broker/worker boundary.
+        # Celery's eager mode would execute locally and could report a false
+        # success without publishing to Redis, so the setting is an exact
+        # boolean contract rather than a truthiness check.
+        if getattr(app.conf, "task_always_eager", None) is not False:
+            raise LivenessFailure("task_eager_invalid")
         stage = "namespace"
         broker_url = app.conf.broker_url
         result_url = app.conf.result_backend
@@ -836,52 +1127,29 @@ def _validate_task_id(task_id: str) -> str:
     return task_id
 
 
-@_trusted_spawn_factory
 def _spawn_child(
     identity: RunIdentity,
     task_id: str,
     deadline: float,
-    *,
-    preexec_fn: Callable[[], None] | None = None,
-) -> tuple[subprocess.Popen[bytes], int]:
-    read_fd, write_fd = os.pipe()
-    try:
-        os.set_inheritable(write_fd, True)
-        python_bin = os.environ.get("PLATFORM_PYTHON_BIN") or sys.executable
-        command = [
-            python_bin,
-            str(Path(__file__).resolve()),
-            "--child",
-            "--task-id",
-            task_id,
-            "--deadline",
-            f"{deadline:.9f}",
-            "--control-fd",
-            str(write_fd),
-        ]
-        process = subprocess.Popen(
-            command,
-            cwd=str(identity.release),
-            env=dict(os.environ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            pass_fds=(write_fd,),
-            preexec_fn=preexec_fn,
-            start_new_session=True,
-        )
-    except BaseException:
-        # A real stdlib Popen constructor owns cleanup of any partial child;
-        # no synthetic handle is manufactured after a constructor failure.
-        os.close(read_fd)
-        raise
-    finally:
-        os.close(write_fd)
-    return process, read_fd
+) -> tuple[_ProcessHandle, int]:
+    python_bin = os.environ.get("PLATFORM_PYTHON_BIN") or sys.executable
+    command = [
+        python_bin,
+        str(Path(__file__).resolve()),
+        "--child",
+        "--task-id",
+        task_id,
+        "--deadline",
+        f"{deadline:.9f}",
+        "--control-fd",
+        str(CONTROL_FD),
+        "--spawn-ack-fd",
+        str(SPAWN_ACK_FD),
+    ]
+    return _spawn_posix(command, dict(os.environ), deadline=deadline, require_ack=True)
 
 
-def _signal_child_group(process: subprocess.Popen[bytes], signal_number: int) -> None:
+def _signal_child_group(process: _ProcessHandle, signal_number: int) -> None:
     try:
         _signal_group_id(process.pid, signal_number)
     except BaseException:
@@ -900,25 +1168,13 @@ class _GroupFinalization:
 
 
 def _register_process_group(
-    process: subprocess.Popen[bytes],
+    process: _ProcessHandle,
 ) -> tuple[int | None, bool]:
-    """Capture the start-new-session PGID immediately after Popen returns."""
+    """Return the identity captured atomically by ``_spawn_posix``."""
 
-    try:
-        pid = process.pid
-        if not isinstance(pid, int) or pid <= 1:
-            return None, False
-        pgid = os.getpgid(pid)
-    except BaseException:
-        # The real Popen constructor owns cleanup if construction itself
-        # failed.  A returned process whose identity cannot be proved is
-        # always fail-closed by the caller.
-        try:
-            pid = process.pid
-        except BaseException:
-            return None, False
-        return pid if isinstance(pid, int) and pid > 1 else None, False
-    return pgid, pgid == pid
+    if not isinstance(process, _ProcessHandle) or process.pid <= 1:
+        return None, False
+    return process.pgid, process.identity_proven
 
 
 def _group_exists(pgid: int) -> bool:
@@ -948,40 +1204,95 @@ def _signal_group_id(pgid: int, signal_number: int) -> None:
         raise
 
 
-def _wait_group_absent(
-    pgid: int,
+def _record_wait_status(process: _ProcessHandle, pid: int, status: int) -> bool:
+    """Record one waitpid result while retaining the exact leader identity."""
+
+    if pid == process.pid:
+        if os.WIFEXITED(status):
+            process.returncode = os.WEXITSTATUS(status)
+        elif os.WIFSIGNALED(status):
+            process.returncode = -os.WTERMSIG(status)
+        process.reaped = True
+        return True
+    return False
+
+
+def _reap_group(
+    process: _ProcessHandle,
     deadline: float,
     clock: Callable[[], float],
-) -> bool:
-    while True:
+) -> tuple[bool, bool]:
+    """Reap only children in the captured PGID, never unrelated children."""
+
+    leader_reaped = process.reaped
+    descendant_reaped = False
+    while clock() < deadline:
         try:
-            if not _group_exists(pgid):
-                return True
+            child_pid, status = os.waitpid(-process.pgid, os.WNOHANG)
+        except ChildProcessError:
+            break
+        except OSError as exc:
+            if exc.errno == errno.ECHILD:
+                break
+            return leader_reaped, descendant_reaped
+        if child_pid == 0:
+            break
+        if _record_wait_status(process, child_pid, status):
+            leader_reaped = True
+        else:
+            descendant_reaped = True
+    return leader_reaped, descendant_reaped
+
+
+def _wait_group_absent(
+    process: _ProcessHandle,
+    deadline: float,
+    clock: Callable[[], float],
+) -> tuple[bool, bool, bool]:
+    descendant_reaped = False
+    leader_reaped = process.reaped
+    while True:
+        leader_reaped, found_descendant = _reap_group(process, deadline, clock)
+        descendant_reaped = descendant_reaped or found_descendant
+        try:
+            if not _group_exists(process.pgid):
+                return True, leader_reaped, descendant_reaped
         except BaseException:
-            return False
+            return False, leader_reaped, descendant_reaped
         remaining = deadline - clock()
         if remaining <= 0:
-            return False
+            return False, leader_reaped, descendant_reaped
         time.sleep(min(0.01, remaining))
 
 
-def _reap_leader(
-    process: subprocess.Popen[bytes],
+def _reap_leader_only(
+    process: _ProcessHandle,
     deadline: float,
     clock: Callable[[], float],
 ) -> bool:
-    try:
-        process.wait(timeout=max(0.0, deadline - clock()))
-    except BaseException:
-        return False
-    try:
-        return process.poll() is not None
-    except BaseException:
-        return False
+    """Reap only the captured leader when its PGID identity is unproven."""
+
+    while clock() < deadline:
+        try:
+            child_pid, status = os.waitpid(process.pid, os.WNOHANG)
+        except ChildProcessError:
+            return process.reaped
+        except OSError as exc:
+            if exc.errno == errno.ECHILD:
+                return process.reaped
+            return False
+        if child_pid == process.pid:
+            _record_wait_status(process, child_pid, status)
+            return True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.01, remaining))
+    return process.reaped
 
 
 def _finalize_process_group(
-    process: subprocess.Popen[bytes],
+    process: _ProcessHandle,
     pgid: int | None,
     *,
     identity_proven: bool,
@@ -990,83 +1301,79 @@ def _finalize_process_group(
 ) -> _GroupFinalization:
     """Prove a dedicated group is gone, stopping descendants if necessary.
 
-    ``start_new_session=True`` makes the leader PID the PGID on Linux.  The
-    caller records that identity immediately after construction and invokes
-    this function in its outer ``finally``.  The exact-group probe avoids
-    ``ps``/process-tree scans; immediate finalization bounds the small Linux
-    PGID-reuse window.
+    ``setsid=True`` makes the leader PID the PGID on Linux.  The leader is
+    intentionally kept unreaped until this function has finalized the exact
+    group, preventing PID/PGID reuse.  No process-tree scan is used.
     """
-
-    if pgid is None or not identity_proven:
-        return _GroupFinalization(
-            forced_stop=True,
-            descendant_cleanup=False,
-            leader_reaped=_reap_leader(process, deadline, clock),
-            proven_absent=False,
-        )
-    try:
-        group_present = _group_exists(pgid)
-    except BaseException:
-        return _GroupFinalization(
-            forced_stop=True,
-            descendant_cleanup=False,
-            leader_reaped=_reap_leader(process, deadline, clock),
-            proven_absent=False,
-        )
-    if not group_present:
-        leader_reaped = _reap_leader(process, deadline, clock)
+    forced_stop = False
+    descendant_cleanup = False
+    leader_reaped = process.reaped
+    group_absent = False
+    if pgid is None or not identity_proven or pgid != process.pgid:
+        # Do not signal a numeric PGID when the setsid/getpgid identity proof
+        # failed: it could name an unrelated caller-owned group.  The leader
+        # PID remains owned (and unreused) until this bounded exact-PID reap;
+        # descendants remain fail-closed rather than risking an unrelated kill.
         try:
-            proven_absent = not _group_exists(pgid)
+            os.kill(process.pid, signal.SIGKILL)
         except BaseException:
-            proven_absent = False
-        return _GroupFinalization(
-            forced_stop=False,
-            descendant_cleanup=False,
-            leader_reaped=leader_reaped,
-            proven_absent=proven_absent and leader_reaped,
-        )
-
-    forced_stop = True
+            pass
+        leader_reaped = _reap_leader_only(process, deadline, clock)
+        result = _GroupFinalization(True, descendant_cleanup, leader_reaped, False)
+        _close_process_resources(process)
+        return result
     try:
         leader_exited = process.poll() is not None
+        leader_reaped, descendant_reaped = _reap_group(process, deadline, clock)
+        descendant_cleanup = descendant_reaped
+        group_present = _group_exists(pgid)
+        if group_present and leader_exited:
+            descendant_cleanup = True
+        if not group_present:
+            group_absent = True
+        elif group_present:
+            forced_stop = True
+            _signal_group_id(pgid, signal.SIGTERM)
+            term_deadline = min(deadline, clock() + GROUP_FINALIZE_STOP_GRACE_SECONDS)
+            group_absent, leader_reaped, found_descendant = _wait_group_absent(
+                process,
+                term_deadline,
+                clock,
+            )
+            descendant_cleanup = descendant_cleanup or found_descendant
+            if not group_absent:
+                _signal_group_id(pgid, signal.SIGKILL)
+                kill_deadline = min(deadline, clock() + GROUP_FINALIZE_KILL_GRACE_SECONDS)
+                group_absent, leader_reaped, found_descendant = _wait_group_absent(
+                    process,
+                    kill_deadline,
+                    clock,
+                )
+                descendant_cleanup = descendant_cleanup or found_descendant
+        if group_absent and not leader_reaped:
+            leader_reaped, found_descendant = _reap_group(process, deadline, clock)
+            descendant_cleanup = descendant_cleanup or found_descendant
+        try:
+            group_absent = group_absent and not _group_exists(pgid)
+        except BaseException:
+            group_absent = False
     except BaseException:
-        leader_exited = False
-    descendant_cleanup = leader_exited
-    try:
-        _signal_group_id(pgid, signal.SIGTERM)
-    except BaseException:
-        return _GroupFinalization(
-            forced_stop=True,
-            descendant_cleanup=descendant_cleanup,
-            leader_reaped=_reap_leader(process, deadline, clock),
-            proven_absent=False,
-        )
-    term_deadline = min(
-        deadline,
-        clock() + GROUP_FINALIZE_STOP_GRACE_SECONDS,
-    )
-    if not _wait_group_absent(pgid, term_deadline, clock):
+        forced_stop = True
         try:
             _signal_group_id(pgid, signal.SIGKILL)
         except BaseException:
-            return _GroupFinalization(
-                forced_stop=True,
-                descendant_cleanup=descendant_cleanup,
-                leader_reaped=_reap_leader(process, deadline, clock),
-                proven_absent=False,
+            pass
+        try:
+            group_absent, leader_reaped, found_descendant = _wait_group_absent(
+                process,
+                deadline,
+                clock,
             )
-        kill_deadline = min(
-            deadline,
-            clock() + GROUP_FINALIZE_KILL_GRACE_SECONDS,
-        )
-        group_absent = _wait_group_absent(pgid, kill_deadline, clock)
-    else:
-        group_absent = True
-    leader_reaped = _reap_leader(process, deadline, clock)
-    try:
-        group_absent = group_absent and not _group_exists(pgid)
-    except BaseException:
-        group_absent = False
+            descendant_cleanup = descendant_cleanup or found_descendant
+        except BaseException:
+            group_absent = False
+    finally:
+        _close_process_resources(process)
     return _GroupFinalization(
         forced_stop=forced_stop,
         descendant_cleanup=descendant_cleanup,
@@ -1075,8 +1382,36 @@ def _finalize_process_group(
     )
 
 
+def _emergency_finalize(
+    process: _ProcessHandle,
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+) -> None:
+    """Best-effort constructor-failure cleanup before an exception escapes."""
+
+    _finalize_process_group(
+        process,
+        process.pgid,
+        identity_proven=process.identity_proven,
+        deadline=deadline,
+        clock=clock,
+    )
+
+
+def _close_process_resources(process: _ProcessHandle) -> None:
+    for fd_name in ("control_fd", "pidfd"):
+        fd = getattr(process, fd_name)
+        if isinstance(fd, int) and fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            setattr(process, fd_name, None)
+
+
 def _stop_child_now(
-    process: subprocess.Popen[bytes],
+    process: _ProcessHandle,
     *,
     clock: Callable[[], float],
 ) -> None:
@@ -1089,14 +1424,8 @@ def _stop_child_now(
             attempts += 1
         if process.poll() is None:
             _signal_child_group(process, signal.SIGKILL)
-    try:
-        process.wait(timeout=CHILD_KILL_GRACE_SECONDS)
-    except BaseException:
-        _signal_child_group(process, signal.SIGKILL)
-        try:
-            process.wait(timeout=CHILD_KILL_GRACE_SECONDS)
-        except BaseException:
-            pass
+    # ``waitid(WNOWAIT)`` keeps the leader owned by the outer group finalizer.
+    process.poll()
 
 
 @dataclass(slots=True)
@@ -1109,7 +1438,7 @@ class _ChildCollection:
 
 
 def _collect_child(
-    process: subprocess.Popen[bytes],
+    process: _ProcessHandle,
     control_fd: int,
     *,
     child_deadline: float,
@@ -1125,8 +1454,7 @@ def _collect_child(
     forced_termination = False
     natural_exit_before_deadline = False
     try:
-        for fd in (control_fd, process.stdout.fileno() if process.stdout else None,
-                   process.stderr.fileno() if process.stderr else None):
+        for fd in (control_fd,):
             if fd is None:
                 continue
             os.set_blocking(fd, False)
@@ -1190,11 +1518,6 @@ def _collect_child(
             natural_exit_before_deadline = True
         if process.poll() is None:
             _stop_child_now(process, clock=clock)
-        else:
-            try:
-                process.wait(timeout=CHILD_KILL_GRACE_SECONDS)
-            except BaseException:
-                _stop_child_now(process, clock=clock)
     finally:
         for fd in tuple(open_fds):
             try:
@@ -1206,12 +1529,10 @@ def _collect_child(
             except BaseException:
                 pass
         selector.close()
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except BaseException:
-                    pass
+        try:
+            os.close(control_fd)
+        except OSError:
+            pass
     events: list[dict[str, object]] = []
     valid = (
         not control_overflow
@@ -1235,7 +1556,7 @@ def _collect_child(
     return _ChildCollection(
         events=events,
         valid=valid and bool(open_fds) is False,
-        returncode=process.returncode,
+        returncode=process.poll(),
         forced_termination=forced_termination,
         natural_exit_before_deadline=natural_exit_before_deadline,
     )
@@ -1251,7 +1572,7 @@ class _CleanupCollection:
 
 
 def _stop_cleanup_now(
-    process: subprocess.Popen[bytes],
+    process: _ProcessHandle,
     *,
     deadline: float,
     clock: Callable[[], float],
@@ -1275,30 +1596,19 @@ def _stop_cleanup_now(
             # start-new-session PGID; the outer finalizer proves its absence.
             forced = True
             _signal_child_group(process, signal.SIGKILL)
-        remaining = max(0.0, deadline - clock())
-        try:
-            process.wait(timeout=remaining)
-        except BaseException:
-            if process.poll() is None:
-                forced = True
-                _signal_child_group(process, signal.SIGKILL)
-            remaining = max(0.0, deadline - clock())
-            try:
-                process.wait(timeout=remaining)
-            except BaseException:
-                pass
+        process.poll()
     except BaseException:
         forced = True
         try:
             _signal_child_group(process, signal.SIGKILL)
-            process.wait(timeout=max(0.0, deadline - clock()))
+            process.poll()
         except BaseException:
             pass
     return forced
 
 
 def _collect_cleanup(
-    process: subprocess.Popen[bytes],
+    process: _ProcessHandle,
     control_fd: int,
     *,
     deadline: float,
@@ -1319,11 +1629,7 @@ def _collect_cleanup(
     stop_at: float | None = None
     kill_sent = False
     try:
-        for fd in (
-            control_fd,
-            process.stdout.fileno() if process.stdout else None,
-            process.stderr.fileno() if process.stderr else None,
-        ):
+        for fd in (control_fd,):
             if fd is None:
                 continue
             os.set_blocking(fd, False)
@@ -1386,10 +1692,7 @@ def _collect_cleanup(
                 clock=clock,
             ) or forced_termination
         else:
-            try:
-                process.wait(timeout=max(0.0, deadline - clock()))
-            except BaseException:
-                forced_termination = True
+            process.poll()
     finally:
         for fd in tuple(open_fds):
             try:
@@ -1401,12 +1704,10 @@ def _collect_cleanup(
             except BaseException:
                 pass
         selector.close()
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except BaseException:
-                    pass
+        try:
+            os.close(control_fd)
+        except OSError:
+            pass
 
     valid = (
         not control_overflow
@@ -1440,7 +1741,7 @@ def _collect_cleanup(
     return _CleanupCollection(
         ok=ok,
         valid=valid and not open_fds,
-        returncode=process.returncode,
+        returncode=process.poll(),
         forced_termination=forced_termination,
         natural_exit_before_deadline=natural_exit_before_deadline,
     )
@@ -1512,27 +1813,17 @@ def _summarize_child(
     return outcome
 
 
-def run_liveness(
+def _run_liveness_core(
     identity: RunIdentity,
     *,
     clock: Callable[[], float] | None = None,
-    spawn_child: Callable[..., tuple[subprocess.Popen[bytes], int]] | None = None,
-    spawn_cleanup: Callable[..., tuple[subprocess.Popen[bytes], int]] | None = None,
-    post_spawn_hook: Callable[[str, subprocess.Popen[bytes], int | None], object]
+    post_spawn_hook: Callable[[str, _ProcessHandle, int | None], object]
     | None = None,
 ) -> dict[str, object]:
     """Supervise one roundtrip and isolated exact-key cleanup."""
 
     if clock is None:
         clock = time.monotonic
-    if spawn_child is None:
-        spawn_child = _spawn_child
-    if spawn_cleanup is None:
-        spawn_cleanup = _spawn_cleanup
-    if not getattr(spawn_child, "_platform_spawn_factory", False):
-        return _new_result("failed", {}, "not_run")
-    if not getattr(spawn_cleanup, "_platform_spawn_factory", False):
-        return _new_result("failed", {}, "not_run")
     checks: dict[str, str] = {}
     try:
         start = clock()
@@ -1544,11 +1835,11 @@ def run_liveness(
     task_id: str | None = None
     broker_url: str | None = None
     result_url: str | None = None
-    handle: tuple[subprocess.Popen[bytes], int] | None = None
+    handle: tuple[_ProcessHandle, int] | None = None
     child_pgid: int | None = None
     child_group_identity = False
     collection_completed = False
-    cleanup_handle: tuple[subprocess.Popen[bytes], int] | None = None
+    cleanup_handle: tuple[_ProcessHandle, int] | None = None
     cleanup_pgid: int | None = None
     cleanup_group_identity = False
     cleanup_collection_completed = False
@@ -1582,14 +1873,15 @@ def run_liveness(
         )
         checks["release_identity"] = "passed"
         task_id = _new_task_id()
-        with _SpawnGuard() as spawn_guard:
-            handle = spawn_child(
-                identity,
-                task_id,
-                child_deadline,
-                preexec_fn=spawn_guard.child_preexec_fn(),
-            )
-            child_pgid, child_group_identity = spawn_guard.register(handle[0])
+        handle = _spawn_child(identity, task_id, child_deadline)
+        if (
+            not isinstance(handle, tuple)
+            or len(handle) != 2
+            or not isinstance(handle[0], _ProcessHandle)
+            or not isinstance(handle[1], int)
+        ):
+            raise LivenessFailure("spawn_contract_invalid")
+        child_pgid, child_group_identity = _register_process_group(handle[0])
         if post_spawn_hook is not None:
             post_spawn_hook("work", handle[0], child_pgid)
         child_collection = _collect_child(
@@ -1645,7 +1937,7 @@ def run_liveness(
                 outcome.uncertain = True
                 try:
                     _signal_child_group(handle[0], signal.SIGKILL)
-                    handle[0].wait(timeout=CHILD_KILL_GRACE_SECONDS)
+                    handle[0].poll()
                 except BaseException:
                     pass
         if handle is not None:
@@ -1681,17 +1973,22 @@ def run_liveness(
                 try:
                     cleanup_key = _validate_result_key(cleanup_key, task_id)
                     _remaining(deadline, clock)
-                    with _SpawnGuard() as cleanup_guard:
-                        cleanup_handle = spawn_cleanup(
-                            identity,
-                            cleanup_key,
-                            result_url,
-                            deadline,
-                            preexec_fn=cleanup_guard.child_preexec_fn(),
-                        )
-                        cleanup_pgid, cleanup_group_identity = cleanup_guard.register(
-                            cleanup_handle[0]
-                        )
+                    cleanup_handle = _spawn_cleanup(
+                        identity,
+                        cleanup_key,
+                        result_url,
+                        deadline,
+                    )
+                    if (
+                        not isinstance(cleanup_handle, tuple)
+                        or len(cleanup_handle) != 2
+                        or not isinstance(cleanup_handle[0], _ProcessHandle)
+                        or not isinstance(cleanup_handle[1], int)
+                    ):
+                        raise LivenessFailure("spawn_contract_invalid")
+                    cleanup_pgid, cleanup_group_identity = _register_process_group(
+                        cleanup_handle[0]
+                    )
                     if post_spawn_hook is not None:
                         post_spawn_hook("cleanup", cleanup_handle[0], cleanup_pgid)
                     cleanup_collection_deadline = max(
@@ -1744,16 +2041,6 @@ def run_liveness(
                             or not cleanup_group.leader_reaped
                         ):
                             cleanup_ok = False
-                    if cleanup_handle is not None:
-                        for stream in (
-                            cleanup_handle[0].stdout,
-                            cleanup_handle[0].stderr,
-                        ):
-                            if stream is not None:
-                                try:
-                                    stream.close()
-                                except BaseException:
-                                    pass
             if cleanup_ok and (outcome.terminal or not outcome.attempted) and not outcome.uncertain:
                 cleanup_status = "proven"
             elif cleanup_key is not None:
@@ -1768,14 +2055,69 @@ def run_liveness(
             status = "failed"
         if status == "passed" and broker_url and cleanup_status == "proven":
             _backlog_evidence(broker_url, deadline, clock=clock)
-        if handle is not None:
-            for stream in (handle[0].stdout, handle[0].stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except BaseException:
-                        pass
     return _new_result(status, checks, cleanup_status)
+
+
+def run_liveness(
+    identity: RunIdentity,
+    *,
+    clock: Callable[[], float] | None = None,
+    post_spawn_hook: Callable[[str, _ProcessHandle, int | None], object]
+    | None = None,
+) -> dict[str, object]:
+    """Run one roundtrip under a main-thread signal shield.
+
+    The shield spans validation, both spawns, protocol I/O and exact-group
+    cleanup.  It is removed only after the fixed result object has been built;
+    the CLI adds an outer shield while rendering that object.
+    """
+
+    if threading.current_thread() is not threading.main_thread():
+        return _new_result("failed", {}, "not_run")
+    shield = _SignalShield()
+    try:
+        shield.install()
+    except BaseException:
+        return _new_result("failed", {}, "not_run")
+    payload: dict[str, object] = _new_result("failed", {}, "not_run")
+    subreaper = _ChildSubreaper()
+    try:
+        try:
+            subreaper.enter()
+        except BaseException:
+            payload = _new_result("failed", {}, "not_run")
+        else:
+            try:
+                payload = _run_liveness_core(
+                    identity,
+                    clock=clock,
+                    post_spawn_hook=post_spawn_hook,
+                )
+            except BaseException:
+                payload = _new_result("failed", {}, "unproven")
+    finally:
+        try:
+            subreaper.restore()
+        except BaseException:
+            payload = _new_result("cleanup_unproven", {}, "unproven")
+    try:
+        if shield.first_signal is not None:
+            checks = payload.get("checks", {})
+            cleanup = payload.get("cleanup")
+            if cleanup == "not_run":
+                payload = _new_result("failed", checks if isinstance(checks, Mapping) else {}, "not_run")
+            else:
+                payload = _new_result(
+                    "cleanup_unproven",
+                    checks if isinstance(checks, Mapping) else {},
+                    "unproven",
+                )
+    finally:
+        try:
+            shield.restore()
+        except BaseException:
+            payload = _new_result("cleanup_unproven", {}, "unproven")
+    return payload
 
 
 def _run(identity: RunIdentity) -> tuple[dict[str, object], int]:
@@ -1794,11 +2136,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-id")
     parser.add_argument("--deadline", type=float)
     parser.add_argument("--control-fd", type=int)
+    parser.add_argument("--spawn-ack-fd", type=int)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     checks: dict[str, str] = {}
+    outer_shield: _SignalShield | None = None
     try:
         args = _parse_args(argv)
         if args.child:
@@ -1808,9 +2152,13 @@ def main(argv: list[str] | None = None) -> int:
                 or args.control_fd is None
             ):
                 return 1
+            if args.spawn_ack_fd is not None and not _child_send_spawn_ack(args.spawn_ack_fd):
+                return 1
             return _child_roundtrip(args.task_id, args.deadline, args.control_fd)
         if args.cleanup_child:
             if args.deadline is None or args.control_fd is None:
+                return 1
+            if args.spawn_ack_fd is not None and not _child_send_spawn_ack(args.spawn_ack_fd):
                 return 1
             result_url = os.environ.get(CLEANUP_RESULT_URL_ENV)
             encoded_key = os.environ.get(CLEANUP_RESULT_KEY_ENV)
@@ -1828,6 +2176,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.deadline,
                 args.control_fd,
             )
+        outer_shield = _SignalShield()
+        outer_shield.install()
         if args.app_dir is None or args.release is None or args.expected_source_sha is None:
             raise LivenessFailure("arguments_invalid")
         identity = validate_release_identity(
@@ -1843,7 +2193,26 @@ def main(argv: list[str] | None = None) -> int:
     except BaseException:
         payload = _new_result("failed", checks, "not_run")
         status = 1
-    _emit_result(payload)
+    if outer_shield is not None and outer_shield.first_signal is not None:
+        existing_checks = payload.get("checks", {})
+        payload = _new_result(
+            "cleanup_unproven" if payload.get("cleanup") != "not_run" else "failed",
+            existing_checks if isinstance(existing_checks, Mapping) else {},
+            "unproven" if payload.get("cleanup") != "not_run" else "not_run",
+        )
+        status = 2 if payload["status"] == "cleanup_unproven" else 1
+    try:
+        _emit_result(payload)
+    except BaseException:
+        return 1
+    finally:
+        if outer_shield is not None:
+            try:
+                outer_shield.restore()
+            except BaseException:
+                status = 2
+    if outer_shield is not None and outer_shield.first_signal is not None:
+        status = 2 if payload.get("cleanup") != "not_run" else 1
     return status
 
 
