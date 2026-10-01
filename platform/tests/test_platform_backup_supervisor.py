@@ -219,6 +219,8 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             copy.copy(trusted_head)
         with self.assertRaises(TypeError):
             pickle.dumps(trusted_head)
+        with self.assertRaises(AttributeError):
+            object.__setattr__(trusted_head, "_value", "stolen-head")
         with self.assertRaises(TypeError):
             supervisor._TrustedAlembicHead(
                 object(), trusted_head.value, trusted_head.source_root
@@ -314,6 +316,8 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             copy.copy(capability)
         with self.assertRaises(TypeError):
             pickle.dumps(capability)
+        with self.assertRaises(AttributeError):
+            object.__setattr__(capability, "_operation_token", "offsite")
         with self.assertRaises(TypeError):
             supervisor._MutationCapability(object(), object())
         with self.assertRaises(TypeError):
