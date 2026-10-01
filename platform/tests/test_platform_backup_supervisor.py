@@ -112,7 +112,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             app_dir = Path(temporary_dir)
             (app_dir / "shared").mkdir()
-            session = supervisor.EvidenceSession.start(
+            supervisor.EvidenceSession.start(
                 app_dir, "local-backup", locks=supervisor.LOCK_ORDER
             )
             recovered = supervisor.recover_inprogress_evidence(app_dir)
