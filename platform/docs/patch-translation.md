@@ -16,12 +16,12 @@ completed translation from PostgreSQL and warms Redis on a miss.
 
 When Steam data is discovered, the application registers the exact source
 version in PostgreSQL before publishing one Celery task for that version. The
-unique identity and row lock prevent repeated home refreshes, startup refreshes
-or patch-detail cache-miss refreshes from creating duplicate tasks. A user read
-never starts OpenAI translation. If a task cannot find its registered database
-record, it fails closed and the condition is logged for diagnosis. Failed
-translations are retained as failed state rather than silently requeued on
-every refresh.
+unique identity and row lock prevent the worker beat, API cache-miss,
+patch-miss background, or operator/manual refresh paths from creating duplicate
+tasks. A user read never starts OpenAI translation. If a task cannot find its
+registered database record, it fails closed and the condition is logged for
+diagnosis. Failed translations are retained as failed state rather than
+silently requeued on every refresh.
 
 The deployed translation version is `ru-v10`, defined in
 `apps/platform_api/app/services/patch_translation_config.py`. It includes the
@@ -175,5 +175,8 @@ Manual/diagnostic comparison is still required when changing prompt/glossary beh
 - `apps/platform_api/app/services/patch_translation_runtime.py` — model input/context, prompt-cache key, request, validation, result cache and merge flow.
 - `apps/platform_worker/worker.py` — background scheduling/execution.
 - `python_packages/platform_infra/models.py` and the corresponding Alembic revision — durable translation state and its identity constraints.
-- `tools/platform_refresh_home_content.py` — operator/startup refresh without a second translation enqueue path.
+- `tools/platform_refresh_home_content.py` — explicit operator/manual refresh
+  without a second translation enqueue path. Automated freshness is owned by
+  the worker beat schedule, the API cache-miss path and the patch-miss
+  background refresh path; there is no worker-startup refresh hook.
 - `tests/test_platform_patch_translation*.py` — regression coverage.
