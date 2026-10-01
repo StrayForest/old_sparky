@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 import json
 from datetime import UTC, datetime
 import hashlib
 import os
+import pickle
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -209,6 +211,21 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             trusted_head.source_root,
             (app_dir / "current").resolve(strict=False),
         )
+        with self.assertRaises(TypeError):
+            trusted_head.value = "not-current-head"
+        with self.assertRaises(TypeError):
+            trusted_head.source_root = Path("/tmp/forged-source")
+        with self.assertRaises(TypeError):
+            copy.copy(trusted_head)
+        with self.assertRaises(TypeError):
+            pickle.dumps(trusted_head)
+        with self.assertRaises(TypeError):
+            supervisor._TrustedAlembicHead(
+                object(), trusted_head.value, trusted_head.source_root
+            )
+        uninitialized = object.__new__(supervisor._TrustedAlembicHead)
+        with self.assertRaises(supervisor.BackupSupervisorError):
+            supervisor.require_trusted_alembic_head(uninitialized)
 
     def test_local_backup_rejects_untrusted_explicit_expected_head(self) -> None:
         restore = mock.Mock()
@@ -224,6 +241,16 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                     Path("/tmp/oldsparky-supervisor-head-mismatch"),
                     expected_alembic_head="not-current-head",
                     capability=supervisor._capability("maintenance"),
+                    lock=mock.Mock(),
+                    evidence=mock.Mock(),
+                )
+            with self.assertRaisesRegex(
+                supervisor.BackupSupervisorError, "mutation capability"
+            ):
+                supervisor.run_local_backup(
+                    Path("/tmp/oldsparky-supervisor-operation-mismatch"),
+                    expected_alembic_head="20260913_0053",
+                    capability=supervisor._capability("offsite"),
                     lock=mock.Mock(),
                     evidence=mock.Mock(),
                 )
@@ -277,6 +304,35 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         )
 
     def test_capability_and_nested_evidence_schema_fail_closed(self) -> None:
+        capability = supervisor._capability("maintenance")
+        self.assertEqual(capability.operation, "maintenance")
+        with self.assertRaises(TypeError):
+            capability.operation = "offsite"
+        with self.assertRaises(supervisor.BackupSupervisorError):
+            supervisor.require_mutation_capability(capability, "offsite")
+        with self.assertRaises(TypeError):
+            copy.copy(capability)
+        with self.assertRaises(TypeError):
+            pickle.dumps(capability)
+        with self.assertRaises(TypeError):
+            supervisor._MutationCapability(object(), object())
+        with self.assertRaises(TypeError):
+            class Forged(supervisor._MutationCapability):
+                def prove(self, _operation: str) -> None:
+                    return None
+
+        uninitialized = object.__new__(supervisor._MutationCapability)
+        with self.assertRaises(supervisor.BackupSupervisorError):
+            supervisor.require_mutation_capability(uninitialized, "maintenance")
+
+        class NoOpProve:
+            operation = "maintenance"
+
+            def prove(self, _operation: str) -> None:
+                return None
+
+        with self.assertRaises(supervisor.BackupSupervisorError):
+            supervisor.require_mutation_capability(NoOpProve(), "maintenance")
         with self.assertRaises(supervisor.BackupSupervisorError):
             supervisor.require_mutation_capability(object(), "maintenance")
         payload = supervisor._empty_evidence(

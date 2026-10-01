@@ -37,7 +37,7 @@ import stat
 import sys
 import tempfile
 from types import SimpleNamespace
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, final
 from uuid import uuid4
 
 
@@ -384,29 +384,89 @@ def assert_operation_lock_order(operation: str, sequence: tuple[str, ...] | list
         )
 
 
-class _MutationCapability:
-    __slots__ = ("_token", "operation")
+_CAPABILITY_FACTORY_TOKEN = object()
+_CAPABILITY_MAINTENANCE_TOKEN = object()
+_CAPABILITY_OFFSITE_TOKEN = object()
 
-    def __init__(self, token: object, operation: str) -> None:
-        if token is not _CAPABILITY_TOKEN:
+
+def _capability_operation_token(operation: str) -> object:
+    if operation == "maintenance":
+        return _CAPABILITY_MAINTENANCE_TOKEN
+    if operation == "offsite":
+        return _CAPABILITY_OFFSITE_TOKEN
+    raise BackupSupervisorError(f"unknown backup mutation operation: {operation}")
+
+
+@final
+class _MutationCapability:
+    """Immutable, supervisor-created authority for one mutation contour.
+
+    The constructor requires a private factory token; callers receive only
+    instances created by ``_capability``.
+    """
+
+    __slots__ = ("_operation_token",)
+
+    def __init__(self, factory_token: object, operation_token: object) -> None:
+        if type(self) is not _MutationCapability:
+            raise TypeError("backup mutation capability is final")
+        if factory_token is not _CAPABILITY_FACTORY_TOKEN:
             raise TypeError("backup mutation capability is supervisor-owned")
-        self._token = token
-        self.operation = operation
+        if not (
+            operation_token is _CAPABILITY_MAINTENANCE_TOKEN
+            or operation_token is _CAPABILITY_OFFSITE_TOKEN
+        ):
+            raise TypeError("backup mutation capability operation is invalid")
+        object.__setattr__(self, "_operation_token", operation_token)
+
+    def __init_subclass__(cls, **_: object) -> None:
+        raise TypeError("backup mutation capability is final")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise TypeError("backup mutation capability is immutable")
+
+    @property
+    def operation(self) -> str:
+        operation_token = object.__getattribute__(self, "_operation_token")
+        if operation_token is _CAPABILITY_MAINTENANCE_TOKEN:
+            return "maintenance"
+        if operation_token is _CAPABILITY_OFFSITE_TOKEN:
+            return "offsite"
+        raise BackupSupervisorError("backup mutation capability is invalid")
 
     def prove(self, operation: str) -> None:
-        if self._token is not _CAPABILITY_TOKEN or self.operation != operation:
+        if type(self) is not _MutationCapability:
+            raise BackupSupervisorError("backup mutation capability is invalid")
+        expected_token = _capability_operation_token(operation)
+        try:
+            operation_token = object.__getattribute__(self, "_operation_token")
+        except AttributeError as exc:
+            raise BackupSupervisorError("backup mutation capability is invalid") from exc
+        if operation_token is not expected_token:
             raise BackupSupervisorError("backup mutation capability is invalid")
 
+    def __copy__(self) -> None:
+        raise TypeError("backup mutation capability cannot be copied")
 
-_CAPABILITY_TOKEN = object()
+    def __deepcopy__(self, _memo: dict[int, object]) -> None:
+        raise TypeError("backup mutation capability cannot be copied")
+
+    def __reduce__(self) -> None:
+        raise TypeError("backup mutation capability cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int) -> None:
+        raise TypeError("backup mutation capability cannot be serialized")
 
 
 def _capability(operation: str) -> _MutationCapability:
-    return _MutationCapability(_CAPABILITY_TOKEN, operation)
+    return _MutationCapability(
+        _CAPABILITY_FACTORY_TOKEN,
+        _capability_operation_token(operation),
+    )
 
 
 def require_mutation_capability(value: object, operation: str) -> _MutationCapability:
-    if not isinstance(value, _MutationCapability):
+    if type(value) is not _MutationCapability:
         raise BackupSupervisorError(
             "backup mutation requires an in-process supervisor capability"
         )
@@ -414,26 +474,62 @@ def require_mutation_capability(value: object, operation: str) -> _MutationCapab
     return value
 
 
+_TRUSTED_HEAD_FACTORY_TOKEN = object()
+_TRUSTED_HEAD_TOKEN = object()
+
+
+@final
 class _TrustedAlembicHead:
     """An exact migration head resolved once by the supervisor boundary.
 
     The token is deliberately private so a low-level backup helper cannot be
     handed an arbitrary revision string.  The source root travels with the
     value, allowing tests to use an isolated trusted graph without changing
-    the production ``app_dir/current`` resolution rule.
+    the production ``app_dir/current`` resolution rule.  Only
+    ``_trusted_head_for_source`` creates instances after reading the trusted
+    migration graph.
     """
 
-    __slots__ = ("_token", "value", "source_root")
+    __slots__ = ("_token", "_value", "_source_root")
 
-    def __init__(self, token: object, value: str, source_root: Path) -> None:
-        if token is not _TRUSTED_HEAD_TOKEN:
+    def __init__(self, factory_token: object, value: str, source_root: Path) -> None:
+        if type(self) is not _TrustedAlembicHead:
+            raise TypeError("trusted Alembic head is final")
+        if factory_token is not _TRUSTED_HEAD_FACTORY_TOKEN:
             raise TypeError("trusted Alembic head is supervisor-owned")
-        self._token = token
-        self.value = value
-        self.source_root = source_root
+        if not isinstance(value, str) or ALEMBIC_HEAD_RE.fullmatch(value) is None:
+            raise TypeError("trusted Alembic head is invalid")
+        if not isinstance(source_root, Path) or not source_root.is_absolute():
+            raise TypeError("trusted Alembic source root is invalid")
+        object.__setattr__(self, "_token", _TRUSTED_HEAD_TOKEN)
+        object.__setattr__(self, "_value", value)
+        object.__setattr__(self, "_source_root", source_root)
 
+    def __init_subclass__(cls, **_: object) -> None:
+        raise TypeError("trusted Alembic head is final")
 
-_TRUSTED_HEAD_TOKEN = object()
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise TypeError("trusted Alembic head is immutable")
+
+    @property
+    def value(self) -> str:
+        return object.__getattribute__(self, "_value")
+
+    @property
+    def source_root(self) -> Path:
+        return object.__getattribute__(self, "_source_root")
+
+    def __copy__(self) -> None:
+        raise TypeError("trusted Alembic head cannot be copied")
+
+    def __deepcopy__(self, _memo: dict[int, object]) -> None:
+        raise TypeError("trusted Alembic head cannot be copied")
+
+    def __reduce__(self) -> None:
+        raise TypeError("trusted Alembic head cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int) -> None:
+        raise TypeError("trusted Alembic head cannot be serialized")
 
 
 def _trusted_head_for_source(
@@ -466,7 +562,7 @@ def _trusted_head_for_source(
         raise BackupSupervisorError("trusted deployed Alembic source graph is unavailable") from exc
     if not isinstance(value, str) or ALEMBIC_HEAD_RE.fullmatch(value) is None:
         raise BackupSupervisorError("trusted deployed Alembic head is invalid")
-    return _TrustedAlembicHead(_TRUSTED_HEAD_TOKEN, value, resolved_root)
+    return _TrustedAlembicHead(_TRUSTED_HEAD_FACTORY_TOKEN, value, resolved_root)
 
 
 def require_trusted_alembic_head(
@@ -477,18 +573,34 @@ def require_trusted_alembic_head(
 ) -> _TrustedAlembicHead:
     """Validate the supervisor-only head passed to a mutating primitive."""
 
-    if not isinstance(value, _TrustedAlembicHead) or value._token is not _TRUSTED_HEAD_TOKEN:
+    if type(value) is not _TrustedAlembicHead:
         raise BackupSupervisorError(
             "backup restore requires a supervisor-resolved trusted Alembic head"
         )
+    try:
+        token = object.__getattribute__(value, "_token")
+        head_value = object.__getattribute__(value, "_value")
+        head_source_root = object.__getattribute__(value, "_source_root")
+    except AttributeError as exc:
+        raise BackupSupervisorError(
+            "backup restore requires a supervisor-resolved trusted Alembic head"
+        ) from exc
+    if token is not _TRUSTED_HEAD_TOKEN:
+        raise BackupSupervisorError(
+            "backup restore requires a supervisor-resolved trusted Alembic head"
+        )
+    if not isinstance(head_value, str) or ALEMBIC_HEAD_RE.fullmatch(head_value) is None:
+        raise BackupSupervisorError("trusted Alembic head is invalid")
+    if not isinstance(head_source_root, Path) or not head_source_root.is_absolute():
+        raise BackupSupervisorError("trusted Alembic source root is invalid")
     if source_root is not None:
         try:
             resolved_root = Path(source_root).resolve(strict=False)
         except OSError as exc:
             raise BackupSupervisorError("trusted Alembic source root is invalid") from exc
-        if resolved_root != value.source_root:
+        if resolved_root != head_source_root:
             raise BackupSupervisorError("trusted Alembic source root changed")
-    if expected is not None and expected != value.value:
+    if expected is not None and expected != head_value:
         raise BackupSupervisorError(
             "requested Alembic head does not match the trusted deployed source graph"
         )
