@@ -26,12 +26,37 @@ import tempfile
 from typing import Any
 import urllib.parse
 
+try:
+    from .platform_backup_manifest import (
+        BACKUP_NAME_RE,
+        BackupManifestError,
+        read_private_prefix,
+        read_manifest_file,
+        sha256_private_file,
+    )
+except ImportError:  # Direct execution from the tools directory.
+    try:
+        from tools.platform_backup_manifest import (
+            BACKUP_NAME_RE,
+            BackupManifestError,
+            read_private_prefix,
+            read_manifest_file,
+            sha256_private_file,
+        )
+    except ImportError:
+        from platform_backup_manifest import (  # type: ignore[no-redef]
+            BACKUP_NAME_RE,
+            BackupManifestError,
+            read_private_prefix,
+            read_manifest_file,
+            sha256_private_file,
+        )
+
 
 DEFAULT_BACKUP_ENV = Path("/opt/oldsparky/platform/shared/.env.backup")
 DEFAULT_PLATFORM_ENV = Path("/opt/oldsparky/platform/shared/.env.platform")
 DEFAULT_BACKUP_DIR = Path("/opt/oldsparky/platform/shared/backups")
 GPG_BINARY = "/usr/bin/gpg"
-BACKUP_NAME_RE = re.compile(r"^platformdb-(\d{8}T\d{6}Z)\.dump$")
 FINGERPRINT_RE = re.compile(r"^[A-F0-9]{40,64}$")
 SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
@@ -327,33 +352,6 @@ def load_config(
     )
 
 
-def _validate_private_regular_file(path: Path, *, apply: bool, label: str) -> os.stat_result:
-    try:
-        file_stat = path.lstat()
-    except OSError as exc:
-        raise OffsiteBackupError(
-            f"{label} is missing: {path}.", ExitCode.SOURCE_BACKUP
-        ) from exc
-    if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
-        raise OffsiteBackupError(
-            f"{label} must be a regular non-symlink file: {path}.",
-            ExitCode.SOURCE_BACKUP,
-        )
-    if file_stat.st_mode & 0o077:
-        raise OffsiteBackupError(
-            f"{label} must not be accessible by group or other users: {path}.",
-            ExitCode.SOURCE_BACKUP,
-        )
-    expected_owner = 0 if apply else os.geteuid()
-    if file_stat.st_uid != expected_owner:
-        expected = "root" if apply else "the invoking user"
-        raise OffsiteBackupError(
-            f"{label} must be owned by {expected}: {path}.",
-            ExitCode.SOURCE_BACKUP,
-        )
-    return file_stat
-
-
 def select_verified_backup(
     backup_dir: Path,
     dump_argument: Path | None,
@@ -367,21 +365,28 @@ def select_verified_backup(
             ExitCode.CONFIGURATION,
         )
     try:
-        resolved_dir = backup_dir.resolve(strict=True)
-    except (FileNotFoundError, OSError) as exc:
+        backup_dir_stat = backup_dir.lstat()
+    except OSError as exc:
         raise OffsiteBackupError(
             f"Backup directory is missing: {backup_dir}.", ExitCode.SOURCE_BACKUP
         ) from exc
-    if not resolved_dir.is_dir():
+    if stat.S_ISLNK(backup_dir_stat.st_mode) or not stat.S_ISDIR(backup_dir_stat.st_mode):
         raise OffsiteBackupError(
-            f"Backup path is not a directory: {resolved_dir}.", ExitCode.SOURCE_BACKUP
+            f"Backup path must be a regular non-symlink directory: {backup_dir}.",
+            ExitCode.SOURCE_BACKUP,
         )
+    try:
+        resolved_dir = backup_dir.resolve(strict=True)
+    except OSError as exc:
+        raise OffsiteBackupError(
+            f"Backup directory is unavailable: {backup_dir}.", ExitCode.SOURCE_BACKUP
+        ) from exc
 
     if dump_argument is None:
         try:
             manifests = sorted(
                 resolved_dir.glob("platformdb-*.json"),
-                key=lambda path: path.stat().st_mtime,
+                key=lambda path: (path.stat().st_mtime_ns, path.name),
             )
         except OSError as exc:
             raise OffsiteBackupError(
@@ -396,14 +401,26 @@ def select_verified_backup(
         metadata_path = manifests[-1]
         dump_path = metadata_path.with_suffix(".dump")
     else:
+        requested_path = dump_argument
+        if not requested_path.is_absolute():
+            requested_path = backup_dir / requested_path
         try:
-            dump_path = dump_argument.resolve(strict=True)
+            # Resolve only the parent for the containment check.  Keep the
+            # original final component so lstat/O_NOFOLLOW can reject a
+            # symlink instead of silently accepting its target.
+            if requested_path.parent.resolve(strict=True) != resolved_dir:
+                raise OffsiteBackupError(
+                    "--dump must reference a direct child of --backup-dir.",
+                    ExitCode.SOURCE_BACKUP,
+                )
+            dump_path = requested_path
+            resolved_dump_path = requested_path.resolve(strict=True)
         except (FileNotFoundError, OSError) as exc:
             raise OffsiteBackupError(
                 f"Requested backup dump is missing: {dump_argument}.",
                 ExitCode.SOURCE_BACKUP,
             ) from exc
-        if dump_path.parent != resolved_dir:
+        if resolved_dump_path.parent != resolved_dir or resolved_dump_path.name != requested_path.name:
             raise OffsiteBackupError(
                 "--dump must reference a direct child of --backup-dir.",
                 ExitCode.SOURCE_BACKUP,
@@ -413,99 +430,78 @@ def select_verified_backup(
     match = BACKUP_NAME_RE.fullmatch(dump_path.name)
     if match is None:
         raise OffsiteBackupError(
-            "Backup dump name must match platformdb-YYYYMMDDTHHMMSSZ.dump.",
+            "Backup dump name must match platformdb-YYYYMMDDTHHMMSSZ-<run_id>.dump.",
             ExitCode.SOURCE_BACKUP,
         )
-    dump_stat = _validate_private_regular_file(
-        dump_path, apply=apply, label="Platform backup dump"
-    )
-    _validate_private_regular_file(
-        metadata_path, apply=apply, label="Platform backup manifest"
-    )
+    expected_owner = 0 if apply else os.geteuid()
+    expected_group = 0 if apply else os.getegid()
     try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError) as exc:
+        manifest_file = read_manifest_file(
+            metadata_path,
+            expected_owner=expected_owner,
+            expected_group=expected_group,
+            expected_dump_file=dump_path.name,
+        )
+    except BackupManifestError as exc:
         raise OffsiteBackupError(
-            f"Platform backup manifest is invalid: {metadata_path}.",
+            f"Platform backup manifest is invalid: {metadata_path}: {exc}",
             ExitCode.SOURCE_BACKUP,
         ) from exc
-    if not isinstance(metadata, dict):
-        raise OffsiteBackupError(
-            f"Platform backup manifest must be a JSON object: {metadata_path}.",
-            ExitCode.SOURCE_BACKUP,
-        )
-
-    try:
-        format_version = int(metadata.get("format_version") or 0)
-    except (TypeError, ValueError):
-        format_version = 0
+    manifest = manifest_file.manifest
     if (
-        metadata.get("database") != "platformdb"
-        or metadata.get("schema") != "platform"
-        or metadata.get("dump_file") != dump_path.name
-        or not metadata.get("restore_verified")
-        or not metadata.get("alembic_revision_verified")
-        or format_version < 2
+        manifest.database != "platformdb"
+        or manifest.schemas != ("platform", "public")
+        or not manifest.restore_verified
+        or not manifest.alembic_revision_verified
     ):
         raise OffsiteBackupError(
             "Only a format-v2, Alembic-checked, restore-verified platformdb backup may be uploaded.",
             ExitCode.SOURCE_BACKUP,
         )
-    expected_sha256 = str(metadata.get("sha256") or "").lower()
-    if not SHA256_RE.fullmatch(expected_sha256):
-        raise OffsiteBackupError(
-            "Platform backup manifest has no valid SHA-256 checksum.",
-            ExitCode.SOURCE_BACKUP,
-        )
     try:
-        actual_sha256 = sha256_file(dump_path)
-    except OSError as exc:
+        actual_sha256, dump_stat = sha256_private_file(
+            dump_path,
+            label="Platform backup dump",
+            expected_owner=expected_owner,
+            expected_group=expected_group,
+        )
+    except BackupManifestError as exc:
         raise OffsiteBackupError(
-            "Could not read the platform backup dump for checksum validation.",
+            f"Could not read the platform backup dump for checksum validation: {exc}",
             ExitCode.SOURCE_BACKUP,
         ) from exc
-    if actual_sha256 != expected_sha256:
+    if actual_sha256 != manifest.sha256:
         raise OffsiteBackupError(
             "Platform backup checksum does not match its restore-verified manifest.",
             ExitCode.SOURCE_BACKUP,
         )
-    try:
-        manifest_size = int(metadata.get("size_bytes") or -1)
-    except (TypeError, ValueError):
-        manifest_size = -1
-    if dump_stat.st_size <= 0 or manifest_size != dump_stat.st_size:
+    if dump_stat.st_size <= 0 or manifest.size_bytes != dump_stat.st_size:
         raise OffsiteBackupError(
             "Platform backup size does not match its restore-verified manifest.",
             ExitCode.SOURCE_BACKUP,
         )
     try:
-        with dump_path.open("rb") as dump_handle:
-            dump_magic = dump_handle.read(5)
-    except OSError as exc:
+        dump_prefix, _ = read_private_prefix(
+            dump_path,
+            label="Platform backup dump",
+            expected_owner=expected_owner,
+            expected_group=expected_group,
+            prefix_bytes=5,
+        )
+    except BackupManifestError as exc:
         raise OffsiteBackupError(
-            "Could not validate the platform backup archive format.",
+            f"Could not validate the platform backup archive format: {exc}",
             ExitCode.SOURCE_BACKUP,
         ) from exc
-    if dump_magic != b"PGDMP":
+    if dump_prefix != b"PGDMP":
         raise OffsiteBackupError(
             "Platform backup is not a PostgreSQL custom-format archive.",
             ExitCode.SOURCE_BACKUP,
         )
-    try:
-        completed_at = dt.datetime.fromisoformat(
-            str(metadata["completed_at_utc"]).replace("Z", "+00:00")
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise OffsiteBackupError(
-            "Platform backup manifest has no valid UTC completion timestamp.",
-            ExitCode.SOURCE_BACKUP,
-        ) from exc
-    if completed_at.tzinfo is None:
-        completed_at = completed_at.replace(tzinfo=dt.UTC)
-    completed_at = completed_at.astimezone(dt.UTC)
+    completed_at = manifest.completed_at_utc
     try:
         backup_timestamp = dt.datetime.strptime(
-            match.group(1), "%Y%m%dT%H%M%SZ"
+            match.group("timestamp"), "%Y%m%dT%H%M%SZ"
         ).replace(tzinfo=dt.UTC)
     except ValueError as exc:
         raise OffsiteBackupError(
@@ -524,13 +520,7 @@ def select_verified_backup(
             ExitCode.SOURCE_BACKUP,
         )
 
-    try:
-        metadata_sha256 = sha256_file(metadata_path)
-    except OSError as exc:
-        raise OffsiteBackupError(
-            "Platform backup manifest checksum could not be calculated.",
-            ExitCode.SOURCE_BACKUP,
-        ) from exc
+    metadata_sha256 = hashlib.sha256(manifest_file.raw_bytes).hexdigest()
     return VerifiedBackup(
         dump_path=dump_path,
         metadata_path=metadata_path,

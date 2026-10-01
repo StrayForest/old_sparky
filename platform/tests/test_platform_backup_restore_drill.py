@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import datetime as dt
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 
@@ -21,8 +25,31 @@ backup_drill = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = backup_drill
 SPEC.loader.exec_module(backup_drill)
 
+MANIFEST_SCRIPT_PATH = REPO_ROOT / "platform" / "tools" / "platform_backup_manifest.py"
+MANIFEST_SPEC = importlib.util.spec_from_file_location(
+    "platform_backup_manifest_for_restore_tests", MANIFEST_SCRIPT_PATH
+)
+assert MANIFEST_SPEC is not None and MANIFEST_SPEC.loader is not None
+manifest_contract = importlib.util.module_from_spec(MANIFEST_SPEC)
+sys.modules[MANIFEST_SPEC.name] = manifest_contract
+MANIFEST_SPEC.loader.exec_module(manifest_contract)
+
 
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
+    def _creator_args(self, output_dir: pathlib.Path, *, dump_only: bool = True) -> argparse.Namespace:
+        return argparse.Namespace(
+            env_file=str(output_dir / ".env.platform"),
+            output_dir=str(output_dir),
+            keep=2,
+            admin_database_url=None,
+            dump_only=dump_only,
+        )
+
+    def _creator_environment(self) -> dict[str, str]:
+        return {
+            "PLATFORM_DATABASE_URL": "postgresql://platform_user@127.0.0.1:5432/platformdb"
+        }
+
     def test_parse_database_url_accepts_platformdb_and_decodes_credentials(self) -> None:
         target = backup_drill.parse_database_url(
             "postgresql+asyncpg://platform%5Fuser:p%40ss@127.0.0.1:5433/platformdb"
@@ -94,21 +121,31 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
-            dump_path = output_dir / "platformdb-20260714T120000Z.dump"
+            now = dt.datetime.now(dt.UTC)
+            run_id = "b" * 32
+            dump_path = output_dir / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{run_id}.dump"
             dump_path.write_bytes(b"custom-format-backup")
+            dump_path.chmod(0o600)
             metadata_path = dump_path.with_suffix(".json")
             metadata_path.write_text(
                 json.dumps(
-                    {
-                        "dump_file": dump_path.name,
-                        "sha256": hashlib.sha256(dump_path.read_bytes()).hexdigest(),
-                        "completed_at_utc": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
-                        "restore_verified": True,
-                        "restored_table_count": 31,
-                    }
+                    manifest_contract.build_manifest(
+                        run_id=run_id,
+                        dump_file=dump_path.name,
+                        size_bytes=dump_path.stat().st_size,
+                        sha256=hashlib.sha256(dump_path.read_bytes()).hexdigest(),
+                        started_at_utc=now,
+                        completed_at_utc=now,
+                        duration_seconds=0,
+                        restore_verified=True,
+                        alembic_revision_verified=True,
+                        restored_table_count=31,
+                        restore_error=None,
+                    )
                 ),
                 encoding="utf-8",
             )
+            metadata_path.chmod(0o600)
 
             result = backup_drill.check_latest_backup(output_dir, max_age_hours=24)
 
@@ -118,19 +155,30 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def test_check_latest_cli_rejects_unverified_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
-            dump_path = output_dir / "platformdb-20260714T120000Z.dump"
+            now = dt.datetime.now(dt.UTC)
+            run_id = "c" * 32
+            dump_path = output_dir / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{run_id}.dump"
             dump_path.write_bytes(b"custom-format-backup")
+            dump_path.chmod(0o600)
             dump_path.with_suffix(".json").write_text(
                 json.dumps(
-                    {
-                        "dump_file": dump_path.name,
-                        "sha256": hashlib.sha256(dump_path.read_bytes()).hexdigest(),
-                        "completed_at_utc": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
-                        "restore_verified": False,
-                    }
+                    manifest_contract.build_manifest(
+                        run_id=run_id,
+                        dump_file=dump_path.name,
+                        size_bytes=dump_path.stat().st_size,
+                        sha256=hashlib.sha256(dump_path.read_bytes()).hexdigest(),
+                        started_at_utc=now,
+                        completed_at_utc=now,
+                        duration_seconds=0,
+                        restore_verified=False,
+                        alembic_revision_verified=False,
+                        restored_table_count=None,
+                        restore_error="restore not run",
+                    )
                 ),
                 encoding="utf-8",
             )
+            dump_path.with_suffix(".json").chmod(0o600)
 
             result = subprocess.run(
                 [
@@ -151,20 +199,37 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
     def test_prune_unverified_backups_keeps_verified_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
-            verified_dump = output_dir / "platformdb-verified.dump"
-            failed_dump = output_dir / "platformdb-failed.dump"
+            now = dt.datetime.now(dt.UTC)
+            verified_dump = output_dir / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{'e' * 32}.dump"
+            failed_dump = output_dir / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{'f' * 32}.dump"
             verified_dump.write_bytes(b"verified")
             failed_dump.write_bytes(b"failed")
+            for dump_path, run_id, restore_verified in (
+                (verified_dump, "e" * 32, True),
+                (failed_dump, "f" * 32, False),
+            ):
+                dump_path.chmod(0o600)
+                dump_path.with_suffix(".json").write_text(
+                    json.dumps(
+                        manifest_contract.build_manifest(
+                            run_id=run_id,
+                            dump_file=dump_path.name,
+                            size_bytes=dump_path.stat().st_size,
+                            sha256=hashlib.sha256(dump_path.read_bytes()).hexdigest(),
+                            started_at_utc=now,
+                            completed_at_utc=now,
+                            duration_seconds=0,
+                            restore_verified=restore_verified,
+                            alembic_revision_verified=restore_verified,
+                            restored_table_count=1 if restore_verified else None,
+                            restore_error=None if restore_verified else "restore failed",
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                dump_path.with_suffix(".json").chmod(0o600)
             verified_metadata = verified_dump.with_suffix(".json")
             failed_metadata = failed_dump.with_suffix(".json")
-            verified_metadata.write_text(
-                json.dumps({"dump_file": verified_dump.name, "restore_verified": True}),
-                encoding="utf-8",
-            )
-            failed_metadata.write_text(
-                json.dumps({"dump_file": failed_dump.name, "restore_verified": False}),
-                encoding="utf-8",
-            )
 
             removed = backup_drill.prune_unverified_backups(
                 output_dir,
@@ -176,6 +241,207 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertFalse(failed_dump.exists())
             self.assertFalse(failed_metadata.exists())
             self.assertEqual(len(removed), 2)
+
+    def test_concurrent_same_second_creators_reserve_distinct_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            output_dir.mkdir(exist_ok=True)
+            fixed_now = dt.datetime(2026, 10, 1, 12, 0, 0, tzinfo=dt.UTC)
+
+            def fake_run_command(
+                command: list[str], *, stdout: int | None = None, **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                if command[0] == "pg_dump":
+                    assert stdout is not None
+                    self.assertNotIn("--file", command)
+                    os.write(stdout, b"PGDMP concurrent creator output")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                with (
+                    mock.patch.dict(
+                        backup_drill.os.environ, self._creator_environment(), clear=False
+                    ),
+                    mock.patch.object(
+                        backup_drill, "load_env", return_value=self._creator_environment()
+                    ),
+                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
+                    mock.patch.object(backup_drill, "utc_now", return_value=fixed_now),
+                ):
+                    results = list(
+                        executor.map(
+                            lambda _index: backup_drill.create_backup(
+                                self._creator_args(output_dir)
+                            ),
+                            range(2),
+                        )
+                    )
+
+            self.assertEqual(len({result["run_id"] for result in results}), 2)
+            self.assertEqual(len(tuple(output_dir.glob("*.dump"))), 2)
+            self.assertEqual(len(tuple(output_dir.glob("*.json"))), 2)
+            for result in results:
+                manifest_path = output_dir / result["metadata_file"]
+                self.assertTrue(manifest_path.exists())
+                parsed = manifest_contract.read_manifest_file(
+                    manifest_path,
+                    expected_owner=os.geteuid(),
+                    expected_group=os.getegid(),
+                    expected_dump_file=result["dump_file"],
+                ).manifest
+                self.assertEqual(parsed.run_id, result["run_id"])
+
+    def test_secure_temp_rejects_symlink_and_hardlink_preplants(self) -> None:
+        fixed_uuid = uuid.UUID("11111111111111111111111111111111")
+        for preplant_kind in ("symlink", "hardlink"):
+            with self.subTest(preplant_kind=preplant_kind), tempfile.TemporaryDirectory() as temporary_dir:
+                root = pathlib.Path(temporary_dir)
+                output_dir = root / "backups"
+                output_dir.mkdir()
+                dump_name = (
+                    f"platformdb-20261001T120000Z-{fixed_uuid.hex}.dump"
+                )
+                temporary_path = output_dir / f".{dump_name}.{os.getpid()}.tmp"
+                outside = root / "outside.bin"
+                outside.write_bytes(b"protected outside data")
+                if preplant_kind == "symlink":
+                    temporary_path.symlink_to(outside)
+                else:
+                    os.link(outside, temporary_path)
+
+                with (
+                    mock.patch.dict(
+                        backup_drill.os.environ, self._creator_environment(), clear=False
+                    ),
+                    mock.patch.object(
+                        backup_drill, "load_env", return_value=self._creator_environment()
+                    ),
+                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(backup_drill.uuid, "uuid4", return_value=fixed_uuid),
+                    mock.patch.object(
+                        backup_drill,
+                        "utc_now",
+                        return_value=dt.datetime(2026, 10, 1, 12, tzinfo=dt.UTC),
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "already occupied"):
+                        backup_drill.create_backup(self._creator_args(output_dir))
+
+                self.assertEqual(outside.read_bytes(), b"protected outside data")
+                self.assertTrue(temporary_path.is_symlink() or temporary_path.is_file())
+                self.assertEqual(tuple(output_dir.glob("platformdb-*.dump")), ())
+                self.assertEqual(tuple(output_dir.glob("platformdb-*.json")), ())
+
+    def test_secure_temp_rejects_symlink_and_hardlink_replacement_races(self) -> None:
+        fixed_uuid = uuid.UUID("22222222222222222222222222222222")
+        for replacement_kind in ("symlink", "hardlink"):
+            with self.subTest(replacement_kind=replacement_kind), tempfile.TemporaryDirectory() as temporary_dir:
+                root = pathlib.Path(temporary_dir)
+                output_dir = root / "backups"
+                output_dir.mkdir()
+                dump_name = (
+                    f"platformdb-20261001T120000Z-{fixed_uuid.hex}.dump"
+                )
+                temporary_path = output_dir / f".{dump_name}.{os.getpid()}.tmp"
+                outside = root / "outside.bin"
+                outside.write_bytes(b"protected outside data")
+
+                def racing_run_command(
+                    command: list[str], *, stdout: int | None = None, **_: object
+                ) -> subprocess.CompletedProcess[str]:
+                    if command[0] == "pg_dump":
+                        assert stdout is not None
+                        os.write(stdout, b"PGDMP race output")
+                        temporary_path.unlink()
+                        if replacement_kind == "symlink":
+                            temporary_path.symlink_to(outside)
+                        else:
+                            os.link(outside, temporary_path)
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                with (
+                    mock.patch.dict(
+                        backup_drill.os.environ, self._creator_environment(), clear=False
+                    ),
+                    mock.patch.object(
+                        backup_drill, "load_env", return_value=self._creator_environment()
+                    ),
+                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(backup_drill.uuid, "uuid4", return_value=fixed_uuid),
+                    mock.patch.object(
+                        backup_drill,
+                        "utc_now",
+                        return_value=dt.datetime(2026, 10, 1, 12, tzinfo=dt.UTC),
+                    ),
+                    mock.patch.object(
+                        backup_drill, "run_command", side_effect=racing_run_command
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "replaced|hardlink"):
+                        backup_drill.create_backup(self._creator_args(output_dir))
+
+                self.assertEqual(outside.read_bytes(), b"protected outside data")
+                self.assertEqual(tuple(output_dir.glob("platformdb-*.dump")), ())
+                self.assertEqual(tuple(output_dir.glob("platformdb-*.json")), ())
+
+    def test_publication_failures_remove_all_partial_backup_artifacts(self) -> None:
+        manifest_module = sys.modules[backup_drill.write_manifest.__module__]
+        for failure_stage in ("dump_directory", "manifest_file", "manifest_directory"):
+            with self.subTest(failure_stage=failure_stage), tempfile.TemporaryDirectory() as temporary_dir:
+                output_dir = pathlib.Path(temporary_dir)
+
+                def fake_run_command(
+                    command: list[str], *, stdout: int | None = None, **_: object
+                ) -> subprocess.CompletedProcess[str]:
+                    if command[0] == "pg_dump":
+                        assert stdout is not None
+                        os.write(stdout, b"PGDMP failure-injection output")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                patchers = [
+                    mock.patch.dict(
+                        backup_drill.os.environ, self._creator_environment(), clear=False
+                    ),
+                    mock.patch.object(
+                        backup_drill, "load_env", return_value=self._creator_environment()
+                    ),
+                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(
+                        backup_drill, "run_command", side_effect=fake_run_command
+                    ),
+                ]
+                if failure_stage == "dump_directory":
+                    patchers.append(
+                        mock.patch.object(
+                            backup_drill,
+                            "_fsync_directory",
+                            side_effect=OSError("injected dump directory fsync failure"),
+                        )
+                    )
+                elif failure_stage == "manifest_file":
+                    patchers.append(
+                        mock.patch.object(
+                            manifest_module,
+                            "_fsync_file",
+                            side_effect=OSError("injected manifest file fsync failure"),
+                        )
+                    )
+                else:
+                    patchers.append(
+                        mock.patch.object(
+                            manifest_module,
+                            "_fsync_directory",
+                            side_effect=OSError("injected manifest directory fsync failure"),
+                        )
+                    )
+                with ExitStack() as stack:
+                    for patcher in patchers:
+                        stack.enter_context(patcher)
+                    with self.assertRaises(Exception):
+                        backup_drill.create_backup(self._creator_args(output_dir))
+
+                self.assertEqual(tuple(output_dir.iterdir()), ())
 
     def test_restore_failure_does_not_prune_existing_backups(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -200,10 +466,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 dump_only=False,
             )
 
-            def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            def fake_run_command(
+                command: list[str], *, stdout: int | None = None, **_: object
+            ) -> subprocess.CompletedProcess[str]:
                 if command[0] == "pg_dump":
-                    dump_path = pathlib.Path(command[command.index("--file") + 1])
-                    dump_path.write_bytes(b"new-backup")
+                    assert stdout is not None
+                    backup_drill.os.write(stdout, b"PGDMP new-backup")
                     return subprocess.CompletedProcess(command, 0, "", "")
                 if command[0] == "pg_restore":
                     return subprocess.CompletedProcess(command, 0, "", "")

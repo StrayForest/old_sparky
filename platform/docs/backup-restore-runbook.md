@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-29
+- Last reviewed: 2026-10-01
 
 ## Local verified backup
 
@@ -11,6 +11,37 @@
 manifest, restores into a new temporary database, validates tables,
 extensions/Alembic and drops the drill database. Daily maintenance retains 14
 verified copies.
+
+The manifest is the closed, versioned v2 contract implemented by
+[`platform_backup_manifest.py`](../tools/platform_backup_manifest.py). It
+requires the ordered `schemas: ["platform", "public"]` value, the exact
+`required_extensions: ["pg_trgm"]` list, a unique 32-character `run_id`,
+archive size and SHA-256, restore/Alembic status and UTC timing fields. The retired singular
+`schema` field is invalid; it is not migrated or interpreted as `schemas`.
+The archive and manifest use the same timestamp plus run ID, so two runs in
+one second cannot share a dump/manifest pair. Manifest publication is
+temporary-file + file fsync + atomic rename + backup-directory fsync. Readers
+reject partial JSON, extra or duplicate keys, wrong types/order, symlinks,
+hardlinks, unexpected owner/group or mode, path mismatches, checksum and size
+drift.
+
+The dump producer reserves both final names with `O_EXCL`, writes `pg_dump`
+through a held mode-`0600` descriptor, verifies that descriptor and pathname
+identity before publication, and removes the reserved pair on any publication
+or directory-fsync failure.
+
+Residual Phase A risk: a same-owner writer with access to the backup directory
+can still replace the published dump pathname after its final identity/hash
+check and before the manifest publication (or during a later consumer
+operation). Consumers fail closed when that replacement is observed, but the
+window itself is not yet serialized. Phase B must add the backup operation
+lock/supervisor across dump, manifest, retention and offsite selection, then
+revalidate the published pair before timer enablement or merge readiness.
+The offsite timer remains disabled until that gate is complete.
+
+The read-only health monitor uses this same parser and archive checksum path;
+legacy, minimal, extra-key or malformed metadata therefore fails the backup
+health check closed.
 
 The low-level create/restore drill is invoked by storage maintenance; do not
 run its mutating mode directly on the production host because it does not
@@ -70,8 +101,9 @@ Off-host backup remains incomplete until all of these are evidenced:
 
 `platform_backup_offsite.py` validates and encrypts locally by default, deletes
 its temporary ciphertext and makes no remote write. `--apply` uploads only the
-newest format-v2 restore-verified archive and verifies size/SHA/metadata. It
-never deletes remote objects.
+newest canonical v2 restore-verified archive and verifies size/SHA/metadata.
+It consumes the same manifest parser as the creator and never deletes remote
+objects.
 
 ```bash
 cd /opt/oldsparky/platform/current
@@ -81,9 +113,10 @@ cd /opt/oldsparky/platform/current
   tools/platform_backup_offsite.py --apply --json
 ```
 
-Enable `deadlock-offsite-backup.timer` only after the manual recovery drill.
-Do not automate remote deletion during launch hardening. R2 is an off-host copy,
-not an immutable vault; retain tested offline ciphertext too.
+The `deadlock-offsite-backup.timer` remains disabled in this phase. Run only
+the local dry run while the manual recovery drill and operator enablement gate
+remain open. Do not automate remote deletion during launch hardening. R2 is an
+off-host copy, not an immutable vault; retain tested offline ciphertext too.
 
 ## Production restore gate
 

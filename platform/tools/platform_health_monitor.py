@@ -7,7 +7,9 @@ from datetime import UTC, datetime
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 from typing import Any
@@ -23,6 +25,19 @@ def _load_staged_disk_policy() -> Any:
     )
     if spec is None or spec.loader is None:
         raise ImportError("platform disk policy helper is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_staged_backup_manifest() -> Any:
+    helper_path = Path(__file__).resolve().with_name("platform_backup_manifest.py")
+    spec = importlib.util.spec_from_file_location(
+        "_oldsparky_platform_backup_manifest", helper_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("platform backup manifest helper is unavailable")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -53,6 +68,26 @@ except ImportError:  # Direct execution from the tools directory.
         is_healthy = _disk_policy.is_healthy
         minimum_free_bytes = _disk_policy.minimum_free_bytes
         snapshot_for_path = _disk_policy.snapshot_for_path
+
+
+try:
+    from .platform_backup_manifest import (
+        BackupManifestError,
+        read_manifest_file,
+        sha256_private_file,
+    )
+except ImportError:  # Direct execution from the tools directory.
+    try:
+        from tools.platform_backup_manifest import (
+            BackupManifestError,
+            read_manifest_file,
+            sha256_private_file,
+        )
+    except ImportError:
+        _backup_manifest = _load_staged_backup_manifest()
+        BackupManifestError = _backup_manifest.BackupManifestError
+        read_manifest_file = _backup_manifest.read_manifest_file
+        sha256_private_file = _backup_manifest.sha256_private_file
 
 
 DEFAULT_SERVICES = ("deadlock-api", "deadlock-worker", "deadlock-web", "nginx")
@@ -218,33 +253,38 @@ def check_memory(*, min_available_percent: float, meminfo_path: Path = Path("/pr
     )
 
 
-def parse_timestamp(value: object) -> datetime:
-    if not isinstance(value, str):
-        raise ValueError("timestamp is missing")
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        raise ValueError("timestamp has no timezone")
-    return parsed.astimezone(UTC)
-
-
 def check_backup(directory: Path, *, max_age_hours: float, now: datetime | None = None) -> Check:
     current_time = now or datetime.now(UTC)
     try:
-        candidates = sorted(directory.glob("platformdb-*.json"), key=lambda item: item.stat().st_mtime)
+        directory_stat = directory.lstat()
+        if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+            raise ValueError("backup directory is not a regular directory")
+        candidates = sorted(
+            directory.glob("platformdb-*.json"),
+            key=lambda item: (item.stat().st_mtime_ns, item.name),
+        )
         if not candidates:
             raise FileNotFoundError("backup metadata missing")
         metadata_path = candidates[-1]
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        created_at = parse_timestamp(metadata.get("completed_at_utc", metadata.get("created_at")))
-        dump_name = metadata.get("dump_file")
-        if not isinstance(dump_name, str) or Path(dump_name).name != dump_name:
-            raise ValueError("invalid dump file name")
-        dump_path = directory / dump_name
-        if not dump_path.is_file() or dump_path.stat().st_size <= 0:
-            raise FileNotFoundError("backup archive missing")
-        if metadata.get("restore_verified") is not True:
+        manifest_file = read_manifest_file(
+            metadata_path,
+            expected_owner=os.geteuid(),
+            expected_group=os.getegid(),
+            expected_dump_file=metadata_path.with_suffix(".dump").name,
+        )
+        manifest = manifest_file.manifest
+        if not manifest.restore_verified or not manifest.alembic_revision_verified:
             raise ValueError("latest backup is not restore verified")
-        age_hours = max(0.0, (current_time - created_at).total_seconds() / 3600)
+        dump_path = directory / manifest.dump_file
+        actual_sha256, dump_stat = sha256_private_file(
+            dump_path,
+            label="Platform backup dump",
+            expected_owner=os.geteuid(),
+            expected_group=os.getegid(),
+        )
+        if actual_sha256 != manifest.sha256 or dump_stat.st_size != manifest.size_bytes:
+            raise ValueError("latest backup checksum or size does not match its manifest")
+        age_hours = max(0.0, (current_time - manifest.completed_at_utc).total_seconds() / 3600)
         return Check(
             "backup",
             age_hours <= max_age_hours,
@@ -252,10 +292,10 @@ def check_backup(directory: Path, *, max_age_hours: float, now: datetime | None 
                 "age_hours": round(age_hours, 1),
                 "max_age_hours": max_age_hours,
                 "restore_verified": True,
-                "archive_bytes": dump_path.stat().st_size,
+                "archive_bytes": dump_stat.st_size,
             },
         )
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (BackupManifestError, OSError, ValueError, json.JSONDecodeError) as exc:
         return Check("backup", False, {"error": type(exc).__name__})
 
 

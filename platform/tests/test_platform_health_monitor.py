@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -21,6 +22,7 @@ for import_root in (str(PLATFORM_ROOT), str(TOOLS_ROOT)):
         sys.path.insert(0, import_root)
 
 from tools import platform_storage_maintenance as STORAGE  # noqa: E402
+from tools import platform_backup_manifest as MANIFEST  # noqa: E402
 from tools.platform_disk_policy import (  # noqa: E402
     BYTES_PER_GIB,
     snapshot_from_usage,
@@ -34,19 +36,44 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PlatformHealthMonitorTests(unittest.TestCase):
+    def _write_verified_backup(
+        self,
+        directory: Path,
+        *,
+        dump_name: str,
+        completed_at: datetime,
+        restore_verified: bool = True,
+    ) -> tuple[Path, Path]:
+        run_id = dump_name.rsplit("-", 1)[1].removesuffix(".dump")
+        dump_path = directory / dump_name
+        dump_path.write_bytes(b"PGDMP health-monitor backup")
+        dump_path.chmod(0o600)
+        metadata_path = dump_path.with_suffix(".json")
+        payload = MANIFEST.build_manifest(
+            run_id=run_id,
+            dump_file=dump_path.name,
+            size_bytes=dump_path.stat().st_size,
+            sha256=hashlib.sha256(dump_path.read_bytes()).hexdigest(),
+            started_at_utc=completed_at,
+            completed_at_utc=completed_at,
+            duration_seconds=0,
+            restore_verified=restore_verified,
+            alembic_revision_verified=restore_verified,
+            restored_table_count=31 if restore_verified else None,
+            restore_error=None if restore_verified else "restore failed",
+        )
+        metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+        metadata_path.chmod(0o600)
+        return dump_path, metadata_path
+
     def test_backup_requires_fresh_restore_verified_archive(self) -> None:
         now = datetime(2026, 8, 1, 12, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as temporary_dir:
             directory = Path(temporary_dir)
-            dump_path = directory / "platformdb-20260801T110000Z.dump"
-            dump_path.write_bytes(b"not-empty")
-            metadata = {
-                "completed_at_utc": (now - timedelta(hours=1)).isoformat(),
-                "dump_file": dump_path.name,
-                "restore_verified": True,
-            }
-            (directory / "platformdb-20260801T110000Z.json").write_text(
-                json.dumps(metadata), encoding="utf-8"
+            dump_path, _ = self._write_verified_backup(
+                directory,
+                dump_name="platformdb-20260801T110000Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.dump",
+                completed_at=now - timedelta(hours=1),
             )
 
             result = MODULE.check_backup(directory, max_age_hours=36, now=now)
@@ -58,23 +85,47 @@ class PlatformHealthMonitorTests(unittest.TestCase):
         now = datetime(2026, 8, 1, 12, tzinfo=UTC)
         with tempfile.TemporaryDirectory() as temporary_dir:
             directory = Path(temporary_dir)
-            dump_path = directory / "platformdb-20260730T000000Z.dump"
-            dump_path.write_bytes(b"not-empty")
-            (directory / "platformdb-20260730T000000Z.json").write_text(
-                json.dumps(
-                    {
-                        "completed_at_utc": (now - timedelta(hours=60)).isoformat(),
-                        "dump_file": dump_path.name,
-                        "restore_verified": True,
-                    }
-                ),
-                encoding="utf-8",
+            self._write_verified_backup(
+                directory,
+                dump_name="platformdb-20260730T000000Z-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.dump",
+                completed_at=now - timedelta(hours=60),
             )
 
             stale = MODULE.check_backup(directory, max_age_hours=36, now=now)
 
         self.assertFalse(stale.ok)
         self.assertGreater(stale.detail["age_hours"], 36)
+
+    def test_backup_rejects_legacy_extra_and_malformed_manifests(self) -> None:
+        now = datetime(2026, 8, 1, 12, tzinfo=UTC)
+        mutations = (
+            "legacy",
+            "extra",
+            "malformed",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary_dir:
+                directory = Path(temporary_dir)
+                _dump_path, metadata_path = self._write_verified_backup(
+                    directory,
+                    dump_name="platformdb-20260801T110000Z-cccccccccccccccccccccccccccccccc.dump",
+                    completed_at=now - timedelta(hours=1),
+                )
+                if mutation == "malformed":
+                    metadata_path.write_text('{"format_version": 2', encoding="utf-8")
+                else:
+                    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    if mutation == "legacy":
+                        payload.pop("schemas")
+                        payload["schema"] = "platform"
+                    else:
+                        payload["unexpected"] = True
+                    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+                metadata_path.chmod(0o600)
+
+                result = MODULE.check_backup(directory, max_age_hours=36, now=now)
+
+                self.assertFalse(result.ok)
 
     def test_memory_check_uses_available_memory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -193,6 +244,10 @@ class PlatformHealthMonitorTests(unittest.TestCase):
             shutil.copyfile(
                 TOOLS_ROOT / "platform_disk_policy.py",
                 staged_tools / "platform_disk_policy.py",
+            )
+            shutil.copyfile(
+                TOOLS_ROOT / "platform_backup_manifest.py",
+                staged_tools / "platform_backup_manifest.py",
             )
             decoy = root / "decoy"
             decoy.mkdir()

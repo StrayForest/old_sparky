@@ -120,6 +120,11 @@ editing a workflow filename list. The stable gate and command registry remains
 the [canonical verifier](../tools/platform_verify.py),
 which delegates `backend` and each sub-contour to the guarded runner.
 
+The backup manifest producer/consumer regression module
+`test_platform_backup_manifest` is catalog-owned by `backend-tool-contract`,
+alongside the restore-drill and offsite-selection tests. Its fixtures are
+local-only and do not enable the offsite timer or contact R2.
+
 Every aggregate and backend sub-contour is guarded before test discovery by
 one pure, fail-closed resource validator. It requires the exact values
 `PLATFORM_ENVIRONMENT=test`, `PLATFORM_DB_SCHEMA=platform`, database
