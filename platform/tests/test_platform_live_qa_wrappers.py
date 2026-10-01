@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO, TextIOWrapper
 import json
 import os
@@ -10,7 +10,9 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import Mock, patch
 
@@ -98,6 +100,12 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         supervisor = (
             TOOLS_ROOT / "platform_live_launch_supervisor.sh"
         ).read_text(encoding="utf-8")
+        trusted_launch = (
+            TOOLS_ROOT / "platform_live_launch_trusted.sh"
+        ).read_text(encoding="utf-8")
+        remote_dispatcher = (
+            TOOLS_ROOT / "platform_workflow_remote_dispatch.py"
+        ).read_text(encoding="utf-8")
         self.assertIn("PROD_SSH_HOST", source)
         self.assertIn("ssh " + "\\", source)
         self.assertIn(
@@ -128,14 +136,39 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("PLATFORM_LIVE_QA_INSTALL_ROOT", supervisor)
         self.assertIn("platform_live_user_qa_dispatch.py verify", supervisor)
         self.assertIn("platform_release_lock_exec.sh", supervisor)
+        self.assertIn("PLATFORM_LIVE_QA_INSTALL_ROOT", trusted_launch)
+        self.assertIn("PLATFORM_LIVE_QA_TIMEOUT_SECONDS", trusted_launch)
+        self.assertIn('f"--preserve-env={preserved_names}"', remote_dispatcher)
+        self.assertIn("TRUSTED_LIVE_DISPATCHER", remote_dispatcher)
+        self.assertIn("_trusted_live_launch_postconditions", remote_dispatcher)
+        self.assertIn('"LIVE_BROWSER_QA_SUCCESS "', remote_dispatcher)
         self.assertNotIn("/root/old_sparky", supervisor)
         self.assertNotIn("npm ci", source)
         self.assertNotIn("npm run test:live", source)
         self.assertNotIn('bash -s -- "$LIVE_BASE_URL"', source)
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', source)
         self.assertLess(
             source.index("platform_workflow_input_guard.py live"),
             source.index('printf \'%s\\n\' "$PROD_SSH_KEY"'),
         )
+        self.assertLess(
+            source.index('test "$GITHUB_REF" = "refs/heads/dev"'),
+            source.index("actions/checkout@"),
+        )
+        self.assertLess(
+            source.index('test "$GITHUB_REF" = "refs/heads/dev"'),
+            source.index("secrets.PROD_SSH_KEY"),
+        )
+        self.assertIn(
+            'expected_marker = f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}"',
+            source,
+        )
+        self.assertIn(
+            "valid_marker_count = sum(line == expected_marker for line in marker_lines)",
+            source,
+        )
+        self.assertIn("invalid_success_marker_count", source)
+        self.assertNotIn('"live_browser_qa_success" in lower', source)
 
         # OpenSSH concatenates command arguments into a remote shell command,
         # so every workflow SSH command must end at a fixed dispatcher mode.
@@ -327,8 +360,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "remote workflow input is invalid\n")
         self.assertNotIn(invalid_emails[0], stderr.getvalue())
 
-        # A valid payload still produces a fixed helper argv; shell quoting is
-        # not involved at this local subprocess boundary.
+        # A valid payload still produces a fixed trusted-helper contour. Shell
+        # quoting is not involved at this local subprocess boundary, and the
+        # child receives only the reviewed environment needed by the helper.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             helper = root / "platform_live_launch_supervisor.sh"
@@ -338,32 +372,64 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 BytesIO((json.dumps(valid_live) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
+            stdout = StringIO()
             child = Mock(pid=1234)
             child.wait.return_value = 0
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_ROOT", root), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_LAUNCH", helper), \
                 patch.object(
+                    platform_workflow_remote_dispatch,
+                    "_trusted_live_launch_postconditions",
+                    return_value=True,
+                ), \
+                patch.object(
                     platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child
-                ) as popen:
+                ) as popen, \
+                redirect_stdout(stdout):
                 self.assertEqual(
                     platform_workflow_remote_dispatch.main(["live-launch"]),
                     0,
                 )
             self.assertEqual(
+                stdout.getvalue(),
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={valid_live['target_sha']}\n",
+            )
+            self.assertEqual(
                 popen.call_args.args[0],
                 [
                     "/usr/bin/sudo",
                     "-n",
+                    "--preserve-env=HOME,LANG,PATH,"
+                    "PLATFORM_LIVE_QA_INSTALL_ROOT,PLATFORM_LIVE_QA_TARGET_SHA,"
+                    "PLATFORM_LIVE_PROVISION,PLATFORM_LIVE_MARKER,"
+                    "PLATFORM_LIVE_QA_TIMEOUT_SECONDS,PLAYWRIGHT_LIVE_BASE_URL",
                     "--",
                     str(helper),
-                    valid_live["base_url"],
-                    valid_live["provision"],
-                    valid_live["marker"],
-                    valid_live["target_sha"],
                 ],
             )
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertIs(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
+            self.assertIs(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+            self.assertEqual(
+                popen.call_args.kwargs["env"]["PLATFORM_LIVE_QA_INSTALL_ROOT"],
+                f"{root}/releases/{valid_live['target_sha']}",
+            )
+            self.assertEqual(
+                set(popen.call_args.kwargs["env"]),
+                {
+                    "HOME",
+                    "LANG",
+                    "PATH",
+                    "PLATFORM_LIVE_QA_INSTALL_ROOT",
+                    "PLATFORM_LIVE_QA_TARGET_SHA",
+                    "PLATFORM_LIVE_PROVISION",
+                    "PLATFORM_LIVE_MARKER",
+                    "PLATFORM_LIVE_QA_TIMEOUT_SECONDS",
+                    "PLAYWRIGHT_LIVE_BASE_URL",
+                },
+            )
 
         # The local handoff is an atomic private file, not a shell fragment or
         # an Actions artifact.
@@ -842,6 +908,133 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         killpg.assert_called_once_with(9876, platform_workflow_remote_dispatch.signal.SIGTERM)
 
+    def test_live_launch_dispatcher_to_trusted_helper_contract_is_hermetic(self) -> None:
+        """Exercise the closed env, hidden child output and marker boundary locally."""
+
+        payload = {
+            "schema": 1,
+            "base_url": "https://old-sparky.com",
+            "provision": "false",
+            "marker": "",
+            "target_sha": "a" * 40,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "platform_live_launch_trusted.sh"
+            verifier = root / "platform_live_user_qa_dispatch.py"
+            fake_sudo = root / "sudo"
+            helper_exit = root / "helper-exit"
+            verifier_exit = root / "verifier-exit"
+            captured_environment = root / "helper-environment.json"
+            helper.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                f"Path({str(captured_environment)!r}).write_text("
+                "json.dumps(dict(os.environ), sort_keys=True) + '\\n', "
+                "encoding='utf-8')\n"
+                f"exit_path = Path({str(helper_exit)!r})\n"
+                "code = int(exit_path.read_text(encoding='ascii'))\n"
+                "print('trusted child stdout must stay private', flush=True)\n"
+                "print('trusted child stderr must stay private', file=sys.stderr, flush=True)\n"
+                "if code == 124:\n"
+                "    import time\n"
+                "    time.sleep(10)\n"
+                "raise SystemExit(code)\n",
+                encoding="utf-8",
+            )
+            verifier.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                f"raise SystemExit(int(Path({str(verifier_exit)!r}).read_text(encoding='ascii')))\n",
+                encoding="utf-8",
+            )
+            fake_sudo.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import sys\n"
+                "index = sys.argv.index('--') + 1\n"
+                "os.execv(sys.argv[index], sys.argv[index:])\n",
+                encoding="utf-8",
+            )
+            for path, mode in ((helper, 0o755), (verifier, 0o500), (fake_sudo, 0o755)):
+                path.chmod(mode)
+
+            def run_dispatch() -> tuple[int, str, str]:
+                stdin = TextIOWrapper(
+                    BytesIO((json.dumps(payload) + "\n").encode("utf-8")),
+                    encoding="utf-8",
+                )
+                stdout = StringIO()
+                stderr = StringIO()
+                with (
+                    patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    result = platform_workflow_remote_dispatch.main(["live-launch"])
+                return result, stdout.getvalue(), stderr.getvalue()
+
+            with (
+                patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_ROOT", root),
+                patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_LAUNCH", helper),
+                patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_DISPATCHER", verifier),
+                patch.object(platform_workflow_remote_dispatch, "SUDO", str(fake_sudo)),
+                patch.object(platform_workflow_remote_dispatch, "_trusted_live_launch_helper", return_value=True),
+                patch.object(platform_workflow_remote_dispatch, "_trusted_live_dispatcher", return_value=True),
+            ):
+                helper_exit.write_text("0", encoding="ascii")
+                verifier_exit.write_text("0", encoding="ascii")
+                result, stdout, stderr = run_dispatch()
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    stdout,
+                    f"LIVE_BROWSER_QA_SUCCESS source_commit={payload['target_sha']}\n",
+                )
+                self.assertEqual(stderr, "")
+                self.assertEqual(
+                    json.loads(captured_environment.read_text(encoding="utf-8")),
+                    {
+                        "HOME": "/root",
+                        "LANG": "C.UTF-8",
+                        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                        "PLATFORM_LIVE_QA_INSTALL_ROOT": (
+                            f"{root}/releases/{payload['target_sha']}"
+                        ),
+                        "PLATFORM_LIVE_QA_TARGET_SHA": payload["target_sha"],
+                        "PLATFORM_LIVE_PROVISION": "false",
+                        "PLATFORM_LIVE_MARKER": "",
+                        "PLATFORM_LIVE_QA_TIMEOUT_SECONDS": "300",
+                        "PLAYWRIGHT_LIVE_BASE_URL": "https://old-sparky.com",
+                    },
+                )
+
+                helper_exit.write_text("7", encoding="ascii")
+                result, stdout, stderr = run_dispatch()
+                self.assertEqual(result, 7)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, "")
+
+                helper_exit.write_text("124", encoding="ascii")
+                with patch.object(
+                    platform_workflow_remote_dispatch,
+                    "LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS",
+                    1.0,
+                ):
+                    result, stdout, stderr = run_dispatch()
+                self.assertEqual(result, 124)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, "")
+
+                helper_exit.write_text("0", encoding="ascii")
+                verifier_exit.write_text("3", encoding="ascii")
+                result, stdout, stderr = run_dispatch()
+                self.assertEqual(result, 2)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, "")
+
     def test_cleanup_export_inventory_is_closed_and_idempotent(self) -> None:
         def build_root(prefix: str, run_id: str, names: tuple[str, ...]) -> Path:
             root = Path(f"{prefix}{run_id}")
@@ -1052,6 +1245,133 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("platform_live_user_qa_trusted.sh", dispatcher)
         self.assertIn("platform_live_qa_mailbox_helper.py", dispatcher)
         self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", dispatcher)
+
+    def test_live_launch_accepts_only_exact_target_sha_success_evidence(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(
+            encoding="utf-8"
+        )
+        invocation = "/usr/bin/python3 - \"$raw_report\" \"$safe_report\" \"$SUPERVISOR_STATUS\" \"$TARGET_SHA\" <<'PY'"
+        start = workflow.index(invocation)
+        script_start = workflow.index("          import json\n", start)
+        script_end = workflow.index("          PY\n", script_start)
+        script = textwrap.dedent(workflow[script_start:script_end])
+        target_sha = "a" * 40
+        fixtures = (
+            (
+                "exact marker",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n",
+                0,
+                True,
+                1,
+                0,
+            ),
+            (
+                "duplicate exact markers are rejected",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n" * 2,
+                0,
+                False,
+                2,
+                0,
+            ),
+            ("marker only", "LIVE_BROWSER_QA_SUCCESS\n", 0, False, 0, 1),
+            (
+                "wrong full SHA",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={'b' * 40}\n",
+                0,
+                False,
+                0,
+                1,
+            ),
+            (
+                "mixed target markers",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n"
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={'b' * 40}\n",
+                0,
+                False,
+                1,
+                1,
+            ),
+            (
+                "valid marker followed by failure",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n"
+                "browser failure\n",
+                0,
+                False,
+                1,
+                0,
+            ),
+            (
+                "truncated SHA",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha[:-1]}\n",
+                0,
+                False,
+                0,
+                1,
+            ),
+            (
+                "embedded marker",
+                f"prefix LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n",
+                0,
+                False,
+                0,
+                0,
+            ),
+            (
+                "nonzero supervisor evidence",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n",
+                1,
+                False,
+                1,
+                0,
+            ),
+            (
+                "bounded log truncation",
+                f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}\n" + "x" * 262144,
+                0,
+                False,
+                1,
+                0,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for (
+                name,
+                log,
+                exit_code,
+                expected_success,
+                expected_marker_count,
+                expected_invalid_marker_count,
+            ) in fixtures:
+                with self.subTest(evidence=name):
+                    slug = name.replace(" ", "-")
+                    raw = root / f"{slug}.log"
+                    report_path = root / f"{slug}.json"
+                    raw.write_text(log, encoding="utf-8")
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            script,
+                            str(raw),
+                            str(report_path),
+                            str(exit_code),
+                            target_sha,
+                        ],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    report = json.loads(report_path.read_text(encoding="utf-8"))
+                    self.assertEqual(report["success"], expected_success)
+                    self.assertEqual(report["exact_evidence"], expected_success)
+                    self.assertEqual(report["success_marker_count"], expected_marker_count)
+                    self.assertEqual(
+                        report["invalid_success_marker_count"],
+                        expected_invalid_marker_count,
+                    )
 
     def test_all_wrappers_disable_xtrace_before_any_work(self) -> None:
         for wrapper in WRAPPERS:

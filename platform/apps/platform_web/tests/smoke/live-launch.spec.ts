@@ -414,7 +414,6 @@ test("live admin route is protected for anonymous users", async ({ page, request
   await page.goto("/admin");
   await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
   await expect(page.getByTestId("admin-console")).toHaveCount(0);
-  await page.waitForLoadState("networkidle");
 });
 
 test("live home uses text-only tournament steps without overflow", async ({ page }, testInfo) => {

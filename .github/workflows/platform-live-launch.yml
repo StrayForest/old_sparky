@@ -40,6 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = workflow_dispatch || { echo "Live launch accepts workflow_dispatch only." >&2; exit 1; }
+          test "$GITHUB_REF" = "refs/heads/dev" || { echo "Live launch must run from the reviewed dev ref." >&2; exit 1; }
           test "$LIVE_BASE_URL" = "https://old-sparky.com" || { echo "Live launch requires the canonical origin." >&2; exit 1; }
           case "$LIVE_PROVISION" in true|false) ;; *) echo "Live provision mode is invalid." >&2; exit 1 ;; esac
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Live launch requires an exact target SHA." >&2; exit 1; }
@@ -265,9 +266,10 @@ jobs:
             rm -f -- "$raw_report"
           }
           trap cleanup_raw_report EXIT
-          /usr/bin/python3 - "$raw_report" "$safe_report" "$SUPERVISOR_STATUS" <<'PY'
+          /usr/bin/python3 - "$raw_report" "$safe_report" "$SUPERVISOR_STATUS" "$TARGET_SHA" <<'PY'
           import json
           from pathlib import Path
+          import re
           import sys
 
           source = Path(sys.argv[1])
@@ -276,31 +278,36 @@ jobs:
               process_status = int(sys.argv[3])
           except ValueError:
               process_status = 1
-          raw = source.read_bytes()[:262144]
-          truncated = len(raw) == 262144
+          target_sha = sys.argv[4]
+          if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
+              raise SystemExit("live-launch target SHA is not an exact lowercase full SHA")
+          maximum_bytes = 262144
+          with source.open("rb") as stream:
+              raw = stream.read(maximum_bytes + 1)
+          truncated = len(raw) > maximum_bytes
+          raw = raw[:maximum_bytes]
           text = raw.decode("utf-8", errors="replace")
-          lines = text.splitlines()[:1000]
-          lower = text.lower()
+          all_lines = text.splitlines()
+          truncated = truncated or len(all_lines) > 1000
+          lines = all_lines[:1000]
+          expected_marker = f"LIVE_BROWSER_QA_SUCCESS source_commit={target_sha}"
+          marker_prefix = re.compile(r"^LIVE_BROWSER_QA_SUCCESS(?:\s|$)")
+          marker_lines = [line for line in lines if marker_prefix.match(line)]
+          valid_marker_count = sum(line == expected_marker for line in marker_lines)
+          invalid_marker_count = len(marker_lines) - valid_marker_count
+          exact_evidence = process_status == 0 and not truncated and lines == [expected_marker]
           if process_status != 0:
               status = "failed"
               success = False
               errors = {"transport": 1}
-          elif "live_browser_qa_success" in lower:
+          elif exact_evidence:
               status = "passed"
               success = True
               errors = {"none": 1}
-          elif any(word in lower for word in ("error", "failed", "failure", "timeout")):
-              status = "failed"
+          else:
+              status = "truncated" if truncated else "failed"
               success = False
               errors = {"other": 1}
-          elif lines:
-              status = "unknown"
-              success = False
-              errors = {"none": 1}
-          else:
-              status = "unavailable"
-              success = False
-              errors = {"none": 1}
           report = {
               "schema": 1,
               "status": status,
@@ -309,7 +316,11 @@ jobs:
               "line_count": len(lines),
               "retained_line_count": len(lines),
               "truncated": truncated,
-              "test_count": 1 if "live_browser_qa_success" in lower else 0,
+              "exact_evidence": exact_evidence,
+              "success_marker_count": valid_marker_count,
+              "invalid_success_marker_count": invalid_marker_count,
+              "extra_line_count": max(0, len(lines) - 1),
+              "test_count": 1 if exact_evidence else 0,
               "failed_test_count": 0 if success else (1 if lines else 0),
               "tests": ([{"name": "browser_public", "status": "passed", "route_class": "other", "http_status": 0, "error_class": "none"}] if success else []),
               "class_counts": {"success": 1} if success else {"failure": 1},
@@ -359,6 +370,15 @@ jobs:
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           if report.get("truncated") is not False or report.get("status") in {"truncated", "error", "unavailable"}:
               raise SystemExit("required live-launch report is incomplete")
+          if report.get("process_exit_code") != 0:
+              raise SystemExit("live-launch supervisor did not exit successfully")
+          if (
+              report.get("exact_evidence") is not True
+              or report.get("success_marker_count") != 1
+              or report.get("invalid_success_marker_count") != 0
+              or report.get("extra_line_count") != 0
+          ):
+              raise SystemExit("live-launch evidence is not one exact target-SHA record")
           if report.get("success") is not True:
               raise SystemExit("Live browser QA did not pass; see fixed report classes.")
           PY

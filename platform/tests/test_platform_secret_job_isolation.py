@@ -75,6 +75,11 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         source = _workflow("platform-live-launch.yml")
         jobs = _job_blocks(source)
         self.assertIn("if: ${{ always() }}", jobs["validate-live-inputs"])
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', jobs["validate-live-inputs"])
+        self.assertLess(
+            source.index('test "$GITHUB_REF" = "refs/heads/dev"'),
+            source.index("secrets.PROD_SSH_KEY"),
+        )
         self.assertIn("needs: validate-live-inputs", jobs["live-sanity"])
         self.assertIn("environment: production", jobs["live-sanity"])
         self.assertIn("needs: live-sanity", jobs["sanitize-live-report"])
@@ -82,6 +87,8 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertNotIn("actions/checkout@", jobs["sanitize-live-report"])
         self.assertIn("platform-live-launch-sanitized-", jobs["live-sanity"])
         self.assertNotIn("platform-live-launch-raw-", jobs["live-sanity"])
+        self.assertIn("success_marker_count", jobs["live-sanity"])
+        self.assertIn("invalid_success_marker_count", jobs["live-sanity"])
         self.assertNotRegex(jobs["sanitize-live-report"], r"secrets\.PROD_SSH_")
         self.assertIn("download", jobs["sanitize-live-report"].lower())
         self.assertIn("steps.cleanup_ssh.outcome == 'success'", jobs["live-sanity"])

@@ -13,11 +13,16 @@ DISPATCHER="$TRUSTED_ROOT/platform_live_user_qa_dispatch.py"
 RELEASE_LOCK_EXEC="$TRUSTED_ROOT/platform_release_lock_exec.sh"
 APP_DIR="/opt/oldsparky/platform"
 TARGET_SHA="${PLATFORM_LIVE_QA_TARGET_SHA:-}"
+INSTALL_ROOT="${PLATFORM_LIVE_QA_INSTALL_ROOT:-}"
 BASE_URL="${PLAYWRIGHT_LIVE_BASE_URL:-}"
 PROVISION="${PLATFORM_LIVE_PROVISION:-}"
 MARKER="${PLATFORM_LIVE_MARKER:-}"
+TIMEOUT_SECONDS="${PLATFORM_LIVE_QA_TIMEOUT_SECONDS:-}"
 
-if [[ "$EUID" -ne 0 || ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+if [[ "$EUID" -ne 0 || ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ \
+  || "$INSTALL_ROOT" != "/root/.oldsparky/liveqa/releases/$TARGET_SHA" \
+  || ! "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,3}$ \
+  || "$TIMEOUT_SECONDS" -gt 300 ]]; then
   echo "Trusted live-launch requires root and an exact target SHA." >&2
   exit 1
 fi

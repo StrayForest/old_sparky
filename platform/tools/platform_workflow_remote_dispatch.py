@@ -112,6 +112,7 @@ LIVE_HELPER = ACTIVE_TOOLS_DIR / "platform_live_launch_supervisor.sh"
 LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"
 TRUSTED_LIVE_ROOT = Path("/root/.oldsparky/liveqa")
 TRUSTED_LIVE_LAUNCH = TRUSTED_LIVE_ROOT / "platform_live_launch_trusted.sh"
+TRUSTED_LIVE_DISPATCHER = TRUSTED_LIVE_ROOT / "platform_live_user_qa_dispatch.py"
 DEPLOY_HELPER = ACTIVE_TOOLS_DIR / "platform_production_deploy_supervisor.sh"
 ARTIFACT_DIR_HELPER = ACTIVE_TOOLS_DIR / "platform_prepare_artifact_dir.py"
 EXTERNAL_EXPORT_PREFIX = "/tmp/old-sparky-production-retained-load-"
@@ -122,6 +123,7 @@ CLEANUP_OPERATION_TIMEOUT_SECONDS = 300.0
 ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS = 120.0
 LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 300.0
 LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0
+LIVE_LAUNCH_POSTCONDITION_TIMEOUT_SECONDS = 30.0
 CHILD_TERMINATION_GRACE_SECONDS = 5.0
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 HOST_GENERATION_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -191,17 +193,27 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _run_bounded_child(command: list[str], *, timeout_seconds: float) -> int:
+def _run_bounded_child(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+    environment: dict[str, str] | None = None,
+) -> int:
     """Run one synchronous privileged child with process-group cleanup."""
 
     try:
+        popen_arguments: dict[str, object] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "start_new_session": True,
+            "close_fds": True,
+        }
+        if environment is not None:
+            popen_arguments["env"] = environment
         process = subprocess.Popen(  # nosec B603
             command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
+            **popen_arguments,
         )
     except OSError:
         return 2
@@ -212,15 +224,48 @@ def _run_bounded_child(command: list[str], *, timeout_seconds: float) -> int:
         return 124
 
 
-def _run_trusted_live_launch(arguments: list[str]) -> int:
+def _trusted_live_launch_environment(payload: dict[str, str]) -> dict[str, str]:
+    """Build the closed environment consumed by the root trusted helper."""
+
+    target_sha = payload["target_sha"]
+    return {
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "PLATFORM_LIVE_QA_INSTALL_ROOT": str(
+            TRUSTED_LIVE_ROOT / "releases" / target_sha
+        ),
+        "PLATFORM_LIVE_QA_TARGET_SHA": target_sha,
+        "PLATFORM_LIVE_PROVISION": payload["provision"],
+        "PLATFORM_LIVE_MARKER": payload["marker"],
+        "PLATFORM_LIVE_QA_TIMEOUT_SECONDS": str(
+            int(LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS)
+        ),
+        "PLAYWRIGHT_LIVE_BASE_URL": payload["base_url"],
+    }
+
+
+def _run_trusted_live_launch(payload: dict[str, str]) -> int:
     if not _trusted_live_launch_helper():
         return 2
-    command = [SUDO, "-n", "--", str(TRUSTED_LIVE_LAUNCH), *arguments]
+    environment = _trusted_live_launch_environment(payload)
+    # Keep the sudo target on the root-owned allowlisted helper.  The explicit
+    # preserve list carries only this reviewed environment; it never forwards
+    # the SSH caller's ambient environment or a secret-bearing value.
+    preserved_names = ",".join(environment)
+    command = [
+        SUDO,
+        "-n",
+        f"--preserve-env={preserved_names}",
+        "--",
+        str(TRUSTED_LIVE_LAUNCH),
+    ]
     # The trusted helper performs the synchronous handoff to its supervisor;
     # bound that handoff while retaining the supervisor's own detached work.
     return _run_bounded_child(
         command,
         timeout_seconds=LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS,
+        environment=environment,
     )
 
 
@@ -479,6 +524,52 @@ def _trusted_live_launch_helper() -> bool:
         and metadata.st_gid == 0
         and metadata.st_nlink == 1
         and stat.S_IMODE(metadata.st_mode) == 0o755
+    )
+
+
+def _trusted_live_dispatcher() -> bool:
+    """Check the fixed active-generation verifier before the postcondition."""
+
+    try:
+        root_metadata = TRUSTED_LIVE_ROOT.lstat()
+        metadata = TRUSTED_LIVE_DISPATCHER.lstat()
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISDIR(root_metadata.st_mode)
+        and root_metadata.st_uid == 0
+        and root_metadata.st_gid == 0
+        and not stat.S_IMODE(root_metadata.st_mode) & 0o022
+        and stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == 0o500
+    )
+
+
+def _trusted_live_launch_postconditions(target_sha: str) -> bool:
+    """Recheck the active live-QA generation after the child succeeds."""
+
+    if not _trusted_live_dispatcher():
+        return False
+    command = [
+        SUDO,
+        "-n",
+        "--",
+        "/usr/bin/python3.12",
+        "-I",
+        "-B",
+        str(TRUSTED_LIVE_DISPATCHER),
+        "verify",
+        target_sha,
+    ]
+    return (
+        _run_bounded_child(
+            command,
+            timeout_seconds=LIVE_LAUNCH_POSTCONDITION_TIMEOUT_SECONDS,
+        )
+        == 0
     )
 
 
@@ -844,14 +935,19 @@ def main(argv: list[str] | None = None) -> int:
                 [payload["target_sha"]],
                 timeout_seconds=LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS,
             )
-        return _run_trusted_live_launch(
-            [
-                payload["base_url"],
-                payload["provision"],
-                payload["marker"],
-                payload["target_sha"],
-            ],
+        launch_status = _run_trusted_live_launch(payload)
+        if launch_status != 0:
+            return launch_status
+        if not _trusted_live_launch_postconditions(payload["target_sha"]):
+            return 2
+        # The privileged child has DEVNULL stdout/stderr.  This is the sole
+        # public success record and is printed only after the active-generation
+        # verifier has passed again after browser execution.
+        print(
+            "LIVE_BROWSER_QA_SUCCESS "
+            f"source_commit={payload['target_sha']}"
         )
+        return 0
     except (WorkflowInputError, OSError, ValueError, subprocess.SubprocessError):
         return _fail()
 

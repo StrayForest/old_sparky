@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-04
+- Last reviewed: 2026-10-01
 
 This is the special CSP/browser/live-user QA path. Normal production release,
 rollback and release-transaction recovery are owned by
@@ -199,7 +199,8 @@ Dispatch only after the exact deployed `dev` SHA is confirmed. The workflow
 creates no fixture until the release lock, active-SHA check, host-installed
 supervisor/helper, bundle and browser preflight checks pass.
 
-The launch workflow validates `base_url`, `provision` and the optional marker
+The launch workflow accepts only an exact `workflow_dispatch` from
+`refs/heads/dev`. It validates `base_url`, `provision` and the optional marker
 with the canonical bounded-ASCII workflow-input parser before it creates any
 SSH key file or performs keyscan. It hands the accepted values to the remote
 host as private mode-0600 JSON on stdin; the SSH command contains only the
@@ -208,7 +209,23 @@ literal `live-launch` dispatcher mode. The remote dispatcher and
 the supervisor as fixed-argv data. Shell punctuation, quotes, newlines,
 command substitutions, option-like prefixes, Unicode/control/NUL-equivalent
 and overlong markers are rejected without reaching SSH, and rejected values
-are never printed in the browser report.
+are never printed in the browser report. With `provision=false`, the handoff
+contains an empty marker and the remote supervisor runs the browser contour
+without rotating or creating the CSP QA bundle.
+
+The remote dispatcher crosses the root-owned trusted launch helper with an
+explicit minimal environment: the target-bound release root, full target SHA,
+canonical origin, provision mode, marker and the reviewed operation timeout.
+The helper rejects any missing or mismatched value before it verifies the
+active generation. Child stdout/stderr stay private to the dispatcher; after a
+zero exit and a second active-generation verification, the dispatcher alone
+prints one structured record. The workflow publishes success only when the
+remote command exits zero, its bounded output is complete, and the entire raw
+report is exactly one full-line structured record with the exact 40-character
+target SHA (`LIVE_BROWSER_QA_SUCCESS source_commit=<target-sha>`).
+Duplicate, marker-only, extra/failure, wrong or truncated SHA records,
+embedded substring matches and nonzero remote evidence fail the gate; the raw
+report is removed before any sanitized artifact is uploaded.
 
 To rotate a stale existing bundle, dispatch the same launch workflow with
 `provision=true` and a fresh marker. The provisioner does not unlink the old
