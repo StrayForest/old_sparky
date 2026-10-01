@@ -174,6 +174,26 @@ class PlatformWorkerTestResourceContractTests(unittest.TestCase):
         with self.assertRaises(TestResourceConfigurationError):
             validate_test_celery_resource_configuration(unsafe)
 
+    def test_test_runtime_rejects_adversarial_celery_url_syntax(self) -> None:
+        adversarial_urls = (
+            "redis://127.0.0.1:/13",  # empty explicit port
+            "redis://127.0.0.1:6379/%ZZ",  # invalid percent escape
+            "redis://[::1%25eth0]:6379/13",  # IPv6 zone identifier
+            "redis://127.0.0.1:6379/13\x01",  # C0 control character
+            "redis://worker:secret@127.0.0.1:6379/13",  # userinfo
+            "redis://127.0.0.1:abc/13",  # malformed port
+            "redis://127.0.0.1:6379/013",  # malformed/noncanonical path
+            "redis://[::1]:/13",  # empty IPv6 port
+            "redis://[::1/13",  # malformed IPv6 authority
+        )
+
+        for unsafe_url in adversarial_urls:
+            with self.subTest(unsafe_url=repr(unsafe_url)):
+                unsafe = dict(self._VALID_SETTINGS)
+                unsafe["platform_celery_broker_url"] = unsafe_url
+                with self.assertRaises(TestResourceConfigurationError):
+                    validate_test_celery_resource_configuration(unsafe)
+
 
 if __name__ == "__main__":
     unittest.main()

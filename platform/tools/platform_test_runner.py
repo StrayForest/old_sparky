@@ -20,11 +20,13 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import shutil
 import sys
 import time
 import unittest
+import unicodedata
 from typing import Iterable, Iterator, Mapping, Sequence
 import ipaddress
 from urllib.parse import urlsplit
@@ -157,12 +159,14 @@ def validate_test_celery_resource_configuration(
         label="PLATFORM_CELERY_BROKER_URL",
         schemes=frozenset({"redis", "rediss"}),
         expected_path="/13",
+        allow_userinfo=False,
     )
     result_backend_url, _ = _parse_local_test_url(
         result_backend_value,
         label="PLATFORM_CELERY_RESULT_BACKEND",
         schemes=frozenset({"redis", "rediss"}),
         expected_path="/14",
+        allow_userinfo=False,
     )
     # Keep this explicit even though the paths above are closed values: it
     # makes the namespace separation invariant obvious to callers and guards
@@ -213,13 +217,21 @@ def _parse_local_test_url(
     label: str,
     schemes: frozenset[str],
     expected_path: str,
+    allow_userinfo: bool = True,
 ) -> tuple[str, str]:
     """Parse one exact loopback URL without DNS or client-library behavior."""
 
     if not isinstance(raw_url, str) or not raw_url or raw_url != raw_url.strip():
         raise TestResourceConfigurationError(f"{label} must be a non-empty URL.")
-    if any(character in raw_url for character in "\x00\r\n\t"):
+    if any(
+        ord(character) < 0x20
+        or ord(character) == 0x7F
+        or unicodedata.category(character) == "Cc"
+        for character in raw_url
+    ):
         raise TestResourceConfigurationError(f"{label} contains unsafe control characters.")
+    if re.search(r"%(?![0-9A-Fa-f]{2})", raw_url):
+        raise TestResourceConfigurationError(f"{label} contains an invalid percent escape.")
     # Query strings can carry alternate database names, Redis DB selectors,
     # socket options, or host lists understood by a client but invisible in the
     # path check.  Fragments are never sent to a server and are likewise an
@@ -246,6 +258,37 @@ def _parse_local_test_url(
         raise TestResourceConfigurationError(f"{label} must contain one host only.")
     if parts.netloc.count("@") > 1:
         raise TestResourceConfigurationError(f"{label} contains ambiguous userinfo.")
+    if not allow_userinfo and (
+        "@" in parts.netloc
+        or parts.username is not None
+        or parts.password is not None
+    ):
+        raise TestResourceConfigurationError(f"{label} must not contain userinfo.")
+    authority = parts.netloc.rsplit("@", 1)[-1]
+    if authority.startswith("["):
+        closing_bracket = authority.find("]")
+        if closing_bracket < 0:
+            raise TestResourceConfigurationError(f"{label} has a malformed IPv6 host.")
+        port_suffix = authority[closing_bracket + 1 :]
+        if port_suffix and not port_suffix.startswith(":"):
+            raise TestResourceConfigurationError(f"{label} has a malformed port.")
+        if port_suffix == ":" or (
+            port_suffix.startswith(":") and not port_suffix[1:].isdigit()
+        ):
+            raise TestResourceConfigurationError(f"{label} has a malformed port.")
+    else:
+        if authority.count(":") > 1:
+            raise TestResourceConfigurationError(
+                f"{label} must bracket an IPv6 host or use one host only."
+            )
+        if ":" in authority:
+            host_part, port_text = authority.rsplit(":", 1)
+            if not host_part or not port_text or not port_text.isdigit():
+                raise TestResourceConfigurationError(f"{label} has a malformed port.")
+    if "%" in hostname:
+        raise TestResourceConfigurationError(
+            f"{label} must not contain an IPv6 zone or encoded hostname."
+        )
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError as exc:
@@ -304,6 +347,7 @@ def validate_test_resource_configuration(
         label="PLATFORM_REDIS_URL",
         schemes=frozenset({"redis", "rediss"}),
         expected_path="/15",
+        allow_userinfo=False,
     )
     return TestResourceConfiguration(
         environment=environment,

@@ -167,6 +167,11 @@ test-resource validator requires application Redis DB15, broker DB13 and
 result DB14 on loopback; these are namespace conventions only, not a Redis
 security boundary. The worker subprocess has a bounded readiness/roundtrip
 window and is always TERM/KILL/reaped with exact temporary-state cleanup.
+Pull-request evidence for this contour is attributed to the workflow's tested
+merge-candidate SHA (the PR merge run), not to the source-head SHA. Exact
+source identity remains enforced by the existing checkout/tree/digest
+contracts and the trusted `dev` release-runtime path; this contour does not
+weaken the GitHub checkout or replace that source verification.
 
 Ownership is deliberately split:
 
