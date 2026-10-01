@@ -981,6 +981,59 @@ def _cleanup_roundtrip_resources(
     return errors
 
 
+def _sanitize_cleanup_note(value: object, *, limit: int = 512) -> str:
+    """Keep cleanup diagnostics bounded and single-line before attaching them."""
+
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+    if not text:
+        return "<no detail>"
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def _cleanup_exception_note(exc: BaseException) -> str:
+    """Format one cleanup exception without attaching its traceback or object repr."""
+
+    return (
+        "roundtrip cleanup exception: "
+        f"{type(exc).__name__}: {_sanitize_cleanup_note(exc)}"
+    )
+
+
+def _finish_roundtrip_cleanup(
+    cleanup: Callable[[], list[str]],
+    *,
+    primary_exception: BaseException | None,
+) -> None:
+    """Complete cleanup without allowing it to replace a work exception."""
+
+    cleanup_errors: list[str] = []
+    cleanup_exception: BaseException | None = None
+    try:
+        cleanup_errors.extend(cleanup())
+    except BaseException as exc:
+        cleanup_exception = exc
+
+    if cleanup_errors:
+        cleanup_note = "roundtrip cleanup errors: " + "; ".join(
+            _sanitize_cleanup_note(error) for error in cleanup_errors
+        )
+        if primary_exception is not None:
+            primary_exception.add_note(cleanup_note)
+        elif cleanup_exception is not None:
+            cleanup_exception.add_note(cleanup_note)
+        else:
+            raise CleanupFailure(cleanup_note)
+
+    if cleanup_exception is None:
+        return
+    if primary_exception is not None:
+        primary_exception.add_note(_cleanup_exception_note(cleanup_exception))
+        return
+    raise cleanup_exception
+
+
 def _assert_safe_redis_mutation_targets(
     configuration: TestCeleryResourceConfiguration,
 ) -> None:
@@ -1069,7 +1122,6 @@ class PlatformWorkerBrokerRoundtripIntegrationTests(unittest.TestCase):
         broker_allow_prefixes: tuple[bytes, ...] = ()
         result_allow_prefixes: tuple[bytes, ...] = ()
         task_ids: list[str] = []
-        cleanup_errors: list[str] = []
         primary_exception: BaseException | None = None
         watchdog = _ParentDeadlineWatchdog(total_deadline)
         watchdog.start()
@@ -1354,8 +1406,8 @@ class PlatformWorkerBrokerRoundtripIntegrationTests(unittest.TestCase):
             raise
         finally:
             try:
-                cleanup_errors.extend(
-                    _cleanup_roundtrip_resources(
+                _finish_roundtrip_cleanup(
+                    lambda: _cleanup_roundtrip_resources(
                         process=process,
                         log=log,
                         broker_client=broker_client,
@@ -1371,14 +1423,9 @@ class PlatformWorkerBrokerRoundtripIntegrationTests(unittest.TestCase):
                         result_allow_prefixes=result_allow_prefixes,
                         run_root=run_root,
                         deadline=total_deadline,
-                    )
+                    ),
+                    primary_exception=primary_exception,
                 )
-                if cleanup_errors:
-                    if primary_exception is None:
-                        raise CleanupFailure("; ".join(cleanup_errors))
-                    primary_exception.add_note(
-                        "roundtrip cleanup errors: " + "; ".join(cleanup_errors)
-                    )
             finally:
                 watchdog.stop()
 
@@ -2045,30 +2092,124 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
             with self.subTest(fatal_type=fatal_type.__name__):
                 process = _FakeProcess()
                 broker = _MemoryRedis({b"owned"})
+                run_root = Path(tempfile.mkdtemp(prefix="platform-celery-primary-"))
+
+                try:
+                    with patch(
+                        __name__ + "._terminate_worker_process",
+                        side_effect=fatal_type("operator cancellation"),
+                    ):
+                        with self.assertRaises(fatal_type):
+                            _finish_roundtrip_cleanup(
+                                lambda: _cleanup_roundtrip_resources(
+                                    process=process,
+                                    log=_FakeLog(),
+                                    broker_client=broker,
+                                    result_client=None,
+                                    broker_initially_empty=True,
+                                    result_initially_empty=False,
+                                    broker_owned_keys={b"owned"},
+                                    result_owned_keys=set(),
+                                    broker_allow_prefixes=(),
+                                    result_allow_fragments=(),
+                                    run_root=run_root,
+                                    deadline=time.monotonic() + 2,
+                                ),
+                                primary_exception=None,
+                            )
+
+                    self.assertFalse(process.running)
+                    self.assertEqual(broker.keys, set())
+                    self.assertTrue(broker.closed)
+                    self.assertFalse(run_root.exists())
+                finally:
+                    if run_root.exists():
+                        shutil.rmtree(run_root)
+
+    def test_primary_runtime_error_survives_cleanup_keyboard_interrupt(self) -> None:
+        for cleanup_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(cleanup_type=cleanup_type.__name__):
+                primary = RuntimeError("work body failed")
+                process = _FakeProcess()
+                broker = _MemoryRedis({b"owned"})
+                run_root = Path(tempfile.mkdtemp(prefix="platform-celery-primary-"))
 
                 with patch(
                     __name__ + "._terminate_worker_process",
-                    side_effect=fatal_type("operator cancellation"),
+                    side_effect=cleanup_type("cleanup\noperator cancellation"),
                 ):
-                    with self.assertRaises(fatal_type):
-                        _cleanup_roundtrip_resources(
-                            process=process,
-                            log=_FakeLog(),
-                            broker_client=broker,
-                            result_client=None,
-                            broker_initially_empty=True,
-                            result_initially_empty=False,
-                            broker_owned_keys={b"owned"},
-                            result_owned_keys=set(),
-                            broker_allow_prefixes=(),
-                            result_allow_fragments=(),
-                            run_root=None,
-                            deadline=time.monotonic() + 2,
+                    try:
+                        with self.assertRaises(RuntimeError) as raised:
+                            try:
+                                raise primary
+                            except BaseException as caught:
+                                _finish_roundtrip_cleanup(
+                                    lambda: _cleanup_roundtrip_resources(
+                                        process=process,
+                                        log=_FakeLog(),
+                                        broker_client=broker,
+                                        result_client=None,
+                                        broker_initially_empty=True,
+                                        result_initially_empty=False,
+                                        broker_owned_keys={b"owned"},
+                                        result_owned_keys=set(),
+                                        broker_allow_prefixes=(),
+                                        result_allow_fragments=(),
+                                        run_root=run_root,
+                                        deadline=time.monotonic() + 2,
+                                    ),
+                                    primary_exception=caught,
+                                )
+                                raise
+                        self.assertIs(raised.exception, primary)
+                        self.assertEqual(str(raised.exception), "work body failed")
+                        self.assertTrue(
+                            any(cleanup_type.__name__ in note for note in primary.__notes__)
                         )
+                        self.assertTrue(all("\n" not in note for note in primary.__notes__))
+                    finally:
+                        if run_root.exists():
+                            shutil.rmtree(run_root)
 
                 self.assertFalse(process.running)
                 self.assertEqual(broker.keys, set())
                 self.assertTrue(broker.closed)
+                self.assertFalse(run_root.exists())
+
+    def test_primary_exception_gets_sanitized_ordinary_cleanup_note(self) -> None:
+        primary = RuntimeError("work body failed")
+        broker = _MemoryRedis({b"owned"})
+        broker.delete_error = RuntimeError("injected\nredis detail")
+
+        with self.assertRaises(RuntimeError) as raised:
+            try:
+                raise primary
+            except BaseException as caught:
+                _finish_roundtrip_cleanup(
+                    lambda: _cleanup_roundtrip_resources(
+                        process=None,
+                        log=None,
+                        broker_client=broker,
+                        result_client=None,
+                        broker_initially_empty=True,
+                        result_initially_empty=False,
+                        broker_owned_keys={b"owned"},
+                        result_owned_keys=set(),
+                        broker_allow_prefixes=(),
+                        result_allow_fragments=(),
+                        run_root=None,
+                        deadline=time.monotonic() + 2,
+                    ),
+                    primary_exception=caught,
+                )
+                raise
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(str(raised.exception), "work body failed")
+        self.assertTrue(any("Redis cleanup" in note for note in primary.__notes__))
+        self.assertTrue(all("\n" not in note for note in primary.__notes__))
+        self.assertTrue(any("\\n" in note for note in primary.__notes__))
+        self.assertTrue(broker.closed)
 
     def test_cleanup_catches_hung_redis_scan_without_skipping_close(self) -> None:
         broker = _ScanFailureRedis()
