@@ -19,8 +19,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: platform-draft-cloudflare-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
-  cancel-in-progress: true
+  group: platform-draft-cloudflare-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
 
 jobs:
   verify-pr:
@@ -69,11 +69,19 @@ jobs:
     name: Detect Draft release
     if: >-
       ${{
-        github.event_name == 'workflow_dispatch' ||
+        github.repository == 'StrayForest/old_sparky' &&
+        (github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.status == 'completed' &&
          github.event.workflow_run.conclusion == 'success' &&
          github.event.workflow_run.event == 'push' &&
-         github.event.workflow_run.head_branch == 'dev')
+         github.event.workflow_run.head_branch == 'dev' &&
+         github.event.workflow_run.repository.full_name == 'StrayForest/old_sparky' &&
+         github.event.workflow_run.head_repository.full_name == 'StrayForest/old_sparky' &&
+         github.event.workflow_run.workflow_id == 339062797 &&
+         github.event.workflow_run.name == 'Platform security and build' &&
+         github.event.workflow_run.path == '.github/workflows/platform-security.yml' &&
+         github.event.workflow_run.head_sha != ''))
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -85,12 +93,18 @@ jobs:
         id: resolve-target
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          CANONICAL_REPOSITORY: ${{ github.repository }}
           DISPATCH_REF: ${{ github.ref }}
           DISPATCH_SHA: ${{ github.sha }}
           WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           WORKFLOW_TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
+          test -n "$GH_TOKEN"
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$CANONICAL_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_API_URL" = "https://api.github.com"
           case "$GITHUB_EVENT_NAME" in
             workflow_dispatch)
               test "$DISPATCH_REF" = "refs/heads/dev"
@@ -108,6 +122,39 @@ jobs:
               exit 1
               ;;
           esac
+          current_dev_ref="$RUNNER_TEMP/platform-draft-current-dev-ref.json"
+          trap 'rm -f -- "$current_dev_ref"' EXIT
+          curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 10 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/dev" \
+            --output "$current_dev_ref"
+          /usr/bin/python3 - "$current_dev_ref" "$target_sha" "$CANONICAL_REPOSITORY" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          ref_path, target_sha, repository = sys.argv[1:]
+          if repository != "StrayForest/old_sparky":
+              raise SystemExit("canonical repository is invalid")
+          try:
+              payload = json.loads(Path(ref_path).read_text(encoding="utf-8"))
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+              raise SystemExit("current dev ref response is not valid JSON") from exc
+          if not isinstance(payload, dict) or payload.get("ref") != "refs/heads/dev":
+              raise SystemExit("current dev ref response is malformed")
+          obj = payload.get("object")
+          if not isinstance(obj, dict) or obj.get("type") != "commit":
+              raise SystemExit("current dev ref is not an immutable commit")
+          current_sha = obj.get("sha")
+          if not isinstance(current_sha, str) or re.fullmatch(r"[0-9a-f]{40}", current_sha) is None:
+              raise SystemExit("current dev commit SHA is malformed")
+          if current_sha != target_sha:
+              raise SystemExit("target SHA is not current dev")
+          PY
           printf 'target_sha=%s\n' "$target_sha" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -152,7 +199,7 @@ jobs:
 
   build-release:
     name: Build digest-bound Draft bundle without Cloudflare credentials
-    if: ${{ needs.detect-release.outputs.changed == 'true' }}
+    if: ${{ needs.detect-release.result == 'success' && needs.detect-release.outputs.changed == 'true' }}
     needs: [detect-release]
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -304,7 +351,12 @@ jobs:
 
   release:
     name: Publish Draft edge runtime
-    if: ${{ needs.detect-release.outputs.changed == 'true' }}
+    if: >-
+      ${{
+        needs.detect-release.result == 'success' &&
+        needs.detect-release.outputs.changed == 'true' &&
+        needs.build-release.result == 'success'
+      }}
     needs: [detect-release, build-release]
     runs-on: ubuntu-latest
     timeout-minutes: 25

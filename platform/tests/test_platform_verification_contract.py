@@ -9,8 +9,11 @@ import sys
 import unittest
 from pathlib import Path
 import tempfile
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import yaml
 
 from tools.platform_test_catalog import (
     BACKEND_CONTOURS,
@@ -147,6 +150,19 @@ def _write_backend_component_fixture(root: Path) -> None:
             + "\n",
             encoding="utf-8",
         )
+
+
+def _draft_current_dev_parser_script() -> str:
+    workflow = yaml.safe_load(
+        DRAFT_CLOUDFLARE_WORKFLOW.read_text(encoding="utf-8")
+    )
+    resolver = workflow["jobs"]["detect-release"]["steps"][0]
+    run = resolver["run"]
+    marker = (
+        "/usr/bin/python3 - \"$current_dev_ref\" \"$target_sha\" "
+        '\"$CANONICAL_REPOSITORY\" <<\'PY\'\n'
+    )
+    return textwrap.dedent(run.split(marker, 1)[1].split("\nPY", 1)[0])
 
 
 class PlatformVerificationContractTests(unittest.TestCase):
@@ -882,6 +898,230 @@ except lock.VerificationLockError as exc:
         )
         draft_text = DRAFT_CLOUDFLARE_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(draft_cloudflare_workflow_issues(draft_text), [])
+        self.assertEqual(
+            yaml.safe_load(draft_text)["jobs"]["detect-release"]["if"].strip().startswith("${{"),
+            True,
+        )
+        fork_dispatch_repository = draft_text.replace(
+            "github.repository == 'StrayForest/old_sparky'",
+            "github.repository == 'attacker/old_sparky'",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "exact canonical trigger identity expression" in issue
+                for issue in draft_cloudflare_workflow_issues(fork_dispatch_repository)
+            )
+        )
+        branch_or = draft_text.replace(
+            "github.event.workflow_run.event == 'push' &&",
+            "github.event.workflow_run.event == 'push' ||",
+            1,
+        )
+        self.assertIsInstance(yaml.safe_load(branch_or), dict)
+        self.assertTrue(
+            any(
+                "exact canonical trigger identity expression" in issue
+                for issue in draft_cloudflare_workflow_issues(branch_or)
+            )
+        )
+        resolver_or_true = draft_text.replace(
+            'test "$DISPATCH_SHA" = "$GITHUB_SHA"',
+            'test "$DISPATCH_SHA" = "$GITHUB_SHA" || true',
+            1,
+        )
+        self.assertIsInstance(yaml.safe_load(resolver_or_true), dict)
+        self.assertTrue(
+            any(
+                "exact dispatch SHA equality guard" in issue
+                or "hide provenance failures" in issue
+                for issue in draft_cloudflare_workflow_issues(resolver_or_true)
+            )
+        )
+        build_always = draft_text.replace(
+            "if: ${{ needs.detect-release.result == 'success' && needs.detect-release.outputs.changed == 'true' }}",
+            "if: ${{ always() && needs.detect-release.result == 'success' && needs.detect-release.outputs.changed == 'true' }}",
+            1,
+        )
+        self.assertIsInstance(yaml.safe_load(build_always), dict)
+        self.assertTrue(
+            any(
+                "build-release if must require successful" in issue
+                for issue in draft_cloudflare_workflow_issues(build_always)
+            )
+        )
+        release_if = """      ${{
+        needs.detect-release.result == 'success' &&
+        needs.detect-release.outputs.changed == 'true' &&
+        needs.build-release.result == 'success'
+      }}"""
+        release_always = draft_text.replace(
+            release_if,
+            """      ${{
+        always() &&
+        needs.detect-release.result == 'success' &&
+        needs.detect-release.outputs.changed == 'true' &&
+        needs.build-release.result == 'success'
+      }}""",
+            1,
+        )
+        self.assertIsInstance(yaml.safe_load(release_always), dict)
+        self.assertTrue(
+            any(
+                "release if must require successful" in issue
+                for issue in draft_cloudflare_workflow_issues(release_always)
+            )
+        )
+        combined_critical_mutation = release_always.replace(
+            "if: ${{ needs.detect-release.result == 'success' && needs.detect-release.outputs.changed == 'true' }}",
+            "if: ${{ always() && needs.detect-release.result == 'success' && needs.detect-release.outputs.changed == 'true' }}",
+            1,
+        ).replace(
+            "github.event.workflow_run.event == 'push' &&",
+            "github.event.workflow_run.event == 'push' ||",
+            1,
+        ).replace(
+            'test "$DISPATCH_SHA" = "$GITHUB_SHA"',
+            'test "$DISPATCH_SHA" = "$GITHUB_SHA" || true',
+            1,
+        )
+        self.assertIsInstance(yaml.safe_load(combined_critical_mutation), dict)
+        combined_issues = draft_cloudflare_workflow_issues(combined_critical_mutation)
+        self.assertTrue(any("exact canonical trigger identity expression" in issue for issue in combined_issues))
+        self.assertTrue(any("build-release if must require successful" in issue for issue in combined_issues))
+        self.assertTrue(any("release if must require successful" in issue for issue in combined_issues))
+        self.assertTrue(any("exact dispatch SHA equality guard" in issue for issue in combined_issues))
+        missing_current_dev_equality = draft_text.replace(
+            "if current_sha != target_sha:",
+            "if False:",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "current dev SHA equality" in issue
+                for issue in draft_cloudflare_workflow_issues(missing_current_dev_equality)
+            )
+        )
+        malformed_api_failure = draft_text.replace(
+            "--fail-with-body --silent --show-error",
+            "--silent --show-error",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "fail-closed GitHub ref request" in issue
+                for issue in draft_cloudflare_workflow_issues(malformed_api_failure)
+            )
+        )
+        unbounded_api = draft_text.replace(
+            "--connect-timeout 5 --max-time 10",
+            "--connect-timeout 5",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "bounded GitHub ref total timeout" in issue
+                for issue in draft_cloudflare_workflow_issues(unbounded_api)
+            )
+        )
+        retried_api = draft_text.replace(
+            "--connect-timeout 5 --max-time 10",
+            "--connect-timeout 5 --max-time 10 --retry 2",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "must not retry an unsafe provenance read" in issue
+                for issue in draft_cloudflare_workflow_issues(retried_api)
+            )
+        )
+        hidden_api_failure = draft_text.replace(
+            '--output "$current_dev_ref"',
+            '--output "$current_dev_ref" || true',
+            1,
+        )
+        self.assertTrue(
+            any(
+                "hide provenance failures" in issue
+                for issue in draft_cloudflare_workflow_issues(hidden_api_failure)
+            )
+        )
+        missing_api_parse = draft_text.replace(
+            'payload.get("ref") != "refs/heads/dev"',
+            'payload.get("ref") != "refs/heads/main"',
+            1,
+        )
+        self.assertTrue(
+            any(
+                "parsed dev ref identity" in issue
+                for issue in draft_cloudflare_workflow_issues(missing_api_parse)
+            )
+        )
+        parser = _draft_current_dev_parser_script()
+        with tempfile.TemporaryDirectory() as directory:
+            ref_path = Path(directory) / "dev.json"
+            target_sha = "a" * 40
+            ref_path.write_text(
+                json.dumps(
+                    {
+                        "ref": "refs/heads/dev",
+                        "object": {"type": "commit", "sha": target_sha},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            valid_api = subprocess.run(
+                [sys.executable, "-", str(ref_path), target_sha, "StrayForest/old_sparky"],
+                input=parser,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(valid_api.returncode, 0, valid_api.stderr)
+            stale_api = json.loads(ref_path.read_text(encoding="utf-8"))
+            stale_api["object"]["sha"] = "b" * 40
+            ref_path.write_text(json.dumps(stale_api), encoding="utf-8")
+            stale_result = subprocess.run(
+                [sys.executable, "-", str(ref_path), target_sha, "StrayForest/old_sparky"],
+                input=parser,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(stale_result.returncode, 0)
+            self.assertIn("target SHA is not current dev", stale_result.stderr)
+            ref_path.write_text("{malformed", encoding="utf-8")
+            malformed_result = subprocess.run(
+                [sys.executable, "-", str(ref_path), target_sha, "StrayForest/old_sparky"],
+                input=parser,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(malformed_result.returncode, 0)
+            self.assertIn("not valid JSON", malformed_result.stderr)
+        split_draft_concurrency = draft_text.replace(
+            "group: platform-draft-cloudflare-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}",
+            "group: platform-draft-cloudflare-${{ github.ref }}",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "immutable target SHA" in issue
+                for issue in draft_cloudflare_workflow_issues(split_draft_concurrency)
+            )
+        )
+        cancelling_draft_concurrency = draft_text.replace(
+            "cancel-in-progress: false",
+            "cancel-in-progress: true",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "must not cancel" in issue
+                for issue in draft_cloudflare_workflow_issues(cancelling_draft_concurrency)
+            )
+        )
         missing_draft_timeout = draft_text.replace(
             "    timeout-minutes: 20\n",
             "",
@@ -915,6 +1155,73 @@ except lock.VerificationLockError as exc:
                 for issue in draft_cloudflare_workflow_issues(non_dev_dispatch)
             )
         )
+        identity_mutations = (
+            (
+                "github.event.workflow_run.status == 'completed'",
+                "github.event.workflow_run.status == 'queued'",
+                "completed workflow_run guard",
+            ),
+            (
+                "github.event.workflow_run.event == 'push'",
+                "github.event.workflow_run.event == 'workflow_dispatch'",
+                "workflow_run push guard",
+            ),
+            (
+                "github.event.workflow_run.head_branch == 'dev'",
+                "github.event.workflow_run.head_branch == 'main'",
+                "workflow_run dev branch guard",
+            ),
+            (
+                "github.event.workflow_run.repository.full_name == 'StrayForest/old_sparky'",
+                "github.event.workflow_run.repository.full_name == 'attacker/old_sparky'",
+                "canonical workflow_run repository guard",
+            ),
+            (
+                "github.event.workflow_run.head_repository.full_name == 'StrayForest/old_sparky'",
+                "github.event.workflow_run.head_repository.full_name == 'attacker/old_sparky'",
+                "canonical workflow_run head repository guard",
+            ),
+            (
+                "github.event.workflow_run.workflow_id == 339062797",
+                "github.event.workflow_run.workflow_id == 339062798",
+                "canonical source workflow id guard",
+            ),
+            (
+                "github.event.workflow_run.name == 'Platform security and build'",
+                "github.event.workflow_run.name == 'Attacker workflow'",
+                "canonical source workflow name guard",
+            ),
+            (
+                "github.event.workflow_run.path == '.github/workflows/platform-security.yml'",
+                "github.event.workflow_run.path == '.github/workflows/attacker.yml'",
+                "canonical source workflow path guard",
+            ),
+            (
+                "github.event.workflow_run.head_sha != ''",
+                "github.event.workflow_run.head_sha == ''",
+                "workflow_run SHA presence guard",
+            ),
+        )
+        for original, replacement, description in identity_mutations:
+            with self.subTest(identity=description):
+                mutated_identity = draft_text.replace(original, replacement, 1)
+                self.assertTrue(
+                    any(
+                        "exact canonical trigger identity expression" in issue
+                        for issue in draft_cloudflare_workflow_issues(mutated_identity)
+                    )
+                )
+        name_only_identity = draft_text
+        for original, _, description in identity_mutations:
+            if description == "canonical source workflow name guard":
+                continue
+            name_only_identity = name_only_identity.replace(original, "true", 1)
+        self.assertTrue(
+            any(
+                "exact canonical trigger identity expression" in issue
+                for issue in draft_cloudflare_workflow_issues(name_only_identity)
+            )
+        )
         unbounded_draft_curl = draft_text.replace(
             "--connect-timeout 5",
             "",
@@ -923,6 +1230,7 @@ except lock.VerificationLockError as exc:
         self.assertTrue(
             any(
                 "--connect-timeout 5" in issue
+                or "bounded GitHub ref connect timeout" in issue
                 for issue in draft_cloudflare_workflow_issues(unbounded_draft_curl)
             )
         )
