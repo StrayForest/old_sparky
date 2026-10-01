@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-import os
 from pathlib import Path
 import re
 import stat
@@ -36,8 +35,6 @@ from tools.platform_workflow_provenance import ProvenanceError, validate_securit
 from tools.platform_security_status import (
     FAIL_DESCRIPTION,
     REPOSITORY,
-    SECURITY_WORKFLOW_NAME,
-    SECURITY_WORKFLOW_PATH,
     ReconcilerError,
     complete_workflow_run_keys,
     evaluate_status,
