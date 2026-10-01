@@ -144,6 +144,28 @@ _FAIL_HIDING_EXEC_DIRECTIVES = frozenset(
     {"ExecStart", "ExecStartPre", "ExecStartPost", "ExecCondition"}
 )
 
+
+def _has_ignored_exec_prefix(value: str) -> bool:
+    """Return whether a command line uses systemd's failure-ignoring prefix.
+
+    systemd accepts ``@``, ``:``, ``-`` and one of ``+``, ``!`` or ``!!`` in
+    any order before the executable.  Checking only ``value.startswith('-')``
+    therefore misses valid combinations such as ``+-/bin/true`` and
+    ``@-/bin/true``.  Stop at the first non-prefix character so a hyphen in an
+    executable name or argument is not treated as an ignored-status marker.
+    """
+
+    prefix_end = 0
+    while prefix_end < len(value):
+        if value.startswith("!!", prefix_end):
+            prefix_end += 2
+            continue
+        if value[prefix_end] in "@-:!+":
+            prefix_end += 1
+            continue
+        break
+    return "-" in value[:prefix_end]
+
 # A oneshot is an operational boundary: adding a new directive can change
 # whether a failed maintenance/backup run is visible or silently retried.  An
 # exact allow-list keeps that policy reviewable and makes accidental unit-file
@@ -501,7 +523,7 @@ def validate_failure_policy(units: Mapping[str, UnitFile]) -> None:
             )
         for key in _FAIL_HIDING_EXEC_DIRECTIVES:
             values = service.values("Service", key)
-            if any(value.startswith("-") for value in values):
+            if any(_has_ignored_exec_prefix(value) for value in values):
                 raise SystemdContractError(
                     f"{service_name}: {key} must fail closed (ignored '-' prefix forbidden)"
                 )
@@ -520,7 +542,7 @@ def validate_failure_policy(units: Mapping[str, UnitFile]) -> None:
                 f"{sorted(unexpected)!r}"
             )
         exec_values = service.values("Service", "ExecStart")
-        if not exec_values or any(value.startswith("-") for value in exec_values):
+        if not exec_values or any(_has_ignored_exec_prefix(value) for value in exec_values):
             raise SystemdContractError(
                 f"{service_name}: oneshot ExecStart must fail closed"
             )

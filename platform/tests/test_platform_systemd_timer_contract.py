@@ -313,6 +313,53 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             with self.assertRaisesRegex(contract.SystemdContractError, "hard-link"):
                 contract.load_units(root)
 
+    def test_parser_rejects_owner_group_and_mode_drift(self) -> None:
+        mutations = (
+            ("mode", lambda path: path.chmod(0o600), "mode"),
+            ("owner", lambda path: os.chown(path, 1, -1), "ownership"),
+            ("group", lambda path: os.chown(path, -1, 1), "ownership"),
+        )
+        for label, mutate, message in mutations:
+            with self.subTest(metadata=label):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                        shutil.copy2(source, root / source.name)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                        shutil.copy2(source, root / source.name)
+                    mutate(root / "deadlock-maintenance.timer")
+                    with self.assertRaisesRegex(contract.SystemdContractError, message):
+                        contract.load_units(root)
+
+    def test_parser_rejects_replacement_after_open_before_final_lstat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                shutil.copy2(source, root / source.name)
+            for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                shutil.copy2(source, root / source.name)
+
+            target = root / "deadlock-maintenance.timer"
+            outside = root.parent / "outside.timer"
+            outside.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+            original_open = contract.os.open
+            replacement_done = False
+
+            def replace_after_open(*args: object, **kwargs: object) -> int:
+                nonlocal replacement_done
+                descriptor = original_open(*args, **kwargs)
+                if Path(args[0]) == target and not replacement_done:
+                    replacement_done = True
+                    target.unlink()
+                    target.symlink_to(outside)
+                return descriptor
+
+            with mock.patch.object(contract.os, "open", side_effect=replace_after_open):
+                with self.assertRaisesRegex(
+                    contract.SystemdContractError, "changed|symlink|hard-linked"
+                ):
+                    contract.load_units(root)
+
     def test_failure_contract_rejects_oneshot_failure_hiding_mutations(self) -> None:
         mutations = (
             (
@@ -322,6 +369,18 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
             (
                 "ExecStartPost=-/bin/true\n",
                 "fail closed",
+            ),
+            (
+                "ExecStartPre=-/bin/true\n",
+                "fail closed",
+            ),
+            (
+                "ExecCondition=-/bin/true\n",
+                "fail closed",
+            ),
+            (
+                "ConditionPathIsSymbolicLink=-/tmp/not-current\n",
+                "must not hide a failure",
             ),
             (
                 "Restart=on-failure\nRestartSec=5\n",
@@ -342,6 +401,28 @@ class PlatformSystemdTimerContractTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     with self.assertRaisesRegex(contract.SystemdContractError, message):
+                        contract.validate_all(root)
+
+    def test_failure_contract_rejects_combined_ignored_exec_prefixes(self) -> None:
+        # systemd accepts these command-prefix combinations in any order;
+        # every one still makes a non-zero command status non-fatal.
+        for prefix in ("+-", "@-", ":-", "!-", "!!-"):
+            with self.subTest(prefix=prefix):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.service"):
+                        shutil.copy2(source, root / source.name)
+                    for source in SYSTEMD_ROOT.glob("deadlock-*.timer"):
+                        shutil.copy2(source, root / source.name)
+                    service = root / "deadlock-maintenance.service"
+                    text = service.read_text(encoding="utf-8")
+                    text = text.replace(
+                        "ExecStart=/opt/oldsparky/platform/shared/venv/bin/python",
+                        f"ExecStart={prefix}/bin/true",
+                        1,
+                    )
+                    service.write_text(text, encoding="utf-8")
+                    with self.assertRaisesRegex(contract.SystemdContractError, "fail closed"):
                         contract.validate_all(root)
 
     def test_installers_have_closed_enable_sets_and_offsite_is_not_enabled(self) -> None:
