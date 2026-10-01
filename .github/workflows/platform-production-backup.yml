@@ -121,6 +121,7 @@ jobs:
 
           if ! "$python_bin" "$maintenance_tool" maintenance \
             --app-dir "$runtime" \
+            --source-release-dir "$runtime/dist/releases" \
             --backup-keep 14 \
             --backup-max-age-hours 24 \
             --backup-only \

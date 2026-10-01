@@ -75,7 +75,7 @@ except ImportError:  # Direct execution from the tools directory.
 
 
 DEFAULT_APP_DIR = Path("/opt/oldsparky/platform")
-DEFAULT_SOURCE_RELEASE_DIR = Path("/root/old_sparky/platform/dist/releases")
+DEFAULT_SOURCE_RELEASE_DIR = Path("/opt/oldsparky/platform/dist/releases")
 DEFAULT_WEB_ARTIFACT_DIR = Path("/root/old_sparky/platform/apps/platform_web")
 BACKUP_ONLY_KEEP = 14
 SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
@@ -713,6 +713,14 @@ def run_maintenance(
 ) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     app_dir = args.app_dir.resolve(strict=True)
+    if args.apply:
+        source_candidate = Path(args.source_release_dir)
+        if (
+            not source_candidate.exists()
+            or not source_candidate.is_dir()
+            or source_candidate.is_symlink()
+        ):
+            raise RuntimeError("canonical source release contour is unavailable")
     disk_before_snapshot = disk_snapshot_for_path(Path("/"))
 
     if args.apply and _locks_held:

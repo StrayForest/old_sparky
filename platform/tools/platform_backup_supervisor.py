@@ -32,7 +32,9 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import stat
+import sys
 import tempfile
 from types import SimpleNamespace
 from typing import Any, Iterator, Mapping
@@ -40,6 +42,12 @@ from uuid import uuid4
 
 
 BACKUP_LOCK_PATH = Path("/run/lock/oldsparky-platform-backup.lock")
+# This is a Linux abstract-namespace socket name, deliberately not derived
+# from the lock filename.  The socket is held for the complete operation and
+# is released by the kernel when the owning process exits.  Keeping this
+# boundary outside the filesystem closes the inode-replacement hole in a
+# pathname-only flock scheme.
+_BACKUP_SINGLETON_NAME = b"\0oldsparky-platform-backup-v1"
 LOCK_ROOT = Path("/run/lock")
 BACKUP_EVIDENCE_DIRNAME = "backup-evidence"
 EVIDENCE_SCHEMA = 1
@@ -207,18 +215,51 @@ def _open_lock_parent(root: Path) -> tuple[int, os.stat_result]:
     return descriptor, opened
 
 
-def _lock_path_for(path: Path | None) -> tuple[Path, Path]:
-    target = BACKUP_LOCK_PATH if path is None else Path(path)
-    # Production callers cannot redirect the operation lock.  A test may
-    # replace the module constant or pass a test pathname explicitly; the
-    # canonical production default is always the fixed root path.
-    if not target.is_absolute() or target.name != BACKUP_LOCK_PATH.name:
+def _lock_path_for(path: Path, *, allow_test_path: bool = False) -> tuple[Path, Path]:
+    target = Path(path)
+    if (not allow_test_path and target != BACKUP_LOCK_PATH) or (
+        allow_test_path
+        and (not target.is_absolute() or target.name != BACKUP_LOCK_PATH.name)
+    ):
         raise BackupLockError("backup lock pathname is not canonical")
     return target, target.parent
 
 
+def _bind_backup_singleton(name: bytes = _BACKUP_SINGLETON_NAME) -> socket.socket:
+    """Bind the fixed kernel singleton before opening the filesystem lock.
+
+    ``name`` is private-test dependency injection only.  Production callers
+    use the module constant and have no path/socket-name selection API.
+    """
+
+    if not name.startswith(b"\0") or name != _BACKUP_SINGLETON_NAME:
+        # The test backend below passes an explicitly generated private name;
+        # production can never redirect this boundary accidentally.
+        if not name.startswith(b"\0oldsparky-platform-backup-test-"):
+            raise BackupLockError("backup singleton name is not canonical")
+    try:
+        singleton = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        singleton.bind(name)
+        singleton.listen(1)
+        return singleton
+    except OSError as exc:
+        try:
+            singleton.close()
+        except (UnboundLocalError, OSError):
+            pass
+        if exc.errno in {errno.EADDRINUSE, errno.EAGAIN}:
+            raise BackupLockConflict(
+                "another backup operation owns the kernel singleton"
+            ) from exc
+        raise BackupLockError("backup kernel singleton could not be acquired") from exc
+
+
 @contextmanager
-def exclusive_backup_lock(path: Path | None = None) -> Iterator[BackupLockHandle]:
+def _exclusive_backup_lock_backend(
+    lock_path: Path,
+    *,
+    singleton_name: bytes,
+) -> Iterator[BackupLockHandle]:
     """Acquire the root-owned canonical lock without waiting or trusting mtime.
 
     ``flock(2)`` is non-blocking by design.  A stale filename is harmless: the
@@ -227,8 +268,15 @@ def exclusive_backup_lock(path: Path | None = None) -> Iterator[BackupLockHandle
     identity checks before and after the operation.
     """
 
-    lock_path, lock_root = _lock_path_for(path)
-    parent_fd, _ = _open_lock_parent(lock_root)
+    lock_path, lock_root = _lock_path_for(
+        lock_path, allow_test_path=singleton_name != _BACKUP_SINGLETON_NAME
+    )
+    singleton = _bind_backup_singleton(singleton_name)
+    try:
+        parent_fd, _ = _open_lock_parent(lock_root)
+    except BaseException:
+        singleton.close()
+        raise
     descriptor: int | None = None
     handle: BackupLockHandle | None = None
     try:
@@ -267,14 +315,42 @@ def exclusive_backup_lock(path: Path | None = None) -> Iterator[BackupLockHandle
         handle.validate()
         yield handle
     finally:
-        if handle is not None:
-            handle.close()
-        elif descriptor is not None:
+        try:
+            if handle is not None:
+                handle.close()
+            elif descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        finally:
             try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        os.close(parent_fd)
+                os.close(parent_fd)
+            finally:
+                singleton.close()
+
+
+@contextmanager
+def exclusive_backup_lock() -> Iterator[BackupLockHandle]:
+    """Acquire the fixed root-owned lock and fixed kernel singleton."""
+
+    with _exclusive_backup_lock_backend(
+        BACKUP_LOCK_PATH, singleton_name=_BACKUP_SINGLETON_NAME
+    ) as handle:
+        yield handle
+
+
+@contextmanager
+def _exclusive_backup_lock_for_test(
+    path: Path,
+    *,
+    singleton_name: bytes | None = None,
+) -> Iterator[BackupLockHandle]:
+    """Private dependency-injected backend used only by lock unit tests."""
+
+    name = singleton_name or (b"\0oldsparky-platform-backup-test-" + uuid4().hex.encode())
+    with _exclusive_backup_lock_backend(Path(path), singleton_name=name) as handle:
+        yield handle
 
 
 def operation_lock_requirements(operation: str) -> tuple[str, ...]:
@@ -347,6 +423,254 @@ class BackupPairSnapshot:
     manifest_sha256: str
     size_bytes: int
     run_id: str
+
+
+def _pair_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _validate_pair_stat(metadata: os.stat_result, *, label: str) -> None:
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise BackupSupervisorError(f"{label} metadata is unsafe")
+
+
+def _read_held_fd(descriptor: int, *, label: str) -> tuple[bytes, os.stat_result]:
+    try:
+        before = os.fstat(descriptor)
+        _validate_pair_stat(before, label=label)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise BackupSupervisorError(f"{label} could not be read") from exc
+    if _pair_identity(after) != _pair_identity(before):
+        raise BackupSupervisorError(f"{label} changed while it was read")
+    return b"".join(chunks), after
+
+
+def _hash_held_fd(descriptor: int, *, label: str) -> tuple[str, os.stat_result]:
+    try:
+        before = os.fstat(descriptor)
+        _validate_pair_stat(before, label=label)
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(
+                descriptor, min(1024 * 1024, before.st_size - offset), offset
+            )
+            if not chunk:
+                break
+            digest.update(chunk)
+            offset += len(chunk)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise BackupSupervisorError(f"{label} could not be hashed") from exc
+    if offset != before.st_size or _pair_identity(after) != _pair_identity(before):
+        raise BackupSupervisorError(f"{label} changed while it was hashed")
+    return digest.hexdigest(), after
+
+
+@dataclass(slots=True)
+class HeldBackupPair:
+    """An exact pair held by descriptors for the complete consumer transaction."""
+
+    dump_path: Path
+    manifest_path: Path
+    dump_fd: int
+    manifest_fd: int
+    dump_identity: tuple[int, int, int, int, int]
+    manifest_identity: tuple[int, int, int, int, int]
+    dump_sha256: str
+    manifest_sha256: str
+    manifest_bytes: bytes
+    run_id: str
+    _closed: bool = False
+
+    @property
+    def snapshot(self) -> BackupPairSnapshot:
+        return BackupPairSnapshot(
+            dump_name=self.dump_path.name,
+            manifest_name=self.manifest_path.name,
+            dump_identity=self.dump_identity,
+            manifest_identity=self.manifest_identity,
+            dump_sha256=self.dump_sha256,
+            manifest_sha256=self.manifest_sha256,
+            size_bytes=self.dump_identity[3],
+            run_id=self.run_id,
+        )
+
+    def _validate_one(
+        self,
+        path: Path,
+        descriptor: int,
+        identity: tuple[int, int, int, int, int],
+        digest: str,
+        *,
+        label: str,
+    ) -> None:
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = path.lstat()
+        except OSError as exc:
+            raise BackupSupervisorError(f"{label} identity was lost") from exc
+        _validate_pair_stat(descriptor_stat, label=label)
+        _validate_pair_stat(path_stat, label=label)
+        if _pair_identity(descriptor_stat) != identity or _pair_identity(path_stat) != identity:
+            raise BackupSupervisorError(f"{label} was replaced while held")
+        current_digest, after = _hash_held_fd(descriptor, label=label)
+        if current_digest != digest or _pair_identity(after) != identity:
+            raise BackupSupervisorError(f"{label} bytes changed while held")
+        try:
+            final_path_stat = path.lstat()
+        except OSError as exc:
+            raise BackupSupervisorError(f"{label} disappeared while held") from exc
+        _validate_pair_stat(final_path_stat, label=label)
+        if _pair_identity(final_path_stat) != identity:
+            raise BackupSupervisorError(f"{label} pathname changed while held")
+
+    def validate(self) -> None:
+        if self._closed:
+            raise BackupSupervisorError("backup pair descriptors are closed")
+        self._validate_one(
+            self.dump_path,
+            self.dump_fd,
+            self.dump_identity,
+            self.dump_sha256,
+            label="backup dump",
+        )
+        self._validate_one(
+            self.manifest_path,
+            self.manifest_fd,
+            self.manifest_identity,
+            self.manifest_sha256,
+            label="backup manifest",
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        failure: BaseException | None = None
+        try:
+            self.validate()
+        except BaseException as exc:
+            failure = exc
+        for descriptor in (self.dump_fd, self.manifest_fd):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self._closed = True
+        if failure is not None:
+            raise failure
+
+
+@contextmanager
+def held_backup_pair(
+    dump_path: Path,
+    manifest_path: Path | None = None,
+) -> Iterator[HeldBackupPair]:
+    """Open and pin both pair members with ``O_NOFOLLOW`` until exit."""
+
+    dump_path = Path(dump_path)
+    manifest_path = dump_path.with_suffix(".json") if manifest_path is None else Path(manifest_path)
+    if dump_path.parent.resolve(strict=True) != manifest_path.parent.resolve(strict=True):
+        raise BackupSupervisorError("backup dump and manifest are not siblings")
+    if manifest_path.with_suffix(".dump").name != dump_path.name:
+        raise BackupSupervisorError("backup dump and manifest names do not match")
+    descriptors: list[int] = []
+    pair: HeldBackupPair | None = None
+    try:
+        opened: list[tuple[Path, str, int, os.stat_result, bytes | None]] = []
+        for path, label, read_bytes in (
+            (dump_path, "backup dump", False),
+            (manifest_path, "backup manifest", True),
+        ):
+            try:
+                path_stat = path.lstat()
+                _validate_pair_stat(path_stat, label=label)
+                descriptor = os.open(
+                    path,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                )
+                descriptors.append(descriptor)
+                opened_stat = os.fstat(descriptor)
+                _validate_pair_stat(opened_stat, label=label)
+                if _pair_identity(opened_stat) != _pair_identity(path_stat):
+                    raise BackupSupervisorError(f"{label} changed while opening")
+                raw: bytes | None = None
+                if read_bytes:
+                    raw, opened_stat = _read_held_fd(descriptor, label=label)
+                opened.append((path, label, descriptor, opened_stat, raw))
+            except OSError as exc:
+                raise BackupSupervisorError(f"{label} could not be opened") from exc
+        dump, manifest = opened
+        dump_sha, dump_stat = _hash_held_fd(dump[2], label="backup dump")
+        manifest_sha, manifest_stat = _hash_held_fd(manifest[2], label="backup manifest")
+        manifest_module = _manifest_module()
+        try:
+            parsed = manifest_module.parse_manifest_bytes(
+                manifest[4] or b"", expected_dump_file=dump_path.name
+            )
+        except Exception as exc:
+            raise BackupSupervisorError("backup manifest is invalid") from exc
+        if (
+            not parsed.restore_verified
+            or not parsed.alembic_revision_verified
+            or parsed.sha256 != dump_sha
+            or parsed.size_bytes != dump_stat.st_size
+        ):
+            raise BackupSupervisorError("backup dump/manifest pair is not restore-verified")
+        run_id = str(parsed.run_id)
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise BackupSupervisorError("backup manifest run identity is invalid")
+        pair = HeldBackupPair(
+            dump_path=dump_path,
+            manifest_path=manifest_path,
+            dump_fd=dump[2],
+            manifest_fd=manifest[2],
+            dump_identity=_pair_identity(dump_stat),
+            manifest_identity=_pair_identity(manifest_stat),
+            dump_sha256=dump_sha,
+            manifest_sha256=manifest_sha,
+            manifest_bytes=manifest[4] or b"",
+            run_id=run_id,
+        )
+        pair.validate()
+        yield pair
+    finally:
+        if pair is not None:
+            active_exception = sys.exc_info()[1]
+            try:
+                pair.close()
+            except BackupSupervisorError:
+                if active_exception is None:
+                    raise
+        else:
+            for descriptor in descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def _private_file_snapshot(path: Path, *, label: str) -> tuple[os.stat_result, str]:
@@ -427,59 +751,8 @@ def snapshot_backup_pair(
 ) -> BackupPairSnapshot:
     """Read and hash an exact dump/manifest pair with identity pinning."""
 
-    dump_path = Path(dump_path)
-    manifest_path = dump_path.with_suffix(".json") if manifest_path is None else Path(manifest_path)
-    if dump_path.parent.resolve(strict=True) != manifest_path.parent.resolve(strict=True):
-        raise BackupSupervisorError("backup dump and manifest are not siblings")
-    if manifest_path.with_suffix(".dump").name != dump_path.name:
-        raise BackupSupervisorError("backup dump and manifest names do not match")
-    dump_stat, dump_sha = _private_file_snapshot(dump_path, label="backup dump")
-    manifest_stat, manifest_sha = _private_file_snapshot(
-        manifest_path, label="backup manifest"
-    )
-    manifest_module = _manifest_module()
-    try:
-        manifest_file = manifest_module.read_manifest_file(
-            manifest_path,
-            expected_owner=os.geteuid(),
-            expected_group=os.getegid(),
-            expected_dump_file=dump_path.name,
-        )
-    except Exception as exc:
-        raise BackupSupervisorError("backup manifest is invalid") from exc
-    manifest = manifest_file.manifest
-    if (
-        not manifest.restore_verified
-        or not manifest.alembic_revision_verified
-        or manifest.sha256 != dump_sha
-        or manifest.size_bytes != dump_stat.st_size
-    ):
-        raise BackupSupervisorError("backup dump/manifest pair is not restore-verified")
-    run_id = str(manifest.run_id)
-    if not RUN_ID_RE.fullmatch(run_id):
-        raise BackupSupervisorError("backup manifest run identity is invalid")
-    return BackupPairSnapshot(
-        dump_name=dump_path.name,
-        manifest_name=manifest_path.name,
-        dump_identity=(
-            dump_stat.st_dev,
-            dump_stat.st_ino,
-            dump_stat.st_nlink,
-            dump_stat.st_size,
-            dump_stat.st_mtime_ns,
-        ),
-        manifest_identity=(
-            manifest_stat.st_dev,
-            manifest_stat.st_ino,
-            manifest_stat.st_nlink,
-            manifest_stat.st_size,
-            manifest_stat.st_mtime_ns,
-        ),
-        dump_sha256=dump_sha,
-        manifest_sha256=manifest_sha,
-        size_bytes=dump_stat.st_size,
-        run_id=run_id,
-    )
+    with held_backup_pair(dump_path, manifest_path) as pair:
+        return pair.snapshot
 
 
 def assert_backup_pair_unchanged(
@@ -628,6 +901,8 @@ def validate_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     _validate_public_text(alembic["revision"], pattern=REVISION_RE, label="Alembic revision")
     if type(alembic["verified"]) is not bool:
         raise BackupEvidenceError("backup evidence Alembic state is invalid")
+    if alembic["verified"] and alembic["revision"] == "unknown":
+        raise BackupEvidenceError("verified backup evidence must bind an Alembic head")
     locks = _validate_section_keys(payload, "locks")
     for key in ("required", "acquired", "order"):
         if not isinstance(locks[key], list) or any(
@@ -711,10 +986,51 @@ def _write_private_new(path: Path, payload: bytes) -> None:
 
 def _atomic_replace_private(path: Path, payload: bytes) -> None:
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    replaced = False
     try:
         _write_private_new(temporary, payload)
         os.replace(temporary, path)
+        replaced = True
         _sync_directory(path.parent)
+    except BaseException:
+        # If the directory fsync failed after rename, a green final record is
+        # not trustworthy.  Remove this publication; the caller retains an
+        # in-progress unknown record as the durable non-green state.
+        if replaced:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            try:
+                _sync_directory(path.parent)
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _publish_unknown_inprogress(path: Path, payload: Mapping[str, Any]) -> None:
+    """Best-effort unknown receipt update that never removes the target."""
+
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    encoded = (json.dumps(payload, sort_keys=True) + "\n").encode()
+    try:
+        _write_private_new(temporary, encoded)
+        os.replace(temporary, path)
+        try:
+            _sync_directory(path.parent)
+        except OSError:
+            # The target is intentionally retained.  Readers already treat
+            # any in-progress record as unknown even if this sync is lost.
+            pass
+    except (OSError, BackupEvidenceError):
+        # Keep the pre-existing in-progress record if the replacement could
+        # not be completed.  It is still interpreted as unknown by readers.
+        pass
     finally:
         try:
             temporary.unlink()
@@ -731,6 +1047,10 @@ def _evidence_basename(operation_id: str, *, inprogress: bool) -> str:
 
 
 def _load_evidence(path: Path) -> dict[str, Any]:
+    if path.name.endswith(".json") and not path.name.endswith(".json.inprogress"):
+        inprogress = tuple(path.parent.glob("platform-backup-*.json.inprogress"))
+        if inprogress:
+            raise BackupEvidenceError("final backup evidence is shadowed by in-progress work")
     try:
         metadata = path.lstat()
         if (
@@ -766,6 +1086,7 @@ def recover_inprogress_evidence(app_dir: Path) -> tuple[Path, ...]:
         payload["completed_at_utc"] = _utc_now()
         payload["error_class"] = "interrupted_evidence"
         final = path.with_name(path.name.removesuffix(".inprogress"))
+        _publish_unknown_inprogress(path, payload)
         _atomic_replace_private(final, (json.dumps(payload, sort_keys=True) + "\n").encode())
         try:
             path.unlink()
@@ -887,11 +1208,34 @@ class EvidenceSession:
         validate_evidence(self.payload)
         directory = self.path.parent
         final = directory / _evidence_basename(self.operation_id, inprogress=False)
-        _atomic_replace_private(final, (json.dumps(self.payload, sort_keys=True) + "\n").encode())
+        try:
+            _atomic_replace_private(
+                final, (json.dumps(self.payload, sort_keys=True) + "\n").encode()
+            )
+        except BaseException as exc:
+            unknown = dict(self.payload)
+            unknown["status"] = "unknown"
+            unknown["completed_at_utc"] = _utc_now()
+            unknown["error_class"] = "evidence_publish_failed"
+            _publish_unknown_inprogress(self.path, unknown)
+            raise BackupEvidenceError("backup evidence final publication failed") from exc
         try:
             self.path.unlink()
             _sync_directory(directory)
         except OSError as exc:
+            try:
+                final.unlink()
+            except OSError:
+                pass
+            try:
+                _sync_directory(directory)
+            except OSError:
+                pass
+            unknown = dict(self.payload)
+            unknown["status"] = "unknown"
+            unknown["completed_at_utc"] = _utc_now()
+            unknown["error_class"] = "evidence_cleanup_failed"
+            _publish_unknown_inprogress(self.path, unknown)
             raise BackupEvidenceError("backup evidence in-progress cleanup failed") from exc
         return final
 
@@ -991,7 +1335,10 @@ def ordered_backup_lock_scope(
         maintenance = importlib.import_module("platform_storage_maintenance")
     source = source_release_dir
     if source is None:
-        source = Path("/root/old_sparky/platform/dist/releases")
+        source = Path("/opt/oldsparky/platform/dist/releases")
+    source = Path(source)
+    if not source.exists() or not source.is_dir() or source.is_symlink():
+        raise BackupSupervisorError("canonical source release contour is unavailable")
     with retention.release_operation_lock(Path(app_dir)):
         with retention.exclusive_retained_load_lock():
             source_scope = maintenance.source_release_lock(source)
@@ -1021,6 +1368,8 @@ def _restore_args(
     env_file: Path | None = None,
     output_dir: Path | None = None,
     admin_database_url: str | None = None,
+    expected_alembic_head: str | None = None,
+    source_root: Path | None = None,
 ) -> argparse.Namespace:
     shared = Path(app_dir) / "shared"
     return SimpleNamespace(
@@ -1028,6 +1377,8 @@ def _restore_args(
         output_dir=str(output_dir or (shared / "backups")),
         keep=keep,
         admin_database_url=admin_database_url,
+        expected_alembic_head=expected_alembic_head,
+        source_root=source_root,
         dump_only=False,
     )
 
@@ -1055,12 +1406,17 @@ def run_local_backup(
         # in that mode its sibling directory, rather than the repository
         # package root, is on sys.path.
         restore = importlib.import_module("platform_backup_restore_drill")
+    expected_head = getattr(args, "expected_alembic_head", None)
+    if expected_head is None:
+        expected_head = restore.expected_alembic_head(Path(app_dir) / "current")
     args = _restore_args(
         app_dir,
         keep=keep,
         env_file=env_file,
         output_dir=output_dir,
         admin_database_url=admin_database_url,
+        expected_alembic_head=expected_head,
+        source_root=Path(app_dir) / "current",
     )
     # The supervisor, not the low-level producer, owns rotation.  Existing
     # callers retain the primitive's default behavior, while this path passes
@@ -1076,7 +1432,11 @@ def run_local_backup(
         "production_restore": "disabled",
     }
     evidence.payload["alembic"] = {
-        "revision": "verified" if created.get("alembic_revision_verified") else "unknown",
+        "revision": (
+            created.get("alembic_revision")
+            if created.get("alembic_revision_verified")
+            else "unknown"
+        ),
         "verified": bool(created.get("alembic_revision_verified")),
     }
     # Freshness is proven by the exact manifest and archive pair while the
@@ -1099,9 +1459,13 @@ def run_local_backup(
     removed: list[str] = []
     if created.get("restore_verified") is not True:
         raise BackupSupervisorError("backup restore drill did not pass")
-    removed.extend(restore.prune_unverified_backups(output_dir, preserve_metadata=manifest))
+    removed.extend(
+        restore.prune_unverified_backups(
+            output_dir, preserve_metadata=manifest, capability=capability
+        )
+    )
     assert_backup_pair_unchanged(pair, dump, manifest)
-    removed.extend(restore.prune_backups(output_dir, keep=keep))
+    removed.extend(restore.prune_backups(output_dir, keep=keep, capability=capability))
     # The selected pair must remain intact even if pruning saw a malformed
     # unrelated archive.  This also proves no writer replaced it during prune.
     assert_backup_pair_unchanged(pair, dump, manifest)
@@ -1143,65 +1507,111 @@ def run_offsite(
         Path(args.backup_dir), getattr(args, "dump", None),
         max_age_hours=float(args.max_age_hours), apply=bool(args.apply),
     )
-    pair = snapshot_backup_pair(backup.dump_path, backup.metadata_path)
-    evidence.update_pair(pair)
     work = Path(tempfile.mkdtemp(prefix="oldsparky-offsite-"))
     work.chmod(0o700)
+    encrypted: Any | None = None
     try:
-        config = offsite.load_config(args.env_file, args.platform_env_file, apply=bool(args.apply))
-        encrypted = offsite.encrypt_backup(config, backup, work, apply=bool(args.apply))
-        assert_backup_pair_unchanged(pair, backup.dump_path, backup.metadata_path)
-        key = offsite.object_key(config, backup)
-        result: dict[str, Any] = {
-            "ok": True,
-            "mode": "apply" if args.apply else "dry-run",
-            "source_dump": pair.dump_name,
-            "source_sha256": pair.dump_sha256,
-            "cipher_sha256": encrypted.sha256,
-            "cipher_size_bytes": encrypted.size_bytes,
-            "bucket": config.bucket_name,
-            "object_key": key,
-            "uploaded": False,
-            "verified": False,
-            "remote_operations": 0,
-            "retention_actions": 0,
-        }
-        if not args.apply:
-            evidence.update_remote(attempted=False, object=key)
-            assert_backup_pair_unchanged(pair, backup.dump_path, backup.metadata_path)
-            return result
-        storage_client = client if client is not None else offsite.build_storage_client(config, timeout=float(args.timeout))
-        evidence.update_remote(attempted=True, object=key)
-        try:
+        with held_backup_pair(backup.dump_path, backup.metadata_path) as held:
+            pair = held.snapshot
+            # Selection happened by pathname.  Refuse a selected object whose
+            # exact held identity/content no longer matches that selection,
+            # even if an attacker replaced both files with valid-looking data.
+            if (
+                backup.dump_path != held.dump_path
+                or backup.metadata_path != held.manifest_path
+                or backup.plaintext_sha256 != pair.dump_sha256
+                or backup.metadata_sha256 != pair.manifest_sha256
+                or backup.size_bytes != pair.size_bytes
+                or (
+                    backup.dump_identity is not None
+                    and backup.dump_identity != pair.dump_identity
+                )
+                or (
+                    backup.metadata_identity is not None
+                    and backup.metadata_identity != pair.manifest_identity
+                )
+            ):
+                raise BackupSupervisorError("selected backup pair changed before pinning")
+            held.validate()
+            evidence.update_pair(pair)
+            try:
+                restore = importlib.import_module("tools.platform_backup_restore_drill")
+            except ImportError:
+                restore = importlib.import_module("platform_backup_restore_drill")
+            evidence.payload["alembic"] = {
+                "revision": restore.expected_alembic_head(Path(app_dir) / "current"),
+                "verified": True,
+            }
+            config = offsite.load_config(
+                args.env_file, args.platform_env_file, apply=bool(args.apply)
+            )
+            encrypted = offsite.encrypt_backup_from_fd(
+                config,
+                backup,
+                work,
+                source_fd=held.dump_fd,
+                validate_source=held.validate,
+                apply=bool(args.apply),
+            )
+            held.validate()
+            key = offsite.object_key(config, backup)
+            result: dict[str, Any] = {
+                "ok": True,
+                "mode": "apply" if args.apply else "dry-run",
+                "source_dump": pair.dump_name,
+                "source_sha256": pair.dump_sha256,
+                "cipher_sha256": encrypted.sha256,
+                "cipher_size_bytes": encrypted.size_bytes,
+                "bucket": config.bucket_name,
+                "object_key": key,
+                "uploaded": False,
+                "verified": False,
+                "remote_operations": 0,
+                "retention_actions": 0,
+            }
+            if not args.apply:
+                evidence.update_remote(attempted=False, object=key)
+                held.validate()
+                return result
+            storage_client = (
+                client
+                if client is not None
+                else offsite.build_storage_client(config, timeout=float(args.timeout))
+            )
+            evidence.update_remote(attempted=True, object=key)
+            held.validate()
             storage_client.head_bucket(Bucket=config.bucket_name)
+            held.validate()
             uploaded, remote = offsite.upload_and_verify(
                 storage_client,
                 config=config,
                 backup=backup,
                 encrypted=encrypted,
                 key=key,
+                encrypted_fd=encrypted.fd,
             )
-        except Exception:
-            # The evidence stores a stable class only; exception text remains
-            # in protected journald, never in the durable report.
-            raise
-        assert_backup_pair_unchanged(pair, backup.dump_path, backup.metadata_path)
-        evidence.update_remote(
-            attempted=True,
-            uploaded=uploaded,
-            head_verified=True,
-            object=key,
-        )
-        result.update(
-            {
-                "cipher_sha256": remote["cipher_sha256"],
-                "uploaded": uploaded,
-                "verified": True,
-                "remote_operations": 4 if uploaded else 2,
-            }
-        )
-        return result
+            held.validate()
+            evidence.update_remote(
+                attempted=True,
+                uploaded=uploaded,
+                head_verified=True,
+                object=key,
+            )
+            result.update(
+                {
+                    "cipher_sha256": remote["cipher_sha256"],
+                    "uploaded": uploaded,
+                    "verified": True,
+                    "remote_operations": 4 if uploaded else 2,
+                }
+            )
+            return result
     finally:
+        if encrypted is not None and getattr(encrypted, "fd", None) is not None:
+            try:
+                os.close(encrypted.fd)
+            except OSError:
+                pass
         # The temporary ciphertext is deliberately private and never becomes
         # evidence.  Keep cleanup bounded to the supervisor-owned directory.
         import shutil
@@ -1308,7 +1718,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="operation", required=True)
     maintenance = subparsers.add_parser("maintenance")
     maintenance.add_argument("--app-dir", type=Path, default=Path("/opt/oldsparky/platform"))
-    maintenance.add_argument("--source-release-dir", type=Path, default=Path("/root/old_sparky/platform/dist/releases"))
+    maintenance.add_argument("--source-release-dir", type=Path, default=Path("/opt/oldsparky/platform/dist/releases"))
     maintenance.add_argument("--web-artifact-dir", type=Path, default=Path("/root/old_sparky/platform/apps/platform_web"))
     maintenance.add_argument("--backup-keep", type=int, default=14)
     maintenance.add_argument("--backup-max-age-hours", type=float, default=24.0)
@@ -1326,7 +1736,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     maintenance.add_argument("--json", action="store_true", dest="as_json")
     backup = subparsers.add_parser("backup")
     backup.add_argument("--app-dir", type=Path, default=Path("/opt/oldsparky/platform"))
-    backup.add_argument("--source-release-dir", type=Path, default=Path("/root/old_sparky/platform/dist/releases"))
+    backup.add_argument("--source-release-dir", type=Path, default=Path("/opt/oldsparky/platform/dist/releases"))
     backup.add_argument("--backup-keep", "--keep", dest="keep", type=int, default=14)
     backup.add_argument(
         "--backup-max-age-hours", "--max-age-hours", dest="max_age_hours", type=float, default=24.0

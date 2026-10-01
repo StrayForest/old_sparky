@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tools import platform_backup_supervisor
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "platform" / "tools" / "platform_backup_offsite.py"
@@ -167,6 +169,7 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 keep=2,
                 admin_database_url=None,
                 dump_only=False,
+                _supervisor_capability=platform_backup_supervisor._capability("maintenance"),
             )
 
             def fake_run_command(
@@ -212,6 +215,7 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 keep=2,
                 admin_database_url=None,
                 dump_only=False,
+                _supervisor_capability=platform_backup_supervisor._capability("maintenance"),
             )
 
             def fake_run_command(

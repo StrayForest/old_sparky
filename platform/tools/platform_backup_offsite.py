@@ -23,7 +23,7 @@ import stat
 import subprocess  # nosec B404
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Callable
 import urllib.parse
 
 try:
@@ -107,6 +107,8 @@ class VerifiedBackup:
     plaintext_sha256: str
     metadata_sha256: str
     size_bytes: int
+    dump_identity: tuple[int, int, int, int, int] | None = None
+    metadata_identity: tuple[int, int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,10 @@ class EncryptedBackup:
     md5_hex: str
     md5_base64: str
     size_bytes: int
+    # Supervisor-owned off-site transactions keep this descriptor open from
+    # encryption through HeadObject/PutObject.  Legacy dry-run callers may
+    # leave it unset and use the path-based primitive below.
+    fd: int | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -521,6 +527,23 @@ def select_verified_backup(
         )
 
     metadata_sha256 = hashlib.sha256(manifest_file.raw_bytes).hexdigest()
+    try:
+        metadata_stat = metadata_path.lstat()
+    except OSError as exc:
+        raise OffsiteBackupError(
+            "Backup manifest identity was lost during selection.", ExitCode.SOURCE_BACKUP
+        ) from exc
+    if (
+        stat.S_ISLNK(metadata_stat.st_mode)
+        or not stat.S_ISREG(metadata_stat.st_mode)
+        or metadata_stat.st_nlink != 1
+        or metadata_stat.st_uid != expected_owner
+        or metadata_stat.st_gid != expected_group
+        or stat.S_IMODE(metadata_stat.st_mode) != 0o600
+    ):
+        raise OffsiteBackupError(
+            "Backup manifest metadata changed during selection.", ExitCode.SOURCE_BACKUP
+        )
     return VerifiedBackup(
         dump_path=dump_path,
         metadata_path=metadata_path,
@@ -528,6 +551,20 @@ def select_verified_backup(
         plaintext_sha256=actual_sha256,
         metadata_sha256=metadata_sha256,
         size_bytes=dump_stat.st_size,
+        dump_identity=(
+            dump_stat.st_dev,
+            dump_stat.st_ino,
+            dump_stat.st_nlink,
+            dump_stat.st_size,
+            dump_stat.st_mtime_ns,
+        ),
+        metadata_identity=(
+            metadata_stat.st_dev,
+            metadata_stat.st_ino,
+            metadata_stat.st_nlink,
+            metadata_stat.st_size,
+            metadata_stat.st_mtime_ns,
+        ),
     )
 
 
@@ -784,6 +821,204 @@ def encrypt_backup(
     )
 
 
+def encrypt_backup_from_fd(
+    config: OffsiteConfig,
+    backup: VerifiedBackup,
+    work_dir: Path,
+    *,
+    source_fd: int,
+    validate_source: Callable[[], None],
+    apply: bool,
+) -> EncryptedBackup:
+    """Encrypt bytes from a held dump descriptor and return a held ciphertext fd.
+
+    The supervisor owns this path.  Neither GPG nor the upload consumer is
+    allowed to reopen the selected dump or ciphertext by pathname.
+    """
+
+    gpg_home = work_dir / "gnupg"
+    validate_public_key(config, gpg_home, apply=apply)
+    try:
+        free_bytes = shutil.disk_usage(work_dir).free
+    except OSError as exc:
+        raise OffsiteBackupError(
+            "Could not validate temporary disk capacity for encryption.",
+            ExitCode.ENCRYPTION,
+        ) from exc
+    if free_bytes < backup.size_bytes + MIN_TEMP_HEADROOM_BYTES:
+        raise OffsiteBackupError(
+            "Insufficient temporary disk capacity for encrypted backup output.",
+            ExitCode.ENCRYPTION,
+        )
+    encrypted_path = work_dir / f"{backup.dump_path.name}.gpg"
+    output_fd: int | None = None
+    source_dup: int | None = None
+    try:
+        validate_source()
+        output_fd = os.open(
+            encrypted_path,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        source_dup = os.dup(source_fd)
+        os.set_inheritable(source_dup, False)
+        command = [
+            GPG_BINARY,
+            "--no-options",
+            "--batch",
+            "--yes",
+            "--no-tty",
+            "--homedir",
+            str(gpg_home),
+            "--trust-model",
+            "always",
+            "--cipher-algo",
+            "AES256",
+            "--compress-algo",
+            "none",
+            "--recipient",
+            config.recipient_fingerprint,
+            "--encrypt",
+            "-",
+        ]
+        try:
+            os.lseek(source_dup, 0, os.SEEK_SET)
+            subprocess.run(  # nosec B603 - fixed argv, shell=False
+                command,
+                check=True,
+                stdin=source_dup,
+                stdout=output_fd,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                },
+                pass_fds=(source_dup,),
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise OffsiteBackupError(
+                "OpenPGP public-key encryption failed.", ExitCode.ENCRYPTION
+            ) from exc
+        finally:
+            os.close(source_dup)
+            source_dup = None
+        validate_source()
+        os.fsync(output_fd)
+        output_stat = os.fstat(output_fd)
+        if (
+            not stat.S_ISREG(output_stat.st_mode)
+            or output_stat.st_nlink != 1
+            or output_stat.st_uid != os.geteuid()
+            or output_stat.st_gid != os.getegid()
+            or stat.S_IMODE(output_stat.st_mode) != 0o600
+            or output_stat.st_size <= 0
+            or output_stat.st_size > MAX_SINGLE_PUT_BYTES
+        ):
+            raise OffsiteBackupError(
+                "OpenPGP encryption did not produce a protected ciphertext file.",
+                ExitCode.ENCRYPTION,
+            )
+        output_path_stat = encrypted_path.lstat()
+        if (
+            not stat.S_ISREG(output_path_stat.st_mode)
+            or output_path_stat.st_nlink != 1
+            or (output_path_stat.st_dev, output_path_stat.st_ino)
+            != (output_stat.st_dev, output_stat.st_ino)
+        ):
+            raise OffsiteBackupError(
+                "OpenPGP ciphertext pathname was replaced.", ExitCode.ENCRYPTION
+            )
+        try:
+            os.lseek(output_fd, 0, os.SEEK_SET)
+            cipher_sha = hashlib.sha256()
+            cipher_md5 = hashlib.md5(usedforsecurity=False)
+            while True:
+                chunk = os.read(output_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                cipher_sha.update(chunk)
+                cipher_md5.update(chunk)
+        except OSError as exc:
+            raise OffsiteBackupError(
+                "Could not hash the generated OpenPGP ciphertext.", ExitCode.ENCRYPTION
+            ) from exc
+        after_stat = os.fstat(output_fd)
+        if (
+            after_stat.st_size != output_stat.st_size
+            or after_stat.st_mtime_ns != output_stat.st_mtime_ns
+            or (after_stat.st_dev, after_stat.st_ino) != (output_stat.st_dev, output_stat.st_ino)
+        ):
+            raise OffsiteBackupError(
+                "OpenPGP ciphertext changed while it was hashed.", ExitCode.ENCRYPTION
+            )
+        if os.pread(output_fd, 5, 0) == b"PGDMP":
+            raise OffsiteBackupError(
+                "Encryption output unexpectedly contains the plaintext backup archive.",
+                ExitCode.ENCRYPTION,
+            )
+        packet_result = _run_gpg(
+            [
+                GPG_BINARY,
+                "--no-options",
+                "--batch",
+                "--no-tty",
+                "--homedir",
+                str(gpg_home),
+                "--list-packets",
+                f"/proc/self/fd/{output_fd}",
+            ],
+            check=False,
+        )
+        has_public_key_packet = ":pubkey enc packet:" in packet_result.stdout
+        has_encrypted_data_packet = any(
+            marker in packet_result.stdout
+            for marker in (":encrypted data packet:", ":aead encrypted packet:")
+        )
+        if (
+            packet_result.returncode not in (0, 2)
+            or not has_public_key_packet
+            or not has_encrypted_data_packet
+        ):
+            raise OffsiteBackupError(
+                "Encryption output is not a public-key OpenPGP ciphertext.",
+                ExitCode.ENCRYPTION,
+            )
+        return EncryptedBackup(
+            path=encrypted_path,
+            sha256=cipher_sha.hexdigest(),
+            md5_hex=cipher_md5.hexdigest(),
+            md5_base64=base64.b64encode(cipher_md5.digest()).decode("ascii"),
+            size_bytes=after_stat.st_size,
+            fd=output_fd,
+        )
+    except Exception:
+        if output_fd is not None:
+            try:
+                os.close(output_fd)
+            except OSError:
+                pass
+            output_fd = None
+        try:
+            encrypted_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        raise
+    finally:
+        if source_dup is not None:
+            try:
+                os.close(source_dup)
+            except OSError:
+                pass
+
+
 def object_key(config: OffsiteConfig, backup: VerifiedBackup) -> str:
     return (
         f"{config.key_prefix}/{backup.timestamp:%Y/%m}/"
@@ -934,6 +1169,7 @@ def upload_and_verify(
     backup: VerifiedBackup,
     encrypted: EncryptedBackup,
     key: str,
+    encrypted_fd: int | None = None,
 ) -> tuple[bool, dict[str, str]]:
     existing = _head_object(client, bucket=config.bucket_name, key=key)
     if existing is not None:
@@ -942,7 +1178,19 @@ def upload_and_verify(
         )
     metadata = _expected_metadata(config, backup, encrypted)
     try:
-        with encrypted.path.open("rb") as ciphertext:
+        body_handle = None
+        if encrypted_fd is not None:
+            try:
+                duplicate = os.dup(encrypted_fd)
+                os.lseek(duplicate, 0, os.SEEK_SET)
+                body_handle = os.fdopen(duplicate, "rb", closefd=True)
+            except OSError as exc:
+                raise OffsiteBackupError(
+                    "Could not open the held ciphertext descriptor.", ExitCode.STORAGE
+                ) from exc
+        else:
+            body_handle = encrypted.path.open("rb")
+        with body_handle as ciphertext:
             response = client.put_object(
                 Bucket=config.bucket_name,
                 Key=key,

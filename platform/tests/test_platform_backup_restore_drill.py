@@ -16,6 +16,8 @@ import unittest
 import uuid
 from unittest import mock
 
+from tools import platform_backup_supervisor
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "platform" / "tools" / "platform_backup_restore_drill.py"
@@ -43,6 +45,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             keep=2,
             admin_database_url=None,
             dump_only=dump_only,
+            _supervisor_capability=platform_backup_supervisor._capability("maintenance"),
         )
 
     def _creator_environment(self) -> dict[str, str]:
@@ -66,6 +69,24 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill.parse_database_url(
                 "postgresql+asyncpg://platform_user:secret@127.0.0.1:5432/sparkydb"
             )
+
+    def test_expected_alembic_head_is_derived_from_trusted_source_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            versions = root / "alembic" / "versions"
+            versions.mkdir(parents=True)
+            (versions / "001.py").write_text(
+                "revision = '001'\ndown_revision = None\n", encoding="utf-8"
+            )
+            (versions / "002.py").write_text(
+                "revision = '002'\ndown_revision = '001'\n", encoding="utf-8"
+            )
+            self.assertEqual(backup_drill.expected_alembic_head(root), "002")
+            (versions / "003.py").write_text(
+                "revision = '003'\ndown_revision = '001'\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "exactly one head"):
+                backup_drill.expected_alembic_head(root)
 
     def test_local_admin_commands_use_postgres_os_user(self) -> None:
         target = backup_drill.DatabaseTarget("127.0.0.1", 5432, "platform_user", None, "platformdb")
@@ -109,6 +130,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 app_target=target,
                 admin_target=None,
                 timestamp_slug="20260720T120000Z",
+                expected_alembic_head="20260801_0036",
             )
 
         self.assertEqual(table_count, 22)
@@ -234,6 +256,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             removed = backup_drill.prune_unverified_backups(
                 output_dir,
                 preserve_metadata=verified_metadata,
+                capability=platform_backup_supervisor._capability("maintenance"),
             )
 
             self.assertTrue(verified_dump.exists())
@@ -464,6 +487,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 keep=1,
                 admin_database_url=None,
                 dump_only=False,
+                _supervisor_capability=platform_backup_supervisor._capability("maintenance"),
             )
 
             def fake_run_command(

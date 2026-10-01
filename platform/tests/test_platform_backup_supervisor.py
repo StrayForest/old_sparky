@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+import hashlib
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 from tools import platform_backup_supervisor as supervisor
 
 
@@ -14,9 +17,9 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             path = Path(temporary_dir) / supervisor.BACKUP_LOCK_PATH.name
             path.write_bytes(b"stale")
             path.chmod(0o600)
-            with supervisor.exclusive_backup_lock(path):
+            with supervisor._exclusive_backup_lock_for_test(path):
                 with self.assertRaises(supervisor.BackupLockConflict) as context:
-                    with supervisor.exclusive_backup_lock(path):
+                    with supervisor._exclusive_backup_lock_for_test(path):
                         pass
                 self.assertEqual(context.exception.status, "blocked")
                 self.assertEqual(context.exception.exit_code, 75)
@@ -31,7 +34,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             target.chmod(0o600)
             path.symlink_to(target)
             with self.assertRaises(supervisor.BackupLockError):
-                with supervisor.exclusive_backup_lock(path):
+                with supervisor._exclusive_backup_lock_for_test(path):
                     pass
             path.unlink()
             path.write_bytes(b"")
@@ -39,15 +42,36 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             hardlink = root / "hardlink"
             hardlink.hardlink_to(path)
             with self.assertRaises(supervisor.BackupLockError):
-                with supervisor.exclusive_backup_lock(path):
+                with supervisor._exclusive_backup_lock_for_test(path):
                     pass
             hardlink.unlink()
             with self.assertRaises(supervisor.BackupLockError):
-                with supervisor.exclusive_backup_lock(path):
+                with supervisor._exclusive_backup_lock_for_test(path):
                     replacement = root / "replacement"
                     replacement.write_bytes(b"")
                     replacement.chmod(0o600)
                     os.replace(replacement, path)
+
+    def test_kernel_singleton_blocks_after_lock_inode_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            path = root / supervisor.BACKUP_LOCK_PATH.name
+            path.write_bytes(b"")
+            path.chmod(0o600)
+            singleton = b"\0oldsparky-platform-backup-test-replaced"
+            with self.assertRaises(supervisor.BackupLockError):
+                with supervisor._exclusive_backup_lock_for_test(
+                    path, singleton_name=singleton
+                ):
+                    replacement = root / "replacement"
+                    replacement.write_bytes(b"")
+                    replacement.chmod(0o600)
+                    os.replace(replacement, path)
+                    with self.assertRaises(supervisor.BackupLockConflict):
+                        with supervisor._exclusive_backup_lock_for_test(
+                            path, singleton_name=singleton
+                        ):
+                            pass
 
     def test_lock_matrix_rejects_reverse_edges_and_duplicates(self) -> None:
         self.assertEqual(
@@ -95,6 +119,59 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             payload = json.loads(recovered[0].read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "unknown")
             self.assertEqual(payload["error_class"], "interrupted_evidence")
+
+    def test_evidence_fsync_failure_removes_final_and_keeps_unknown_inprogress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            app_dir = Path(temporary_dir)
+            (app_dir / "shared").mkdir()
+            session = supervisor.EvidenceSession.start(
+                app_dir, "offsite", locks=("backup",)
+            )
+            final_path = session.path.with_name(session.path.name.removesuffix(".inprogress"))
+            with mock.patch.object(
+                supervisor, "_sync_directory", side_effect=OSError("injected fsync")
+            ):
+                with self.assertRaises(supervisor.BackupEvidenceError):
+                    session.finish("passed")
+            self.assertFalse(final_path.exists())
+            self.assertTrue(session.path.exists())
+            self.assertEqual(supervisor.read_latest_evidence(app_dir)["status"], "unknown")
+            with self.assertRaises(supervisor.BackupEvidenceError):
+                supervisor._load_evidence(final_path)
+
+    def test_held_pair_rejects_path_replacement_after_fd_pin(self) -> None:
+        from tools import platform_backup_manifest as manifest
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            dump = root / f"platformdb-20261001T120000Z-{'a' * 32}.dump"
+            dump.write_bytes(b"PGDMP held-source")
+            dump.chmod(0o600)
+            now = datetime.now(UTC)
+            metadata = manifest.build_manifest(
+                run_id="a" * 32,
+                dump_file=dump.name,
+                size_bytes=dump.stat().st_size,
+                sha256=hashlib.sha256(dump.read_bytes()).hexdigest(),
+                started_at_utc=now,
+                completed_at_utc=now,
+                duration_seconds=0,
+                restore_verified=True,
+                alembic_revision_verified=True,
+                restored_table_count=1,
+                restore_error=None,
+            )
+            manifest_path = dump.with_suffix(".json")
+            manifest_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            manifest_path.chmod(0o600)
+            with self.assertRaises(supervisor.BackupSupervisorError):
+                with supervisor.held_backup_pair(dump, manifest_path) as pair:
+                    self.assertEqual(os.pread(pair.dump_fd, 5, 0), b"PGDMP")
+                    replacement = root / "replacement.dump"
+                    replacement.write_bytes(b"PGDMP replacement")
+                    replacement.chmod(0o600)
+                    os.replace(replacement, dump)
+                    pair.validate()
 
     def test_destructive_production_restore_is_fail_closed(self) -> None:
         with self.assertRaises(supervisor.ProductionRestoreDisabled):

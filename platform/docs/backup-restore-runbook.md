@@ -13,6 +13,13 @@ manifest, restores into a new temporary database, validates tables,
 extensions/Alembic and drops the drill database. Daily maintenance retains 14
 verified copies.
 
+Production source-release retention is rooted at
+`/opt/oldsparky/platform/dist/releases`; apply entrypoints pass this path
+explicitly and fail closed if it is unavailable. The restore drill binds the
+database to the exact single Alembic head derived from the deployed
+`alembic/versions` graph; a missing, branched or mismatched graph is not a
+successful verification.
+
 The manifest is the closed, versioned v2 contract implemented by
 [`platform_backup_manifest.py`](../tools/platform_backup_manifest.py). It
 requires the ordered `schemas: ["platform", "public"]` value, the exact
@@ -35,8 +42,11 @@ Phase B closes the same-owner writer window with the canonical backup
 supervisor and `/run/lock/oldsparky-platform-backup.lock`. The lock is a
 root-owned, single-link regular file with mode `0600`; it is opened with a
 held descriptor, validated against the pathname, and protected by a
-non-blocking kernel `flock`. A stale filename is safe to reuse, while a
-symlink, hardlink, pathname replacement or active owner fails closed.
+non-blocking kernel `flock` plus a fixed Linux abstract-namespace AF_UNIX
+singleton. Replacing the lock filename therefore cannot create a second
+owner. A stale filename is safe to reuse, while a symlink, hardlink, pathname
+replacement or active owner fails closed. The production API has no
+caller-selected lock path; only private tests inject a temporary backend.
 
 All mutating operations use one lock order:
 `release -> retained-load -> source/build -> live-QA -> backup`. Local create,
@@ -48,11 +58,16 @@ of re-acquiring them.
 
 `platform_backup_supervisor.py` is the sole production mutation owner. It
 revalidates the exact dump/manifest pair identity, SHA-256 and size both
-before and after consumer work. Its private evidence record is written as
+before and after consumer work. Off-site selection holds both `O_NOFOLLOW`
+descriptors for the complete select/encrypt/HeadObject/PUT transaction; GPG
+reads the held dump descriptor and uploads read from a held ciphertext
+descriptor, never a reopened pathname. Its private evidence record is written as
 `started` before mutation and published atomically after completion. The
 closed schema permits `started`, `passed`, `failed`, `blocked`, `cancelled`
 and `unknown`; stale/interrupted `.inprogress` records become `unknown`, never
-green. Evidence contains only bounded release/manifest/checksum, lock,
+green. A final publication or directory-fsync failure removes the final
+receipt and retains an unknown `.inprogress` record; readers reject a final
+receipt while any matching in-progress record exists. Evidence contains only bounded release/manifest/checksum, lock,
 Alembic, recovery and remote-transport fields—never credentials, raw stderr,
 private paths or PIDs.
 
@@ -68,7 +83,9 @@ health check closed.
 
 The low-level create/restore drill is invoked in-process by the supervisor; do
 not run its mutating primitive directly on the production host because it does
-not acquire the host-wide operation locks. Create a production backup through
+not acquire the host-wide operation locks. Its mutating create and prune
+functions require an unforgeable in-process supervisor capability and refuse
+direct calls. Create a production backup through
 the lock-aware backup-only mode:
 
 ```bash
@@ -76,6 +93,7 @@ cd /opt/oldsparky/platform/current
 /opt/oldsparky/platform/shared/venv/bin/python \
   tools/platform_backup_supervisor.py maintenance \
   --app-dir /opt/oldsparky/platform \
+  --source-release-dir /opt/oldsparky/platform/dist/releases \
   --backup-keep 14 --backup-max-age-hours 24 \
   --backup-only --apply --json
 ```
