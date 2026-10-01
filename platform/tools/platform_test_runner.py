@@ -111,6 +111,82 @@ class TestResourceConfiguration:
     redis_database: str
 
 
+@dataclass(frozen=True, slots=True)
+class TestCeleryResourceConfiguration:
+    """Namespace-only Redis contract for an isolated Celery integration run.
+
+    Redis logical databases are not a security boundary.  This validator only
+    proves that the test process selected the reviewed loopback namespaces and
+    that broker, result and application clients cannot accidentally share one
+    logical database.
+    """
+
+    environment: str
+    app_redis_url: str
+    app_redis_database: str
+    broker_url: str
+    broker_database: str
+    result_backend_url: str
+    result_backend_database: str
+
+
+def validate_test_celery_resource_configuration(
+    settings: object | Mapping[str, object] | None = None,
+) -> TestCeleryResourceConfiguration:
+    """Validate the test-only app/broker/result Redis namespace contract.
+
+    The base test resource validator remains authoritative for PostgreSQL and
+    application Redis DB15.  Celery integration additionally requires broker
+    DB13 and result DB14, all on a literal loopback URL.  No client is created,
+    no connection is attempted and no Redis ``SELECT`` isolation is assumed.
+    """
+
+    base = validate_test_resource_configuration(settings)
+    broker_url_value = _configuration_value(
+        settings,
+        "platform_celery_broker_url",
+        "PLATFORM_CELERY_BROKER_URL",
+    )
+    result_backend_value = _configuration_value(
+        settings,
+        "platform_celery_result_backend",
+        "PLATFORM_CELERY_RESULT_BACKEND",
+    )
+    broker_url, _ = _parse_local_test_url(
+        broker_url_value,
+        label="PLATFORM_CELERY_BROKER_URL",
+        schemes=frozenset({"redis", "rediss"}),
+        expected_path="/13",
+    )
+    result_backend_url, _ = _parse_local_test_url(
+        result_backend_value,
+        label="PLATFORM_CELERY_RESULT_BACKEND",
+        schemes=frozenset({"redis", "rediss"}),
+        expected_path="/14",
+    )
+    # Keep this explicit even though the paths above are closed values: it
+    # makes the namespace separation invariant obvious to callers and guards
+    # future edits that might relax one of the path checks.
+    databases = {
+        base.redis_database,
+        broker_url.rsplit("/", 1)[-1],
+        result_backend_url.rsplit("/", 1)[-1],
+    }
+    if databases != {"13", "14", "15"}:
+        raise TestResourceConfigurationError(
+            "test Redis namespaces must be distinct application DB15, broker DB13 and result DB14."
+        )
+    return TestCeleryResourceConfiguration(
+        environment=base.environment,
+        app_redis_url=base.redis_url,
+        app_redis_database=base.redis_database,
+        broker_url=broker_url,
+        broker_database="13",
+        result_backend_url=result_backend_url,
+        result_backend_database="14",
+    )
+
+
 def _configuration_value(
     settings: object | Mapping[str, object] | None,
     attribute: str,
@@ -288,6 +364,7 @@ def _require_integration_resources_ready() -> None:
     # only one allowed to perform liveness/readiness checks.
     try:
         configuration = validate_test_resource_configuration()
+        validate_test_celery_resource_configuration()
     except TestResourceConfigurationError as exc:
         raise SystemExit(f"LOCAL GATE BLOCKED: {exc}") from exc
     try:

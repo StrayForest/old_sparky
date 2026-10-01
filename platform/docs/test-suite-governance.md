@@ -148,6 +148,39 @@ Privileged release-lock tests hold a serial test guard and use unique
 root-owned files directly beneath `/run/lock`; cleanup removes only the exact
 test-prefixed regular file and never the production canonical lock.
 
+### Celery worker contract and liveness boundary
+
+The worker registry contract is owned by the independent literal manifest at
+`tests/worker_registry_manifest.py` and its `backend-unit` contract tests.
+The manifest lists the nine application task names, every explicit route,
+the three required queues, all five beat entries, task result/time-limit
+ownership, and bounded cadence/expiry values. The tests compare that manifest
+with the registered Celery application and the production launcher source;
+they do not derive expected ownership from production code.
+
+The `backend-integration` contour additionally runs one ephemeral Celery
+worker with the official CLI, `pool=solo`, concurrency `1`, no embedded beat
+and no schedule/state file. It proves broker DB13 -> worker -> safe
+`platform.ping` -> result DB14 roundtrips on each high/default/low queue and
+checks the registered task and active queue control-plane views. The pure
+test-resource validator requires application Redis DB15, broker DB13 and
+result DB14 on loopback; these are namespace conventions only, not a Redis
+security boundary. The worker subprocess has a bounded readiness/roundtrip
+window and is always TERM/KILL/reaped with exact temporary-state cleanup.
+
+Ownership is deliberately split:
+
+| Evidence | Pull request / CI owner | Later release or passive owner |
+| --- | --- | --- |
+| Task/route/beat/queue registry | `backend-unit` literal contract | Production worker launcher and beat singleton remain release-owned; this phase does not change them |
+| Broker-to-worker-to-result execution | `backend-integration` ephemeral Redis/PostgreSQL CI job | Production operations/health monitoring may add a separate passive task-liveness signal in a later reviewed phase |
+| Domain idempotency and recovery | Existing backend unit/integration tests | Existing workflow and release owners |
+
+Systemd `active`/process checks are service-supervision evidence only. They
+must not be reported as proof that a task was accepted, executed or persisted.
+This Phase A package therefore does not modify the production health monitor,
+systemd units, release workflows, queues or beat singleton.
+
 Local/canonical invocations that use the host test services hold one global
 cross-UID lock at the fixed
 `/run/lock/oldsparky-platform-verification/oldsparky-platformdb-test.lock`
