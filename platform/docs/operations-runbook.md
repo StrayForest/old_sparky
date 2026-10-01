@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-09-29
+- Last reviewed: 2026-10-01
 
 ## Runtime checks
 
@@ -14,8 +14,8 @@ journalctl -u deadlock-api -u deadlock-worker -u deadlock-web \
 df -h /
 ```
 
-`systemctl`/journal output proves service/process supervision only; it does not prove Redis -> worker -> result execution. The PR-blocking proof is the [backend-integration roundtrip](test-suite-governance.md#celery-worker-contract-and-liveness-boundary) on Redis DB13/14/15; passive production task liveness remains a later owner.
-Phase A leaves the health monitor, systemd units, production queues and beat singleton unchanged.
+`systemctl`/journal output proves service/process supervision only; it does not prove Redis -> worker -> result execution. The PR-blocking proof is the [backend-integration roundtrip](test-suite-governance.md#celery-worker-contract-and-liveness-boundary) on Redis DB13/14/15. The release state machine now adds one production-only B1 roundtrip to the first loopback smoke after restart/readiness: `platform_worker_liveness.py` runs as `oldsparky-worker` with the generated `shared/env/worker.env`, imports only `apps.platform_worker.worker:celery_app`, publishes one fixed `platform.ping` to the default queue, and proves the exact result key is absent after cleanup. Its JSON evidence is fixed-schema and redacted; backlog lengths are non-gating evidence. Public smoke, no-restart recovery and passive health monitoring do not run this helper.
+The worker liveness helper requires the supervisor's exact trusted source SHA and verifies `current -> RELEASE.json` before publishing. A mismatch fails before release side effects; the existing release receipt/recovery contract remains authoritative.
 
 API, web, PostgreSQL and Redis bind loopback; Nginx is the only origin listener;
 the platform connects directly to PostgreSQL on `127.0.0.1:5432`.

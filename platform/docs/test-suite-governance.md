@@ -185,13 +185,13 @@ Ownership is deliberately split:
 | Evidence | Pull request / CI owner | Later release or passive owner |
 | --- | --- | --- |
 | Task/route/beat/queue registry | `backend-unit` literal contract | Production worker launcher and beat singleton remain release-owned; this phase does not change them |
-| Broker-to-worker-to-result execution | `backend-integration` ephemeral Redis/PostgreSQL CI job | Production operations/health monitoring may add a separate passive task-liveness signal in a later reviewed phase |
+| Broker-to-worker-to-result execution | `backend-integration` ephemeral Redis/PostgreSQL CI job | Release B1 loopback smoke runs one bounded `platform.ping` through the deployed `apps.platform_worker.worker:celery_app`; passive health monitoring remains out of scope |
 | Domain idempotency and recovery | Existing backend unit/integration tests | Existing workflow and release owners |
-
 Systemd `active`/process checks are service-supervision evidence only. They
 must not be reported as proof that a task was accepted, executed or persisted.
-This Phase A package therefore does not modify the production health monitor,
-systemd units, release workflows, queues or beat singleton.
+The B1 release helper runs only as first loopback smoke after restart/readiness; it
+uses supervisor SHA/generated worker env, Redis DB13/14, and proves cleanup.
+Public/no-restart/passive paths skip it; no systemd, queue, schedule or passive state changes.
 
 Local/canonical invocations that use the host test services hold one global
 cross-UID lock at the fixed

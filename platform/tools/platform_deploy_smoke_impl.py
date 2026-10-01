@@ -37,6 +37,7 @@ SYSTEMCTL_TIMEOUT_SECONDS = 30.0
 RUNUSER_TIMEOUT_SECONDS = 30.0
 DATABASE_CONNECT_TIMEOUT_SECONDS = 30.0
 DATABASE_COMMAND_TIMEOUT_SECONDS = 30.0
+SOURCE_SHA_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 
 EXPECTED_CSP_POLICY_TEMPLATE = (
     "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; "
@@ -96,6 +97,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--web-origin", default=DEFAULT_WEB_ORIGIN)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument(
+        "--expected-source-sha",
+        default=None,
+        help="Require current/RELEASE.json identity before any network smoke.",
+    )
+    parser.add_argument(
         "--expected-csp-mode",
         choices=tuple(CSP_HEADER_BY_MODE),
         required=True,
@@ -129,6 +135,11 @@ def validate_edge_options(args: argparse.Namespace) -> None:
             is_loopback = parsed.hostname == "localhost"
         if not is_loopback:
             raise ValueError("TLS verification may be skipped only for a literal loopback origin.")
+
+
+def validate_expected_source_sha(value: str | None) -> None:
+    if value is not None and SOURCE_SHA_PATTERN.fullmatch(value) is None:
+        raise ValueError("--expected-source-sha must be a lowercase commit SHA.")
 
 
 def edge_origin_is_loopback(origin: str) -> bool:
@@ -268,7 +279,47 @@ def check_web_runtime_cache(
     }
 
 
-def check_release_layout(app_dir: pathlib.Path) -> list[dict[str, object]]:
+def check_release_source_identity(
+    app_dir: pathlib.Path,
+    expected_source_sha: str,
+) -> dict[str, object]:
+    current = app_dir / "current"
+    errors: list[str] = []
+    current_target: pathlib.Path | None = None
+    release_slug = ""
+    try:
+        current_metadata = current.lstat()
+        current_target = current.resolve(strict=True)
+        if not stat.S_ISLNK(current_metadata.st_mode):
+            errors.append("current pointer is not a symlink")
+        if current_target.parent != (app_dir / "releases").resolve(strict=True):
+            errors.append("current pointer leaves the release directory")
+        release_slug = current_target.name
+        release_json = current_target / "RELEASE.json"
+        metadata = release_json.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            errors.append("RELEASE.json is not a regular file")
+        payload = json.loads(release_json.read_text(encoding="ascii"))
+        if not isinstance(payload, dict):
+            errors.append("RELEASE.json is not an object")
+        elif (
+            payload.get("source_git_commit") != expected_source_sha
+            or payload.get("release_slug") != release_slug
+        ):
+            errors.append("release source identity mismatch")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        errors.append("active release identity is unavailable")
+    return {
+        "name": "release_source_identity",
+        "ok": not errors,
+        "detail": "verified" if not errors else "mismatch",
+    }
+
+
+def check_release_layout(
+    app_dir: pathlib.Path,
+    expected_source_sha: str | None = None,
+) -> list[dict[str, object]]:
     current = app_dir / "current"
     previous = app_dir / "previous"
     shared_env = app_dir / "shared/.env.platform"
@@ -313,6 +364,8 @@ def check_release_layout(app_dir: pathlib.Path) -> list[dict[str, object]]:
             ]
         )
         results.append(check_web_runtime_cache(app_dir, current_target))
+    if expected_source_sha is not None:
+        results.append(check_release_source_identity(app_dir, expected_source_sha))
     return results
 
 
@@ -720,6 +773,7 @@ async def check_http_security_headers(
 async def main() -> int:
     args = parse_args()
     validate_edge_options(args)
+    validate_expected_source_sha(args.expected_source_sha)
     app_dir = pathlib.Path(args.app_dir)
     env_file = pathlib.Path(args.env_file) if args.env_file else app_dir / "shared/.env.platform"
 
@@ -728,8 +782,24 @@ async def main() -> int:
     merged_env.update(env)
 
     results: list[dict[str, object]] = []
-    results.extend(check_release_layout(app_dir))
+    results.extend(check_release_layout(app_dir, args.expected_source_sha))
     results.extend(check_service_active(service) for service in DEFAULT_SERVICES)
+
+    # The trusted supervisor's source identity is a precondition for all
+    # subsequent DB/HTTP work.  A mismatch must not become a late smoke
+    # failure after another side effect has been observed.
+    if args.expected_source_sha is not None and any(
+        item["name"] == "release_source_identity" and not item["ok"]
+        for item in results
+    ):
+        payload = {"ok": False, "results": results}
+        if args.as_json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            for item in results:
+                status = "OK" if item["ok"] else "FAIL"
+                print(f"[{status}] {item['name']}: {item['detail']}")
+        return 1
 
     required_env_keys = (
         "PLATFORM_DATABASE_URL",

@@ -14,6 +14,7 @@ CONFIRM_MIGRATION_NOT_REVERSED=0
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
 EXPECTED_CSP_MODE="enforce"
+EXPECTED_SOURCE_SHA="${PLATFORM_RELEASE_EXPECTED_SOURCE_SHA:-}"
 EDGE_ORIGIN="https://127.0.0.1"
 EDGE_HOST="old-sparky.com"
 PUBLIC_EDGE_ORIGIN="https://old-sparky.com"
@@ -58,6 +59,15 @@ while [[ $# -gt 0 ]]; do
     --expected-csp-mode)
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       EXPECTED_CSP_MODE="$2"
+      shift 2
+      ;;
+    --expected-source-sha)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      if [[ -n "$EXPECTED_SOURCE_SHA" && "$EXPECTED_SOURCE_SHA" != "$2" ]]; then
+        public_status failed identity >&2
+        exit 3
+      fi
+      EXPECTED_SOURCE_SHA="$2"
       shift 2
       ;;
     --edge-origin)
@@ -134,6 +144,10 @@ if [[ "$ABORT_RETAINED" -eq 0 && "$CONFIRM_MIGRATION_NOT_REVERSED" -eq 1 ]]; the
 fi
 if [[ "$EXPECTED_CSP_MODE" != "enforce" ]]; then
   public_status failed policy >&2
+  exit 1
+fi
+if [[ -n "$EXPECTED_SOURCE_SHA" && ! "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40,64}$ ]]; then
+  public_status failed argument >&2
   exit 1
 fi
 
@@ -292,6 +306,89 @@ candidate_env() {
 run_candidate() {
   candidate_env
   (cd "$CANDIDATE" && "$@") >/dev/null 2>/dev/null
+}
+
+validate_expected_artifact_source() {
+  [[ -n "$EXPECTED_SOURCE_SHA" ]] || return 0
+  /usr/bin/python3 -I - "$ARTIFACT" "$EXPECTED_SOURCE_SHA" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+import tarfile
+
+archive_path, expected_sha = sys.argv[1:]
+if re.fullmatch(r"[0-9a-f]{40,64}", expected_sha) is None:
+    raise SystemExit(1)
+slug = Path(archive_path).name.removesuffix(".tar.gz")
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", slug):
+    raise SystemExit(1)
+try:
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        member = archive.getmember(f"{slug}/RELEASE.json")
+        handle = archive.extractfile(member)
+        if handle is None:
+            raise SystemExit(1)
+        payload = json.load(handle)
+except (OSError, KeyError, TypeError, ValueError, tarfile.TarError, json.JSONDecodeError):
+    raise SystemExit(1)
+if (
+    not isinstance(payload, dict)
+    or payload.get("release_slug") != slug
+    or payload.get("source_git_commit") != expected_sha
+):
+    raise SystemExit(1)
+PY
+}
+
+verify_active_candidate_identity() {
+  local active_target active_sha expected_sha
+  [[ -L "$APP_DIR/current" ]] || return 1
+  active_target="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
+  [[ -n "$active_target" && "$active_target" == "$CANDIDATE" ]] || return 1
+  active_sha="$({
+    /usr/bin/python3 -I - "$active_target/RELEASE.json" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+try:
+    value = json.loads(Path(sys.argv[1]).read_text(encoding="ascii")).get("source_git_commit", "")
+except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+    value = ""
+if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value):
+    print(value)
+PY
+  } 2>/dev/null)"
+  expected_sha="$EXPECTED_SOURCE_SHA"
+  [[ -n "$expected_sha" ]] || expected_sha="$candidate_sha"
+  [[ -n "$expected_sha" && "$active_sha" == "$expected_sha" ]] || return 1
+  [[ -n "$candidate_sha" && "$candidate_sha" == "$expected_sha" ]]
+}
+
+run_worker_liveness_smoke() {
+  [[ -n "$EXPECTED_SOURCE_SHA" ]] || return 1
+  local worker_env="$SHARED_DIR/env/worker.env"
+  local helper="$CANDIDATE/tools/platform_worker_liveness.py"
+  [[ -f "$helper" && ! -L "$helper" && -x "$helper" \
+    && -f "$worker_env" && ! -L "$worker_env" ]] || return 1
+  run_bounded_command 15 /usr/sbin/runuser -u oldsparky-worker -- /usr/bin/env -i \
+    LANG=C.UTF-8 \
+    HOME=/nonexistent \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONNOUSERSITE=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="$CANDIDATE" \
+    PLATFORM_APP_DIR="$APP_DIR" \
+    PLATFORM_SHARED_DIR="$SHARED_DIR" \
+    PLATFORM_ENV_FILE="$worker_env" \
+    PLATFORM_RUNTIME_SERVICE=worker \
+    PLATFORM_PYTHON_BIN="$SHARED_VENV/bin/python" \
+    "$SHARED_VENV/bin/python" "$helper" \
+      --app-dir "$APP_DIR" \
+      --release "$CANDIDATE" \
+      --expected-source-sha "$EXPECTED_SOURCE_SHA" \
+    >/dev/null 2>/dev/null
 }
 
 systemd_now_ns() {
@@ -1394,6 +1491,10 @@ if [[ "$RESUME" -eq 0 ]]; then
       exit 1
       ;;
   esac
+  validate_expected_artifact_source || {
+    public_status failed identity >&2
+    exit 3
+  }
   if transaction_path_present; then
     public_status failed pending_operation >&2
     exit 3
@@ -1472,6 +1573,10 @@ PY
 } 2>/dev/null)"
 if [[ -n "$candidate_sha" ]]; then
   PUBLIC_SOURCE_SHA="$candidate_sha"
+fi
+if [[ -n "$EXPECTED_SOURCE_SHA" && "$candidate_sha" != "$EXPECTED_SOURCE_SHA" ]]; then
+  public_status failed identity >&2
+  exit 3
 fi
 
 phase="$(printf '%s' "$TRANSACTION_JSON" | json_field phase)"
@@ -1562,6 +1667,13 @@ case "$phase" in
 esac
 
 if [[ "$phase" == "activation-pending" ]]; then
+  # The current pointer has just been promoted. Verify that it is exactly the
+  # expected candidate before any runtime reconciliation, restart or
+  # readiness side effect can observe a mixed release.
+  verify_active_candidate_identity || {
+    public_status failed identity >&2
+    exit 3
+  }
   # The trusted live-QA payload is part of activation identity. Reconcile it
   # while the canonical release lock is still held, before any post-activation
   # readiness or smoke work can observe the new current release.
@@ -1641,6 +1753,18 @@ if [[ "$phase" == "nginx-pending" ]]; then
 fi
 
 if [[ "$phase" == "nginx-applied" ]]; then
+  smoke_source_args=()
+  if [[ -n "$EXPECTED_SOURCE_SHA" ]]; then
+    smoke_source_args=(--expected-source-sha "$EXPECTED_SOURCE_SHA")
+  fi
+  verify_active_candidate_identity || {
+    public_status failed identity >&2
+    exit 3
+  }
+  run_worker_liveness_smoke || {
+    public_status failed readiness >&2
+    exit 1
+  }
   candidate_env
   "$SHARED_VENV/bin/python" "$CANDIDATE/tools/platform_deploy_smoke.py" \
     --app-dir "$APP_DIR" \
@@ -1648,11 +1772,13 @@ if [[ "$phase" == "nginx-applied" ]]; then
     --edge-origin "$EDGE_ORIGIN" \
     --edge-host "$EDGE_HOST" \
     --edge-insecure-loopback \
+    "${smoke_source_args[@]}" \
     --expected-csp-mode "$EXPECTED_CSP_MODE" >/dev/null 2>/dev/null
   "$SHARED_VENV/bin/python" "$CANDIDATE/tools/platform_deploy_smoke.py" \
     --app-dir "$APP_DIR" \
     --env-file "$SHARED_DIR/.env.platform" \
     --edge-origin "$PUBLIC_EDGE_ORIGIN" \
+    "${smoke_source_args[@]}" \
     --expected-csp-mode "$EXPECTED_CSP_MODE" >/dev/null 2>/dev/null
   release_preflight
   set_phase nginx-applied smoke-passed

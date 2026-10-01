@@ -62,6 +62,7 @@ REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS = (
     "tools/platform_storage_evidence_summary.py",
     "tools/platform_media_migration_diagnostics_summary.py",
 )
+REQUIRED_RELEASE_HELPERS = ("tools/platform_worker_liveness.py",)
 
 RELEASE_KEYS = {
     "artifact_format_version",
@@ -613,6 +614,7 @@ def _required_members(
         "apps/platform_web/package-lock.json",
         "apps/platform_web/.next/standalone/server.js",
         *REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS,
+        *REQUIRED_RELEASE_HELPERS,
     )
     required_directories = (
         "wheelhouse",
@@ -623,7 +625,7 @@ def _required_members(
         member = by_name.get(f"{release_slug}/{relative}")
         if member is None or not member.isfile():
             raise ArtifactError(f"release archive is missing required file: {relative}")
-        if relative in REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS and member.size <= 0:
+        if relative in (*REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS, *REQUIRED_RELEASE_HELPERS) and member.size <= 0:
             raise ArtifactError(
                 f"release archive is missing required helper content: {relative}"
             )

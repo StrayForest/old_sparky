@@ -574,9 +574,11 @@ if [[ ! -f "$candidate_deploy" || -L "$candidate_deploy" || ! -x "$candidate_dep
 fi
 storage_summary_tool="$host_tools_dir/platform_storage_evidence_summary.py"
 candidate_status=0
+PLATFORM_RELEASE_EXPECTED_SOURCE_SHA="$target_sha" \
 LC_ALL=C.UTF-8 "$candidate_deploy" \
   --artifact "$artifact_path" \
   --app-dir "$runtime" \
+  --expected-source-sha "$target_sha" \
   --edge-origin https://127.0.0.1 \
   --edge-host old-sparky.com \
   --expected-csp-mode enforce >/dev/null 2>/dev/null || candidate_status=$?
