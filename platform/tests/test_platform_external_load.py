@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -15,9 +18,12 @@ from tools.platform_external_load import (
     analyze_concurrency_ramp,
     _ready_vote_action,
     _annotate_timing,
+    _ResultAccumulator,
     _request,
     load_manifest,
+    percentile,
     run_load,
+    run_phase,
     spread_offsets,
     summarize_logical_results,
     summarize_results,
@@ -62,6 +68,263 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_streaming_accumulator_preserves_high_cardinality_counts_and_percentiles(self) -> None:
+        accumulator = _ResultAccumulator()
+        latencies = [float((index * 37) % 1000) for index in range(4096)]
+        for index, elapsed_ms in enumerate(latencies):
+            accumulator.add(
+                RequestResult(
+                    phase="synthetic",
+                    method="GET",
+                    path="/health",
+                    status=200 if index % 17 else 503,
+                    elapsed_ms=elapsed_ms,
+                    ok=index % 17 != 0,
+                    response_bytes=index,
+                )
+            )
+
+        summary = accumulator.summary()
+
+        self.assertEqual(summary["requests"], 4096)
+        self.assertEqual(summary["errors"], 241)
+        self.assertEqual(summary["status_counts"], {"200": 3855, "503": 241})
+        self.assertEqual(
+            summary["latency"]["p95_ms"],
+            round(percentile(latencies, 95) or 0, 3),
+        )
+        self.assertEqual(summary["response_bytes"]["max_bytes"], 4095)
+
+    def test_sliding_phase_bounds_live_work_and_reduces_each_completion(self) -> None:
+        users = [
+            VirtualUser(f"user-{index:08d}", "qa-tournament", "s" * 64, "c" * 64)
+            for index in range(96)
+        ]
+        active = 0
+        peak_active = 0
+        completed = 0
+        last_result: RequestResult | None = None
+        lock = threading.Lock()
+
+        def builder(
+            _origin: str,
+            user: VirtualUser,
+            phase: str,
+            _timeout: float,
+        ) -> RequestResult:
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.001)
+            with lock:
+                active -= 1
+            return RequestResult(
+                phase=phase,
+                method="GET",
+                path=f"/users/{user.user_id}",
+                status=200,
+                elapsed_ms=1.0,
+                ok=True,
+                response_bytes=1,
+                response_json={"large": "x" * 4096},
+            )
+
+        def consume(result: RequestResult) -> None:
+            nonlocal completed, last_result
+            self.assertIsNotNone(result.response_json)
+            completed += 1
+            last_result = result
+
+        class TrackingExecutor(ThreadPoolExecutor):
+            last: "TrackingExecutor | None" = None
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.pending = set()
+                self.peak_pending = 0
+                self.submitted = 0
+                type(self).last = self
+
+            def submit(self, *args, **kwargs):
+                future = super().submit(*args, **kwargs)
+                self.submitted += 1
+                self.pending.add(future)
+                self.peak_pending = max(self.peak_pending, len(self.pending))
+
+                def discard(completed_future) -> None:
+                    self.pending.discard(completed_future)
+
+                future.add_done_callback(discard)
+                return future
+
+        before = {
+            thread.name
+            for thread in threading.enumerate()
+            if thread.name.startswith("external-load")
+        }
+        with patch(
+            "tools.platform_external_load.ThreadPoolExecutor", TrackingExecutor
+        ):
+            returned = run_phase(
+                "https://old-sparky.com",
+                users,
+                phase="synthetic",
+                spread_seconds=0,
+                concurrency=4,
+                timeout=1,
+                request_builder=builder,
+                result_consumer=consume,
+            )
+
+        self.assertEqual(returned, [])
+        self.assertEqual(completed, len(users))
+        self.assertLessEqual(peak_active, 4)
+        self.assertEqual(TrackingExecutor.last.submitted, len(users))
+        self.assertLessEqual(TrackingExecutor.last.peak_pending, 4)
+        self.assertEqual(TrackingExecutor.last.pending, set())
+        self.assertIsNotNone(last_result)
+        self.assertIsNone(last_result.response_json)
+        self.assertEqual(active, 0)
+        self.assertEqual(
+            {
+                thread.name
+                for thread in threading.enumerate()
+                if thread.name.startswith("external-load")
+            },
+            before,
+        )
+
+    def test_sliding_phase_cancels_pending_work_on_deadline_signal(self) -> None:
+        users = [
+            VirtualUser(f"user-{index:08d}", "qa-tournament", "s" * 64, "c" * 64)
+            for index in range(8)
+        ]
+        started = threading.Event()
+
+        class DeadlineBudget:
+            def check(self, _phase: str, *, operation: str) -> None:
+                if operation == "future_complete":
+                    raise RuntimeError("synthetic deadline")
+
+            def remaining_seconds(self) -> float:
+                return 1.0
+
+            def remaining_runner_seconds(self) -> float:
+                return 1.0
+
+            def sleep(self, delay: float, _phase: str, *, operation: str) -> None:
+                time.sleep(delay)
+
+        def builder(
+            _origin: str,
+            _user: VirtualUser,
+            phase: str,
+            _timeout: float,
+        ) -> RequestResult:
+            started.set()
+            time.sleep(0.01)
+            return RequestResult(
+                phase=phase,
+                method="GET",
+                path="/health",
+                status=200,
+                elapsed_ms=1.0,
+                ok=True,
+                response_bytes=1,
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic deadline"):
+            run_phase(
+                "https://old-sparky.com",
+                users,
+                phase="synthetic-deadline",
+                spread_seconds=0,
+                concurrency=2,
+                timeout=1,
+                request_builder=builder,
+                budget=DeadlineBudget(),
+            )
+        self.assertTrue(started.is_set())
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and any(
+            thread.name.startswith("external-load")
+            for thread in threading.enumerate()
+        ):
+            time.sleep(0.005)
+        self.assertFalse(
+            any(
+                thread.name.startswith("external-load")
+                for thread in threading.enumerate()
+            )
+        )
+
+    def test_request_projects_only_route_correctness_fields(self) -> None:
+        class FakeResponse:
+            status = 200
+            headers = {"etag": '"etag-1"'}
+
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, size: int) -> bytes:
+                chunk, self.body = self.body[:size], self.body[size:]
+                return chunk
+
+        user = VirtualUser("user-00000001", "qa-tournament", "s" * 64, "c" * 64)
+        def request_with(body: bytes, *, method: str, path: str) -> RequestResult:
+            with patch(
+                "tools.platform_external_load.urlopen",
+                return_value=FakeResponse(body),
+            ):
+                return _request(
+                    "https://old-sparky.com",
+                    user,
+                    method=method,
+                    path=path,
+                    phase="synthetic",
+                    timeout=1.0,
+                    session_cookie_name="session",
+                    csrf_cookie_name="csrf",
+                )
+
+        read = request_with(
+            json.dumps({"secret": "must-not-survive", "changed": True}).encode(),
+            method="GET",
+            path="/tournaments/qa-tournament/workspace",
+        )
+        self.assertIsNone(read.response_json)
+        self.assertEqual(read.response_etag, '"etag-1"')
+        vote = request_with(
+            json.dumps(
+                {
+                    "code": "READY_VOTE_OVERLOADED",
+                    "retryable": True,
+                    "retry_after_ms": 250,
+                    "changed": True,
+                    "secret": "must-not-survive",
+                }
+            ).encode(),
+            method="POST",
+            path="/tournaments/qa-tournament/deadlock/ready-check/vote",
+        )
+        self.assertEqual(
+            vote.response_json,
+            {
+                "code": "READY_VOTE_OVERLOADED",
+                "retryable": True,
+                "retry_after_ms": 250,
+                "changed": True,
+            },
+        )
+        self.assertNotIn("secret", json.dumps(vote.response_json))
+
     def test_read_mix_uses_the_current_tournament_page_request(self) -> None:
         route = _route_for_read(0, "qa-tournament")
 
@@ -311,7 +574,7 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertIsNotNone(result.exception_at_utc)
         self.assertIsNotNone(result.finished_at_utc)
 
-    def test_diagnostic_summary_keeps_every_failed_request_not_only_error_sample_cap(self) -> None:
+    def test_diagnostic_summary_caps_rows_and_reports_totals(self) -> None:
         results = [
             RequestResult(
                 phase="diagnostic",
@@ -330,7 +593,9 @@ class ExternalLoadTests(unittest.TestCase):
         summary = summarize_results(results)
 
         self.assertEqual(len(summary["error_samples"]), 25)
-        self.assertEqual(len(summary["timeout_diagnostics"]), 26)
+        self.assertEqual(len(summary["timeout_diagnostics"]), 25)
+        self.assertEqual(summary["timeout_diagnostic_total"], 26)
+        self.assertEqual(summary["timeout_diagnostic_truncated"], 1)
 
     def test_ready_vote_retries_only_explicit_overload_and_reports_logical_latency(self) -> None:
         _, users = load_manifest_from_payload(manifest_payload())

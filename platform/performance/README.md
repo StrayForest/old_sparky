@@ -224,6 +224,27 @@ before signalling. Stale/reused PIDs or an ambiguous/restarting tree are not
 profiled. See the [observer implementation](../tools/platform_external_load_observer.py)
 and the [workflow binding check](../../.github/workflows/platform-production-external-load.yml).
 
+### External-load memory and diagnostic bounds
+
+The external client uses a sliding `FIRST_COMPLETED` window: at most the
+configured HTTP concurrency worth of futures/results is live, and the next
+action is submitted only after one completion has been reduced. A streaming
+phase accumulator keeps counters and compact eight-byte numeric sample arrays;
+the historical sorted linear-interpolation percentile algorithm is unchanged.
+Its sample population is bounded by the selected profile's planned attempt
+count, and the report is rendered only after those accounted samples are
+reduced. Completed request objects, response bodies and parsed payloads are
+released immediately. Read/page routes retain only status, ETag, byte count
+and timing; Ready Vote retains only `code`, `retryable`, `retry_after_ms`,
+`changed` and the state-read `active_round.ready_count` correctness fields.
+
+`error_samples` and `timeout_diagnostics` retain the deterministic first 25
+rows per summary. The corresponding `*_total` and `*_truncated` counters make
+discarded diagnostics explicit; no response body, secret, raw URL or
+diagnostic identifier is added to those rows. These bounds do not change the
+profile rates, durations, thresholds, status counters, correctness checks or
+percentile math.
+
 CPU-profile files whose PID is not among the workers armed for this observer
 window are ignored for the private authoritative summary, never deleted, and
 remain caller/host retention artifacts. The private observer reports that

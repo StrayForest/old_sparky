@@ -757,6 +757,10 @@ PUBLIC_SUMMARY_INT_FIELDS = frozenset(
         "mismatches",
         "cf_ray_present",
         "cf_ray_count",
+        "error_sample_total",
+        "error_sample_truncated",
+        "timeout_diagnostic_total",
+        "timeout_diagnostic_truncated",
     }
 )
 PUBLIC_SUMMARY_NUMBER_FIELDS = frozenset(
