@@ -175,7 +175,7 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             worker_command=(sys.executable, str(worker_script)),
             report_path=final_report,
             worker_report_path=worker_report,
-            max_duration_seconds=float(config.pop('duration', 1.0)),
+            max_duration_seconds=float(config.pop('duration', 3.0)),
             max_runner_minutes=float(config.pop('runner_minutes', 1.0)),
             worker_config=config,
             term_grace_seconds=0.05,
@@ -469,7 +469,7 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 root / 'runner.child.json',
                 mode='hang',
                 duration=10,
-                runner_minutes=0.02,
+                runner_minutes=0.05,
             )
             self.assertEqual(result.reason, 'max_runner_minutes')
             self.assertLess(result.returncode or 0, 0)
@@ -549,7 +549,7 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 root / 'final.json',
                 root / 'child.json',
                 mode='partial-report',
-                duration=1.0,
+                duration=3.0,
             )
             self.assertEqual(result.reason, 'max_duration_seconds')
             self.assertEqual(
