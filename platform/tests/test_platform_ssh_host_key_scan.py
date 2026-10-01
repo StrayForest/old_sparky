@@ -27,6 +27,40 @@ WRONG_FINGERPRINT_KEY = (
 )
 WRONG_FINGERPRINT = "SHA256:LddYowaSeS4K43x8OABxsQ5x/hf1iykbdiUbyDF3CR4"
 
+# This is an explicit inventory of the workflows that currently own SSH host
+# verification.  Keep it independent from workflow discovery: removing a
+# workflow must fail this contract until its ownership is intentionally
+# removed from the reviewed architecture.
+EXPECTED_SCAN_WORKFLOWS = frozenset(
+    {
+        "platform-cloudflare-range-alert.yml",
+        "platform-live-launch.yml",
+        "platform-live-user-qa.yml",
+        "platform-media-migration-diagnostics.yml",
+        "platform-patch-translation-qa.yml",
+        "platform-production-as12-proof.yml",
+        "platform-production-backup.yml",
+        "platform-production-content-diagnostics.yml",
+        "platform-production-deploy.yml",
+        "platform-production-external-load.yml",
+        "platform-production-profile-review-fixture.yml",
+        "platform-production-recovery-bootstrap-abort.yml",
+        "platform-production-release-abort.yml",
+        "platform-production-release-recover.yml",
+        "platform-production-retained-load-abort.yml",
+        "platform-production-retained-load-cleanup.yml",
+        "platform-production-service-recovery.yml",
+        "platform-production-storage-diagnostics.yml",
+        "platform-production-storage-maintenance.yml",
+        "platform-production-web-runtime-diagnostics.yml",
+    }
+)
+LEGACY_DIAGNOSTICS_WORKFLOW = "platform-production-diagnostics.yml"
+PATCH_DIAGNOSTICS_WORKFLOW = "platform-production-content-diagnostics.yml"
+TRANSLATION_OWNER_WORKFLOW = "platform-patch-translation-qa.yml"
+EXPECTED_SCAN_SITE_COUNT = 23
+EXPECTED_STANDARD_SCAN_COUNT = 22
+
 
 def _workflow_runs(path: Path) -> list[tuple[str, int, str]]:
     document = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -79,6 +113,7 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
     def test_every_workflow_site_uses_the_same_bounded_pinned_contract(self) -> None:
         site_count = 0
         workflow_count = 0
+        scanned_workflows: set[str] = set()
         standard_blocks: list[str] = []
         as12_blocks: list[str] = []
         paths = sorted((*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")))
@@ -88,6 +123,7 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
             if not scan_runs:
                 continue
             workflow_count += 1
+            scanned_workflows.add(path.name)
             active_text = _active_shell_text(runs)
             self.assertNotIn("ssh-keyscan -T 10", active_text, path.name)
             self.assertNotIn("StrictHostKeyChecking no", active_text, path.name)
@@ -132,9 +168,19 @@ class ProductionSSHHostKeyScanContractTests(unittest.TestCase):
                     else standard_blocks
                 )
                 target.append(block)
-        self.assertEqual(workflow_count, 21)
-        self.assertEqual(site_count, 24)
-        self.assertEqual(len(standard_blocks), 23)
+        self.assertEqual(scanned_workflows, EXPECTED_SCAN_WORKFLOWS)
+        self.assertEqual(workflow_count, len(EXPECTED_SCAN_WORKFLOWS))
+        self.assertNotIn(LEGACY_DIAGNOSTICS_WORKFLOW, scanned_workflows)
+        self.assertFalse((WORKFLOW_DIR / LEGACY_DIAGNOSTICS_WORKFLOW).exists())
+        self.assertIn(PATCH_DIAGNOSTICS_WORKFLOW, scanned_workflows)
+        patch_owner = (WORKFLOW_DIR / PATCH_DIAGNOSTICS_WORKFLOW).read_text(encoding="utf-8")
+        self.assertIn("platform_content_diagnostics.py", patch_owner)
+        self.assertIn("refresh_content_distribution", patch_owner)
+        self.assertNotIn("translate_patch_to_russian", patch_owner)
+        self.assertNotIn("MAX_OPENAI_CALLS", patch_owner)
+        self.assertIn(TRANSLATION_OWNER_WORKFLOW, EXPECTED_SCAN_WORKFLOWS)
+        self.assertEqual(site_count, EXPECTED_SCAN_SITE_COUNT)
+        self.assertEqual(len(standard_blocks), EXPECTED_STANDARD_SCAN_COUNT)
         self.assertEqual(len(set(standard_blocks)), 1)
         self.assertEqual(len(as12_blocks), 1)
         self.assertEqual(

@@ -2,6 +2,11 @@ name: Platform production content diagnostics
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Exact source SHA currently deployed on the production VPS"
+        required: true
+        type: string
   workflow_run:
     workflows: ["Platform production deploy"]
     types: [completed]
@@ -9,12 +14,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: platform-production-deploy
+  cancel-in-progress: false
+
 jobs:
   validate-content-provenance:
     name: Validate content diagnostics handoff
     outputs:
       deploy_ready: ${{ steps.deployment_provenance.outputs.deploy_ready }}
       provenance_digest: ${{ steps.deployment_provenance.outputs.provenance_digest }}
+      trusted_source_sha: ${{ steps.trusted_default.outputs.sha }}
+      trusted_helper_digest: ${{ steps.stage_diagnostics_helper.outputs.digest }}
     permissions:
       actions: read
       contents: read
@@ -26,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.expected_sha }}
       SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
       SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
       SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
@@ -78,6 +89,46 @@ jobs:
           ref: ${{ steps.trusted_default.outputs.sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Stage trusted diagnostics helper
+        id: stage_diagnostics_helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper_dir="$RUNNER_TEMP/platform-content-diagnostics-helper"
+          install -d -m 700 "$helper_dir"
+          test -f platform/tools/platform_content_diagnostics.py
+          test ! -L platform/tools/platform_content_diagnostics.py
+          install -m 600 platform/tools/platform_content_diagnostics.py \
+            "$helper_dir/platform_content_diagnostics.py"
+          test -f "$helper_dir/platform_content_diagnostics.py"
+          test ! -L "$helper_dir/platform_content_diagnostics.py"
+          test "$(stat -c '%a' "$helper_dir/platform_content_diagnostics.py")" = 600
+          digest="$(sha256sum "$helper_dir/platform_content_diagnostics.py" | awk '{print $1}')"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Upload trusted diagnostics helper
+        if: ${{ success() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-content-diagnostics-helper-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-content-diagnostics-helper
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Validate content diagnostics input
+        shell: bash
+        env:
+          TARGET_SHA: ${{ env.TARGET_SHA }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            test "$GITHUB_REF" = "refs/heads/dev" \
+              || { echo "Production content diagnostics must run from dev." >&2; exit 1; }
+          fi
+          /usr/bin/python3 -I platform/tools/platform_workflow_input_guard.py sha \
+            --value "$TARGET_SHA"
 
       - name: Verify exact completed production deployment provenance (shared validator)
         id: deployment_provenance
@@ -230,12 +281,37 @@ jobs:
     timeout-minutes: 10
     environment: production
     env:
-      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.expected_sha }}
       SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
       SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
       SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
+      DIAGNOSTICS_TOOL: ${{ runner.temp }}/platform-content-diagnostics-helper/platform_content_diagnostics.py
 
     steps:
+      - name: Download trusted diagnostics helper
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-content-diagnostics-helper-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-content-diagnostics-helper
+
+      - name: Verify trusted diagnostics helper digest
+        shell: bash
+        env:
+          EXPECTED_HELPER_DIGEST: ${{ needs.validate-content-provenance.outputs.trusted_helper_digest }}
+        run: |
+          set -euo pipefail
+          helper_dir="$RUNNER_TEMP/platform-content-diagnostics-helper"
+          test -d "$helper_dir" && test ! -L "$helper_dir"
+          mapfile -t helper_entries < <(find "$helper_dir" -mindepth 1 -maxdepth 1 -print)
+          test "${#helper_entries[@]}" -eq 1
+          test "${helper_entries[0]}" = "$DIAGNOSTICS_TOOL"
+          test -f "$DIAGNOSTICS_TOOL" && test ! -L "$DIAGNOSTICS_TOOL"
+          chmod 600 "$DIAGNOSTICS_TOOL"
+          actual_digest="$(sha256sum "$DIAGNOSTICS_TOOL" | awk '{print $1}')"
+          [[ "$EXPECTED_HELPER_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          test "$actual_digest" = "$EXPECTED_HELPER_DIGEST"
+          test "$(stat -c '%a' "$DIAGNOSTICS_TOOL")" = 600
+
       - name: Consume validated deployment provenance
         if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
         shell: bash
@@ -300,7 +376,149 @@ jobs:
           chmod 600 "$ssh_dir/known_hosts"
           printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
+      - name: Verify latest patch distribution
+        id: patch_distribution
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          remote_log="$RUNNER_TEMP/platform-production-content-diagnostics-patch.log"
+          remote_error="$RUNNER_TEMP/platform-production-content-diagnostics-patch-error.log"
+          : >"$remote_log"
+          : >"$remote_error"
+          chmod 600 "$remote_log" "$remote_error"
+          set +e
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -F "$SSH_DIR/config" \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$TARGET_SHA" >"$remote_log" 2>"$remote_error" <<'REMOTE'
+          set -Eeuo pipefail
+          target_sha="$1"
+          runtime=/opt/oldsparky/platform
+          guard="$runtime/current/tools/platform_release_lock_exec.sh"
+          test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
+            || { echo "Production mutation guard is missing" >&2; exit 1; }
+          /bin/bash "$guard" \
+            --app-dir "$runtime" \
+            --expected-sha "$target_sha" \
+            -- /bin/bash -s <<'MUTATION'
+          set -Eeuo pipefail
+          runtime=/opt/oldsparky/platform
+          cd "$runtime/current"
+          export PLATFORM_APP_DIR="$runtime"
+          export PLATFORM_SHARED_DIR="$runtime/shared"
+          export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          export PLATFORM_PYTHON_BIN="$runtime/shared/venv/bin/python"
+          source "$runtime/current/tools/platform_runtime_common.sh"
+          platform_load_env_file
+          export PYTHONPATH="$runtime/current"
+          probe_dir="$(mktemp -d /tmp/oldsparky-content-diagnostics.XXXXXX)"
+          chmod 700 "$probe_dir"
+          trap 'rm -rf -- "$probe_dir"' EXIT
+          "$runtime/shared/venv/bin/python" - "$probe_dir" <<'PY' >/dev/null
+          import asyncio
+          import json
+          from pathlib import Path
+          import sys
+
+          import httpx
+
+          from apps.platform_api.app.services import home_content_security
+
+
+          async def fetch_detail(client: httpx.AsyncClient, url: str) -> dict[str, object]:
+              response = await client.get(url)
+              response.raise_for_status()
+              payload = response.json()
+              if not isinstance(payload, dict):
+                  raise ValueError("patch detail response is not an object")
+              return payload
+
+
+          async def main(output_dir: Path) -> None:
+              home = await home_content_security.refresh_content_distribution(force=True)
+              if not isinstance(home, dict) or home.get("patches_available") is not True:
+                  raise ValueError("patch distribution is unavailable")
+              (output_dir / "home.json").write_text(
+                  json.dumps(home, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8",
+              )
+              patches = home.get("patches") if isinstance(home, dict) else None
+              if not isinstance(patches, list) or not patches:
+                  raise ValueError("patch distribution is empty")
+              latest = patches[0]
+              latest_id = latest.get("id") if isinstance(latest, dict) else None
+              if not isinstance(latest_id, str):
+                  raise ValueError("latest patch identifier is unavailable")
+              internal_detail = await home_content_security.get_cached_patch_detail(latest_id)
+              if internal_detail is None:
+                  raise ValueError("structured patch detail is unavailable")
+              (output_dir / "internal.json").write_text(
+                  json.dumps(internal_detail, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8",
+              )
+              async with httpx.AsyncClient(
+                  timeout=15,
+                  follow_redirects=False,
+                  headers={"Accept": "application/json"},
+              ) as client:
+                  internal_api, public_api = await asyncio.gather(
+                      fetch_detail(
+                          client,
+                          f"http://127.0.0.1:8010/api/v1/content/patches/{latest_id}",
+                      ),
+                      fetch_detail(
+                          client,
+                          f"https://old-sparky.com/api/v1/content/patches/{latest_id}",
+                      ),
+                  )
+              (output_dir / "internal-api.json").write_text(
+                  json.dumps(internal_api, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8",
+              )
+              (output_dir / "public-api.json").write_text(
+                  json.dumps(public_api, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8",
+              )
+
+
+          asyncio.run(main(Path(sys.argv[1])))
+          PY
+          /usr/bin/python3 "$runtime/current/tools/platform_content_diagnostics.py" verify \
+            --home "$probe_dir/home.json" \
+            --internal "$probe_dir/internal.json" \
+            --internal-api "$probe_dir/internal-api.json" \
+            --public-api "$probe_dir/public-api.json"
+          MUTATION
+          REMOTE
+          remote_status=$?
+          set -e
+          if (( remote_status != 0 )); then
+            rm -f -- "$remote_log" "$remote_error"
+            /usr/bin/python3 "$DIAGNOSTICS_TOOL" failure-summary \
+              --error-class remote_or_transport
+            exit 1
+          fi
+          if ! summary_line="$(/usr/bin/python3 "$DIAGNOSTICS_TOOL" parse-summary \
+            --file "$remote_log" --require-passed --exit-code "$remote_status")"; then
+            rm -f -- "$remote_log" "$remote_error"
+            /usr/bin/python3 "$DIAGNOSTICS_TOOL" failure-summary \
+              --error-class malformed
+            exit 1
+          fi
+          printf '%s\n' "$summary_line"
+          printf 'summary_line=%s\n' "$summary_line" >> "$GITHUB_OUTPUT"
+          rm -f -- "$remote_log" "$remote_error"
+
       - name: Probe and refresh production home content
+        id: home_content
         if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
         shell: bash
         env:
@@ -378,7 +596,7 @@ jobs:
           PY
 
           echo '=== Forced home content refresh ==='
-          tools/platform_refresh_home_content.sh >/dev/null 2>/dev/null
+          tools/platform_refresh_content_distribution.sh >/dev/null 2>/dev/null
 
           echo '=== Local API home content and live page shape ==='
           "$python_bin" - <<'PY'
@@ -515,6 +733,36 @@ jobs:
           printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=passed error_class=none'
           rm -f -- "$remote_log" "$remote_error"
 
+      - name: Write sanitized aggregate diagnostic evidence
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PATCH_OUTCOME: ${{ steps.patch_distribution.outcome }}
+          PATCH_SUMMARY: ${{ steps.patch_distribution.outputs.summary_line }}
+          CONTENT_OUTCOME: ${{ steps.home_content.outcome }}
+        run: |
+          set -euo pipefail
+          umask 077
+          aggregate="$RUNNER_TEMP/platform-production-content-diagnostics-aggregate.json"
+          /usr/bin/python3 "$DIAGNOSTICS_TOOL" evidence \
+            --output "$aggregate" \
+            --target-sha "$TARGET_SHA" \
+            --event "$GITHUB_EVENT_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --patch-outcome "$PATCH_OUTCOME" \
+            --patch-summary "$PATCH_SUMMARY" \
+            --content-outcome "$CONTENT_OUTCOME"
+
+      - name: Upload sanitized aggregate diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-content-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-production-content-diagnostics-aggregate.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Remove production SSH material
         id: cleanup_ssh
         if: ${{ always() }}
@@ -546,8 +794,12 @@ jobs:
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
           rm -f -- \
+            "$RUNNER_TEMP/platform-production-content-diagnostics-patch.log" \
+            "$RUNNER_TEMP/platform-production-content-diagnostics-patch-error.log" \
             "$RUNNER_TEMP/platform-production-content-diagnostics.log" \
             "$RUNNER_TEMP/platform-production-content-diagnostics-error.log"
+          test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics-patch.log"
+          test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics-patch-error.log"
           test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics.log"
           test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics-error.log"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"

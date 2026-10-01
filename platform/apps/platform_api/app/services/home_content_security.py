@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import logging
+import re
 from secrets import token_urlsafe
 from typing import Any
 
@@ -13,17 +15,93 @@ from apps.platform_api.app.services import home_content as base
 from apps.platform_api.app.services.external_content_http import (
     BoundedNoRedirectAsyncClient,
 )
-from apps.platform_api.app.services.patch_translation import (
-    ensure_patch_translation_records,
-)
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.redis import redis_client
 
 
 logger = logging.getLogger(__name__)
+_PATCH_ID_RE = re.compile(r"^[0-9]{1,32}$")
+
+
+@dataclass(frozen=True)
+class _ContentRefreshResult:
+    payload: dict[str, Any]
+    patch_details: dict[str, dict[str, Any]]
+    patches_available: bool
+
+
+def _cached_result(payload: dict[str, Any]) -> _ContentRefreshResult:
+    return _ContentRefreshResult(
+        payload=payload,
+        patch_details={},
+        patches_available=payload.get("patches_available") is True,
+    )
 
 
 async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
+    """Refresh public content and maintain the normal translation/sitemap path."""
+
+    result = await _refresh_home_content(force=force)
+    translation_registration_succeeded = True
+    if result.patch_details:
+        # Keep the translation subsystem out of the translation-free diagnostic
+        # owner below.  Import lazily so merely importing this hardened module
+        # cannot load or initialize OpenAI/Celery code.
+        from apps.platform_api.app.services.patch_translation import (
+            ensure_patch_translation_records,
+        )
+
+        try:
+            translation_registration = await ensure_patch_translation_records(
+                result.patch_details
+            )
+            if translation_registration["enqueue_failures"]:
+                logger.error(
+                    "home_content_translation_registration_degraded registered=%s enqueued=%s failures=%s",
+                    translation_registration["registered"],
+                    translation_registration["enqueued"],
+                    translation_registration["enqueue_failures"],
+                )
+        except Exception:
+            translation_registration_succeeded = False
+            logger.exception("home_content_translation_registration_failed")
+    if translation_registration_succeeded and result.patches_available and result.patch_details:
+        await base.publish_patch_sitemap_index(result.payload["patches"])
+    return result.payload
+
+
+async def refresh_content_distribution(*, force: bool = False) -> dict[str, Any]:
+    """Refresh patch/video distribution without translation or Celery side effects.
+
+    Production diagnostics use this narrow owner.  It intentionally shares the
+    bounded cache/upstream refresh implementation but never imports, registers,
+    translates, or enqueues patch translations and never publishes the sitemap.
+    """
+
+    result = await _refresh_home_content(force=force)
+    return result.payload
+
+
+async def get_cached_patch_detail(patch_id: str) -> dict[str, Any] | None:
+    """Read a structured cached patch detail without translation fallback."""
+
+    if _PATCH_ID_RE.fullmatch(str(patch_id)) is None:
+        return None
+    cache = redis_client()
+    try:
+        encoded = await cache.get(base.PATCH_DETAIL_KEY_PREFIX + str(patch_id))
+    finally:
+        await cache.aclose()
+    if not encoded:
+        return None
+    try:
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+async def _refresh_home_content(*, force: bool = False) -> _ContentRefreshResult:
     """Refresh public content through bounded, no-redirect upstream I/O."""
 
     settings = get_settings()
@@ -34,7 +112,7 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
         if not force:
             cached = await base._read_json(cache, base.HOME_CONTENT_KEY)
             if cached is not None:
-                return cached
+                return _cached_result(cached)
         stale = await base._read_json(cache, base.HOME_CONTENT_STALE_KEY)
         acquired = bool(
             await cache.set(
@@ -46,9 +124,9 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
         )
         if not acquired:
             if stale is not None:
-                return stale
+                return _cached_result(stale)
             await asyncio.sleep(0.2)
-            return (
+            return _cached_result(
                 await base._read_json(cache, base.HOME_CONTENT_KEY)
                 or base._empty_home_content()
             )
@@ -159,31 +237,11 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
                     ex=base.PATCH_DETAIL_TTL_SECONDS,
                 )
             await pipeline.execute()
-        translation_registration_succeeded = True
-        if patch_details:
-            try:
-                translation_registration = await ensure_patch_translation_records(
-                    patch_details
-                )
-                if translation_registration["enqueue_failures"]:
-                    logger.error(
-                        "home_content_translation_registration_degraded registered=%s enqueued=%s failures=%s",
-                        translation_registration["registered"],
-                        translation_registration["enqueued"],
-                        translation_registration["enqueue_failures"],
-                    )
-            except Exception:
-                translation_registration_succeeded = False
-                logger.exception(
-                    "home_content_translation_registration_failed"
-                )
-        if (
-            translation_registration_succeeded
-            and not isinstance(steam_result, Exception)
-            and patch_details
-        ):
-            await base.publish_patch_sitemap_index(patches)
-        return payload
+        return _ContentRefreshResult(
+            payload=payload,
+            patch_details=patch_details,
+            patches_available=not isinstance(steam_result, Exception),
+        )
     finally:
         if acquired:
             await cache.eval(

@@ -165,6 +165,20 @@ its result. It must not run in a polling loop or be described as a pure QA
 check. A read-only check must fail on cache miss instead of invoking the
 translator.
 
+`Platform production content diagnostics` is a separate owner and does not
+translate patches or call OpenAI. It only forces the hardened patch refresh,
+checks that the refreshed home payload advertises available non-empty patches,
+and verifies that the latest numeric patch ID and non-empty schema-valid
+sections agree across the internal and public APIs. Keep the translation
+regression set and its `MAX_OPENAI_CALLS` budget in
+`platform-patch-translation-qa.yml`; do not add a second production
+translation owner. Its refresh calls the translation-free distribution API and
+does not register records, enqueue Celery work or perform an OpenAI fallback.
+The production workflow invokes `tools/platform_refresh_content_distribution.sh`
+for that owner-layer refresh; the normal
+`tools/platform_refresh_home_content.py` path remains translation-enabled for
+worker/startup callers.
+
 Manual/diagnostic comparison is still required when changing prompt/glossary behavior because numeric correctness alone cannot detect terminology mistakes, item/mechanic ambiguity, prose truncation or awkward Russian phrasing.
 
 ## Code owners
@@ -175,5 +189,6 @@ Manual/diagnostic comparison is still required when changing prompt/glossary beh
 - `apps/platform_api/app/services/patch_translation_runtime.py` — model input/context, prompt-cache key, request, validation, result cache and merge flow.
 - `apps/platform_worker/worker.py` — background scheduling/execution.
 - `python_packages/platform_infra/models.py` and the corresponding Alembic revision — durable translation state and its identity constraints.
-- `tools/platform_refresh_home_content.py` — operator/startup refresh without a second translation enqueue path.
+- `tools/platform_refresh_home_content.py` — operator/startup refresh with the normal translation registration path.
+- `tools/platform_refresh_content_distribution.py` and `.sh` — translation-free production diagnostics refresh owner.
 - `tests/test_platform_patch_translation*.py` — regression coverage.

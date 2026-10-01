@@ -70,7 +70,7 @@ and user identity to be idle, accepts only root-owned non-symlink
 contract, and always retains at least the newest valid unprotected fallback.
 The keep count is a hard cap for unprotected caches, not an age window.
 Health monitoring and storage maintenance share one conservative hard gate: available free space must be at least 5 GiB and conservative use (`total - available`, including filesystem-reserved headroom) must be at most 85%; exact 5 GiB and 85% boundaries pass, and 80% is not a failure threshold.
-The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.
+The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it. The manual `platform-production-content-diagnostics.yml` workflow requires the exact deployed `expected_sha` and retains only a sanitized aggregate for fourteen days; translation remains in its separate controlled warm-up.
 
 Application services write structured JSON to journald. Nginx remains the
 request-log owner, so the production Gunicorn access stream is disabled to

@@ -19,6 +19,7 @@ OWNED_SECRET_WORKFLOWS = {
     "platform-production-retained-load-abort.yml": ("abort",),
     "platform-production-retained-load-cleanup.yml": ("cleanup",),
     "platform-production-service-recovery.yml": ("recover-web",),
+    "platform-production-content-diagnostics.yml": ("content-diagnostics",),
     "platform-production-storage-diagnostics.yml": ("collect",),
     "platform-production-storage-maintenance.yml": ("maintenance",),
 }

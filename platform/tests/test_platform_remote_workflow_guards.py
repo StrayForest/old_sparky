@@ -603,6 +603,37 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
         self.assertNotIn("operator", rendered.stdout)
         self.assertNotIn("production.example.test", rendered.stdout)
 
+    def test_content_diagnostics_owns_patch_distribution_without_translation(self) -> None:
+        workflow_path = WORKFLOW_ROOT / "platform-production-content-diagnostics.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
+
+        self.assertIn("  workflow_dispatch:\n    inputs:\n      expected_sha:", workflow)
+        self.assertIn("        required: true", workflow)
+        self.assertNotIn("\n  push:\n", workflow)
+        self.assertIn("platform_workflow_input_guard.py sha", workflow)
+        self.assertIn("platform_release_lock_exec.sh", workflow)
+        self.assertIn("--expected-sha", workflow)
+        self.assertIn("home_content_security.refresh_content_distribution(force=True)", workflow)
+        self.assertIn("home_content_security.get_cached_patch_detail", workflow)
+        self.assertIn("platform_content_diagnostics.py", workflow)
+        self.assertIn("parse-summary", workflow)
+        self.assertIn("--require-passed", workflow)
+        self.assertIn("Write sanitized aggregate diagnostic evidence", workflow)
+        self.assertIn("evidence", workflow)
+        self.assertIn("127.0.0.1:8010/api/v1/content/patches", workflow)
+        self.assertIn("https://old-sparky.com/api/v1/content/patches", workflow)
+        self.assertIn("failure-summary", workflow)
+        self.assertIn("trusted_source_sha", workflow)
+        self.assertIn("expected_sha:", workflow)
+        self.assertIn("Upload sanitized aggregate diagnostic evidence", workflow)
+        self.assertIn("retention-days: 14", workflow)
+        self.assertNotIn("translate_patch_to_russian", workflow)
+        self.assertNotIn("MAX_OPENAI_CALLS", workflow)
+        self.assertNotIn("refresh_home_content(force=True)", workflow)
+        self.assertNotIn("ensure_patch_translation_records", workflow)
+        self.assertNotIn("patch_detail_security", workflow)
+        self.assertFalse((WORKFLOW_ROOT / "platform-production-diagnostics.yml").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

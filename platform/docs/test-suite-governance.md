@@ -476,6 +476,23 @@ reviewed guard before exposing an SSH secret; host-side revalidation fails
 closed when the installed helper is absent or returns an error. The canonical
 load-profile registry remains the owner of profile IDs and dispatchability.
 
+Production content diagnostics has one narrow owner: it refreshes and verifies
+the latest patch distribution, then compares the internal and public patch API
+responses under the active-release lock. It requires `patches_available`, a
+non-empty numeric latest ID and non-empty schema-valid sections; a malformed,
+empty or failed producer result cannot become a successful workflow. Its
+workflow-dispatch path is bound to a required exact `expected_sha`, and its
+aggregate evidence is sanitized before the fourteen-day artifact upload.
+The closed summary, section projection/parity check and evidence writer live in
+the stdlib-only `platform/tools/platform_content_diagnostics.py` contract; the
+diagnostic refresh owner never registers or enqueues translations. The
+credential-bearing job consumes only the digest-bound helper artifact staged by
+the trusted provenance job; it never checks out candidate code.
+Russian translation and every OpenAI call belong only to
+`platform-patch-translation-qa.yml`, which owns the explicit
+`MAX_OPENAI_CALLS` budget. Content diagnostics must not grow a second
+translation contour.
+
 The canonical load-profile registry is `platform/performance/`.
 Profiles record fixture shape, logical actions, HTTP attempts, concurrency,
 spread/ramp, retry semantics, expected statuses, correctness, latency budgets,
