@@ -213,12 +213,19 @@ are never printed in the browser report. With `provision=false`, the handoff
 contains an empty marker and the remote supervisor runs the browser contour
 without rotating or creating the CSP QA bundle.
 
-The workflow publishes success only when the remote command exits zero, its
-bounded output is complete, and the output contains the full-line structured
-record `LIVE_BROWSER_QA_SUCCESS source_commit=<target-sha>` with the exact
-40-character target SHA. Marker-only, wrong or truncated SHA records, embedded
-substring matches and nonzero remote evidence fail the gate; the raw report is
-removed before any sanitized artifact is uploaded.
+The remote dispatcher crosses the root-owned trusted launch helper with an
+explicit minimal environment: the target-bound release root, full target SHA,
+canonical origin, provision mode, marker and the reviewed operation timeout.
+The helper rejects any missing or mismatched value before it verifies the
+active generation. Child stdout/stderr stay private to the dispatcher; after a
+zero exit and a second active-generation verification, the dispatcher alone
+prints one structured record. The workflow publishes success only when the
+remote command exits zero, its bounded output is complete, and the entire raw
+report is exactly one full-line structured record with the exact 40-character
+target SHA (`LIVE_BROWSER_QA_SUCCESS source_commit=<target-sha>`).
+Duplicate, marker-only, extra/failure, wrong or truncated SHA records,
+embedded substring matches and nonzero remote evidence fail the gate; the raw
+report is removed before any sanitized artifact is uploaded.
 
 To rotate a stale existing bundle, dispatch the same launch workflow with
 `provision=true` and a fresh marker. The provisioner does not unlink the old
