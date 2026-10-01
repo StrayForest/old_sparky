@@ -310,9 +310,10 @@ The production deploy workflow acquires the release lock before the retained
 load lock (`/run/lock/oldsparky-retained-load-matrix.lock`) and keeps both
 through candidate activation, runtime-profile changes, service
 restart/readiness, final smoke and the commit boundary. Retained-load and
-cleanup take only the load lock; storage maintenance acquires release then
-load; rollback, release recovery and service recovery take only the release
-lock. This is the only lock ordering and has no reverse edge. Release recovery
+cleanup take only the load lock; storage maintenance uses the supervisor's
+release -> retained-load -> source/build -> live-QA -> backup order; rollback,
+release recovery and service recovery take only the release lock. No path uses
+a reverse edge. Release recovery
 passes its inherited release-lock file descriptor through
 rollback and runtime restoration, so Nginx and readiness are not changed after
 the lock is released.

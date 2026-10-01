@@ -987,7 +987,20 @@ def upload_and_verify(
     )
 
 
-def execute(args: argparse.Namespace) -> dict[str, Any]:
+def execute(
+    args: argparse.Namespace, *, capability: object | None = None
+) -> dict[str, Any]:
+    if args.apply:
+        if capability is None:
+            raise OffsiteBackupError(
+                "off-site mutation requires the in-process backup supervisor",
+                ExitCode.CONFIGURATION,
+            )
+        try:
+            from . import platform_backup_supervisor as supervisor
+        except ImportError:
+            import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+        supervisor.require_mutation_capability(capability, "offsite")
     validate_timeout(args.timeout)
     config = load_config(args.env_file, args.platform_env_file, apply=args.apply)
     backup = select_verified_backup(
@@ -1066,7 +1079,21 @@ def _print_result(result: dict[str, Any], *, as_json: bool) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        result = execute(args)
+        if args.apply:
+            # Production off-site mutation belongs to the lock/evidence
+            # supervisor.  ``execute`` remains a library primitive for
+            # hermetic tests and local dry-run callers; no ambient environment
+            # variable or inherited FD can grant this path authority.
+            try:
+                from . import platform_backup_supervisor as supervisor
+            except ImportError:
+                import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+            result = supervisor.run_offsite_entrypoint(
+                args,
+                app_dir=Path("/opt/oldsparky/platform"),
+            )
+        else:
+            result = execute(args)
         _print_result(result, as_json=args.as_json)
         return int(ExitCode.OK)
     except OffsiteBackupError as exc:

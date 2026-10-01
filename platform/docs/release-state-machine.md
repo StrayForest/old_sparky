@@ -43,10 +43,11 @@ Production deploy has one additional lock edge: it acquires the release lock
 first, then `/run/lock/oldsparky-retained-load-matrix.lock`, and holds both
 through candidate activation, runtime-profile mutation, service
 restart/readiness, final smoke and the success boundary. Retained-load and
-cleanup acquire only the second lock; storage maintenance acquires the release
-lock and then the second lock; rollback, release recovery and service recovery
-acquire only the release lock. No path acquires these locks in the reverse
-order, so deploy cannot deadlock with a retained-load, maintenance or recovery
+cleanup acquire only the second lock; storage maintenance uses the supervisor's
+release -> retained-load -> source/build -> live-QA -> backup order; rollback,
+release recovery and service recovery acquire only the release lock. No path
+acquires these locks in the reverse order, so deploy cannot deadlock with a
+retained-load, maintenance or recovery
 operation. Recovery passes the inherited release-lock file descriptor through
 rollback and runtime restore and keeps it held for the final Nginx/readiness checks.
 

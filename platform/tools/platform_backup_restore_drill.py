@@ -653,7 +653,30 @@ def _new_backup_identity(
     raise RuntimeError("Could not allocate a unique platform backup run_id.")
 
 
-def create_backup(args: argparse.Namespace) -> dict[str, Any]:
+def create_backup(
+    args: argparse.Namespace,
+    *,
+    prune: bool = True,
+    capability: object | None = None,
+) -> dict[str, Any]:
+    """Create one archive/manifest pair.
+
+    Rotation is supervisor-owned in production.  ``prune=False`` is an
+    in-process handoff used only by ``platform_backup_supervisor``; keeping the
+    primitive parameterized also lets the focused producer tests exercise the
+    publication contract without acquiring the host-wide lock.  The command
+    line mutation path is routed by :func:`main` through the supervisor.
+    """
+    if not prune:
+        if capability is None:
+            raise RuntimeError(
+                "supervisor-owned backup creation requires an in-process capability"
+            )
+        try:
+            from . import platform_backup_supervisor as supervisor
+        except ImportError:
+            import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+        supervisor.require_mutation_capability(capability, "maintenance")
     env_file = pathlib.Path(args.env_file)
     output_dir = pathlib.Path(args.output_dir)
     file_env = load_env(env_file)
@@ -817,7 +840,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         write_manifest(metadata_path, metadata)
         metadata_written = True
         removed: list[str] = []
-        if restore_verified:
+        if restore_verified and prune:
             removed.extend(prune_unverified_backups(output_dir, preserve_metadata=metadata_path))
             removed.extend(prune_backups(output_dir, keep=args.keep))
         result = {"ok": restore_error is None, **metadata, "metadata_file": str(metadata_path), "removed": removed}
@@ -889,11 +912,34 @@ def main() -> int:
         if selected_modes > 1:
             raise ValueError("--dump-only, --check-latest, and --verify-dump are mutually exclusive.")
         if args.verify_dump is not None:
-            result = verify_existing_dump(args)
+            # A production restore drill is a supervisor-owned mutation.  The
+            # read-only ``--check-latest`` path below remains available to
+            # health/preflight diagnostics.
+            raise RuntimeError(
+                "--verify-dump is a supervisor-owned restore drill; use platform_backup_supervisor"
+            )
         elif args.check_latest:
             result = check_latest_backup(pathlib.Path(args.output_dir), max_age_hours=args.max_age_hours)
         else:
-            result = create_backup(args)
+            try:
+                from . import platform_backup_supervisor as supervisor
+            except ImportError:
+                import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+            # No environment variable or numeric FD is accepted as a
+            # capability.  The supervisor calls ``create_backup`` in-process.
+            result = supervisor.run_backup_entrypoint(
+                argparse.Namespace(
+                    app_dir=pathlib.Path(args.output_dir).resolve().parents[1],
+                    source_release_dir=pathlib.Path("/root/old_sparky/platform/dist/releases"),
+                    keep=args.keep,
+                    max_age_hours=args.max_age_hours,
+                    env_file=pathlib.Path(args.env_file),
+                    output_dir=pathlib.Path(args.output_dir),
+                    admin_database_url=args.admin_database_url,
+                    as_json=args.as_json,
+                ),
+                app_dir=pathlib.Path(args.output_dir).resolve().parents[1],
+            )
         print_result(result, as_json=args.as_json)
         return 0
     except Exception as exc:

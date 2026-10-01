@@ -150,10 +150,10 @@ jobs:
           PY
           )"
           test "$active_sha" = "$expected_sha" || fail "Active release SHA differs from expected_sha."
-          test -f "$current/tools/platform_storage_maintenance.py" \
-            && test ! -L "$current/tools/platform_storage_maintenance.py" \
-            && test -x "$current/tools/platform_storage_maintenance.py" \
-            || fail "Installed storage maintenance tool is missing."
+          test -f "$current/tools/platform_backup_supervisor.py" \
+            && test ! -L "$current/tools/platform_backup_supervisor.py" \
+            && test -x "$current/tools/platform_backup_supervisor.py" \
+            || fail "Installed backup supervisor is missing."
           test -f "$summary_tool" && test ! -L "$summary_tool" \
             || fail "Storage evidence summary helper is missing or unsafe."
 

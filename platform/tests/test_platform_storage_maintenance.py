@@ -599,13 +599,14 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             REPO_ROOT / "platform/deploy/journald/60-deadlock-platform-retention.conf"
         ).read_text()
 
-        self.assertIn("platform_storage_maintenance.py --apply", service)
+        self.assertIn("platform_backup_supervisor.py maintenance", service)
         self.assertEqual(
             [line for line in service.splitlines() if line.startswith("ExecStart=")],
             [
                 "ExecStart=/opt/oldsparky/platform/shared/venv/bin/python "
                 "/opt/oldsparky/platform/current/tools/"
-                "platform_storage_maintenance.py --apply --backup-keep 14 "
+                "platform_backup_supervisor.py maintenance --app-dir "
+                "/opt/oldsparky/platform --apply --backup-keep 14 "
                 "--release-keep 5 --test-artifact-max-age-days 7 "
                 "--screenshot-max-age-days 30 --failed-build-max-age-days 1 "
                 "--minimum-free-gib 5 --maximum-used-percent 85"
