@@ -30,6 +30,15 @@ through a held mode-`0600` descriptor, verifies that descriptor and pathname
 identity before publication, and removes the reserved pair on any publication
 or directory-fsync failure.
 
+Residual Phase A risk: a same-owner writer with access to the backup directory
+can still replace the published dump pathname after its final identity/hash
+check and before the manifest publication (or during a later consumer
+operation). Consumers fail closed when that replacement is observed, but the
+window itself is not yet serialized. Phase B must add the backup operation
+lock/supervisor across dump, manifest, retention and offsite selection, then
+revalidate the published pair before timer enablement or merge readiness.
+The offsite timer remains disabled until that gate is complete.
+
 The read-only health monitor uses this same parser and archive checksum path;
 legacy, minimal, extra-key or malformed metadata therefore fails the backup
 health check closed.
