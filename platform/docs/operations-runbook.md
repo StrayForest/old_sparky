@@ -17,7 +17,8 @@ df -h /
 `systemctl`/journal output proves service/process supervision only; it does not prove Redis -> worker -> result execution. The PR-blocking proof is the [backend-integration roundtrip](test-suite-governance.md#celery-worker-contract-and-liveness-boundary) on Redis DB13/14/15; passive production task liveness remains a later owner.
 Phase A leaves the health monitor, systemd units, production queues and beat singleton unchanged.
 
-API, web, PostgreSQL and Redis bind loopback; Nginx is the only origin listener; the platform connects to PostgreSQL on `127.0.0.1:5432`.
+API, web, PostgreSQL and Redis bind loopback; Nginx is the only origin listener;
+the platform connects directly to PostgreSQL on `127.0.0.1:5432`.
 The canonical environment is root-owned `0600`; scoped env files are renderer-generated and not edited manually. The retired Telegram bot, `sparkydb` and host PgBouncer are absent and must not become platform dependencies.
 
 `deadlock-health-monitor.timer` performs the lightweight five-minute readiness,

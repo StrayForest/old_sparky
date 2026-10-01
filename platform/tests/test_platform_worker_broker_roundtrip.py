@@ -543,7 +543,7 @@ def _terminate_worker_process(
             )
             is None
         )
-    except BaseException as exc:
+    except BaseException:
         errors.append("worker poll [failure]")
         # Treat an unreadable process state as potentially live and make the
         # escalation path the safe default.
@@ -564,7 +564,7 @@ def _terminate_worker_process(
             )
         except ProcessLookupError:
             pass
-        except BaseException as exc:
+        except BaseException:
             errors.append("worker TERM [failure]")
             must_kill = True
         try:
@@ -583,7 +583,7 @@ def _terminate_worker_process(
             # Expected escalation path: the hard deadline still governs the
             # KILL wait below.
             must_kill = True
-        except BaseException as exc:
+        except BaseException:
             errors.append("worker TERM wait [failure]")
             must_kill = True
 
@@ -596,7 +596,7 @@ def _terminate_worker_process(
             )
         except ProcessLookupError:
             pass
-        except BaseException as exc:
+        except BaseException:
             errors.append("worker TERM group [failure]")
 
     if must_kill:
@@ -608,7 +608,7 @@ def _terminate_worker_process(
             )
         except ProcessLookupError:
             pass
-        except BaseException as exc:
+        except BaseException:
             errors.append("worker KILL [failure]")
         try:
             remaining = max(0.0, deadline - time.monotonic())
@@ -617,7 +617,7 @@ def _terminate_worker_process(
                 deadline=deadline,
                 label="worker KILL wait",
             )
-        except BaseException as exc:
+        except BaseException:
             errors.append("worker KILL wait [failure]")
             # A wait implementation can fail after the signal was delivered.
             # Make one final bounded reap attempt before reporting the child
@@ -631,7 +631,7 @@ def _terminate_worker_process(
                     deadline=deadline,
                     label="worker final reap",
                 )
-            except BaseException as reap_exc:
+            except BaseException:
                 errors.append("worker final reap [failure]")
     else:
         # ``poll`` may reap an exited child, but this explicit bounded wait
@@ -643,7 +643,7 @@ def _terminate_worker_process(
                 deadline=deadline,
                 label="worker reap",
             )
-        except BaseException as exc:
+        except BaseException:
             errors.append("worker reap [failure]")
 
     try:
@@ -653,7 +653,7 @@ def _terminate_worker_process(
             label="worker final poll",
         ) is None:
             errors.append("worker remained live after TERM/KILL cleanup")
-    except BaseException as exc:
+    except BaseException:
         errors.append("worker final poll [failure]")
 
     try:
@@ -665,7 +665,7 @@ def _terminate_worker_process(
                     deadline=deadline,
                     label="worker stdin close",
                 )
-            except BaseException as exc:
+            except BaseException:
                 errors.append("worker stdin close [failure]")
         if log is not None:
             stream = getattr(log, "_stream", None)
@@ -678,7 +678,7 @@ def _terminate_worker_process(
                         deadline=deadline,
                         label="worker stdout close",
                     )
-                except BaseException as exc:
+                except BaseException:
                     errors.append("worker stdout close [failure]")
             try:
                 _best_effort_bounded_call(
@@ -686,7 +686,7 @@ def _terminate_worker_process(
                     deadline=deadline,
                     label="worker log EOF join",
                 )
-            except BaseException as exc:
+            except BaseException:
                 errors.append("worker log join [failure]")
             if log.thread_alive:
                 errors.append("worker log-drain thread remained live after EOF deadline")
@@ -702,7 +702,7 @@ def _terminate_worker_process(
                 deadline=deadline,
                 label="worker stdout close",
             )
-    except BaseException as exc:
+    except BaseException:
         errors.append("worker log join [failure]")
 
     if errors:
