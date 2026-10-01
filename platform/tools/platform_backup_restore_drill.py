@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 import urllib.parse
@@ -167,12 +168,18 @@ def run_command(
     *,
     target: DatabaseTarget | None = None,
     capture_output: bool = False,
+    stdout: int | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
+    if capture_output and stdout is not None:
+        raise ValueError("capture_output and an explicit stdout descriptor are incompatible")
     return subprocess.run(
         command,
         check=True,
         text=True,
         capture_output=capture_output,
+        stdout=stdout,
+        pass_fds=pass_fds,
         env=command_env(target) if target is not None else None,
     )
 
@@ -192,6 +199,131 @@ def _fsync_directory(path: pathlib.Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+SECURE_FILE_MODE = 0o600
+
+
+@dataclasses.dataclass(frozen=True)
+class BackupReservation:
+    run_id: str
+    dump_path: pathlib.Path
+    metadata_path: pathlib.Path
+    dump_reservation_fd: int
+    metadata_reservation_fd: int
+
+
+def _stat_identity(file_stat: os.stat_result) -> tuple[int, int, int]:
+    return file_stat.st_dev, file_stat.st_ino, file_stat.st_nlink
+
+
+def _validate_secure_stat(
+    file_stat: os.stat_result,
+    *,
+    label: str,
+    expected_size: int | None = None,
+) -> os.stat_result:
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise RuntimeError(f"{label} must be a regular file.")
+    if file_stat.st_nlink != 1:
+        raise RuntimeError(f"{label} must not be a hardlink.")
+    if stat.S_IMODE(file_stat.st_mode) != SECURE_FILE_MODE:
+        raise RuntimeError(f"{label} must have mode 0600.")
+    if file_stat.st_uid != os.geteuid() or file_stat.st_gid != os.getegid():
+        raise RuntimeError(f"{label} has an unexpected owner or group.")
+    if expected_size is not None and file_stat.st_size != expected_size:
+        raise RuntimeError(f"{label} has an unexpected size.")
+    return file_stat
+
+
+def _secure_create(path: pathlib.Path, *, label: str) -> tuple[int, os.stat_result]:
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, SECURE_FILE_MODE)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"Could not create secure {label}: {path}.") from exc
+    try:
+        file_stat = _validate_secure_stat(os.fstat(descriptor), label=label, expected_size=0)
+        return descriptor, file_stat
+    except Exception:
+        os.close(descriptor)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _verify_path_matches_fd(
+    path: pathlib.Path,
+    descriptor: int,
+    *,
+    label: str,
+    expected_size: int | None = None,
+) -> os.stat_result:
+    descriptor_stat = _validate_secure_stat(
+        os.fstat(descriptor), label=label, expected_size=expected_size
+    )
+    try:
+        path_stat = path.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{label} disappeared while it was being verified.") from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise RuntimeError(f"{label} must not be a symlink.")
+    _validate_secure_stat(path_stat, label=label, expected_size=expected_size)
+    if _stat_identity(path_stat) != _stat_identity(descriptor_stat):
+        raise RuntimeError(f"{label} was replaced while it was being written.")
+    return descriptor_stat
+
+
+def _hash_secure_fd(descriptor: int, *, label: str) -> tuple[str, os.stat_result]:
+    before = _validate_secure_stat(os.fstat(descriptor), label=label)
+    if before.st_size <= 0:
+        raise RuntimeError(f"{label} must be non-empty.")
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    except OSError as exc:
+        raise RuntimeError(f"Could not hash {label}.") from exc
+    after = _validate_secure_stat(os.fstat(descriptor), label=label)
+    if (
+        _stat_identity(after) != _stat_identity(before)
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+    ):
+        raise RuntimeError(f"{label} changed while it was hashed.")
+    return digest.hexdigest(), after
+
+
+def _best_effort_unlink(path: pathlib.Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def _best_effort_cleanup(paths: tuple[pathlib.Path, ...], directory: pathlib.Path) -> None:
+    for path in paths:
+        _best_effort_unlink(path)
+    try:
+        _fsync_directory(directory)
+    except OSError:
+        pass
 
 
 def utc_now() -> dt.datetime:
@@ -486,23 +618,38 @@ def require_commands(*commands: str) -> None:
 def _new_backup_identity(
     output_dir: pathlib.Path,
     timestamp_slug: str,
-) -> tuple[str, pathlib.Path, pathlib.Path]:
+) -> BackupReservation:
+    """Reserve both final names with O_EXCL before any dump process starts."""
+
     for _ in range(8):
         run_id = uuid.uuid4().hex
         dump_path = output_dir / f"platformdb-{timestamp_slug}-{run_id}.dump"
         metadata_path = dump_path.with_suffix(".json")
         try:
-            dump_path.lstat()
-            dump_exists = True
-        except FileNotFoundError:
-            dump_exists = False
+            dump_reservation_fd, _ = _secure_create(
+                dump_path, label="backup dump reservation"
+            )
+        except FileExistsError:
+            continue
         try:
-            metadata_path.lstat()
-            metadata_exists = True
-        except FileNotFoundError:
-            metadata_exists = False
-        if not dump_exists and not metadata_exists:
-            return run_id, dump_path, metadata_path
+            metadata_reservation_fd, _ = _secure_create(
+                metadata_path, label="backup manifest reservation"
+            )
+        except FileExistsError:
+            os.close(dump_reservation_fd)
+            _best_effort_unlink(dump_path)
+            continue
+        except Exception:
+            os.close(dump_reservation_fd)
+            _best_effort_unlink(dump_path)
+            raise
+        return BackupReservation(
+            run_id=run_id,
+            dump_path=dump_path,
+            metadata_path=metadata_path,
+            dump_reservation_fd=dump_reservation_fd,
+            metadata_reservation_fd=metadata_reservation_fd,
+        )
     raise RuntimeError("Could not allocate a unique platform backup run_id.")
 
 
@@ -523,20 +670,41 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         required.extend(["createdb", "dropdb", "psql"])
     require_commands(*required)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        output_dir_stat = output_dir.lstat()
+    except FileNotFoundError:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir_stat = output_dir.lstat()
+    if stat.S_ISLNK(output_dir_stat.st_mode) or not stat.S_ISDIR(output_dir_stat.st_mode):
+        raise RuntimeError(f"Backup output path must be a regular directory: {output_dir}.")
     timestamp = utc_now()
     timestamp_slug = timestamp.strftime("%Y%m%dT%H%M%SZ")
     # The timestamp is human-readable ordering metadata only.  The run ID is
     # the identity boundary that prevents same-second creators from sharing a
     # dump or manifest path.
-    run_id, dump_path, metadata_path = _new_backup_identity(output_dir, timestamp_slug)
+    reservation = _new_backup_identity(output_dir, timestamp_slug)
+    run_id = reservation.run_id
+    dump_path = reservation.dump_path
+    metadata_path = reservation.metadata_path
     temporary_dump_path = output_dir / f".{dump_path.name}.{os.getpid()}.tmp"
     started_at = utc_now()
     restore_verified = False
     restored_table_count: int | None = None
     restore_error: str | None = None
+    temporary_dump_fd: int | None = None
+    temporary_dump_created = False
+    metadata_written = False
 
     try:
+        try:
+            temporary_dump_fd, _ = _secure_create(
+                temporary_dump_path, label="temporary platform backup dump"
+            )
+            temporary_dump_created = True
+        except FileExistsError as exc:
+            raise RuntimeError(
+                f"Temporary platform backup path is already occupied: {temporary_dump_path}."
+            ) from exc
         run_command(
             [
                 "pg_dump",
@@ -546,19 +714,79 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                 "--schema=platform",
                 "--schema=public",
                 *connection_args(app_target),
-                "--file",
-                str(temporary_dump_path),
             ],
             target=app_target,
+            stdout=temporary_dump_fd,
         )
-        if not temporary_dump_path.is_file() or temporary_dump_path.stat().st_size <= 0:
+        dump_stat = _verify_path_matches_fd(
+            temporary_dump_path,
+            temporary_dump_fd,
+            label="Temporary platform backup dump",
+        )
+        if dump_stat.st_size <= 0:
             raise RuntimeError("pg_dump did not produce a non-empty archive.")
-        run_command(["pg_restore", "--list", str(temporary_dump_path)], capture_output=True)
-        temporary_dump_path.chmod(0o600)
-        with temporary_dump_path.open("rb") as dump_handle:
-            os.fsync(dump_handle.fileno())
+        try:
+            os.fsync(temporary_dump_fd)
+        except OSError as exc:
+            raise RuntimeError("Could not fsync the temporary platform backup dump.") from exc
+        dump_stat = _verify_path_matches_fd(
+            temporary_dump_path,
+            temporary_dump_fd,
+            label="Temporary platform backup dump",
+            expected_size=dump_stat.st_size,
+        )
+        run_command(
+            ["pg_restore", "--list", f"/proc/self/fd/{temporary_dump_fd}"],
+            capture_output=True,
+            pass_fds=(temporary_dump_fd,),
+        )
+        _verify_path_matches_fd(
+            temporary_dump_path,
+            temporary_dump_fd,
+            label="Temporary platform backup dump",
+            expected_size=dump_stat.st_size,
+        )
+        archive_sha256, dump_stat = _hash_secure_fd(
+            temporary_dump_fd, label="Temporary platform backup dump"
+        )
+        _verify_path_matches_fd(
+            dump_path,
+            reservation.dump_reservation_fd,
+            label="Reserved platform backup dump",
+            expected_size=0,
+        )
+        _verify_path_matches_fd(
+            metadata_path,
+            reservation.metadata_reservation_fd,
+            label="Reserved platform backup manifest",
+            expected_size=0,
+        )
+        _verify_path_matches_fd(
+            temporary_dump_path,
+            temporary_dump_fd,
+            label="Temporary platform backup dump",
+            expected_size=dump_stat.st_size,
+        )
         temporary_dump_path.replace(dump_path)
-        _fsync_directory(output_dir)
+        temporary_dump_created = False
+        os.close(temporary_dump_fd)
+        temporary_dump_fd = None
+        try:
+            published_sha256, published_stat = sha256_private_file(
+                dump_path,
+                label="Published platform backup dump",
+                expected_owner=os.geteuid(),
+                expected_group=os.getegid(),
+            )
+        except BackupManifestError as exc:
+            raise RuntimeError("Published platform backup dump failed identity validation.") from exc
+        if published_sha256 != archive_sha256 or published_stat.st_size != dump_stat.st_size:
+            raise RuntimeError("Published platform backup dump changed before manifest publication.")
+        dump_stat = published_stat
+        try:
+            _fsync_directory(output_dir)
+        except OSError as exc:
+            raise RuntimeError("Could not fsync the backup directory after publishing the dump.") from exc
 
         if not args.dump_only:
             try:
@@ -576,8 +804,8 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         metadata = build_manifest(
             run_id=run_id,
             dump_file=dump_path.name,
-            size_bytes=dump_path.stat().st_size,
-            sha256=sha256_file(dump_path),
+            size_bytes=dump_stat.st_size,
+            sha256=archive_sha256,
             started_at_utc=started_at,
             completed_at_utc=completed_at,
             duration_seconds=round((completed_at - started_at).total_seconds(), 3),
@@ -587,6 +815,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             restore_error=restore_error,
         )
         write_manifest(metadata_path, metadata)
+        metadata_written = True
         removed: list[str] = []
         if restore_verified:
             removed.extend(prune_unverified_backups(output_dir, preserve_metadata=metadata_path))
@@ -595,9 +824,18 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         if restore_error is not None:
             raise RuntimeError(f"Platform backup was created but restore verification failed: {restore_error}")
         return result
+    except Exception:
+        if not metadata_written:
+            cleanup_paths: list[pathlib.Path] = [dump_path, metadata_path]
+            if temporary_dump_created:
+                cleanup_paths.append(temporary_dump_path)
+            _best_effort_cleanup(tuple(cleanup_paths), output_dir)
+        raise
     finally:
-        if temporary_dump_path.exists():
-            temporary_dump_path.unlink()
+        if temporary_dump_fd is not None:
+            os.close(temporary_dump_fd)
+        os.close(reservation.dump_reservation_fd)
+        os.close(reservation.metadata_reservation_fd)
 
 
 def print_result(result: dict[str, Any], *, as_json: bool) -> None:

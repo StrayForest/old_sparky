@@ -550,6 +550,19 @@ def read_manifest_file(
     )
 
 
+def _fsync_directory(path: Path) -> None:
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_descriptor = os.open(path, directory_flags)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _fsync_file(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
 def build_manifest(
     *,
     run_id: str,
@@ -600,6 +613,8 @@ def write_manifest(path: Path, payload: Mapping[str, Any]) -> BackupManifest:
     parent = path.parent
     temporary_path: Path | None = None
     descriptor: int | None = None
+    replaced = False
+    published_identity: tuple[int, int, int] | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=parent
@@ -610,16 +625,34 @@ def write_manifest(path: Path, payload: Mapping[str, Any]) -> BackupManifest:
             descriptor = None
             handle.write(raw_bytes)
             handle.flush()
-            os.fsync(handle.fileno())
+            _fsync_file(handle.fileno())
         os.replace(temporary_path, path)
         temporary_path = None
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        directory_descriptor = os.open(parent, directory_flags)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        replaced = True
+        published_stat = path.lstat()
+        published_identity = (
+            published_stat.st_dev,
+            published_stat.st_ino,
+            published_stat.st_nlink,
+        )
+        _fsync_directory(parent)
     except OSError as exc:
+        if replaced and published_identity is not None:
+            try:
+                current_stat = path.lstat()
+                current_identity = (
+                    current_stat.st_dev,
+                    current_stat.st_ino,
+                    current_stat.st_nlink,
+                )
+                if current_identity == published_identity:
+                    path.unlink()
+            except OSError:
+                pass
+            try:
+                _fsync_directory(parent)
+            except OSError:
+                pass
         raise BackupManifestError(f"could not atomically write backup manifest: {path}") from exc
     finally:
         if descriptor is not None:

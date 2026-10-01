@@ -25,6 +25,15 @@ reject partial JSON, extra or duplicate keys, wrong types/order, symlinks,
 hardlinks, unexpected owner/group or mode, path mismatches, checksum and size
 drift.
 
+The dump producer reserves both final names with `O_EXCL`, writes `pg_dump`
+through a held mode-`0600` descriptor, verifies that descriptor and pathname
+identity before publication, and removes the reserved pair on any publication
+or directory-fsync failure.
+
+The read-only health monitor uses this same parser and archive checksum path;
+legacy, minimal, extra-key or malformed metadata therefore fails the backup
+health check closed.
+
 The low-level create/restore drill is invoked by storage maintenance; do not
 run its mutating mode directly on the production host because it does not
 acquire the host-wide operation locks. Create a production backup through the

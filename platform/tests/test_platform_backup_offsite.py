@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -168,10 +169,13 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 dump_only=False,
             )
 
-            def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            def fake_run_command(
+                command: list[str], *, stdout: int | None = None, **_: object
+            ) -> subprocess.CompletedProcess[str]:
                 if command[0] == "pg_dump":
-                    dump_path = Path(command[command.index("--file") + 1])
-                    dump_path.write_bytes(b"PGDMP creator output")
+                    assert stdout is not None
+                    self.assertNotIn("--file", command)
+                    os.write(stdout, b"PGDMP creator output")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
@@ -210,9 +214,13 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 dump_only=False,
             )
 
-            def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            def fake_run_command(
+                command: list[str], *, stdout: int | None = None, **_: object
+            ) -> subprocess.CompletedProcess[str]:
                 if command[0] == "pg_dump":
-                    Path(command[command.index("--file") + 1]).write_bytes(b"PGDMP same second")
+                    assert stdout is not None
+                    self.assertNotIn("--file", command)
+                    os.write(stdout, b"PGDMP same second")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
