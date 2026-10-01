@@ -158,21 +158,22 @@ ownership, and bounded cadence/expiry values. The tests compare that manifest
 with the registered Celery application and the production launcher source;
 they do not derive expected ownership from production code.
 
-The `backend-integration` contour additionally runs one ephemeral Celery
-worker with the official CLI, `pool=solo`, concurrency `1`, no embedded beat
-and no schedule/state file. It proves broker DB13 -> worker -> safe
-test-only liveness probe -> result DB14 roundtrips on each high/default/low
-route and checks the registered task and active queue control-plane views.
-The probe routes through Celery's router into cryptographically unique
-per-run queues; broker evidence observes Kombu Redis priority-step keys, not
-just a base-queue length. The pure test-resource validator requires
-application Redis DB15, broker DB13 and result DB14 on loopback; these are
-namespace conventions only, not a Redis security boundary. DB13/14 must be
-empty before a run, and cleanup deletes only observed or exact run-allowlisted
-queue, priority, binding, unacked, pidbox and result keys; it never uses
-`FLUSHDB` and refuses foreign-key sentinels. The worker subprocess has a
-bounded readiness/roundtrip window and is always TERM/KILL/reaped with exact
-temporary-state cleanup.
+The `backend-integration` contour launches a disposable liveness-probe supervisor
+subprocess. Only that child imports/configures Celery, registers safe probe
+variants, resolves high/default/low routes and publishes them; the parent never
+mutates or caches the production app. After the parent observes each broker key,
+an explicit ACK starts the official CLI worker (`pool=solo`, concurrency `1`, no
+beat or schedule/state file). The supervisor reports registration/active-queue
+and result events; the parent independently reads DB14 and proves `pong` for
+each route. Celery routing uses cryptographically unique per-run queues, and
+broker evidence observes Kombu Redis priority-step keys, not base-queue length.
+The pure validator requires application DB15, broker DB13 and result DB14 on
+loopback; these are namespace conventions, not a Redis security boundary.
+DB13/14 must be empty before a run; cleanup deletes only observed/run-allowlisted
+queue, priority, binding, unacked, pidbox and result keys, never `FLUSHDB`, and
+refuses foreign sentinels. A shared monotonic 40-second watchdog covers the
+supervisor/worker chain, Redis sockets, TERM/KILL/reap, log EOF join and
+temporary-state postconditions.
 Pull-request evidence for this contour is attributed to the workflow's tested
 merge-candidate SHA (the PR merge run), not to the source-head SHA. Exact
 source identity remains enforced by the existing checkout/tree/digest

@@ -43,8 +43,9 @@ class BeatEntryContract:
 
 
 # These names are deliberately repeated instead of imported from the worker.
-# They are the queues that the production worker must consume, and the
-# integration test uses the same safe queues in the isolated Redis DB13.
+# They are the queues that the production worker must consume.  The
+# integration probe maps the same high/default/low semantics onto unique
+# transient queues in isolated Redis DB13 so it cannot collide with them.
 HIGH_PRIORITY_QUEUE = "deadlock-platform-high"
 DEFAULT_PRIORITY_QUEUE = "deadlock-platform-default"
 LOW_PRIORITY_QUEUE = "deadlock-platform-low"
