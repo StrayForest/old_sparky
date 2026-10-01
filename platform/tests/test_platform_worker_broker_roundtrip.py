@@ -1208,6 +1208,13 @@ def _finish_roundtrip_cleanup(
 ) -> None:
     """Complete cleanup without allowing it to replace a work exception."""
 
+    # A caller may invoke cleanup from inside an ``except`` body without
+    # passing the handled exception explicitly.  Preserve that active primary
+    # and let an explicit primary take precedence when both are present.
+    active_exception = sys.exception()
+    effective_primary = (
+        primary_exception if primary_exception is not None else active_exception
+    )
     cleanup_report = _CleanupReport(())
     cleanup_exception: BaseException | None = None
     try:
@@ -1237,12 +1244,12 @@ def _finish_roundtrip_cleanup(
 
     if evidence:
         evidence_note = _render_cleanup_evidence(evidence)
-        if primary_exception is not None:
-            primary_exception.add_note(evidence_note)
+        if effective_primary is not None:
+            effective_primary.add_note(evidence_note)
     else:
         evidence_note = "roundtrip cleanup evidence: cleanup [cleanup-failure]"
 
-    if primary_exception is not None:
+    if effective_primary is not None:
         return
     if fatal_kind is not None:
         safe_exception = _new_safe_fatal_exception(fatal_kind, fatal_exit_code)
@@ -2546,6 +2553,48 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
         )
         self.assertTrue(all("SUPERSECRET" not in note for note in primary.__notes__))
         self.assertTrue(all("PRIVATE-LOG" not in note for note in primary.__notes__))
+
+        active_primary = RuntimeError("SUPERSECRET")
+        with self.assertRaises(RuntimeError) as raised:
+            try:
+                raise active_primary
+            except RuntimeError:
+                _finish_roundtrip_cleanup(
+                    lambda: first_report,
+                    primary_exception=None,
+                )
+                raise
+        self.assertIs(raised.exception, active_primary)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertTrue(
+            all("SUPERSECRET" not in note for note in active_primary.__notes__)
+        )
+        self.assertTrue(
+            all("PRIVATE-LOG" not in note for note in active_primary.__notes__)
+        )
+        self.assertTrue(
+            any(
+                "worker cleanup [keyboard-interrupt]" in note
+                for note in active_primary.__notes__
+            )
+        )
+
+        explicit_primary = RuntimeError("explicit primary")
+        active_other = RuntimeError("ACTIVE-SECRET")
+        try:
+            raise active_other
+        except RuntimeError:
+            _finish_roundtrip_cleanup(
+                lambda: first_report,
+                primary_exception=explicit_primary,
+            )
+        self.assertTrue(
+            any(
+                "worker cleanup [keyboard-interrupt]" in note
+                for note in explicit_primary.__notes__
+            )
+        )
+        self.assertEqual(getattr(active_other, "__notes__", ()), ())
 
     def test_cleanup_catches_hung_redis_scan_without_skipping_close(self) -> None:
         broker = _ScanFailureRedis()
