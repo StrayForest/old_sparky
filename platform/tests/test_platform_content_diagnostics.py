@@ -244,6 +244,35 @@ class PlatformContentDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [PASSING_SUMMARY])
 
+    def test_verify_rejects_cache_level_contract_mutations_without_leaking_values(self) -> None:
+        mutations = {
+            "title": "cache title drift",
+            "published_at": "2026-09-02T00:00:00+00:00",
+            "url": "https://cache.example.invalid/drift",
+            "content": "cache content drift with secret-token",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                changed = _detail()
+                changed[field] = value
+                self._write_inputs(root, details=[changed, _detail(), _detail()])
+                result = self._run(
+                    "verify",
+                    "--home",
+                    str(root / "home.json"),
+                    "--internal",
+                    str(root / "internal.json"),
+                    "--internal-api",
+                    str(root / "internal-api.json"),
+                    "--public-api",
+                    str(root / "public-api.json"),
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("error_class=parity", result.stdout)
+            self.assertNotIn(str(value), result.stdout)
+            self.assertNotIn(str(value), result.stderr)
+
     def test_verify_rejects_empty_false_status_and_malformed_latest_patch(self) -> None:
         for home in (
             _home(available=False),
@@ -424,6 +453,68 @@ class PlatformContentDiagnosticsTests(unittest.TestCase):
             with self.assertRaises(diagnostics.DiagnosticsFailure) as context:
                 diagnostics._write_secure_json(Path(temporary) / "aggregate.json", payload)
         self.assertEqual(context.exception.error_class, "artifact")
+
+    def test_evidence_writer_rejects_wrong_types_bool_counts_and_out_of_range_counts(self) -> None:
+        payload = diagnostics.evidence_payload(
+            target_sha="a" * 40,
+            event="workflow_dispatch",
+            run_id="44",
+            run_attempt="1",
+            patch_outcome="success",
+            patch_summary=PASSING_SUMMARY,
+            content_outcome="success",
+        )
+        mutations = (
+            ("target_sha", 123),
+            ("latest_patch_id", 1001),
+            ("run_id", True),
+            ("internal_section_count", True),
+            ("internal_section_count", 101),
+            ("public_api_section_count", "2"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                candidate = dict(payload)
+                candidate[field] = value
+                with self.assertRaises(diagnostics.DiagnosticsFailure) as context:
+                    diagnostics._write_secure_json(Path(temporary) / "aggregate.json", candidate)
+            self.assertEqual(context.exception.error_class, "artifact")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = dict(payload)
+            candidate["target_sha"] = "123"
+            with self.assertRaises(diagnostics.DiagnosticsFailure) as context:
+                diagnostics._write_secure_json(Path(temporary) / "aggregate.json", candidate)
+        self.assertEqual(context.exception.error_class, "artifact")
+
+    def test_helper_boundaries_reject_non_text_and_bool_as_integer_inputs(self) -> None:
+        with self.assertRaises(diagnostics.DiagnosticsFailure) as context:
+            diagnostics.evidence_payload(
+                target_sha=123,  # type: ignore[arg-type]
+                event="workflow_dispatch",
+                run_id="44",
+                run_attempt="1",
+                patch_outcome="success",
+                patch_summary=PASSING_SUMMARY,
+                content_outcome="success",
+            )
+        self.assertEqual(context.exception.error_class, "malformed")
+        with self.assertRaises(diagnostics.DiagnosticsFailure) as context:
+            diagnostics.evidence_payload(
+                target_sha="a" * 40,
+                event="workflow_dispatch",
+                run_id=True,  # type: ignore[arg-type]
+                run_attempt="1",
+                patch_outcome="success",
+                patch_summary=PASSING_SUMMARY,
+                content_outcome="success",
+            )
+        self.assertEqual(context.exception.error_class, "malformed")
+        for patch_id, count in ((1001, 2), ("1001", True), ("1001", 101)):
+            with self.subTest(patch_id=patch_id, count=count):
+                with self.assertRaises(diagnostics.DiagnosticsFailure) as context:
+                    diagnostics.passed_summary(patch_id, count)  # type: ignore[arg-type]
+            self.assertEqual(context.exception.error_class, "status")
 
     def test_translation_free_owner_is_explicit_and_workflow_does_not_use_normal_refresh(self) -> None:
         workflow = (

@@ -17,7 +17,6 @@ import os
 from pathlib import Path
 import re
 import stat
-import sys
 import tempfile
 from typing import Any
 
@@ -82,6 +81,7 @@ SECTION_STABLE_FIELDS = (
     "objective_icon_url",
 )
 ABILITY_STABLE_FIELDS = ("name", "icon_url")
+MAX_SECTION_COUNT = 100
 EVIDENCE_FIELDS = frozenset(
     {
         "schema",
@@ -252,7 +252,7 @@ def _canonical_section(value: object) -> dict[str, Any]:
 def canonical_section_projection(value: object) -> list[dict[str, Any]]:
     """Return the closed, ordered public projection of patch sections."""
 
-    if not isinstance(value, list) or not value or len(value) > 100:
+    if not isinstance(value, list) or not value or len(value) > MAX_SECTION_COUNT:
         _fail("producer")
     return [_canonical_section(item) for item in value]
 
@@ -270,6 +270,19 @@ def _stable_section_projection(sections: list[dict[str, Any]]) -> list[dict[str,
         }
         for section in sections
     ]
+
+
+def _cache_level_projection(detail: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the cache contract while allowing section text translation."""
+
+    return {
+        "id": detail["id"],
+        "title": detail["title"],
+        "published_at": detail["published_at"],
+        "url": detail["url"],
+        "content": detail["content"],
+        "sections": _stable_section_projection(detail["sections"]),
+    }
 
 
 def canonical_detail(value: object, *, expected_id: str | None = None) -> dict[str, Any]:
@@ -334,18 +347,24 @@ def validate_distribution(
     public_projection = canonical_detail(public_api_detail, expected_id=patch_id)
     if internal_projection != public_projection:
         _fail("parity")
-    if _stable_section_projection(cached_projection["sections"]) != _stable_section_projection(
-        internal_projection["sections"]
+    if _cache_level_projection(cached_projection) != _cache_level_projection(
+        internal_projection
     ):
         _fail("parity")
     section_count = len(internal_projection["sections"])
-    if section_count <= 0:
+    if not 0 < section_count <= MAX_SECTION_COUNT:
         _fail("producer")
     return patch_id, section_count
 
 
 def passed_summary(patch_id: str, section_count: int) -> str:
-    if PATCH_ID_RE.fullmatch(patch_id) is None or section_count <= 0:
+    if (
+        not isinstance(patch_id, str)
+        or PATCH_ID_RE.fullmatch(patch_id) is None
+        or isinstance(section_count, bool)
+        or not isinstance(section_count, int)
+        or not 0 < section_count <= MAX_SECTION_COUNT
+    ):
         _fail("status")
     return (
         "PRODUCTION_PATCH_DISTRIBUTION schema=1 status=passed error_class=none "
@@ -355,6 +374,8 @@ def passed_summary(patch_id: str, section_count: int) -> str:
 
 
 def failed_summary(error_class: str) -> str:
+    if not isinstance(error_class, str):
+        _fail("malformed")
     safe_error_class = error_class if error_class in ERROR_CLASSES else "internal"
     if safe_error_class == "none":
         safe_error_class = "internal"
@@ -405,7 +426,12 @@ def parse_summary_text(
 ) -> str:
     """Validate one output line and its process status, returning canonical text."""
 
-    if not isinstance(text, str) or "\r" in text:
+    if (
+        not isinstance(text, str)
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or "\r" in text
+    ):
         _fail("malformed")
     if text.endswith("\n"):
         line = text[:-1]
@@ -431,9 +457,19 @@ def _format_record(record: Mapping[str, Any]) -> str:
 
 
 def _safe_int(value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,31}", value) is None:
+    if not isinstance(value, str):
+        _fail("malformed")
+    if re.fullmatch(r"[1-9][0-9]{0,31}", value) is None:
         return 0
     return int(value)
+
+
+def _required_text(value: object) -> str:
+    """Reject non-text helper inputs instead of coercing them to strings."""
+
+    if not isinstance(value, str):
+        _fail("malformed")
+    return value
 
 
 def evidence_payload(
@@ -448,6 +484,13 @@ def evidence_payload(
 ) -> dict[str, Any]:
     """Build the only JSON shape permitted for retained aggregate evidence."""
 
+    target_sha = _required_text(target_sha)
+    event = _required_text(event)
+    run_id = _required_text(run_id)
+    run_attempt = _required_text(run_attempt)
+    patch_outcome = _required_text(patch_outcome)
+    patch_summary = _required_text(patch_summary)
+    content_outcome = _required_text(content_outcome)
     safe_sha = target_sha if re.fullmatch(r"[0-9a-f]{40}", target_sha) else "unavailable"
     safe_event = event if event in {"workflow_dispatch", "workflow_run"} else "unavailable"
     safe_run_id = _safe_int(run_id)
@@ -508,11 +551,17 @@ def _write_secure_json(path: Path, payload: Mapping[str, Any]) -> None:
         or payload.get("content_status") not in OUTCOMES
         or (
             payload.get("target_sha") != "unavailable"
-            and re.fullmatch(r"[0-9a-f]{40}", str(payload.get("target_sha"))) is None
+            and (
+                not isinstance(payload.get("target_sha"), str)
+                or re.fullmatch(r"[0-9a-f]{40}", payload.get("target_sha")) is None
+            )
         )
         or (
             payload.get("latest_patch_id") != "unavailable"
-            and PATCH_ID_RE.fullmatch(str(payload.get("latest_patch_id"))) is None
+            and (
+                not isinstance(payload.get("latest_patch_id"), str)
+                or PATCH_ID_RE.fullmatch(payload.get("latest_patch_id")) is None
+            )
         )
     ):
         _fail("artifact")
@@ -524,7 +573,13 @@ def _write_secure_json(path: Path, payload: Mapping[str, Any]) -> None:
         "public_api_section_count",
     ):
         value = payload.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 10**32:
+        max_value = MAX_SECTION_COUNT if field.endswith("section_count") else 10**32
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > max_value
+        ):
             _fail("artifact")
     if payload["status"] == "passed":
         if (
