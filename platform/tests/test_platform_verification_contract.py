@@ -30,6 +30,13 @@ from tools.platform_load import (
     run_profile,
     validate_profile,
 )
+from tools.platform_migration_support import (
+    MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+    MigrationCommandError,
+    MigrationCommandTimeout,
+    run_migration_subprocess,
+    validate_disposable_migration_target,
+)
 from tools.platform_verify import (
     CI_GATE_IDS,
     DETERMINISTIC_GATE_IDS,
@@ -194,6 +201,57 @@ class PlatformVerificationContractTests(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 with self.assertRaises(TestResourceConfigurationError):
                     validate_test_resource_configuration(self._test_settings(**overrides))
+
+    def test_migration_target_validator_is_loopback_test_only(self) -> None:
+        target = validate_disposable_migration_target(
+            self._test_settings().platform_database_url,
+            environment="test",
+            schema="platform",
+        )
+        self.assertEqual(target.database_name, "platformdb_test")
+        self.assertEqual(target.schema, "platform")
+        for database_url, environment, schema in (
+            (
+                "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb",
+                "production",
+                "platform",
+            ),
+            (
+                "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test",
+                "test",
+                "public",
+            ),
+            (
+                "postgresql+asyncpg://u:p@localhost:5432/platformdb_test",
+                "test",
+                "platform",
+            ),
+        ):
+            with self.subTest(database_url=database_url, environment=environment, schema=schema):
+                with self.assertRaisesRegex(RuntimeError, "migration target"):
+                    validate_disposable_migration_target(
+                        database_url,
+                        environment=environment,
+                        schema=schema,
+                    )
+
+    def test_migration_subprocess_failures_are_typed_and_bounded(self) -> None:
+        with self.assertRaises(MigrationCommandError):
+            result = run_migration_subprocess(
+                [sys.executable, "-c", "raise SystemExit(7)"],
+                label="migration test failure",
+                check=True,
+            )
+            if result.returncode == 0:
+                self.fail("migration failure fixture unexpectedly succeeded")
+        with self.assertRaises(MigrationCommandTimeout) as timeout:
+            run_migration_subprocess(
+                [sys.executable, "-c", "import time; time.sleep(1)"],
+                label="migration test timeout",
+                timeout_seconds=0.01,
+            )
+        self.assertEqual(timeout.exception.timeout_seconds, 0.01)
+        self.assertEqual(MIGRATION_SUBPROCESS_TIMEOUT_SECONDS, 180.0)
 
     def test_invalid_resource_config_fails_before_client_imports(self) -> None:
         unsafe_environment = {

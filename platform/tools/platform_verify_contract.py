@@ -32,6 +32,7 @@ try:
         FULL_GATE_IDS,
         OUT_OF_SCOPE_GATE_IDS,
     )
+    from tools.platform_migration_support import MIGRATION_SUBPROCESS_TIMEOUT_SECONDS
     from tools.platform_verify import (
         CI_GATE_IDS,
         DETERMINISTIC_GATE_IDS,
@@ -60,6 +61,7 @@ except ModuleNotFoundError:  # Direct execution from platform/tools.
         FULL_GATE_IDS,
         OUT_OF_SCOPE_GATE_IDS,
     )
+    from platform_migration_support import MIGRATION_SUBPROCESS_TIMEOUT_SECONDS
     from platform_verify import (
         CI_GATE_IDS,
         DETERMINISTIC_GATE_IDS,
@@ -1216,6 +1218,115 @@ def _backend_timeout_budget_issues(blocks: dict[str, str]) -> list[str]:
     return issues
 
 
+def _migration_contract_issues(security_text: str) -> list[str]:
+    """Keep the bounded migration scenario and its full CI route executable."""
+
+    issues: list[str] = []
+    migration = _workflow_job_block(security_text, "migration")
+    if not migration:
+        return ["platform-security.yml is missing migration job"]
+    if "needs: classifier" not in migration:
+        issues.append("migration job must depend on classifier")
+    if "if: ${{ needs.classifier.outputs.class == 'full' }}" not in migration:
+        issues.append("migration job must be full-route gated")
+    if "continue-on-error" in migration or re.search(
+        r"^\s{4,}retries?\s*:", migration, re.IGNORECASE | re.MULTILINE
+    ):
+        issues.append("migration job must not mask or retry the migration scenario")
+    timeout = re.search(r"^    timeout-minutes:\s*(\d+)\s*$", migration, re.MULTILINE)
+    if timeout is None or int(timeout.group(1)) != 5:
+        issues.append("migration job must retain the five-minute hard deadline")
+    if migration.count("platform_verify.py migration") != 1:
+        issues.append("migration job must invoke the canonical migration gate exactly once")
+    for marker in (
+        "PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test",
+        "PLATFORM_DB_SCHEMA: platform",
+        "image: postgres:16",
+    ):
+        if marker not in migration:
+            issues.append(f"migration job is missing its disposable target marker: {marker}")
+    integration = _workflow_job_block(security_text, "backend-integration")
+    if (
+        "/usr/bin/timeout --foreground --signal=TERM --kill-after=10s 180s" not in integration
+        or ".venv_platform/bin/python -m alembic upgrade head" not in integration
+    ):
+        issues.append(
+            "backend-integration Alembic bootstrap must use the 180-second timeout contract"
+        )
+
+    scenario_path = PLATFORM_ROOT / "tools" / "platform_migration_scenario.py"
+    support_path = PLATFORM_ROOT / "tools" / "platform_migration_support.py"
+    verify_path = PLATFORM_ROOT / "tools" / "platform_verify.py"
+    try:
+        scenario = scenario_path.read_text(encoding="utf-8")
+        support = support_path.read_text(encoding="utf-8")
+        verify = verify_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return [f"migration contract source is unreadable: {exc}"]
+    if "HEAD_REVISION" in scenario:
+        issues.append("migration scenario must not hardcode HEAD_REVISION")
+    if f"MIGRATION_SUBPROCESS_TIMEOUT_SECONDS = {MIGRATION_SUBPROCESS_TIMEOUT_SECONDS:g}.0" not in support:
+        issues.append("migration support must define the 180-second subprocess timeout")
+    for marker in ("MigrationCommandTimeout", "MigrationCommandError", "run_migration_subprocess"):
+        if marker not in scenario and marker not in support:
+            issues.append(f"migration timeout contract is missing {marker}")
+    if "timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS" not in scenario:
+        issues.append(
+            "migration timeout contract is missing timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS"
+        )
+    if 'operation == "current"' not in scenario or 'command.append("--check-heads")' not in scenario:
+        issues.append("migration scenario must run Alembic current --check-heads")
+    for marker in (
+        "information_schema.tables",
+        "information_schema.columns",
+        "pg_catalog.pg_index",
+        "indisvalid",
+        "indisready",
+        "indislive",
+    ):
+        if marker not in scenario:
+            issues.append(f"migration scenario schema invariant is missing {marker}")
+    for marker in (
+        "IRREVERSIBLE_REVISION = \"20260829_0046\"",
+        "select_reversible_range()",
+        "operation=\"downgrade\"",
+        "validate_disposable_migration_target",
+    ):
+        if marker not in scenario:
+            issues.append(f"migration scenario safety contract is missing {marker}")
+    if "downgrade is an irreversible no-op" not in support:
+        issues.append("migration support must reject no-op downgrade candidates")
+    if "timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS" not in verify:
+        issues.append("canonical migration gate must apply the 180-second timeout")
+
+    # These representative migration/tool/test/workflow paths must all remain
+    # on the complete route.  A packaging-only path may be non-deployable, but
+    # it may never become docs-only or another reduced gate set.
+    from tools.platform_ci_classifier import classify
+
+    route_paths = (
+        "platform/alembic/env.py",
+        "platform/alembic/versions/20260913_0053_tournament_list_read_model_retry.py",
+        "platform/tools/platform_migration_scenario.py",
+        "platform/tools/platform_migration_support.py",
+        "platform/tools/platform_verify.py",
+        "platform/tests/test_platform_verification_contract.py",
+        ".github/workflows/platform-security.yml",
+    )
+    for path in route_paths:
+        manifest = classify(
+            [path],
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        if manifest["class"] != "full" or tuple(manifest["expected_gates"]) != tuple(FULL_GATE_IDS):
+            issues.append(f"classifier reduced migration route for {path}")
+        if manifest["fallback"]:
+            issues.append(f"classifier unexpectedly fell back for known migration route {path}")
+    return issues
+
+
 def _backend_workflow_issues(security_text: str) -> list[str]:
     """Check the backend DAG without executing any CI jobs."""
 
@@ -1711,6 +1822,7 @@ def collect_issues() -> list[str]:
                 f"found {invocations.count(gate_id)}"
             )
     issues.extend(_backend_workflow_issues(security_text))
+    issues.extend(_migration_contract_issues(security_text))
     issues.extend(host_tools_pin_verification_issues(security_text))
     issues.extend(release_runtime_workflow_issues(security_text))
     issues.extend(

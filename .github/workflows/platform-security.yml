@@ -281,6 +281,7 @@ jobs:
       - name: Migrate isolated CI database
         run: >-
           sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          /usr/bin/timeout --foreground --signal=TERM --kill-after=10s 180s
           .venv_platform/bin/python -m alembic upgrade head"
       - name: Run serial backend integration contour exactly once
         run: >-
@@ -495,7 +496,7 @@ jobs:
     needs: classifier
     if: ${{ needs.classifier.outputs.class == 'full' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     services:
       postgres:
         image: postgres:16

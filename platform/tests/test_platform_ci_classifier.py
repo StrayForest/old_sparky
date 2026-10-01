@@ -384,6 +384,26 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     require_deployable=True,
                 )
 
+        for path in (
+            "platform/alembic/env.py",
+            "platform/alembic/versions/20260913_0053_tournament_list_read_model_retry.py",
+            "platform/tools/platform_migration_scenario.py",
+            "platform/tools/platform_migration_support.py",
+            "platform/tools/platform_verify.py",
+            "platform/tests/test_platform_verification_contract.py",
+            ".github/workflows/platform-security.yml",
+        ):
+            with self.subTest(migration_route=path):
+                manifest = classify(
+                    [path],
+                    event="push",
+                    target_sha=self.TARGET_SHA,
+                    branch="dev",
+                )
+                self.assertEqual(manifest["class"], "full")
+                self.assertEqual(tuple(manifest["expected_gates"]), FULL_GATE_IDS)
+                self.assertFalse(manifest["fallback"])
+
         unknown_mixed = classify(
             [
                 ".github/workflows/platform-security.yml",

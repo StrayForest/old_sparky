@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
 import unittest
 
 from python_packages.platform_infra.db import Base
@@ -44,21 +42,6 @@ class MediaModelTests(unittest.TestCase):
         self.assertTrue(foreign_key.use_alter)
         self.assertEqual(foreign_key.ondelete, "SET NULL")
         self.assertGreater(len(Base.metadata.sorted_tables), 0)
-
-    def test_migration_follows_current_head(self) -> None:
-        migration_path = (
-            Path(__file__).resolve().parents[1]
-            / "alembic"
-            / "versions"
-            / "20260801_0036_media_assets.py"
-        )
-        spec = importlib.util.spec_from_file_location("media_migration_0036", migration_path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        self.assertEqual(module.revision, "20260801_0036")
-        self.assertEqual(module.down_revision, "20260731_0035")
-
 
 if __name__ == "__main__":
     unittest.main()
