@@ -245,9 +245,10 @@ class WorkerLivenessHelperTests(unittest.TestCase):
         sleep_seconds: float = 0.0,
         exit_code: int = 0,
         ignore_term: bool = False,
-    ) -> tuple[callable, dict[str, subprocess.Popen[bytes]]]:
+        fork_descendant: bool = False,
+    ) -> tuple[callable, dict[str, object]]:
         encoded = json.dumps(events, separators=(",", ":"))
-        holder: dict[str, subprocess.Popen[bytes]] = {}
+        holder: dict[str, object] = {}
 
         def spawn(_identity: liveness.RunIdentity, _task_id: str, _deadline: float):
             read_fd, write_fd = os.pipe()
@@ -259,6 +260,16 @@ class WorkerLivenessHelperTests(unittest.TestCase):
                 if {ignore_term!r}:
                     import signal
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                if {fork_descendant!r}:
+                    child_pid = os.fork()
+                    if child_pid == 0:
+                        for child_fd in (fd, 1, 2):
+                            try:
+                                os.close(child_fd)
+                            except OSError:
+                                pass
+                        time.sleep(5.0)
+                        raise SystemExit(0)
                 for event in json.loads({encoded!r}):
                     os.write(fd, (json.dumps(event, separators=(',', ':')) + '\\n').encode('ascii'))
                 time.sleep({sleep_seconds!r})
@@ -275,6 +286,7 @@ class WorkerLivenessHelperTests(unittest.TestCase):
             )
             os.close(write_fd)
             holder["process"] = process
+            holder["pgid"] = os.getpgid(process.pid)
             return process, read_fd
 
         return spawn, holder
@@ -286,12 +298,14 @@ class WorkerLivenessHelperTests(unittest.TestCase):
         sleep_seconds: float = 0.0,
         exit_code: int = 0,
         ignore_term: bool = False,
-    ) -> tuple[callable, dict[str, subprocess.Popen[bytes]]]:
+        fork_descendant: bool = False,
+    ) -> tuple[callable, dict[str, object]]:
         spawn, holder = self._spawn_control_child(
             [{"event": "cleanup", "ok": ok}],
             sleep_seconds=sleep_seconds,
             exit_code=exit_code,
             ignore_term=ignore_term,
+            fork_descendant=fork_descendant,
         )
 
         def cleanup_spawn(
@@ -339,6 +353,40 @@ class WorkerLivenessHelperTests(unittest.TestCase):
         self.assertEqual(redis_client.exists_calls, [])
         self.assertIsNotNone(holder["process"].poll())
         self.assertIsNotNone(cleanup_holder["process"].poll())
+
+    def test_terminal_success_with_fd_closed_descendant_is_cleanup_unproven(self) -> None:
+        task_id = "platform-release-ping-" + "3" * 32
+        key = b"celery-task-meta-" + task_id.encode("ascii")
+        events = [
+            {"event": "route", "ok": True},
+            {"event": "published", "key": base64.b64encode(key).decode("ascii")},
+            {
+                "event": "terminal",
+                "ok": True,
+                "forget_ok": True,
+                "key": base64.b64encode(key).decode("ascii"),
+            },
+        ]
+        spawn, holder = self._spawn_control_child(events, fork_descendant=True)
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+        ):
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
+
+        self.assertEqual(payload["status"], "cleanup_unproven")
+        self.assertEqual(payload["cleanup"], "unproven")
+        self.assertIsNotNone(holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
+        self.assertFalse(liveness._group_exists(holder["pgid"]))
 
     def test_forget_failure_cannot_claim_a_successful_roundtrip(self) -> None:
         task_id = "platform-release-ping-" + "e" * 32
@@ -529,6 +577,42 @@ class WorkerLivenessHelperTests(unittest.TestCase):
         self.assertIsNotNone(child_holder["process"].poll())
         self.assertIsNotNone(cleanup_holder["process"].poll())
 
+    def test_cleanup_success_with_fd_closed_descendant_is_unproven(self) -> None:
+        task_id = "platform-release-ping-" + "4" * 32
+        key = b"celery-task-meta-" + task_id.encode("ascii")
+        events = [
+            {"event": "route", "ok": True},
+            {"event": "published", "key": base64.b64encode(key).decode("ascii")},
+            {
+                "event": "terminal",
+                "ok": True,
+                "forget_ok": True,
+                "key": base64.b64encode(key).decode("ascii"),
+            },
+        ]
+        spawn, child_holder = self._spawn_control_child(events)
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child(
+            fork_descendant=True,
+        )
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+        ):
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
+
+        self.assertEqual(payload["status"], "cleanup_unproven")
+        self.assertEqual(payload["cleanup"], "unproven")
+        self.assertIsNotNone(child_holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
+        self.assertFalse(liveness._group_exists(cleanup_holder["pgid"]))
+
     def test_parent_cancellation_reaps_child_and_emits_no_exception(self) -> None:
         task_id = "platform-release-ping-" + "d" * 32
         key = b"celery-task-meta-" + task_id.encode("ascii")
@@ -558,6 +642,33 @@ class WorkerLivenessHelperTests(unittest.TestCase):
         self.assertIsNotNone(holder["process"].poll())
         self.assertIsNotNone(cleanup_holder["process"].poll())
         self.assertNotIn("KeyboardInterrupt", json.dumps(payload))
+
+    def test_exception_after_spawn_finalizes_descendant_group(self) -> None:
+        task_id = "platform-release-ping-" + "5" * 32
+        spawn, holder = self._spawn_control_child(
+            [],
+            fork_descendant=True,
+        )
+        cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
+        identity = _identity(Path("/opt/oldsparky/platform"))
+        with (
+            mock.patch.object(liveness, "validate_worker_execution"),
+            mock.patch.object(liveness, "_load_worker_environment"),
+            mock.patch.dict(os.environ, self._parent_env(), clear=False),
+            mock.patch.object(liveness, "_new_task_id", return_value=task_id),
+            mock.patch.object(liveness, "_collect_child", side_effect=KeyboardInterrupt),
+        ):
+            payload = liveness.run_liveness(
+                identity,
+                spawn_child=spawn,
+                spawn_cleanup=cleanup_spawn,
+            )
+
+        self.assertEqual(payload["status"], "cleanup_unproven")
+        self.assertEqual(payload["cleanup"], "unproven")
+        self.assertIsNotNone(holder["process"].poll())
+        self.assertIsNotNone(cleanup_holder["process"].poll())
+        self.assertFalse(liveness._group_exists(holder["pgid"]))
 
     def test_malformed_child_control_is_redacted_and_cleanup_unproven(self) -> None:
         spawn, holder = self._spawn_control_child([])

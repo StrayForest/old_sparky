@@ -18,6 +18,7 @@ import base64
 import binascii
 from collections.abc import Mapping
 from dataclasses import dataclass
+import errno
 import importlib
 import importlib.util
 import json
@@ -42,6 +43,8 @@ CHILD_STOP_GRACE_SECONDS = 0.75
 CHILD_KILL_GRACE_SECONDS = 0.75
 CLEANUP_STOP_GRACE_SECONDS = 0.20
 CLEANUP_KILL_GRACE_SECONDS = 0.20
+GROUP_FINALIZE_STOP_GRACE_SECONDS = 0.15
+GROUP_FINALIZE_KILL_GRACE_SECONDS = 0.15
 DEFAULT_EXPIRES_SECONDS = 10.0
 WORKER_USER = "oldsparky-worker"
 WORKER_RUNTIME_SERVICE = "worker"
@@ -800,14 +803,196 @@ def _spawn_child(
 
 def _signal_child_group(process: subprocess.Popen[bytes], signal_number: int) -> None:
     try:
-        os.killpg(process.pid, signal_number)
-    except ProcessLookupError:
-        pass
+        _signal_group_id(process.pid, signal_number)
     except BaseException:
+        # The finalizer performs the authoritative exact-PGID probe.  This
+        # best-effort stop path must never fall back to a potentially reused
+        # leader PID.
+        pass
+
+
+@dataclass(slots=True)
+class _GroupFinalization:
+    forced_stop: bool
+    descendant_cleanup: bool
+    leader_reaped: bool
+    proven_absent: bool
+
+
+def _register_process_group(
+    process: subprocess.Popen[bytes],
+) -> tuple[int | None, bool]:
+    """Capture the start-new-session PGID immediately after Popen returns."""
+
+    try:
+        pid = process.pid
+        if not isinstance(pid, int) or pid <= 1:
+            return None, False
+        pgid = os.getpgid(pid)
+    except BaseException:
+        # The real Popen constructor owns cleanup if construction itself
+        # failed.  A returned process whose identity cannot be proved is
+        # always fail-closed by the caller.
         try:
-            process.send_signal(signal_number)
+            pid = process.pid
         except BaseException:
-            pass
+            return None, False
+        return pid if isinstance(pid, int) and pid > 1 else None, False
+    return pgid, pgid == pid
+
+
+def _group_exists(pgid: int) -> bool:
+    """Probe exactly one Linux process group without scanning process state."""
+
+    if not isinstance(pgid, int) or pgid <= 1:
+        raise OSError(errno.EINVAL, "invalid process group")
+    try:
+        os.killpg(pgid, 0)
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            return True
+        raise
+    return True
+
+
+def _signal_group_id(pgid: int, signal_number: int) -> None:
+    """Signal only the captured PGID; never fall back to a reused leader PID."""
+
+    try:
+        os.killpg(pgid, signal_number)
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return
+        raise
+
+
+def _wait_group_absent(
+    pgid: int,
+    deadline: float,
+    clock: Callable[[], float],
+) -> bool:
+    while True:
+        try:
+            if not _group_exists(pgid):
+                return True
+        except BaseException:
+            return False
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.01, remaining))
+
+
+def _reap_leader(
+    process: subprocess.Popen[bytes],
+    deadline: float,
+    clock: Callable[[], float],
+) -> bool:
+    try:
+        process.wait(timeout=max(0.0, deadline - clock()))
+    except BaseException:
+        return False
+    try:
+        return process.poll() is not None
+    except BaseException:
+        return False
+
+
+def _finalize_process_group(
+    process: subprocess.Popen[bytes],
+    pgid: int | None,
+    *,
+    identity_proven: bool,
+    deadline: float,
+    clock: Callable[[], float],
+) -> _GroupFinalization:
+    """Prove a dedicated group is gone, stopping descendants if necessary.
+
+    ``start_new_session=True`` makes the leader PID the PGID on Linux.  The
+    caller records that identity immediately after construction and invokes
+    this function in its outer ``finally``.  The exact-group probe avoids
+    ``ps``/process-tree scans; immediate finalization bounds the small Linux
+    PGID-reuse window.
+    """
+
+    if pgid is None or not identity_proven:
+        return _GroupFinalization(
+            forced_stop=True,
+            descendant_cleanup=False,
+            leader_reaped=_reap_leader(process, deadline, clock),
+            proven_absent=False,
+        )
+    try:
+        group_present = _group_exists(pgid)
+    except BaseException:
+        return _GroupFinalization(
+            forced_stop=True,
+            descendant_cleanup=False,
+            leader_reaped=_reap_leader(process, deadline, clock),
+            proven_absent=False,
+        )
+    if not group_present:
+        leader_reaped = _reap_leader(process, deadline, clock)
+        try:
+            proven_absent = not _group_exists(pgid)
+        except BaseException:
+            proven_absent = False
+        return _GroupFinalization(
+            forced_stop=False,
+            descendant_cleanup=False,
+            leader_reaped=leader_reaped,
+            proven_absent=proven_absent and leader_reaped,
+        )
+
+    forced_stop = True
+    try:
+        leader_exited = process.poll() is not None
+    except BaseException:
+        leader_exited = False
+    descendant_cleanup = leader_exited
+    try:
+        _signal_group_id(pgid, signal.SIGTERM)
+    except BaseException:
+        return _GroupFinalization(
+            forced_stop=True,
+            descendant_cleanup=descendant_cleanup,
+            leader_reaped=_reap_leader(process, deadline, clock),
+            proven_absent=False,
+        )
+    term_deadline = min(
+        deadline,
+        clock() + GROUP_FINALIZE_STOP_GRACE_SECONDS,
+    )
+    if not _wait_group_absent(pgid, term_deadline, clock):
+        try:
+            _signal_group_id(pgid, signal.SIGKILL)
+        except BaseException:
+            return _GroupFinalization(
+                forced_stop=True,
+                descendant_cleanup=descendant_cleanup,
+                leader_reaped=_reap_leader(process, deadline, clock),
+                proven_absent=False,
+            )
+        kill_deadline = min(
+            deadline,
+            clock() + GROUP_FINALIZE_KILL_GRACE_SECONDS,
+        )
+        group_absent = _wait_group_absent(pgid, kill_deadline, clock)
+    else:
+        group_absent = True
+    leader_reaped = _reap_leader(process, deadline, clock)
+    try:
+        group_absent = group_absent and not _group_exists(pgid)
+    except BaseException:
+        group_absent = False
+    return _GroupFinalization(
+        forced_stop=forced_stop,
+        descendant_cleanup=descendant_cleanup,
+        leader_reaped=leader_reaped,
+        proven_absent=group_absent and leader_reaped,
+    )
 
 
 def _stop_child_now(
@@ -1006,8 +1191,8 @@ def _stop_cleanup_now(
                 _signal_child_group(process, signal.SIGKILL)
         else:
             # A leader can have exited while a descendant still owns one of
-            # the inherited protocol/log pipes.  Always close that group when
-            # cleanup collection was interrupted.
+            # the inherited protocol/log pipes.  Signal only the original
+            # start-new-session PGID; the outer finalizer proves its absence.
             forced = True
             _signal_child_group(process, signal.SIGKILL)
         remaining = max(0.0, deadline - clock())
@@ -1279,8 +1464,12 @@ def run_liveness(
     broker_url: str | None = None
     result_url: str | None = None
     handle: tuple[subprocess.Popen[bytes], int] | None = None
+    child_pgid: int | None = None
+    child_group_identity = False
     collection_completed = False
     cleanup_handle: tuple[subprocess.Popen[bytes], int] | None = None
+    cleanup_pgid: int | None = None
+    cleanup_group_identity = False
     cleanup_collection_completed = False
     outcome = _ChildOutcome(uncertain=True)
     cleanup_status = "not_run"
@@ -1313,6 +1502,7 @@ def run_liveness(
         checks["release_identity"] = "passed"
         task_id = _new_task_id()
         handle = spawn_child(identity, task_id, child_deadline)
+        child_pgid, child_group_identity = _register_process_group(handle[0])
         child_collection = _collect_child(
             handle[0],
             handle[1],
@@ -1369,6 +1559,27 @@ def run_liveness(
                     handle[0].wait(timeout=CHILD_KILL_GRACE_SECONDS)
                 except BaseException:
                     pass
+        if handle is not None:
+            try:
+                child_group = _finalize_process_group(
+                    handle[0],
+                    child_pgid,
+                    identity_proven=child_group_identity,
+                    deadline=deadline,
+                    clock=clock,
+                )
+            except BaseException:
+                child_group = None
+            if child_group is None or (
+                not child_group.proven_absent
+                or child_group.forced_stop
+                or child_group.descendant_cleanup
+                or not child_group.leader_reaped
+            ):
+                outcome.uncertain = True
+                outcome.success = False
+                if outcome.terminal:
+                    outcome.result_state = "failed"
         if task_id is not None and result_url is not None:
             cleanup_key = outcome.key
             if cleanup_key is None and (outcome.attempted or outcome.uncertain):
@@ -1387,10 +1598,19 @@ def run_liveness(
                         result_url,
                         deadline,
                     )
+                    cleanup_pgid, cleanup_group_identity = _register_process_group(
+                        cleanup_handle[0]
+                    )
+                    cleanup_collection_deadline = max(
+                        clock(),
+                        deadline
+                        - GROUP_FINALIZE_STOP_GRACE_SECONDS
+                        - GROUP_FINALIZE_KILL_GRACE_SECONDS,
+                    )
                     cleanup_collection = _collect_cleanup(
                         cleanup_handle[0],
                         cleanup_handle[1],
-                        deadline=deadline,
+                        deadline=cleanup_collection_deadline,
                         clock=clock,
                     )
                     cleanup_collection_completed = True
@@ -1412,13 +1632,24 @@ def run_liveness(
                             cleanup_running = True
                             cleanup_ok = False
                     if cleanup_handle is not None and cleanup_running:
+                        cleanup_ok = False
+                    if cleanup_handle is not None:
                         try:
-                            _stop_cleanup_now(
+                            cleanup_group = _finalize_process_group(
                                 cleanup_handle[0],
+                                cleanup_pgid,
+                                identity_proven=cleanup_group_identity,
                                 deadline=deadline,
                                 clock=clock,
                             )
                         except BaseException:
+                            cleanup_group = None
+                        if cleanup_group is None or (
+                            not cleanup_group.proven_absent
+                            or cleanup_group.forced_stop
+                            or cleanup_group.descendant_cleanup
+                            or not cleanup_group.leader_reaped
+                        ):
                             cleanup_ok = False
                     if cleanup_handle is not None:
                         for stream in (
