@@ -148,6 +148,51 @@ Privileged release-lock tests hold a serial test guard and use unique
 root-owned files directly beneath `/run/lock`; cleanup removes only the exact
 test-prefixed regular file and never the production canonical lock.
 
+### Celery worker contract and liveness boundary
+
+The worker registry contract is owned by the independent literal manifest at
+`tests/worker_registry_manifest.py` and its `backend-unit` contract tests.
+The manifest lists the nine application task names, every explicit route,
+the three required queues, all five beat entries, task result/time-limit
+ownership, and bounded cadence/expiry values. The tests compare that manifest
+with the registered Celery application and the production launcher source;
+they do not derive expected ownership from production code.
+
+The `backend-integration` contour launches a disposable liveness-probe supervisor
+subprocess. Only that child imports/configures Celery, registers safe probe
+variants, resolves high/default/low routes and publishes them; the parent never
+mutates or caches the production app. After the parent observes each broker key,
+an explicit ACK starts the official CLI worker (`pool=solo`, concurrency `1`, no
+beat or schedule/state file). The supervisor reports registration/active-queue
+and result events; the parent independently reads DB14 and proves `pong` for
+each route. Celery routing uses cryptographically unique per-run queues, and
+broker evidence observes Kombu Redis priority-step keys, not base-queue length.
+The pure validator requires application DB15, broker DB13 and result DB14 on
+loopback; these are namespace conventions, not a Redis security boundary.
+DB13/14 must be empty before a run; cleanup deletes only observed/run-allowlisted
+queue, priority, binding, unacked, pidbox and result keys, never `FLUSHDB`, and
+refuses foreign sentinels. A shared monotonic 40-second watchdog covers the
+supervisor/worker chain, Redis sockets, TERM/KILL/reap, log EOF join and
+temporary-state postconditions.
+Pull-request evidence for this contour is attributed to the workflow's tested
+merge-candidate SHA (the PR merge run), not to the source-head SHA. Exact
+source identity remains enforced by the existing checkout/tree/digest
+contracts and the trusted `dev` release-runtime path; this contour does not
+weaken the GitHub checkout or replace that source verification.
+
+Ownership is deliberately split:
+
+| Evidence | Pull request / CI owner | Later release or passive owner |
+| --- | --- | --- |
+| Task/route/beat/queue registry | `backend-unit` literal contract | Production worker launcher and beat singleton remain release-owned; this phase does not change them |
+| Broker-to-worker-to-result execution | `backend-integration` ephemeral Redis/PostgreSQL CI job | Production operations/health monitoring may add a separate passive task-liveness signal in a later reviewed phase |
+| Domain idempotency and recovery | Existing backend unit/integration tests | Existing workflow and release owners |
+
+Systemd `active`/process checks are service-supervision evidence only. They
+must not be reported as proof that a task was accepted, executed or persisted.
+This Phase A package therefore does not modify the production health monitor,
+systemd units, release workflows, queues or beat singleton.
+
 Local/canonical invocations that use the host test services hold one global
 cross-UID lock at the fixed
 `/run/lock/oldsparky-platform-verification/oldsparky-platformdb-test.lock`

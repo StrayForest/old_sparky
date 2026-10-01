@@ -22,24 +22,6 @@ class AsyncSessionContext:
         return None
 
 
-class PlatformMediaWorkerConfigurationTests(unittest.TestCase):
-    def test_media_tasks_are_bounded_periodic_and_ignore_results(self) -> None:
-        self.assertEqual(
-            worker.celery_app.conf.beat_schedule["media-reconciliation"],
-            {
-                "task": "platform.media_reconciliation",
-                "schedule": 60.0,
-                "options": {"expires": 60.0},
-            },
-        )
-        self.assertEqual(worker.media_reconciliation.name, "platform.media_reconciliation")
-        self.assertTrue(worker.media_reconciliation.ignore_result)
-        self.assertEqual(worker.media_process_asset.name, "platform.media_process_asset")
-        self.assertTrue(worker.media_process_asset.ignore_result)
-        self.assertEqual(worker.media_process_asset.soft_time_limit, 90)
-        self.assertEqual(worker.media_process_asset.time_limit, 120)
-
-
 class PlatformMediaWorkerLockTests(PlatformIsolatedAsyncioTestCase):
     @staticmethod
     def _redis_client(*, acquired: bool) -> Mock:
