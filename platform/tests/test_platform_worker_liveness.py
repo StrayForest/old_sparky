@@ -8,7 +8,6 @@ import io
 import json
 import os
 from pathlib import Path
-import re
 import signal
 import sys
 import tempfile
@@ -878,7 +877,6 @@ class WorkerLivenessHelperTests(unittest.TestCase):
 
     def test_parent_cancellation_reaps_child_and_emits_no_exception(self) -> None:
         task_id = "platform-release-ping-" + "d" * 32
-        key = b"celery-task-meta-" + task_id.encode("ascii")
         spawn, holder = self._spawn_control_child([], sleep_seconds=5.0)
         cleanup_spawn, cleanup_holder = self._spawn_cleanup_control_child()
         redis_client = _FakeRedisClient()

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import shlex
 import shutil
 import stat
@@ -4055,6 +4056,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "phase", "--expected", "venv-transitioned", "--phase", "staged"
         )
         self.add_runtime_stubs(candidate)
+        self.write_fake_python(self.shared / "venv/bin/python")
         systemctl = self.write_initial_systemctl()
         self.run_transaction("capture-initial-systemd", "--systemctl", str(systemctl))
         self.run_transaction(
@@ -4694,9 +4696,28 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             encoding="utf-8",
         )
         python = self.shared / "venv/bin/python"
+        worker_uid = pwd.getpwnam("oldsparky-worker").pw_uid
         python.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
+            f"if [[ \"${{1:-}}\" == *platform_worker_liveness.py ]]; then\n"
+            f"  [[ \"$(id -u)\" == {worker_uid} ]]\n"
+            "  [[ \"$#\" -eq 7 ]]\n"
+            "  [[ \"$2\" == --app-dir && \"$4\" == --release ]]\n"
+            "  [[ \"$6\" == --expected-source-sha && \"$7\" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]\n"
+            "  [[ \"${PLATFORM_RUNTIME_SERVICE:-}\" == worker ]]\n"
+            "  [[ \"${PLATFORM_APP_DIR:-}\" == \"$3\" ]]\n"
+            "  [[ \"${PLATFORM_SHARED_DIR:-}\" == \"$3/shared\" ]]\n"
+            "  [[ \"${PLATFORM_ENV_FILE:-}\" == \"$3/shared/env/worker.env\" ]]\n"
+            "  [[ \"${PLATFORM_PYTHON_BIN:-}\" == \"$0\" ]]\n"
+            "  [[ \"${PYTHONPATH:-}\" == \"$5\" ]]\n"
+            "  [[ \"${LANG:-}\" == C.UTF-8 && \"${HOME:-}\" == /nonexistent ]]\n"
+            "  [[ \"${PATH:-}\" == /usr/sbin:/usr/bin:/sbin:/bin ]]\n"
+            "  [[ \"${PYTHONNOUSERSITE:-}\" == 1 && \"${PYTHONDONTWRITEBYTECODE:-}\" == 1 ]]\n"
+            "  printf '%s\\n' liveness-probe >> \"$3/shared/.test-worker-liveness.log\"\n"
+            "  printf '%s\\n' '{\"schema\":1,\"kind\":\"platform_worker_liveness\",\"status\":\"passed\",\"checks\":{\"worker_uid\":\"passed\",\"worker_env\":\"passed\",\"release_identity\":\"passed\",\"broker_namespace\":\"passed\",\"result_namespace\":\"passed\",\"task_route\":\"passed\",\"task_result\":\"passed\"},\"backlog\":{\"high\":\"redacted\",\"default\":\"redacted\",\"low\":\"redacted\"},\"cleanup\":\"proven\"}'\n"
+            "  exit 0\n"
+            "fi\n"
             "if [[ \"${1:-}\" == \"-I\" && \"${2:-}\" == *platform_live_qa_runtime_install.py ]]; then\n"
             "  exec /usr/bin/python3 \"$@\"\n"
             "fi\n"
@@ -4746,6 +4767,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         (venv / "deps-version").write_text(f"{marker}\n")
 
     def write_fake_python(self, path: Path) -> None:
+        worker_uid = pwd.getpwnam("oldsparky-worker").pw_uid
         path.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
@@ -4756,7 +4778,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "    fi\n"
             "    ;;\n"
             "  *platform_worker_liveness.py)\n"
-            "    [[ \"$(id -u)\" == 993 ]]\n"
+            f"    [[ \"$(id -u)\" == {worker_uid} ]]\n"
             "    [[ \"$#\" -eq 7 ]]\n"
             "    [[ \"$2\" == --app-dir && \"$4\" == --release ]]\n"
             "    [[ \"$6\" == --expected-source-sha && \"$7\" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]\n"
