@@ -5,82 +5,79 @@ on:
     workflows: [Platform security and build]
     types: [completed]
 
-# This workflow has no source checkout, candidate data, or repository secret inputs.
-# It exists outside the cancellable security workflow so a cancelled/skipped
-# run still receives a terminal commit status whenever GitHub starts workflow_run.
+permissions: {}
+
+# A run and rerun have independent reconciliation lifecycles.  Do not use a
+# shared workflow/ref group: it could cancel or merge unrelated source events.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
+
+# This workflow runs from the default branch after the producer completes.
+# Only the immutable default-branch reconciler is checked out; source-run
+# files, code and artifacts are never obtained or executed here.
 jobs:
   finalize-status:
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      actions: read
+      contents: read
       statuses: write
-    env:
-      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
-      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
-      SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-      SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-      SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
     steps:
-      - name: Publish the exact completed run as a terminal status
+      - name: Resolve immutable default-branch reconciler
+        id: trusted_status
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_BRANCH: dev
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          trusted_ref="$RUNNER_TEMP/platform-trusted-status-ref.json"
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}" \
+            --output "$trusted_ref"
+          /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          branch = sys.argv[3]
+          obj = payload.get("object") if isinstance(payload, dict) else None
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if (
+              payload.get("ref") != f"refs/heads/{branch}"
+              or not isinstance(obj, dict)
+              or obj.get("type") != "commit"
+              or not isinstance(sha, str)
+              or re.fullmatch(r"[0-9a-f]{40}", sha) is None
+          ):
+              raise SystemExit("trusted default branch commit is malformed")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"sha={sha}\n")
+          PY
+          rm -f -- "$trusted_ref"
+      - name: Checkout trusted default-branch reconciler
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.trusted_status.outputs.sha }}
+          fetch-depth: 1
+          path: trusted-status-source
+          persist-credentials: false
+      - name: Reconcile the completed security workflow run
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
-          [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
-          attempt_url="$(/usr/bin/python3 - "$SOURCE_RUN_URL" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$GITHUB_REPOSITORY" <<'PY'
-          import re
-          import sys
-          from urllib.parse import urlsplit
-
-          base, run_id, attempt, repository = sys.argv[1:]
-          expected = f"https://github.com/{repository}/actions/runs/{run_id}"
-          parsed = urlsplit(base)
-          if (
-              base != expected
-              or parsed.scheme != "https"
-              or parsed.netloc != "github.com"
-              or parsed.query
-              or parsed.fragment
-              or not re.fullmatch(r"[1-9][0-9]{0,31}", attempt)
-          ):
-              raise SystemExit("workflow run URL is not canonical")
-          print(f"{expected}/attempts/{attempt}")
-          PY
-          )"
-          case "$SOURCE_CONCLUSION" in
-            success)
-              state=success
-              description="Platform security and build passed"
-              ;;
-            cancelled|failure|skipped|timed_out|action_required|neutral|stale|startup_failure)
-              state=failure
-              description="Platform security or build failed"
-              ;;
-            *)
-              state=failure
-              description="Platform security or build failed"
-              ;;
-          esac
-          payload="$(/usr/bin/python3 - "$state" "$description" "$attempt_url" <<'PY'
-          import json
-          import sys
-
-          print(json.dumps({
-              "state": sys.argv[1],
-              "context": "platform-security-build",
-              "description": sys.argv[2],
-              "target_url": sys.argv[3],
-          }))
-          PY
-          )"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "$payload"
+          /usr/bin/python3 -I -B \
+            "$GITHUB_WORKSPACE/trusted-status-source/platform/tools/platform_security_status.py" \
+            reconcile --event-file "$GITHUB_EVENT_PATH"

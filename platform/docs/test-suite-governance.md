@@ -418,14 +418,42 @@ parallelism, caches, artifacts, permissions, environment authorization and
 commit statuses. The security workflow invokes stable gate IDs and retains
 parallel full-route jobs; reduced routes skip only gates absent from their
 manifest. Its aggregate `platform-security-build=success` status for the exact
-tested execution SHA remains the release authority; the workflow names that
-value `TESTED_SHA=${{ github.sha }}` for pull-request synthetic merges, pushes,
-merge queues and manual dispatches. On a pull request, the source-head SHA is
-used only for the changed-file diff and never replaces `TESTED_SHA`; the
-trusted default-branch SHA used to check out the classifier is separate
-implementation provenance. Manual commit statuses are published only for
-`push` and `workflow_dispatch`, and target `TESTED_SHA`. A local pass is
-neither necessary nor sufficient for deployment.
+tested execution SHA remains the release authority. During the Phase B
+bootstrap, the read-only `status-final` job retains the existing inline
+evaluator as authority; it does not execute `platform_security_status.py` from
+the PR/tested SHA and makes no trusted-evaluator claim. The separate
+`status-publish` job checks out only exact trusted `github.sha` on `dev`, owns
+terminal status publication only for a `push` or `workflow_dispatch` at exact
+`refs/heads/dev`, and invokes the shared tested status tool. The pending
+`status-start` job
+uses the same dev-only predicate, so non-dev dispatches cannot leave a pending
+context. The workflow names the tested value `TESTED_SHA=${{ github.sha }}` for
+pull-request synthetic merges, pushes, merge queues and manual dispatches. On a
+pull request, the source-head SHA is used only for the changed-file diff and
+never replaces `TESTED_SHA`; the trusted default-branch SHA used to check out
+the classifier is separate implementation provenance. A local pass is neither
+necessary nor sufficient for deployment.
+
+The default-branch `workflow_run` reconciler checks out only the resolved
+immutable trusted `dev` SHA and invokes the same status tool with an API-only
+client; its bounded pagination, exact source identity, newer-run check,
+terminal-failure classification and duplicate-status guard are covered by
+injected-client unit tests. It never consumes source-run code or artifacts.
+Both writers suppress only an existing same-context status for the exact
+canonical attempt URL and desired terminal state. An older success or
+different target cannot suppress a current failure, while a newer success or
+running run suppresses an older writer. TODO (Phase B2): after the helper has
+landed on trusted `dev` and received a separate reviewed release, switch the
+read-only `status-final` evaluator to that helper without changing its stable
+job name.
+
+This is code/release API enforcement, not a claim about GitHub branch
+protection. No observable required-check rule is added, removed or changed by
+this bootstrap; the `platform-security-build` context is currently not
+configured as a GitHub required-check rule. The checked-in auto-deploy and
+production validators enforce the exact-SHA status independently.
+Repository-settings changes are outside this contract and are not performed
+by CI or this change.
 
 The auto-deploy and production-deploy provenance gates read the exact
 commit's paginated raw status rows through GitHub's [list commit statuses
