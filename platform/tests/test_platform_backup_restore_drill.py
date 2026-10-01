@@ -124,7 +124,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_dir, mock.patch.object(
             backup_drill, "run_command", side_effect=responses
-        ) as run_command:
+        ) as run_command, mock.patch.object(
+            backup_drill, "_trusted_alembic_head", return_value="20260801_0036"
+        ):
             table_count = backup_drill.perform_restore_drill(
                 pathlib.Path(temporary_dir) / "backup.dump",
                 app_target=target,
@@ -139,6 +141,27 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertIn("CREATE SCHEMA platform", run_command.call_args_list[2].args[0][-1])
         self.assertIn("--schema=platform", run_command.call_args_list[3].args[0])
         self.assertIn("--schema=public", run_command.call_args_list[4].args[0])
+
+    def test_restore_drill_rejects_explicit_head_not_in_trusted_graph(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", "secret", "platformdb"
+        )
+        source_root = pathlib.Path("/tmp/oldsparky-trusted-source")
+        with mock.patch.object(
+            backup_drill, "_trusted_alembic_head", return_value="20260913_0053"
+        ) as trusted_head, mock.patch.object(backup_drill, "run_command") as run_command:
+            with self.assertRaisesRegex(RuntimeError, "trusted deployed source graph"):
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/tmp/backup.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    timestamp_slug="20261001T120000Z",
+                    expected_alembic_head="not-current-head",
+                    source_root=source_root,
+                )
+
+        trusted_head.assert_called_once_with(source_root)
+        run_command.assert_not_called()
 
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

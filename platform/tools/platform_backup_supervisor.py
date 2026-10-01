@@ -1407,12 +1407,15 @@ def run_local_backup(
         # in that mode its sibling directory, rather than the repository
         # package root, is on sys.path.
         restore = importlib.import_module("platform_backup_restore_drill")
-    # The supervisor API carries the trusted expected head explicitly.  When a
-    # caller does not provide one, derive it from the deployed source graph;
-    # never read hidden state from a CLI Namespace that has not been built yet.
-    expected_head = expected_alembic_head
-    if expected_head is None:
-        expected_head = restore.expected_alembic_head(Path(app_dir) / "current")
+    # The deployed source graph is authoritative.  An explicit value is only
+    # accepted when it is the same value proven by that graph; otherwise an
+    # in-process caller could weaken the exact-head restore check.
+    trusted_head = restore.expected_alembic_head(Path(app_dir) / "current")
+    if expected_alembic_head is not None and expected_alembic_head != trusted_head:
+        raise BackupSupervisorError(
+            "requested Alembic head does not match the trusted deployed source graph"
+        )
+    expected_head = trusted_head
     restore_args = _restore_args(
         app_dir,
         keep=keep,
@@ -1668,6 +1671,11 @@ def run_backup_entrypoint(
             app_dir, source_release_dir=source_release_dir, include_predecessors=True
         ) as (capability, lock, _live_qa_lock_fd):
             evidence.update_release(_source_sha_from_release(app_dir))
+            try:
+                restore = importlib.import_module("tools.platform_backup_restore_drill")
+            except ImportError:
+                restore = importlib.import_module("platform_backup_restore_drill")
+            expected_alembic_head = restore.expected_alembic_head(Path(app_dir) / "current")
             return run_local_backup(
                 app_dir,
                 keep=int(getattr(args, "keep", 14)),
@@ -1675,6 +1683,7 @@ def run_backup_entrypoint(
                 env_file=getattr(args, "env_file", None),
                 output_dir=getattr(args, "output_dir", None),
                 admin_database_url=getattr(args, "admin_database_url", None),
+                expected_alembic_head=expected_alembic_head,
                 capability=capability,
                 lock=lock,
                 evidence=evidence,

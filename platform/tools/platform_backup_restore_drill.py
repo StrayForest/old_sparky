@@ -574,7 +574,12 @@ def perform_restore_drill(
     expected_alembic_head: str | None = None,
     source_root: pathlib.Path | None = None,
 ) -> int:
-    expected_head = expected_alembic_head or _trusted_alembic_head(source_root)
+    trusted_head = _trusted_alembic_head(source_root)
+    if expected_alembic_head is not None and expected_alembic_head != trusted_head:
+        raise RuntimeError(
+            "Expected Alembic head does not match the trusted deployed source graph."
+        )
+    expected_head = trusted_head
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
         admin_target is None

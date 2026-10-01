@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 from tools import platform_backup_supervisor as supervisor
@@ -181,6 +182,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         """The supervisor must build restore args without hidden CLI state."""
 
         restore = mock.Mock()
+        restore.expected_alembic_head.return_value = "20260913_0053"
         restore.create_backup.side_effect = RuntimeError("pg_dump sentinel")
         app_dir = Path("/tmp/oldsparky-supervisor-head-regression")
         lock = mock.Mock()
@@ -199,10 +201,73 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                 )
 
         lock.validate.assert_called_once_with()
-        restore.expected_alembic_head.assert_not_called()
+        restore.expected_alembic_head.assert_called_once_with(app_dir / "current")
         restore.create_backup.assert_called_once()
         restore_args = restore.create_backup.call_args.args[0]
         self.assertEqual(restore_args.expected_alembic_head, "20260913_0053")
+
+    def test_local_backup_rejects_untrusted_explicit_expected_head(self) -> None:
+        restore = mock.Mock()
+        restore.expected_alembic_head.return_value = "20260913_0053"
+
+        with mock.patch.object(
+            supervisor.importlib, "import_module", return_value=restore
+        ):
+            with self.assertRaisesRegex(
+                supervisor.BackupSupervisorError, "trusted deployed source graph"
+            ):
+                supervisor.run_local_backup(
+                    Path("/tmp/oldsparky-supervisor-head-mismatch"),
+                    expected_alembic_head="not-current-head",
+                    capability=supervisor._capability("maintenance"),
+                    lock=mock.Mock(),
+                    evidence=mock.Mock(),
+                )
+
+        restore.create_backup.assert_not_called()
+
+    def test_production_backup_entrypoint_propagates_trusted_expected_head(self) -> None:
+        app_dir = Path("/tmp/oldsparky-supervisor-entrypoint")
+        expected_head = "20260913_0053"
+        restore = mock.Mock()
+        restore.expected_alembic_head.return_value = expected_head
+        evidence = mock.Mock()
+        evidence_context = mock.MagicMock()
+        evidence_context.__enter__.return_value = evidence
+        lock = mock.Mock()
+        capability = supervisor._capability("maintenance")
+        scope_context = mock.MagicMock()
+        scope_context.__enter__.return_value = (capability, lock, None)
+        args = SimpleNamespace(
+            keep=14,
+            max_age_hours=24.0,
+            env_file=None,
+            output_dir=None,
+            admin_database_url=None,
+        )
+
+        with (
+            mock.patch.object(
+                supervisor, "evidence_session", return_value=evidence_context
+            ),
+            mock.patch.object(
+                supervisor, "ordered_backup_lock_scope", return_value=scope_context
+            ),
+            mock.patch.object(supervisor, "_source_sha_from_release", return_value="unknown"),
+            mock.patch.object(
+                supervisor.importlib, "import_module", return_value=restore
+            ),
+            mock.patch.object(
+                supervisor, "run_local_backup", return_value={"ok": True}
+            ) as run_local,
+        ):
+            result = supervisor.run_backup_entrypoint(args, app_dir=app_dir)
+
+        self.assertEqual(result, {"ok": True})
+        restore.expected_alembic_head.assert_called_once_with(app_dir / "current")
+        self.assertEqual(
+            run_local.call_args.kwargs["expected_alembic_head"], expected_head
+        )
 
     def test_capability_and_nested_evidence_schema_fail_closed(self) -> None:
         with self.assertRaises(supervisor.BackupSupervisorError):
