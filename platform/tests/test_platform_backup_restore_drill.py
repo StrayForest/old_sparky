@@ -37,17 +37,14 @@ sys.modules[MANIFEST_SPEC.name] = manifest_contract
 MANIFEST_SPEC.loader.exec_module(manifest_contract)
 
 
-def _trusted_head(source_root: pathlib.Path) -> object:
+def _trusted_source(source_root: pathlib.Path) -> pathlib.Path:
     versions = source_root / "alembic" / "versions"
     versions.mkdir(parents=True)
     (versions / "001.py").write_text(
         "revision = '20260913_0053'\ndown_revision = None\n",
         encoding="utf-8",
     )
-    return platform_backup_supervisor._trusted_head_for_source(
-        source_root,
-        restore=backup_drill,
-    )
+    return source_root
 
 
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
@@ -58,7 +55,25 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             keep=2,
             admin_database_url=None,
             dump_only=dump_only,
-            _supervisor_capability=platform_backup_supervisor._capability("maintenance"),
+        )
+
+    def _create_backup(
+        self,
+        args: argparse.Namespace,
+        *,
+        source_root: pathlib.Path | None = None,
+    ) -> dict[str, object]:
+        return platform_backup_supervisor._run_local_backup_scope(
+            args,
+            app_dir=pathlib.Path(args.output_dir),
+            source_root=source_root,
+            _restore_module=backup_drill,
+            lock=mock.Mock(),
+            callback=lambda capability, trusted_head, _restore: backup_drill.create_backup(
+                args,
+                capability=capability,
+                trusted_alembic_head=trusted_head,
+            ),
         )
 
     def _creator_environment(self) -> dict[str, str]:
@@ -289,10 +304,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             verified_metadata = verified_dump.with_suffix(".json")
             failed_metadata = failed_dump.with_suffix(".json")
 
-            removed = backup_drill.prune_unverified_backups(
-                output_dir,
-                preserve_metadata=verified_metadata,
-                capability=platform_backup_supervisor._capability("maintenance"),
+            removed = platform_backup_supervisor._run_maintenance_scope(
+                lock=mock.Mock(),
+                callback=lambda capability: backup_drill.prune_unverified_backups(
+                    output_dir,
+                    preserve_metadata=verified_metadata,
+                    capability=capability,
+                ),
             )
 
             self.assertTrue(verified_dump.exists())
@@ -330,7 +348,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 ):
                     results = list(
                         executor.map(
-                            lambda _index: backup_drill.create_backup(
+                            lambda _index: self._create_backup(
                                 self._creator_args(output_dir)
                             ),
                             range(2),
@@ -385,7 +403,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     ),
                 ):
                     with self.assertRaisesRegex(RuntimeError, "already occupied"):
-                        backup_drill.create_backup(self._creator_args(output_dir))
+                        self._create_backup(self._creator_args(output_dir))
 
                 self.assertEqual(outside.read_bytes(), b"protected outside data")
                 self.assertTrue(temporary_path.is_symlink() or temporary_path.is_file())
@@ -438,7 +456,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     ),
                 ):
                     with self.assertRaisesRegex(RuntimeError, "replaced|hardlink"):
-                        backup_drill.create_backup(self._creator_args(output_dir))
+                        self._create_backup(self._creator_args(output_dir))
 
                 self.assertEqual(outside.read_bytes(), b"protected outside data")
                 self.assertEqual(tuple(output_dir.glob("platformdb-*.dump")), ())
@@ -498,7 +516,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     for patcher in patchers:
                         stack.enter_context(patcher)
                     with self.assertRaises(Exception):
-                        backup_drill.create_backup(self._creator_args(output_dir))
+                        self._create_backup(self._creator_args(output_dir))
 
                 self.assertEqual(tuple(output_dir.iterdir()), ())
 
@@ -523,15 +541,14 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 keep=1,
                 admin_database_url=None,
                 dump_only=False,
-                _supervisor_capability=platform_backup_supervisor._capability("maintenance"),
             )
-            trusted_head = _trusted_head(output_dir / "trusted-source")
+            trusted_source = _trusted_source(output_dir / "trusted-source")
 
             with self.assertRaisesRegex(
                 platform_backup_supervisor.BackupSupervisorError,
-                "trusted Alembic head",
+                "trusted deployed Alembic source graph",
             ):
-                backup_drill.create_backup(args)
+                self._create_backup(args)
 
             def fake_run_command(
                 command: list[str], *, stdout: int | None = None, **_: object
@@ -571,9 +588,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(RuntimeError, "restore verification failed"):
-                    backup_drill.create_backup(
+                    self._create_backup(
                         args,
-                        trusted_alembic_head=trusted_head,
+                        source_root=trusted_source,
                     )
 
             self.assertTrue(old_dump.exists())

@@ -47,17 +47,14 @@ FINGERPRINT = "A" * 40
 R2_ENDPOINT = f"https://{'a' * 32}.r2.cloudflarestorage.com"
 
 
-def _trusted_head(source_root: Path) -> object:
+def _trusted_source(source_root: Path) -> Path:
     versions = source_root / "alembic" / "versions"
     versions.mkdir(parents=True)
     (versions / "001.py").write_text(
         "revision = '20260913_0053'\ndown_revision = None\n",
         encoding="utf-8",
     )
-    return platform_backup_supervisor._trusted_head_for_source(
-        source_root,
-        restore=backup_creator,
-    )
+    return source_root
 
 
 def _write_private(path: Path, content: str | bytes) -> None:
@@ -170,20 +167,39 @@ class RecordingStorageClient:
 
 
 class PlatformBackupOffsiteTests(unittest.TestCase):
+    def _create_backup(
+        self,
+        args: argparse.Namespace,
+        *,
+        app_dir: Path,
+        source_root: Path,
+    ) -> dict[str, object]:
+        return platform_backup_supervisor._run_local_backup_scope(
+            args,
+            app_dir=app_dir,
+            source_root=source_root,
+            _restore_module=backup_creator,
+            lock=mock.Mock(),
+            callback=lambda capability, trusted_head, _restore: backup_creator.create_backup(
+                args,
+                capability=capability,
+                trusted_alembic_head=trusted_head,
+            ),
+        )
+
     def test_actual_creator_manifest_is_consumed_by_offsite_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             env_path = root / ".env.platform"
             output_dir = root / "backups"
             output_dir.mkdir()
-            trusted_head = _trusted_head(root / "trusted-source")
+            trusted_source = _trusted_source(root / "trusted-source")
             args = argparse.Namespace(
                 env_file=str(env_path),
                 output_dir=str(output_dir),
                 keep=2,
                 admin_database_url=None,
                 dump_only=False,
-                _supervisor_capability=platform_backup_supervisor._capability("maintenance"),
             )
 
             def fake_run_command(
@@ -206,9 +222,10 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 mock.patch.object(backup_creator, "run_command", side_effect=fake_run_command),
                 mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
             ):
-                created = backup_creator.create_backup(
+                created = self._create_backup(
                     args,
-                    trusted_alembic_head=trusted_head,
+                    app_dir=root,
+                    source_root=trusted_source,
                 )
 
             selected = offsite.select_verified_backup(
@@ -225,7 +242,7 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
             root = Path(temporary_dir)
             output_dir = root / "backups"
             output_dir.mkdir()
-            trusted_head = _trusted_head(root / "trusted-source")
+            trusted_source = _trusted_source(root / "trusted-source")
             fixed_now = dt.datetime(2026, 10, 1, 12, 0, 0, tzinfo=dt.UTC)
             args = argparse.Namespace(
                 env_file=str(root / ".env.platform"),
@@ -233,7 +250,6 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 keep=2,
                 admin_database_url=None,
                 dump_only=False,
-                _supervisor_capability=platform_backup_supervisor._capability("maintenance"),
             )
 
             def fake_run_command(
@@ -257,13 +273,15 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
                 mock.patch.object(backup_creator, "utc_now", return_value=fixed_now),
             ):
-                first = backup_creator.create_backup(
+                first = self._create_backup(
                     args,
-                    trusted_alembic_head=trusted_head,
+                    app_dir=root,
+                    source_root=trusted_source,
                 )
-                second = backup_creator.create_backup(
+                second = self._create_backup(
                     args,
-                    trusted_alembic_head=trusted_head,
+                    app_dir=root,
+                    source_root=trusted_source,
                 )
 
             self.assertNotEqual(first["run_id"], second["run_id"])

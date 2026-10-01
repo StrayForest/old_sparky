@@ -386,12 +386,19 @@ def assert_operation_lock_order(operation: str, sequence: tuple[str, ...] | list
 
 
 def _build_authority_broker():
-    """Build closure-owned identity registries for supervisor authorities."""
+    """Build the private authority boundary and its guarded consumers.
+
+    The registry and its mutators deliberately never leave this closure.  A
+    caller can receive an already-issued authority only as the argument to a
+    callback executed by one of the fixed supervisor scopes below.  This is a
+    stronger boundary than a module-private ``_issue_*`` helper: reflection
+    over module globals cannot obtain a raw issuer or registry.
+    """
 
     def identity_registry():
         records: dict[int, tuple[weakref.ReferenceType[Any], object]] = {}
 
-        def issue(instance: object, record: object) -> None:
+        def register(instance: object, record: object) -> None:
             key = id(instance)
             current = records.get(key)
             if current is not None and current[0]() is not None:
@@ -414,38 +421,183 @@ def _build_authority_broker():
                 return None
             return current[1]
 
-        return issue, lookup
+        return register, lookup
 
-    issue_capability, lookup_capability = identity_registry()
-    issue_head, lookup_head = identity_registry()
+    register_capability, lookup_capability = identity_registry()
+    register_head, lookup_head = identity_registry()
 
-    def issue_capability_authority(instance: object, operation: str) -> None:
-        if type(instance) is not _MutationCapability:
-            raise BackupSupervisorError("backup mutation capability is not issuable")
-        if operation not in {"maintenance", "offsite"}:
-            raise BackupSupervisorError(f"unknown backup mutation operation: {operation}")
-        issue_capability(instance, operation)
-
-    def lookup_capability_authority(instance: object) -> object | None:
+    def capability_record(instance: object) -> object | None:
         return lookup_capability(instance)
 
-    def issue_head_authority(instance: object, value: str, source_root: Path) -> None:
-        if type(instance) is not _TrustedAlembicHead:
-            raise BackupSupervisorError("trusted Alembic head is not issuable")
+    def head_record(instance: object) -> object | None:
+        return lookup_head(instance)
+
+    def make_capability(
+        operation: str,
+        scope_state: dict[str, bool] | None = None,
+    ) -> _MutationCapability:
+        if operation not in {"maintenance", "offsite"}:
+            raise BackupSupervisorError(f"unknown backup mutation operation: {operation}")
+        instance = object.__new__(_MutationCapability)
+        register_capability(instance, (operation, scope_state))
+        return instance
+
+    def make_head(
+        value: str,
+        source_root: Path,
+        scope_state: dict[str, bool] | None = None,
+    ) -> _TrustedAlembicHead:
         if not isinstance(value, str) or ALEMBIC_HEAD_RE.fullmatch(value) is None:
             raise BackupSupervisorError("trusted Alembic head is invalid")
         if not isinstance(source_root, Path) or not source_root.is_absolute():
             raise BackupSupervisorError("trusted Alembic source root is invalid")
-        issue_head(instance, (value, source_root))
+        instance = object.__new__(_TrustedAlembicHead)
+        register_head(instance, (value, source_root, scope_state))
+        return instance
 
-    def lookup_head_authority(instance: object) -> object | None:
-        return lookup_head(instance)
+    def contains_authority(value: object, seen: set[int] | None = None) -> bool:
+        """Prevent a scoped callback from smuggling authority out in a result."""
+
+        if type(value) in {_MutationCapability, _TrustedAlembicHead}:
+            return True
+        if seen is None:
+            seen = set()
+        identity = id(value)
+        if identity in seen:
+            return False
+        seen.add(identity)
+        if isinstance(value, Mapping):
+            return any(
+                contains_authority(key, seen) or contains_authority(item, seen)
+                for key, item in value.items()
+            )
+        if isinstance(value, (tuple, list, set, frozenset)):
+            return any(contains_authority(item, seen) for item in value)
+        return False
+
+    def public_result(value: Any) -> Any:
+        if contains_authority(value):
+            raise BackupSupervisorError("supervisor authority cannot escape its operation scope")
+        return value
+
+    def validate_scope_lock(lock: object) -> None:
+        validator = getattr(lock, "validate", None)
+        if not callable(validator):
+            raise BackupSupervisorError("backup operation requires a held backup lock")
+        try:
+            validator()
+        except BackupSupervisorError:
+            raise
+        except Exception as exc:
+            raise BackupSupervisorError("held backup lock is invalid") from exc
+
+    def load_restore_module() -> Any:
+        try:
+            return importlib.import_module("tools.platform_backup_restore_drill")
+        except ImportError:
+            # The installed production entrypoint is executed by absolute
+            # path; in that mode its sibling directory is on sys.path.
+            return importlib.import_module("platform_backup_restore_drill")
+
+    def resolve_trusted_head(
+        source_root: Path,
+        *,
+        restore: Any | None = None,
+        scope_state: dict[str, bool] | None = None,
+    ) -> _TrustedAlembicHead:
+        """Derive and pin the exact head from the trusted source graph."""
+
+        root = Path(source_root)
+        if not root.is_absolute():
+            raise BackupSupervisorError("trusted Alembic source root must be absolute")
+        try:
+            resolved_root = root.resolve(strict=False)
+        except OSError as exc:
+            raise BackupSupervisorError("trusted Alembic source root is invalid") from exc
+        if restore is None:
+            restore = load_restore_module()
+        try:
+            value = restore.expected_alembic_head(root)
+        except Exception as exc:
+            raise BackupSupervisorError(
+                "trusted deployed Alembic source graph is unavailable"
+            ) from exc
+        return make_head(value, resolved_root, scope_state)
+
+    def trusted_head_for_source(source_root: Path) -> _TrustedAlembicHead:
+        """Resolve a trusted head using the deployed restore graph only."""
+
+        return resolve_trusted_head(source_root, restore=load_restore_module())
+
+    def local_backup_scope(
+        args: argparse.Namespace,
+        *,
+        app_dir: Path,
+        lock: BackupLockHandle,
+        source_root: Path | None = None,
+        _restore_module: Any | None = None,
+        callback: Any,
+    ) -> Any:
+        """Issue fixed local-backup authorities only inside a held lock scope."""
+
+        validate_scope_lock(lock)
+        scope_state = {"active": True}
+        try:
+            restore = _restore_module if _restore_module is not None else load_restore_module()
+            trusted_source = Path(source_root or (Path(app_dir) / "current"))
+            trusted_head = None
+            if not bool(getattr(args, "dump_only", False)):
+                trusted_head = resolve_trusted_head(
+                    trusted_source,
+                    restore=restore,
+                    scope_state=scope_state,
+                )
+            capability = make_capability("maintenance", scope_state)
+            return public_result(callback(capability, trusted_head, restore))
+        finally:
+            scope_state["active"] = False
+
+    def offsite_scope(
+        args: argparse.Namespace,
+        *,
+        app_dir: Path,
+        lock: BackupLockHandle,
+        _restore_module: Any | None = None,
+        callback: Any,
+    ) -> Any:
+        """Issue the fixed off-site authority after graph validation."""
+
+        validate_scope_lock(lock)
+        scope_state = {"active": True}
+        try:
+            restore = _restore_module if _restore_module is not None else load_restore_module()
+            trusted_head = resolve_trusted_head(
+                Path(app_dir) / "current",
+                restore=restore,
+                scope_state=scope_state,
+            )
+            capability = make_capability("offsite", scope_state)
+            return public_result(callback(capability, trusted_head, restore))
+        finally:
+            scope_state["active"] = False
+
+    def maintenance_scope(*, lock: BackupLockHandle, callback: Any) -> Any:
+        """Issue the fixed maintenance authority under the held backup lock."""
+
+        validate_scope_lock(lock)
+        scope_state = {"active": True}
+        try:
+            return public_result(callback(make_capability("maintenance", scope_state)))
+        finally:
+            scope_state["active"] = False
 
     return (
-        issue_capability_authority,
-        lookup_capability_authority,
-        issue_head_authority,
-        lookup_head_authority,
+        capability_record,
+        head_record,
+        trusted_head_for_source,
+        local_backup_scope,
+        offsite_scope,
+        maintenance_scope,
     )
 
 
@@ -466,17 +618,40 @@ class _MutationCapability:
 
     @property
     def operation(self) -> str:
-        operation = _authority_lookup_capability(self)
-        if operation not in {"maintenance", "offsite"}:
+        record = _authority_capability_record(self)
+        if (
+            not isinstance(record, tuple)
+            or len(record) != 2
+            or record[0] not in {"maintenance", "offsite"}
+            or (
+                record[1] is not None
+                and (
+                    not isinstance(record[1], dict)
+                    or record[1].get("active") is not True
+                )
+            )
+        ):
             raise BackupSupervisorError("backup mutation capability is invalid")
-        return operation
+        return record[0]
 
     def prove(self, operation: str) -> None:
         if type(self) is not _MutationCapability:
             raise BackupSupervisorError("backup mutation capability is invalid")
         if operation not in {"maintenance", "offsite"}:
             raise BackupSupervisorError("backup mutation capability is invalid")
-        if _authority_lookup_capability(self) != operation:
+        record = _authority_capability_record(self)
+        if (
+            not isinstance(record, tuple)
+            or len(record) != 2
+            or record[0] != operation
+            or (
+                record[1] is not None
+                and (
+                    not isinstance(record[1], dict)
+                    or record[1].get("active") is not True
+                )
+            )
+        ):
             raise BackupSupervisorError("backup mutation capability is invalid")
 
     def __copy__(self) -> None:
@@ -490,12 +665,6 @@ class _MutationCapability:
 
     def __reduce_ex__(self, _protocol: int) -> None:
         raise TypeError("backup mutation capability cannot be serialized")
-
-
-def _capability(operation: str) -> _MutationCapability:
-    capability = object.__new__(_MutationCapability)
-    _authority_issue_capability(capability, operation)
-    return capability
 
 
 def require_mutation_capability(value: object, operation: str) -> _MutationCapability:
@@ -512,10 +681,10 @@ class _TrustedAlembicHead:
     """An exact migration head resolved once by the supervisor boundary.
 
     The provenance record lives in the private authority broker, not on the
-    object.  The source root travels with the value, allowing tests to use an
-    isolated trusted graph without changing the production ``app_dir/current``
-    resolution rule.  Only ``_trusted_head_for_source`` creates instances
-    after reading the trusted migration graph.
+    object.  The source root travels with the value, allowing the guarded
+    hermetic test contour to use an isolated trusted graph without changing
+    the production ``app_dir/current`` resolution rule.  Only the broker's
+    trusted-graph resolver creates instances after reading that graph.
     """
 
     __slots__ = ("__weakref__",)
@@ -531,15 +700,35 @@ class _TrustedAlembicHead:
 
     @property
     def value(self) -> str:
-        record = _authority_lookup_head(self)
-        if not isinstance(record, tuple) or len(record) != 2:
+        record = _authority_head_record(self)
+        if (
+            not isinstance(record, tuple)
+            or len(record) != 3
+            or (
+                record[2] is not None
+                and (
+                    not isinstance(record[2], dict)
+                    or record[2].get("active") is not True
+                )
+            )
+        ):
             raise BackupSupervisorError("trusted Alembic head is invalid")
         return record[0]
 
     @property
     def source_root(self) -> Path:
-        record = _authority_lookup_head(self)
-        if not isinstance(record, tuple) or len(record) != 2:
+        record = _authority_head_record(self)
+        if (
+            not isinstance(record, tuple)
+            or len(record) != 3
+            or (
+                record[2] is not None
+                and (
+                    not isinstance(record[2], dict)
+                    or record[2].get("active") is not True
+                )
+            )
+        ):
             raise BackupSupervisorError("trusted Alembic head is invalid")
         return record[1]
 
@@ -556,41 +745,6 @@ class _TrustedAlembicHead:
         raise TypeError("trusted Alembic head cannot be serialized")
 
 
-def _trusted_head_for_source(
-    source_root: Path,
-    *,
-    restore: Any | None = None,
-) -> _TrustedAlembicHead:
-    """Resolve and pin the trusted Alembic graph for one supervisor run.
-
-    ``restore`` is private dependency injection for hermetic tests.  Normal
-    production callers always resolve the sibling restore helper and the
-    deployed ``current`` release path.
-    """
-
-    root = Path(source_root)
-    if not root.is_absolute():
-        raise BackupSupervisorError("trusted Alembic source root must be absolute")
-    try:
-        resolved_root = root.resolve(strict=False)
-    except OSError as exc:
-        raise BackupSupervisorError("trusted Alembic source root is invalid") from exc
-    if restore is None:
-        try:
-            restore = importlib.import_module("tools.platform_backup_restore_drill")
-        except ImportError:
-            restore = importlib.import_module("platform_backup_restore_drill")
-    try:
-        value = restore.expected_alembic_head(root)
-    except Exception as exc:
-        raise BackupSupervisorError("trusted deployed Alembic source graph is unavailable") from exc
-    if not isinstance(value, str) or ALEMBIC_HEAD_RE.fullmatch(value) is None:
-        raise BackupSupervisorError("trusted deployed Alembic head is invalid")
-    head = object.__new__(_TrustedAlembicHead)
-    _authority_issue_head(head, value, resolved_root)
-    return head
-
-
 def require_trusted_alembic_head(
     value: object,
     *,
@@ -603,12 +757,16 @@ def require_trusted_alembic_head(
         raise BackupSupervisorError(
             "backup restore requires a supervisor-resolved trusted Alembic head"
         )
-    record = _authority_lookup_head(value)
-    if not isinstance(record, tuple) or len(record) != 2:
+    record = _authority_head_record(value)
+    if not isinstance(record, tuple) or len(record) != 3:
         raise BackupSupervisorError(
             "backup restore requires a supervisor-resolved trusted Alembic head"
         )
-    head_value, head_source_root = record
+    head_value, head_source_root, scope_state = record
+    if scope_state is not None and (
+        not isinstance(scope_state, dict) or scope_state.get("active") is not True
+    ):
+        raise BackupSupervisorError("trusted Alembic head is no longer active")
     if not isinstance(head_value, str) or ALEMBIC_HEAD_RE.fullmatch(head_value) is None:
         raise BackupSupervisorError("trusted Alembic head is invalid")
     if not isinstance(head_source_root, Path) or not head_source_root.is_absolute():
@@ -628,11 +786,14 @@ def require_trusted_alembic_head(
 
 
 (
-    _authority_issue_capability,
-    _authority_lookup_capability,
-    _authority_issue_head,
-    _authority_lookup_head,
+    _authority_capability_record,
+    _authority_head_record,
+    _trusted_head_for_source,
+    _run_local_backup_scope,
+    _run_offsite_scope,
+    _run_maintenance_scope,
 ) = _build_authority_broker()
+del _build_authority_broker
 
 
 @dataclass(frozen=True, slots=True)
@@ -1539,12 +1700,17 @@ def ordered_backup_lock_scope(
     *,
     source_release_dir: Path | None = None,
     include_predecessors: bool = True,
-) -> Iterator[tuple[_MutationCapability, BackupLockHandle, int | None]]:
-    """Yield a capability after acquiring the exact global lock suffix/order."""
+) -> Iterator[tuple[BackupLockHandle, int | None]]:
+    """Yield held locks in the exact global order.
+
+    Mutation authority is issued by the operation-specific supervisor scope
+    while this context is held; it is intentionally not returned with the
+    lock tuple.
+    """
 
     if not include_predecessors:
         with exclusive_backup_lock() as backup_lock:
-            yield _capability("offsite"), backup_lock, None
+            yield backup_lock, None
         return
 
     try:
@@ -1569,7 +1735,7 @@ def ordered_backup_lock_scope(
                 # runtime cache is selected.  The backup lock is always last.
                 with _machine_live_qa_lock() as live_qa_lock_fd:
                     with exclusive_backup_lock() as backup_lock:
-                        yield _capability("maintenance"), backup_lock, live_qa_lock_fd
+                        yield backup_lock, live_qa_lock_fd
 
 
 def _source_sha_from_release(app_dir: Path) -> str:
@@ -1609,8 +1775,7 @@ def run_local_backup(
     env_file: Path | None = None,
     output_dir: Path | None = None,
     admin_database_url: str | None = None,
-    expected_alembic_head: str | None = None,
-    trusted_alembic_head: object | None = None,
+    trusted_alembic_head: object,
     source_root: Path | None = None,
     capability: object,
     lock: BackupLockHandle,
@@ -1618,8 +1783,8 @@ def run_local_backup(
 ) -> dict[str, Any]:
     """Create, verify, and prune one local backup under the final lock."""
 
-    require_mutation_capability(capability, "maintenance")
     lock.validate()
+    require_mutation_capability(capability, "maintenance")
     try:
         restore = importlib.import_module("tools.platform_backup_restore_drill")
     except ImportError:
@@ -1628,22 +1793,10 @@ def run_local_backup(
         # package root, is on sys.path.
         restore = importlib.import_module("platform_backup_restore_drill")
     trusted_source = Path(source_root or (Path(app_dir) / "current"))
-    if trusted_alembic_head is None:
-        trusted_alembic_head = _trusted_head_for_source(
-            trusted_source,
-            restore=restore,
-        )
-    else:
-        trusted_alembic_head = require_trusted_alembic_head(
-            trusted_alembic_head,
-            source_root=trusted_source,
-            expected=expected_alembic_head,
-        )
-    if expected_alembic_head is not None:
-        require_trusted_alembic_head(
-            trusted_alembic_head,
-            expected=expected_alembic_head,
-        )
+    trusted_alembic_head = require_trusted_alembic_head(
+        trusted_alembic_head,
+        source_root=trusted_source,
+    )
     restore_args = _restore_args(
         app_dir,
         keep=keep,
@@ -1651,9 +1804,8 @@ def run_local_backup(
         output_dir=output_dir,
         admin_database_url=admin_database_url,
     )
-    # The supervisor, not the low-level producer, owns rotation.  Existing
-    # callers retain the primitive's default behavior, while this path passes
-    # the in-process capability and explicitly disables nested pruning.
+    # The supervisor, not the low-level producer, owns rotation.  This path
+    # passes the in-process capability and explicitly disables nested pruning.
     created = restore.create_backup(
         restore_args,
         prune=False,
@@ -1728,6 +1880,7 @@ def run_offsite(
     args: argparse.Namespace,
     *,
     app_dir: Path,
+    trusted_alembic_head: object,
     capability: object,
     lock: BackupLockHandle,
     evidence: EvidenceSession,
@@ -1735,8 +1888,8 @@ def run_offsite(
 ) -> dict[str, Any]:
     """Select/encrypt/upload/head-verify one exact pair under backup lock."""
 
-    require_mutation_capability(capability, "offsite")
     lock.validate()
+    require_mutation_capability(capability, "offsite")
     try:
         offsite = importlib.import_module("tools.platform_backup_offsite")
     except ImportError:
@@ -1772,13 +1925,9 @@ def run_offsite(
                 raise BackupSupervisorError("selected backup pair changed before pinning")
             held.validate()
             evidence.update_pair(pair)
-            try:
-                restore = importlib.import_module("tools.platform_backup_restore_drill")
-            except ImportError:
-                restore = importlib.import_module("platform_backup_restore_drill")
-            trusted_head = _trusted_head_for_source(
-                Path(app_dir) / "current",
-                restore=restore,
+            trusted_head = require_trusted_alembic_head(
+                trusted_alembic_head,
+                source_root=Path(app_dir) / "current",
             )
             evidence.payload["alembic"] = {
                 "revision": trusted_head.value,
@@ -1814,6 +1963,7 @@ def run_offsite(
             if not args.apply:
                 evidence.update_remote(attempted=False, object=key)
                 held.validate()
+                lock.validate()
                 return result
             storage_client = (
                 client
@@ -1847,6 +1997,7 @@ def run_offsite(
                     "remote_operations": 4 if uploaded else 2,
                 }
             )
+            lock.validate()
             return result
     finally:
         if encrypted is not None and getattr(encrypted, "fd", None) is not None:
@@ -1884,13 +2035,18 @@ def run_offsite_entrypoint(args: argparse.Namespace, *, app_dir: Path) -> dict[s
     # evidence boundary exists.
     with evidence_session(app_dir, "offsite", locks=requirements) as evidence:
         with exclusive_backup_lock() as lock:
-            capability = _capability("offsite")
-            return run_offsite(
+            return _run_offsite_scope(
                 args,
                 app_dir=app_dir,
-                capability=capability,
                 lock=lock,
-                evidence=evidence,
+                callback=lambda capability, trusted_head, _restore: run_offsite(
+                    args,
+                    app_dir=app_dir,
+                    trusted_alembic_head=trusted_head,
+                    capability=capability,
+                    lock=lock,
+                    evidence=evidence,
+                ),
             )
 
 
@@ -1904,26 +2060,24 @@ def run_backup_entrypoint(
     with evidence_session(app_dir, "local-backup", locks=requirements) as evidence:
         with ordered_backup_lock_scope(
             app_dir, source_release_dir=source_release_dir, include_predecessors=True
-        ) as (capability, lock, _live_qa_lock_fd):
+        ) as (lock, _live_qa_lock_fd):
             evidence.update_release(_source_sha_from_release(app_dir))
-            try:
-                restore = importlib.import_module("tools.platform_backup_restore_drill")
-            except ImportError:
-                restore = importlib.import_module("platform_backup_restore_drill")
-            return run_local_backup(
-                app_dir,
-                keep=int(getattr(args, "keep", 14)),
-                max_age_hours=float(getattr(args, "max_age_hours", 24.0)),
-                env_file=getattr(args, "env_file", None),
-                output_dir=getattr(args, "output_dir", None),
-                admin_database_url=getattr(args, "admin_database_url", None),
-                trusted_alembic_head=_trusted_head_for_source(
-                    Path(app_dir) / "current",
-                    restore=restore,
-                ),
-                capability=capability,
+            return _run_local_backup_scope(
+                args,
+                app_dir=app_dir,
                 lock=lock,
-                evidence=evidence,
+                callback=lambda capability, trusted_head, _restore: run_local_backup(
+                    app_dir,
+                    keep=int(getattr(args, "keep", 14)),
+                    max_age_hours=float(getattr(args, "max_age_hours", 24.0)),
+                    env_file=getattr(args, "env_file", None),
+                    output_dir=getattr(args, "output_dir", None),
+                    admin_database_url=getattr(args, "admin_database_url", None),
+                    trusted_alembic_head=trusted_head,
+                    capability=capability,
+                    lock=lock,
+                    evidence=evidence,
+                ),
             )
 
 
@@ -1937,19 +2091,22 @@ def run_maintenance_entrypoint(args: argparse.Namespace) -> dict[str, Any]:
             app_dir,
             source_release_dir=getattr(args, "source_release_dir", None),
             include_predecessors=True,
-        ) as (capability, lock, live_qa_lock_fd):
+        ) as (lock, live_qa_lock_fd):
             evidence.update_release(_source_sha_from_release(app_dir))
             try:
                 storage = importlib.import_module("tools.platform_storage_maintenance")
             except ImportError:
                 storage = importlib.import_module("platform_storage_maintenance")
-            report = storage.run_maintenance(
-                args,
-                _supervisor_capability=capability,
-                _backup_lock=lock,
-                _live_qa_lock_fd=live_qa_lock_fd,
-                _locks_held=True,
-                _evidence=evidence,
+            report = _run_maintenance_scope(
+                lock=lock,
+                callback=lambda capability: storage.run_maintenance(
+                    args,
+                    _supervisor_capability=capability,
+                    _backup_lock=lock,
+                    _live_qa_lock_fd=live_qa_lock_fd,
+                    _locks_held=True,
+                    _evidence=evidence,
+                ),
             )
             if report.get("ok") is False:
                 evidence.mark_terminal("failed", error_class="storage_health_failed")

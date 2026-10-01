@@ -538,13 +538,20 @@ def run_backup(
         import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
     if lock is None or evidence is None:
         raise RuntimeError("supervisor backup capability requires held lock and evidence")
-    return supervisor.run_local_backup(
-        app_dir,
-        keep=keep,
-        max_age_hours=max_age_hours,
-        capability=capability,
+    supervisor.require_mutation_capability(capability, "maintenance")
+    return supervisor._run_local_backup_scope(
+        argparse.Namespace(dump_only=False),
+        app_dir=app_dir,
         lock=lock,
-        evidence=evidence,
+        callback=lambda scoped_capability, trusted_head, _restore: supervisor.run_local_backup(
+            app_dir,
+            keep=keep,
+            max_age_hours=max_age_hours,
+            trusted_alembic_head=trusted_head,
+            capability=scoped_capability,
+            lock=lock,
+            evidence=evidence,
+        ),
     )
 
 
@@ -754,13 +761,16 @@ def run_maintenance(
             with maintenance_lock_scope(args, app_dir=app_dir) as _source_dir:
                 with supervisor._machine_live_qa_lock() as live_qa_fd:
                     with supervisor.exclusive_backup_lock() as backup_lock:
-                        return run_maintenance(
-                            args,
-                            _supervisor_capability=supervisor._capability("maintenance"),
-                            _backup_lock=backup_lock,
-                            _live_qa_lock_fd=live_qa_fd,
-                            _evidence=evidence,
-                            _locks_held=True,
+                        return supervisor._run_maintenance_scope(
+                            lock=backup_lock,
+                            callback=lambda capability: run_maintenance(
+                                args,
+                                _supervisor_capability=capability,
+                                _backup_lock=backup_lock,
+                                _live_qa_lock_fd=live_qa_fd,
+                                _evidence=evidence,
+                                _locks_held=True,
+                            ),
                         )
 
     if args.apply:
