@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 import ipaddress
 import json
 import os
@@ -63,6 +64,129 @@ class ForeignRedisKeyError(AssertionError):
 
 class CleanupFailure(AssertionError):
     """The bounded worker/Redis cleanup contract could not be proven."""
+
+
+MAX_CLEANUP_EVIDENCE = 64
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupEvidence:
+    """Safe, bounded cleanup evidence with no exception payload."""
+
+    stage: str
+    code: str
+
+    def render(self) -> str:
+        return f"{self.stage} [{self.code}]"
+
+    def __str__(self) -> str:
+        return self.render()
+
+    def __contains__(self, fragment: object) -> bool:
+        return isinstance(fragment, str) and fragment in self.render()
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupReport:
+    """All bounded cleanup evidence, including a fatal cancellation if any."""
+
+    evidence: tuple[_CleanupEvidence, ...]
+    fatal_exception: BaseException | None = None
+
+    def __iter__(self):
+        return iter(self.evidence)
+
+    def __len__(self) -> int:
+        return len(self.evidence)
+
+    def __bool__(self) -> bool:
+        return bool(self.evidence) or self.fatal_exception is not None
+
+
+_CLEANUP_STAGE_ALLOWLIST = frozenset(
+    {
+        "cleanup",
+        "worker cleanup",
+        "worker log cleanup",
+        "worker finalizer",
+        "Celery broker Redis cleanup",
+        "Celery broker Redis close",
+        "Celery result Redis cleanup",
+        "Celery result Redis close",
+        "temporary-directory cleanup",
+        "shielded worker TERM",
+        "shielded worker TERM wait",
+        "shielded worker KILL",
+        "shielded worker KILL wait",
+        "shielded worker final reap",
+        "shielded worker final poll",
+        "shielded worker stdin close",
+        "shielded worker stdout close",
+        "shielded worker log EOF join",
+        "shielded worker log state",
+    }
+)
+
+
+def _cleanup_exception_code(exc: BaseException) -> str:
+    """Map exception classes to a closed set of safe evidence codes."""
+
+    if isinstance(exc, KeyboardInterrupt):
+        return "keyboard-interrupt"
+    if isinstance(exc, SystemExit):
+        return "system-exit"
+    if isinstance(exc, ForeignRedisKeyError):
+        return "foreign-redis-key"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "timeout"
+    if isinstance(exc, (TimeoutError, CleanupFailure)):
+        return "cleanup-failure"
+    if isinstance(exc, ProcessLookupError):
+        return "process-lookup"
+    if isinstance(exc, RuntimeError):
+        return "runtime-error"
+    return "base-exception"
+
+
+def _cleanup_evidence(
+    stage: str,
+    *,
+    exc: BaseException | None = None,
+    code: str | None = None,
+) -> _CleanupEvidence:
+    """Build evidence from allowlisted stage/code values only."""
+
+    safe_stage = stage if stage in _CLEANUP_STAGE_ALLOWLIST else "cleanup"
+    if exc is not None:
+        safe_code = _cleanup_exception_code(exc)
+    else:
+        safe_code = code if code in {
+            "process-group-missing",
+            "process-live",
+            "postcondition-unproven",
+            "thread-live",
+            "eof-missing",
+            "drain-error",
+        } else "cleanup-failure"
+    return _CleanupEvidence(safe_stage, safe_code)
+
+
+def _dedupe_cleanup_evidence(
+    evidence: Iterable[_CleanupEvidence],
+) -> tuple[_CleanupEvidence, ...]:
+    """Preserve first-seen order while enforcing a bounded report."""
+
+    result: list[_CleanupEvidence] = []
+    seen: set[tuple[str, str]] = set()
+    for item in evidence:
+        key = (item.stage, item.code)
+        if key in seen:
+            continue
+        if len(result) >= MAX_CLEANUP_EVIDENCE:
+            break
+        seen.add(key)
+        result.append(item)
+    return tuple(result)
 
 
 class _RoundtripDeadlineExceeded(TimeoutError):
@@ -354,7 +478,7 @@ def _terminate_worker_process(
             is None
         )
     except BaseException as exc:
-        errors.append(f"worker poll: {exc}")
+        errors.append("worker poll [failure]")
         # Treat an unreadable process state as potentially live and make the
         # escalation path the safe default.
         running = True
@@ -375,7 +499,7 @@ def _terminate_worker_process(
         except ProcessLookupError:
             pass
         except BaseException as exc:
-            errors.append(f"worker TERM: {exc}")
+            errors.append("worker TERM [failure]")
             must_kill = True
         try:
             remaining = max(0.0, deadline - time.monotonic())
@@ -394,7 +518,7 @@ def _terminate_worker_process(
             # KILL wait below.
             must_kill = True
         except BaseException as exc:
-            errors.append(f"worker TERM wait: {exc}")
+            errors.append("worker TERM wait [failure]")
             must_kill = True
 
     if not running and must_kill:
@@ -407,7 +531,7 @@ def _terminate_worker_process(
         except ProcessLookupError:
             pass
         except BaseException as exc:
-            errors.append(f"worker TERM group: {exc}")
+            errors.append("worker TERM group [failure]")
 
     if must_kill:
         try:
@@ -419,7 +543,7 @@ def _terminate_worker_process(
         except ProcessLookupError:
             pass
         except BaseException as exc:
-            errors.append(f"worker KILL: {exc}")
+            errors.append("worker KILL [failure]")
         try:
             remaining = max(0.0, deadline - time.monotonic())
             _best_effort_bounded_call(
@@ -428,7 +552,7 @@ def _terminate_worker_process(
                 label="worker KILL wait",
             )
         except BaseException as exc:
-            errors.append(f"worker KILL wait: {exc}")
+            errors.append("worker KILL wait [failure]")
             # A wait implementation can fail after the signal was delivered.
             # Make one final bounded reap attempt before reporting the child
             # as live; this also exercises the no-zombie contract in tests.
@@ -442,7 +566,7 @@ def _terminate_worker_process(
                     label="worker final reap",
                 )
             except BaseException as reap_exc:
-                errors.append(f"worker final reap: {reap_exc}")
+                errors.append("worker final reap [failure]")
     else:
         # ``poll`` may reap an exited child, but this explicit bounded wait
         # keeps the contract true for every path and for test doubles.
@@ -454,7 +578,7 @@ def _terminate_worker_process(
                 label="worker reap",
             )
         except BaseException as exc:
-            errors.append(f"worker reap: {exc}")
+            errors.append("worker reap [failure]")
 
     try:
         if _best_effort_bounded_call(
@@ -464,7 +588,7 @@ def _terminate_worker_process(
         ) is None:
             errors.append("worker remained live after TERM/KILL cleanup")
     except BaseException as exc:
-        errors.append(f"worker final poll: {exc}")
+        errors.append("worker final poll [failure]")
 
     try:
         stdin = getattr(process, "stdin", None)
@@ -476,7 +600,7 @@ def _terminate_worker_process(
                     label="worker stdin close",
                 )
             except BaseException as exc:
-                errors.append(f"worker stdin close: {exc}")
+                errors.append("worker stdin close [failure]")
         if log is not None:
             stream = getattr(log, "_stream", None)
             if stream is None:
@@ -489,7 +613,7 @@ def _terminate_worker_process(
                         label="worker stdout close",
                     )
                 except BaseException as exc:
-                    errors.append(f"worker stdout close: {exc}")
+                    errors.append("worker stdout close [failure]")
             try:
                 _best_effort_bounded_call(
                     lambda: log.join(deadline),
@@ -497,7 +621,7 @@ def _terminate_worker_process(
                     label="worker log EOF join",
                 )
             except BaseException as exc:
-                errors.append(f"worker log join: {exc}")
+                errors.append("worker log join [failure]")
             if log.thread_alive:
                 errors.append("worker log-drain thread remained live after EOF deadline")
             eof = getattr(log, "eof", None)
@@ -505,7 +629,7 @@ def _terminate_worker_process(
                 errors.append("worker log-drain did not reach EOF before deadline")
             drain_error = getattr(log, "drain_error", None)
             if drain_error is not None:
-                errors.append(f"worker log drain: {drain_error}")
+                errors.append("worker log drain [failure]")
         elif process.stdout is not None:
             _best_effort_bounded_call(
                 process.stdout.close,
@@ -513,7 +637,7 @@ def _terminate_worker_process(
                 label="worker stdout close",
             )
     except BaseException as exc:
-        errors.append(f"worker log join: {exc}")
+        errors.append("worker log join [failure]")
 
     if errors:
         raise CleanupFailure("; ".join(errors))
@@ -712,7 +836,7 @@ def _shielded_worker_finalizer(
     *,
     deadline: float,
     send_signal: Callable[[int, signal.Signals], None] | None = None,
-) -> list[str]:
+) -> _CleanupReport:
     """Best-effort parent-owned finalization after cancellation/error.
 
     The ordinary terminator is deliberately injectable in contract tests and
@@ -724,7 +848,8 @@ def _shielded_worker_finalizer(
     """
 
     send_signal = send_signal or os.killpg
-    errors: list[str] = []
+    errors: list[_CleanupEvidence] = []
+    fatal_exception: BaseException | None = None
 
     def attempt(
         label: str,
@@ -740,9 +865,11 @@ def _shielded_worker_finalizer(
             )
         except ProcessLookupError:
             if not ignore_process_lookup:
-                errors.append(f"{label}: process group does not exist")
+                errors.append(_cleanup_evidence(label, code="process-group-missing"))
         except BaseException as exc:
-            errors.append(f"{label}: {exc}")
+            errors.append(_cleanup_evidence(label, exc=exc))
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)) and fatal_exception is None:
+                fatal_exception = exc
         return None
 
     if process is not None:
@@ -773,7 +900,7 @@ def _shielded_worker_finalizer(
         )
         final_status = attempt("shielded worker final poll", process.poll)
         if final_status is None:
-            errors.append("shielded worker remained live after TERM/KILL cleanup")
+            errors.append(_cleanup_evidence("shielded worker final poll", code="process-live"))
 
         stdin = getattr(process, "stdin", None)
         if stdin is not None:
@@ -788,19 +915,24 @@ def _shielded_worker_finalizer(
         attempt("shielded worker log EOF join", lambda: log.join(deadline))
         try:
             if log.thread_alive:
-                errors.append("shielded worker log-drain thread remained live")
+                errors.append(_cleanup_evidence("shielded worker log state", code="thread-live"))
             eof = getattr(log, "eof", None)
             if eof is not None and not eof.is_set():
-                errors.append("shielded worker log-drain did not reach EOF")
+                errors.append(_cleanup_evidence("shielded worker log state", code="eof-missing"))
             drain_error = getattr(log, "drain_error", None)
             if drain_error is not None:
-                errors.append(f"shielded worker log drain: {drain_error}")
+                errors.append(_cleanup_evidence("shielded worker log state", code="drain-error"))
         except BaseException as exc:
-            errors.append(f"shielded worker log state: {exc}")
+            errors.append(_cleanup_evidence("shielded worker log state", exc=exc))
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)) and fatal_exception is None:
+                fatal_exception = exc
     elif process is not None and process.stdout is not None:
         attempt("shielded worker stdout close", process.stdout.close)
 
-    return errors
+    return _CleanupReport(
+        evidence=_dedupe_cleanup_evidence(errors),
+        fatal_exception=fatal_exception,
+    )
 
 
 def _cleanup_temporary_directory(run_root: Path, *, deadline: float) -> None:
@@ -854,15 +986,15 @@ def _cleanup_roundtrip_resources(
     run_root: Path | None,
     deadline: float,
     send_signal: Callable[[int, signal.Signals], None] | None = None,
-) -> list[str]:
+) -> _CleanupReport:
     """Run shielded process, Redis and temporary-state cleanup phases."""
 
-    errors: list[str] = []
+    errors: list[_CleanupEvidence] = []
     fatal_exception: BaseException | None = None
 
     def note_error(label: str, exc: BaseException) -> None:
         nonlocal fatal_exception
-        errors.append(f"{label}: {exc}")
+        errors.append(_cleanup_evidence(label, exc=exc))
         if isinstance(exc, (KeyboardInterrupt, SystemExit)) and fatal_exception is None:
             fatal_exception = exc
 
@@ -907,15 +1039,15 @@ def _cleanup_roundtrip_resources(
 
     if process_cleanup_failed:
         try:
-            errors.extend(
-                f"worker finalizer: {error}"
-                for error in _shielded_worker_finalizer(
-                    process,
-                    log,
-                    deadline=deadline,
-                    send_signal=send_signal,
-                )
+            finalizer_report = _shielded_worker_finalizer(
+                process,
+                log,
+                deadline=deadline,
+                send_signal=send_signal,
             )
+            errors.extend(finalizer_report.evidence)
+            if finalizer_report.fatal_exception is not None and fatal_exception is None:
+                fatal_exception = finalizer_report.fatal_exception
         except BaseException as exc:
             note_error("worker finalizer", exc)
 
@@ -966,7 +1098,12 @@ def _cleanup_roundtrip_resources(
             except BaseException as exc:
                 note_error(f"{label} Redis close", exc)
         if not delete_succeeded:
-            errors.append(f"{label} Redis owned-key postcondition was not proven")
+            errors.append(
+                _cleanup_evidence(
+                    f"{label} Redis cleanup",
+                    code="postcondition-unproven",
+                )
+            )
 
     if run_root is not None:
         for _attempt in range(2):
@@ -976,62 +1113,65 @@ def _cleanup_roundtrip_resources(
             except BaseException as exc:
                 note_error("temporary-directory cleanup", exc)
 
-    if fatal_exception is not None:
-        raise fatal_exception
-    return errors
+    return _CleanupReport(
+        evidence=_dedupe_cleanup_evidence(errors),
+        fatal_exception=fatal_exception,
+    )
 
 
-def _sanitize_cleanup_note(value: object, *, limit: int = 512) -> str:
-    """Keep cleanup diagnostics bounded and single-line before attaching them."""
+def _render_cleanup_evidence(evidence: Iterable[_CleanupEvidence]) -> str:
+    """Render only bounded stage/code pairs for an exception note."""
 
-    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
-    if not text:
-        return "<no detail>"
-    if len(text) > limit:
-        return text[: limit - 1] + "…"
-    return text
-
-
-def _cleanup_exception_note(exc: BaseException) -> str:
-    """Format one cleanup exception without attaching its traceback or object repr."""
-
-    return (
-        "roundtrip cleanup exception: "
-        f"{type(exc).__name__}: {_sanitize_cleanup_note(exc)}"
+    return "roundtrip cleanup evidence: " + "; ".join(
+        item.render() for item in evidence
     )
 
 
 def _finish_roundtrip_cleanup(
-    cleanup: Callable[[], list[str]],
+    cleanup: Callable[[], _CleanupReport],
     *,
     primary_exception: BaseException | None,
 ) -> None:
     """Complete cleanup without allowing it to replace a work exception."""
 
-    cleanup_errors: list[str] = []
+    cleanup_report = _CleanupReport(())
     cleanup_exception: BaseException | None = None
     try:
-        cleanup_errors.extend(cleanup())
+        cleanup_report = cleanup()
     except BaseException as exc:
         cleanup_exception = exc
 
-    if cleanup_errors:
-        cleanup_note = "roundtrip cleanup errors: " + "; ".join(
-            _sanitize_cleanup_note(error) for error in cleanup_errors
-        )
-        if primary_exception is not None:
-            primary_exception.add_note(cleanup_note)
-        elif cleanup_exception is not None:
-            cleanup_exception.add_note(cleanup_note)
-        else:
-            raise CleanupFailure(cleanup_note)
+    evidence = list(cleanup_report.evidence)
+    if cleanup_exception is not None:
+        evidence.append(_cleanup_evidence("cleanup", exc=cleanup_exception))
+    evidence = list(_dedupe_cleanup_evidence(evidence))
 
-    if cleanup_exception is None:
-        return
+    if cleanup_report.fatal_exception is not None and not any(
+        item.code == _cleanup_exception_code(cleanup_report.fatal_exception)
+        for item in evidence
+    ):
+        evidence.append(
+            _cleanup_evidence("cleanup", exc=cleanup_report.fatal_exception)
+        )
+        evidence = list(_dedupe_cleanup_evidence(evidence))
+
+    if evidence:
+        evidence_note = _render_cleanup_evidence(evidence)
+        if primary_exception is not None:
+            primary_exception.add_note(evidence_note)
+        elif cleanup_exception is not None:
+            cleanup_exception.add_note(evidence_note)
+        elif cleanup_report.fatal_exception is not None:
+            cleanup_report.fatal_exception.add_note(evidence_note)
+        else:
+            raise CleanupFailure(evidence_note)
+
     if primary_exception is not None:
-        primary_exception.add_note(_cleanup_exception_note(cleanup_exception))
         return
-    raise cleanup_exception
+    if cleanup_report.fatal_exception is not None:
+        raise cleanup_report.fatal_exception
+    if cleanup_exception is not None:
+        raise cleanup_exception
 
 
 def _assert_safe_redis_mutation_targets(
@@ -2136,7 +2276,7 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
 
                 with patch(
                     __name__ + "._terminate_worker_process",
-                    side_effect=cleanup_type("cleanup\noperator cancellation"),
+                    side_effect=cleanup_type("worker-log=PRIVATE-LOG"),
                 ):
                     try:
                         with self.assertRaises(RuntimeError) as raised:
@@ -2164,9 +2304,18 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
                         self.assertIs(raised.exception, primary)
                         self.assertEqual(str(raised.exception), "work body failed")
                         self.assertTrue(
-                            any(cleanup_type.__name__ in note for note in primary.__notes__)
+                            any(
+                                _cleanup_exception_code(cleanup_type("probe")) in note
+                                for note in primary.__notes__
+                            )
+                        )
+                        self.assertTrue(
+                            any("worker cleanup" in note for note in primary.__notes__)
                         )
                         self.assertTrue(all("\n" not in note for note in primary.__notes__))
+                        self.assertTrue(
+                            all("PRIVATE-LOG" not in note for note in primary.__notes__)
+                        )
                     finally:
                         if run_root.exists():
                             shutil.rmtree(run_root)
@@ -2179,7 +2328,7 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
     def test_primary_exception_gets_sanitized_ordinary_cleanup_note(self) -> None:
         primary = RuntimeError("work body failed")
         broker = _MemoryRedis({b"owned"})
-        broker.delete_error = RuntimeError("injected\nredis detail")
+        broker.delete_error = RuntimeError("redis://:SUPERSECRET/13")
 
         with self.assertRaises(RuntimeError) as raised:
             try:
@@ -2208,8 +2357,74 @@ class PlatformWorkerCleanupContractTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "work body failed")
         self.assertTrue(any("Redis cleanup" in note for note in primary.__notes__))
         self.assertTrue(all("\n" not in note for note in primary.__notes__))
-        self.assertTrue(any("\\n" in note for note in primary.__notes__))
+        self.assertTrue(all("SUPERSECRET" not in note for note in primary.__notes__))
+        self.assertTrue(all("redis://" not in note for note in primary.__notes__))
         self.assertTrue(broker.closed)
+
+    def test_cleanup_report_retains_deduped_stage_evidence_after_fatal(self) -> None:
+        def collect_report() -> _CleanupReport:
+            process = _FakeProcess()
+            broker = _MemoryRedis({b"broker-owned"})
+            result = _MemoryRedis({b"result-owned"})
+            broker.delete_error = RuntimeError("redis://:SUPERSECRET/13")
+            result.delete_error = RuntimeError("worker-log=PRIVATE-LOG")
+            run_root = Path(tempfile.mkdtemp(prefix="platform-celery-report-"))
+            try:
+                with patch(
+                    __name__ + "._terminate_worker_process",
+                    side_effect=KeyboardInterrupt("worker-log=PRIVATE-LOG"),
+                ):
+                    report = _cleanup_roundtrip_resources(
+                        process=process,
+                        log=_FakeLog(),
+                        broker_client=broker,
+                        result_client=result,
+                        broker_initially_empty=True,
+                        result_initially_empty=True,
+                        broker_owned_keys={b"broker-owned"},
+                        result_owned_keys={b"result-owned"},
+                        broker_allow_prefixes=(),
+                        result_allow_fragments=(),
+                        result_allow_prefixes=(),
+                        run_root=run_root,
+                        deadline=time.monotonic() + 2,
+                    )
+                return report
+            finally:
+                if run_root.exists():
+                    shutil.rmtree(run_root)
+
+        first_report = collect_report()
+        second_report = collect_report()
+        first_evidence = tuple(item.render() for item in first_report.evidence)
+        second_evidence = tuple(item.render() for item in second_report.evidence)
+
+        self.assertEqual(first_evidence, second_evidence)
+        self.assertEqual(type(first_report.fatal_exception).__name__, "KeyboardInterrupt")
+        self.assertEqual(type(second_report.fatal_exception).__name__, "KeyboardInterrupt")
+        self.assertEqual(len(first_evidence), len(set(first_evidence)))
+        self.assertLessEqual(len(first_evidence), MAX_CLEANUP_EVIDENCE)
+        self.assertTrue(
+            any("worker cleanup [keyboard-interrupt]" in item for item in first_evidence)
+        )
+        self.assertTrue(
+            any(
+                "Celery broker Redis cleanup [runtime-error]" in item
+                for item in first_evidence
+            )
+        )
+        self.assertTrue(any("postcondition-unproven" in item for item in first_evidence))
+        self.assertTrue(all("SUPERSECRET" not in item for item in first_evidence))
+        self.assertTrue(all("PRIVATE-LOG" not in item for item in first_evidence))
+
+        primary = RuntimeError("work body failed")
+        _finish_roundtrip_cleanup(lambda: first_report, primary_exception=primary)
+        self.assertTrue(any("worker cleanup" in note for note in primary.__notes__))
+        self.assertTrue(
+            any("Celery broker Redis cleanup" in note for note in primary.__notes__)
+        )
+        self.assertTrue(all("SUPERSECRET" not in note for note in primary.__notes__))
+        self.assertTrue(all("PRIVATE-LOG" not in note for note in primary.__notes__))
 
     def test_cleanup_catches_hung_redis_scan_without_skipping_close(self) -> None:
         broker = _ScanFailureRedis()
