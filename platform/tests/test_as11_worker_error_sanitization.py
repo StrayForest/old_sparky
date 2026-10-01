@@ -17,12 +17,16 @@ from python_packages.platform_infra.db import (
 )
 from python_packages.platform_infra.models import AuditLog, Tournament, User
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_integration_password import (
+    INTEGRATION_PASSWORD,
+    patch_integration_registration_hash,
+)
 
 
 class AS11WorkerErrorSanitizationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-as11-{uuid4().hex[:8]}"
-        self.password = "integration-pass-123"
+        self.password = INTEGRATION_PASSWORD
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup_test_data()
@@ -64,14 +68,15 @@ class AS11WorkerErrorSanitizationTests(PlatformIsolatedAsyncioTestCase):
 
     async def _register_organizer(self) -> tuple[httpx.AsyncClient, str]:
         client = await self._new_client()
-        response = await client.post(
-            "/api/v1/auth/register",
-            json={
-                "email": f"{self.prefix}-organizer@example.com",
-                "password": self.password,
-                "display_name": "as11-organizer",
-            },
-        )
+        with patch_integration_registration_hash():
+            response = await client.post(
+                "/api/v1/auth/register",
+                json={
+                    "email": f"{self.prefix}-organizer@example.com",
+                    "password": self.password,
+                    "display_name": "as11-organizer",
+                },
+            )
         self.assertEqual(response.status_code, 201, response.text)
         user_id = str(response.json()["user"]["id"])
         async with session_factory()() as db_session:

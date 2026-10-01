@@ -17,12 +17,16 @@ from python_packages.platform_infra.models import (
     User,
 )
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_integration_password import (
+    INTEGRATION_PASSWORD,
+    patch_integration_registration_hash,
+)
 
 
 class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-profile-workspace-{uuid4().hex[:8]}"
-        self.password = "integration-pass-123"
+        self.password = INTEGRATION_PASSWORD
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup()
@@ -69,14 +73,15 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                 base_url="http://testserver",
             )
         )
-        response = await client.post(
-            "/api/v1/auth/register",
-            json={
-                "email": f"{self.prefix}-{label}@example.com",
-                "password": self.password,
-                "display_name": f"test-{label}"[:15],
-            },
-        )
+        with patch_integration_registration_hash():
+            response = await client.post(
+                "/api/v1/auth/register",
+                json={
+                    "email": f"{self.prefix}-{label}@example.com",
+                    "password": self.password,
+                    "display_name": f"test-{label}"[:15],
+                },
+            )
         self.assertEqual(response.status_code, 201, response.text)
         return client
 
