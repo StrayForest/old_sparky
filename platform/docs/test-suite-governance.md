@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-27
+- Last reviewed: 2026-10-01
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
@@ -110,6 +110,17 @@ these five catalog contours:
 | `backend-privileged` | 1200s | serial | root/service-identity, media, release/install/systemd, root-owned artifact metadata and privileged wrapper tests |
 | `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts |
 | `backend` (aggregate) | 3600s | serial orchestration | disjoint union of the five contours |
+
+The privileged contour owns the deterministic systemd host contract in
+`tests/test_platform_systemd_timer_contract.py`. Its parser checks the closed
+service/timer inventory, every `Unit=` edge, schedule/jitter/persistent
+semantics, oneshot failure behavior and the absence of legacy `sparkydb`
+references. Its fake-systemctl harness runs copied installers against only
+temporary unit/configuration directories and records enable, disable, start
+and daemon-reload calls; it never enables the off-site timer or contacts the
+host systemd manager. Keep this coverage in the privileged contour because
+the installer intentionally requires root-owned unit metadata, while the
+test remains hermetic and performs no production action.
 
 The timeout values are the catalog's executable contract, not a moving test
 count or an estimate derived from the current number of methods. The catalog
