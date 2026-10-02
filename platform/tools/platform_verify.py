@@ -336,17 +336,6 @@ def _run(
     return 0
 
 
-def _security_dependency_lock_preflight(candidate: Path) -> str | None:
-    """Validate one lock without reopening its mutable repository pathname."""
-
-    try:
-        relative_path = candidate.relative_to(PLATFORM_ROOT).as_posix()
-    except ValueError:
-        return "outside-root"
-    _, failure = _read_stable_security_dependency_lock(PLATFORM_ROOT, relative_path)
-    return failure
-
-
 def _security_lock_metadata_matches(
     left: os.stat_result,
     right: os.stat_result,
@@ -406,15 +395,18 @@ def _read_stable_security_dependency_lock(
     ):
         return None, "unsafe-path"
     nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
     if not nofollow:
         return None, "nofollow-unavailable"
+    if not nonblock:
+        return None, "nonblock-unavailable"
     directory_flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_DIRECTORY", 0)
         | nofollow
     )
-    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
     directory_descriptor: int | None = None
     descriptor: int | None = None
     try:

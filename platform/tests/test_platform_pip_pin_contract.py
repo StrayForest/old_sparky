@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 
@@ -158,7 +159,7 @@ class PlatformPipPinContractTests(unittest.TestCase):
                     self.assertNotEqual(verifier._run_security_dependency_audits(), 0)
                     run.assert_not_called()
 
-    def test_security_dependency_lock_preflight_rejects_mutations_and_reads_remaining(self) -> None:
+    def test_security_dependency_audit_rejects_mutations_and_reads_remaining(self) -> None:
         mutations = (
             ("empty", b""),
             ("comment-only", b"# comment\n"),
@@ -326,6 +327,70 @@ class PlatformPipPinContractTests(unittest.TestCase):
             self.assertTrue(swapped)
             self.assertEqual(payload, expected)
             self.assertIsNone(failure)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / EXPECTED_SECURITY_DEPENDENCY_LOCKS[0]
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(PLATFORM_ROOT / EXPECTED_SECURITY_DEPENDENCY_LOCKS[0], source)
+            script = textwrap.dedent(
+                """
+                import os
+                from pathlib import Path
+                import sys
+
+                from tools import platform_verify as verifier
+
+                root = Path(sys.argv[1])
+                source = root / "requirements-platform.lock.txt"
+                original_stat = verifier.os.stat
+                state = {"swapped": False}
+
+                def swap_after_stat(path, *args, **kwargs):
+                    metadata = original_stat(path, *args, **kwargs)
+                    if (
+                        path == source.name
+                        and kwargs.get("dir_fd") is not None
+                        and not state["swapped"]
+                    ):
+                        state["swapped"] = True
+                        source.rename(root / "original-lock")
+                        os.mkfifo(source)
+                    return metadata
+
+                verifier.os.stat = swap_after_stat
+                payload, failure = verifier._read_stable_security_dependency_lock(
+                    root,
+                    "requirements-platform.lock.txt",
+                )
+                raise SystemExit(
+                    0
+                    if state["swapped"]
+                    and payload is None
+                    and failure in {"changed-before-read", "unsafe-metadata"}
+                    else 1
+                )
+                """
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(root)],
+                cwd=PLATFORM_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch.object(verifier.os, "O_NONBLOCK", 0):
+                payload, failure = verifier._read_stable_security_dependency_lock(
+                    root,
+                    EXPECTED_SECURITY_DEPENDENCY_LOCKS[0],
+                )
+            self.assertIsNone(payload)
+            self.assertEqual(failure, "nonblock-unavailable")
 
     def test_security_dependency_snapshot_cleanup_survives_audit_failure(self) -> None:
         for expected_status in (17, 124):
