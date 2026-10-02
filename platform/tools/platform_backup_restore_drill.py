@@ -476,16 +476,21 @@ def check_latest_backup(output_dir: pathlib.Path, *, max_age_hours: float) -> di
     }
 
 
-def local_postgres_admin_command(action: str, target: DatabaseTarget, database: str) -> list[str]:
+def local_postgres_admin_command(
+    action: str,
+    target: DatabaseTarget,
+    database: str,
+    helpers: supervisor.TrustedPostgresHelpers,
+) -> list[str]:
     if action == "create":
-        executable = supervisor.trusted_executable("createdb")
+        executable = helpers.executable("createdb")
         command = [executable, "--owner", target.username, database]
     elif action == "drop":
-        executable = supervisor.trusted_executable("dropdb")
+        executable = helpers.executable("dropdb")
         command = [executable, "--if-exists", database]
     else:  # pragma: no cover - internal programming error
         raise ValueError(f"Unsupported database admin action: {action}")
-    return [supervisor.trusted_executable("runuser"), "-u", "postgres", "--", *command]
+    return [helpers.executable("runuser"), "-u", "postgres", "--", *command]
 
 
 def remote_admin_command(
@@ -493,13 +498,14 @@ def remote_admin_command(
     admin_target: DatabaseTarget,
     app_target: DatabaseTarget,
     database: str,
+    helpers: supervisor.TrustedPostgresHelpers,
 ) -> list[str]:
     base = connection_args(admin_target, include_database=False)
     if action == "create":
-        executable = supervisor.trusted_executable("createdb")
+        executable = helpers.executable("createdb")
         return [executable, *base, "--owner", app_target.username, database]
     if action == "drop":
-        executable = supervisor.trusted_executable("dropdb")
+        executable = helpers.executable("dropdb")
         return [executable, *base, "--if-exists", database]
     raise ValueError(f"Unsupported database admin action: {action}")
 
@@ -583,6 +589,7 @@ def perform_restore_drill(
     *,
     app_target: DatabaseTarget,
     admin_target: DatabaseTarget | None,
+    helpers: supervisor.TrustedPostgresHelpers,
     timestamp_slug: str,
     trusted_alembic_head: object | None = None,
     expected_alembic_head: str | None = None,
@@ -616,16 +623,24 @@ def perform_restore_drill(
         admin_target is None
         and os.geteuid() == 0
         and app_target.host in LOCAL_DATABASE_HOSTS
-        and _trusted_command_available("runuser")
+        and helpers.runuser is not None
     )
     if use_local_admin:
-        create_command = local_postgres_admin_command("create", app_target, drill_database)
-        drop_command = local_postgres_admin_command("drop", app_target, drill_database)
+        create_command = local_postgres_admin_command(
+            "create", app_target, drill_database, helpers
+        )
+        drop_command = local_postgres_admin_command(
+            "drop", app_target, drill_database, helpers
+        )
         admin_command_target = None
     else:
         effective_admin = admin_target or app_target.with_database("postgres")
-        create_command = remote_admin_command("create", effective_admin, app_target, drill_database)
-        drop_command = remote_admin_command("drop", effective_admin, app_target, drill_database)
+        create_command = remote_admin_command(
+            "create", effective_admin, app_target, drill_database, helpers
+        )
+        drop_command = remote_admin_command(
+            "drop", effective_admin, app_target, drill_database, helpers
+        )
         admin_command_target = effective_admin
 
     created = False
@@ -751,20 +766,14 @@ def perform_restore_drill(
                 primary.add_note(f"restore-drill cleanup was not proven: {cleanup_error}")
 
 
-def require_commands(*commands: str) -> None:
-    missing = [command for command in commands if not _trusted_command_available(command)]
-    if missing:
-        raise RuntimeError(
-            f"Missing or untrusted required PostgreSQL command(s): {', '.join(missing)}"
-        )
-
-
-def _trusted_command_available(command: str) -> bool:
+def require_commands(
+    *commands: str,
+    optional: tuple[str, ...] = (),
+) -> supervisor.TrustedPostgresHelpers:
     try:
-        supervisor.trusted_executable(command)
-    except supervisor.BackupCommandError:
-        return False
-    return True
+        return supervisor.resolve_trusted_postgres_helpers(*commands, optional=optional)
+    except supervisor.BackupCommandError as exc:
+        raise RuntimeError(str(exc)) from None
 
 
 def _new_backup_identity(
@@ -850,7 +859,16 @@ def create_backup(
     required = ["pg_dump", "pg_restore"]
     if not args.dump_only:
         required.extend(["createdb", "dropdb", "psql"])
-    require_commands(*required)
+    local_admin_candidate = (
+        not args.dump_only
+        and admin_target is None
+        and os.geteuid() == 0
+        and app_target.host in LOCAL_DATABASE_HOSTS
+    )
+    helpers = require_commands(
+        *required,
+        optional=("runuser",) if local_admin_candidate else (),
+    )
     deadline = supervisor.operation_deadline(
         float(getattr(args, "timeout_seconds", DEFAULT_OPERATION_TIMEOUT_SECONDS))
     )
@@ -982,6 +1000,7 @@ def create_backup(
                     dump_path,
                     app_target=app_target,
                     admin_target=admin_target,
+                    helpers=helpers,
                     timestamp_slug=timestamp_slug,
                     trusted_alembic_head=trusted_head,
                     deadline=deadline,
@@ -1070,12 +1089,24 @@ def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
     app_target = parse_database_url(database_url)
     admin_url = args.admin_database_url or merged_env.get("PLATFORM_BACKUP_ADMIN_URL")
     admin_target = parse_database_url(admin_url, require_platformdb=False) if admin_url else None
-    require_commands("pg_restore", "createdb", "dropdb", "psql")
+    local_admin_candidate = (
+        admin_target is None
+        and os.geteuid() == 0
+        and app_target.host in LOCAL_DATABASE_HOSTS
+    )
+    helpers = require_commands(
+        "pg_restore",
+        "createdb",
+        "dropdb",
+        "psql",
+        optional=("runuser",) if local_admin_candidate else (),
+    )
     run_command(["pg_restore", "--list", str(dump_path)], capture_output=True)
     table_count = perform_restore_drill(
         dump_path,
         app_target=app_target,
         admin_target=admin_target,
+        helpers=helpers,
         timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
     )
     return {

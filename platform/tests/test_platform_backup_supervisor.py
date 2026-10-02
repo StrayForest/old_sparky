@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from contextlib import contextmanager
+import dataclasses
 import json
 from datetime import UTC, datetime
 import hashlib
@@ -300,9 +301,16 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
 
     def test_command_validation_allows_root_local_runuser_and_rejects_shell_parallelism(self) -> None:
         env = supervisor._sanitized_env({"PATH": os.environ["PATH"], "SECRET": "must-not-pass"})
-        command = supervisor._validate_command(["runuser", "-u", "postgres", "--", "createdb"], env)
+        command = supervisor._validate_command(
+            ["runuser", "-u", "postgres", "--", sys.executable, "-c", "pass"], env
+        )
         self.assertTrue(Path(command[0]).is_absolute())
-        self.assertEqual(supervisor._trusted_executable("pg_dump", env), "/usr/bin/pg_dump")
+        self.assertEqual(command[4], sys.executable)
+        self.assertEqual(supervisor._trusted_executable(sys.executable, env), sys.executable)
+        helpers = supervisor.resolve_trusted_postgres_helpers("runuser")
+        self.assertEqual(helpers.executable("runuser"), command[0])
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            helpers.runuser = "/tmp/runuser"
         self.assertNotIn("SECRET", env)
         with tempfile.TemporaryDirectory(dir="/root") as temporary_dir:
             root = Path(temporary_dir)
@@ -328,34 +336,35 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             supervisor._validate_command(["pg_dump"], {"PATH": "/tmp"})
 
     def test_postgres_helper_metadata_mutations_fail_closed(self) -> None:
-        for name in ("createdb", "dropdb", "psql", "pg_dump", "pg_restore"):
-            canonical = Path("/usr/bin") / name
-            self.assertEqual(supervisor.trusted_executable(name), str(canonical))
-            self.assertEqual(
-                supervisor._secure_executable(canonical), canonical.resolve(strict=True)
-            )
-            with tempfile.TemporaryDirectory(dir="/root") as temporary_dir:
-                root = Path(temporary_dir)
-                helper = root / name
-                helper.symlink_to(canonical)
-                self.assertEqual(
-                    supervisor._secure_executable(helper), canonical.resolve(strict=True)
-                )
+        with tempfile.TemporaryDirectory(dir="/root") as temporary_dir:
+            root = Path(temporary_dir)
+            canonical = root / "canonical-helper"
+            canonical.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            canonical.chmod(0o755)
+            os.chown(root, 0, 0)
+            os.chown(canonical, 0, 0)
+            helper = root / "createdb"
+            helper.symlink_to(canonical)
+            os.chown(helper, 0, 0, follow_symlinks=False)
 
-                root.chmod(0o777)
-                with self.assertRaises(supervisor.BackupCommandError):
-                    supervisor._secure_executable(helper)
-                root.chmod(0o700)
+            self.assertEqual(supervisor._secure_executable(helper), canonical)
 
-                os.chown(helper, 65534, 65534, follow_symlinks=False)
-                with self.assertRaises(supervisor.BackupCommandError):
-                    supervisor._secure_executable(helper)
+            root.chmod(0o777)
+            with self.assertRaises(supervisor.BackupCommandError):
+                supervisor._secure_executable(helper)
+            root.chmod(0o700)
 
-                helper.unlink()
-                helper.write_bytes(canonical.read_bytes())
-                helper.chmod(0o775)
-                with self.assertRaises(supervisor.BackupCommandError):
-                    supervisor._secure_executable(helper)
+            os.chown(helper, 65534, 65534, follow_symlinks=False)
+            with self.assertRaises(supervisor.BackupCommandError):
+                supervisor._secure_executable(helper)
+            os.chown(helper, 0, 0, follow_symlinks=False)
+
+            helper.unlink()
+            helper.write_bytes(canonical.read_bytes())
+            helper.chmod(0o775)
+            os.chown(helper, 0, 0)
+            with self.assertRaises(supervisor.BackupCommandError):
+                supervisor._secure_executable(helper)
 
     def test_monitor_protocol_rejects_malformed_oversized_and_nonzero_status(self) -> None:
         for payload, overflow in ((b"not-json", False), (b"{}", False), (b"{}", True)):

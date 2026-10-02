@@ -44,6 +44,15 @@ backup_creator = importlib.util.module_from_spec(RESTORE_SPEC)
 sys.modules[RESTORE_SPEC.name] = backup_creator
 RESTORE_SPEC.loader.exec_module(backup_creator)
 
+TEST_HELPERS = platform_backup_supervisor.TrustedPostgresHelpers(
+    runuser="/usr/sbin/runuser",
+    createdb="/usr/bin/createdb",
+    dropdb="/usr/bin/dropdb",
+    psql="/usr/bin/psql",
+    pg_dump="/usr/bin/pg_dump",
+    pg_restore="/usr/bin/pg_restore",
+)
+
 
 @contextmanager
 def _held_test_lock():
@@ -229,7 +238,9 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                     clear=False,
                 ),
                 mock.patch.object(backup_creator, "load_env", return_value={"PLATFORM_DATABASE_URL": "postgresql://platform_user@127.0.0.1/platformdb"}),
-                mock.patch.object(backup_creator, "require_commands"),
+                mock.patch.object(
+                    backup_creator, "require_commands", return_value=TEST_HELPERS
+                ),
                 mock.patch.object(backup_creator, "run_command", side_effect=fake_run_command),
                 mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
             ):
@@ -279,7 +290,9 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                     clear=False,
                 ),
                 mock.patch.object(backup_creator, "load_env", return_value={"PLATFORM_DATABASE_URL": "postgresql://platform_user@127.0.0.1/platformdb"}),
-                mock.patch.object(backup_creator, "require_commands"),
+                mock.patch.object(
+                    backup_creator, "require_commands", return_value=TEST_HELPERS
+                ),
                 mock.patch.object(backup_creator, "run_command", side_effect=fake_run_command),
                 mock.patch.object(backup_creator, "perform_restore_drill", return_value=31),
                 mock.patch.object(backup_creator, "utc_now", return_value=fixed_now),

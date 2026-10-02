@@ -153,6 +153,32 @@ _TRUSTED_RUNUSER = frozenset({Path("/usr/sbin/runuser"), Path("/usr/bin/runuser"
 _PSQL_FLAGS = frozenset({"--no-psqlrc", "--tuples-only", "--no-align"})
 _PSQL_VALUE_OPTIONS = frozenset({"--host", "--port", "--username", "--dbname", "--command", "-c"})
 _ENV_KEYS = frozenset({"PATH", "LANG", "LC_ALL", "PGPASSWORD", "PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGSERVICE", "PGSSLMODE", "PGOPTIONS", "HOME", "TMPDIR"})
+_TRUSTED_HELPER_NAMES = _TRUSTED_PG_TOOLS | {"runuser"}
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedPostgresHelpers:
+    """Resolved helper paths carried from preflight to pure command builders.
+
+    Values are resolved by :func:`resolve_trusted_postgres_helpers` in
+    production.  Tests that only assert argv shape may provide explicit
+    literal paths; the execution boundary still validates every command again.
+    """
+
+    runuser: str | None = None
+    createdb: str | None = None
+    dropdb: str | None = None
+    psql: str | None = None
+    pg_dump: str | None = None
+    pg_restore: str | None = None
+
+    def executable(self, name: str) -> str:
+        if name not in _TRUSTED_HELPER_NAMES:
+            raise BackupCommandError("backup helper name is not supported")
+        value = getattr(self, name)
+        if not isinstance(value, str) or not value:
+            raise BackupCommandError(f"backup helper was not resolved: {name}")
+        return value
 
 
 @dataclass(slots=True)
@@ -268,6 +294,40 @@ def trusted_executable(value: str, env: Mapping[str, str] | None = None) -> str:
     """Return an absolute executable alias after the production trust checks."""
 
     return _trusted_executable(value, _sanitized_env(env))
+
+
+def resolve_trusted_postgres_helpers(
+    *commands: str,
+    optional: tuple[str, ...] = (),
+    env: Mapping[str, str] | None = None,
+) -> TrustedPostgresHelpers:
+    """Resolve required and optional helpers once at a mutation preflight.
+
+    Required helpers fail closed.  An unavailable optional helper is omitted;
+    callers use that only for the existing local-admin-to-remote fallback.
+    No caller may treat an omitted helper as executable, and actual command
+    execution revalidates the supplied path through ``_validate_command``.
+    """
+
+    required = tuple(dict.fromkeys(commands))
+    requested = tuple(dict.fromkeys((*required, *optional)))
+    optional_names = set(optional) - set(required)
+    invalid = [name for name in requested if name not in _TRUSTED_HELPER_NAMES]
+    if invalid:
+        raise BackupCommandError("backup helper name is not supported")
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for name in requested:
+        try:
+            resolved[name] = trusted_executable(name, env)
+        except BackupCommandError:
+            if name in optional_names:
+                continue
+            missing.append(name)
+    if missing:
+        names = ", ".join(dict.fromkeys(missing))
+        raise BackupCommandError(f"Missing or untrusted required PostgreSQL command(s): {names}")
+    return TrustedPostgresHelpers(**resolved)
 
 
 def _validate_command(command: list[str], env: Mapping[str, str]) -> list[str]:
