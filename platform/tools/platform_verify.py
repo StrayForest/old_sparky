@@ -13,14 +13,51 @@ from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
+import re
+import stat
 import subprocess
 import sys
+import tempfile
 from typing import Sequence
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = PLATFORM_ROOT / "tools"
 WEB_ROOT = PLATFORM_ROOT / "apps" / "platform_web"
+
+# Keep the dependency-security surface explicit. These locks are owned by
+# different contours and intentionally cannot be merged into one pip-audit
+# input because several packages are pinned to different versions between
+# contours. A new lock owner must update this list and its contract tests;
+# silently discovering files would make a new install surface auditable only
+# by accident.
+SECURITY_DEPENDENCY_LOCKS: tuple[str, ...] = (
+    "requirements-platform.lock.txt",
+    "requirements-ci.lock.txt",
+    "requirements-ci-locker.lock.txt",
+    "apps/platform_draft/requirements-assets.lock.txt",
+)
+PIP_AUDIT_SOCKET_TIMEOUT_SECONDS = 10
+SECURITY_DEPENDENCY_AUDIT_TIMEOUT_SECONDS = 120
+# Lock files are authored as small, ASCII, one-package-per-line files. Keep
+# the preflight bounded even if a path is replaced between stat and open.
+SECURITY_DEPENDENCY_LOCK_MAX_BYTES = 1024 * 1024
+SECURITY_DEPENDENCY_LOCK_LINE = re.compile(
+    r"^[A-Za-z0-9_.-]+=="
+    r"[A-Za-z0-9][A-Za-z0-9_.+!-]* --hash=sha256:[0-9a-f]{64}$"
+)
+PIP_AUDIT_FLAGS: tuple[str, ...] = (
+    "--disable-pip",
+    "--require-hashes",
+    "--strict",
+    "--format",
+    "columns",
+    "--progress-spinner",
+    "off",
+    "--timeout",
+    str(PIP_AUDIT_SOCKET_TIMEOUT_SECONDS),
+)
 
 
 def _backend_catalog_module():
@@ -299,6 +336,262 @@ def _run(
     return 0
 
 
+def _security_lock_metadata_matches(
+    left: os.stat_result,
+    right: os.stat_result,
+) -> bool:
+    """Compare identity and every metadata field that can change during a read."""
+
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_mode == right.st_mode
+        and left.st_uid == right.st_uid
+        and left.st_gid == right.st_gid
+        and left.st_nlink == right.st_nlink
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
+def _validate_security_dependency_lock_payload(payload: bytes) -> str | None:
+    """Validate the exact ASCII lock grammar after reading stable bytes."""
+
+    if not payload:
+        return "empty"
+    if len(payload) > SECURITY_DEPENDENCY_LOCK_MAX_BYTES:
+        return "oversized"
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError:
+        return "not-ascii"
+    if not text.endswith("\n"):
+        return "missing-final-newline"
+    lines = text[:-1].split("\n")
+    if not lines or any(SECURITY_DEPENDENCY_LOCK_LINE.fullmatch(line) is None for line in lines):
+        return "malformed-line"
+    return None
+
+
+def _read_stable_security_dependency_lock(
+    root: Path,
+    relative_path: str,
+) -> tuple[bytes | None, str | None]:
+    """Read and validate one lock through a stable descriptor walk.
+
+    Every parent component is opened with ``O_NOFOLLOW`` and retained by file
+    descriptor, so replacing a repository parent with a symlink cannot redirect
+    the final open.  The parser and returned bytes come from the same descriptor
+    whose identity and metadata are checked before and after the bounded read.
+    """
+
+    path = PurePosixPath(relative_path)
+    if (
+        path.is_absolute()
+        or "\\" in relative_path
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        return None, "unsafe-path"
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nofollow:
+        return None, "nofollow-unavailable"
+    if not nonblock:
+        return None, "nonblock-unavailable"
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | nofollow
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
+    directory_descriptor: int | None = None
+    descriptor: int | None = None
+    try:
+        directory_descriptor = os.open(root, directory_flags)
+        if not stat.S_ISDIR(os.fstat(directory_descriptor).st_mode):
+            return None, "unsafe-root"
+        for component in path.parts[:-1]:
+            next_directory = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            try:
+                if not stat.S_ISDIR(os.fstat(next_directory).st_mode):
+                    return None, "unsafe-parent"
+                previous_directory = directory_descriptor
+                directory_descriptor = next_directory
+                next_directory = None
+                try:
+                    os.close(previous_directory)
+                except OSError:
+                    pass
+            finally:
+                if next_directory is not None:
+                    try:
+                        os.close(next_directory)
+                    except OSError:
+                        pass
+        candidate = os.stat(
+            path.parts[-1],
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(candidate.st_mode)
+            or candidate.st_nlink != 1
+            or candidate.st_size == 0
+            or candidate.st_size > SECURITY_DEPENDENCY_LOCK_MAX_BYTES
+        ):
+            return None, "unsafe-metadata"
+        descriptor = os.open(
+            path.parts[-1],
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not _security_lock_metadata_matches(candidate, before)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size == 0
+            or before.st_size > SECURITY_DEPENDENCY_LOCK_MAX_BYTES
+        ):
+            return None, "changed-before-read"
+        data = bytearray()
+        while len(data) <= SECURITY_DEPENDENCY_LOCK_MAX_BYTES:
+            chunk = os.read(
+                descriptor,
+                SECURITY_DEPENDENCY_LOCK_MAX_BYTES + 1 - len(data),
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(descriptor)
+        if (
+            not _security_lock_metadata_matches(before, after)
+            or len(data) != after.st_size
+            or len(data) > SECURITY_DEPENDENCY_LOCK_MAX_BYTES
+        ):
+            return None, "changed-during-read"
+        payload = bytes(data)
+        return payload, _validate_security_dependency_lock_payload(payload)
+    except OSError:
+        return None, "unreadable"
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
+
+
+def _write_security_dependency_snapshot(
+    directory: Path,
+    index: int,
+    payload: bytes,
+) -> Path:
+    """Write one private immutable audit input from already validated bytes."""
+
+    path = directory / f"lock-{index:02d}.txt"
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | nofollow,
+            0o600,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("security dependency snapshot write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o400)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != len(payload)
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+        ):
+            raise OSError("security dependency snapshot metadata is unsafe")
+        return path
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _run_security_dependency_audits() -> int:
+    """Audit every authored Python lock surface and retain the first failure."""
+
+    first_failure = 0
+    try:
+        with tempfile.TemporaryDirectory(prefix=".platform-security-audit-") as temporary:
+            snapshot_directory = Path(temporary)
+            for index, lock_path in enumerate(SECURITY_DEPENDENCY_LOCKS):
+                label = f"security/dependency-audit/{lock_path}"
+                payload, preflight_failure = _read_stable_security_dependency_lock(
+                    PLATFORM_ROOT,
+                    lock_path,
+                )
+                if preflight_failure is not None or payload is None:
+                    print(
+                        f"[GATE FAIL] {label} lock preflight failed: "
+                        f"{preflight_failure or 'empty-read'}",
+                        file=sys.stderr,
+                    )
+                    first_failure = first_failure or 1
+                    continue
+                try:
+                    snapshot = _write_security_dependency_snapshot(
+                        snapshot_directory,
+                        index,
+                        payload,
+                    )
+                except OSError:
+                    print(
+                        f"[GATE FAIL] {label} audit snapshot could not be created",
+                        file=sys.stderr,
+                    )
+                    first_failure = first_failure or 1
+                    continue
+                status = _run(
+                    label,
+                    [
+                        _python(),
+                        "-m",
+                        "pip_audit",
+                        "-r",
+                        str(snapshot),
+                        *PIP_AUDIT_FLAGS,
+                    ],
+                    timeout_seconds=SECURITY_DEPENDENCY_AUDIT_TIMEOUT_SECONDS,
+                )
+                first_failure = first_failure or status
+    except OSError:
+        print(
+            "[GATE FAIL] security dependency audit snapshot cleanup failed",
+            file=sys.stderr,
+        )
+        first_failure = first_failure or 1
+    return first_failure
+
+
 def _backend_command(arguments: Sequence[str]) -> list[str]:
     if not arguments:
         return [_tool("platform_run_tests.sh"), "--contour", "backend"]
@@ -434,10 +727,6 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
     if gate_id == "security":
         commands = (
             (
-                "security/dependency-audit",
-                [_python(), "-m", "pip_audit", "-r", "requirements-ci.lock.txt"],
-            ),
-            (
                 "security/bandit",
                 [
                     _python(),
@@ -459,6 +748,9 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
                 [_python(), "tools/platform_secret_scan.py", "--root", ".."],
             ),
         )
+        dependency_status = _run_security_dependency_audits()
+        if dependency_status:
+            return dependency_status
         for label, command in commands:
             status = _run(label, command)
             if status:

@@ -404,8 +404,18 @@ The installer and generator sanitize ambient pip configuration through
 [`tools/platform_ci_pip_env.sh`](../tools/platform_ci_pip_env.sh), use only
 the canonical PyPI index, and never forward extra indexes, trusted hosts,
 find-links, certificate paths or proxy variables.
-The security dependency-audit gate also audits this complete lock, so the
-runtime, quality and security tool dependency sets are covered by one report.
+The security dependency-audit gate audits four exact hashed lock surfaces in
+separate invocations: the runtime/release lock, the aggregate CI lock, the
+CI-locker bootstrap lock and the Draft asset lock. Separate invocations are
+intentional because runtime and CI can pin a shared package to different
+versions. The gate uses `pip-audit --disable-pip --require-hashes --strict`
+with bounded network and subprocess timeouts, fails closed on a missing or
+malformed lock, and runs every listed lock before returning an aggregate
+failure. Each lock is read through a no-follow descriptor walk, validated from
+bounded stable bytes, and audited from a private snapshot of those exact bytes;
+the mutable repository pathname is never passed to `pip-audit`. Direct
+unhashed input files remain owned by the CI-lock generator and release
+wheelhouse validator rather than being treated as resolved lockfiles.
 
 Each job's setup-python cache is keyed by the lock path, so lock changes
 invalidate dependency artifacts without sharing a mutable virtualenv between
