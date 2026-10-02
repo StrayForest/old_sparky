@@ -29,6 +29,9 @@ def _held_test_lock():
 
 class PlatformBackupSupervisorTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._executable_patch = mock.patch.object(sys, "executable", "/usr/bin/python3")
+        self._executable_patch.start()
+        self.addCleanup(self._executable_patch.stop)
         source = Path(supervisor.__file__).with_name("platform_backup_process_monitor.py")
         source_bytes = source.read_bytes()
         self._monitor_stage = tempfile.TemporaryDirectory(dir="/root", prefix="oldsparky-monitor-")
