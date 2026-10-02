@@ -39,6 +39,29 @@ SECURITY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security.yml"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
 STATUS_FINALIZER_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security-status-finalizer.yml"
+CURL_HARDENED_WORKFLOWS = {
+    ".github/workflows/platform-production-autodeploy.yml": 9,
+    ".github/workflows/platform-production-deploy.yml": 32,
+    ".github/workflows/platform-production-content-diagnostics.yml": 6,
+    ".github/workflows/platform-patch-translation-qa.yml": 6,
+}
+
+
+def _curl_blocks(workflow: str) -> tuple[str, ...]:
+    """Collect each literal curl command, including its continued lines."""
+
+    lines = workflow.splitlines()
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        if "curl --" not in line or line.lstrip().startswith("#"):
+            continue
+        block = line
+        next_index = index + 1
+        while block.rstrip().endswith("\\") and next_index < len(lines):
+            block += "\n" + lines[next_index]
+            next_index += 1
+        blocks.append(block)
+    return tuple(blocks)
 
 # PR117 was merged as a real merge commit.  The push range is the first
 # parent (the branch before the merge) to that merge commit; the PR range is
@@ -1292,6 +1315,75 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 self.assertNotIn("\r", line)
                 self.assertNotIn("\n", line)
                 self.assertLessEqual(len(line), 520)
+
+    def test_release_authority_workflow_curl_transport_contract(self) -> None:
+        """Every release-side curl is explicit, bounded and fail-closed."""
+
+        allowed_sizes = {65536, 524288, 1048576, 4194304, 8388608}
+
+        def assert_contract(path: Path, source: str, expected_count: int) -> None:
+            blocks = _curl_blocks(source)
+            self.assertEqual(len(blocks), expected_count, path)
+            for block in blocks:
+                for option, expected in (
+                    ("--connect-timeout", {"5"}),
+                    ("--retry", {"0"}),
+                ):
+                    values = re.findall(rf"{re.escape(option)}\s+([0-9]+)", block)
+                    self.assertEqual(values, list(expected), (path, option, block))
+                timeouts = re.findall(r"--max-time\s+([0-9]+)", block)
+                sizes = re.findall(r"--max-filesize\s+([0-9]+)", block)
+                self.assertEqual(len(timeouts), 1, (path, "max-time", block))
+                self.assertEqual(len(sizes), 1, (path, "max-filesize", block))
+                size = int(sizes[0])
+                self.assertIn(size, allowed_sizes, (path, size, block))
+                self.assertEqual(
+                    int(timeouts[0]),
+                    60 if size == 8388608 or "/zip" in block else 15,
+                    (path, timeouts, sizes, block),
+                )
+                self.assertTrue(
+                    "--fail-with-body" in block or re.search(r"--fail(?:\s|$)", block),
+                    (path, "fail", block),
+                )
+                self.assertNotIn("--retry-all-errors", block)
+                if "--request POST" in block:
+                    self.assertIn('--output "$status_response"', block, (path, block))
+                    self.assertNotIn("--location", block, (path, block))
+
+            post_count = sum("--request POST" in block for block in blocks)
+            self.assertEqual(source.count('status_response="$(mktemp "$RUNNER_TEMP/'), post_count, path)
+            self.assertEqual(source.count('status_response_bytes="$(wc -c < "$status_response")"'), post_count, path)
+            self.assertEqual(source.count("status response is oversized"), post_count, path)
+            if post_count:
+                self.assertEqual(source.count("trap 'rm -f -- \"$status_response\"' EXIT"), post_count, path)
+
+        sources: dict[Path, str] = {}
+        for relative, expected_count in CURL_HARDENED_WORKFLOWS.items():
+            path = REPO_ROOT / relative
+            source = path.read_text(encoding="utf-8")
+            sources[path] = source
+            assert_contract(path, source, expected_count)
+
+        # These mutations model the common regressions: an unbounded command,
+        # an accidental retry, a relaxed artifact timeout/cap and a status
+        # response sent to the log instead of a private bounded file.
+        auto = next(path for path in sources if path.name == "platform-production-autodeploy.yml")
+        deploy = next(path for path in sources if path.name == "platform-production-deploy.yml")
+        mutations = (
+            (auto, sources[auto].replace("--retry 0", "--retry 1", 1)),
+            (auto, sources[auto].replace("--max-filesize 65536", "--max-filesize 65537", 1)),
+            (deploy, sources[deploy].replace("--max-time 15", "--max-time 30", 1)),
+            (
+                deploy,
+                sources[deploy].replace('--output "$status_response"', "--output /dev/null", 1),
+            ),
+            (deploy, sources[deploy].replace("--connect-timeout 5", "--connect-timeout 10", 1)),
+        )
+        for path, mutated in mutations:
+            with self.subTest(mutation=path.name):
+                with self.assertRaises(AssertionError):
+                    assert_contract(path, mutated, CURL_HARDENED_WORKFLOWS[str(path.relative_to(REPO_ROOT))])
 
     def test_classifier_zip_rejects_traversal_symlink_bomb_and_duplicate(self) -> None:
         payload = b'{"schema":1}\n'

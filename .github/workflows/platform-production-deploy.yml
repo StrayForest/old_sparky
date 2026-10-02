@@ -233,6 +233,7 @@ jobs:
               [[ "$GITHUB_REF" == "refs/heads/dev" ]] || { echo "Manual production runs must target the dev branch." >&2; exit 1; }
               branch_json="$(
                 curl --fail-with-body --silent --show-error \
+                  --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
                   --header "Authorization: Bearer $GH_TOKEN" \
                   --header "Accept: application/vnd.github+json" \
                   --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -389,6 +390,7 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/dev"
           trusted_ref="$RUNNER_TEMP/platform-trusted-classifier-ref.json"
           curl --fail --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -447,6 +449,7 @@ jobs:
             while :; do
               page_path="$pages_dir/page-${page}.json"
               curl --fail --silent --show-error --location \
+                --connect-timeout 5 --max-time 15 --retry 0 \
                 --max-filesize 4194304 \
                 "${api_headers[@]}" \
                 "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${CLASSIFIER_RUN_ID}/artifacts?per_page=100&page=${page}" \
@@ -494,6 +497,7 @@ jobs:
             exit 1
           }
           curl --fail --silent --show-error --location \
+            --connect-timeout 5 --max-time 60 --retry 0 \
             --max-filesize 4194304 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
@@ -647,7 +651,8 @@ jobs:
           [[ "$HOST_TOOLS_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
           metadata_path="$RUNNER_TEMP/host-tools-artifact-metadata.json"
           metadata_error="$RUNNER_TEMP/host-tools-artifact-metadata.error"
-          if ! curl --fail --silent --show-error --location --max-filesize 524288 \
+          if ! curl --fail --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 524288 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -660,7 +665,8 @@ jobs:
           rm -f -- "$metadata_error"
           test "$(stat -c '%F:%a:%h' -- "$metadata_path")" = "regular file:600:1"
           api_zip="$RUNNER_TEMP/platform-host-tools-artifact.zip"
-          curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 60 --retry 0 --max-filesize 8388608 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -680,7 +686,8 @@ jobs:
           printf '%s  %s\n' "$HOST_TOOLS_ARTIFACT_DIGEST" "$api_zip" | sha256sum -c - >/dev/null 2>/dev/null
           attempt_json="$RUNNER_TEMP/host-tools-workflow-attempt.json"
           attempt_error="$RUNNER_TEMP/host-tools-workflow-attempt.error"
-          if ! curl --fail --silent --show-error --location --max-filesize 524288 \
+          if ! curl --fail --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 524288 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -793,7 +800,8 @@ jobs:
           [[ "$outer_digest" =~ ^[0-9a-f]{64}$ ]]
           metadata_path="$RUNNER_TEMP/host-tools-final-artifact-metadata.json"
           outer_path="$RUNNER_TEMP/host-tools-final-artifact.zip"
-          curl --fail-with-body --silent --show-error --location --max-filesize 524288 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 524288 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -824,7 +832,8 @@ jobs:
           if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
               raise SystemExit("host-tools outer artifact digest is invalid")
           PY
-          curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 60 --retry 0 --max-filesize 8388608 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -1204,7 +1213,8 @@ jobs:
           inner_root="$RUNNER_TEMP/platform-host-tools-inner/platform-host-tools"
           attestation_json="$RUNNER_TEMP/host-tools-attestation.json"
           jobs_json="$RUNNER_TEMP/host-tools-build-jobs.json"
-          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 1048576 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -1729,6 +1739,7 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/dev"
           dev_ref="$RUNNER_TEMP/platform-current-dev-ref.json"
           curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -1757,6 +1768,7 @@ jobs:
           rm -f -- "$dev_ref"
           trusted_ref="$RUNNER_TEMP/platform-trusted-default-ref.json"
           curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -1825,7 +1837,9 @@ jobs:
             test ! -L "$pages_dir"
             while :; do
               page_path="$pages_dir/page-${page}.json"
-              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              curl --fail-with-body --silent --show-error \
+                --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 1048576 \
+                "${api_headers[@]}" \
                 "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=${page}" \
                 --output "$page_path"
               count="$(/usr/bin/python3 - "$page_path" <<'PY'
@@ -1863,10 +1877,14 @@ jobs:
           fetch_snapshot() {
             local snapshot_dir="$1"
             install -d -m 700 "$snapshot_dir"
-            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
+              "${api_headers[@]}" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-security.yml" \
               --output "$snapshot_dir/workflow.json"
-            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
+              "${api_headers[@]}" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SECURITY_RUN_ID}" \
               --output "$snapshot_dir/run.json"
             fetch_statuses "$snapshot_dir/statuses.json"
@@ -2187,6 +2205,7 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/dev"
           trusted_ref="$RUNNER_TEMP/platform-trusted-classifier-ref.json"
           curl --fail --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -2250,7 +2269,7 @@ jobs:
             while :; do
               page_path="$pages_dir/page-${page}.json"
               curl --fail --silent --show-error --location \
-                --max-filesize 4194304 \
+                --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 4194304 \
                 "${api_headers[@]}" \
                 "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${CLASSIFIER_RUN_ID}/artifacts?per_page=100&page=${page}" \
                 --output "$page_path"
@@ -2297,7 +2316,7 @@ jobs:
             exit 1
           }
           curl --fail --silent --show-error --location \
-            --max-filesize 4194304 \
+            --connect-timeout 5 --max-time 60 --retry 0 --max-filesize 4194304 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
             --output "$route_dir/artifact.zip"
@@ -2331,7 +2350,9 @@ jobs:
           [[ "$PUBLISHED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || { echo "Published GitHub artifact ID is invalid" >&2; exit 1; }
           [[ "$PUBLISHED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo "Published GitHub artifact digest is invalid" >&2; exit 1; }
           artifact_metadata="$RUNNER_TEMP/platform-release-artifact-metadata.json"
-          curl --fail-with-body --silent --show-error --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
+          curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}" --output "$artifact_metadata"
           /usr/bin/python3 - "$artifact_metadata" "$PUBLISHED_ARTIFACT_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
           import json
@@ -2347,7 +2368,9 @@ jobs:
               raise SystemExit("published release artifact is not bound to this exact workflow run and SHA")
           PY
           artifact_zip="$RUNNER_TEMP/platform-release-artifact.zip"
-          curl --fail-with-body --silent --show-error --location --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 60 --retry 0 --max-filesize 8388608 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}/zip" --output "$artifact_zip"
           printf '%s  %s\n' "$PUBLISHED_ARTIFACT_DIGEST" "$artifact_zip" | sha256sum -c - >/dev/null 2>/dev/null || { echo "Published GitHub artifact digest verification failed" >&2; exit 1; }
           release_slug="$(/usr/bin/python3 - "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$TARGET_SHA" <<'PY'
@@ -2489,7 +2512,8 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28"
           )
           attempt_metadata="$RUNNER_TEMP/host-tools-production-attempt.json"
-          curl --fail-with-body --silent --show-error --location --max-filesize 524288 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 524288 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
             --output "$attempt_metadata"
@@ -2517,7 +2541,8 @@ jobs:
           PY
           handoff_metadata="$RUNNER_TEMP/host-tools-handoff-metadata.json"
           handoff_zip="$RUNNER_TEMP/host-tools-handoff.zip"
-          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 1048576 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_HANDOFF_ARTIFACT_ID}" \
             --output "$handoff_metadata"
@@ -2551,7 +2576,8 @@ jobs:
           ):
               raise SystemExit("host-tools handoff artifact is not bound to this exact run")
           PY
-          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 60 --retry 0 --max-filesize 8388608 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_HANDOFF_ARTIFACT_ID}/zip" \
             --output "$handoff_zip"
@@ -2611,7 +2637,8 @@ jobs:
           outer_metadata="$RUNNER_TEMP/host-tools-production-metadata.json"
           outer_zip="$RUNNER_TEMP/host-tools-production.zip"
           outer_dir="$RUNNER_TEMP/host-tools-production-envelope"
-          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 1048576 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}" \
             --output "$outer_metadata"
@@ -2646,7 +2673,8 @@ jobs:
           ):
               raise SystemExit("host-tools outer artifact is not bound to the exact build")
           PY
-          curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 60 --retry 0 --max-filesize 8388608 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip" \
             --output "$outer_zip"
@@ -2731,7 +2759,8 @@ jobs:
             --format json > "$attestation_path"
           test -s "$attestation_path"
           jobs_path="$RUNNER_TEMP/host-tools-production-jobs.json"
-          curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+          curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 1048576 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
             --output "$jobs_path"
@@ -2939,7 +2968,7 @@ jobs:
           test -s "$input_path"
           require_current_dev_head() {
             local branch_json dev_sha
-            branch_json="$(curl --fail-with-body --silent --show-error --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
+            branch_json="$(curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
             dev_sha="$(printf '%s' "$branch_json" | /usr/bin/python3 -c 'import json,sys; payload=json.load(sys.stdin); sha=payload["commit"]["sha"]; assert isinstance(sha,str) and len(sha)==40 and all(c in "0123456789abcdef" for c in sha), "current dev head SHA is malformed"; print(sha)')"
             test "$dev_sha" = "$TARGET_SHA" || { echo "Refusing production side effects: dev moved from $TARGET_SHA to $dev_sha." >&2; exit 1; }
           }
@@ -2959,7 +2988,7 @@ jobs:
         run: |
           set -euo pipefail
           input_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
-          branch_json="$(curl --fail-with-body --silent --show-error --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
+          branch_json="$(curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
           dev_sha="$(printf '%s' "$branch_json" | /usr/bin/python3 -c 'import json,sys; payload=json.load(sys.stdin); sha=payload["commit"]["sha"]; assert isinstance(sha,str) and len(sha)==40 and all(c in "0123456789abcdef" for c in sha), "current dev head SHA is malformed"; print(sha)')"
           test "$dev_sha" = "$TARGET_SHA" || { echo "Refusing activation: dev moved from $TARGET_SHA to $dev_sha." >&2; exit 1; }
           remote_log="$RUNNER_TEMP/platform-production-deploy-remote.log"
@@ -3076,12 +3105,27 @@ jobs:
               "target_url": sys.argv[1],
           }, separators=(",", ":")))
           PY
-          curl --fail-with-body --silent --show-error --request POST \
+          status_response="$(mktemp "$RUNNER_TEMP/platform-production-pending-status-response.XXXXXX")"
+          trap 'rm -f -- "$status_response"' EXIT
+          if ! curl --fail-with-body --silent --show-error --request POST \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data-binary @"$RUNNER_TEMP/platform-pending-status.json"
+            --output "$status_response" \
+            --data-binary @"$RUNNER_TEMP/platform-pending-status.json"; then
+            echo "production pending status request failed" >&2
+            exit 1
+          fi
+          status_response_bytes="$(wc -c < "$status_response")"
+          case "$status_response_bytes" in
+            ''|*[!0-9]*) echo "production pending status response size is malformed" >&2; exit 1 ;;
+          esac
+          (( status_response_bytes <= 65536 )) || {
+            echo "production pending status response is oversized" >&2
+            exit 1
+          }
           rm -f -- "$RUNNER_TEMP/platform-pending-status.json"
 
   # This is the release-authority barrier.  It is always scheduled so a
@@ -3218,12 +3262,27 @@ jobs:
               "target_url": sys.argv[2],
           }, separators=(",", ":")))
           PY
-          curl --fail-with-body --silent --show-error --request POST \
+          status_response="$(mktemp "$RUNNER_TEMP/platform-production-failure-status-response.XXXXXX")"
+          trap 'rm -f -- "$status_response"' EXIT
+          if ! curl --fail-with-body --silent --show-error --request POST \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data-binary @"$RUNNER_TEMP/platform-failure-status.json"
+            --output "$status_response" \
+            --data-binary @"$RUNNER_TEMP/platform-failure-status.json"; then
+            echo "production failure status request failed" >&2
+            exit 1
+          fi
+          status_response_bytes="$(wc -c < "$status_response")"
+          case "$status_response_bytes" in
+            ''|*[!0-9]*) echo "production failure status response size is malformed" >&2; exit 1 ;;
+          esac
+          (( status_response_bytes <= 65536 )) || {
+            echo "production failure status response is oversized" >&2
+            exit 1
+          }
           rm -f -- "$RUNNER_TEMP/platform-failure-status.json"
           {
             echo "### Platform production deploy"
@@ -3386,6 +3445,7 @@ jobs:
           [[ "$CONTENT_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           metadata="$RUNNER_TEMP/platform-release-receipt-content-metadata.json"
           curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -3488,12 +3548,27 @@ jobs:
               "target_url": sys.argv[1],
           }, separators=(",", ":")))
           PY
-          curl --fail-with-body --silent --show-error --request POST \
+          status_response="$(mktemp "$RUNNER_TEMP/platform-production-success-status-response.XXXXXX")"
+          trap 'rm -f -- "$status_response"' EXIT
+          if ! curl --fail-with-body --silent --show-error --request POST \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data-binary @"$RUNNER_TEMP/platform-success-status.json"
+            --output "$status_response" \
+            --data-binary @"$RUNNER_TEMP/platform-success-status.json"; then
+            echo "production success status request failed" >&2
+            exit 1
+          fi
+          status_response_bytes="$(wc -c < "$status_response")"
+          case "$status_response_bytes" in
+            ''|*[!0-9]*) echo "production success status response size is malformed" >&2; exit 1 ;;
+          esac
+          (( status_response_bytes <= 65536 )) || {
+            echo "production success status response is oversized" >&2
+            exit 1
+          }
           rm -f -- "$RUNNER_TEMP/platform-success-status.json" "$RUNNER_TEMP/platform-release-receipt-content.json" "$RUNNER_TEMP/platform-release-receipt.json"
           {
             echo "### Platform production deploy"
