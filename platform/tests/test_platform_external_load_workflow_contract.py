@@ -435,17 +435,21 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertEqual(source.count("--max-time 30"), len(commands))
             self.assertNotIn("--retry", source)
 
-        for label, mutated in (
-            ("metadata connect timeout", self.source.replace("--connect-timeout 5", "--connect-timeout 6", 1)),
-            ("metadata absolute timeout", self.source.replace("--max-time 15", "--max-time 30", 1)),
-            ("enabled retry", self.source.replace("--retry 0", "--retry 1", 1)),
-            ("removed retry", self.source.replace("--retry 0 ", "", 1)),
-            ("metadata response cap", self.source.replace("--max-filesize 65536", "--max-filesize 65537", 1)),
-            ("artifact absolute timeout", self.source.replace("--max-time 30", "--max-time 31", 1)),
+        for workflow_name, source in (
+            ("trusted", self.source),
+            ("recovery", self.recovery_source),
         ):
-            with self.subTest(mutation=label):
-                with self.assertRaises(AssertionError):
-                    assert_external_curl_policy(mutated)
+            for label, mutated in (
+                ("metadata connect timeout", source.replace("--connect-timeout 5", "--connect-timeout 6", 1)),
+                ("metadata absolute timeout", source.replace("--max-time 15", "--max-time 30", 1)),
+                ("enabled retry", source.replace("--retry 0", "--retry 1", 1)),
+                ("removed retry", source.replace("--retry 0 ", "", 1)),
+                ("metadata response cap", source.replace("--max-filesize 65536", "--max-filesize 65537", 1)),
+                ("artifact absolute timeout", source.replace("--max-time 30", "--max-time 31", 1)),
+            ):
+                with self.subTest(workflow=workflow_name, mutation=label):
+                    with self.assertRaises(AssertionError):
+                        assert_external_curl_policy(mutated)
 
     def test_fake_transfer_argv_contains_the_boundaries_from_source(self) -> None:
         """Exercise representative source command argv through fake binaries."""
@@ -630,6 +634,12 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         job = self.entry_document["jobs"]["trusted-external-load"]
         uses = job["uses"]
         self.assertRegex(uses, r"^StrayForest/old_sparky/\.github/workflows/platform-production-external-load-trusted\.yml@[0-9a-f]{40}$")
+        self.assertEqual(
+            uses,
+            "StrayForest/old_sparky/.github/workflows/"
+            "platform-production-external-load-trusted.yml@"
+            "0a607e80bec74f48a1f57326c98aa5b5fcb9019e",
+        )
         self.assertNotIn("runs-on", job)
         self.assertNotIn("environment", job)
         self.assertNotIn("steps", job)
