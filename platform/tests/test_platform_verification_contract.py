@@ -245,15 +245,15 @@ class PlatformVerificationContractTests(unittest.TestCase):
             )
             if result.returncode == 0:
                 self.fail("migration failure fixture unexpectedly succeeded")
-        with self.assertRaises(MigrationCommandTimeout) as timeout:
+        with self.assertRaises(MigrationCommandTimeout):
             run_migration_subprocess([sys.executable, "-c", "import time; time.sleep(1)"], label="migration test timeout", timeout_seconds=0.05)
         with self.assertRaises(MigrationCommandTimeout):
             run_migration_subprocess([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1)"], label="migration TERM ignore", timeout_seconds=0.2)
         flood = run_migration_subprocess([sys.executable, "-c", "print('x' * 1000000)"], label="migration flood", timeout_seconds=1)
         self.assertLessEqual(len(flood.stdout), 4096)
         with self.assertRaises(MigrationCommandError) as failure:
-            run_migration_subprocess([sys.executable, "-c", "import os; print(os.getenv('PLATFORM_SECRET_KEY')); raise SystemExit(3)"], label="migration redaction", env={"PLATFORM_SECRET_KEY": "SUPERSECRET"}, check=True)
-        self.assertNotIn("SUPERSECRET", str(failure.exception))
+            run_migration_subprocess([sys.executable, "-c", "import os; print(os.getenv('PLATFORM_DATABASE_URL').replace('SUPERSECRET', 'transformed')); raise SystemExit(3)"], label="migration redaction", env={"PLATFORM_DATABASE_URL": "postgresql+asyncpg://user:SUPERSECRET@127.0.0.1:5432/platformdb_test"}, check=True)
+        self.assertNotRegex(str(failure.exception), r"SUPERSECRET|transformed")
         with migration_scenario_deadline(1):
             with self.assertRaises(MigrationContractError):
                 run_migration_subprocess([sys.executable, "-c", "pass"], label="nested", timeout_seconds=0.1)

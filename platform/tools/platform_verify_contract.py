@@ -32,7 +32,6 @@ try:
         FULL_GATE_IDS,
         OUT_OF_SCOPE_GATE_IDS,
     )
-    from tools.platform_migration_support import MIGRATION_SCENARIO_DEADLINE_SECONDS
     from tools.platform_verify import (
         CI_GATE_IDS,
         DETERMINISTIC_GATE_IDS,
@@ -61,7 +60,6 @@ except ModuleNotFoundError:  # Direct execution from platform/tools.
         FULL_GATE_IDS,
         OUT_OF_SCOPE_GATE_IDS,
     )
-    from platform_migration_support import MIGRATION_SCENARIO_DEADLINE_SECONDS
     from platform_verify import (
         CI_GATE_IDS,
         DETERMINISTIC_GATE_IDS,
@@ -1265,8 +1263,14 @@ def _migration_contract_issues(security_text: str) -> list[str]:
         return [f"migration contract source is unreadable: {exc}"]
     if "HEAD_REVISION" in scenario:
         issues.append("migration scenario must not hardcode HEAD_REVISION")
-    if f"MIGRATION_SCENARIO_DEADLINE_SECONDS = {MIGRATION_SCENARIO_DEADLINE_SECONDS:g}.0" not in support:
+    inner = re.search(r"^MIGRATION_SCENARIO_DEADLINE_SECONDS = ([0-9.]+)$", support, re.MULTILINE)
+    outer = re.search(r"^MIGRATION_GATE_TIMEOUT_SECONDS = ([0-9.]+)$", support, re.MULTILINE)
+    if inner is None or float(inner.group(1)) != 180.0:
         issues.append("migration support must define the 180-second subprocess timeout")
+    if outer is None or float(outer.group(1)) != 210.0:
+        issues.append("migration support must define the 210-second outer timeout")
+    if inner is not None and outer is not None and float(outer.group(1)) <= float(inner.group(1)):
+        issues.append("migration outer timeout must exceed the inner scenario deadline")
     for marker in ("MigrationCommandTimeout", "MigrationCommandError", "run_migration_subprocess"):
         if marker not in scenario and marker not in support:
             issues.append(f"migration timeout contract is missing {marker}")

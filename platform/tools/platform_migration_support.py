@@ -20,7 +20,7 @@ import selectors
 import signal
 import subprocess
 import time
-from typing import Mapping, Sequence
+from typing import Sequence
 from urllib.parse import urlsplit
 
 
@@ -357,17 +357,17 @@ def assert_single_head_state(
     return state
 
 
-def _redact_diagnostic(output: object, env: Mapping[str, str] | None = None) -> str:
+def _redact_diagnostic(output: object, env: dict[str, str] | None = None) -> str:
     text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
-    if env:
-        for key, value in env.items():
-            if value and re.search(r"PASSWORD|SECRET|TOKEN|PRIVATE|API[_-]?KEY|DATABASE_URL|REDIS_URL", key, re.I):
-                text = text.replace(value, "<redacted>")
+    for key, value in (env or {}).items():
+        if value and re.search(r"PASSWORD|SECRET|TOKEN|PRIVATE|API[_-]?KEY|DATABASE_URL|REDIS_URL", key, re.I):
+            text = text.replace(value, "<redacted>")
+    text = re.sub(r"(?i)(://[^/\s:@]+):[^@\s]+@", r"\1:<redacted>@", text)
     text = re.sub(r"(?i)(password|secret|token|private[_-]?key|api[_-]?key)\s*[=:]\s*[^\s,;]+", r"\1=<redacted>", text)
     return text[-MIGRATION_DIAGNOSTIC_BYTES:]
 
 
-def migration_command_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+def migration_command_env(env: dict[str, str] | None = None) -> dict[str, str]:
     return {key: value for key, value in (os.environ if env is None else env).items() if key in _MIGRATION_ENV_KEYS}
 
 
@@ -392,7 +392,6 @@ def run_migration_subprocess(
     env: Mapping[str, str] | None = None,
     check: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a controlled migration child under one absolute deadline."""
     active = _ACTIVE_DEADLINE.get()
     if active is not None and (deadline is not None or timeout_seconds is not None):
         raise MigrationContractError("migration subprocesses must share one deadline")
@@ -414,8 +413,7 @@ def run_migration_subprocess(
                 except OSError as exc:
                     raise MigrationCleanupUnproven(f"{label} cleanup could not be proven") from exc
                 if chunk:
-                    tail.extend(chunk)
-                    del tail[:-MIGRATION_DIAGNOSTIC_BYTES]
+                    tail[:] = (tail + chunk)[-MIGRATION_DIAGNOSTIC_BYTES:]
                 else:
                     selector.unregister(stream)
                     stream.close()
@@ -456,8 +454,6 @@ def run_migration_subprocess(
                 label=label, command=command, returncode=-1,
                 output=f"{type(exc).__name__}: executable unavailable",
             ) from exc
-        if process.stdout is None:
-            raise MigrationCleanupUnproven(f"{label} cleanup could not be proven")
         os.set_blocking(process.stdout.fileno(), False)
         selector.register(process.stdout, selectors.EVENT_READ)
         if not pump(max(time.monotonic(), deadline - min(2.0, max(0.0, deadline - time.monotonic()) / 10))):
