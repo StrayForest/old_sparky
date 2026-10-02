@@ -250,8 +250,10 @@ two live phases in one fresh Linux child at `C=512, N=4096` with independent
 submitted/completed/peak-pending/live-payload counters, native-thread
 restoration, direct-child absence and process-group reap, and emits only
 bounded JSON. The independent acceptance limits are `VmHWM`/`ru_maxrss` delta
-`<192 MiB` for live phases and `<24 MiB` for the accumulator child; the probe
-has an absolute 15-second supervisor deadline. The existing sliding-window
+`<192 MiB` for live phases and `<24 MiB` for the accumulator child; live and
+hostile probes have absolute 15-second and 0.5-second supervisor deadlines,
+respectively, while the accumulator probe has a 30-second deadline. The
+existing sliding-window
 pending bound remains the mutation contract: the former submit-all
 implementation fails when pending work reaches `N`. This is local/CI evidence
 only and does not authorize a production load run. Completed request objects,

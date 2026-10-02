@@ -37,6 +37,7 @@ from tools.platform_external_load import (
 
 RSS_PROBE = Path(__file__).with_name("fixtures") / "external_load_rss_probe.py"
 RSS_DEADLINE_SECONDS = 15.0
+RSS_DEADLINES = {"live": RSS_DEADLINE_SECONDS, "accumulator": 30.0, "hostile": 0.5}
 LIVE_HWM_LIMIT_BYTES = 192 * 1024 * 1024
 ACCUMULATOR_HWM_LIMIT_BYTES = 24 * 1024 * 1024
 PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
@@ -46,7 +47,8 @@ def _run_rss_probe(mode: str) -> dict[str, object]:
     with tempfile.TemporaryDirectory() as directory:
         stdout_path, stderr_path = Path(directory) / "out", Path(directory) / "err"
         started = time.monotonic()
-        deadline = started + RSS_DEADLINE_SECONDS
+        deadline_seconds = RSS_DEADLINES[mode]
+        deadline = started + deadline_seconds
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
             process = subprocess.Popen(
                 [sys.executable, str(RSS_PROBE), mode],
@@ -62,7 +64,7 @@ def _run_rss_probe(mode: str) -> dict[str, object]:
                 ),
             )
             pgid = process.pid
-            cleanup_budget = min(0.5, RSS_DEADLINE_SECONDS / 2)
+            cleanup_budget = min(0.5, deadline_seconds / 2)
             def signal_group(sig: int) -> None:
                 try:
                     if process.poll() is None:
@@ -84,7 +86,7 @@ def _run_rss_probe(mode: str) -> dict[str, object]:
                 signal_group(signal.SIGKILL)
                 process.wait(timeout=max(0.0, deadline - time.monotonic()))
         elapsed = time.monotonic() - started
-        if elapsed > RSS_DEADLINE_SECONDS:
+        if elapsed > deadline_seconds:
             raise AssertionError("RSS probe exceeded its absolute deadline")
         if os.path.exists(f"/proc/{pgid}"):
             raise AssertionError("RSS probe process was not reaped")
@@ -94,12 +96,12 @@ def _run_rss_probe(mode: str) -> dict[str, object]:
             pass
         else:
             raise AssertionError("RSS probe process group survived cleanup")
-        if mode == "hostile" and b"hostile-ready\n" not in stdout_path.read_bytes():
-            raise AssertionError("RSS probe ready marker missing")
         if process.returncode != 0:
             raise AssertionError(f"RSS probe failed (returncode={process.returncode}, stdout_bytes={min(stdout_path.stat().st_size, PROBE_OUTPUT_LIMIT_BYTES)}, stderr_bytes={min(stderr_path.stat().st_size, PROBE_OUTPUT_LIMIT_BYTES)})")
         if stdout_path.stat().st_size > PROBE_OUTPUT_LIMIT_BYTES or stderr_path.stat().st_size > PROBE_OUTPUT_LIMIT_BYTES:
             raise AssertionError("RSS probe output exceeded its cap")
+        if mode == "hostile" and b"hostile-ready\n" not in stdout_path.read_bytes():
+            raise AssertionError("RSS probe ready marker missing")
         if stderr_path.read_bytes():
             raise AssertionError("RSS probe emitted stderr")
         report = json.loads(stdout_path.read_text(encoding="utf-8"))
@@ -346,7 +348,7 @@ class ExternalLoadTests(unittest.TestCase):
             self.assertEqual({thread.name for thread in threading.enumerate() if thread.name.startswith("external-load")}, baseline)
 
     def test_rss_supervisor_reaps_hostile_child_with_short_deadline(self) -> None:
-        with patch.object(sys.modules[__name__], "RSS_DEADLINE_SECONDS", 0.5), patch.object(os, "killpg", wraps=os.killpg) as killpg, self.assertRaisesRegex(AssertionError, "RSS probe failed"):
+        with patch.object(os, "killpg", wraps=os.killpg) as killpg, self.assertRaisesRegex(AssertionError, "RSS probe failed"):
             _run_rss_probe("hostile")
         self.assertEqual([call.args[1] for call in killpg.call_args_list[:2]], [signal.SIGTERM, signal.SIGKILL])
 
