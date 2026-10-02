@@ -11,7 +11,6 @@ import os
 import pathlib
 import re
 import secrets
-import shutil
 import stat
 import sys
 import urllib.parse
@@ -619,7 +618,7 @@ def perform_restore_drill(
     trusted_alembic_head: object | None = None,
     expected_alembic_head: str | None = None,
     source_root: pathlib.Path | None = None,
-    deadline: float | None = None,
+    deadline: float,
 ) -> int:
     if trusted_alembic_head is not None:
         trusted = supervisor.require_trusted_alembic_head(
@@ -635,9 +634,11 @@ def perform_restore_drill(
                 "Expected Alembic head does not match the trusted deployed source graph."
             )
         expected_head = trusted_head
-    cleanup_deadline = deadline if deadline is not None else supervisor.operation_deadline(DEFAULT_OPERATION_TIMEOUT_SECONDS)
+    cleanup_deadline = deadline
     operation_deadline = supervisor.cleanup_deadline(cleanup_deadline)
     cleanup_reserve = cleanup_deadline - operation_deadline
+    psql = helpers.executable("psql")
+    pg_restore = helpers.executable("pg_restore")
 
     def invoke(command: list[str], *, cleanup: bool = False, **kwargs: Any) -> Any:
         kwargs["cleanup_reserve_seconds"] = 0.0 if cleanup else kwargs.get("cleanup_reserve_seconds", cleanup_reserve)
@@ -700,7 +701,7 @@ def perform_restore_drill(
         for extension in REQUIRED_PLATFORM_EXTENSIONS:
             invoke(
                 [
-                    "psql",
+                    psql,
                     "--no-psqlrc",
                     *connection_args(restore_target),
                     "--command",
@@ -710,8 +711,8 @@ def perform_restore_drill(
                 capture_output=True,
             )
         invoke(
-            [
-                "psql",
+                [
+                    psql,
                 "--no-psqlrc",
                 *connection_args(restore_target),
                 "--command",
@@ -726,7 +727,7 @@ def perform_restore_drill(
         ):
             invoke(
                 [
-                    "pg_restore",
+                    pg_restore,
                     "--exit-on-error",
                     "--no-owner",
                     "--no-acl",
@@ -738,7 +739,7 @@ def perform_restore_drill(
             )
         table_count_result = invoke(
             [
-                "psql",
+                psql,
                 "--no-psqlrc",
                 "--tuples-only",
                 "--no-align",
@@ -754,7 +755,7 @@ def perform_restore_drill(
             raise RuntimeError("Restore drill produced no tables in the platform schema.")
         connectivity_result = invoke(
             [
-                "psql",
+                psql,
                 "--no-psqlrc",
                 "--tuples-only",
                 "--no-align",
@@ -769,7 +770,7 @@ def perform_restore_drill(
             raise RuntimeError("Restore drill connectivity verification failed.")
         revision_result = invoke(
             [
-                "psql",
+                psql,
                 "--no-psqlrc",
                 "--tuples-only",
                 "--no-align",
@@ -787,7 +788,7 @@ def perform_restore_drill(
             )
         extension_count_result = invoke(
             [
-                "psql",
+                psql,
                 "--no-psqlrc",
                 "--tuples-only",
                 "--no-align",
@@ -884,6 +885,7 @@ def create_backup(
     prune: bool = True,
     capability: object | None = None,
     trusted_alembic_head: object | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Create one archive/manifest pair.
 
@@ -933,10 +935,12 @@ def create_backup(
         *required,
         optional=("runuser",) if local_admin_candidate else (),
     )
-    deadline = supervisor.operation_deadline(
-        float(getattr(args, "timeout_seconds", DEFAULT_OPERATION_TIMEOUT_SECONDS))
-    )
-    supervisor.ensure_process_monitor(deadline=deadline)
+    if deadline is None:
+        deadline = supervisor.operation_deadline(
+            float(getattr(args, "timeout_seconds", DEFAULT_OPERATION_TIMEOUT_SECONDS))
+        )
+    pg_dump = helpers.executable("pg_dump")
+    pg_restore = helpers.executable("pg_restore")
 
     try:
         output_dir_stat = output_dir.lstat()
@@ -979,7 +983,7 @@ def create_backup(
             ) from exc
         run_command(
             [
-                "pg_dump",
+                pg_dump,
                 "--format=custom",
                 "--no-owner",
                 "--no-acl",
@@ -1009,7 +1013,7 @@ def create_backup(
             expected_size=dump_stat.st_size,
         )
         run_command(
-            ["pg_restore", "--list", f"/proc/self/fd/{temporary_dump_fd}"],
+            [pg_restore, "--list", f"/proc/self/fd/{temporary_dump_fd}"],
             capture_output=True,
             pass_fds=(temporary_dump_fd,),
             deadline=deadline,
@@ -1237,7 +1241,7 @@ def main() -> int:
                     env_file=pathlib.Path(args.env_file),
                     output_dir=pathlib.Path(args.output_dir),
                     admin_database_url=args.admin_database_url,
-                    timeout_seconds=args.timeout_seconds,
+                    backup_timeout_seconds=args.timeout_seconds,
                     as_json=args.as_json,
                 ),
                 app_dir=pathlib.Path(args.output_dir).resolve().parents[1],

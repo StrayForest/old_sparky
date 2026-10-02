@@ -531,6 +531,7 @@ def run_backup(
     capability: object | None = None,
     lock: Any | None = None,
     evidence: Any | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Compatibility facade for the supervisor-owned backup primitive.
 
@@ -566,6 +567,7 @@ def run_backup(
             lock=lock,
             evidence=evidence,
             backup_timeout_seconds=backup_timeout_seconds,
+            deadline=deadline,
         ),
     )
 
@@ -630,6 +632,7 @@ def _plan_and_maybe_apply(
     capability: object | None = None,
     backup_lock: Any | None = None,
     evidence: Any | None = None,
+    deadline: float | None = None,
 ) -> tuple[
     RetentionPlan,
     ArtifactRetentionPlan,
@@ -689,6 +692,8 @@ def _plan_and_maybe_apply(
                     lock=backup_lock,
                     evidence=evidence,
                 )
+            if deadline is not None:
+                backup_kwargs["deadline"] = deadline
             backup = {
                 "status": "completed",
                 **run_backup(app_dir, **backup_kwargs),
@@ -733,6 +738,7 @@ def run_maintenance(
     _live_qa_lock_fd: int | None = None,
     _evidence: Any | None = None,
     _locks_held: bool = False,
+    _backup_deadline: float | None = None,
 ) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     app_dir = args.app_dir.resolve(strict=True)
@@ -786,6 +792,7 @@ def run_maintenance(
                                 _live_qa_lock_fd=live_qa_fd,
                                 _evidence=evidence,
                                 _locks_held=True,
+                                _backup_deadline=_backup_deadline,
                             ),
                         )
 
@@ -813,6 +820,8 @@ def run_maintenance(
                     lock=_backup_lock,
                     evidence=_evidence,
                 )
+            if _backup_deadline is not None:
+                backup_kwargs["deadline"] = _backup_deadline
             # Keep patched test/library facades observationally compatible;
             # the concrete production ``run_backup`` function always receives
             # the in-process capability above.
@@ -848,6 +857,7 @@ def run_maintenance(
                 capability=_supervisor_capability,
                 backup_lock=_backup_lock,
                 evidence=_evidence,
+                deadline=_backup_deadline,
             )
             live_qa_plan = live_qa_guard.prune_runtime_cache_release_lock_held(
                 apply=True,

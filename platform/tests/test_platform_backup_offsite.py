@@ -225,7 +225,7 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
             def fake_run_command(
                 command: list[str], *, stdout: int | None = None, **_: object
             ) -> subprocess.CompletedProcess[str]:
-                if command[0] == "pg_dump":
+                if Path(command[0]).name == "pg_dump":
                     assert stdout is not None
                     self.assertNotIn("--file", command)
                     os.write(stdout, b"PGDMP creator output")
@@ -277,7 +277,7 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
             def fake_run_command(
                 command: list[str], *, stdout: int | None = None, **_: object
             ) -> subprocess.CompletedProcess[str]:
-                if command[0] == "pg_dump":
+                if Path(command[0]).name == "pg_dump":
                     assert stdout is not None
                     self.assertNotIn("--file", command)
                     os.write(stdout, b"PGDMP same second")

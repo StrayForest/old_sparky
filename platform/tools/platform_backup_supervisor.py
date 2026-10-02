@@ -2333,6 +2333,7 @@ def run_local_backup(
     lock: BackupLockHandle,
     evidence: EvidenceSession,
     backup_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Create, verify, and prune one local backup under the final lock."""
 
@@ -2365,6 +2366,7 @@ def run_local_backup(
         prune=False,
         capability=capability,
         trusted_alembic_head=trusted_alembic_head,
+        deadline=deadline,
     )
     output_dir = Path(restore_args.output_dir)
     dump = output_dir / str(created["dump_file"])
@@ -2637,7 +2639,8 @@ def run_backup_entrypoint(
     timeout_seconds = float(
         getattr(args, "backup_timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS)
     )
-    ensure_process_monitor(deadline=operation_deadline(timeout_seconds))
+    deadline = operation_deadline(timeout_seconds)
+    ensure_process_monitor(deadline=deadline)
     requirements = operation_lock_requirements("local-backup")
     with evidence_session(app_dir, "local-backup", locks=requirements) as evidence:
         with ordered_backup_lock_scope(
@@ -2660,6 +2663,7 @@ def run_backup_entrypoint(
                     lock=lock,
                     evidence=evidence,
                     backup_timeout_seconds=timeout_seconds,
+                    deadline=deadline,
                 ),
             )
 
@@ -2670,7 +2674,8 @@ def run_maintenance_entrypoint(args: argparse.Namespace) -> dict[str, Any]:
     timeout_seconds = float(
         getattr(args, "backup_timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS)
     )
-    ensure_process_monitor(deadline=operation_deadline(timeout_seconds))
+    deadline = operation_deadline(timeout_seconds)
+    ensure_process_monitor(deadline=deadline)
     app_dir = Path(args.app_dir).resolve(strict=True)
     requirements = operation_lock_requirements("maintenance")
     with evidence_session(app_dir, "maintenance", locks=requirements) as evidence:
@@ -2693,6 +2698,7 @@ def run_maintenance_entrypoint(args: argparse.Namespace) -> dict[str, Any]:
                     _live_qa_lock_fd=live_qa_lock_fd,
                     _locks_held=True,
                     _evidence=evidence,
+                    _backup_deadline=deadline,
                 ),
             )
             if report.get("ok") is False:

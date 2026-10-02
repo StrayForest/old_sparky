@@ -230,6 +230,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 helpers=TEST_HELPERS,
                 timestamp_slug="20260720T120000Z",
                 expected_alembic_head="20260801_0036",
+                deadline=platform_backup_supervisor.operation_deadline(30.0),
             )
 
         self.assertEqual(table_count, 22)
@@ -256,10 +257,89 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     timestamp_slug="20261001T120000Z",
                     expected_alembic_head="not-current-head",
                     source_root=source_root,
+                    deadline=platform_backup_supervisor.operation_deadline(30.0),
                 )
 
         trusted_head.assert_called_once_with(source_root)
         run_command.assert_not_called()
+
+    def test_verify_existing_dump_forwards_one_absolute_deadline(self) -> None:
+        sentinel = 12345.678
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            dump_path = root / "existing.dump"
+            dump_path.write_bytes(b"custom-format-backup")
+            args = argparse.Namespace(
+                verify_dump=str(dump_path),
+                env_file=str(root / ".env.platform"),
+                admin_database_url=None,
+                timeout_seconds=37.5,
+            )
+            monitor = platform_backup_supervisor.ensure_process_monitor
+            monitor.reset_mock()
+            with (
+                mock.patch.object(
+                    backup_drill,
+                    "load_env",
+                    return_value={
+                        "PLATFORM_DATABASE_URL": (
+                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
+                        )
+                    },
+                ),
+                mock.patch.object(
+                    backup_drill, "require_commands", return_value=TEST_HELPERS
+                ),
+                mock.patch.object(
+                    platform_backup_supervisor,
+                    "operation_deadline",
+                    return_value=sentinel,
+                ) as operation_deadline,
+                mock.patch.object(
+                    backup_drill,
+                    "run_command",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ) as run_command,
+                mock.patch.object(
+                    backup_drill, "perform_restore_drill", return_value=7
+                ) as restore_drill,
+            ):
+                result = backup_drill.verify_existing_dump(args)
+
+        operation_deadline.assert_called_once_with(37.5)
+        monitor.assert_called_once_with(deadline=sentinel)
+        self.assertEqual(run_command.call_args.kwargs["deadline"], sentinel)
+        self.assertEqual(restore_drill.call_args.kwargs["deadline"], sentinel)
+        self.assertEqual(result["restored_table_count"], 7)
+
+    def test_main_forwards_legacy_timeout_to_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            args = argparse.Namespace(
+                check_latest=False,
+                dump_only=False,
+                verify_dump=None,
+                output_dir=str(pathlib.Path(temporary_dir) / "backups"),
+                keep=2,
+                max_age_hours=24.0,
+                env_file=str(pathlib.Path(temporary_dir) / ".env.platform"),
+                admin_database_url=None,
+                timeout_seconds=37.5,
+                as_json=False,
+            )
+            with (
+                mock.patch.object(backup_drill, "parse_args", return_value=args),
+                mock.patch.object(
+                    platform_backup_supervisor,
+                    "run_backup_entrypoint",
+                    return_value={"ok": True},
+                ) as run_backup_entrypoint,
+                mock.patch.object(backup_drill, "print_result"),
+            ):
+                self.assertEqual(backup_drill.main(), 0)
+
+        forwarded_args = run_backup_entrypoint.call_args.args[0]
+        self.assertEqual(forwarded_args.backup_timeout_seconds, 37.5)
+        self.assertFalse(hasattr(forwarded_args, "timeout_seconds"))
 
     def test_ambiguous_create_never_attempts_drop(self) -> None:
         target = backup_drill.DatabaseTarget("127.0.0.1", 5432, "platform_user", None, "platformdb")
@@ -267,7 +347,14 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill, "run_command", side_effect=[subprocess.CompletedProcess([], 0, "", ""), platform_backup_supervisor.BackupCommandTimeout()]
         ) as run_command:
             with self.assertRaises(platform_backup_supervisor.BackupCleanupUnproven) as error:
-                backup_drill.perform_restore_drill(pathlib.Path("/tmp/backup.dump"), app_target=target, admin_target=None, timestamp_slug="ignored")
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/tmp/backup.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    helpers=TEST_HELPERS,
+                    timestamp_slug="ignored",
+                    deadline=platform_backup_supervisor.operation_deadline(30.0),
+                )
         self.assertRegex(error.exception.database_id or "", platform_backup_supervisor.RESTORE_DRILL_DATABASE_ID_RE)
         self.assertEqual(run_command.call_count, 2)
 
@@ -464,7 +551,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             def fake_run_command(
                 command: list[str], *, stdout: int | None = None, **_: object
             ) -> subprocess.CompletedProcess[str]:
-                if command[0] == "pg_dump":
+                if pathlib.Path(command[0]).name == "pg_dump":
                     assert stdout is not None
                     self.assertNotIn("--file", command)
                     os.write(stdout, b"PGDMP concurrent creator output")
@@ -567,7 +654,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 def racing_run_command(
                     command: list[str], *, stdout: int | None = None, **_: object
                 ) -> subprocess.CompletedProcess[str]:
-                    if command[0] == "pg_dump":
+                    if pathlib.Path(command[0]).name == "pg_dump":
                         assert stdout is not None
                         os.write(stdout, b"PGDMP race output")
                         temporary_path.unlink()
@@ -613,7 +700,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 def fake_run_command(
                     command: list[str], *, stdout: int | None = None, **_: object
                 ) -> subprocess.CompletedProcess[str]:
-                    if command[0] == "pg_dump":
+                    if pathlib.Path(command[0]).name == "pg_dump":
                         assert stdout is not None
                         os.write(stdout, b"PGDMP failure-injection output")
                     return subprocess.CompletedProcess(command, 0, "", "")
@@ -697,11 +784,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             def fake_run_command(
                 command: list[str], *, stdout: int | None = None, **_: object
             ) -> subprocess.CompletedProcess[str]:
-                if command[0] == "pg_dump":
+                if pathlib.Path(command[0]).name == "pg_dump":
                     assert stdout is not None
                     backup_drill.os.write(stdout, b"PGDMP new-backup")
                     return subprocess.CompletedProcess(command, 0, "", "")
-                if command[0] == "pg_restore":
+                if pathlib.Path(command[0]).name == "pg_restore":
                     if "--list" in command:
                         return subprocess.CompletedProcess(command, 0, "", "")
                     raise RuntimeError("restore failed")
@@ -763,14 +850,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 def round_trip_command(
                     command: list[str], *, stdout: int | None = None, **_: object
                 ) -> subprocess.CompletedProcess[str]:
-                    if command[0] == "pg_dump":
+                    if pathlib.Path(command[0]).name == "pg_dump":
                         assert stdout is not None
                         backup_drill.os.write(stdout, b"PGDMP decorated restore failure")
                     return subprocess.CompletedProcess(command, 0, "", "")
 
                 with (mock.patch.dict(backup_drill.os.environ, self._creator_environment(), clear=False),
                       mock.patch.object(backup_drill, "load_env", return_value=self._creator_environment()),
-                      mock.patch.object(backup_drill, "require_commands"),
+                      mock.patch.object(
+                          backup_drill, "require_commands", return_value=TEST_HELPERS
+                      ),
                       mock.patch.object(backup_drill, "run_command", side_effect=round_trip_command),
                       mock.patch.object(backup_drill, "perform_restore_drill", side_effect=failure)):
                     with self.assertRaisesRegex(RuntimeError, "restore verification failed") as raised:
