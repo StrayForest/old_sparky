@@ -13,12 +13,254 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
   cancel-in-progress: false
 
-# This workflow runs from the default branch after the producer completes.
-# Only the immutable default-branch reconciler is checked out; source-run
-# files, code and artifacts are never obtained or executed here.
+# Authority is intentionally separate from the status writer.  It has only
+# read permissions and never checks out source code or publishes a status.
+# The source SHA is not required to be the current dev head: an older exact
+# run may still have a pending status that this finalizer must close.
 jobs:
+  authority:
+    name: Validate completed security run authority
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_run_id: ${{ steps.source.outputs.source_run_id }}
+      source_run_attempt: ${{ steps.source.outputs.source_run_attempt }}
+      reconciler_sha: ${{ steps.metadata.outputs.reconciler_sha }}
+    steps:
+      - name: Validate canonical workflow_run envelope
+        id: source
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: StrayForest/old_sparky
+          EXPECTED_SERVER_URL: https://github.com
+          EXPECTED_API_URL: https://api.github.com
+          EXPECTED_WORKFLOW_ID: "339062797"
+          EXPECTED_WORKFLOW_NAME: Platform security and build
+          EXPECTED_WORKFLOW_PATH: .github/workflows/platform-security.yml
+          EXPECTED_EVENT: push
+          EXPECTED_BRANCH: dev
+          EXPECTED_STATUS: completed
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          SOURCE_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          SOURCE_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          SOURCE_WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_STATUS: ${{ github.event.workflow_run.status }}
+          SOURCE_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          /usr/bin/python3 -I -B - "$GITHUB_EVENT_PATH" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          event_path, output_path = sys.argv[1:]
+          env = os.environ
+          expected = {
+              "repository": env["EXPECTED_REPOSITORY"],
+              "head_repository": env["EXPECTED_REPOSITORY"],
+              "workflow_id": int(env["EXPECTED_WORKFLOW_ID"]),
+              "name": env["EXPECTED_WORKFLOW_NAME"],
+              "path": env["EXPECTED_WORKFLOW_PATH"],
+              "event": env["EXPECTED_EVENT"],
+              "head_branch": env["EXPECTED_BRANCH"],
+              "status": env["EXPECTED_STATUS"],
+          }
+
+          try:
+              payload = json.loads(Path(event_path).read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+              raise SystemExit("workflow_run event is not valid JSON") from exc
+          run = payload.get("workflow_run") if isinstance(payload, dict) else None
+          if not isinstance(run, dict):
+              raise SystemExit("workflow_run event is malformed")
+
+          if (
+              env.get("GITHUB_REPOSITORY") != expected["repository"]
+              or env.get("GITHUB_SERVER_URL") != env["EXPECTED_SERVER_URL"]
+              or env.get("GITHUB_API_URL") != env["EXPECTED_API_URL"]
+              or env.get("GITHUB_EVENT_NAME") != "workflow_run"
+              or env.get("GITHUB_REF") != "refs/heads/dev"
+          ):
+              raise SystemExit("finalizer GitHub context is not canonical")
+          repositories = {
+              key: run.get(key, {}).get("full_name")
+              if isinstance(run.get(key), dict)
+              else None
+              for key in ("repository", "head_repository")
+          }
+          if repositories != {
+              "repository": expected["repository"],
+              "head_repository": expected["head_repository"],
+          }:
+              raise SystemExit("source repositories are not canonical")
+          for field, value in expected.items():
+              if field in {"repository", "head_repository"}:
+                  continue
+              if run.get(field) != value:
+                  raise SystemExit(f"source workflow {field} is not canonical")
+
+          scalar_environment = {
+              "repository": ("SOURCE_REPOSITORY", expected["repository"]),
+              "head_repository": ("SOURCE_HEAD_REPOSITORY", expected["head_repository"]),
+              "workflow_id": ("SOURCE_WORKFLOW_ID", str(expected["workflow_id"])),
+              "name": ("SOURCE_WORKFLOW_NAME", expected["name"]),
+              "path": ("SOURCE_WORKFLOW_PATH", expected["path"]),
+              "event": ("SOURCE_EVENT", expected["event"]),
+              "head_branch": ("SOURCE_HEAD_BRANCH", expected["head_branch"]),
+              "status": ("SOURCE_STATUS", expected["status"]),
+              "head_sha": ("SOURCE_HEAD_SHA", run.get("head_sha")),
+              "id": ("SOURCE_RUN_ID", str(run.get("id"))),
+              "run_attempt": ("SOURCE_RUN_ATTEMPT", str(run.get("run_attempt"))),
+          }
+          for field, (environment_key, expected_value) in scalar_environment.items():
+              if env.get(environment_key) != expected_value:
+                  raise SystemExit(f"workflow_run {field} expression changed")
+          head_sha = run.get("head_sha")
+          if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+              raise SystemExit("source head SHA is not lowercase hexadecimal")
+          for field in ("id", "run_attempt"):
+              value = run.get(field)
+              if type(value) is not int or not 0 < value < 10**32:
+                  raise SystemExit(f"source {field} is malformed")
+          if not isinstance(run.get("conclusion"), str) or not run["conclusion"]:
+              raise SystemExit("source conclusion is malformed")
+          with Path(output_path).open("a", encoding="ascii") as output:
+              output.write(f"source_sha={head_sha}\n")
+              output.write(f"source_run_id={run['id']}\n")
+              output.write(f"source_run_attempt={run['run_attempt']}\n")
+          PY
+
+      - name: Verify exact run and workflow metadata before checkout or status write
+        id: metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_REPOSITORY: StrayForest/old_sparky
+          EXPECTED_WORKFLOW_ID: "339062797"
+          EXPECTED_WORKFLOW_NAME: Platform security and build
+          EXPECTED_WORKFLOW_PATH: .github/workflows/platform-security.yml
+          EXPECTED_BRANCH: dev
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_API_URL" = "https://api.github.com"
+          metadata_dir="$RUNNER_TEMP/platform-security-finalizer-authority-$SOURCE_RUN_ID-$SOURCE_RUN_ATTEMPT"
+          install -d -m 700 -- "$metadata_dir"
+          trap 'rm -rf -- "$metadata_dir"' EXIT
+          api_root="$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY"
+          curl --fail --silent --show-error --request GET \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api_root/actions/runs/$SOURCE_RUN_ID" \
+            --output "$metadata_dir/run.json"
+          curl --fail --silent --show-error --request GET \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api_root/actions/workflows/$EXPECTED_WORKFLOW_ID" \
+            --output "$metadata_dir/workflow.json"
+          curl --fail --silent --show-error --request GET \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api_root/git/ref/heads/$EXPECTED_BRANCH" \
+            --output "$metadata_dir/ref.json"
+          /usr/bin/python3 -I -B - "$metadata_dir" "$GITHUB_EVENT_PATH" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          metadata_dir, event_path, output_path = sys.argv[1:]
+          root = Path(metadata_dir)
+          env = os.environ
+
+          def read_json(name: str) -> object:
+              with (root / name).open("rb") as handle:
+                  raw = handle.read(65537)
+              if len(raw) > 65536:
+                  raise SystemExit(f"{name} exceeds the response cap")
+              try:
+                  return json.loads(raw.decode("utf-8"))
+              except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                  raise SystemExit(f"{name} is not valid JSON") from exc
+
+          try:
+              event_payload = json.loads(Path(event_path).read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+              raise SystemExit("workflow_run event is not valid JSON") from exc
+          event_run = event_payload.get("workflow_run") if isinstance(event_payload, dict) else None
+          run = read_json("run.json")
+          workflow = read_json("workflow.json")
+          ref = read_json("ref.json")
+          if not isinstance(event_run, dict) or not isinstance(run, dict) or not isinstance(workflow, dict):
+              raise SystemExit("workflow metadata is malformed")
+          expected_fields = ("id", "run_attempt", "workflow_id", "name", "path", "event", "head_branch", "status", "conclusion", "head_sha")
+          for field in expected_fields:
+              if run.get(field) != event_run.get(field):
+                  raise SystemExit(f"API run {field} does not match the event")
+          for field, expected in (
+              ("id", 339062797),
+              ("name", "Platform security and build"),
+              ("path", ".github/workflows/platform-security.yml"),
+          ):
+              if workflow.get(field) != expected:
+                  raise SystemExit(f"API workflow {field} is not canonical")
+          for field in ("repository", "head_repository"):
+              event_value = event_run.get(field)
+              run_value = run.get(field)
+              if (
+                  not isinstance(event_value, dict)
+                  or not isinstance(run_value, dict)
+                  or event_value.get("full_name") != "StrayForest/old_sparky"
+                  or run_value.get("full_name") != event_value.get("full_name")
+              ):
+                  raise SystemExit(f"API run {field} is not canonical")
+          if (
+              not isinstance(ref, dict)
+              or ref.get("ref") != "refs/heads/dev"
+              or not isinstance(ref.get("object"), dict)
+              or ref["object"].get("type") != "commit"
+              or not isinstance(ref["object"].get("sha"), str)
+              or re.fullmatch(r"[0-9a-f]{40}", ref["object"]["sha"]) is None
+          ):
+              raise SystemExit("trusted default branch ref is not an immutable commit")
+          if (
+              env.get("SOURCE_SHA") != event_run.get("head_sha")
+              or env.get("SOURCE_RUN_ID") != str(event_run.get("id"))
+              or env.get("SOURCE_RUN_ATTEMPT") != str(event_run.get("run_attempt"))
+          ):
+              raise SystemExit("authority outputs changed before metadata validation")
+          with Path(output_path).open("a", encoding="ascii") as output:
+              output.write(f"reconciler_sha={ref['object']['sha']}\n")
+          PY
+
   finalize-status:
-    if: ${{ always() }}
+    name: Reconcile completed security status
+    needs: [authority]
+    if: ${{ needs.authority.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -26,49 +268,11 @@ jobs:
       contents: read
       statuses: write
     steps:
-      - name: Resolve immutable default-branch reconciler
-        id: trusted_status
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TRUSTED_BRANCH: dev
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
-          test "$GITHUB_SERVER_URL" = "https://github.com"
-          trusted_ref="$RUNNER_TEMP/platform-trusted-status-ref.json"
-          curl --fail-with-body --silent --show-error \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}" \
-            --output "$trusted_ref"
-          /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
-          import json
-          from pathlib import Path
-          import re
-          import sys
-
-          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          branch = sys.argv[3]
-          obj = payload.get("object") if isinstance(payload, dict) else None
-          sha = obj.get("sha") if isinstance(obj, dict) else None
-          if (
-              payload.get("ref") != f"refs/heads/{branch}"
-              or not isinstance(obj, dict)
-              or obj.get("type") != "commit"
-              or not isinstance(sha, str)
-              or re.fullmatch(r"[0-9a-f]{40}", sha) is None
-          ):
-              raise SystemExit("trusted default branch commit is malformed")
-          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
-              output.write(f"sha={sha}\n")
-          PY
-          rm -f -- "$trusted_ref"
       - name: Checkout trusted default-branch reconciler
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ steps.trusted_status.outputs.sha }}
+          repository: StrayForest/old_sparky
+          ref: ${{ needs.authority.outputs.reconciler_sha }}
           fetch-depth: 1
           path: trusted-status-source
           persist-credentials: false
@@ -76,8 +280,29 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          AUTHORITY_SOURCE_SHA: ${{ needs.authority.outputs.source_sha }}
+          AUTHORITY_SOURCE_RUN_ID: ${{ needs.authority.outputs.source_run_id }}
+          AUTHORITY_SOURCE_RUN_ATTEMPT: ${{ needs.authority.outputs.source_run_attempt }}
         run: |
           set -euo pipefail
+          /usr/bin/python3 -I -B - "$GITHUB_EVENT_PATH" "$AUTHORITY_SOURCE_SHA" "$AUTHORITY_SOURCE_RUN_ID" "$AUTHORITY_SOURCE_RUN_ATTEMPT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          event_path, expected_sha, expected_id, expected_attempt = sys.argv[1:]
+          payload = json.loads(Path(event_path).read_text(encoding="utf-8"))
+          run = payload.get("workflow_run") if isinstance(payload, dict) else None
+          if (
+              not isinstance(run, dict)
+              or run.get("head_sha") != expected_sha
+              or str(run.get("id")) != expected_id
+              or str(run.get("run_attempt")) != expected_attempt
+              or re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None
+          ):
+              raise SystemExit("authority output does not match the source event")
+          PY
           /usr/bin/python3 -I -B \
             "$GITHUB_WORKSPACE/trusted-status-source/platform/tools/platform_security_status.py" \
             reconcile --event-file "$GITHUB_EVENT_PATH"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+import os
 from pathlib import Path
 import re
 import stat
@@ -576,32 +577,301 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("workflow_run:", workflow)
         self.assertIn("workflows: [Platform security and build]", workflow)
         self.assertIn("types: [completed]", workflow)
-        self.assertIn("if: ${{ always() }}", workflow)
+        self.assertNotIn("always()", workflow)
+        self.assertIn("  authority:", workflow)
+        self.assertIn("  finalize-status:", workflow)
+        self.assertLess(workflow.index("  authority:"), workflow.index("  finalize-status:"))
+        authority = workflow.split("  finalize-status:", 1)[0]
+        writer = workflow.split("  finalize-status:", 1)[1]
+        self.assertNotIn("statuses: write", authority)
+        self.assertNotIn("actions/checkout@", authority)
+        self.assertIn("needs: [authority]", writer)
+        self.assertIn("if: ${{ needs.authority.result == 'success' }}", writer)
+        self.assertIn("needs.authority.outputs.reconciler_sha", writer)
+        self.assertIn("AUTHORITY_SOURCE_SHA", writer)
+        self.assertIn("AUTHORITY_SOURCE_RUN_ID", writer)
+        self.assertIn("AUTHORITY_SOURCE_RUN_ATTEMPT", writer)
         self.assertIn(
-            "permissions:\n      actions: read\n      contents: read\n      statuses: write",
-            workflow,
+            "permissions:\n      actions: read\n      contents: read",
+            authority,
         )
+        self.assertEqual(workflow.count("statuses: write"), 1)
         self.assertIn(
             "group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
             workflow,
         )
-        self.assertIn("actions/checkout@", workflow)
-        self.assertIn("ref: ${{ steps.trusted_status.outputs.sha }}", workflow)
+        self.assertIn("actions/checkout@", writer)
+        self.assertIn("ref: ${{ needs.authority.outputs.reconciler_sha }}", writer)
         self.assertIn("path: trusted-status-source", workflow)
         self.assertIn("persist-credentials: false", workflow)
-        self.assertNotIn("github.event.workflow_run.head_sha", workflow)
+        for field in (
+            "github.event.workflow_run.repository.full_name",
+            "github.event.workflow_run.head_repository.full_name",
+            "github.event.workflow_run.workflow_id",
+            "github.event.workflow_run.name",
+            "github.event.workflow_run.path",
+            "github.event.workflow_run.event",
+            "github.event.workflow_run.head_branch",
+            "github.event.workflow_run.status",
+            "github.event.workflow_run.head_sha",
+            "github.event.workflow_run.id",
+            "github.event.workflow_run.run_attempt",
+        ):
+            self.assertIn(field, workflow)
+        for field in (
+            "339062797",
+            "Platform security and build",
+            ".github/workflows/platform-security.yml",
+            "EXPECTED_EVENT: push",
+            "EXPECTED_BRANCH: dev",
+            "EXPECTED_STATUS: completed",
+            'env.get("GITHUB_SERVER_URL")',
+            'env.get("GITHUB_API_URL")',
+            'env.get("GITHUB_EVENT_NAME")',
+            'expected_fields = ("id", "run_attempt", "workflow_id", "name", "path", "event", "head_branch", "status", "conclusion", "head_sha")',
+        ):
+            self.assertIn(field, workflow)
         self.assertNotIn("download-artifact", workflow)
         self.assertNotIn("upload-artifact", workflow)
         self.assertNotIn("secrets.", workflow)
         self.assertIn("reconcile --event-file", workflow)
-        self.assertNotIn("urlopen", workflow)
-        self.assertNotIn("MAX_RUN_PAGES", workflow)
-        self.assertNotIn("candidate > run_key", workflow)
-        self.assertNotIn("/statuses/", workflow)
+        self.assertNotIn("platform_release", workflow)
+        self.assertNotIn("/statuses/", authority)
+        curl_lines = [line.strip() for line in workflow.splitlines() if line.strip().startswith("curl ")]
+        self.assertEqual(len(curl_lines), 3)
+        for line in curl_lines:
+            self.assertIn("--fail --silent --show-error --request GET", line)
+        self.assertEqual(workflow.count("--connect-timeout 5"), 3)
+        self.assertEqual(workflow.count("--max-time 15"), 3)
+        self.assertEqual(workflow.count("--retry 0"), 3)
+        self.assertEqual(workflow.count("--max-filesize 65536"), 3)
+        self.assertIn("actions/runs/$SOURCE_RUN_ID", workflow)
+        self.assertIn("actions/workflows/$EXPECTED_WORKFLOW_ID", workflow)
+        self.assertIn("len(raw) > 65536", workflow)
+        self.assertIn("reconciler_sha=", workflow)
+        # The trusted checkout SHA is implementation provenance only.  The
+        # completed source SHA is intentionally allowed to be older than dev.
+        self.assertIn("source SHA is not required to be the current dev head", workflow)
+        self.assertNotIn("SOURCE_SHA == ref", workflow)
+        self.assertNotIn("SOURCE_SHA != ref", workflow)
         self.assertLess(
             workflow.index("name: Platform security status finalizer"),
             workflow.index("reconcile --event-file"),
         )
+
+        # Execute the two inline authority validators against independent
+        # fixtures.  The mutation matrix keeps each source/API identity field
+        # fail-closed without importing the workflow implementation.
+        source_marker = '          /usr/bin/python3 -I -B - "$GITHUB_EVENT_PATH" "$GITHUB_OUTPUT" <<\'PY\'\n'
+        source_start = workflow.index(source_marker) + len(source_marker)
+        source_end = workflow.index("          PY\n", source_start)
+        source_contract = textwrap.dedent(workflow[source_start:source_end])
+        metadata_marker = '          /usr/bin/python3 -I -B - "$metadata_dir" "$GITHUB_EVENT_PATH" "$GITHUB_OUTPUT" <<\'PY\'\n'
+        metadata_start = workflow.index(metadata_marker) + len(metadata_marker)
+        metadata_end = workflow.index("          PY\n", metadata_start)
+        metadata_contract = textwrap.dedent(workflow[metadata_start:metadata_end])
+
+        source_sha = "a" * 40
+        source_run = {
+            "id": 123456,
+            "run_attempt": 2,
+            "workflow_id": 339062797,
+            "name": "Platform security and build",
+            "path": ".github/workflows/platform-security.yml",
+            "event": "push",
+            "head_branch": "dev",
+            "status": "completed",
+            "conclusion": "cancelled",
+            "head_sha": source_sha,
+            "repository": {"full_name": "StrayForest/old_sparky"},
+            "head_repository": {"full_name": "StrayForest/old_sparky"},
+        }
+        source_event = {"workflow_run": source_run}
+        source_environment = os.environ.copy()
+        source_environment.update(
+            {
+                "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                "GITHUB_SERVER_URL": "https://github.com",
+                "GITHUB_API_URL": "https://api.github.com",
+                "GITHUB_EVENT_NAME": "workflow_run",
+                "GITHUB_REF": "refs/heads/dev",
+                "EXPECTED_REPOSITORY": "StrayForest/old_sparky",
+                "EXPECTED_SERVER_URL": "https://github.com",
+                "EXPECTED_API_URL": "https://api.github.com",
+                "EXPECTED_WORKFLOW_ID": "339062797",
+                "EXPECTED_WORKFLOW_NAME": "Platform security and build",
+                "EXPECTED_WORKFLOW_PATH": ".github/workflows/platform-security.yml",
+                "EXPECTED_EVENT": "push",
+                "EXPECTED_BRANCH": "dev",
+                "EXPECTED_STATUS": "completed",
+                "SOURCE_REPOSITORY": "StrayForest/old_sparky",
+                "SOURCE_HEAD_REPOSITORY": "StrayForest/old_sparky",
+                "SOURCE_WORKFLOW_ID": "339062797",
+                "SOURCE_WORKFLOW_NAME": "Platform security and build",
+                "SOURCE_WORKFLOW_PATH": ".github/workflows/platform-security.yml",
+                "SOURCE_EVENT": "push",
+                "SOURCE_HEAD_BRANCH": "dev",
+                "SOURCE_STATUS": "completed",
+                "SOURCE_HEAD_SHA": source_sha,
+                "SOURCE_RUN_ID": "123456",
+                "SOURCE_RUN_ATTEMPT": "2",
+            }
+        )
+
+        def run_inline(
+            contract: str,
+            args: list[str],
+            environment: Mapping[str, str],
+        ) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, "-I", "-B", "-", *args],
+                input=contract,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=dict(environment),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            output_path = root / "output"
+            event_path.write_text(json.dumps(source_event), encoding="utf-8")
+            valid = run_inline(
+                source_contract,
+                [str(event_path), str(output_path)],
+                source_environment,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            for label, mutate in (
+                ("repository", lambda candidate: candidate["repository"].update(full_name="fork/old_sparky")),
+                ("head_repository", lambda candidate: candidate["head_repository"].update(full_name="fork/old_sparky")),
+                ("workflow_id", lambda candidate: candidate.update(workflow_id=1)),
+                ("name", lambda candidate: candidate.update(name="Other workflow")),
+                ("path", lambda candidate: candidate.update(path=".github/workflows/other.yml")),
+                ("event", lambda candidate: candidate.update(event="workflow_dispatch")),
+                ("branch", lambda candidate: candidate.update(head_branch="feature")),
+                ("status", lambda candidate: candidate.update(status="in_progress")),
+                ("sha", lambda candidate: candidate.update(head_sha=source_sha.upper())),
+                ("run_id", lambda candidate: candidate.update(id=0)),
+                ("run_attempt", lambda candidate: candidate.update(run_attempt=0)),
+                ("conclusion", lambda candidate: candidate.pop("conclusion")),
+            ):
+                candidate = json.loads(json.dumps(source_event))
+                mutate(candidate["workflow_run"])
+                event_path.write_text(json.dumps(candidate), encoding="utf-8")
+                rejected = run_inline(
+                    source_contract,
+                    [str(event_path), str(output_path)],
+                    source_environment,
+                )
+                self.assertNotEqual(rejected.returncode, 0, label)
+            for label, key, value in (
+                ("server", "GITHUB_SERVER_URL", "https://evil.example"),
+                ("api", "GITHUB_API_URL", "https://api.example"),
+                ("context", "GITHUB_REPOSITORY", "fork/old_sparky"),
+            ):
+                mutated_environment = dict(source_environment)
+                mutated_environment[key] = value
+                event_path.write_text(json.dumps(source_event), encoding="utf-8")
+                rejected = run_inline(
+                    source_contract,
+                    [str(event_path), str(output_path)],
+                    mutated_environment,
+                )
+                self.assertNotEqual(rejected.returncode, 0, label)
+
+        metadata_run = dict(source_run)
+        metadata_workflow = {
+            "id": 339062797,
+            "name": "Platform security and build",
+            "path": ".github/workflows/platform-security.yml",
+        }
+        metadata_ref = {
+            "ref": "refs/heads/dev",
+            "object": {"type": "commit", "sha": "b" * 40},
+        }
+        metadata_environment = os.environ.copy()
+        metadata_environment.update(
+            {
+                "SOURCE_SHA": source_sha,
+                "SOURCE_RUN_ID": "123456",
+                "SOURCE_RUN_ATTEMPT": "2",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            output_path = root / "output"
+            event_path.write_text(json.dumps(source_event), encoding="utf-8")
+
+            def write_metadata(
+                run: object = metadata_run,
+                workflow_metadata: object = metadata_workflow,
+                ref_metadata: object = metadata_ref,
+            ) -> Path:
+                metadata_path = root / "metadata"
+                metadata_path.mkdir(exist_ok=True)
+                (metadata_path / "run.json").write_text(json.dumps(run), encoding="utf-8")
+                (metadata_path / "workflow.json").write_text(json.dumps(workflow_metadata), encoding="utf-8")
+                (metadata_path / "ref.json").write_text(json.dumps(ref_metadata), encoding="utf-8")
+                return metadata_path
+
+            metadata_path = write_metadata()
+            valid = run_inline(
+                metadata_contract,
+                [str(metadata_path), str(event_path), str(output_path)],
+                metadata_environment,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertIn("reconciler_sha=", output_path.read_text(encoding="ascii"))
+            for label, field, value in (
+                ("API run ID", "id", 123457),
+                ("API attempt", "run_attempt", 3),
+                ("API workflow ID", "workflow_id", 1),
+                ("API name", "name", "Other workflow"),
+                ("API path", "path", ".github/workflows/other.yml"),
+                ("API event", "event", "workflow_dispatch"),
+                ("API branch", "head_branch", "feature"),
+                ("API status", "status", "in_progress"),
+                ("API repository", "repository", {"full_name": "fork/old_sparky"}),
+                ("API head_repository", "head_repository", {"full_name": "fork/old_sparky"}),
+                ("API SHA", "head_sha", "c" * 40),
+            ):
+                candidate = dict(metadata_run)
+                candidate[field] = value
+                metadata_path = write_metadata(run=candidate)
+                rejected = run_inline(
+                    metadata_contract,
+                    [str(metadata_path), str(event_path), str(output_path)],
+                    metadata_environment,
+                )
+                self.assertNotEqual(rejected.returncode, 0, label)
+            for label, field, value in (
+                ("API workflow ID", "id", 1),
+                ("API workflow name", "name", "Other workflow"),
+                ("API workflow path", "path", ".github/workflows/other.yml"),
+            ):
+                candidate = dict(metadata_workflow)
+                candidate[field] = value
+                metadata_path = write_metadata(workflow_metadata=candidate)
+                rejected = run_inline(
+                    metadata_contract,
+                    [str(metadata_path), str(event_path), str(output_path)],
+                    metadata_environment,
+                )
+                self.assertNotEqual(rejected.returncode, 0, label)
+            oversized = root / "metadata-oversized"
+            oversized.mkdir()
+            (oversized / "run.json").write_bytes(b"{" + b"\"x\":\"" + b"x" * 65550 + b"\"}")
+            (oversized / "workflow.json").write_text(json.dumps(metadata_workflow), encoding="utf-8")
+            (oversized / "ref.json").write_text(json.dumps(metadata_ref), encoding="utf-8")
+            rejected = run_inline(
+                metadata_contract,
+                [str(oversized), str(event_path), str(output_path)],
+                metadata_environment,
+            )
+            self.assertNotEqual(rejected.returncode, 0, "oversized API response")
 
         pending_at = security.index("--data", security.index("Mark platform security build pending"))
         first_gate_at = security.index("  backend-static:")

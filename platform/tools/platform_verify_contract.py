@@ -369,7 +369,7 @@ def security_status_permission_issues(security_text: str) -> list[str]:
 
 
 def status_finalizer_workflow_issues() -> list[str]:
-    """Keep the trusted-default-branch status reconciler fail-closed."""
+    """Keep status finalizer authority separate from its status writer."""
 
     if not STATUS_FINALIZER_WORKFLOW.is_file():
         return ["platform security status finalizer workflow is missing"]
@@ -382,22 +382,92 @@ def status_finalizer_workflow_issues() -> list[str]:
         "workflows: [Platform security and build]",
         "types: [completed]",
         "group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
+        "  authority:",
         "  finalize-status:",
-        "if: ${{ always() }}",
-        "actions: read",
-        "contents: read",
-        "statuses: write",
         "actions/checkout@",
-        "ref: ${{ steps.trusted_status.outputs.sha }}",
+        "ref: ${{ needs.authority.outputs.reconciler_sha }}",
         "path: trusted-status-source",
         "persist-credentials: false",
-        "TRUSTED_BRANCH: dev",
+        "EXPECTED_WORKFLOW_ID: \"339062797\"",
+        "EXPECTED_WORKFLOW_NAME: Platform security and build",
+        "EXPECTED_WORKFLOW_PATH: .github/workflows/platform-security.yml",
+        "EXPECTED_EVENT: push",
+        "EXPECTED_BRANCH: dev",
+        "EXPECTED_STATUS: completed",
+        "github.event.workflow_run.repository.full_name",
+        "github.event.workflow_run.head_repository.full_name",
+        "github.event.workflow_run.workflow_id",
+        "github.event.workflow_run.run_attempt",
+        "actions/runs/$SOURCE_RUN_ID",
+        "actions/workflows/$EXPECTED_WORKFLOW_ID",
+        "expected_fields = (\"id\", \"run_attempt\", \"workflow_id\", \"name\", \"path\", \"event\", \"head_branch\", \"status\", \"conclusion\", \"head_sha\")",
+        "--connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536",
+        "len(raw) > 65536",
+        "needs: [authority]",
+        "if: ${{ needs.authority.result == 'success' }}",
+        "AUTHORITY_SOURCE_SHA",
+        "AUTHORITY_SOURCE_RUN_ID",
+        "AUTHORITY_SOURCE_RUN_ATTEMPT",
         "platform_security_status.py",
         "reconcile --event-file",
     )
     for marker in required_markers:
         if marker not in text:
             issues.append(f"status finalizer is missing required marker: {marker}")
+
+    authority = _workflow_job_block(text, "authority")
+    writer = _workflow_job_block(text, "finalize-status")
+    if not authority:
+        issues.append("status finalizer authority job is missing")
+    if not writer:
+        issues.append("status finalizer writer job is missing")
+    read_permissions = "permissions:\n      actions: read\n      contents: read"
+    if read_permissions not in authority:
+        issues.append("status finalizer authority must have only actions/contents read permissions")
+    if "statuses: write" in authority or "actions/checkout@" in authority or "always()" in authority:
+        issues.append("status finalizer authority must not write status, checkout, or bypass needs")
+    writer_permissions = "permissions:\n      actions: read\n      contents: read\n      statuses: write"
+    if writer_permissions not in writer:
+        issues.append("status finalizer writer must have actions/contents read and statuses write")
+    if "needs: [authority]" not in writer or "if: ${{ needs.authority.result == 'success' }}" not in writer:
+        issues.append("status finalizer writer must require successful authority")
+    if "always()" in text:
+        issues.append("status finalizer must not bypass failed authority with always()")
+
+    curl_commands: list[str] = []
+    lines = text.splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not re.match(r"^\s*curl\s", line):
+            index += 1
+            continue
+        command = line
+        while line.rstrip().endswith("\\") and index + 1 < len(lines):
+            index += 1
+            line = lines[index]
+            command += line
+        curl_commands.append(command)
+        index += 1
+    if len(curl_commands) != 3:
+        issues.append(f"status finalizer must have exactly three bounded authority GETs, got {len(curl_commands)}")
+    for command in curl_commands:
+        for flag in (
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--request GET",
+            "--connect-timeout 5",
+            "--max-time 15",
+            "--retry 0",
+            "--max-filesize 65536",
+        ):
+            if flag not in command:
+                issues.append(f"status finalizer curl is missing {flag}")
+    for forbidden in ("--retry-all-errors", "--retry 2", "--max-time 30"):
+        if forbidden in text:
+            issues.append(f"status finalizer has an unbounded or retrying curl marker: {forbidden}")
+
     forbidden_markers = (
         "actions/download-artifact",
         "actions/upload-artifact",
@@ -411,18 +481,6 @@ def status_finalizer_workflow_issues() -> list[str]:
     for marker in forbidden_markers:
         if marker in text:
             issues.append(f"status finalizer must not use source/artifact execution marker: {marker}")
-    permissions = re.search(
-        r"^    permissions:\n(?P<body>(?:^      [^\n]+\n?)*)",
-        text,
-        re.MULTILINE,
-    )
-    if permissions is None:
-        issues.append("status finalizer must scope API permissions on finalize-status")
-    else:
-        body = permissions.group("body")
-        expected = "      actions: read\n      contents: read\n      statuses: write\n"
-        if body != expected:
-            issues.append("status finalizer permissions must be actions/contents read and statuses write")
     return issues
 
 
