@@ -669,6 +669,15 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                         return fake_offsite
                     return real_import_module(name)
 
+                real_rmtree = platform_backup_supervisor.shutil.rmtree
+
+                def cancelling_rmtree(
+                    path: str | os.PathLike[str], *args: object, **kwargs: object
+                ):
+                    if Path(path).name.startswith("oldsparky-offsite-"):
+                        raise cancellation()
+                    return real_rmtree(path, *args, **kwargs)
+
                 with (
                     mock.patch.object(
                         platform_backup_supervisor.importlib,
@@ -678,7 +687,7 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                     mock.patch.object(
                         platform_backup_supervisor.shutil,
                         "rmtree",
-                        side_effect=cancellation,
+                        side_effect=cancelling_rmtree,
                     ),
                 ):
                     with self.assertRaises(cancellation):
@@ -708,6 +717,8 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                     os.fstat(cipher_fd)
                 persisted = platform_backup_supervisor.read_latest_evidence(root)
                 self.assertEqual(persisted["recovery"]["cleanup_status"], "unproven")
+                self.assertIsNone(persisted["recovery"]["database_id"])
+                self.assertIsNone(persisted["recovery"]["operator_action"])
 
     def test_encrypt_uses_ephemeral_keyring_and_produces_mode_0600_ciphertext(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

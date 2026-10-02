@@ -260,14 +260,17 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "restore_verified": True,
             "age_hours": 0.25,
         }
-        with mock.patch.object(
-            maintenance.subprocess,
-            "run",
-            side_effect=(
-                subprocess.CompletedProcess([], 0, json.dumps(create_result), ""),
-                subprocess.CompletedProcess([], 0, json.dumps(check_result), ""),
-            ),
-        ) as run:
+        with (
+            mock.patch.object(sys, "executable", "/usr/bin/python3"),
+            mock.patch.object(
+                maintenance.subprocess,
+                "run",
+                side_effect=(
+                    subprocess.CompletedProcess([], 0, json.dumps(create_result), ""),
+                    subprocess.CompletedProcess([], 0, json.dumps(check_result), ""),
+                ),
+            ) as run,
+        ):
             result = maintenance.run_backup(
                 self.root / "runtime" / "platform",
                 keep=14,
