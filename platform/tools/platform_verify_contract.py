@@ -12,6 +12,8 @@ import shlex
 import sys
 from typing import Iterable
 
+import yaml
+
 try:
     from tools.platform_test_catalog import (
         BACKEND_CONTOURS,
@@ -95,6 +97,7 @@ CLASSIFIER_TOOL = PLATFORM_ROOT / "tools" / "platform_ci_classifier.py"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-deploy.yml"
 CANDIDATE_HOST_TOOLS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-host-tools-candidate.yml"
+LIVE_LAUNCH_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-live-launch.yml"
 
 DIRECT_CANONICAL_COMMANDS = (
     "platform_run_tests.sh",
@@ -437,6 +440,249 @@ def _workflow_job_needs(job_block: str) -> set[str]:
         if item.strip().startswith("-")
     )
     return dependencies
+
+
+def live_launch_workflow_issues(workflow_text: str | None = None) -> list[str]:
+    """Verify the live-launch authority boundary from parsed workflow data.
+
+    The live workflow is a privileged manual entry point.  Its authority job
+    must prove the runner context and current ``dev`` SHA before any checkout,
+    repository script, production environment or secret can be reached.
+    Keep this contract structural so a valid-YAML mutation cannot pass merely
+    because the expected words still occur elsewhere in the file.
+    """
+
+    if workflow_text is None:
+        try:
+            workflow_text = LIVE_LAUNCH_WORKFLOW.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            return [f"live-launch workflow is unreadable: {exc}"]
+    try:
+        document = yaml.safe_load(workflow_text)
+    except yaml.YAMLError as exc:
+        return [f"live-launch workflow is not valid YAML: {exc}"]
+    if not isinstance(document, dict):
+        return ["live-launch workflow root must be a mapping"]
+
+    issues: list[str] = []
+    trigger = document.get("on")
+    if trigger is None and True in document:
+        # PyYAML's YAML 1.1 loader treats the unquoted ``on`` key as boolean.
+        trigger = document[True]
+    if not isinstance(trigger, dict) or set(trigger) != {"workflow_dispatch"}:
+        issues.append("live-launch must have only the workflow_dispatch trigger")
+    if document.get("name") != "Platform live launch sanity":
+        issues.append("live-launch workflow name is not canonical")
+    if document.get("permissions") != {"contents": "read"}:
+        issues.append("live-launch top-level permissions must be contents: read")
+    concurrency = document.get("concurrency")
+    if not isinstance(concurrency, dict):
+        issues.append("live-launch must define top-level concurrency")
+    else:
+        if concurrency.get("group") != "platform-live-launch-${{ github.sha }}":
+            issues.append("live-launch concurrency must be keyed by github.sha")
+        if concurrency.get("cancel-in-progress") is not False:
+            issues.append("live-launch concurrency must not cancel an active SHA")
+
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return [*issues, "live-launch jobs must be a mapping"]
+
+    authority = jobs.get("authority")
+    if not isinstance(authority, dict):
+        issues.append("live-launch authority job is missing")
+        return issues
+    if "needs" in authority:
+        issues.append("live-launch authority must not depend on another job")
+    if "if" in authority:
+        issues.append("live-launch authority must not be conditionally bypassable")
+    if authority.get("permissions") != {"contents": "read"}:
+        issues.append("live-launch authority must have only contents: read")
+    if "environment" in authority:
+        issues.append("live-launch authority must not use a production environment")
+    authority_text = json.dumps(authority, sort_keys=True)
+    for marker, message in (
+        ("actions/checkout@", "checkout"),
+        ("platform/", "repository scripts"),
+        ("secrets.", "production secrets"),
+    ):
+        if marker in authority_text:
+            issues.append(f"live-launch authority must not reach {message}")
+    outputs = authority.get("outputs")
+    if not isinstance(outputs, dict) or outputs.get("trusted_sha") != "${{ steps.resolve-dev.outputs.trusted_sha }}":
+        issues.append("live-launch authority must expose only the resolved trusted SHA")
+    authority_steps = authority.get("steps")
+    if not isinstance(authority_steps, list) or len(authority_steps) < 2:
+        issues.append("live-launch authority must have context and API steps")
+        authority_steps = []
+    first_run = authority_steps[0].get("run", "") if isinstance(authority_steps[0], dict) else ""
+    context_markers = (
+        'test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"',
+        'test "$GITHUB_SERVER_URL" = "https://github.com"',
+        'test "$GITHUB_API_URL" = "https://api.github.com"',
+        'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"',
+        'test "$GITHUB_REF" = "refs/heads/dev"',
+        'test "$GITHUB_WORKFLOW" = "Platform live launch sanity"',
+        'GITHUB_WORKFLOW_REF',
+        'StrayForest/old_sparky/.github/workflows/platform-live-launch.yml@refs/heads/dev',
+        '[[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]',
+    )
+    for marker in context_markers:
+        if marker not in first_run:
+            issues.append(f"live-launch authority context check is missing: {marker}")
+    resolve = next(
+        (
+            step
+            for step in authority_steps
+            if isinstance(step, dict) and step.get("id") == "resolve-dev"
+        ),
+        None,
+    )
+    if not isinstance(resolve, dict):
+        issues.append("live-launch authority resolve-dev step is missing")
+        resolve_run = ""
+    else:
+        resolve_run = resolve.get("run", "")
+        resolve_env = resolve.get("env")
+        if not isinstance(resolve_env, dict) or resolve_env.get("GITHUB_TOKEN") != "${{ github.token }}":
+            issues.append("live-launch API step must receive only github.token")
+    for marker, message in (
+        ("--connect-timeout 5", "connect timeout"),
+        ("--max-time 10", "absolute timeout"),
+        ("--retry 0", "retry policy"),
+        ('-H "Authorization: Bearer $GITHUB_TOKEN"', "authentication"),
+        ('"https://api.github.com/repos/StrayForest/old_sparky/git/ref/heads/dev"', "dev ref URL"),
+        ('json.loads(response_path.read_text(encoding="utf-8"))', "JSON parser"),
+        ('payload.get("ref") != "refs/heads/dev"', "exact ref parser"),
+        ('obj.get("type") != "commit"', "commit object parser"),
+        ('re.fullmatch(r"[0-9a-f]{40}", current_sha)', "current SHA parser"),
+        ("current_sha != target_sha", "current SHA equality"),
+        ("printf 'trusted_sha=%s\\n' \"$target_sha\"", "trusted SHA output"),
+    ):
+        if marker not in resolve_run:
+            issues.append(f"live-launch authority is missing {message}")
+    curl_lines = resolve_run.splitlines()
+    curl_commands: list[str] = []
+    for index, line in enumerate(curl_lines):
+        if line.strip() != "curl \\":
+            continue
+        command_lines = [line]
+        cursor = index
+        while command_lines[-1].rstrip().endswith("\\") and cursor + 1 < len(curl_lines):
+            cursor += 1
+            command_lines.append(curl_lines[cursor])
+        curl_commands.append("\n".join(command_lines))
+    if len(curl_commands) != 1:
+        issues.append("live-launch authority must contain exactly one bounded API curl")
+    else:
+        curl_command = curl_commands[0]
+        max_filesize_values = re.findall(r"--max-filesize\s+([^\s\\]+)", curl_command)
+        if max_filesize_values != ["65536"]:
+            issues.append("live-launch API curl must have exactly one --max-filesize 65536")
+        dev_ref_url = '"https://api.github.com/repos/StrayForest/old_sparky/git/ref/heads/dev"'
+        if (
+            "--max-filesize 65536" in curl_command
+            and dev_ref_url in curl_command
+            and curl_command.index("--max-filesize 65536") > curl_command.index(dev_ref_url)
+        ):
+            issues.append("live-launch API curl max-filesize must precede its URL")
+    if 'target_sha="$GITHUB_SHA"' not in resolve_run:
+        issues.append("live-launch authority must resolve the workflow SHA")
+    if "|| true" in resolve_run:
+        issues.append("live-launch authority must not ignore API failures")
+
+    def _needs(job: object) -> set[str]:
+        if not isinstance(job, dict):
+            return set()
+        value = job.get("needs")
+        if isinstance(value, str):
+            return {value}
+        if isinstance(value, list):
+            return {item for item in value if isinstance(item, str)}
+        return set()
+
+    def _job_text(job: object) -> str:
+        return json.dumps(job, sort_keys=True) if isinstance(job, dict) else ""
+
+    def _steps(job: object) -> list[dict[str, object]]:
+        if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+            return []
+        return [step for step in job["steps"] if isinstance(step, dict)]
+
+    validate = jobs.get("validate-live-inputs")
+    if not isinstance(validate, dict):
+        issues.append("live-launch validate-live-inputs job is missing")
+    else:
+        if _needs(validate) != {"authority"}:
+            issues.append("live-launch validation must depend only on authority")
+        if validate.get("if") != "${{ needs.authority.result == 'success' }}":
+            issues.append("live-launch validation must require successful authority")
+        validate_env = validate.get("env")
+        if not isinstance(validate_env, dict) or validate_env.get("TARGET_SHA") != "${{ needs.authority.outputs.trusted_sha }}":
+            issues.append("live-launch validation must consume authority trusted_sha")
+        validate_steps = _steps(validate)
+        checkouts = [step for step in validate_steps if str(step.get("uses", "")).startswith("actions/checkout@")]
+        if not checkouts:
+            issues.append("live-launch validation must checkout the immutable target")
+        else:
+            checkout = checkouts[0]
+            if checkout.get("with", {}).get("ref") != "${{ env.TARGET_SHA }}":
+                issues.append("live-launch checkout must use the authority target SHA")
+            if checkout.get("with", {}).get("persist-credentials") is not False:
+                issues.append("live-launch checkout must disable persistent credentials")
+            checkout_index = validate_steps.index(checkout)
+            if not any(
+                "git rev-parse HEAD" in str(step.get("run", ""))
+                for step in validate_steps[checkout_index + 1 :]
+            ):
+                issues.append("live-launch checkout must verify its exact target SHA")
+        if "github.sha" in _job_text(validate):
+            issues.append("live-launch validation must not fall back to github.sha")
+
+    live = jobs.get("live-sanity")
+    if not isinstance(live, dict):
+        issues.append("live-launch live-sanity job is missing")
+    else:
+        if _needs(live) != {"authority", "validate-live-inputs"}:
+            issues.append("live-sanity must depend on authority and validation")
+        live_if = str(live.get("if", ""))
+        if "needs.authority.result == 'success'" not in live_if or "needs.validate-live-inputs.result == 'success'" not in live_if:
+            issues.append("live-sanity must require successful authority and validation")
+        live_env = live.get("env")
+        if not isinstance(live_env, dict) or live_env.get("TARGET_SHA") != "${{ needs.authority.outputs.trusted_sha }}":
+            issues.append("live-sanity must consume authority trusted_sha")
+        if live.get("environment") != "production":
+            issues.append("live-sanity must own the production environment")
+
+    sanitize = jobs.get("sanitize-live-report")
+    if not isinstance(sanitize, dict):
+        issues.append("live-launch sanitize-live-report job is missing")
+    else:
+        if _needs(sanitize) != {"authority", "live-sanity"}:
+            issues.append("live-launch sanitizer must depend on authority and live-sanity")
+        sanitize_if = str(sanitize.get("if", ""))
+        if "always()" not in sanitize_if or "needs.authority.result == 'success'" not in sanitize_if:
+            issues.append("live-launch sanitizer must retain its barrier but require authority")
+        sanitize_env = sanitize.get("env")
+        if not isinstance(sanitize_env, dict) or sanitize_env.get("TARGET_SHA") != "${{ needs.authority.outputs.trusted_sha }}":
+            issues.append("live-launch sanitizer must consume authority trusted_sha")
+        sanitizer_steps_text = "\n".join(
+            str(step.get("run", "")) for step in _steps(sanitize)
+        )
+        if '"$TARGET_SHA" <<\'PY\'' not in sanitizer_steps_text or 'report.get("target_sha") != target_sha' not in sanitizer_steps_text:
+            issues.append("live-launch sanitizer must verify the authority target SHA in its report")
+
+    for job_name, job in jobs.items():
+        if job_name == "authority":
+            continue
+        if not isinstance(job, dict):
+            issues.append(f"live-launch job {job_name} is not a mapping")
+            continue
+        if "authority" not in _needs(job):
+            issues.append(f"live-launch downstream job {job_name} bypasses authority")
+        if "always()" in str(job.get("if", "")) and "needs.authority.result == 'success'" not in str(job.get("if", "")):
+            issues.append(f"live-launch downstream job {job_name} has an authority-bypassing always()")
+    return issues
 
 
 def _production_job_secret_names(job_block: str) -> set[str]:
@@ -1667,6 +1913,7 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
 def collect_issues() -> list[str]:
     issues: list[str] = []
 
+    issues.extend(live_launch_workflow_issues())
     issues.extend(f"action pin: {issue}" for issue in action_pin_issues())
     issues.extend(workflow_level_permission_issues())
     for workflow_path, workflow_text in _workflow_texts():

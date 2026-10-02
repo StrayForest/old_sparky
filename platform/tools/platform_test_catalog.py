@@ -452,12 +452,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 158,
     "module_digest": "a77d2cff5b4122f04ba7932d758aac60cd98e15405d3d09e4cb45da7c1207310",
-    "test_count": 1486,
-    "test_id_digest": "c167eaf9c4d1544fa7278b30a297e037201d5fb8b58e1814536d0a16de63a3d1",
+    "test_count": 1487,
+    "test_id_digest": "28adb0f7bced1ae5c253febd06e88055d74dc2d3591f1267dc2d07dc5a68e9f2",
     "backend_test_count": 1442,
     "backend_test_id_digest": "608d8846e25b86a26b8c478d888788aedddd11226e63c465be471a4e5ebbe216",
-    "verification_test_count": 44,
-    "verification_test_id_digest": "d8873be495648857a31f012be4e6b1b1438b091214bc6fb046fa620f34debd32",
+    "verification_test_count": 45,
+    "verification_test_id_digest": "46df4f1de9e58a61c10ef524a4e5117c4eb35f2425e4f07d151ebfcf48e1b986",
     "verification_classifier_test_count": 23,
     "verification_classifier_test_id_digest": "9273fe85861db634d66f43be86290e9bc01540f43ad5a3dd357d845314b0227a",
 }
@@ -508,8 +508,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     VERIFICATION_CONTOUR: {
         "module_count": 2,
         "module_digest": "b2a31b179b655a3aafcfd5c2ebc5dd0f09645024663d5985815355c2a2b984ee",
-        "test_count": 44,
-        "test_id_digest": "d8873be495648857a31f012be4e6b1b1438b091214bc6fb046fa620f34debd32",
+        "test_count": 45,
+        "test_id_digest": "46df4f1de9e58a61c10ef524a4e5117c4eb35f2425e4f07d151ebfcf48e1b986",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])

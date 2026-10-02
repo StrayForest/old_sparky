@@ -21,10 +21,97 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: platform-live-launch-${{ github.sha }}
+  cancel-in-progress: false
+
 jobs:
+  authority:
+    name: Authorize live-launch target
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      trusted_sha: ${{ steps.resolve-dev.outputs.trusted_sha }}
+    steps:
+      - name: Reject non-canonical live-launch context
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky" \
+            || { echo "Live launch requires the canonical repository." >&2; exit 1; }
+          test "$GITHUB_SERVER_URL" = "https://github.com" \
+            || { echo "Live launch requires the canonical GitHub server." >&2; exit 1; }
+          test "$GITHUB_API_URL" = "https://api.github.com" \
+            || { echo "Live launch requires the canonical GitHub API." >&2; exit 1; }
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch" \
+            || { echo "Live launch accepts workflow_dispatch only." >&2; exit 1; }
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Live launch must run from the reviewed dev ref." >&2; exit 1; }
+          test "$GITHUB_WORKFLOW" = "Platform live launch sanity" \
+            || { echo "Live launch workflow identity is invalid." >&2; exit 1; }
+          test "$GITHUB_WORKFLOW_REF" = \
+            "StrayForest/old_sparky/.github/workflows/platform-live-launch.yml@refs/heads/dev" \
+            || { echo "Live launch workflow path/ref identity is invalid." >&2; exit 1; }
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "Live launch requires an exact lowercase target SHA." >&2; exit 1; }
+      - name: Resolve and authorize current dev target
+        id: resolve-dev
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target_sha="$GITHUB_SHA"
+          ref_response="$RUNNER_TEMP/live-launch-dev-ref.json"
+          trap 'rm -f -- "$ref_response"' EXIT
+          umask 077
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --connect-timeout 5 \
+            --max-time 10 \
+            --retry 0 \
+            --max-filesize 65536 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --output "$ref_response" \
+            "https://api.github.com/repos/StrayForest/old_sparky/git/ref/heads/dev"
+          test "$(wc -c < "$ref_response")" -le 65536
+          /usr/bin/python3 - "$ref_response" "$target_sha" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          response_path = Path(sys.argv[1])
+          target_sha = sys.argv[2]
+          try:
+              payload = json.loads(response_path.read_text(encoding="utf-8"))
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+              raise SystemExit("current dev ref response is not valid JSON") from exc
+          if not isinstance(payload, dict) or payload.get("ref") != "refs/heads/dev":
+              raise SystemExit("current dev ref response has an invalid ref")
+          obj = payload.get("object")
+          if not isinstance(obj, dict) or obj.get("type") != "commit":
+              raise SystemExit("current dev ref response is not a commit")
+          current_sha = obj.get("sha")
+          if (
+              not isinstance(current_sha, str)
+              or re.fullmatch(r"[0-9a-f]{40}", current_sha) is None
+              or current_sha != target_sha
+          ):
+              raise SystemExit("current dev ref does not match the workflow target")
+          PY
+          printf 'trusted_sha=%s\n' "$target_sha" >> "$GITHUB_OUTPUT"
+
   validate-live-inputs:
     name: Validate live-launch handoff
-    if: ${{ always() }}
+    needs: authority
+    if: ${{ needs.authority.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -33,14 +120,13 @@ jobs:
       LIVE_BASE_URL: ${{ inputs.base_url }}
       LIVE_PROVISION: ${{ inputs.provision }}
       LIVE_MARKER: ${{ inputs.marker }}
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ needs.authority.outputs.trusted_sha }}
     steps:
       - name: Reject invalid live-launch dispatch before mode branch
         shell: bash
         run: |
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = workflow_dispatch || { echo "Live launch accepts workflow_dispatch only." >&2; exit 1; }
-          test "$GITHUB_REF" = "refs/heads/dev" || { echo "Live launch must run from the reviewed dev ref." >&2; exit 1; }
           test "$LIVE_BASE_URL" = "https://old-sparky.com" || { echo "Live launch requires the canonical origin." >&2; exit 1; }
           case "$LIVE_PROVISION" in true|false) ;; *) echo "Live provision mode is invalid." >&2; exit 1 ;; esac
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Live launch requires an exact target SHA." >&2; exit 1; }
@@ -79,7 +165,10 @@ jobs:
         run: rm -f -- "$RUNNER_TEMP/live-launch-input.json"
 
   live-sanity:
-    needs: validate-live-inputs
+    needs:
+      - authority
+      - validate-live-inputs
+    if: ${{ needs.authority.result == 'success' && needs.validate-live-inputs.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production
@@ -87,7 +176,7 @@ jobs:
       LIVE_BASE_URL: ${{ inputs.base_url }}
       LIVE_PROVISION: ${{ inputs.provision }}
       LIVE_MARKER: ${{ inputs.marker }}
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ needs.authority.outputs.trusted_sha }}
     steps:
       - name: Download validated live-launch handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -310,6 +399,7 @@ jobs:
               errors = {"other": 1}
           report = {
               "schema": 1,
+              "target_sha": target_sha,
               "status": status,
               "success": success,
               "process_exit_code": process_status if 0 <= process_status <= 255 else 1,
@@ -344,12 +434,16 @@ jobs:
 
   sanitize-live-report:
     name: Sanitize live-launch report
-    needs: live-sanity
-    if: ${{ always() }}
+    needs:
+      - authority
+      - live-sanity
+    if: ${{ always() && needs.authority.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
+    env:
+      TARGET_SHA: ${{ needs.authority.outputs.trusted_sha }}
     steps:
       - name: Download sanitized live-launch report
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -363,11 +457,15 @@ jobs:
           install -m 600 \
             "$RUNNER_TEMP/live-launch-sanitized/live-launch-sanitized.json" \
             "$RUNNER_TEMP/live-launch-report.json"
-          /usr/bin/python3 - "$RUNNER_TEMP/live-launch-report.json" <<'PY'
+          /usr/bin/python3 - "$RUNNER_TEMP/live-launch-report.json" "$TARGET_SHA" <<'PY'
           import json
           from pathlib import Path
+          import re
           import sys
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          target_sha = sys.argv[2]
+          if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None or report.get("target_sha") != target_sha:
+              raise SystemExit("live-launch report target SHA mismatch")
           if report.get("truncated") is not False or report.get("status") in {"truncated", "error", "unavailable"}:
               raise SystemExit("required live-launch report is incomplete")
           if report.get("process_exit_code") != 0:
