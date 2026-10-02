@@ -313,6 +313,12 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             with self.assertRaises(supervisor.BackupCleanupUnproven):
                 supervisor._read_monitor_status(bytearray(payload), overflow)
         from tools import platform_backup_process_monitor as monitor
+        valid = b'{"schema":1,"status":"timeout","returncode":124}\n'
+        with mock.patch.object(monitor.os, "read", return_value=valid), mock.patch.object(monitor.os, "write", side_effect=[1, InterruptedError(4, "interrupted"), BlockingIOError(11, "try again"), len(valid) - 1]):
+            self.assertTrue(monitor._forward_status(1, 2, time.monotonic_ns() + 1_000_000_000))
+        with mock.patch.object(monitor.os, "read", side_effect=(valid + b"\n", valid + valid, valid[:-1], b"x" * (monitor.STATUS_LIMIT + 1), b"")):
+            for _ in range(5):
+                self.assertFalse(monitor._forward_status(1, 2, time.monotonic_ns() + 1_000_000_000))
         self.assertEqual(
             monitor._parse(
                 [

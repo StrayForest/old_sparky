@@ -94,14 +94,25 @@ def _cancelled(fd: int) -> bool:
     except ValueError:
         return True
 
-
-def _forward_status(source: int, destination: int) -> bool:
+def _forward_status(source: int, destination: int, deadline: int) -> bool:
     try:
         payload = os.read(source, STATUS_LIMIT + 1)
-        if not payload or len(payload) > STATUS_LIMIT or not payload.endswith(b"\n"):
+        if (not payload or len(payload) > STATUS_LIMIT or payload.count(b"\n") != 1
+                or not payload.endswith(b"\n")):
             return False
-        os.write(destination, payload)
-        return True
+        written = 0
+        for _ in range(8):
+            if written == len(payload) or time.monotonic_ns() >= deadline:
+                break
+            try:
+                written += os.write(destination, payload[written:])
+            except OSError as exc:
+                if exc.errno in (errno.EINTR, errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                return False
+            if written <= 0:
+                return False
+        return written == len(payload)
     except OSError:
         return False
 
@@ -193,7 +204,10 @@ def _monitor(
             except InterruptedError:
                 continue
             if result == child:
-                forwarded = _forward_status(status_read, status_fd)
+                forwarded = _forward_status(status_read, status_fd, cleanup_deadline)
+                if not forwarded and time.monotonic_ns() >= work_deadline:
+                    _emit(status_fd, "timeout", 124)
+                    return 0
                 return 0 if forwarded and os.WIFEXITED(child_status) and os.WEXITSTATUS(child_status) == 0 else MONITOR_ERROR_EXIT
             now = time.monotonic_ns()
             if not cancelled and now >= work_deadline:
@@ -224,7 +238,7 @@ def _monitor(
                     os.waitpid(child, 0)
                 except ChildProcessError:
                     pass
-                if not _forward_status(status_read, status_fd):
+                if not _forward_status(status_read, status_fd, cleanup_deadline):
                     _emit(status_fd, "timeout", 124)
                 return 0
     except BaseException:
