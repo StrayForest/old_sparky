@@ -69,6 +69,36 @@ def _pass_truth_table(state: dict[str, object]) -> bool:
     )
 
 
+def _ssh_file_commands(body: str, executable: str) -> list[str]:
+    """Extract each ``ssh/scp -F`` invocation without merging ``&&`` calls."""
+
+    lines = body.splitlines()
+    commands: list[str] = []
+    marker = f"{executable} -F "
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#") or marker not in stripped:
+            continue
+        command = stripped[stripped.index(marker) :]
+        next_index = index
+        while command.endswith("\\") and next_index + 1 < len(lines):
+            next_line = lines[next_index + 1].strip()
+            if marker in next_line and not next_line.startswith(("'", '"')):
+                break
+            command = f"{command[:-1].rstrip()} {next_line}"
+            next_index += 1
+        commands.append(command)
+    return commands
+
+
+def _scp_commands(body: str) -> list[str]:
+    return _ssh_file_commands(body, "scp")
+
+
+def _ssh_commands(body: str) -> list[str]:
+    return _ssh_file_commands(body, "ssh")
+
+
 class ExternalLoadWorkflowContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -227,6 +257,80 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertIn(artifact, self.source)
         self.assertIn("test -n \"$artifact_id\" && test -n \"$artifact_digest\"", self.source)
         self.assertIn("if-no-files-found: error", self.source)
+
+    def test_trusted_fixture_transfers_have_exact_liveness_bounds_and_barriers(self) -> None:
+        expected_options = (
+            "-o ConnectTimeout=10",
+            "-o ServerAliveInterval=15",
+            "-o ServerAliveCountMax=3",
+        )
+
+        def assert_transfer_policy(source: str) -> None:
+            jobs = _jobs(source)
+            for job_name, expected_counts in (
+                ("fixture-setup", {"ssh": 2, "scp": 2}),
+                ("fixture-finalize", {"ssh": 6, "scp": 3}),
+            ):
+                commands_by_type = {
+                    "ssh": _ssh_commands(jobs[job_name]),
+                    "scp": _scp_commands(jobs[job_name]),
+                }
+                for executable, commands in commands_by_type.items():
+                    self.assertEqual(expected_counts[executable], len(commands), job_name)
+                    for command in commands:
+                        remote_index = command.index('"$PROD_SSH_USER@$PROD_SSH_HOST')
+                        positions = []
+                        for option in expected_options:
+                            self.assertEqual(1, command.count(option), command)
+                            position = command.index(option)
+                            self.assertLess(position, remote_index, command)
+                            positions.append(position)
+                        self.assertEqual(sorted(positions), positions, command)
+
+            setup = jobs["fixture-setup"]
+            ready_marker = '$export_dir/ready" "$artifact_dir/ready"'
+            manifest_marker = '$export_dir/manifest.json" "$manifest_path"'
+            self.assertIn(ready_marker, setup)
+            self.assertIn(manifest_marker, setup)
+            ready_position = setup.index(ready_marker)
+            manifest_position = setup.index(manifest_marker)
+            self.assertLess(ready_position, manifest_position)
+            self.assertIn("&& scp -F", setup[ready_position:manifest_position])
+
+            finalize = jobs["fixture-finalize"].split(
+                "- name: Signal fixture completion and collect origin evidence", 1
+            )[1].split("- name: Exact cleanup of external fixture", 1)[0]
+            summary_position = finalize.index("$export_dir/matrix-summary.json")
+            exit_position = finalize.index("$export_dir/supervisor.exit")
+            self.assertLess(summary_position, exit_position)
+            self.assertIn("&& bounded_download", finalize[summary_position:exit_position])
+
+        assert_transfer_policy(self.source)
+        for label, mutated in (
+            (
+                "changed connect timeout",
+                self.source.replace("-o ConnectTimeout=10", "-o ConnectTimeout=11", 1),
+            ),
+            (
+                "removed keepalive interval",
+                self.source.replace("-o ServerAliveInterval=15 ", "", 1),
+            ),
+            (
+                "changed keepalive count",
+                self.source.replace("-o ServerAliveCountMax=3", "-o ServerAliveCountMax=2", 1),
+            ),
+            (
+                "reordered setup barriers",
+                self.source.replace(
+                    '"$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/ready" "$artifact_dir/ready"',
+                    '"$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path"',
+                    1,
+                ),
+            ),
+        ):
+            with self.subTest(mutation=label):
+                with self.assertRaises(AssertionError):
+                    assert_transfer_policy(mutated)
 
     def test_evaluator_cannot_hide_upstream_failure_or_publish_success(self) -> None:
         evaluator = self.jobs["evaluate-load"]
