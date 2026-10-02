@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
+from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
 from sqlalchemy import delete, select
 
+from apps.platform_api.app.api.routes import profiles
 from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
@@ -94,20 +96,41 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(me.status_code, 200, me.text)
         user_id = me.json()["id"]
 
-        async with session_factory()() as blocker:
-            await blocker.execute(
-                select(User.id).where(User.id == user_id).with_for_update()
-            )
-            task = asyncio.create_task(request())
-            await asyncio.sleep(0.15)
-            was_blocked = not task.done()
-            await blocker.rollback()
+        lock_attempted = asyncio.Event()
+        lock_acquired = asyncio.Event()
+        original_lock = profiles.lock_profile_owner
 
-        response = await task
-        self.assertTrue(
-            was_blocked,
-            "replace-all dream-slot writes must wait on the shared User row lock",
-        )
+        async def observe_lock(db_session, locked_user_id):
+            lock_attempted.set()
+            result = await original_lock(db_session, locked_user_id)
+            lock_acquired.set()
+            return result
+
+        task: asyncio.Task[httpx.Response] | None = None
+        try:
+            async with session_factory()() as blocker:
+                await blocker.execute(
+                    select(User.id).where(User.id == user_id).with_for_update()
+                )
+                try:
+                    with patch.object(
+                        profiles, "lock_profile_owner", side_effect=observe_lock
+                    ):
+                        task = asyncio.create_task(request())
+                        await asyncio.wait_for(lock_attempted.wait(), timeout=5)
+                        self.assertFalse(lock_acquired.is_set())
+                        self.assertFalse(task.done())
+                        await asyncio.wait_for(blocker.rollback(), timeout=5)
+                        response = await asyncio.wait_for(task, timeout=5)
+                        self.assertTrue(lock_acquired.is_set())
+                finally:
+                    if blocker.in_transaction():
+                        await asyncio.wait_for(blocker.rollback(), timeout=5)
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
         return response
 
     async def test_workspace_returns_deadlock_priority_and_complete_dream_slots(self) -> None:
