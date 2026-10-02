@@ -99,6 +99,9 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         self.assertLess(lock_check, npm_install)
         audit = jobs["build-release"].index("/usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit")
         self.assertLess(audit, npm_install)
+        self.assertIn("for entry in platform/apps/platform_draft/node_modules/*; do", jobs["build-release"])
+        self.assertNotIn("node_modules/.", jobs["build-release"])
+        self.assertNotIn("dotglob", jobs["build-release"])
         self.assertEqual(
             source.count("/usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit"),
             2,

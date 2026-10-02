@@ -58,7 +58,9 @@ npm status, or high/critical finding fails closed. The subsequent hash-locked `n
 intentional: it avoids a second uncontrolled audit while the dedicated gate
 owns the report. The release job also verifies the generated Wrangler runtime
 manifest and lock digests before the credential-bearing publish job consumes
-the artifact. This contour has no Cloudflare credentials in `verify-pr` or
+the artifact. Its reviewed runtime inventory is the exact 1,648-file result of
+the workflow's literal `node_modules/*` shell copy; hidden npm metadata is not
+part of the artifact. This contour has no Cloudflare credentials in `verify-pr` or
 `build-release` and is not substituted by the general `web-quality` gate.
 
 The first eight gates are deterministic and always part of the normal CI
