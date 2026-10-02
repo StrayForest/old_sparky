@@ -690,7 +690,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 self.assertIn("--max-time 15", body)
                 self.assertIn("--retry 0", body)
                 self.assertIn("--max-filesize 65536", body)
-                self.assertIn(f'mktemp "$RUNNER_TEMP/', body)
+                self.assertIn('mktemp "$RUNNER_TEMP/', body)
                 self.assertIn(f'trap \'rm -f -- "${response}"\' EXIT', body)
                 self.assertIn(f'--output "${response}"', body)
                 self.assertIn(f'wc -c < "${response}"', body)
