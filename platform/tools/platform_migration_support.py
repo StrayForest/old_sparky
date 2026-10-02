@@ -20,7 +20,7 @@ import selectors
 import signal
 import subprocess
 import time
-from typing import Sequence
+from typing import Mapping, Sequence
 from urllib.parse import urlsplit
 
 
