@@ -1244,7 +1244,8 @@ def main() -> int:
         if args.as_json:
             print(json.dumps(supervisor.safe_error_payload(exc), ensure_ascii=False, indent=2))
         else:
-            print(f"[FAIL] {exc}", file=sys.stderr)
+            payload = supervisor.safe_error_payload(exc)
+            print(f"[FAIL] Platform backup restore ({payload['error_class']})", file=sys.stderr)
         return 1
 
 

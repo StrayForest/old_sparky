@@ -2594,12 +2594,15 @@ def safe_error_payload(exc: BaseException) -> dict[str, Any]:
 
     status, error_class = _operation_error_status(exc)
     payload: dict[str, Any] = {"ok": False, "status": status, "error_class": error_class}
-    if (
-        isinstance(exc, BackupCleanupUnproven)
-        and isinstance(exc.database_id, str)
-        and RESTORE_DRILL_DATABASE_ID_RE.fullmatch(exc.database_id)
-    ):
-        payload.update(database_id=exc.database_id, operator_action=CLEANUP_OPERATOR_ACTION)
+    cleanup_id = (
+        exc.database_id
+        if isinstance(exc, BackupCleanupUnproven)
+        else getattr(exc, "backup_cleanup_unproven", None)
+    )
+    if isinstance(exc, BackupCleanupUnproven) or cleanup_id is not None:
+        payload["cleanup_status"] = "unproven"
+        if isinstance(cleanup_id, str) and RESTORE_DRILL_DATABASE_ID_RE.fullmatch(cleanup_id):
+            payload.update(database_id=cleanup_id, operator_action=CLEANUP_OPERATOR_ACTION)
     return payload
 
 

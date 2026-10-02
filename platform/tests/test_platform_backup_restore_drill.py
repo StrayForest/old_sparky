@@ -6,6 +6,7 @@ from contextlib import ExitStack, contextmanager
 import datetime as dt
 import hashlib
 import importlib.util
+from io import StringIO
 import json
 import os
 import pathlib
@@ -275,25 +276,55 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             check_latest=True, dump_only=False, verify_dump=None, output_dir="/tmp",
             max_age_hours=24.0, as_json=True,
         )
+        human_args = argparse.Namespace(**{**vars(args), "as_json": False})
         valid_id = "platform_restore_drill_" + "a" * 32
+        primary_valid = RuntimeError("primary-secret")
+        primary_valid.backup_cleanup_unproven = valid_id
+        primary_invalid = RuntimeError("primary-secret")
+        primary_invalid.backup_cleanup_unproven = "arbitrary-secret"
         failures = (
-            (platform_backup_supervisor.BackupCleanupUnproven(database_id=valid_id), valid_id),
-            (platform_backup_supervisor.BackupCleanupUnproven(database_id="secret-id"), None),
-            (RuntimeError("stderr=password https://user:secret@example.invalid/db"), None),
+            (platform_backup_supervisor.BackupCleanupUnproven(database_id=valid_id), "backup_cleanup_unproven", valid_id, "unproven"),
+            (platform_backup_supervisor.BackupCleanupUnproven(database_id="secret-id"), "backup_cleanup_unproven", None, "unproven"),
+            (primary_valid, "operation_failed", valid_id, "unproven"),
+            (primary_invalid, "operation_failed", None, "unproven"),
+            (RuntimeError("stderr=password https://user:secret@example.invalid/db"), "operation_failed", None, None),
         )
-        for failure, expected_id in failures:
+        for failure, expected_class, expected_id, expected_cleanup in failures:
+            expected_action = platform_backup_supervisor.CLEANUP_OPERATOR_ACTION if expected_id else None
+            expected = platform_backup_supervisor.safe_error_payload(failure)
+            self.assertEqual(expected["error_class"], expected_class)
+            self.assertEqual(expected.get("cleanup_status"), expected_cleanup)
             with mock.patch.object(backup_drill, "parse_args", return_value=args), mock.patch.object(
                 backup_drill, "check_latest_backup", side_effect=failure
             ), mock.patch("builtins.print") as printed:
                 self.assertEqual(backup_drill.main(), 1)
             raw = printed.call_args.args[0]
             payload = json.loads(raw)
-            self.assertNotRegex(raw, r"password|secret|postgres://")
+            self.assertEqual(payload, expected)
+            self.assertNotRegex(raw, r"password|secret|postgres://|arbitrary-secret")
             self.assertEqual(payload.get("database_id"), expected_id)
             self.assertEqual(
                 payload.get("operator_action"),
-                platform_backup_supervisor.CLEANUP_OPERATOR_ACTION if expected_id else None,
+                expected_action,
             )
+            with mock.patch.object(backup_drill, "parse_args", return_value=human_args), mock.patch.object(
+                backup_drill, "check_latest_backup", side_effect=failure
+            ), mock.patch("sys.stderr", new_callable=StringIO) as stderr:
+                self.assertEqual(backup_drill.main(), 1)
+            self.assertIn(expected_class, stderr.getvalue())
+            self.assertNotRegex(stderr.getvalue(), r"password|secret|postgres://|arbitrary-secret")
+            with mock.patch.object(platform_backup_supervisor, "run_backup_entrypoint", side_effect=failure), mock.patch(
+                "builtins.print"
+            ) as printed:
+                self.assertEqual(platform_backup_supervisor.main(["backup", "--json"]), 1)
+            supervisor_payload = json.loads(printed.call_args.args[0])
+            self.assertEqual(supervisor_payload, expected)
+            with mock.patch.object(platform_backup_supervisor, "run_backup_entrypoint", side_effect=failure), mock.patch(
+                "sys.stderr", new_callable=StringIO
+            ) as stderr:
+                self.assertEqual(platform_backup_supervisor.main(["backup"]), 1)
+            self.assertIn(expected_class, stderr.getvalue())
+            self.assertNotRegex(stderr.getvalue(), r"password|secret|postgres://|arbitrary-secret")
 
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -371,7 +402,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 1)
-            self.assertIn("not restore-verified", result.stderr)
+            self.assertIn("[FAIL] Platform backup restore (operation_failed)", result.stderr)
 
     def test_prune_unverified_backups_keeps_verified_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
