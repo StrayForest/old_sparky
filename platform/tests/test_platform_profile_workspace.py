@@ -7,10 +7,12 @@ from uuid import uuid4
 
 import httpx
 from sqlalchemy import delete, select
+from sqlalchemy.sql import operators
+from sqlalchemy.sql.visitors import iterate
 
-from apps.platform_api.app.api.routes import profile_workspace as profile_workspace_routes
 from apps.platform_api.app.api.routes import profiles
 from apps.platform_api.app.main import create_app
+from apps.platform_api.app.services import profile_workspace as profile_workspace_service
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
@@ -88,12 +90,37 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 201, response.text)
         return client
 
+    @staticmethod
+    def _is_user_owner_lock_statement(statement, user_id: str) -> bool:
+        if getattr(statement, "_for_update_arg", None) is None:
+            return False
+        if not any(
+            description.get("entity") is User and description.get("expr") is User
+            for description in getattr(statement, "column_descriptions", ())
+        ):
+            return False
+        whereclause = getattr(statement, "whereclause", None)
+        if whereclause is None:
+            return False
+        for criterion in iterate(whereclause):
+            if getattr(criterion, "operator", None) is not operators.eq:
+                continue
+            for column, value in (
+                (getattr(criterion, "left", None), getattr(criterion, "right", None)),
+                (getattr(criterion, "right", None), getattr(criterion, "left", None)),
+            ):
+                if not hasattr(column, "compare") or not column.compare(User.id):
+                    continue
+                if getattr(value, "value", object()) == user_id:
+                    return True
+        return False
+
     async def _assert_user_lock_serializes_slot_write(
         self,
         owner: httpx.AsyncClient,
         request,
         *,
-        patch_target=(profiles, "lock_profile_owner"),
+        observe_scalar_lock=False,
     ) -> httpx.Response:
         me = await owner.get("/api/v1/users/me")
         self.assertEqual(me.status_code, 200, me.text)
@@ -101,14 +128,56 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
 
         lock_attempted = asyncio.Event()
         lock_acquired = asyncio.Event()
-        target_module, target_name = patch_target
-        original_lock = getattr(target_module, target_name)
+        if observe_scalar_lock:
+            self.assertTrue(
+                self._is_user_owner_lock_statement(
+                    select(User).where(User.id == user_id).with_for_update(),
+                    user_id,
+                )
+            )
+            self.assertFalse(
+                self._is_user_owner_lock_statement(
+                    select(User).where(User.id == user_id),
+                    user_id,
+                )
+            )
+            self.assertFalse(
+                self._is_user_owner_lock_statement(
+                    select(User).where(User.email == user_id).with_for_update(),
+                    user_id,
+                )
+            )
+            original_scalar = profile_workspace_service.AsyncSession.scalar
 
-        async def observe_lock(*args, **kwargs):
-            lock_attempted.set()
-            result = await original_lock(*args, **kwargs)
-            lock_acquired.set()
-            return result
+            async def observe_scalar(db_session, statement, *args, **kwargs):
+                if self._is_user_owner_lock_statement(statement, user_id):
+                    lock_attempted.set()
+                    result = await original_scalar(
+                        db_session, statement, *args, **kwargs
+                    )
+                    lock_acquired.set()
+                    return result
+                return await original_scalar(db_session, statement, *args, **kwargs)
+
+            lock_patch = patch.object(
+                profile_workspace_service.AsyncSession,
+                "scalar",
+                new=observe_scalar,
+            )
+        else:
+            original_lock = profiles.lock_profile_owner
+
+            async def observe_lock(*args, **kwargs):
+                lock_attempted.set()
+                result = await original_lock(*args, **kwargs)
+                lock_acquired.set()
+                return result
+
+            lock_patch = patch.object(
+                profiles,
+                "lock_profile_owner",
+                side_effect=observe_lock,
+            )
 
         task: asyncio.Task[httpx.Response] | None = None
         try:
@@ -117,9 +186,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                     select(User.id).where(User.id == user_id).with_for_update()
                 )
                 try:
-                    with patch.object(
-                        target_module, target_name, side_effect=observe_lock
-                    ):
+                    with lock_patch:
                         task = asyncio.create_task(request())
                         await asyncio.wait_for(lock_attempted.wait(), timeout=5)
                         self.assertFalse(lock_acquired.is_set())
@@ -268,15 +335,6 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
     async def test_captain_update_waits_for_shared_user_lock(self) -> None:
         owner = await self._register("captain-lock")
 
-        # The captain route resolves this consumer alias at module scope;
-        # patching profiles.lock_profile_owner would not observe its call.
-        self.assertIs(
-            profile_workspace_routes.put_my_captain_profile.__globals__[
-                "update_captain_profile"
-            ],
-            profile_workspace_routes.update_captain_profile,
-        )
-
         response = await self._assert_user_lock_serializes_slot_write(
             owner,
             lambda: owner.put(
@@ -292,7 +350,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                     ],
                 },
             ),
-            patch_target=(profile_workspace_routes, "update_captain_profile"),
+            observe_scalar_lock=True,
         )
 
         self.assertEqual(response.status_code, 200, response.text)
