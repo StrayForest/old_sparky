@@ -565,7 +565,7 @@ with lock.verification_resource_lock("backend-integration"):
             with _lock_holder(
                 [sys.executable, "-c", holder_code, str(lock_path)],
                 cwd=Path(__file__).resolve().parents[1],
-            ) as holder:
+            ):
                 contender_code = """
 from pathlib import Path
 import sys
