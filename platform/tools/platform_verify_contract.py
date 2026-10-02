@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import subprocess
 import sys
 from typing import Iterable
 
@@ -94,6 +95,8 @@ TEST_RUNNER = PLATFORM_ROOT / "tools" / "platform_test_runner.py"
 LEGACY_MANIFEST = PLATFORM_ROOT / "tests" / "test-suite-manifest.json"
 EXTERNAL_LOAD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-external-load.yml"
 TRUSTED_EXTERNAL_LOAD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-external-load-trusted.yml"
+TRUSTED_EXTERNAL_LOAD_POLICY_SHA = "251a4e814abfff59ba4fdff5db4b030829cb889c"
+TRUSTED_EXTERNAL_LOAD_WORKFLOW_RELATIVE = ".github/workflows/platform-production-external-load-trusted.yml"
 EXTERNAL_LOAD_RECOVERY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-external-load-recovery.yml"
 RETAINED_CLEANUP_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-retained-load-cleanup.yml"
 TRUSTED_RETAINED_CLEANUP_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-retained-load-cleanup-trusted.yml"
@@ -1774,6 +1777,50 @@ def _validate_workflow_inputs(
                 )
 
 
+def _trusted_external_load_pin_issues(
+    public_source: str,
+    trusted_source: str,
+) -> list[str]:
+    """Require the public pin to resolve to the reviewed trusted workflow blob."""
+
+    match = re.search(
+        r"(?m)^\s*uses:\s*StrayForest/old_sparky/\.github/workflows/"
+        r"platform-production-external-load-trusted\.yml@(?P<sha>[0-9a-f]{40})\s*$",
+        public_source,
+    )
+    if match is None:
+        return ["public external-load wrapper has no exact trusted-workflow pin"]
+
+    pinned_sha = match.group("sha")
+    issues: list[str] = []
+    if pinned_sha != TRUSTED_EXTERNAL_LOAD_POLICY_SHA:
+        issues.append("public external-load pin is not the reviewed policy commit")
+    try:
+        commit = subprocess.run(
+            ["git", "cat-file", "-e", f"{pinned_sha}^{{commit}}"],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        resolved = subprocess.run(
+            ["git", "show", f"{pinned_sha}:{TRUSTED_EXTERNAL_LOAD_WORKFLOW_RELATIVE}"],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return [*issues, "public external-load pin cannot be resolved from local git"]
+    if commit.returncode != 0 or resolved.returncode != 0:
+        issues.append("public external-load pin cannot be resolved from local git")
+    elif resolved.stdout != trusted_source:
+        issues.append("public external-load pin does not resolve to the reviewed trusted workflow")
+    return issues
+
+
 def _external_load_workflow_issues(
     public_source: str,
     trusted_source: str,
@@ -1831,6 +1878,8 @@ def _external_load_workflow_issues(
         issues.append(
             "public external-load workflow must call the same-repository trusted workflow at a full SHA"
         )
+    else:
+        issues.extend(_trusted_external_load_pin_issues(public_source, trusted_source))
     expected_with = {
         "confirmation": "${{ inputs.confirmation }}",
         "control_email": "${{ inputs.control_email }}",
@@ -1963,7 +2012,7 @@ def _external_load_workflow_issues(
             if metadata_step.get("if") != "${{ always() }}":
                 issues.append("trusted external-load metadata download must run before artifact verification")
             run = metadata_step.get("run")
-            if not isinstance(run, str) or "--max-filesize 1048576" not in run or "install -m 600 /dev/null" not in run or "stat -c '%a'" not in run:
+            if not isinstance(run, str) or "--max-filesize 65536" not in run or "install -m 600 /dev/null" not in run or "stat -c '%a'" not in run:
                 issues.append("trusted external-load metadata download must be bounded and mode-600")
         if not isinstance(artifact_step, dict):
             issues.append("trusted external-load evaluator must verify artifacts in a named step")

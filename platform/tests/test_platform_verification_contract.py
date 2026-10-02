@@ -1025,6 +1025,30 @@ except lock.VerificationLockError as exc:
             _external_load_workflow_issues(public, trusted, load_profiles()),
             [],
         )
+        stale_pin = public.replace(
+            "@251a4e814abfff59ba4fdff5db4b030829cb889c",
+            "@fe99fe0c6f16b0a879a26a4701086fdd6fcb5940",
+            1,
+        )
+        stale_pin_issues = _external_load_workflow_issues(
+            stale_pin,
+            trusted,
+            load_profiles(),
+        )
+        self.assertTrue(
+            any("reviewed policy commit" in issue for issue in stale_pin_issues),
+            stale_pin_issues,
+        )
+        stale_blob = trusted.replace("--retry 0", "--retry 1", 1)
+        stale_blob_issues = _external_load_workflow_issues(
+            public,
+            stale_blob,
+            load_profiles(),
+        )
+        self.assertTrue(
+            any("does not resolve to the reviewed trusted workflow" in issue for issue in stale_blob_issues),
+            stale_blob_issues,
+        )
         mutations = {
             "runs-on": public.replace(
                 "    uses: StrayForest/old_sparky/",
