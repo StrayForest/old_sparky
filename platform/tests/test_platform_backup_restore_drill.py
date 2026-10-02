@@ -37,6 +37,18 @@ manifest_contract = importlib.util.module_from_spec(MANIFEST_SPEC)
 sys.modules[MANIFEST_SPEC.name] = manifest_contract
 MANIFEST_SPEC.loader.exec_module(manifest_contract)
 
+TRUSTED_RUNUSER = "/usr/sbin/runuser"
+TRUSTED_CREATEDB = "/usr/bin/createdb"
+TRUSTED_DROPDB = "/usr/bin/dropdb"
+TEST_HELPERS = platform_backup_supervisor.TrustedPostgresHelpers(
+    runuser=TRUSTED_RUNUSER,
+    createdb=TRUSTED_CREATEDB,
+    dropdb=TRUSTED_DROPDB,
+    psql="/usr/bin/psql",
+    pg_dump="/usr/bin/pg_dump",
+    pg_restore="/usr/bin/pg_restore",
+)
+
 
 @contextmanager
 def _held_test_lock():
@@ -128,20 +140,57 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
     def test_local_admin_commands_use_postgres_os_user(self) -> None:
         target = backup_drill.DatabaseTarget("127.0.0.1", 5432, "platform_user", None, "platformdb")
+        database = "platform_restore_drill_test"
 
         self.assertEqual(
-            backup_drill.local_postgres_admin_command("create", target, "platform_restore_drill_test"),
+            backup_drill.local_postgres_admin_command(
+                "create", target, database, TEST_HELPERS
+            ),
             [
-                "runuser",
+                TRUSTED_RUNUSER,
                 "-u",
                 "postgres",
                 "--",
-                "createdb",
+                TRUSTED_CREATEDB,
                 "--owner",
                 "platform_user",
-                "platform_restore_drill_test",
+                database,
             ],
         )
+        self.assertEqual(
+            backup_drill.local_postgres_admin_command(
+                "drop", target, database, TEST_HELPERS
+            ),
+            [TRUSTED_RUNUSER, "-u", "postgres", "--", TRUSTED_DROPDB, "--if-exists", database],
+        )
+
+    def test_remote_admin_commands_use_explicit_absolute_postgres_helpers(self) -> None:
+        admin_target = backup_drill.DatabaseTarget(
+            "db.internal", 5433, "platform_admin", "secret", "postgres"
+        )
+        app_target = backup_drill.DatabaseTarget(
+            "db.internal", 5433, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_test"
+        base = ["--host", "db.internal", "--port", "5433", "--username", "platform_admin"]
+
+        self.assertEqual(
+            backup_drill.remote_admin_command(
+                "create", admin_target, app_target, database, TEST_HELPERS
+            ),
+            [TRUSTED_CREATEDB, *base, "--owner", "platform_user", database],
+        )
+        self.assertEqual(
+            backup_drill.remote_admin_command(
+                "drop", admin_target, app_target, database, TEST_HELPERS
+            ),
+            [TRUSTED_DROPDB, *base, "--if-exists", database],
+        )
+
+    def test_public_postgres_resolver_rejects_unsafe_inputs(self) -> None:
+        for unsafe in ("/tmp/createdb", "../createdb", "createdb\x00"):
+            with self.assertRaises(platform_backup_supervisor.BackupCommandError):
+                platform_backup_supervisor.trusted_executable(unsafe)
 
     def test_restore_drill_captures_extension_output_for_json_callers(self) -> None:
         target = backup_drill.DatabaseTarget(
@@ -169,6 +218,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 pathlib.Path(temporary_dir) / "backup.dump",
                 app_target=target,
                 admin_target=None,
+                helpers=TEST_HELPERS,
                 timestamp_slug="20260720T120000Z",
                 expected_alembic_head="20260801_0036",
             )
@@ -193,6 +243,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     pathlib.Path("/tmp/backup.dump"),
                     app_target=target,
                     admin_target=None,
+                    helpers=TEST_HELPERS,
                     timestamp_slug="20261001T120000Z",
                     expected_alembic_head="not-current-head",
                     source_root=source_root,
@@ -353,7 +404,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(
                         backup_drill, "load_env", return_value=self._creator_environment()
                     ),
-                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(
+                        backup_drill, "require_commands", return_value=TEST_HELPERS
+                    ),
                     mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
                     mock.patch.object(backup_drill, "utc_now", return_value=fixed_now),
                 ):
@@ -405,7 +458,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(
                         backup_drill, "load_env", return_value=self._creator_environment()
                     ),
-                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(
+                        backup_drill, "require_commands", return_value=TEST_HELPERS
+                    ),
                     mock.patch.object(backup_drill.uuid, "uuid4", return_value=fixed_uuid),
                     mock.patch.object(
                         backup_drill,
@@ -455,7 +510,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(
                         backup_drill, "load_env", return_value=self._creator_environment()
                     ),
-                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(
+                        backup_drill, "require_commands", return_value=TEST_HELPERS
+                    ),
                     mock.patch.object(backup_drill.uuid, "uuid4", return_value=fixed_uuid),
                     mock.patch.object(
                         backup_drill,
@@ -494,7 +551,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     mock.patch.object(
                         backup_drill, "load_env", return_value=self._creator_environment()
                     ),
-                    mock.patch.object(backup_drill, "require_commands"),
+                    mock.patch.object(
+                        backup_drill, "require_commands", return_value=TEST_HELPERS
+                    ),
                     mock.patch.object(
                         backup_drill, "run_command", side_effect=fake_run_command
                     ),
@@ -591,7 +650,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         )
                     },
                 ),
-                mock.patch.object(backup_drill, "require_commands"),
+                mock.patch.object(
+                    backup_drill, "require_commands", return_value=TEST_HELPERS
+                ),
                 mock.patch.object(
                     backup_drill,
                     "run_command",
