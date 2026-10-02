@@ -830,16 +830,13 @@ def require_commands(
 
 
 def _safe_restore_error(exc: BaseException) -> str:
-    """Persist only stable error classes and the validated temporary DB id."""
+    """Persist the allowlisted primary code; cleanup stays structured."""
 
     payload = supervisor.safe_error_payload(exc)
-    if payload["error_class"] == "backup_cleanup_unproven":
-        database_id = payload.get("database_id")
-        if isinstance(database_id, str):
-            return f"cleanup_unproven database_id={database_id} operator_action={payload['operator_action']}"
-        return f"cleanup_unproven operator_action={supervisor.CLEANUP_OPERATOR_ACTION}"
+    if payload.get("cleanup_status") == "unproven" and payload["error_class"] == "backup_cleanup_unproven":
+        return "cleanup_unproven"
     if payload["error_class"] in {"backup_command_timeout", "backup_monitor_unavailable"}:
-        return str(payload["error_class"])
+        return payload["error_class"]
     return "restore_verification_failed"
 
 
@@ -963,6 +960,9 @@ def create_backup(
     restored_table_count: int | None = None
     alembic_revision: str | None = None
     restore_error: str | None = None
+    cleanup_status: str | None = None
+    cleanup_database_id: str | None = None
+    cleanup_operator_action: str | None = None
     temporary_dump_fd: int | None = None
     temporary_dump_created = False
     metadata_written = False
@@ -1079,7 +1079,11 @@ def create_backup(
             except supervisor.BackupCleanupUnproven:
                 raise
             except Exception as exc:
+                restore_payload = supervisor.safe_error_payload(exc)
                 restore_error = _safe_restore_error(exc)
+                cleanup_status = restore_payload.get("cleanup_status")
+                cleanup_database_id = restore_payload.get("database_id")
+                cleanup_operator_action = restore_payload.get("operator_action")
 
         completed_at = utc_now()
         metadata = build_manifest(
@@ -1094,6 +1098,9 @@ def create_backup(
             alembic_revision_verified=restore_verified,
             restored_table_count=restored_table_count,
             restore_error=restore_error,
+            cleanup_status=cleanup_status,
+            database_id=cleanup_database_id,
+            operator_action=cleanup_operator_action,
         )
         write_manifest(metadata_path, metadata)
         metadata_written = True
@@ -1115,17 +1122,14 @@ def create_backup(
             "alembic_revision": alembic_revision or "unknown",
         }
         if restore_error is not None:
-            if restore_error.startswith("cleanup_unproven"):
-                database_id = next(
-                    (
-                        part.split("=", 1)[1]
-                        for part in restore_error.split()
-                        if part.startswith("database_id=")
-                    ),
-                    None,
-                )
-                raise supervisor.BackupCleanupUnproven(database_id=database_id)
-            raise RuntimeError(f"Platform backup was created but restore verification failed: {restore_error}")
+            wrapped = RuntimeError(
+                f"Platform backup was created but restore verification failed: {restore_error}"
+            )
+            if restore_error in {"backup_command_timeout", "backup_monitor_unavailable"}:
+                wrapped.code = restore_error
+            if cleanup_status == "unproven":
+                setattr(wrapped, "backup_cleanup_unproven", cleanup_database_id or "")
+            raise wrapped from None
         return result
     except BaseException:
         if not metadata_written:

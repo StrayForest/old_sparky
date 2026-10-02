@@ -745,6 +745,57 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertTrue(old_metadata.exists())
             self.assertGreaterEqual(len(tuple(output_dir.glob("platformdb-*.dump"))), 2)
 
+            valid_id = "platform_restore_drill_" + "b" * 32
+            for index, (failure, expected_error, expected_id) in enumerate(
+                (
+                    (RuntimeError("primary-secret"), "restore_verification_failed", valid_id),
+                    (platform_backup_supervisor.BackupCommandTimeout(), "backup_command_timeout", valid_id),
+                    (RuntimeError("primary-secret"), "restore_verification_failed", None),
+                    (platform_backup_supervisor.BackupCommandTimeout(), "backup_command_timeout", None),
+                )
+            ):
+                if expected_id is not None:
+                    failure.backup_cleanup_unproven = expected_id
+                else:
+                    failure.backup_cleanup_unproven = "arbitrary-secret"
+                case_dir = output_dir / f"round-trip-{index}"
+                case_dir.mkdir()
+                def round_trip_command(
+                    command: list[str], *, stdout: int | None = None, **_: object
+                ) -> subprocess.CompletedProcess[str]:
+                    if command[0] == "pg_dump":
+                        assert stdout is not None
+                        backup_drill.os.write(stdout, b"PGDMP decorated restore failure")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                with (mock.patch.dict(backup_drill.os.environ, self._creator_environment(), clear=False),
+                      mock.patch.object(backup_drill, "load_env", return_value=self._creator_environment()),
+                      mock.patch.object(backup_drill, "require_commands"),
+                      mock.patch.object(backup_drill, "run_command", side_effect=round_trip_command),
+                      mock.patch.object(backup_drill, "perform_restore_drill", side_effect=failure)):
+                    with self.assertRaisesRegex(RuntimeError, "restore verification failed") as raised:
+                        self._create_backup(
+                            self._creator_args(case_dir, dump_only=False),
+                            source_root=_trusted_source(case_dir / "trusted-source"),
+                        )
+                wrapped = platform_backup_supervisor.safe_error_payload(raised.exception)
+                self.assertEqual((wrapped.get("cleanup_status"), wrapped.get("database_id")),
+                                 ("unproven", expected_id))
+
+                manifest_path = next(case_dir.glob("*.json"))
+                parsed = manifest_contract.read_manifest_file(
+                    manifest_path,
+                    expected_owner=os.geteuid(),
+                    expected_group=os.getegid(),
+                ).manifest
+                self.assertEqual(parsed.restore_error, expected_error)
+                self.assertEqual(parsed.cleanup_status, "unproven")
+                self.assertEqual(parsed.database_id, expected_id)
+                self.assertEqual(
+                    parsed.operator_action,
+                    platform_backup_supervisor.CLEANUP_OPERATOR_ACTION if expected_id else None,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,7 +50,10 @@ one second cannot share a dump/manifest pair. Manifest publication is
 temporary-file + file fsync + atomic rename + backup-directory fsync. Readers
 reject partial JSON, extra or duplicate keys, wrong types/order, symlinks,
 hardlinks, unexpected owner/group or mode, path mismatches, checksum and size
-drift.
+drift. A failed restore keeps its allowlisted primary `restore_error` code;
+when cleanup is unproven, the manifest separately records
+`cleanup_status=unproven` plus the validated generated `database_id` and fixed
+`operator_action` when available.
 
 The dump producer reserves both final names with `O_EXCL`, writes `pg_dump`
 through a held mode-`0600` descriptor, verifies that descriptor and pathname

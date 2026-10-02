@@ -37,6 +37,8 @@ BACKUP_NAME_RE = re.compile(
 MAX_MANIFEST_BYTES = 128 * 1024
 MAX_DUMP_BYTES = 5 * 1024 * 1024 * 1024
 MAX_ERROR_BYTES = 16 * 1024
+RESTORE_DRILL_DATABASE_ID_RE = re.compile(r"^platform_restore_drill_[0-9a-f]{32}$")
+CLEANUP_OPERATOR_ACTION = "inspect_ownership_before_drop"
 
 # This is the one v2 top-level shape.  Keep the order stable in creator output;
 # parsers intentionally do not make JSON object member order semantic.
@@ -56,8 +58,12 @@ MANIFEST_KEYS: tuple[str, ...] = (
     "alembic_revision_verified",
     "restored_table_count",
     "restore_error",
+    "cleanup_status",
+    "database_id",
+    "operator_action",
 )
 MANIFEST_KEY_SET = frozenset(MANIFEST_KEYS)
+LEGACY_MANIFEST_KEY_SET = frozenset(MANIFEST_KEYS[:-3])
 
 
 class BackupManifestError(ValueError):
@@ -81,6 +87,9 @@ class BackupManifest:
     alembic_revision_verified: bool
     restored_table_count: int | None
     restore_error: str | None
+    cleanup_status: str | None = None
+    database_id: str | None = None
+    operator_action: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the canonical JSON-compatible representation."""
@@ -101,6 +110,9 @@ class BackupManifest:
             "alembic_revision_verified": self.alembic_revision_verified,
             "restored_table_count": self.restored_table_count,
             "restore_error": self.restore_error,
+            "cleanup_status": self.cleanup_status,
+            "database_id": self.database_id,
+            "operator_action": self.operator_action,
         }
 
 
@@ -165,7 +177,7 @@ def parse_manifest_payload(
     if any(type(key) is not str for key in payload):
         raise BackupManifestError("backup manifest keys must be strings")
     keys = frozenset(payload)
-    if keys != MANIFEST_KEY_SET:
+    if keys not in {MANIFEST_KEY_SET, LEGACY_MANIFEST_KEY_SET}:
         if "schema" in keys and "schemas" not in keys:
             raise BackupManifestError(
                 'legacy singular "schema" is not accepted by manifest format v2'
@@ -256,6 +268,24 @@ def parse_manifest_payload(
     if restore_verified and restore_error is not None:
         raise BackupManifestError("verified manifest cannot contain restore_error")
 
+    cleanup_status = payload.get("cleanup_status")
+    if cleanup_status is not None and cleanup_status != "unproven":
+        raise BackupManifestError("manifest cleanup_status must be null or unproven")
+    database_id = payload.get("database_id")
+    if database_id is not None and (
+        type(database_id) is not str or RESTORE_DRILL_DATABASE_ID_RE.fullmatch(database_id) is None
+    ):
+        raise BackupManifestError("manifest database_id is not a valid restore-drill identifier")
+    operator_action = payload.get("operator_action")
+    if operator_action is not None and operator_action != CLEANUP_OPERATOR_ACTION:
+        raise BackupManifestError("manifest operator_action is not allowlisted")
+    if cleanup_status is None and (database_id is not None or operator_action is not None):
+        raise BackupManifestError("manifest cleanup evidence requires cleanup_status=unproven")
+    if cleanup_status == "unproven" and ((database_id is None) != (operator_action is None)):
+        raise BackupManifestError("manifest cleanup evidence must include both ID and action")
+    if restore_verified and cleanup_status is not None:
+        raise BackupManifestError("verified manifest cannot contain cleanup evidence")
+
     return BackupManifest(
         format_version=format_version,
         database=DATABASE_NAME,
@@ -272,6 +302,9 @@ def parse_manifest_payload(
         alembic_revision_verified=alembic_revision_verified,
         restored_table_count=restored_table_count,
         restore_error=restore_error,
+        cleanup_status=cleanup_status,
+        database_id=database_id,
+        operator_action=operator_action,
     )
 
 
@@ -576,6 +609,9 @@ def build_manifest(
     alembic_revision_verified: bool,
     restored_table_count: int | None,
     restore_error: str | None,
+    cleanup_status: str | None = None,
+    database_id: str | None = None,
+    operator_action: str | None = None,
 ) -> dict[str, Any]:
     """Build and validate creator output, preserving canonical key order."""
 
@@ -595,6 +631,9 @@ def build_manifest(
         "alembic_revision_verified": alembic_revision_verified,
         "restored_table_count": restored_table_count,
         "restore_error": restore_error,
+        "cleanup_status": cleanup_status,
+        "database_id": database_id,
+        "operator_action": operator_action,
     }
     parse_manifest_payload(payload, expected_dump_file=dump_file)
     return payload
