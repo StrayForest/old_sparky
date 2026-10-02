@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tools import platform_verify as verifier
 from tools import platform_validate_wheelhouse as validator
 from tools.platform_verify_contract import _workflow_step_blocks
 
@@ -29,6 +30,24 @@ LOCK_LINE = re.compile(
     r"^(?P<name>[A-Za-z0-9_.-]+)=="
     r"(?P<version>[A-Za-z0-9][A-Za-z0-9_.+!-]*)"
     r" --hash=sha256:(?P<hash>[0-9a-f]{64})$"
+)
+
+EXPECTED_SECURITY_DEPENDENCY_LOCKS = (
+    "requirements-platform.lock.txt",
+    "requirements-ci.lock.txt",
+    "requirements-ci-locker.lock.txt",
+    "apps/platform_draft/requirements-assets.lock.txt",
+)
+EXPECTED_PIP_AUDIT_FLAGS = (
+    "--disable-pip",
+    "--require-hashes",
+    "--strict",
+    "--format",
+    "columns",
+    "--progress-spinner",
+    "off",
+    "--timeout",
+    "10",
 )
 
 
@@ -67,6 +86,60 @@ def _ci_lock_pins(path: Path = CI_LOCK) -> dict[str, str]:
 
 
 class PlatformPipPinContractTests(unittest.TestCase):
+    def test_security_dependency_audit_manifest_and_flags_are_exact(self) -> None:
+        self.assertEqual(verifier.SECURITY_DEPENDENCY_LOCKS, EXPECTED_SECURITY_DEPENDENCY_LOCKS)
+        self.assertEqual(verifier.PIP_AUDIT_FLAGS, EXPECTED_PIP_AUDIT_FLAGS)
+
+        command_calls: list[tuple[str, list[str], dict[str, object]]] = []
+
+        def fake_run(
+            label: str,
+            command: list[str],
+            **kwargs: object,
+        ) -> int:
+            command_calls.append((label, command, kwargs))
+            return 0
+
+        with mock.patch.object(verifier, "_run", side_effect=fake_run):
+            self.assertEqual(verifier._run_security_dependency_audits(), 0)
+
+        self.assertEqual(len(command_calls), len(EXPECTED_SECURITY_DEPENDENCY_LOCKS))
+        for index, lock_path in enumerate(EXPECTED_SECURITY_DEPENDENCY_LOCKS):
+            label, command, kwargs = command_calls[index]
+            self.assertEqual(label, f"security/dependency-audit/{lock_path}")
+            self.assertEqual(command[1:4], ["-m", "pip_audit", "-r"])
+            self.assertEqual(command[4], lock_path)
+            self.assertEqual(command[5:], list(EXPECTED_PIP_AUDIT_FLAGS))
+            self.assertEqual(kwargs, {"timeout_seconds": 120})
+            self.assertNotIn("install", command)
+            self.assertNotIn("--fix", command)
+
+    def test_security_dependency_audits_all_locks_after_a_failure(self) -> None:
+        for failing_path, expected_status in (
+            ("requirements-platform.lock.txt", 17),
+            ("apps/platform_draft/requirements-assets.lock.txt", 124),
+        ):
+            calls: list[str] = []
+
+            def fake_run(label: str, command: list[str], **kwargs: object) -> int:
+                calls.append(label)
+                self.assertEqual(kwargs, {"timeout_seconds": 120})
+                return expected_status if command[4] == failing_path else 0
+
+            with mock.patch.object(verifier, "_run", side_effect=fake_run):
+                self.assertEqual(verifier._run_security_dependency_audits(), expected_status)
+            self.assertEqual(
+                calls,
+                [f"security/dependency-audit/{path}" for path in EXPECTED_SECURITY_DEPENDENCY_LOCKS],
+            )
+
+    def test_security_dependency_missing_lock_fails_closed_without_running_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(verifier, "PLATFORM_ROOT", Path(temporary)):
+                with mock.patch.object(verifier, "_run") as run:
+                    self.assertNotEqual(verifier._run_security_dependency_audits(), 0)
+                    run.assert_not_called()
+
     def test_ci_lock_covers_runtime_quality_and_bootstrap_inputs(self) -> None:
         runtime = _direct_pins(PLATFORM_ROOT / "requirements-platform.txt")
         quality = _direct_pins(PLATFORM_ROOT / "requirements-quality.txt")
@@ -129,7 +202,14 @@ class PlatformPipPinContractTests(unittest.TestCase):
         self.assertIn("refusing to reuse an existing CI virtualenv", installer)
         self.assertNotIn("requirements-platform.txt", installer)
         self.assertNotIn("requirements-quality.txt", installer)
-        self.assertIn('"-r", "requirements-ci.lock.txt"', verifier)
+        self.assertIn('"requirements-ci.lock.txt"', verifier)
+        self.assertIn('"requirements-platform.lock.txt"', verifier)
+        self.assertIn('"requirements-ci-locker.lock.txt"', verifier)
+        self.assertIn('"apps/platform_draft/requirements-assets.lock.txt"', verifier)
+        self.assertIn('"--disable-pip"', verifier)
+        self.assertIn('"--require-hashes"', verifier)
+        self.assertIn('"--strict"', verifier)
+        self.assertIn('"--timeout"', verifier)
         self.assertNotIn('"-r", "requirements-platform.txt"', verifier)
         self.assertIn("platform_ci_pip_env.sh", installer)
         self.assertIn("platform_ci_pip_env.sh", generator)

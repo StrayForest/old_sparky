@@ -22,6 +22,32 @@ PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = PLATFORM_ROOT / "tools"
 WEB_ROOT = PLATFORM_ROOT / "apps" / "platform_web"
 
+# Keep the dependency-security surface explicit. These locks are owned by
+# different contours and intentionally cannot be merged into one pip-audit
+# input because several packages are pinned to different versions between
+# contours. A new lock owner must update this list and its contract tests;
+# silently discovering files would make a new install surface auditable only
+# by accident.
+SECURITY_DEPENDENCY_LOCKS: tuple[str, ...] = (
+    "requirements-platform.lock.txt",
+    "requirements-ci.lock.txt",
+    "requirements-ci-locker.lock.txt",
+    "apps/platform_draft/requirements-assets.lock.txt",
+)
+PIP_AUDIT_SOCKET_TIMEOUT_SECONDS = 10
+SECURITY_DEPENDENCY_AUDIT_TIMEOUT_SECONDS = 120
+PIP_AUDIT_FLAGS: tuple[str, ...] = (
+    "--disable-pip",
+    "--require-hashes",
+    "--strict",
+    "--format",
+    "columns",
+    "--progress-spinner",
+    "off",
+    "--timeout",
+    str(PIP_AUDIT_SOCKET_TIMEOUT_SECONDS),
+)
+
 
 def _backend_catalog_module():
     try:
@@ -299,6 +325,33 @@ def _run(
     return 0
 
 
+def _run_security_dependency_audits() -> int:
+    """Audit every authored Python lock surface and retain the first failure."""
+
+    first_failure = 0
+    for lock_path in SECURITY_DEPENDENCY_LOCKS:
+        candidate = PLATFORM_ROOT / lock_path
+        label = f"security/dependency-audit/{lock_path}"
+        if candidate.is_symlink() or not candidate.is_file():
+            print(f"[GATE FAIL] {label} lock is missing or not a regular file", file=sys.stderr)
+            first_failure = first_failure or 1
+            continue
+        status = _run(
+            label,
+            [
+                _python(),
+                "-m",
+                "pip_audit",
+                "-r",
+                lock_path,
+                *PIP_AUDIT_FLAGS,
+            ],
+            timeout_seconds=SECURITY_DEPENDENCY_AUDIT_TIMEOUT_SECONDS,
+        )
+        first_failure = first_failure or status
+    return first_failure
+
+
 def _backend_command(arguments: Sequence[str]) -> list[str]:
     if not arguments:
         return [_tool("platform_run_tests.sh"), "--contour", "backend"]
@@ -434,10 +487,6 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
     if gate_id == "security":
         commands = (
             (
-                "security/dependency-audit",
-                [_python(), "-m", "pip_audit", "-r", "requirements-ci.lock.txt"],
-            ),
-            (
                 "security/bandit",
                 [
                     _python(),
@@ -459,6 +508,9 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
                 [_python(), "tools/platform_secret_scan.py", "--root", ".."],
             ),
         )
+        dependency_status = _run_security_dependency_audits()
+        if dependency_status:
+            return dependency_status
         for label, command in commands:
             status = _run(label, command)
             if status:
