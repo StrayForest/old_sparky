@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from typing import Any, Iterator
 
 
@@ -438,8 +439,36 @@ def disk_snapshot(path: Path) -> dict[str, int | float]:
     return disk_snapshot_for_path(path).as_dict()
 
 
-def _run_backup_command(command: list[str]) -> dict[str, Any]:
-    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+def _run_backup_command(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    try:
+        from . import platform_backup_supervisor as supervisor
+    except ImportError:
+        import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+    interpreter = supervisor._trusted_executable(
+        sys.executable, supervisor._sanitized_env(None)
+    )
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("backup command timeout must be finite and positive")
+    if not command or command[0] != interpreter:
+        raise RuntimeError("Platform backup interpreter is not trusted.")
+    try:
+        completed = subprocess.run(  # nosec B603 - fixed trusted script argv
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=supervisor._sanitized_env(None),
+            shell=False,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise supervisor.BackupCommandTimeout(
+            "platform backup command did not complete in its budget"
+        ) from exc
     try:
         result = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
@@ -450,14 +479,28 @@ def _run_backup_command(command: list[str]) -> dict[str, Any]:
 
 
 def _run_backup_legacy(
-    app_dir: Path, *, keep: int, max_age_hours: float = 24.0
+    app_dir: Path,
+    *,
+    keep: int,
+    max_age_hours: float = 24.0,
+    backup_timeout_seconds: float = 1500.0,
 ) -> dict[str, Any]:
     if not math.isfinite(max_age_hours) or max_age_hours <= 0:
         raise ValueError("backup max age must be finite and positive")
+    if not math.isfinite(backup_timeout_seconds) or backup_timeout_seconds <= 0:
+        raise ValueError("backup timeout must be finite and positive")
+    deadline = time.monotonic() + backup_timeout_seconds
     script = Path(__file__).with_name("platform_backup_restore_drill.py")
+    try:
+        from . import platform_backup_supervisor as supervisor
+    except ImportError:
+        import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+    interpreter = supervisor._trusted_executable(
+        sys.executable, supervisor._sanitized_env(None)
+    )
     shared_dir = app_dir / "shared"
     create_command = [
-        sys.executable,
+        interpreter,
         str(script),
         "--env-file",
         str(shared_dir / ".env.platform"),
@@ -465,12 +508,21 @@ def _run_backup_legacy(
         str(shared_dir / "backups"),
         "--keep",
         str(keep),
+        "--timeout-seconds",
+        str(backup_timeout_seconds),
         "--json",
     ]
-    result = _run_backup_command(create_command)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise supervisor.BackupCommandTimeout("legacy backup deadline expired")
+    create_command[create_command.index("--timeout-seconds") + 1] = str(remaining)
+    result = _run_backup_command(create_command, timeout_seconds=remaining)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise supervisor.BackupCommandTimeout("legacy backup deadline expired")
     check_result = _run_backup_command(
         [
-            sys.executable,
+            interpreter,
             str(script),
             "--env-file",
             str(shared_dir / ".env.platform"),
@@ -479,8 +531,11 @@ def _run_backup_legacy(
             "--check-latest",
             "--max-age-hours",
             str(max_age_hours),
+            "--timeout-seconds",
+            str(remaining),
             "--json",
-        ]
+        ],
+        timeout_seconds=remaining,
     )
     if result.get("restore_verified") is not True or check_result.get("restore_verified") is not True:
         raise RuntimeError("Platform backup was not restore-verified.")
@@ -517,9 +572,11 @@ def run_backup(
     *,
     keep: int,
     max_age_hours: float = 24.0,
+    backup_timeout_seconds: float = 1500.0,
     capability: object | None = None,
     lock: Any | None = None,
     evidence: Any | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Compatibility facade for the supervisor-owned backup primitive.
 
@@ -530,7 +587,10 @@ def run_backup(
 
     if capability is None:
         return _run_backup_legacy(
-            app_dir, keep=keep, max_age_hours=max_age_hours
+            app_dir,
+            keep=keep,
+            max_age_hours=max_age_hours,
+            backup_timeout_seconds=backup_timeout_seconds,
         )
     try:
         from . import platform_backup_supervisor as supervisor
@@ -540,7 +600,7 @@ def run_backup(
         raise RuntimeError("supervisor backup capability requires held lock and evidence")
     supervisor.require_mutation_capability(capability, "maintenance")
     return supervisor._run_local_backup_scope(
-        argparse.Namespace(dump_only=False),
+        argparse.Namespace(),
         app_dir=app_dir,
         lock=lock,
         callback=lambda scoped_capability, trusted_head, _restore: supervisor.run_local_backup(
@@ -551,6 +611,8 @@ def run_backup(
             capability=scoped_capability,
             lock=lock,
             evidence=evidence,
+            backup_timeout_seconds=backup_timeout_seconds,
+            deadline=deadline,
         ),
     )
 
@@ -615,6 +677,7 @@ def _plan_and_maybe_apply(
     capability: object | None = None,
     backup_lock: Any | None = None,
     evidence: Any | None = None,
+    deadline: float | None = None,
 ) -> tuple[
     RetentionPlan,
     ArtifactRetentionPlan,
@@ -666,6 +729,7 @@ def _plan_and_maybe_apply(
             backup_kwargs: dict[str, Any] = {
                 "keep": args.backup_keep,
                 "max_age_hours": getattr(args, "backup_max_age_hours", 24.0),
+                "backup_timeout_seconds": getattr(args, "backup_timeout_seconds", 1500.0),
             }
             if capability is not None:
                 backup_kwargs.update(
@@ -673,6 +737,8 @@ def _plan_and_maybe_apply(
                     lock=backup_lock,
                     evidence=evidence,
                 )
+            if deadline is not None:
+                backup_kwargs["deadline"] = deadline
             backup = {
                 "status": "completed",
                 **run_backup(app_dir, **backup_kwargs),
@@ -717,6 +783,7 @@ def run_maintenance(
     _live_qa_lock_fd: int | None = None,
     _evidence: Any | None = None,
     _locks_held: bool = False,
+    _backup_deadline: float | None = None,
 ) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     app_dir = args.app_dir.resolve(strict=True)
@@ -770,6 +837,7 @@ def run_maintenance(
                                 _live_qa_lock_fd=live_qa_fd,
                                 _evidence=evidence,
                                 _locks_held=True,
+                                _backup_deadline=_backup_deadline,
                             ),
                         )
 
@@ -789,6 +857,7 @@ def run_maintenance(
             backup_kwargs: dict[str, Any] = {
                 "keep": BACKUP_ONLY_KEEP,
                 "max_age_hours": getattr(args, "backup_max_age_hours", 24.0),
+                "backup_timeout_seconds": getattr(args, "backup_timeout_seconds", 1500.0),
             }
             if _supervisor_capability is not None:
                 backup_kwargs.update(
@@ -796,6 +865,8 @@ def run_maintenance(
                     lock=_backup_lock,
                     evidence=_evidence,
                 )
+            if _backup_deadline is not None:
+                backup_kwargs["deadline"] = _backup_deadline
             # Keep patched test/library facades observationally compatible;
             # the concrete production ``run_backup`` function always receives
             # the in-process capability above.
@@ -831,6 +902,7 @@ def run_maintenance(
                 capability=_supervisor_capability,
                 backup_lock=_backup_lock,
                 evidence=_evidence,
+                deadline=_backup_deadline,
             )
             live_qa_plan = live_qa_guard.prune_runtime_cache_release_lock_held(
                 apply=True,

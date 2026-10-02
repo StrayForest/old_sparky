@@ -63,6 +63,7 @@ from python_packages.platform_infra.models import MediaAsset, PlayerProfile, Tou
 from python_packages.platform_infra.object_storage import object_key_from_upload_url
 from python_packages.platform_infra.redis import redis_client
 from tools.platform_backup_restore_drill import check_latest_backup
+from tools.platform_backup_manifest import MANIFEST_FORMAT_VERSION
 
 
 CHECKPOINT_VERSION = 1
@@ -1725,12 +1726,12 @@ async def run_cleanup(
             "Cleanup backup evidence is not restore-verified.",
         )
     if (
-        int(backup.get("format_version") or 1) < 2
+        backup.get("format_version") != MANIFEST_FORMAT_VERSION
         or backup.get("alembic_revision_verified") is not True
     ):
         raise MigrationError(
             "fresh_restore_verified_backup_required",
-            "Cleanup requires backup format 2 with verified Alembic state.",
+            f"Cleanup requires backup format {MANIFEST_FORMAT_VERSION} with verified Alembic state.",
         )
 
     results: list[dict[str, Any]] = []
@@ -1811,7 +1812,7 @@ async def run_cleanup(
             lambda record: str(record.get("cursor") or ""),
         ),
         "backup": {
-            "format_version": 2,
+            "format_version": MANIFEST_FORMAT_VERSION,
             "restore_verified": True,
             "alembic_revision_verified": True,
             "age_hours": backup.get("age_hours"),

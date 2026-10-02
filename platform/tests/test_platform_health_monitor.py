@@ -60,7 +60,7 @@ class PlatformHealthMonitorTests(unittest.TestCase):
             restore_verified=restore_verified,
             alembic_revision_verified=restore_verified,
             restored_table_count=31 if restore_verified else None,
-            restore_error=None if restore_verified else "restore failed",
+            restore_error=None if restore_verified else "restore_verification_failed",
         )
         metadata_path.write_text(json.dumps(payload), encoding="utf-8")
         metadata_path.chmod(0o600)
@@ -100,6 +100,7 @@ class PlatformHealthMonitorTests(unittest.TestCase):
         now = datetime(2026, 8, 1, 12, tzinfo=UTC)
         mutations = (
             "legacy",
+            "legacy-v2",
             "extra",
             "malformed",
         )
@@ -118,6 +119,13 @@ class PlatformHealthMonitorTests(unittest.TestCase):
                     if mutation == "legacy":
                         payload.pop("schemas")
                         payload["schema"] = "platform"
+                    elif mutation == "legacy-v2":
+                        payload = {
+                            key: value
+                            for key, value in payload.items()
+                            if key in MANIFEST.LEGACY_MANIFEST_KEY_SET
+                        }
+                        payload["format_version"] = MANIFEST.LEGACY_MANIFEST_FORMAT_VERSION
                     else:
                         payload["unexpected"] = True
                     metadata_path.write_text(json.dumps(payload), encoding="utf-8")

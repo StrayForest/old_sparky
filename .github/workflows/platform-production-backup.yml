@@ -101,6 +101,7 @@ jobs:
           # read-only/library compatibility; this production path enters the
           # single supervisor directly.
           maintenance_tool="$current/tools/platform_backup_supervisor.py"
+          process_monitor="$current/tools/platform_backup_process_monitor.py"
           summary_tool="$current/tools/platform_storage_evidence_summary.py"
           umask 077
           backup_report_file="$(mktemp)"
@@ -116,6 +117,10 @@ jobs:
           test -f "$runtime/shared/.env.platform" || { echo "Platform env file is missing" >&2; exit 1; }
           test -f "$maintenance_tool" && test ! -L "$maintenance_tool" \
             || { echo "Storage maintenance tool is missing" >&2; exit 1; }
+          test -f "$process_monitor" && test ! -L "$process_monitor" \
+            && test -x "$process_monitor" && test "$(stat -c '%u:%F:%a' "$process_monitor")" = "0:regular file:755" \
+            && test "$(readlink -f -- "$process_monitor")" = "$(readlink -f -- "$current")/tools/platform_backup_process_monitor.py" \
+            || { echo "Backup process monitor is missing or unsafe" >&2; exit 1; }
           test -f "$summary_tool" && test ! -L "$summary_tool" \
             || { echo "Storage evidence summary helper is missing or unsafe" >&2; exit 1; }
 
@@ -124,6 +129,7 @@ jobs:
             --source-release-dir "$runtime/dist/releases" \
             --backup-keep 14 \
             --backup-max-age-hours 24 \
+            --backup-timeout-seconds 1500 \
             --backup-only \
             --apply \
             --json >"$backup_report_file" 2>/dev/null; then

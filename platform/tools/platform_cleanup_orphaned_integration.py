@@ -24,6 +24,7 @@ from python_packages.platform_infra.config import get_settings, validate_platfor
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.media.hard_delete import purge_deleted_media_metadata
 from python_packages.platform_infra.models import AuditLog, Tournament, User
+from tools.platform_backup_manifest import MANIFEST_FORMAT_VERSION
 from tools.platform_backup_restore_drill import check_latest_backup
 
 
@@ -31,6 +32,17 @@ MARKER_PATTERN = re.compile(r"^it-deadlock-[0-9a-f]{8}$")
 MAX_USERS = 32
 MAX_TOURNAMENTS = 4
 CONFIRMATION = "DELETE_ORPHANED_INTEGRATION_DATA"
+
+
+def require_current_backup(backup: dict[str, Any]) -> None:
+    if (
+        backup.get("format_version") != MANIFEST_FORMAT_VERSION
+        or backup.get("alembic_revision_verified") is not True
+    ):
+        raise RuntimeError(
+            f"Cleanup requires a fresh format-{MANIFEST_FORMAT_VERSION} "
+            "Alembic-verified backup."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -222,11 +234,7 @@ async def async_main(args: argparse.Namespace) -> dict[str, Any]:
         args.backup_dir,
         max_age_hours=args.backup_max_age_hours,
     )
-    if (
-        int(backup.get("format_version") or 1) < 2
-        or backup.get("alembic_revision_verified") is not True
-    ):
-        raise RuntimeError("Cleanup requires a fresh format-2 Alembic-verified backup.")
+    require_current_backup(backup)
     return await cleanup(args.marker, backup=backup)
 
 

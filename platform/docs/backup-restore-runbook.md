@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-01
+- Last reviewed: 2026-10-02
 
 ## Local verified backup
 
@@ -20,18 +20,72 @@ database to the exact single Alembic head derived from the deployed
 `alembic/versions` graph; a missing, branched or mismatched graph is not a
 successful verification.
 
-The manifest is the closed, versioned v2 contract implemented by
+Before any database backup, restore, archive rotation or retention deletion,
+the supervisor proves the installed PID-namespace monitor. The maintenance
+unit permits only PID namespaces (`RestrictNamespaces=pid`); the off-site unit
+does not run database commands and therefore keeps its stricter namespace and
+empty capability contract. The monitor path must be a root-owned, regular,
+non-symlink executable with safe parent directories.
+
+The operation timeout is one canonical 1500-second budget, passed from the
+supervisor CLI through storage to the restore drill. Two seconds are reserved
+for bounded cleanup. A restore drill uses a cryptographically random strict
+database identifier and first proves that it is absent. A create collision,
+non-zero result or timeout does not prove ownership, so the database is never
+dropped; machine-readable JSON records `cleanup_unproven` and emits separate
+`database_id`/`operator_action` fields only for the exact generated ID and
+fixed action `inspect_ownership_before_drop`; invalid IDs are omitted.
+The operation phase captures a strict identity (temporary name, PostgreSQL OID
+and owner) after creation. Cleanup then uses only the reserved interval and
+re-checks that identity immediately before `dropdb`. A missing, replaced or
+owner-mismatched identity never permits a drop. A cleanup failure is recorded
+as `cleanup_unproven` and never turns the backup green. Because PostgreSQL has
+no conditional `DROP DATABASE` that binds a name to a previously observed OID,
+the restore drill also holds the fixed root-owned
+`/run/lock/oldsparky-platform-restore-lifecycle.lock` for the complete
+probe/create/identity/restore/recheck/drop interval. Every platform-owned
+temporary-database creator or replacer must use this lock; lock refusal fails
+closed before mutation. This is an application serialization boundary, not a
+claim of database-level atomicity: an independent DBA/superuser that ignores
+the lock is outside the automation trust boundary, and an ambiguous identity
+is never auto-dropped.
+
+This is a closed-world inventory of the in-repository database mutation paths.
+The local and remote `createdb`/`dropdb` argv builders in
+`platform_backup_restore_drill.py` are the only production temporary-database
+creator, replacer and dropper, and every caller reaches them through
+`perform_restore_drill`, which holds the lifecycle lock. The supervisor-owned
+`create_backup` path additionally requires its unforgeable mutation capability;
+the `--check-latest` health mode is read-only and creates no database.
+`platform_prepare_test_runtime.py` is a separate local-test
+bootstrap: its fixed `platformdb_test` create and `ALTER DATABASE` operations
+are not a production backup path and must never be used to administer a
+production temporary database. No in-repository production database-rename
+path exists. Any new create, replace, rename or drop path must be rejected
+until it is added to this inventory and wired through the same lock and
+ownership proof. This closed-world contract does not and cannot prevent a
+DBA/superuser from bypassing the lock; such actors remain outside the
+automation trust boundary.
+
+The manifest is the closed, versioned v3 contract implemented by
 [`platform_backup_manifest.py`](../tools/platform_backup_manifest.py). It
 requires the ordered `schemas: ["platform", "public"]` value, the exact
 `required_extensions: ["pg_trgm"]` list, a unique 32-character `run_id`,
 archive size and SHA-256, restore/Alembic status and UTC timing fields. The retired singular
 `schema` field is invalid; it is not migrated or interpreted as `schemas`.
+The parser accepts the exact former v2 shape only for read-only inspection;
+writers reject it, and health checks, retention and off-site selection reject
+legacy manifests rather than silently upgrading them. Current v3 writers
+include the explicit cleanup fields described below.
 The archive and manifest use the same timestamp plus run ID, so two runs in
 one second cannot share a dump/manifest pair. Manifest publication is
 temporary-file + file fsync + atomic rename + backup-directory fsync. Readers
 reject partial JSON, extra or duplicate keys, wrong types/order, symlinks,
 hardlinks, unexpected owner/group or mode, path mismatches, checksum and size
-drift.
+drift. A failed restore keeps its allowlisted primary `restore_error` code;
+when cleanup is unproven, the manifest separately records
+`cleanup_status=unproven` plus the validated generated `database_id` and fixed
+`operator_action` when available.
 
 The dump producer reserves both final names with `O_EXCL`, writes `pg_dump`
 through a held mode-`0600` descriptor, verifies that descriptor and pathname
@@ -69,7 +123,10 @@ green. A final publication or directory-fsync failure removes the final
 receipt and retains an unknown `.inprogress` record; readers reject a final
 receipt while any matching in-progress record exists. Evidence contains only bounded release/manifest/checksum, lock,
 Alembic, recovery and remote-transport fields—never credentials, raw stderr,
-private paths or PIDs.
+private paths or PIDs. Legacy schema-1 evidence is accepted only as a
+read-only shape; current schema-2 evidence adds cleanup status, the exact
+temporary database identity and the fixed operator action whenever cleanup is
+unproven.
 
 The offsite timer remains disabled. Enabling it requires a separate reviewed
 operator gate after the offline recovery drill. Destructive production restore
@@ -95,6 +152,7 @@ cd /opt/oldsparky/platform/current
   --app-dir /opt/oldsparky/platform \
   --source-release-dir /opt/oldsparky/platform/dist/releases \
   --backup-keep 14 --backup-max-age-hours 24 \
+  --backup-timeout-seconds 1500 \
   --backup-only --apply --json
 ```
 
@@ -142,7 +200,7 @@ Off-host backup remains incomplete until all of these are evidenced:
 
 `platform_backup_offsite.py` validates and encrypts locally by default, deletes
 its temporary ciphertext and makes no remote write. Supervisor `--apply`
-uploads only the newest canonical v2 restore-verified archive and verifies
+uploads only the newest canonical v3 restore-verified archive and verifies
 size/SHA/metadata. It consumes the same manifest parser as the creator and
 never deletes remote objects.
 

@@ -121,12 +121,18 @@ def _pid1(
     control: int, status_fd: int, command: list[str],
     pass_fds: tuple[int, ...], stdout_fd: int | None,
     work_deadline: int, cleanup_deadline: int,
-    env: dict[str, str] | None,
+    env: dict[str, str] | None, probe: bool = False,
 ) -> None:
     try:
         _pdeath(os.getppid())
-        if os.getpid() != 1 or not command or any(not isinstance(item, str) or not item for item in command):
-            _emit(status_fd, "namespace_unavailable" if os.getpid() != 1 else "protocol_error")
+        if os.getpid() != 1:
+            _emit(status_fd, "namespace_unavailable")
+            return
+        if probe:
+            _emit(status_fd, "probe-ok")
+            return
+        if not command or any(not isinstance(item, str) or not item for item in command):
+            _emit(status_fd, "protocol_error")
             return
         if stdout_fd is not None and stdout_fd not in pass_fds:
             _emit(status_fd, "protocol_error")
@@ -173,7 +179,7 @@ def _pid1(
 def _monitor(
     command: list[str], pass_fds: tuple[int, ...], stdout_fd: int | None,
     status_fd: int, cleanup_deadline: int, reserve: int,
-    env: dict[str, str] | None,
+    env: dict[str, str] | None, probe: bool = False,
 ) -> int:
     control_write = status_read = status_write = -1
     work_deadline = cleanup_deadline - reserve
@@ -190,7 +196,7 @@ def _monitor(
             os.close(control_write)
             os.close(status_read)
             _pid1(control_read, status_write, command, pass_fds, stdout_fd,
-                  work_deadline, cleanup_deadline, env)
+                  work_deadline, cleanup_deadline, env, probe)
             os._exit(0)
         os.close(control_read)
         os.close(status_write)
@@ -260,16 +266,23 @@ def _monitor(
             os.close(status_fd)
         except OSError:
             pass
-def _parse(argv: list[str]) -> tuple[list[str], tuple[int, ...], int | None, int, int, int]:
+def _parse(argv: list[str]) -> tuple[list[str], tuple[int, ...], int | None, int, int, int, bool]:
     if "--" not in argv:
         raise ValueError("backup monitor target is missing")
     separator = argv.index("--")
     controls, command = argv[:separator], argv[separator + 1 :]
     values: dict[str, str] = {}
     pass_fds: list[int] = []
+    probe = False
     index = 0
     while index < len(controls):
         token = controls[index]
+        if token == "--probe":
+            if probe:
+                raise ValueError("backup monitor protocol is invalid")
+            probe = True
+            index += 1
+            continue
         if token.startswith("--pass-fd="):
             try:
                 fd = int(token.split("=", 1)[1])
@@ -291,15 +304,15 @@ def _parse(argv: list[str]) -> tuple[list[str], tuple[int, ...], int | None, int
         stdout_fd = int(values["--stdout-fd"]) if "--stdout-fd" in values else None
     except (KeyError, ValueError) as exc:
         raise ValueError("backup monitor protocol is invalid") from exc
-    if not command or status_fd < 0 or deadline <= 0 or reserve < 0 or reserve >= deadline or any(fd < 0 for fd in pass_fds) or len(pass_fds) != len(set(pass_fds)) or (stdout_fd is not None and stdout_fd < 0) or status_fd in pass_fds or (stdout_fd is not None and stdout_fd == status_fd):
+    if (not probe and not command) or (probe and (command or pass_fds or stdout_fd is not None)) or status_fd < 0 or deadline <= 0 or reserve < 0 or reserve >= deadline or any(fd < 0 for fd in pass_fds) or len(pass_fds) != len(set(pass_fds)) or (stdout_fd is not None and stdout_fd < 0) or status_fd in pass_fds or (stdout_fd is not None and stdout_fd == status_fd):
         raise ValueError("backup monitor protocol is invalid")
-    return command, tuple(pass_fds), stdout_fd, status_fd, deadline, reserve
+    return command, tuple(pass_fds), stdout_fd, status_fd, deadline, reserve, probe
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        command, pass_fds, stdout_fd, status_fd, deadline, reserve = _parse(argv or sys.argv[1:])
-        return _monitor(command, pass_fds, stdout_fd, status_fd, deadline, reserve, None)
+        command, pass_fds, stdout_fd, status_fd, deadline, reserve, probe = _parse(argv or sys.argv[1:])
+        return _monitor(command, pass_fds, stdout_fd, status_fd, deadline, reserve, None, probe)
     except BaseException:
         return MONITOR_ERROR_EXIT
 

@@ -34,6 +34,7 @@ from pathlib import Path
 import re
 import selectors
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -55,7 +56,8 @@ BACKUP_LOCK_PATH = Path("/run/lock/oldsparky-platform-backup.lock")
 _BACKUP_SINGLETON_NAME = b"\0oldsparky-platform-backup-v1"
 LOCK_ROOT = Path("/run/lock")
 BACKUP_EVIDENCE_DIRNAME = "backup-evidence"
-EVIDENCE_SCHEMA = 1
+EVIDENCE_SCHEMA = 2
+LEGACY_EVIDENCE_SCHEMA = 1
 EVIDENCE_KIND = "platform_backup"
 EVIDENCE_STATUSES = frozenset(
     {"started", "passed", "failed", "blocked", "cancelled", "unknown"}
@@ -84,6 +86,8 @@ ALEMBIC_HEAD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 SAFE_EVIDENCE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 SAFE_ERROR_RE = re.compile(r"^[a-z0-9_.-]{1,80}$")
+RESTORE_DRILL_DATABASE_ID_RE = re.compile(r"^platform_restore_drill_[0-9a-f]{32}$")
+CLEANUP_OPERATOR_ACTION = "inspect_ownership_before_drop"
 
 
 class BackupSupervisorError(RuntimeError):
@@ -129,6 +133,17 @@ class BackupMonitorUnavailable(BackupSupervisorError):
 
 class BackupCleanupUnproven(BackupSupervisorError):
     code = "backup_cleanup_unproven"
+
+    def __init__(
+        self,
+        message: str = "backup cleanup was not proven",
+        *,
+        database_id: str | None = None,
+    ) -> None:
+        self.database_id = database_id
+        if database_id is not None:
+            message += f"; database_id={database_id}"
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +232,7 @@ def _monitor_path(path: Path | None = None) -> Path:
     if path.is_symlink():
         raise BackupMonitorUnavailable("backup process monitor must not be a symlink")
     try:
+        path = path.resolve(strict=True)
         _secure_executable(path)
     except BackupCommandError as exc:
         raise BackupMonitorUnavailable("backup process monitor metadata is unsafe") from exc
@@ -440,33 +456,83 @@ def _cancel_monitor(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _reject_duplicate_status_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate monitor status key")
+        result[key] = value
+    return result
+
+
 def _read_monitor_status(data: bytearray, overflow: bool = False) -> dict[str, object]:
     if overflow:
         raise BackupCleanupUnproven("backup monitor status exceeded protocol limit")
+    raw = bytes(data)
+    if raw.count(b"\n") != 1 or not raw.endswith(b"\n"):
+        raise BackupCleanupUnproven("backup monitor status framing is invalid")
     try:
-        value = json.loads(bytes(data).decode("utf-8"))
+        value = json.loads(
+            raw[:-1].decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_status_keys,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BackupCleanupUnproven("backup monitor status is malformed") from exc
-    if not isinstance(value, dict) or value.get("schema") != 1:
+    except ValueError as exc:
+        raise BackupCleanupUnproven("backup monitor status is malformed") from exc
+    if type(value) is not dict:
+        raise BackupCleanupUnproven("backup monitor status must be an object")
+    if type(value.get("schema")) is not int or value.get("schema") != 1:
         raise BackupCleanupUnproven("backup monitor status schema is invalid")
     status = value.get("status")
-    if status not in {"completed", "timeout", "cancelled", "namespace_unavailable", "protocol_error", "monitor_error"}:
+    if type(status) is not str:
+        raise BackupCleanupUnproven("backup monitor status name is invalid")
+    allowed = {
+        "completed": {"schema", "status", "returncode"},
+        "timeout": {"schema", "status", "returncode"},
+        "cancelled": {"schema", "status", "returncode"},
+        "probe-ok": {"schema", "status"},
+        "namespace_unavailable": {"schema", "status"},
+        "protocol_error": {"schema", "status"},
+        "monitor_error": {"schema", "status"},
+    }
+    if status not in allowed or set(value) != allowed[status]:
         raise BackupCleanupUnproven("backup monitor status is invalid")
-    if status in {"completed", "cancelled", "timeout"} and (not isinstance(value.get("returncode"), int) or isinstance(value.get("returncode"), bool)):
+    if status in {"completed", "cancelled", "timeout"} and (
+        not isinstance(value.get("returncode"), int)
+        or isinstance(value.get("returncode"), bool)
+    ):
         raise BackupCleanupUnproven("backup monitor return code is invalid")
     return value
 
 
-def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, stdout_fd: int | None, pass_fds: tuple[int, ...], deadline: float, cleanup_reserve_seconds: float) -> DatabaseCommandResult:
+def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, stdout_fd: int | None, pass_fds: tuple[int, ...], deadline: float, cleanup_reserve_seconds: float, probe: bool = False) -> DatabaseCommandResult | None:
     work = cleanup_deadline(deadline, reserve_seconds=cleanup_reserve_seconds)
     caller_deadline = deadline + MONITOR_JOIN_GRACE_SECONDS
+    monitor_path = _monitor_path()
+    try:
+        interpreter = _trusted_executable(sys.executable, _sanitized_env(None))
+    except BackupCommandError as exc:
+        raise BackupMonitorUnavailable("backup monitor interpreter metadata is unsafe") from exc
     status_read, status_write = os.pipe()
     inherited_values = [*pass_fds, status_write] + ([] if stdout_fd is None else [stdout_fd])
     inherited = tuple(dict.fromkeys(inherited_values))
-    args = [sys.executable, str(_monitor_path()), "--status-fd", str(status_write), "--deadline-ns", str(int(deadline * 1e9)), "--cleanup-reserve-ns", str(int(cleanup_reserve_seconds * 1e9)), *[f"--pass-fd={fd}" for fd in inherited if fd != status_write]]
+    args = [
+        interpreter,
+        str(monitor_path),
+        "--status-fd",
+        str(status_write),
+        "--deadline-ns",
+        str(int(deadline * 1e9)),
+        "--cleanup-reserve-ns",
+        str(int(cleanup_reserve_seconds * 1e9)),
+        *[f"--pass-fd={fd}" for fd in inherited if fd != status_write],
+    ]
+    if probe:
+        args.append("--probe")
     if stdout_fd is not None:
         args += ["--stdout-fd", str(stdout_fd)]
-    args += ["--", *command]
+    args += ["--", *(() if probe else command)]
     process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
     status, overflow = bytearray(), [False]
@@ -507,6 +573,12 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
                 if remaining > 0:
                     selector.select(min(remaining, 0.02))
         parsed = _read_monitor_status(status, overflow[0])
+        if probe:
+            if process.returncode != 0 or parsed["status"] != "probe-ok":
+                raise BackupMonitorUnavailable("PID namespace probe failed")
+            return None
+        if parsed["status"] == "probe-ok":
+            raise BackupCleanupUnproven("backup monitor probe status used for command")
         if process.returncode != 0:
             if parsed["status"] == "namespace_unavailable":
                 raise BackupMonitorUnavailable("PID namespace is unavailable")
@@ -557,6 +629,21 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
                 os.close(status_write)
             except OSError:
                 pass
+
+
+def ensure_process_monitor(*, deadline: float | None = None) -> None:
+    """Prove the PID namespace contour before a mutating backup operation."""
+
+    effective = deadline if deadline is not None else operation_deadline(DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    _run_monitor_client(
+        [],
+        env=None,
+        stdout_fd=None,
+        pass_fds=(),
+        deadline=effective,
+        cleanup_reserve_seconds=COMMAND_CLEANUP_RESERVE_SECONDS,
+        probe=True,
+    )
 
 
 def run_database_command(command: list[str], *, env: Mapping[str, str] | None = None, stdout_fd: int | None = None, pass_fds: tuple[int, ...] = (), deadline: float | None = None, cleanup_reserve_seconds: float = COMMAND_CLEANUP_RESERVE_SECONDS) -> DatabaseCommandResult:
@@ -1134,13 +1221,11 @@ def _build_authority_broker():
         try:
             restore = _restore_module if _restore_module is not None else load_restore_module()
             trusted_source = Path(source_root or (Path(app_dir) / "current"))
-            trusted_head = None
-            if not bool(getattr(args, "dump_only", False)):
-                trusted_head = resolve_trusted_head(
-                    trusted_source,
-                    restore=restore,
-                    scope_state=scope_state,
-                )
+            trusted_head = resolve_trusted_head(
+                trusted_source,
+                restore=restore,
+                scope_state=scope_state,
+            )
             capability = make_capability("maintenance", scope_state)
             return public_result(callback(capability, trusted_head, restore))
         finally:
@@ -1529,7 +1614,8 @@ def held_backup_pair(
         except Exception as exc:
             raise BackupSupervisorError("backup manifest is invalid") from exc
         if (
-            not parsed.restore_verified
+            parsed.format_version != manifest_module.MANIFEST_FORMAT_VERSION
+            or not parsed.restore_verified
             or not parsed.alembic_revision_verified
             or parsed.sha256 != dump_sha
             or parsed.size_bytes != dump_stat.st_size
@@ -1711,12 +1797,25 @@ def _empty_evidence(
         "recovery": {
             "restore_drill": "unknown",
             "production_restore": "disabled",
+            "cleanup_status": None,
+            "database_id": None,
+            "operator_action": None,
         },
         "error_class": None,
     }
 
 
 EVIDENCE_KEYS = frozenset(_empty_evidence(operation="x", operation_id="0" * 32, status="started", started_at="x"))
+LEGACY_RECOVERY_KEYS = frozenset({"restore_drill", "production_restore"})
+CURRENT_RECOVERY_KEYS = frozenset(
+    {
+        "restore_drill",
+        "production_restore",
+        "cleanup_status",
+        "database_id",
+        "operator_action",
+    }
+)
 EVIDENCE_SECTION_KEYS = {
     "source": frozenset({"dump_file", "sha256", "size_bytes"}),
     "manifest": frozenset({"file", "sha256", "run_id"}),
@@ -1726,7 +1825,7 @@ EVIDENCE_SECTION_KEYS = {
     "remote_transport": frozenset(
         {"attempted", "uploaded", "head_verified", "object"}
     ),
-    "recovery": frozenset({"restore_drill", "production_restore"}),
+    "recovery": CURRENT_RECOVERY_KEYS,
 }
 REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
@@ -1757,7 +1856,12 @@ def _validate_section_keys(
 def validate_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     if set(payload) != EVIDENCE_KEYS:
         raise BackupEvidenceError("backup evidence schema keys are not closed")
-    if payload.get("schema") != EVIDENCE_SCHEMA or payload.get("kind") != EVIDENCE_KIND:
+    schema = payload.get("schema")
+    if (
+        type(schema) is not int
+        or schema not in {LEGACY_EVIDENCE_SCHEMA, EVIDENCE_SCHEMA}
+        or payload.get("kind") != EVIDENCE_KIND
+    ):
         raise BackupEvidenceError("backup evidence schema version is invalid")
     if payload.get("operation") not in OPERATION_LOCK_MATRIX:
         raise BackupEvidenceError("backup evidence operation is invalid")
@@ -1819,11 +1923,35 @@ def validate_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     _validate_public_text(
         remote["object"], pattern=SAFE_EVIDENCE_NAME_RE, label="remote object"
     )
-    recovery = _validate_section_keys(payload, "recovery")
+    recovery = payload.get("recovery")
+    expected_recovery_keys = (
+        LEGACY_RECOVERY_KEYS if schema == LEGACY_EVIDENCE_SCHEMA else CURRENT_RECOVERY_KEYS
+    )
+    if not isinstance(recovery, dict) or set(recovery) != expected_recovery_keys:
+        raise BackupEvidenceError("backup evidence recovery schema is not closed")
     if recovery["restore_drill"] not in EVIDENCE_STATUSES - {"started"}:
         raise BackupEvidenceError("backup evidence restore state is invalid")
     if recovery["production_restore"] != "disabled":
         raise BackupEvidenceError("backup evidence production restore state is invalid")
+    if schema == EVIDENCE_SCHEMA:
+        cleanup_status = recovery["cleanup_status"]
+        cleanup_id = recovery["database_id"]
+        cleanup_action = recovery["operator_action"]
+        if cleanup_status not in {None, "unproven"}:
+            raise BackupEvidenceError("backup evidence cleanup state is invalid")
+        if cleanup_id is not None and (
+            type(cleanup_id) is not str
+            or RESTORE_DRILL_DATABASE_ID_RE.fullmatch(cleanup_id) is None
+        ):
+            raise BackupEvidenceError("backup evidence cleanup identity is invalid")
+        if cleanup_action not in {None, CLEANUP_OPERATOR_ACTION}:
+            raise BackupEvidenceError("backup evidence cleanup action is invalid")
+        if cleanup_status is None and (cleanup_id is not None or cleanup_action is not None):
+            raise BackupEvidenceError("backup evidence cleanup fields require unproven status")
+        if cleanup_status == "unproven" and (
+            (cleanup_id is None) != (cleanup_action is None)
+        ):
+            raise BackupEvidenceError("backup evidence cleanup fields are incomplete")
     error_class = payload.get("error_class")
     if error_class is not None and (
         not isinstance(error_class, str) or SAFE_ERROR_RE.fullmatch(error_class) is None
@@ -2086,6 +2214,15 @@ class EvidenceSession:
         if "object" in values:
             section["object"] = _safe_public_name(values["object"])
 
+    def record_cleanup(self, database_id: object) -> None:
+        recovery = self.payload["recovery"]
+        recovery["cleanup_status"] = "unproven"
+        recovery["database_id"] = None
+        recovery["operator_action"] = None
+        if isinstance(database_id, str) and RESTORE_DRILL_DATABASE_ID_RE.fullmatch(database_id):
+            recovery["database_id"] = database_id
+            recovery["operator_action"] = CLEANUP_OPERATOR_ACTION
+
     def mark_terminal(self, status: str, *, error_class: str | None = None) -> None:
         if status not in EVIDENCE_STATUSES - {"started"}:
             raise BackupEvidenceError("invalid requested evidence status")
@@ -2145,7 +2282,10 @@ def evidence_session(app_dir: Path, operation: str, *, locks: tuple[str, ...]) -
             signal.signal(number, _cancel_signal_handler)
     try:
         yield session
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        safe_payload = safe_error_payload(exc)
+        if safe_payload.get("cleanup_status") == "unproven":
+            session.record_cleanup(safe_payload.get("database_id"))
         session.finish("cancelled", error_class="cancelled")
         raise
     except BackupLockConflict:
@@ -2154,7 +2294,12 @@ def evidence_session(app_dir: Path, operation: str, *, locks: tuple[str, ...]) -
     except BaseException as exc:
         # Never serialize exception text: it may contain paths, credentials,
         # SQL, or child-process stderr.  The type is intentionally coarse.
-        error_class = "cancelled" if isinstance(exc, (SystemExit,)) else "operation_failed"
+        safe_payload = safe_error_payload(exc)
+        if safe_payload.get("cleanup_status") == "unproven":
+            session.record_cleanup(safe_payload.get("database_id"))
+        error_class = (
+            "cancelled" if isinstance(exc, SystemExit) else safe_payload["error_class"]
+        )
         session.finish("failed", error_class=error_class)
         raise
     else:
@@ -2268,6 +2413,7 @@ def _restore_args(
     env_file: Path | None = None,
     output_dir: Path | None = None,
     admin_database_url: str | None = None,
+    backup_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
 ) -> argparse.Namespace:
     shared = Path(app_dir) / "shared"
     return SimpleNamespace(
@@ -2275,7 +2421,7 @@ def _restore_args(
         output_dir=str(output_dir or (shared / "backups")),
         keep=keep,
         admin_database_url=admin_database_url,
-        dump_only=False,
+        timeout_seconds=backup_timeout_seconds,
     )
 
 
@@ -2292,6 +2438,8 @@ def run_local_backup(
     capability: object,
     lock: BackupLockHandle,
     evidence: EvidenceSession,
+    backup_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Create, verify, and prune one local backup under the final lock."""
 
@@ -2315,6 +2463,7 @@ def run_local_backup(
         env_file=env_file,
         output_dir=output_dir,
         admin_database_url=admin_database_url,
+        backup_timeout_seconds=backup_timeout_seconds,
     )
     # The supervisor, not the low-level producer, owns rotation.  This path
     # passes the in-process capability and explicitly disables nested pruning.
@@ -2323,16 +2472,19 @@ def run_local_backup(
         prune=False,
         capability=capability,
         trusted_alembic_head=trusted_alembic_head,
+        deadline=deadline,
     )
     output_dir = Path(restore_args.output_dir)
     dump = output_dir / str(created["dump_file"])
     manifest = dump.with_suffix(".json")
     pair = snapshot_backup_pair(dump, manifest)
     evidence.update_pair(pair)
-    evidence.payload["recovery"] = {
-        "restore_drill": "passed" if created.get("restore_verified") else "failed",
-        "production_restore": "disabled",
-    }
+    evidence.payload["recovery"].update(
+        {
+            "restore_drill": "passed" if created.get("restore_verified") else "failed",
+            "production_restore": "disabled",
+        }
+    )
     evidence.payload["alembic"] = {
         "revision": (
             created.get("alembic_revision")
@@ -2410,10 +2562,12 @@ def run_offsite(
         Path(args.backup_dir), getattr(args, "dump", None),
         max_age_hours=float(args.max_age_hours), apply=bool(args.apply),
     )
-    work = Path(tempfile.mkdtemp(prefix="oldsparky-offsite-"))
-    work.chmod(0o700)
+    work: Path | None = None
     encrypted: Any | None = None
+    primary: BaseException | None = None
     try:
+        work = Path(tempfile.mkdtemp(prefix="oldsparky-offsite-"))
+        work.chmod(0o700)
         with held_backup_pair(backup.dump_path, backup.metadata_path) as held:
             pair = held.snapshot
             # Selection happened by pathname.  Refuse a selected object whose
@@ -2511,6 +2665,9 @@ def run_offsite(
             )
             _lock_boundary_validate(lock)
             return result
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
         if encrypted is not None and getattr(encrypted, "fd", None) is not None:
             try:
@@ -2518,10 +2675,28 @@ def run_offsite(
             except OSError:
                 pass
         # The temporary ciphertext is deliberately private and never becomes
-        # evidence.  Keep cleanup bounded to the supervisor-owned directory.
-        import shutil
-
-        shutil.rmtree(work, ignore_errors=True)
+        # evidence.  A failed removal is machine-detectable but never masks a
+        # more important operation failure.
+        if work is not None:
+            try:
+                shutil.rmtree(work)
+            except OSError as cleanup_error:
+                if primary is None:
+                    raise BackupCleanupUnproven() from cleanup_error
+                setattr(primary, "backup_cleanup_unproven", "")
+                primary.add_note("offsite temporary ciphertext cleanup was not proven")
+            except BaseException as cleanup_error:
+                setattr(cleanup_error, "backup_cleanup_unproven", "")
+                cleanup_error.add_note(
+                    "offsite temporary ciphertext cleanup was not proven"
+                )
+                if primary is None:
+                    raise
+                setattr(primary, "backup_cleanup_unproven", "")
+                primary.add_note(
+                    "offsite temporary ciphertext cleanup raised a cancellation; "
+                    "the primary failure was retained"
+                )
 
 
 def run_production_restore(*_args: object, **_kwargs: object) -> None:
@@ -2537,7 +2712,31 @@ def _operation_error_status(exc: BaseException) -> tuple[str, str]:
         return "blocked", "production_restore_disabled"
     if isinstance(exc, KeyboardInterrupt):
         return "cancelled", "cancelled"
+    code = getattr(exc, "code", None)
+    if code in {
+        "backup_cleanup_unproven",
+        "backup_command_timeout",
+        "backup_monitor_unavailable",
+    }:
+        return "failed", str(code)
     return "failed", "operation_failed"
+
+
+def safe_error_payload(exc: BaseException) -> dict[str, Any]:
+    """Return the bounded JSON error contract shared by backup CLIs."""
+
+    status, error_class = _operation_error_status(exc)
+    payload: dict[str, Any] = {"ok": False, "status": status, "error_class": error_class}
+    cleanup_id = (
+        exc.database_id
+        if isinstance(exc, BackupCleanupUnproven)
+        else getattr(exc, "backup_cleanup_unproven", None)
+    )
+    if isinstance(exc, BackupCleanupUnproven) or cleanup_id is not None:
+        payload["cleanup_status"] = "unproven"
+        if isinstance(cleanup_id, str) and RESTORE_DRILL_DATABASE_ID_RE.fullmatch(cleanup_id):
+            payload.update(database_id=cleanup_id, operator_action=CLEANUP_OPERATOR_ACTION)
+    return payload
 
 
 def run_offsite_entrypoint(args: argparse.Namespace, *, app_dir: Path) -> dict[str, Any]:
@@ -2568,8 +2767,13 @@ def run_backup_entrypoint(
     app_dir: Path,
     source_release_dir: Path | None = None,
 ) -> dict[str, Any]:
+    timeout_seconds = float(
+        getattr(args, "backup_timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    )
+    deadline = operation_deadline(timeout_seconds)
     requirements = operation_lock_requirements("local-backup")
     with evidence_session(app_dir, "local-backup", locks=requirements) as evidence:
+        ensure_process_monitor(deadline=deadline)
         with ordered_backup_lock_scope(
             app_dir, source_release_dir=source_release_dir, include_predecessors=True
         ) as (lock, _live_qa_lock_fd):
@@ -2589,6 +2793,8 @@ def run_backup_entrypoint(
                     capability=capability,
                     lock=lock,
                     evidence=evidence,
+                    backup_timeout_seconds=timeout_seconds,
+                    deadline=deadline,
                 ),
             )
 
@@ -2596,9 +2802,14 @@ def run_backup_entrypoint(
 def run_maintenance_entrypoint(args: argparse.Namespace) -> dict[str, Any]:
     """Route the production maintenance unit through this supervisor."""
 
+    timeout_seconds = float(
+        getattr(args, "backup_timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    )
+    deadline = operation_deadline(timeout_seconds)
     app_dir = Path(args.app_dir).resolve(strict=True)
     requirements = operation_lock_requirements("maintenance")
     with evidence_session(app_dir, "maintenance", locks=requirements) as evidence:
+        ensure_process_monitor(deadline=deadline)
         with ordered_backup_lock_scope(
             app_dir,
             source_release_dir=getattr(args, "source_release_dir", None),
@@ -2618,6 +2829,7 @@ def run_maintenance_entrypoint(args: argparse.Namespace) -> dict[str, Any]:
                     _live_qa_lock_fd=live_qa_lock_fd,
                     _locks_held=True,
                     _evidence=evidence,
+                    _backup_deadline=deadline,
                 ),
             )
             if report.get("ok") is False:
@@ -2641,6 +2853,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     maintenance.add_argument("--web-artifact-dir", type=Path, default=Path("/root/old_sparky/platform/apps/platform_web"))
     maintenance.add_argument("--backup-keep", type=int, default=14)
     maintenance.add_argument("--backup-max-age-hours", type=float, default=24.0)
+    maintenance.add_argument(
+        "--backup-timeout-seconds",
+        type=float,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    )
     maintenance.add_argument("--release-keep", type=int, default=5)
     maintenance.add_argument("--test-artifact-max-age-days", type=int, default=7)
     maintenance.add_argument("--screenshot-max-age-days", type=int, default=30)
@@ -2659,6 +2876,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     backup.add_argument("--backup-keep", "--keep", dest="keep", type=int, default=14)
     backup.add_argument(
         "--backup-max-age-hours", "--max-age-hours", dest="max_age_hours", type=float, default=24.0
+    )
+    backup.add_argument(
+        "--backup-timeout-seconds",
+        type=float,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
     )
     backup.add_argument("--env-file", type=Path)
     backup.add_argument("--output-dir", type=Path)
@@ -2729,13 +2951,12 @@ def main(argv: list[str] | None = None) -> int:
             print("[OK] Platform backup supervisor completed")
         return 0 if result.get("ok", True) is not False else 1
     except BaseException as exc:
-        status, error_class = _operation_error_status(exc)
-        payload = {"ok": False, "status": status, "error_class": error_class}
+        payload = safe_error_payload(exc)
         if getattr(args, "as_json", False):
             print(json.dumps(payload, sort_keys=True))
         else:
-            print(f"[FAIL] Platform backup supervisor ({error_class})", file=os.sys.stderr)
-        return STATUS_EXIT_CODES.get(status, 1)
+            print(f"[FAIL] Platform backup supervisor ({payload['error_class']})", file=os.sys.stderr)
+        return STATUS_EXIT_CODES.get(payload["status"], 1)
 
 
 if __name__ == "__main__":

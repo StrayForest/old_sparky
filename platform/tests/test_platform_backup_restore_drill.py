@@ -6,12 +6,14 @@ from contextlib import ExitStack, contextmanager
 import datetime as dt
 import hashlib
 import importlib.util
+from io import StringIO
 import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from unittest import mock
@@ -69,34 +71,80 @@ def _trusted_source(source_root: pathlib.Path) -> pathlib.Path:
 
 
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
-    def _creator_args(self, output_dir: pathlib.Path, *, dump_only: bool = True) -> argparse.Namespace:
-        return argparse.Namespace(
+    def setUp(self) -> None:
+        self._ensure_monitor_patch = mock.patch.object(
+            platform_backup_supervisor, "ensure_process_monitor"
+        )
+        self._ensure_monitor_patch.start()
+        self.addCleanup(self._ensure_monitor_patch.stop)
+        self._restore_lock_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._restore_lock_dir.cleanup)
+        restore_lock_path = pathlib.Path(self._restore_lock_dir.name) / "restore-lifecycle.lock"
+        self._restore_lock_path_patch = mock.patch.object(
+            backup_drill, "RESTORE_LIFECYCLE_LOCK_PATH", restore_lock_path
+        )
+        self._restore_lock_path_patch.start()
+        self.addCleanup(self._restore_lock_path_patch.stop)
+        for name, value in (
+            ("RESTORE_LIFECYCLE_LOCK_OWNER", os.geteuid()),
+            ("RESTORE_LIFECYCLE_LOCK_GROUP", os.getegid()),
+        ):
+            patcher = mock.patch.object(backup_drill, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _creator_args(self, output_dir: pathlib.Path, *, real_restore: bool = False) -> argparse.Namespace:
+        args = argparse.Namespace(
             env_file=str(output_dir / ".env.platform"),
             output_dir=str(output_dir),
             keep=2,
             admin_database_url=None,
-            dump_only=dump_only,
         )
+        if real_restore:
+            args._real_restore = True
+        return args
 
     def _create_backup(
         self,
         args: argparse.Namespace,
         *,
         source_root: pathlib.Path | None = None,
+        mock_restore: bool = True,
     ) -> dict[str, object]:
+        if source_root is None and not getattr(args, "_real_restore", False):
+            source_root = pathlib.Path(args.output_dir).parent / "trusted-source"
+            versions = source_root / "alembic" / "versions"
+            versions.mkdir(parents=True, exist_ok=True)
+            (versions / "001.py").write_text(
+                "revision = '20260913_0053'\ndown_revision = None\n",
+                encoding="utf-8",
+            )
         with _held_test_lock() as lock:
-            return platform_backup_supervisor._run_local_backup_scope(
-                args,
-                app_dir=pathlib.Path(args.output_dir),
-                source_root=source_root,
-                _restore_module=backup_drill,
-                lock=lock,
-                callback=lambda capability, trusted_head, _restore: backup_drill.create_backup(
+            def callback(capability, trusted_head, _restore):
+                return backup_drill.create_backup(
                     args,
                     capability=capability,
                     trusted_alembic_head=trusted_head,
-                ),
-            )
+                )
+
+            if getattr(args, "_real_restore", False) or not mock_restore:
+                return platform_backup_supervisor._run_local_backup_scope(
+                    args,
+                    app_dir=pathlib.Path(args.output_dir),
+                    source_root=source_root,
+                    _restore_module=backup_drill,
+                    lock=lock,
+                    callback=callback,
+                )
+            with mock.patch.object(backup_drill, "perform_restore_drill", return_value=1):
+                return platform_backup_supervisor._run_local_backup_scope(
+                    args,
+                    app_dir=pathlib.Path(args.output_dir),
+                    source_root=source_root,
+                    _restore_module=backup_drill,
+                    lock=lock,
+                    callback=callback,
+                )
 
     def _creator_environment(self) -> dict[str, str]:
         return {
@@ -198,6 +246,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         )
         responses = [
             subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                '{"name":"platform_restore_drill_' + "a" * 32 + '","oid":42,"owner":"platform_user"}\n',
+                "",
+            ),
             subprocess.CompletedProcess([], 0, "CREATE EXTENSION\n", ""),
             subprocess.CompletedProcess([], 0, "CREATE SCHEMA\n", ""),
             subprocess.CompletedProcess([], 0, "", ""),
@@ -206,6 +261,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "1\n", ""),
             subprocess.CompletedProcess([], 0, "20260801_0036\n", ""),
             subprocess.CompletedProcess([], 0, "1\n", ""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                '{"name":"platform_restore_drill_' + "a" * 32 + '","oid":42,"owner":"platform_user"}\n',
+                "",
+            ),
             subprocess.CompletedProcess([], 0, "", ""),
         ]
 
@@ -213,22 +274,514 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             backup_drill, "run_command", side_effect=responses
         ) as run_command, mock.patch.object(
             backup_drill, "_trusted_alembic_head", return_value="20260801_0036"
-        ):
+        ), mock.patch.object(backup_drill.secrets, "token_hex", return_value="a" * 32):
             table_count = backup_drill.perform_restore_drill(
                 pathlib.Path(temporary_dir) / "backup.dump",
                 app_target=target,
                 admin_target=None,
                 helpers=TEST_HELPERS,
-                timestamp_slug="20260720T120000Z",
                 expected_alembic_head="20260801_0036",
+                deadline=platform_backup_supervisor.operation_deadline(30.0),
             )
 
         self.assertEqual(table_count, 22)
-        self.assertTrue(run_command.call_args_list[1].kwargs["capture_output"])
-        self.assertTrue(run_command.call_args_list[2].kwargs["capture_output"])
-        self.assertIn("CREATE SCHEMA platform", run_command.call_args_list[2].args[0][-1])
-        self.assertIn("--schema=platform", run_command.call_args_list[3].args[0])
-        self.assertIn("--schema=public", run_command.call_args_list[4].args[0])
+        self.assertTrue(run_command.call_args_list[3].kwargs["capture_output"])
+        self.assertTrue(run_command.call_args_list[4].kwargs["capture_output"])
+        self.assertIn("CREATE SCHEMA platform", run_command.call_args_list[4].args[0][-1])
+        self.assertIn("--schema=platform", run_command.call_args_list[5].args[0])
+        self.assertIn("--schema=public", run_command.call_args_list[6].args[0])
+
+    @staticmethod
+    def _identity_json(name: str, *, oid: int = 42, owner: str = "platform_user") -> str:
+        return json.dumps({"name": name, "oid": oid, "owner": owner}) + "\n"
+
+    def test_restore_drill_drops_only_matching_database_identity(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "a" * 32
+        identity = self._identity_json(database)
+        responses = [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, identity, ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "1\n", ""),
+            subprocess.CompletedProcess([], 0, "1\n", ""),
+            subprocess.CompletedProcess([], 0, "head\n", ""),
+            subprocess.CompletedProcess([], 0, "0\n", ""),
+            subprocess.CompletedProcess([], 0, identity, ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with (
+            mock.patch.object(backup_drill, "run_command", side_effect=responses) as run_command,
+            mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+            mock.patch.object(backup_drill.secrets, "token_hex", return_value="a" * 32),
+            mock.patch.object(backup_drill, "REQUIRED_PLATFORM_EXTENSIONS", ()),
+        ):
+            self.assertEqual(
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/tmp/backup.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    helpers=TEST_HELPERS,
+                    expected_alembic_head="head",
+                    deadline=platform_backup_supervisor.operation_deadline(30.0),
+                ),
+                1,
+            )
+
+        command_names = [
+            pathlib.Path(
+                call.args[0][4] if pathlib.Path(call.args[0][0]).name == "runuser" else call.args[0][0]
+            ).name
+            for call in run_command.call_args_list
+        ]
+        self.assertEqual(command_names[-1], "dropdb")
+        self.assertGreater(
+            run_command.call_args_list[2].kwargs["cleanup_reserve_seconds"], 0
+        )
+        self.assertEqual(
+            run_command.call_args_list[-2].kwargs["cleanup_reserve_seconds"], 0.0
+        )
+
+    def test_restore_drill_never_drops_replaced_or_owner_mismatched_database(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        for changed in (
+            {"oid": 99, "owner": "platform_user"},
+            {"oid": 42, "owner": "other_owner"},
+        ):
+            with self.subTest(changed=changed):
+                database = "platform_restore_drill_" + "b" * 32
+                responses = [
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess(
+                        [], 0, self._identity_json(database), ""
+                    ),
+                    RuntimeError("restore failed"),
+                    subprocess.CompletedProcess(
+                        [], 0, self._identity_json(database, **changed), ""
+                    ),
+                ]
+                with (
+                    mock.patch.object(backup_drill, "run_command", side_effect=responses) as run_command,
+                    mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+                    mock.patch.object(backup_drill.secrets, "token_hex", return_value="b" * 32),
+                    mock.patch.object(backup_drill, "REQUIRED_PLATFORM_EXTENSIONS", ()),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "restore failed") as raised:
+                        backup_drill.perform_restore_drill(
+                            pathlib.Path("/tmp/backup.dump"),
+                            app_target=target,
+                            admin_target=None,
+                            helpers=TEST_HELPERS,
+                            expected_alembic_head="head",
+                            deadline=platform_backup_supervisor.operation_deadline(30.0),
+                        )
+                self.assertEqual(
+                    getattr(raised.exception, "backup_cleanup_unproven", None),
+                    database,
+                )
+                command_names = [
+                    pathlib.Path(
+                        call.args[0][4]
+                        if pathlib.Path(call.args[0][0]).name == "runuser"
+                        else call.args[0][0]
+                    ).name
+                    for call in run_command.call_args_list
+                ]
+                self.assertNotIn("dropdb", command_names)
+
+    def test_restore_lifecycle_lock_blocks_an_in_scope_second_creator(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            lock_path = pathlib.Path(temporary_dir) / "restore-lifecycle.lock"
+            with mock.patch.object(backup_drill, "RESTORE_LIFECYCLE_LOCK_PATH", lock_path):
+                with backup_drill._restore_lifecycle_lock(time.monotonic() + 5):
+                    with mock.patch.object(backup_drill, "run_command") as run_command:
+                        with self.assertRaises(platform_backup_supervisor.BackupCommandTimeout):
+                            backup_drill.perform_restore_drill(
+                                pathlib.Path("/tmp/backup.dump"),
+                                app_target=target,
+                                admin_target=None,
+                                helpers=TEST_HELPERS,
+                                deadline=time.monotonic() + 2.2,
+                            )
+                        run_command.assert_not_called()
+
+    def test_restore_drill_rejects_initial_owner_mismatch_without_adoption(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "e" * 32
+        with (
+            mock.patch.object(
+                backup_drill,
+                "run_command",
+                side_effect=[
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess(
+                        [], 0, self._identity_json(database, owner="other_owner"), ""
+                    ),
+                ],
+            ) as run_command,
+            mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+            mock.patch.object(backup_drill.secrets, "token_hex", return_value="e" * 32),
+        ):
+            with self.assertRaises(
+                platform_backup_supervisor.BackupCleanupUnproven
+            ) as raised:
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/tmp/backup.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    helpers=TEST_HELPERS,
+                    expected_alembic_head="head",
+                    deadline=platform_backup_supervisor.operation_deadline(30.0),
+                )
+        self.assertEqual(raised.exception.database_id, database)
+        self.assertEqual(run_command.call_count, 3)
+
+    def test_cleanup_cancellation_keeps_sanitized_identity_for_primary_and_cleanup(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "f" * 32
+        for cancellation in (KeyboardInterrupt, SystemExit):
+            with self.subTest(cancellation=cancellation):
+                responses = [
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, self._identity_json(database), ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    RuntimeError("restore failed"),
+                    cancellation(),
+                ]
+                with (
+                    mock.patch.object(backup_drill, "run_command", side_effect=responses),
+                    mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+                    mock.patch.object(backup_drill.secrets, "token_hex", return_value="f" * 32),
+                    mock.patch.object(backup_drill, "REQUIRED_PLATFORM_EXTENSIONS", ()),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "restore failed") as raised:
+                        backup_drill.perform_restore_drill(
+                            pathlib.Path("/tmp/backup.dump"),
+                            app_target=target,
+                            admin_target=None,
+                            helpers=TEST_HELPERS,
+                            expected_alembic_head="head",
+                            deadline=platform_backup_supervisor.operation_deadline(30.0),
+                        )
+                self.assertEqual(
+                    getattr(raised.exception, "backup_cleanup_unproven", None), database
+                )
+
+    def test_cleanup_only_cancellation_keeps_sanitized_identity(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "1" * 32
+        for cancellation in (KeyboardInterrupt, SystemExit):
+            with self.subTest(cancellation=cancellation):
+                responses = [
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, self._identity_json(database), ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "1\n", ""),
+                    subprocess.CompletedProcess([], 0, "1\n", ""),
+                    subprocess.CompletedProcess([], 0, "head\n", ""),
+                    subprocess.CompletedProcess([], 0, "0\n", ""),
+                    cancellation(),
+                ]
+                with (
+                    mock.patch.object(backup_drill, "run_command", side_effect=responses),
+                    mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+                    mock.patch.object(backup_drill.secrets, "token_hex", return_value="1" * 32),
+                    mock.patch.object(backup_drill, "REQUIRED_PLATFORM_EXTENSIONS", ()),
+                ):
+                    with self.assertRaises(cancellation) as raised:
+                        backup_drill.perform_restore_drill(
+                            pathlib.Path("/tmp/backup.dump"),
+                            app_target=target,
+                            admin_target=None,
+                            helpers=TEST_HELPERS,
+                            expected_alembic_head="head",
+                            deadline=platform_backup_supervisor.operation_deadline(30.0),
+                        )
+                self.assertEqual(
+                    getattr(raised.exception, "backup_cleanup_unproven", None), database
+                )
+                payload = platform_backup_supervisor.safe_error_payload(raised.exception)
+                self.assertEqual(payload["cleanup_status"], "unproven")
+                self.assertEqual(payload["database_id"], database)
+
+    def test_create_and_identity_cancellation_persist_real_cleanup_evidence(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "2" * 32
+        for phase in ("create", "identity"):
+            for cancellation in (KeyboardInterrupt, SystemExit):
+                with self.subTest(phase=phase, cancellation=cancellation):
+                    with tempfile.TemporaryDirectory() as temporary_dir:
+                        app_dir = pathlib.Path(temporary_dir)
+                        (app_dir / "shared").mkdir()
+                        responses = [subprocess.CompletedProcess([], 0, "", "")]
+                        if phase == "identity":
+                            responses.append(subprocess.CompletedProcess([], 0, "", ""))
+                        responses.append(cancellation())
+                        with (
+                            mock.patch.object(backup_drill, "run_command", side_effect=responses),
+                            mock.patch.object(
+                                backup_drill, "_trusted_alembic_head", return_value="head"
+                            ),
+                            mock.patch.object(
+                                backup_drill.secrets, "token_hex", return_value="2" * 32
+                            ),
+                        ):
+                            with self.assertRaises(cancellation):
+                                with platform_backup_supervisor.evidence_session(
+                                    app_dir,
+                                    "local-backup",
+                                    locks=platform_backup_supervisor.LOCK_ORDER,
+                                ):
+                                    backup_drill.perform_restore_drill(
+                                        pathlib.Path("/tmp/backup.dump"),
+                                        app_target=target,
+                                        admin_target=None,
+                                        helpers=TEST_HELPERS,
+                                        expected_alembic_head="head",
+                                        deadline=platform_backup_supervisor.operation_deadline(30.0),
+                                    )
+                        evidence = platform_backup_supervisor.read_latest_evidence(app_dir)
+                        self.assertEqual(evidence["recovery"]["cleanup_status"], "unproven")
+                        self.assertEqual(evidence["recovery"]["database_id"], database)
+                        self.assertEqual(
+                            evidence["recovery"]["operator_action"],
+                            platform_backup_supervisor.CLEANUP_OPERATOR_ACTION,
+                        )
+
+    def test_restore_drill_identity_capture_rejects_absent_ambiguous_and_timeout(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "c" * 32
+        identity_outputs = (
+            "",
+            "{}\n{}\n",
+            (
+                '{"name":"'
+                + database
+                + '","name":"'
+                + database
+                + '","oid":42,"owner":"platform_user"}\n'
+            ),
+        )
+        for identity_output in identity_outputs:
+            with self.subTest(identity_output=identity_output):
+                with (
+                    mock.patch.object(
+                        backup_drill,
+                        "run_command",
+                        side_effect=[
+                            subprocess.CompletedProcess([], 0, "", ""),
+                            subprocess.CompletedProcess([], 0, "", ""),
+                            subprocess.CompletedProcess([], 0, identity_output, ""),
+                        ],
+                    ) as run_command,
+                    mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+                    mock.patch.object(backup_drill.secrets, "token_hex", return_value="c" * 32),
+                ):
+                    with self.assertRaises(platform_backup_supervisor.BackupCleanupUnproven):
+                        backup_drill.perform_restore_drill(
+                            pathlib.Path("/tmp/backup.dump"),
+                            app_target=target,
+                            admin_target=None,
+                            helpers=TEST_HELPERS,
+                            expected_alembic_head="head",
+                            deadline=platform_backup_supervisor.operation_deadline(30.0),
+                        )
+                self.assertEqual(run_command.call_count, 3)
+
+        with (
+            mock.patch.object(
+                backup_drill,
+                "run_command",
+                side_effect=[
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    platform_backup_supervisor.BackupCommandTimeout(),
+                ],
+            ) as run_command,
+            mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+            mock.patch.object(backup_drill.secrets, "token_hex", return_value="c" * 32),
+        ):
+            with self.assertRaises(platform_backup_supervisor.BackupCleanupUnproven):
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/tmp/backup.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    helpers=TEST_HELPERS,
+                    expected_alembic_head="head",
+                    deadline=platform_backup_supervisor.operation_deadline(30.0),
+                )
+        self.assertEqual(run_command.call_count, 3)
+
+    def test_create_backup_persists_real_cleanup_identity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir) / "backups"
+            output_dir.mkdir()
+            trusted_source = _trusted_source(pathlib.Path(temporary_dir) / "trusted-source")
+            args = self._creator_args(output_dir, real_restore=True)
+            database = "platform_restore_drill_" + "d" * 32
+            calls: list[list[str]] = []
+
+            def fake_run_command(
+                command: list[str], *, stdout: int | None = None, **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                executable = pathlib.Path(command[0]).name
+                nested = pathlib.Path(command[4]).name if executable == "runuser" else executable
+                if nested == "pg_dump":
+                    assert stdout is not None
+                    os.write(stdout, b"PGDMP durable cleanup evidence")
+                if nested == "pg_restore":
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                if nested == "psql":
+                    query = command[-1]
+                    if "json_build_object" in query:
+                        identity = {
+                            "name": database,
+                            "oid": 99 if sum("json_build_object" in item[-1] for item in calls) > 1 else 42,
+                            "owner": "platform_user",
+                        }
+                        return subprocess.CompletedProcess(
+                            command, 0, json.dumps(identity) + "\n", ""
+                        )
+                    if "pg_database" in query:
+                        return subprocess.CompletedProcess(command, 0, "", "")
+                    if "information_schema.tables" in query:
+                        return subprocess.CompletedProcess(command, 0, "1\n", "")
+                    if query == "SELECT 1;":
+                        return subprocess.CompletedProcess(command, 0, "1\n", "")
+                    if "version_num" in query:
+                        return subprocess.CompletedProcess(command, 0, "20260913_0053\n", "")
+                    if "pg_extension" in query:
+                        return subprocess.CompletedProcess(command, 0, "1\n", "")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ,
+                    self._creator_environment(),
+                    clear=False,
+                ),
+                mock.patch.object(
+                    backup_drill, "load_env", return_value=self._creator_environment()
+                ),
+                mock.patch.object(
+                    backup_drill, "require_commands", return_value=TEST_HELPERS
+                ),
+                mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
+                mock.patch.object(backup_drill.secrets, "token_hex", return_value="d" * 32),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "restore verification failed"):
+                    self._create_backup(args, source_root=trusted_source)
+
+            manifest_path = next(output_dir.glob("*.json"))
+            parsed = manifest_contract.read_manifest_file(
+                manifest_path,
+                expected_owner=os.geteuid(),
+                expected_group=os.getegid(),
+            ).manifest
+            self.assertEqual(parsed.restore_error, "cleanup_unproven")
+            self.assertEqual(parsed.cleanup_status, "unproven")
+            self.assertEqual(parsed.database_id, database)
+            self.assertEqual(
+                parsed.operator_action,
+                platform_backup_supervisor.CLEANUP_OPERATOR_ACTION,
+            )
+            command_names = [
+                pathlib.Path(
+                    command[4] if pathlib.Path(command[0]).name == "runuser" else command[0]
+                ).name
+                for command in calls
+            ]
+            self.assertNotIn("dropdb", command_names)
+
+    def test_manifest_write_failure_retains_cleanup_identity_in_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            args = self._creator_args(output_dir, real_restore=True)
+            trusted_source = _trusted_source(root / "trusted-source")
+            database = "platform_restore_drill_" + "e" * 32
+
+            def fake_run_command(
+                command: list[str], *, stdout: int | None = None, **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                if pathlib.Path(command[0]).name == "pg_dump":
+                    assert stdout is not None
+                    os.write(stdout, b"PGDMP manifest failure")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ, self._creator_environment(), clear=False
+                ),
+                mock.patch.object(
+                    backup_drill, "load_env", return_value=self._creator_environment()
+                ),
+                mock.patch.object(
+                    backup_drill, "require_commands", return_value=TEST_HELPERS
+                ),
+                mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
+                mock.patch.object(
+                    backup_drill,
+                    "perform_restore_drill",
+                    side_effect=platform_backup_supervisor.BackupCleanupUnproven(
+                        database_id=database
+                    ),
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "write_manifest",
+                    side_effect=backup_drill.BackupManifestError("manifest write failed"),
+                ),
+            ):
+                with self.assertRaises(backup_drill.BackupManifestError) as raised:
+                    with platform_backup_supervisor.evidence_session(
+                        root,
+                        "local-backup",
+                        locks=platform_backup_supervisor.LOCK_ORDER,
+                    ):
+                        self._create_backup(args, source_root=trusted_source)
+
+            payload = platform_backup_supervisor.safe_error_payload(raised.exception)
+            self.assertEqual(payload["cleanup_status"], "unproven")
+            self.assertEqual(payload["database_id"], database)
+            self.assertEqual(
+                payload["operator_action"],
+                platform_backup_supervisor.CLEANUP_OPERATOR_ACTION,
+            )
+            evidence = platform_backup_supervisor.read_latest_evidence(root)
+            self.assertEqual(evidence["recovery"]["database_id"], database)
+            self.assertEqual(
+                evidence["recovery"]["operator_action"],
+                platform_backup_supervisor.CLEANUP_OPERATOR_ACTION,
+            )
 
     def test_restore_drill_rejects_explicit_head_not_in_trusted_graph(self) -> None:
         target = backup_drill.DatabaseTarget(
@@ -244,13 +797,111 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     app_target=target,
                     admin_target=None,
                     helpers=TEST_HELPERS,
-                    timestamp_slug="20261001T120000Z",
                     expected_alembic_head="not-current-head",
                     source_root=source_root,
+                    deadline=platform_backup_supervisor.operation_deadline(30.0),
                 )
 
         trusted_head.assert_called_once_with(source_root)
         run_command.assert_not_called()
+
+    def test_main_forwards_legacy_timeout_to_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            args = argparse.Namespace(
+                check_latest=False,
+                output_dir=str(pathlib.Path(temporary_dir) / "backups"),
+                keep=2,
+                max_age_hours=24.0,
+                env_file=str(pathlib.Path(temporary_dir) / ".env.platform"),
+                admin_database_url=None,
+                timeout_seconds=37.5,
+                as_json=False,
+            )
+            with (
+                mock.patch.object(backup_drill, "parse_args", return_value=args),
+                mock.patch.object(
+                    platform_backup_supervisor,
+                    "run_backup_entrypoint",
+                    return_value={"ok": True},
+                ) as run_backup_entrypoint,
+                mock.patch.object(backup_drill, "print_result"),
+            ):
+                self.assertEqual(backup_drill.main(), 0)
+
+        forwarded_args = run_backup_entrypoint.call_args.args[0]
+        self.assertEqual(forwarded_args.backup_timeout_seconds, 37.5)
+        self.assertFalse(hasattr(forwarded_args, "timeout_seconds"))
+
+    def test_ambiguous_create_never_attempts_drop(self) -> None:
+        target = backup_drill.DatabaseTarget("127.0.0.1", 5432, "platform_user", None, "platformdb")
+        with mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"), mock.patch.object(
+            backup_drill, "run_command", side_effect=[subprocess.CompletedProcess([], 0, "", ""), platform_backup_supervisor.BackupCommandTimeout()]
+        ) as run_command:
+            with self.assertRaises(platform_backup_supervisor.BackupCleanupUnproven) as error:
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/tmp/backup.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    helpers=TEST_HELPERS,
+                    deadline=platform_backup_supervisor.operation_deadline(30.0),
+                )
+        self.assertRegex(error.exception.database_id or "", platform_backup_supervisor.RESTORE_DRILL_DATABASE_ID_RE)
+        self.assertEqual(run_command.call_count, 2)
+
+    def test_json_cli_errors_use_bounded_shared_payload(self) -> None:
+        args = argparse.Namespace(
+            check_latest=True, output_dir="/tmp",
+            max_age_hours=24.0, as_json=True,
+        )
+        human_args = argparse.Namespace(**{**vars(args), "as_json": False})
+        valid_id = "platform_restore_drill_" + "a" * 32
+        primary_valid = RuntimeError("primary-secret")
+        primary_valid.backup_cleanup_unproven = valid_id
+        primary_invalid = RuntimeError("primary-secret")
+        primary_invalid.backup_cleanup_unproven = "arbitrary-secret"
+        failures = (
+            (platform_backup_supervisor.BackupCleanupUnproven(database_id=valid_id), "backup_cleanup_unproven", valid_id, "unproven"),
+            (platform_backup_supervisor.BackupCleanupUnproven(database_id="secret-id"), "backup_cleanup_unproven", None, "unproven"),
+            (primary_valid, "operation_failed", valid_id, "unproven"),
+            (primary_invalid, "operation_failed", None, "unproven"),
+            (RuntimeError("stderr=password https://user:secret@example.invalid/db"), "operation_failed", None, None),
+        )
+        for failure, expected_class, expected_id, expected_cleanup in failures:
+            expected_action = platform_backup_supervisor.CLEANUP_OPERATOR_ACTION if expected_id else None
+            expected = platform_backup_supervisor.safe_error_payload(failure)
+            self.assertEqual(expected["error_class"], expected_class)
+            self.assertEqual(expected.get("cleanup_status"), expected_cleanup)
+            with mock.patch.object(backup_drill, "parse_args", return_value=args), mock.patch.object(
+                backup_drill, "check_latest_backup", side_effect=failure
+            ), mock.patch("builtins.print") as printed:
+                self.assertEqual(backup_drill.main(), 1)
+            raw = printed.call_args.args[0]
+            payload = json.loads(raw)
+            self.assertEqual(payload, expected)
+            self.assertNotRegex(raw, r"password|secret|postgres://|arbitrary-secret")
+            self.assertEqual(payload.get("database_id"), expected_id)
+            self.assertEqual(
+                payload.get("operator_action"),
+                expected_action,
+            )
+            with mock.patch.object(backup_drill, "parse_args", return_value=human_args), mock.patch.object(
+                backup_drill, "check_latest_backup", side_effect=failure
+            ), mock.patch("sys.stderr", new_callable=StringIO) as stderr:
+                self.assertEqual(backup_drill.main(), 1)
+            self.assertIn(expected_class, stderr.getvalue())
+            self.assertNotRegex(stderr.getvalue(), r"password|secret|postgres://|arbitrary-secret")
+            with mock.patch.object(platform_backup_supervisor, "run_backup_entrypoint", side_effect=failure), mock.patch(
+                "builtins.print"
+            ) as printed:
+                self.assertEqual(platform_backup_supervisor.main(["backup", "--json"]), 1)
+            supervisor_payload = json.loads(printed.call_args.args[0])
+            self.assertEqual(supervisor_payload, expected)
+            with mock.patch.object(platform_backup_supervisor, "run_backup_entrypoint", side_effect=failure), mock.patch(
+                "sys.stderr", new_callable=StringIO
+            ) as stderr:
+                self.assertEqual(platform_backup_supervisor.main(["backup"]), 1)
+            self.assertIn(expected_class, stderr.getvalue())
+            self.assertNotRegex(stderr.getvalue(), r"password|secret|postgres://|arbitrary-secret")
 
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -286,6 +937,40 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(result["restored_table_count"], 31)
 
+    def test_check_latest_rejects_read_only_legacy_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = pathlib.Path(temporary_dir)
+            now = dt.datetime.now(dt.UTC)
+            run_id = "a" * 32
+            dump_path = output_dir / f"platformdb-{now:%Y%m%dT%H%M%SZ}-{run_id}.dump"
+            dump_path.write_bytes(b"custom-format-backup")
+            dump_path.chmod(0o600)
+            current = manifest_contract.build_manifest(
+                run_id=run_id,
+                dump_file=dump_path.name,
+                size_bytes=dump_path.stat().st_size,
+                sha256=hashlib.sha256(dump_path.read_bytes()).hexdigest(),
+                started_at_utc=now,
+                completed_at_utc=now,
+                duration_seconds=0,
+                restore_verified=True,
+                alembic_revision_verified=True,
+                restored_table_count=31,
+                restore_error=None,
+            )
+            legacy = {
+                key: value
+                for key, value in current.items()
+                if key in manifest_contract.LEGACY_MANIFEST_KEY_SET
+            }
+            legacy["format_version"] = manifest_contract.LEGACY_MANIFEST_FORMAT_VERSION
+            metadata_path = dump_path.with_suffix(".json")
+            metadata_path.write_text(json.dumps(legacy), encoding="utf-8")
+            metadata_path.chmod(0o600)
+
+            with self.assertRaisesRegex(RuntimeError, "legacy manifest"):
+                backup_drill.check_latest_backup(output_dir, max_age_hours=24)
+
     def test_check_latest_cli_rejects_unverified_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = pathlib.Path(temporary_dir)
@@ -307,7 +992,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                         restore_verified=False,
                         alembic_revision_verified=False,
                         restored_table_count=None,
-                        restore_error="restore not run",
+                        restore_error="restore_verification_failed",
                     )
                 ),
                 encoding="utf-8",
@@ -328,7 +1013,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 1)
-            self.assertIn("not restore-verified", result.stderr)
+            self.assertIn("[FAIL] Platform backup restore (operation_failed)", result.stderr)
 
     def test_prune_unverified_backups_keeps_verified_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -356,7 +1041,9 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                             restore_verified=restore_verified,
                             alembic_revision_verified=restore_verified,
                             restored_table_count=1 if restore_verified else None,
-                            restore_error=None if restore_verified else "restore failed",
+                            restore_error=None
+                            if restore_verified
+                            else "restore_verification_failed",
                         )
                     ),
                     encoding="utf-8",
@@ -390,7 +1077,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             def fake_run_command(
                 command: list[str], *, stdout: int | None = None, **_: object
             ) -> subprocess.CompletedProcess[str]:
-                if command[0] == "pg_dump":
+                if pathlib.Path(command[0]).name == "pg_dump":
                     assert stdout is not None
                     self.assertNotIn("--file", command)
                     os.write(stdout, b"PGDMP concurrent creator output")
@@ -409,11 +1096,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     ),
                     mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
                     mock.patch.object(backup_drill, "utc_now", return_value=fixed_now),
+                    mock.patch.object(backup_drill, "perform_restore_drill", return_value=1),
                 ):
                     results = list(
                         executor.map(
                             lambda _index: self._create_backup(
-                                self._creator_args(output_dir)
+                                self._creator_args(output_dir),
+                                mock_restore=False,
                             ),
                             range(2),
                         )
@@ -493,7 +1182,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 def racing_run_command(
                     command: list[str], *, stdout: int | None = None, **_: object
                 ) -> subprocess.CompletedProcess[str]:
-                    if command[0] == "pg_dump":
+                    if pathlib.Path(command[0]).name == "pg_dump":
                         assert stdout is not None
                         os.write(stdout, b"PGDMP race output")
                         temporary_path.unlink()
@@ -539,7 +1228,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 def fake_run_command(
                     command: list[str], *, stdout: int | None = None, **_: object
                 ) -> subprocess.CompletedProcess[str]:
-                    if command[0] == "pg_dump":
+                    if pathlib.Path(command[0]).name == "pg_dump":
                         assert stdout is not None
                         os.write(stdout, b"PGDMP failure-injection output")
                     return subprocess.CompletedProcess(command, 0, "", "")
@@ -610,7 +1299,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 output_dir=str(output_dir),
                 keep=1,
                 admin_database_url=None,
-                dump_only=False,
+                _real_restore=True,
             )
             trusted_source = _trusted_source(output_dir / "trusted-source")
 
@@ -623,13 +1312,15 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             def fake_run_command(
                 command: list[str], *, stdout: int | None = None, **_: object
             ) -> subprocess.CompletedProcess[str]:
-                if command[0] == "pg_dump":
+                if pathlib.Path(command[0]).name == "pg_dump":
                     assert stdout is not None
                     backup_drill.os.write(stdout, b"PGDMP new-backup")
                     return subprocess.CompletedProcess(command, 0, "", "")
-                if command[0] == "pg_restore":
-                    return subprocess.CompletedProcess(command, 0, "", "")
-                raise RuntimeError("restore failed")
+                if pathlib.Path(command[0]).name == "pg_restore":
+                    if "--list" in command:
+                        return subprocess.CompletedProcess(command, 0, "", "")
+                    raise RuntimeError("restore failed")
+                return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
                 mock.patch.dict(
@@ -668,6 +1359,59 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             self.assertTrue(old_dump.exists())
             self.assertTrue(old_metadata.exists())
             self.assertGreaterEqual(len(tuple(output_dir.glob("platformdb-*.dump"))), 2)
+
+            valid_id = "platform_restore_drill_" + "b" * 32
+            for index, (failure, expected_error, expected_id) in enumerate(
+                (
+                    (RuntimeError("primary-secret"), "restore_verification_failed", valid_id),
+                    (platform_backup_supervisor.BackupCommandTimeout(), "backup_command_timeout", valid_id),
+                    (RuntimeError("primary-secret"), "restore_verification_failed", None),
+                    (platform_backup_supervisor.BackupCommandTimeout(), "backup_command_timeout", None),
+                )
+            ):
+                if expected_id is not None:
+                    failure.backup_cleanup_unproven = expected_id
+                else:
+                    failure.backup_cleanup_unproven = "arbitrary-secret"
+                case_dir = output_dir / f"round-trip-{index}"
+                case_dir.mkdir()
+                def round_trip_command(
+                    command: list[str], *, stdout: int | None = None, **_: object
+                ) -> subprocess.CompletedProcess[str]:
+                    if pathlib.Path(command[0]).name == "pg_dump":
+                        assert stdout is not None
+                        backup_drill.os.write(stdout, b"PGDMP decorated restore failure")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                with (mock.patch.dict(backup_drill.os.environ, self._creator_environment(), clear=False),
+                      mock.patch.object(backup_drill, "load_env", return_value=self._creator_environment()),
+                      mock.patch.object(
+                          backup_drill, "require_commands", return_value=TEST_HELPERS
+                      ),
+                      mock.patch.object(backup_drill, "run_command", side_effect=round_trip_command),
+                      mock.patch.object(backup_drill, "perform_restore_drill", side_effect=failure)):
+                    with self.assertRaisesRegex(RuntimeError, "restore verification failed") as raised:
+                        self._create_backup(
+                            self._creator_args(case_dir, real_restore=True),
+                            source_root=_trusted_source(case_dir / "trusted-source"),
+                        )
+                wrapped = platform_backup_supervisor.safe_error_payload(raised.exception)
+                self.assertEqual((wrapped.get("cleanup_status"), wrapped.get("database_id")),
+                                 ("unproven", expected_id))
+
+                manifest_path = next(case_dir.glob("*.json"))
+                parsed = manifest_contract.read_manifest_file(
+                    manifest_path,
+                    expected_owner=os.geteuid(),
+                    expected_group=os.getegid(),
+                ).manifest
+                self.assertEqual(parsed.restore_error, expected_error)
+                self.assertEqual(parsed.cleanup_status, "unproven")
+                self.assertEqual(parsed.database_id, expected_id)
+                self.assertEqual(
+                    parsed.operator_action,
+                    platform_backup_supervisor.CLEANUP_OPERATOR_ACTION if expected_id else None,
+                )
 
 
 if __name__ == "__main__":

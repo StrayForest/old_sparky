@@ -30,6 +30,7 @@ try:
     from .platform_backup_manifest import (
         BACKUP_NAME_RE,
         BackupManifestError,
+        MANIFEST_FORMAT_VERSION,
         read_private_prefix,
         read_manifest_file,
         sha256_private_file,
@@ -39,6 +40,7 @@ except ImportError:  # Direct execution from the tools directory.
         from tools.platform_backup_manifest import (
             BACKUP_NAME_RE,
             BackupManifestError,
+            MANIFEST_FORMAT_VERSION,
             read_private_prefix,
             read_manifest_file,
             sha256_private_file,
@@ -47,6 +49,7 @@ except ImportError:  # Direct execution from the tools directory.
         from platform_backup_manifest import (  # type: ignore[no-redef]
             BACKUP_NAME_RE,
             BackupManifestError,
+            MANIFEST_FORMAT_VERSION,
             read_private_prefix,
             read_manifest_file,
             sha256_private_file,
@@ -455,13 +458,14 @@ def select_verified_backup(
         ) from exc
     manifest = manifest_file.manifest
     if (
-        manifest.database != "platformdb"
+        manifest.format_version != MANIFEST_FORMAT_VERSION
+        or manifest.database != "platformdb"
         or manifest.schemas != ("platform", "public")
         or not manifest.restore_verified
         or not manifest.alembic_revision_verified
     ):
         raise OffsiteBackupError(
-            "Only a format-v2, Alembic-checked, restore-verified platformdb backup may be uploaded.",
+            "Only a current-format, Alembic-checked, restore-verified platformdb backup may be uploaded.",
             ExitCode.SOURCE_BACKUP,
         )
     try:
@@ -568,7 +572,12 @@ def select_verified_backup(
     )
 
 
-def _run_gpg(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _run_gpg(
+    command: list[str],
+    *,
+    check: bool = True,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
     try:
         # Every argv is built by this module; no shell parsing is involved.
         return subprocess.run(  # nosec B603
@@ -581,6 +590,7 @@ def _run_gpg(command: list[str], *, check: bool = True) -> subprocess.CompletedP
                 "LC_ALL": "C",
                 "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
             },
+            pass_fds=pass_fds,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise OffsiteBackupError(
@@ -974,6 +984,7 @@ def encrypt_backup_from_fd(
                 f"/proc/self/fd/{output_fd}",
             ],
             check=False,
+            pass_fds=(output_fd,),
         )
         has_public_key_packet = ":pubkey enc packet:" in packet_result.stdout
         has_encrypted_data_packet = any(

@@ -456,10 +456,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 160,
     "module_digest": "08f55150df4576133f20a776347836c1561cb4a156a0713e9e47e59bb44b52e2",
-    "test_count": 1527,
-    "test_id_digest": "206b6283196f8a608bf492a0b0f3ed22a0ab17a49d5d8f25c7af43f227f011ab",
-    "backend_test_count": 1483,
-    "backend_test_id_digest": "f0778cd3904581572e08ee0d60f71b2e5130f59142ac7c75868fea568c415033",
+    "test_count": 1555,
+    "test_id_digest": "e0e6c528776b374872c8b1a86a3e488aca22da317a1968ba014869f0f2c694f5",
+    "backend_test_count": 1511,
+    "backend_test_id_digest": "7781b2075a01d4d9002b05c8322c367f5b3e59d827b40b133ef8266d019ec847",
     "verification_test_count": 44,
     "verification_test_id_digest": "d8873be495648857a31f012be4e6b1b1438b091214bc6fb046fa620f34debd32",
     "verification_classifier_test_count": 23,
@@ -488,8 +488,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 45,
         "module_digest": "67bdd6ffe92b225d0311bc58586368338e220b1fc9a3f9e533f14df7e21966c1",
-        "test_count": 347,
-        "test_id_digest": "324bc9adda021a1c68fc6d4e7e38f24ce7486f58052001e7ed5ea6bda749df46",
+        "test_count": 370,
+        "test_id_digest": "e336dcfbe63fdafc9ac161657cab9f267f137e2a1b9657899cef753d8f5d9977",
     },
     "backend-integration": {
         "module_count": 41,
@@ -500,8 +500,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 24,
         "module_digest": "89cbfefb17fa4ec0c418f7adf5dd7dc8d20dfc9d24498b0dfb440811892fd8f3",
-        "test_count": 460,
-        "test_id_digest": "c668656f8a94879ffe7294f6b3eedde53fb1cf69afa132fe5103aa5ad7531b35",
+        "test_count": 465,
+        "test_id_digest": "865ff44f3ed553f09a03867bde142c33a8347de31af9494d798b34e1e7920e0d",
     },
     "performance-contract": {
         "module_count": 10,
