@@ -1772,7 +1772,8 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 getattr(statement, "_for_update_arg", None) is not None
                 and len(descriptions) == 1
                 and descriptions[0].get("entity") is User
-                and left is User.__table__.c.email
+                and hasattr(left, "compare")
+                and left.compare(User.__table__.c.email)
             )
 
         async def observed_scalar(session, statement, *args, **kwargs):
