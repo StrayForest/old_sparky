@@ -35,6 +35,23 @@ def _jobs(source: str) -> dict[str, str]:
     return {match.group("name"): match.group("body") for match in matches}
 
 
+def _curl_commands(source: str) -> list[str]:
+    """Join each backslash-continued curl command for argv policy checks."""
+
+    lines = source.splitlines()
+    commands: list[str] = []
+    for index, line in enumerate(lines):
+        command = line.strip()
+        if not re.match(r"^curl(?:\s|\\)", command):
+            continue
+        next_index = index
+        while command.endswith("\\") and next_index + 1 < len(lines):
+            command = f"{command[:-1].rstrip()} {lines[next_index + 1].strip()}"
+            next_index += 1
+        commands.append(command)
+    return commands
+
+
 def _pass_truth_table(state: dict[str, object]) -> bool:
     """Model the final gate's authoritative status inputs."""
 
@@ -281,34 +298,50 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn('MANIFEST_VALIDATION_STATUS:-1', setup)
 
     def test_network_transfers_have_bounded_arguments_without_retry(self) -> None:
-        workflows = (
-            self.source,
+        def assert_external_curl_policy(source: str) -> None:
+            commands = _curl_commands(source)
+            self.assertTrue(commands)
+            for command in commands:
+                is_artifact_download = "--location" in command
+                expected = (
+                    ("--connect-timeout 10", "--max-time 30", "--max-filesize 67108864")
+                    if is_artifact_download
+                    else ("--connect-timeout 5", "--max-time 15", "--max-filesize 65536")
+                )
+                for option in expected:
+                    self.assertEqual(1, command.count(option), command)
+                self.assertEqual(1, command.count("--retry"), command)
+                self.assertIn("--retry 0", command)
+                self.assertNotIn("--retry 1", command)
+
+        for source in (self.source, self.recovery_source):
+            assert_external_curl_policy(source)
+
+        for source in (
             (REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup-trusted.yml").read_text(
                 encoding="utf-8"
             ),
             (REPO_ROOT / ".github/workflows/platform-production-retained-load-abort-trusted.yml").read_text(
                 encoding="utf-8"
             ),
-        )
-        for source in workflows:
-            curl_calls = re.findall(r"(?m)^\s*curl(?:\s|\\)", source)
-            ssh_calls = re.findall(r"(?m)^\s*(?:if\s+)?ssh(?:\s|\\)", source)
-            scp_calls = re.findall(
-                r"(?m)(?:^\s*(?:if\s+)?scp|&&\s+scp)(?:\s|\\)",
-                source,
-            )
-            self.assertTrue(curl_calls or ssh_calls or scp_calls)
-            if curl_calls:
-                self.assertEqual(source.count("--connect-timeout 10"), len(curl_calls))
-                self.assertEqual(source.count("--max-time 30"), len(curl_calls))
-            transfer_count = len(ssh_calls) + len(scp_calls)
-            for option in (
-                "-o ConnectTimeout=10",
-                "-o ServerAliveInterval=15",
-                "-o ServerAliveCountMax=3",
-            ):
-                self.assertGreaterEqual(source.count(option), transfer_count, option)
+        ):
+            commands = _curl_commands(source)
+            self.assertTrue(commands)
+            self.assertEqual(source.count("--connect-timeout 10"), len(commands))
+            self.assertEqual(source.count("--max-time 30"), len(commands))
             self.assertNotIn("--retry", source)
+
+        for label, mutated in (
+            ("metadata connect timeout", self.source.replace("--connect-timeout 5", "--connect-timeout 6", 1)),
+            ("metadata absolute timeout", self.source.replace("--max-time 15", "--max-time 30", 1)),
+            ("enabled retry", self.source.replace("--retry 0", "--retry 1", 1)),
+            ("removed retry", self.source.replace("--retry 0 ", "", 1)),
+            ("metadata response cap", self.source.replace("--max-filesize 65536", "--max-filesize 65537", 1)),
+            ("artifact absolute timeout", self.source.replace("--max-time 30", "--max-time 31", 1)),
+        ):
+            with self.subTest(mutation=label):
+                with self.assertRaises(AssertionError):
+                    assert_external_curl_policy(mutated)
 
     def test_fake_transfer_argv_contains_the_boundaries_from_source(self) -> None:
         """Exercise representative source command argv through fake binaries."""
@@ -348,10 +381,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(trace.read_text(encoding="utf-8").splitlines(), argv)
                 if command == "curl":
-                    self.assertIn("--connect-timeout", argv)
-                    self.assertIn("10", argv)
-                    self.assertIn("--max-time", argv)
-                    self.assertIn("30", argv)
+                    self.assertEqual(argv[argv.index("--connect-timeout") + 1], "5")
+                    self.assertEqual(argv[argv.index("--max-time") + 1], "15")
+                    self.assertEqual(argv[argv.index("--retry") + 1], "0")
+                    self.assertEqual(argv[argv.index("--max-filesize") + 1], "65536")
                 else:
                     for option in (
                         "ConnectTimeout=10",
