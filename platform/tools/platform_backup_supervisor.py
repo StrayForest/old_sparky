@@ -84,6 +84,8 @@ ALEMBIC_HEAD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 SAFE_EVIDENCE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 SAFE_ERROR_RE = re.compile(r"^[a-z0-9_.-]{1,80}$")
+RESTORE_DRILL_DATABASE_ID_RE = re.compile(r"^platform_restore_drill_[0-9a-f]{32}$")
+CLEANUP_OPERATOR_ACTION = "inspect_ownership_before_drop"
 
 
 class BackupSupervisorError(RuntimeError):
@@ -472,10 +474,11 @@ def _read_monitor_status(data: bytearray, overflow: bool = False) -> dict[str, o
 def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, stdout_fd: int | None, pass_fds: tuple[int, ...], deadline: float, cleanup_reserve_seconds: float, probe: bool = False) -> DatabaseCommandResult | None:
     work = cleanup_deadline(deadline, reserve_seconds=cleanup_reserve_seconds)
     caller_deadline = deadline + MONITOR_JOIN_GRACE_SECONDS
+    monitor_path = _monitor_path()
     status_read, status_write = os.pipe()
     inherited_values = [*pass_fds, status_write] + ([] if stdout_fd is None else [stdout_fd])
     inherited = tuple(dict.fromkeys(inherited_values))
-    args = [sys.executable, str(_monitor_path()), "--status-fd", str(status_write), "--deadline-ns", str(int(deadline * 1e9)), "--cleanup-reserve-ns", str(int(cleanup_reserve_seconds * 1e9)), *[f"--pass-fd={fd}" for fd in inherited if fd != status_write]]
+    args = [sys.executable, str(monitor_path), "--status-fd", str(status_write), "--deadline-ns", str(int(deadline * 1e9)), "--cleanup-reserve-ns", str(int(cleanup_reserve_seconds * 1e9)), *[f"--pass-fd={fd}" for fd in inherited if fd != status_write]]
     if probe:
         args.append("--probe")
     if stdout_fd is not None:
@@ -521,10 +524,12 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
                 if remaining > 0:
                     selector.select(min(remaining, 0.02))
         parsed = _read_monitor_status(status, overflow[0])
-        if parsed["status"] == "probe-ok":
-            if process.returncode != 0:
+        if probe:
+            if process.returncode != 0 or parsed["status"] != "probe-ok":
                 raise BackupMonitorUnavailable("PID namespace probe failed")
             return None
+        if parsed["status"] == "probe-ok":
+            raise BackupCleanupUnproven("backup monitor probe status used for command")
         if process.returncode != 0:
             if parsed["status"] == "namespace_unavailable":
                 raise BackupMonitorUnavailable("PID namespace is unavailable")
@@ -2794,6 +2799,8 @@ def main(argv: list[str] | None = None) -> int:
     except BaseException as exc:
         status, error_class = _operation_error_status(exc)
         payload = {"ok": False, "status": status, "error_class": error_class}
+        if isinstance(exc, BackupCleanupUnproven) and isinstance(exc.database_id, str) and RESTORE_DRILL_DATABASE_ID_RE.fullmatch(exc.database_id):
+            payload.update(database_id=exc.database_id, operator_action=CLEANUP_OPERATOR_ACTION)
         if getattr(args, "as_json", False):
             print(json.dumps(payload, sort_keys=True))
         else:

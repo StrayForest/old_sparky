@@ -840,7 +840,7 @@ def _safe_restore_error(exc: BaseException) -> str:
     if not isinstance(database_id, str):
         database_id = getattr(exc, "database_id", None)
     if getattr(exc, "code", None) == "backup_cleanup_unproven" or database_id is not None:
-        if isinstance(database_id, str) and DATABASE_IDENTIFIER_RE.fullmatch(database_id):
+        if isinstance(database_id, str) and supervisor.RESTORE_DRILL_DATABASE_ID_RE.fullmatch(database_id):
             return (
                 "cleanup_unproven database_id="
                 f"{database_id} operator_action=inspect_ownership_before_drop"

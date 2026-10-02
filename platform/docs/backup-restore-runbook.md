@@ -32,8 +32,9 @@ supervisor CLI through storage to the restore drill. Two seconds are reserved
 for bounded cleanup. A restore drill uses a cryptographically random strict
 database identifier and first proves that it is absent. A create collision,
 non-zero result or timeout does not prove ownership, so the database is never
-dropped; machine-readable output records `cleanup_unproven` with the safe
-identifier and instructs the operator to inspect ownership before any drop.
+dropped; machine-readable JSON records `cleanup_unproven` and emits separate
+`database_id`/`operator_action` fields only for the exact generated ID and
+fixed action `inspect_ownership_before_drop`; invalid IDs are omitted.
 Once creation returns success, cleanup uses only the reserved interval. A
 cleanup failure is recorded as `cleanup_unproven` and never turns the backup
 green.

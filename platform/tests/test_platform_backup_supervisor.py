@@ -267,12 +267,17 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         self.assertTrue(client.call_args.kwargs["probe"])
 
     def test_cleanup_reason_does_not_claim_database_ownership(self) -> None:
-        monitor_error = supervisor.BackupCleanupUnproven("monitor protocol failed")
-        self.assertIsNone(monitor_error.database_id)
-        self.assertEqual(str(monitor_error), "monitor protocol failed")
-        database_error = supervisor.BackupCleanupUnproven(database_id="platform_restore_drill_abc123")
-        self.assertEqual(database_error.database_id, "platform_restore_drill_abc123")
-        self.assertIn("database_id=platform_restore_drill_abc123", str(database_error))
+        valid_id = "platform_restore_drill_" + "a" * 32
+        for database_id in (valid_id, "arbitrary-secret"):
+            with (
+                mock.patch.object(supervisor, "run_backup_entrypoint", side_effect=supervisor.BackupCleanupUnproven(database_id=database_id)),
+                mock.patch("builtins.print") as printed,
+            ):
+                self.assertEqual(supervisor.main(["backup", "--json"]), 1)
+            payload = json.loads(printed.call_args.args[0])
+            self.assertEqual(payload.get("database_id"), database_id if database_id == valid_id else None)
+            self.assertEqual(payload.get("operator_action"), supervisor.CLEANUP_OPERATOR_ACTION if database_id == valid_id else None)
+            self.assertNotIn("arbitrary-secret", json.dumps(payload))
 
     def test_namespace_timeout_kills_detached_double_fork_without_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -426,13 +431,28 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                 invalid[0],
                 reserve_seconds=invalid[1],
             )
+        for reason in ("missing", "unsafe"):
+            before = len(os.listdir("/proc/self/fd"))
+            with mock.patch.object(
+                supervisor, "_monitor_path", side_effect=supervisor.BackupMonitorUnavailable(reason)
+            ):
+                for _ in range(32):
+                    self.assertRaises(supervisor.BackupMonitorUnavailable, supervisor._run_monitor_client, ["echo"], env=None, stdout_fd=None, pass_fds=(), deadline=time.monotonic() + 1, cleanup_reserve_seconds=0.1)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
         with tempfile.TemporaryDirectory() as temporary_dir:
             fake = Path(temporary_dir) / "fake-monitor.py"
-            fake.write_text("#!/usr/bin/python3\nimport os,sys\nfd=int(sys.argv[sys.argv.index('--status-fd')+1])\nos.write(fd,b'{\"schema\":1,\"status\":\"completed\",\"returncode\":0}\\n')\nraise SystemExit(9)\n", encoding="utf-8")
-            fake.chmod(0o755)
+            def emit(status: str, returncode: int = 0, *, exit_code: int | None = None) -> None:
+                payload = (json.dumps({"schema": 1, "status": status, "returncode": returncode}) + "\n").encode()
+                fake.write_text("#!/usr/bin/python3\nimport os,sys\nfd=int(sys.argv[sys.argv.index('--status-fd')+1])\nos.write(fd," + repr(payload) + ")\nraise SystemExit(" + str(returncode if exit_code is None else exit_code) + ")\n", encoding="utf-8")
+                fake.chmod(0o755)
             with mock.patch.object(supervisor, "_monitor_path", return_value=fake):
-                with self.assertRaises(supervisor.BackupCleanupUnproven):
-                    supervisor.run_database_command([sys.executable, "-c", "pass"], deadline=supervisor.operation_deadline(8))
+                for status, returncode in (("completed", 0), ("timeout", 124)):
+                    emit(status, returncode, exit_code=0)
+                    self.assertRaises(supervisor.BackupMonitorUnavailable, supervisor.ensure_process_monitor, deadline=supervisor.operation_deadline(8))
+                emit("probe-ok")
+                self.assertRaises(supervisor.BackupCleanupUnproven, supervisor.run_database_command, [sys.executable, "-c", "pass"], deadline=supervisor.operation_deadline(8))
+                emit("completed", exit_code=9)
+                self.assertRaises(supervisor.BackupCleanupUnproven, supervisor.run_database_command, [sys.executable, "-c", "pass"], deadline=supervisor.operation_deadline(8))
 
     def test_namespace_setup_failure_publishes_status_before_target_spawn(self) -> None:
         from tools import platform_backup_process_monitor as monitor
