@@ -12,7 +12,6 @@ import pathlib
 import re
 import shutil
 import stat
-import subprocess
 import sys
 import urllib.parse
 import uuid
@@ -50,9 +49,18 @@ except ImportError:  # Direct execution from the tools directory.
             write_manifest,
         )
 
+try:
+    from tools import platform_backup_supervisor as supervisor
+except ImportError:
+    try:
+        from . import platform_backup_supervisor as supervisor
+    except ImportError:
+        import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+
 
 DEFAULT_ENV_FILE = pathlib.Path("/opt/oldsparky/platform/shared/.env.platform")
 DEFAULT_OUTPUT_DIR = pathlib.Path("/opt/oldsparky/platform/shared/backups")
+DEFAULT_OPERATION_TIMEOUT_SECONDS = 1500.0
 LOCAL_DATABASE_HOSTS = {None, "", "127.0.0.1", "localhost", "::1"}
 REQUIRED_PLATFORM_EXTENSIONS = REQUIRED_EXTENSIONS
 ALEMBIC_REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -172,6 +180,7 @@ def parse_args() -> argparse.Namespace:
         help="Restore and verify an existing custom-format platform backup, then remove the test DB.",
     )
     parser.add_argument("--max-age-hours", type=float, default=24.0)
+    parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_OPERATION_TIMEOUT_SECONDS)
     parser.add_argument("--json", action="store_true", dest="as_json")
     return parser.parse_args()
 
@@ -241,18 +250,22 @@ def run_command(
     capture_output: bool = False,
     stdout: int | None = None,
     pass_fds: tuple[int, ...] = (),
-) -> subprocess.CompletedProcess[str]:
+    deadline: float | None = None,
+    cleanup_reserve_seconds: float | None = None,
+) -> Any:
     if capture_output and stdout is not None:
         raise ValueError("capture_output and an explicit stdout descriptor are incompatible")
-    return subprocess.run(
+    result = supervisor.run_database_command(
         command,
-        check=True,
-        text=True,
-        capture_output=capture_output,
-        stdout=stdout,
-        pass_fds=pass_fds,
         env=command_env(target) if target is not None else None,
+        stdout_fd=stdout,
+        pass_fds=pass_fds,
+        deadline=deadline,
+        **({} if cleanup_reserve_seconds is None else {"cleanup_reserve_seconds": cleanup_reserve_seconds}),
     )
+    if result.returncode != 0:
+        raise supervisor.BackupCommandError(result=result)
+    return result
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -324,7 +337,7 @@ def _secure_create(path: pathlib.Path, *, label: str) -> tuple[int, os.stat_resu
     try:
         file_stat = _validate_secure_stat(os.fstat(descriptor), label=label, expected_size=0)
         return descriptor, file_stat
-    except Exception:
+    except BaseException:
         os.close(descriptor)
         try:
             path.unlink()
@@ -574,15 +587,9 @@ def perform_restore_drill(
     trusted_alembic_head: object | None = None,
     expected_alembic_head: str | None = None,
     source_root: pathlib.Path | None = None,
+    deadline: float | None = None,
 ) -> int:
     if trusted_alembic_head is not None:
-        try:
-            import tools.platform_backup_supervisor as supervisor
-        except ImportError:
-            try:
-                from . import platform_backup_supervisor as supervisor
-            except ImportError:
-                import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
         trusted = supervisor.require_trusted_alembic_head(
             trusted_alembic_head,
             source_root=source_root,
@@ -596,6 +603,11 @@ def perform_restore_drill(
                 "Expected Alembic head does not match the trusted deployed source graph."
             )
         expected_head = trusted_head
+    deadline = deadline if deadline is not None else supervisor.operation_deadline(DEFAULT_OPERATION_TIMEOUT_SECONDS)
+
+    def invoke(command: list[str], **kwargs: Any) -> Any:
+        return run_command(command, deadline=deadline, **kwargs)
+
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
         admin_target is None
@@ -615,11 +627,11 @@ def perform_restore_drill(
 
     created = False
     try:
-        run_command(create_command, target=admin_command_target)
+        invoke(create_command, target=admin_command_target)
         created = True
         restore_target = app_target.with_database(drill_database)
         for extension in REQUIRED_PLATFORM_EXTENSIONS:
-            run_command(
+            invoke(
                 [
                     "psql",
                     "--no-psqlrc",
@@ -630,7 +642,7 @@ def perform_restore_drill(
                 target=restore_target,
                 capture_output=True,
             )
-        run_command(
+        invoke(
             [
                 "psql",
                 "--no-psqlrc",
@@ -645,7 +657,7 @@ def perform_restore_drill(
             ("--schema=platform",),
             ("--schema=public",),
         ):
-            run_command(
+            invoke(
                 [
                     "pg_restore",
                     "--exit-on-error",
@@ -657,7 +669,7 @@ def perform_restore_drill(
                 ],
                 target=restore_target,
             )
-        table_count_result = run_command(
+        table_count_result = invoke(
             [
                 "psql",
                 "--no-psqlrc",
@@ -673,7 +685,7 @@ def perform_restore_drill(
         table_count = int(table_count_result.stdout.strip())
         if table_count <= 0:
             raise RuntimeError("Restore drill produced no tables in the platform schema.")
-        connectivity_result = run_command(
+        connectivity_result = invoke(
             [
                 "psql",
                 "--no-psqlrc",
@@ -688,7 +700,7 @@ def perform_restore_drill(
         )
         if connectivity_result.stdout.strip() != "1":
             raise RuntimeError("Restore drill connectivity verification failed.")
-        revision_result = run_command(
+        revision_result = invoke(
             [
                 "psql",
                 "--no-psqlrc",
@@ -706,7 +718,7 @@ def perform_restore_drill(
             raise RuntimeError(
                 "Restore drill Alembic revision does not match the trusted deployed head."
             )
-        extension_count_result = run_command(
+        extension_count_result = invoke(
             [
                 "psql",
                 "--no-psqlrc",
@@ -724,7 +736,7 @@ def perform_restore_drill(
         return table_count
     finally:
         if created:
-            run_command(drop_command, target=admin_command_target)
+            invoke(drop_command, target=admin_command_target, cleanup_reserve_seconds=0.0)
 
 
 def require_commands(*commands: str) -> None:
@@ -817,6 +829,9 @@ def create_backup(
     if not args.dump_only:
         required.extend(["createdb", "dropdb", "psql"])
     require_commands(*required)
+    deadline = supervisor.operation_deadline(
+        float(getattr(args, "timeout_seconds", DEFAULT_OPERATION_TIMEOUT_SECONDS))
+    )
 
     try:
         output_dir_stat = output_dir.lstat()
@@ -866,6 +881,7 @@ def create_backup(
             ],
             target=app_target,
             stdout=temporary_dump_fd,
+            deadline=deadline,
         )
         dump_stat = _verify_path_matches_fd(
             temporary_dump_path,
@@ -888,6 +904,7 @@ def create_backup(
             ["pg_restore", "--list", f"/proc/self/fd/{temporary_dump_fd}"],
             capture_output=True,
             pass_fds=(temporary_dump_fd,),
+            deadline=deadline,
         )
         _verify_path_matches_fd(
             temporary_dump_path,
@@ -945,6 +962,7 @@ def create_backup(
                     admin_target=admin_target,
                     timestamp_slug=timestamp_slug,
                     trusted_alembic_head=trusted_head,
+                    deadline=deadline,
                 )
                 restore_verified = True
                 assert trusted_head is not None
@@ -988,7 +1006,7 @@ def create_backup(
         if restore_error is not None:
             raise RuntimeError(f"Platform backup was created but restore verification failed: {restore_error}")
         return result
-    except Exception:
+    except BaseException:
         if not metadata_written:
             cleanup_paths: list[pathlib.Path] = [dump_path, metadata_path]
             if temporary_dump_created:

@@ -8,7 +8,11 @@ import hashlib
 import os
 import pickle
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -204,6 +208,93 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
     def test_destructive_production_restore_is_fail_closed(self) -> None:
         with self.assertRaises(supervisor.ProductionRestoreDisabled):
             supervisor.run_production_restore()
+
+    def test_namespace_helper_success_nonzero_and_bounded_diagnostics(self) -> None:
+        success = supervisor.run_database_command(
+            [sys.executable, "-c", "print('namespace-ok')"],
+            deadline=supervisor.operation_deadline(8),
+        )
+        self.assertEqual(success.stdout.strip(), "namespace-ok")
+        failed = supervisor.run_database_command(
+            [sys.executable, "-c", "import sys;sys.stderr.write('x'*1048576);raise SystemExit(7)"],
+            deadline=supervisor.operation_deadline(8),
+        )
+        self.assertEqual(failed.returncode, 7)
+        self.assertEqual(failed.stderr_bytes, 1048576)
+        self.assertTrue(failed.stderr_truncated)
+        self.assertLessEqual(len(failed.stderr.encode()), supervisor.COMMAND_DIAGNOSTIC_BYTES + 40)
+
+    def test_namespace_timeout_kills_detached_double_fork_without_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            marker = Path(temporary_dir) / "late-marker"
+            code = (
+                "import os,time; first=os.fork();\n"
+                "if first==0:\n second=os.fork();\n"
+                f" if second==0: time.sleep(4);open({str(marker)!r},'w').write('late')\n"
+                " else: os._exit(0)\n"
+                "else: time.sleep(30)"
+            )
+            with self.assertRaises(supervisor.BackupCommandTimeout):
+                supervisor.run_database_command(
+                    [sys.executable, "-c", code], deadline=supervisor.operation_deadline(5)
+                )
+            time.sleep(0.2)
+            self.assertFalse(marker.exists())
+
+    def test_foreign_caller_child_survives_and_pass_fds_reach_target(self) -> None:
+        foreign = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(3)"])
+        try:
+            with tempfile.TemporaryFile() as output:
+                result = supervisor.run_database_command(
+                    [sys.executable, "-c", "import os;os.write(3,b'fd-ok')"],
+                    pass_fds=(output.fileno(),), deadline=supervisor.operation_deadline(8),
+                )
+                self.assertEqual(result.returncode, 0)
+                output.seek(0)
+                self.assertEqual(output.read(), b"fd-ok")
+            self.assertIsNone(foreign.poll())
+        finally:
+            foreign.terminate()
+            foreign.wait(timeout=3)
+
+    def test_command_validation_allows_root_local_runuser_and_rejects_shell_parallelism(self) -> None:
+        env = supervisor._sanitized_env({"PATH": os.environ["PATH"], "SECRET": "must-not-pass"})
+        command = supervisor._validate_command(["runuser", "-u", "postgres", "--", "createdb"], env)
+        self.assertTrue(Path(command[0]).is_absolute())
+        self.assertNotIn("SECRET", env)
+        for bad in (["sh", "-c", "true"], [sys.executable, "--jobs"]):
+            with self.assertRaises(supervisor.BackupCommandError):
+                supervisor._validate_command(bad, env)
+
+    def test_monitor_protocol_rejects_malformed_oversized_and_nonzero_status(self) -> None:
+        for payload, overflow in ((b"not-json", False), (b"{}", False), (b"{}", True)):
+            with self.assertRaises(supervisor.BackupCleanupUnproven):
+                supervisor._read_monitor_status(bytearray(payload), overflow)
+
+    def test_namespace_setup_failure_publishes_status_before_target_spawn(self) -> None:
+        from tools import platform_backup_process_monitor as monitor
+
+        read_fd, write_fd = os.pipe()
+        fake_libc = SimpleNamespace(unshare=lambda _flags: -1)
+        with mock.patch.object(monitor, "_pdeath"), mock.patch.object(monitor.ctypes, "CDLL", return_value=fake_libc):
+            result = monitor._monitor(
+                [sys.executable, "-c", "raise SystemExit(99)"], (), None, write_fd,
+                time.monotonic_ns() + 1_000_000_000, 0, None,
+            )
+        payload = os.read(read_fd, 4096)
+        os.close(read_fd)
+        self.assertNotEqual(result, 0)
+        self.assertIn(b"namespace_unavailable", payload)
+
+    def test_caller_base_exception_closes_monitor_and_preserves_primary(self) -> None:
+        for primary in (KeyboardInterrupt, SystemExit):
+            with self.subTest(primary=primary):
+                with mock.patch.object(supervisor, "_drain", side_effect=primary):
+                    with self.assertRaises(primary):
+                        supervisor.run_database_command(
+                            [sys.executable, "-c", "import time;time.sleep(10)"],
+                            deadline=supervisor.operation_deadline(8),
+                        )
 
     def test_local_backup_passes_explicit_expected_head_before_pg_dump(self) -> None:
         """The supervisor must build restore args without hidden CLI state."""
