@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Sequence
@@ -36,6 +37,13 @@ SECURITY_DEPENDENCY_LOCKS: tuple[str, ...] = (
 )
 PIP_AUDIT_SOCKET_TIMEOUT_SECONDS = 10
 SECURITY_DEPENDENCY_AUDIT_TIMEOUT_SECONDS = 120
+# Lock files are authored as small, ASCII, one-package-per-line files. Keep
+# the preflight bounded even if a path is replaced between stat and open.
+SECURITY_DEPENDENCY_LOCK_MAX_BYTES = 1024 * 1024
+SECURITY_DEPENDENCY_LOCK_LINE = re.compile(
+    r"^[A-Za-z0-9_.-]+=="
+    r"[A-Za-z0-9][A-Za-z0-9_.+!-]* --hash=sha256:[0-9a-f]{64}$"
+)
 PIP_AUDIT_FLAGS: tuple[str, ...] = (
     "--disable-pip",
     "--require-hashes",
@@ -325,6 +333,33 @@ def _run(
     return 0
 
 
+def _security_dependency_lock_preflight(candidate: Path) -> str | None:
+    """Validate the bounded, exact format used by authored security locks."""
+
+    try:
+        size = candidate.stat().st_size
+        if size == 0:
+            return "empty"
+        if size > SECURITY_DEPENDENCY_LOCK_MAX_BYTES:
+            return "oversized"
+        with candidate.open("rb") as stream:
+            payload = stream.read(SECURITY_DEPENDENCY_LOCK_MAX_BYTES + 1)
+    except OSError:
+        return "unreadable"
+    if len(payload) > SECURITY_DEPENDENCY_LOCK_MAX_BYTES:
+        return "oversized"
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError:
+        return "not-ascii"
+    if not text.endswith("\n"):
+        return "missing-final-newline"
+    lines = text[:-1].split("\n")
+    if not lines or any(SECURITY_DEPENDENCY_LOCK_LINE.fullmatch(line) is None for line in lines):
+        return "malformed-line"
+    return None
+
+
 def _run_security_dependency_audits() -> int:
     """Audit every authored Python lock surface and retain the first failure."""
 
@@ -334,6 +369,14 @@ def _run_security_dependency_audits() -> int:
         label = f"security/dependency-audit/{lock_path}"
         if candidate.is_symlink() or not candidate.is_file():
             print(f"[GATE FAIL] {label} lock is missing or not a regular file", file=sys.stderr)
+            first_failure = first_failure or 1
+            continue
+        preflight_failure = _security_dependency_lock_preflight(candidate)
+        if preflight_failure is not None:
+            print(
+                f"[GATE FAIL] {label} lock preflight failed: {preflight_failure}",
+                file=sys.stderr,
+            )
             first_failure = first_failure or 1
             continue
         status = _run(

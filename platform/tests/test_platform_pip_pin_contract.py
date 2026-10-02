@@ -89,6 +89,7 @@ class PlatformPipPinContractTests(unittest.TestCase):
     def test_security_dependency_audit_manifest_and_flags_are_exact(self) -> None:
         self.assertEqual(verifier.SECURITY_DEPENDENCY_LOCKS, EXPECTED_SECURITY_DEPENDENCY_LOCKS)
         self.assertEqual(verifier.PIP_AUDIT_FLAGS, EXPECTED_PIP_AUDIT_FLAGS)
+        self.assertEqual(verifier.SECURITY_DEPENDENCY_LOCK_MAX_BYTES, 1024 * 1024)
 
         command_calls: list[tuple[str, list[str], dict[str, object]]] = []
 
@@ -139,6 +140,70 @@ class PlatformPipPinContractTests(unittest.TestCase):
                 with mock.patch.object(verifier, "_run") as run:
                     self.assertNotEqual(verifier._run_security_dependency_audits(), 0)
                     run.assert_not_called()
+
+    def test_security_dependency_lock_preflight_rejects_mutations_and_reads_remaining(self) -> None:
+        mutations = (
+            ("empty", b""),
+            ("comment-only", b"# comment\n"),
+            ("missing-hash", b"demo==1.0\n"),
+            ("unpinned", b"demo>=1.0 --hash=sha256:" + b"0" * 64 + b"\n"),
+            ("malformed", b"demo==1.0 --hash=sha256:not-a-digest\n"),
+            ("oversized", b"x" * (1024 * 1024 + 1)),
+            ("symlink", None),
+            ("read-failure", None),
+        )
+        remaining_labels = [
+            f"security/dependency-audit/{path}" for path in EXPECTED_SECURITY_DEPENDENCY_LOCKS[1:]
+        ]
+
+        for name, payload in mutations:
+            with self.subTest(mutation=name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    for relative_path in EXPECTED_SECURITY_DEPENDENCY_LOCKS:
+                        target = root / relative_path
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(PLATFORM_ROOT / relative_path, target)
+                    invalid_path = root / EXPECTED_SECURITY_DEPENDENCY_LOCKS[0]
+                    if name == "symlink":
+                        invalid_path.unlink()
+                        invalid_path.symlink_to(root / EXPECTED_SECURITY_DEPENDENCY_LOCKS[1])
+                    elif payload is not None:
+                        invalid_path.write_bytes(payload)
+
+                    calls: list[str] = []
+
+                    def fake_run(label: str, command: list[str], **kwargs: object) -> int:
+                        calls.append(label)
+                        return 0
+
+                    with mock.patch.object(verifier, "PLATFORM_ROOT", root):
+                        if name == "read-failure":
+                            original_open = Path.open
+
+                            def fail_one(
+                                path: Path,
+                                mode: str = "r",
+                                buffering: int = -1,
+                                encoding: str | None = None,
+                                errors: str | None = None,
+                                newline: str | None = None,
+                            ):
+                                if path == invalid_path:
+                                    raise OSError("blocked")
+                                return original_open(path, mode, buffering, encoding, errors, newline)
+
+                            with mock.patch.object(
+                                Path, "open", autospec=True, side_effect=fail_one
+                            ):
+                                with mock.patch.object(verifier, "_run", side_effect=fake_run):
+                                    status = verifier._run_security_dependency_audits()
+                        else:
+                            with mock.patch.object(verifier, "_run", side_effect=fake_run):
+                                status = verifier._run_security_dependency_audits()
+
+                    self.assertNotEqual(status, 0)
+                    self.assertEqual(calls, remaining_labels)
 
     def test_ci_lock_covers_runtime_quality_and_bootstrap_inputs(self) -> None:
         runtime = _direct_pins(PLATFORM_ROOT / "requirements-platform.txt")
