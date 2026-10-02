@@ -526,6 +526,12 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         job = self.entry_document["jobs"]["trusted-external-load"]
         uses = job["uses"]
         self.assertRegex(uses, r"^StrayForest/old_sparky/\.github/workflows/platform-production-external-load-trusted\.yml@[0-9a-f]{40}$")
+        self.assertEqual(
+            uses,
+            "StrayForest/old_sparky/.github/workflows/"
+            "platform-production-external-load-trusted.yml@"
+            "251a4e814abfff59ba4fdff5db4b030829cb889c",
+        )
         self.assertNotIn("runs-on", job)
         self.assertNotIn("environment", job)
         self.assertNotIn("steps", job)
