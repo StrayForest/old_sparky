@@ -40,6 +40,113 @@ AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-autode
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
 STATUS_FINALIZER_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security-status-finalizer.yml"
 
+
+def _workflow_step_script(workflow: str, name: str) -> str:
+    step = re.search(
+        rf"(?ms)^      - name: {re.escape(name)}\n(?P<body>.*?)(?=^      - name: |^  [A-Za-z0-9_-]+:|\Z)",
+        workflow,
+    )
+    if step is None:
+        raise AssertionError(f"workflow step is missing: {name}")
+    run = re.search(r"(?ms)^        run: \|\n(?P<script>.*)", step.group("body"))
+    if run is None:
+        raise AssertionError(f"workflow step has no shell script: {name}")
+    return textwrap.dedent(run.group("script"))
+
+
+def _run_security_api_fixture(
+    script: str,
+    mode: str,
+    *,
+    final_status: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], tuple[str, ...], str]:
+    fake_curl = """#!/usr/bin/env python3
+import json, os, sys, time
+from pathlib import Path
+
+args = sys.argv[1:]
+Path(os.environ["FAKE_CURL_ARGS"]).write_text("\\n".join(args), encoding="utf-8")
+output = Path(args[args.index("--output") + 1])
+url = next(item for item in args if item.startswith("https://api.github.com/"))
+mode = os.environ["FAKE_CURL_MODE"]
+if mode == "hang": time.sleep(0.05); raise SystemExit(28)
+if mode == "write_failure": raise SystemExit(23)
+if mode == "oversize": body = b"x" * 65537
+elif mode == "http_error": body = b"SYNTHETIC_RESPONSE_SECRET"
+elif mode == "malformed": body = b"not-json"
+elif "/git/ref/heads/" in url:
+    body = json.dumps({"ref": "refs/heads/dev", "object": {"type": "commit", "sha": "a" * 40}}).encode()
+else:
+    body = b"{}"
+output.write_bytes(body)
+raise SystemExit(22 if mode == "http_error" else 0)
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        runner_temp = root / "runner-temp"
+        runner_temp.mkdir()
+        workspace = root / "workspace"
+        workspace.mkdir()
+        fake = root / "curl"
+        fake.write_text(fake_curl, encoding="utf-8")
+        fake.chmod(0o700)
+        args_path = root / "curl-args"
+        environment = {
+            **os.environ,
+            "PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}",
+            "FAKE_CURL_MODE": mode,
+            "FAKE_CURL_ARGS": str(args_path),
+            "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_API_URL": "https://api.github.com",
+            "GH_TOKEN": "synthetic-token",
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(root / "github-output"),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_RUN_ID": "12345",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "TRUSTED_BRANCH": "dev",
+            "TESTED_SHA": "a" * 40,
+        }
+        if final_status:
+            environment.update(
+                {
+                    "EVENT_NAME": "push",
+                    "WORKFLOW_REF": "refs/heads/dev",
+                    "CLASSIFIER_RESULT": "success",
+                    "ROUTE_CLASS": "docs-only",
+                    "ROUTE_EVENT": "push",
+                    "ROUTE_DEPLOYABLE": "false",
+                    "ROUTE_FALLBACK": "false",
+                    "ROUTE_RUNTIME_SENSITIVE": "false",
+                    "ROUTE_TARGET_SHA": "a" * 40,
+                    "ROUTE_DIGEST": "b" * 64,
+                    "ROUTE_REASON": "synthetic route",
+                    "EXPECTED_GATES": '["docs", "verification-contract"]',
+                    "STATUS_START_RESULT": "success",
+                    "DOCS_RESULT": "success",
+                    "VERIFICATION_CONTRACT_RESULT": "success",
+                }
+            )
+            for name in (
+                "BACKEND_RESULT", "PYTHON_QUALITY_RESULT", "SECURITY_RESULT",
+                "WEB_QUALITY_RESULT", "WEB_HERMETIC_RESULT", "MIGRATION_RESULT",
+                "RELEASE_RUNTIME_RESULT", "RELEASE_RUNTIME_REAL_RESULT",
+            ):
+                environment[name] = "skipped"
+        completed = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", script],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+        leftovers = tuple(path.name for path in runner_temp.iterdir())
+        args = args_path.read_text(encoding="utf-8") if args_path.exists() else ""
+        return completed, leftovers, args
+
 # PR117 was merged as a real merge commit.  The push range is the first
 # parent (the branch before the merge) to that merge commit; the PR range is
 # the same base to the source head.  In particular, the PR fixture must not
@@ -557,6 +664,89 @@ class PlatformCiClassifierTests(unittest.TestCase):
             workflow,
         )
         self.assertNotIn("schedule:", workflow)
+
+        def assert_api_transport_contract(source: str) -> None:
+            self.assertEqual(source.count("curl --fail-with-body"), 3)
+            self.assertNotIn("set -x", source)
+            self.assertEqual(source.count("$GH_TOKEN"), 3)
+            for step_name, response, byte_count in (
+                (
+                    "Resolve immutable default-branch classifier source",
+                    "trusted_ref",
+                    "trusted_ref_bytes",
+                ),
+                ("Mark platform security build pending", "status_start_response", "status_start_response_bytes"),
+                ("Report platform security build result", "status_final_response", "status_final_response_bytes"),
+            ):
+                match = re.search(
+                    rf"(?ms)^      - name: {re.escape(step_name)}\n(?P<body>.*?)(?=^      - name: |^  [A-Za-z0-9_-]+:\n|\Z)",
+                    source,
+                )
+                self.assertIsNotNone(match, step_name)
+                assert match is not None
+                body = match.group("body")
+                self.assertIn("if ! curl", body)
+                self.assertIn("--connect-timeout 5", body)
+                self.assertIn("--max-time 15", body)
+                self.assertIn("--retry 0", body)
+                self.assertIn("--max-filesize 65536", body)
+                self.assertIn(f'mktemp "$RUNNER_TEMP/', body)
+                self.assertIn(f'trap \'rm -f -- "${response}"\' EXIT', body)
+                self.assertIn(f'--output "${response}"', body)
+                self.assertIn(f'wc -c < "${response}"', body)
+                self.assertIn(f'(( {byte_count} > 65536 ))', body)
+                self.assertNotIn(f'cat "${response}"', body)
+                self.assertNotIn(f'echo "${response}"', body)
+                self.assertIn('--header "Authorization: Bearer $GH_TOKEN"', body)
+
+        assert_api_transport_contract(workflow)
+        for label, mutated in (
+            ("changed timeout", workflow.replace("--max-time 15", "--max-time 30", 1)),
+            ("enabled retries", workflow.replace("--retry 0", "--retry 1", 1)),
+            ("raised response cap", workflow.replace("--max-filesize 65536", "--max-filesize 65537", 1)),
+            ("removed output binding", workflow.replace('--output "$trusted_ref"', '--output /dev/null', 1)),
+            ("removed post-download check", workflow.replace('wc -c < "$trusted_ref"', "wc -c < /dev/null", 1)),
+            ("token in endpoint", workflow.replace("${GITHUB_API_URL}", "${GITHUB_API_URL}/$GH_TOKEN", 1)),
+        ):
+            with self.subTest(mutation=label):
+                with self.assertRaises(AssertionError):
+                    assert_api_transport_contract(mutated)
+
+        def assert_fixture_result(
+            completed: subprocess.CompletedProcess[str],
+            leftovers: tuple[str, ...],
+            args: str,
+            success: bool,
+        ) -> None:
+            self.assertEqual(completed.returncode == 0, success, completed.stderr)
+            self.assertEqual(leftovers, ())
+            self.assertNotIn("SYNTHETIC_RESPONSE_SECRET", completed.stdout + completed.stderr)
+            url_args = [line for line in args.splitlines() if line.startswith("https://api.github.com/")]
+            self.assertEqual(len(url_args), 1)
+            self.assertNotIn("synthetic-token", url_args[0])
+
+        trusted_script = _workflow_step_script(
+            workflow,
+            "Resolve immutable default-branch classifier source",
+        )
+        for mode in ("success", "hang", "oversize", "http_error", "malformed", "write_failure"):
+            with self.subTest(trusted_fixture=mode):
+                completed, leftovers, args = _run_security_api_fixture(trusted_script, mode)
+                assert_fixture_result(completed, leftovers, args, mode == "success")
+
+        for step_name, final_status in (
+            ("Mark platform security build pending", False),
+            ("Report platform security build result", True),
+        ):
+            script = _workflow_step_script(workflow, step_name)
+            for mode in ("success", "hang", "oversize", "http_error", "write_failure"):
+                with self.subTest(status_fixture=(step_name, mode)):
+                    completed, leftovers, args = _run_security_api_fixture(
+                        script,
+                        mode,
+                        final_status=final_status,
+                    )
+                    assert_fixture_result(completed, leftovers, args, mode == "success")
 
     def test_cancel_safe_status_finalizer_overwrites_every_terminal_conclusion(self) -> None:
         workflow = STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8")
