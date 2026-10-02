@@ -144,6 +144,7 @@ class DatabaseCommandResult:
 
 COMMAND_DIAGNOSTIC_BYTES, COMMAND_DIAGNOSTIC_CHUNK = 32 * 1024, 8192
 COMMAND_CLEANUP_RESERVE_SECONDS, DEFAULT_COMMAND_TIMEOUT_SECONDS = 2.0, 1500.0
+MONITOR_JOIN_GRACE_SECONDS = 0.5
 MONITOR_STATUS_BYTES = 4096
 _TRUSTED_PG_TOOLS = frozenset({"createdb", "dropdb", "psql", "pg_dump", "pg_restore"})
 _SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
@@ -185,14 +186,14 @@ def cleanup_deadline(deadline: float, *, reserve_seconds: float = COMMAND_CLEANU
     return work
 
 
-def _monitor_path() -> Path:
-    path = Path(__file__).with_name("platform_backup_process_monitor.py")
+def _monitor_path(path: Path | None = None) -> Path:
+    path = path or Path(__file__).with_name("platform_backup_process_monitor.py")
+    if path.is_symlink():
+        raise BackupMonitorUnavailable("backup process monitor must not be a symlink")
     try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise BackupMonitorUnavailable("backup process monitor is missing") from exc
-    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or not os.access(path, os.X_OK):
-        raise BackupMonitorUnavailable("backup process monitor is not an executable regular file")
+        _secure_executable(path)
+    except BackupCommandError as exc:
+        raise BackupMonitorUnavailable("backup process monitor metadata is unsafe") from exc
     return path
 
 
@@ -392,6 +393,7 @@ def _read_monitor_status(data: bytearray, overflow: bool = False) -> dict[str, o
 
 def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, stdout_fd: int | None, pass_fds: tuple[int, ...], deadline: float, cleanup_reserve_seconds: float) -> DatabaseCommandResult:
     work = cleanup_deadline(deadline, reserve_seconds=cleanup_reserve_seconds)
+    caller_deadline = deadline + MONITOR_JOIN_GRACE_SECONDS
     status_read, status_write = os.pipe()
     inherited_values = [*pass_fds, status_write] + ([] if stdout_fd is None else [stdout_fd])
     inherited = tuple(dict.fromkeys(inherited_values))
@@ -415,14 +417,14 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
                 selector.register(stream, selectors.EVENT_READ, label)
         while process.poll() is None or selector.get_map():
             _drain(selector, buffers, status, overflow)
-            remaining = deadline - time.monotonic()
+            remaining = caller_deadline - time.monotonic()
             if remaining <= 0:
                 _cancel_monitor(process)
                 break
             selector.select(min(remaining, 0.05))
-        while process.poll() is None and time.monotonic() < deadline:
+        while process.poll() is None and time.monotonic() < caller_deadline:
             _drain(selector, buffers, status, overflow)
-            selector.select(min(deadline - time.monotonic(), 0.02))
+            selector.select(min(caller_deadline - time.monotonic(), 0.02))
         if process.poll() is None:
             _cancel_monitor(process)
             try:
@@ -459,7 +461,7 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
             except BaseException:
                 pass
             try:
-                process.wait(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
+                process.wait(timeout=min(0.5, max(0.0, caller_deadline - time.monotonic())))
             except BaseException:
                 try:
                     process.kill()

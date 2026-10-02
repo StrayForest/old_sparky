@@ -28,6 +28,13 @@ def _held_test_lock():
 
 
 class PlatformBackupSupervisorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._real_monitor_path = supervisor._monitor_path
+        self._monitor_path_patch = mock.patch.object(
+            supervisor, "_monitor_path", return_value=Path(supervisor.__file__).with_name("platform_backup_process_monitor.py")
+        )
+        self._monitor_path_patch.start()
+        self.addCleanup(self._monitor_path_patch.stop)
     def test_stale_filename_is_reused_and_conflict_is_typed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             path = Path(temporary_dir) / supervisor.BACKUP_LOCK_PATH.name
@@ -222,6 +229,17 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         self.assertEqual(failed.stderr_bytes, 1048576)
         self.assertTrue(failed.stderr_truncated)
         self.assertLessEqual(len(failed.stderr.encode()), supervisor.COMMAND_DIAGNOSTIC_BYTES + 40)
+        real_drain = supervisor._drain
+        def delayed_drain(*args):
+            time.sleep(0.15)
+            return real_drain(*args)
+        with mock.patch.object(supervisor, "_drain", side_effect=delayed_drain):
+            with self.assertRaises(supervisor.BackupCommandTimeout):
+                supervisor.run_database_command(
+                    [sys.executable, "-c", "pass"],
+                    deadline=supervisor.operation_deadline(0.1),
+                    cleanup_reserve_seconds=0.02,
+                )
 
     def test_namespace_timeout_kills_detached_double_fork_without_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -267,6 +285,23 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         self.assertTrue(Path(command[0]).is_absolute())
         self.assertEqual(supervisor._trusted_executable("pg_dump", env), "/usr/bin/pg_dump")
         self.assertNotIn("SECRET", env)
+        with tempfile.TemporaryDirectory(dir="/root") as temporary_dir:
+            root = Path(temporary_dir)
+            monitor = root / "monitor.py"
+            monitor.write_text("pass\n", encoding="utf-8")
+            monitor.chmod(0o755)
+            self.assertEqual(self._real_monitor_path(monitor), monitor)
+            link = root / "link.py"
+            link.symlink_to(monitor)
+            with self.assertRaises(supervisor.BackupMonitorUnavailable):
+                self._real_monitor_path(link)
+            root.chmod(0o777)
+            with self.assertRaises(supervisor.BackupMonitorUnavailable):
+                self._real_monitor_path(monitor)
+            root.chmod(0o700)
+            os.chown(monitor, 65534, 65534)
+            with self.assertRaises(supervisor.BackupMonitorUnavailable):
+                self._real_monitor_path(monitor)
         for bad in (["sh", "-c", "true"], [sys.executable, "--jobs"], ["/tmp/pg_dump"], ["psql", "-c", r"\copy x"], ["psql", "--command=\\!"], ["psql", "--file", "/tmp/x"], ["runuser", "-u", "postgres", "--", "psql", "-c", r"\!"]):
             with self.assertRaises(supervisor.BackupCommandError):
                 supervisor._validate_command(bad, env)
