@@ -68,7 +68,7 @@ jobs:
             --header "Accept: application/vnd.github+json"
             --header "X-GitHub-Api-Version: 2022-11-28"
           )
-          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+          curl --connect-timeout 5 --max-time 15 --retry 0 --fail-with-body --silent --show-error --max-filesize 65536 \
             "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY/actions/runs/$SOURCE_RUN_ID" \
             --output "$run_metadata"
           /usr/bin/python3 - "$run_metadata" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$TARGET_SHA" "$EXPECTED_REPOSITORY" "$EXPECTED_WORKFLOW_PATH" "$EXPECTED_WORKFLOW_NAME" <<'PY'
@@ -101,7 +101,7 @@ jobs:
           print(json.load(open(sys.argv[1], encoding="utf-8"))["workflow_id"])
           PY
           )"
-          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+          curl --connect-timeout 5 --max-time 15 --retry 0 --fail-with-body --silent --show-error --max-filesize 65536 \
             "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY/actions/workflows/$workflow_id" \
             --output "$workflow_metadata"
           /usr/bin/python3 - "$workflow_metadata" "$EXPECTED_WORKFLOW_PATH" "$EXPECTED_WORKFLOW_NAME" <<'PY'
@@ -111,7 +111,7 @@ jobs:
           if not isinstance(payload, dict) or payload.get("path") != sys.argv[2] or payload.get("name") != sys.argv[3] or payload.get("state") != "active":
               raise SystemExit("trigger workflow id/path is not the reviewed workflow")
           PY
-          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+          curl --connect-timeout 5 --max-time 15 --retry 0 --fail-with-body --silent --show-error --max-filesize 65536 \
             "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY" --output "$repository_metadata"
           /usr/bin/python3 - "$repository_metadata" <<'PY'
           import json, sys
@@ -120,7 +120,7 @@ jobs:
           if not isinstance(payload, dict) or payload.get("default_branch") != "dev":
               raise SystemExit("repository default branch is not the protected dev ref")
           PY
-          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+          curl --connect-timeout 5 --max-time 15 --retry 0 --fail-with-body --silent --show-error --max-filesize 65536 \
             "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY/branches/dev" \
             --output "$branch_metadata"
           /usr/bin/python3 - "$branch_metadata" "$TARGET_SHA" <<'PY'
@@ -137,7 +137,7 @@ jobs:
           ):
               raise SystemExit("trigger ref is not the protected dev commit")
           PY
-          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+          curl --connect-timeout 5 --max-time 15 --retry 0 --fail-with-body --silent --show-error --max-filesize 65536 \
             "${api_headers[@]}" "$GITHUB_API_URL/repos/$EXPECTED_REPOSITORY/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
             --output "$artifacts_metadata"
           /usr/bin/python3 - "$artifacts_metadata" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" <<'PY' >> "$GITHUB_OUTPUT"
@@ -283,14 +283,14 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28"
           )
           mkdir -p -m 700 "$RUNNER_TEMP/external-recovery-input"
-          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+          curl --connect-timeout 5 --max-time 15 --retry 0 --fail-with-body --silent --show-error --max-filesize 65536 \
             "${api_headers[@]}" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID" \
             --output "$RUNNER_TEMP/external-recovery-artifact-metadata.json"
-          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --location --max-filesize 67108864 \
+          curl --connect-timeout 10 --max-time 30 --retry 0 --fail-with-body --silent --show-error --location --max-filesize 67108864 \
             "${api_headers[@]}" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID/zip" \
             --output "$RUNNER_TEMP/external-recovery-input.zip"
           test "$(stat -c '%s' "$RUNNER_TEMP/external-recovery-input.zip")" -le "$INPUT_ARTIFACT_SIZE"
-          curl --connect-timeout 10 --max-time 30 --fail-with-body --silent --show-error --max-filesize 1048576 \
+          curl --connect-timeout 5 --max-time 15 --retry 0 --fail-with-body --silent --show-error --max-filesize 65536 \
             "${api_headers[@]}" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" \
             --output "$RUNNER_TEMP/external-recovery-run-metadata.json"
 

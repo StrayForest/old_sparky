@@ -1963,7 +1963,7 @@ def _external_load_workflow_issues(
             if metadata_step.get("if") != "${{ always() }}":
                 issues.append("trusted external-load metadata download must run before artifact verification")
             run = metadata_step.get("run")
-            if not isinstance(run, str) or "--max-filesize 1048576" not in run or "install -m 600 /dev/null" not in run or "stat -c '%a'" not in run:
+            if not isinstance(run, str) or "--max-filesize 65536" not in run or "install -m 600 /dev/null" not in run or "stat -c '%a'" not in run:
                 issues.append("trusted external-load metadata download must be bounded and mode-600")
         if not isinstance(artifact_step, dict):
             issues.append("trusted external-load evaluator must verify artifacts in a named step")
