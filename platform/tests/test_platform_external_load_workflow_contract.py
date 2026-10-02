@@ -26,6 +26,35 @@ def _jobs(source: str) -> dict[str, str]:
     return {match.group("name"): match.group("body") for match in matches}
 
 
+def _ssh_file_commands(body: str, executable: str) -> list[str]:
+    """Extract each ``ssh/scp -F`` invocation without merging ``&&`` calls."""
+
+    lines = body.splitlines()
+    commands: list[str] = []
+    start = re.compile(rf"^(?:if |&& )?{re.escape(executable)} -F ")
+    for index, line in enumerate(lines):
+        command = line.strip()
+        if not start.match(command):
+            continue
+        next_index = index
+        while command.endswith("\\") and next_index + 1 < len(lines):
+            next_line = lines[next_index + 1].strip()
+            if start.match(next_line):
+                break
+            command = f"{command[:-1].rstrip()} {next_line}"
+            next_index += 1
+        commands.append(command)
+    return commands
+
+
+def _scp_commands(body: str) -> list[str]:
+    return _ssh_file_commands(body, "scp")
+
+
+def _ssh_commands(body: str) -> list[str]:
+    return _ssh_file_commands(body, "ssh")
+
+
 def _pass_truth_table(state: dict[str, object]) -> bool:
     """Model the final gate's authoritative status inputs."""
 
@@ -191,6 +220,47 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertIn(artifact, self.source)
         self.assertIn("test -n \"$artifact_id\" && test -n \"$artifact_digest\"", self.source)
         self.assertIn("if-no-files-found: error", self.source)
+
+        expected_scp_options = (
+            "-o ConnectTimeout=10",
+            "-o ServerAliveInterval=15",
+            "-o ServerAliveCountMax=3",
+        )
+        for job_name, expected_count in (("fixture-setup", 2), ("fixture-finalize", 6)):
+            commands = _scp_commands(self.jobs[job_name])
+            self.assertEqual(expected_count, len(commands), job_name)
+            for command in commands:
+                remote_index = command.index('"$PROD_SSH_USER@$PROD_SSH_HOST')
+                positions = []
+                for option in expected_scp_options:
+                    self.assertEqual(1, command.count(option), command)
+                    position = command.index(option)
+                    self.assertLess(position, remote_index, command)
+                    positions.append(position)
+                self.assertEqual(sorted(positions), positions, command)
+        for job_name, expected_count in (("fixture-setup", 1), ("fixture-finalize", 3)):
+            commands = _ssh_commands(self.jobs[job_name])
+            self.assertEqual(expected_count, len(commands), job_name)
+            for command in commands:
+                remote_index = command.index('"$PROD_SSH_USER@$PROD_SSH_HOST')
+                for option in expected_scp_options:
+                    self.assertEqual(1, command.count(option), command)
+                    self.assertLess(command.index(option), remote_index, command)
+
+        setup = self.jobs["fixture-setup"]
+        ready_position = setup.index('$export_dir/ready" "$artifact_dir/ready"')
+        manifest_position = setup.index('$export_dir/manifest.json" "$manifest_path"')
+        self.assertLess(ready_position, manifest_position)
+        self.assertIn("&& scp", setup[ready_position:manifest_position])
+
+        finalize = self.jobs["fixture-finalize"].split(
+            "- name: Signal fixture completion and collect origin evidence", 1
+        )[1].split("- name: Exact cleanup of external fixture", 1)[0]
+        self.assertEqual(4, len(_scp_commands(finalize)))
+        summary_position = finalize.index("$export_dir/matrix-summary.json")
+        exit_position = finalize.index("$export_dir/supervisor.exit")
+        self.assertLess(summary_position, exit_position)
+        self.assertIn("&& scp", finalize[summary_position:exit_position])
 
     def test_evaluator_cannot_hide_upstream_failure_or_publish_success(self) -> None:
         evaluator = self.jobs["evaluate-load"]
