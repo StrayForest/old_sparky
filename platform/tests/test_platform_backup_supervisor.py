@@ -29,9 +29,25 @@ def _held_test_lock():
 
 class PlatformBackupSupervisorTests(unittest.TestCase):
     def setUp(self) -> None:
+        source = Path(supervisor.__file__).with_name("platform_backup_process_monitor.py")
+        source_bytes = source.read_bytes()
+        self._monitor_stage = tempfile.TemporaryDirectory(dir="/root", prefix="oldsparky-monitor-")
+        self.addCleanup(self._monitor_stage.cleanup)
+        stage_root = Path(self._monitor_stage.name)
+        stage_path = stage_root / source.name
+        stage_path.write_bytes(source_bytes)
+        stage_root.chmod(0o700)
+        stage_path.chmod(0o755)
+        os.chown(stage_root, 0, 0)
+        os.chown(stage_path, 0, 0)
+        self.assertEqual(hashlib.sha256(stage_path.read_bytes()).digest(), hashlib.sha256(source_bytes).digest())
+        self.assertEqual(stage_root.stat().st_uid, 0)
+        self.assertEqual(stage_path.stat().st_uid, 0)
+        self.assertEqual(stage_path.stat().st_mode & 0o777, 0o755)
+        supervisor._secure_executable(stage_path)
         self._real_monitor_path = supervisor._monitor_path
         self._monitor_path_patch = mock.patch.object(
-            supervisor, "_monitor_path", return_value=Path(supervisor.__file__).with_name("platform_backup_process_monitor.py")
+            supervisor, "_monitor_path", return_value=stage_path
         )
         self._monitor_path_patch.start()
         self.addCleanup(self._monitor_path_patch.stop)
