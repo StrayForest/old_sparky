@@ -19,7 +19,7 @@
     }
   ],
   "lock_file": "requirements-ci.lock.txt",
-  "lock_sha256": "d80d165ffd8f46122f30b0e88c3057158024febfd0d0a10a2b353ff4ddd8e133",
+  "lock_sha256": "87e8d9c9019c79b8278e1056d98be801b0fd04414a03e180ad57f93464858a6f",
   "schema": 1,
   "target": {
     "architecture": "x86_64",
