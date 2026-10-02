@@ -8,6 +8,7 @@ from uuid import uuid4
 import httpx
 from sqlalchemy import delete, select
 
+from apps.platform_api.app.api.routes import profile_workspace as profile_workspace_routes
 from apps.platform_api.app.api.routes import profiles
 from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
@@ -91,6 +92,8 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
         self,
         owner: httpx.AsyncClient,
         request,
+        *,
+        patch_target=(profiles, "lock_profile_owner"),
     ) -> httpx.Response:
         me = await owner.get("/api/v1/users/me")
         self.assertEqual(me.status_code, 200, me.text)
@@ -98,11 +101,12 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
 
         lock_attempted = asyncio.Event()
         lock_acquired = asyncio.Event()
-        original_lock = profiles.lock_profile_owner
+        target_module, target_name = patch_target
+        original_lock = getattr(target_module, target_name)
 
-        async def observe_lock(db_session, locked_user_id):
+        async def observe_lock(*args, **kwargs):
             lock_attempted.set()
-            result = await original_lock(db_session, locked_user_id)
+            result = await original_lock(*args, **kwargs)
             lock_acquired.set()
             return result
 
@@ -114,7 +118,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                 )
                 try:
                     with patch.object(
-                        profiles, "lock_profile_owner", side_effect=observe_lock
+                        target_module, target_name, side_effect=observe_lock
                     ):
                         task = asyncio.create_task(request())
                         await asyncio.wait_for(lock_attempted.wait(), timeout=5)
@@ -264,6 +268,15 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
     async def test_captain_update_waits_for_shared_user_lock(self) -> None:
         owner = await self._register("captain-lock")
 
+        # The captain route resolves this consumer alias at module scope;
+        # patching profiles.lock_profile_owner would not observe its call.
+        self.assertIs(
+            profile_workspace_routes.put_my_captain_profile.__globals__[
+                "update_captain_profile"
+            ],
+            profile_workspace_routes.update_captain_profile,
+        )
+
         response = await self._assert_user_lock_serializes_slot_write(
             owner,
             lambda: owner.put(
@@ -279,6 +292,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                     ],
                 },
             ),
+            patch_target=(profile_workspace_routes, "update_captain_profile"),
         )
 
         self.assertEqual(response.status_code, 200, response.text)
