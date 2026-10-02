@@ -39,7 +39,33 @@ The operation phase captures a strict identity (temporary name, PostgreSQL OID
 and owner) after creation. Cleanup then uses only the reserved interval and
 re-checks that identity immediately before `dropdb`. A missing, replaced or
 owner-mismatched identity never permits a drop. A cleanup failure is recorded
-as `cleanup_unproven` and never turns the backup green.
+as `cleanup_unproven` and never turns the backup green. Because PostgreSQL has
+no conditional `DROP DATABASE` that binds a name to a previously observed OID,
+the restore drill also holds the fixed root-owned
+`/run/lock/oldsparky-platform-restore-lifecycle.lock` for the complete
+probe/create/identity/restore/recheck/drop interval. Every platform-owned
+temporary-database creator or replacer must use this lock; lock refusal fails
+closed before mutation. This is an application serialization boundary, not a
+claim of database-level atomicity: an independent DBA/superuser that ignores
+the lock is outside the automation trust boundary, and an ambiguous identity
+is never auto-dropped.
+
+This is a closed-world inventory of the in-repository database mutation paths.
+The local and remote `createdb`/`dropdb` argv builders in
+`platform_backup_restore_drill.py` are the only production temporary-database
+creator, replacer and dropper, and every caller reaches them through
+`perform_restore_drill`, which holds the lifecycle lock. The supervisor-owned
+`create_backup` path additionally requires its unforgeable mutation capability;
+the read-only-archive verification mode may create only its locked temporary
+drill database. `platform_prepare_test_runtime.py` is a separate local-test
+bootstrap: its fixed `platformdb_test` create and `ALTER DATABASE` operations
+are not a production backup path and must never be used to administer a
+production temporary database. No in-repository production database-rename
+path exists. Any new create, replace, rename or drop path must be rejected
+until it is added to this inventory and wired through the same lock and
+ownership proof. This closed-world contract does not and cannot prevent a
+DBA/superuser from bypassing the lock; such actors remain outside the
+automation trust boundary.
 
 The manifest is the closed, versioned v3 contract implemented by
 [`platform_backup_manifest.py`](../tools/platform_backup_manifest.py). It

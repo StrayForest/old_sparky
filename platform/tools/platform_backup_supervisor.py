@@ -34,6 +34,7 @@ from pathlib import Path
 import re
 import selectors
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -479,13 +480,13 @@ def _read_monitor_status(data: bytearray, overflow: bool = False) -> dict[str, o
         raise BackupCleanupUnproven("backup monitor status is malformed") from exc
     except ValueError as exc:
         raise BackupCleanupUnproven("backup monitor status is malformed") from exc
-    if (
-        not isinstance(value, dict)
-        or type(value.get("schema")) is not int
-        or value.get("schema") != 1
-    ):
+    if type(value) is not dict:
+        raise BackupCleanupUnproven("backup monitor status must be an object")
+    if type(value.get("schema")) is not int or value.get("schema") != 1:
         raise BackupCleanupUnproven("backup monitor status schema is invalid")
     status = value.get("status")
+    if type(status) is not str:
+        raise BackupCleanupUnproven("backup monitor status name is invalid")
     allowed = {
         "completed": {"schema", "status", "returncode"},
         "timeout": {"schema", "status", "returncode"},
@@ -2283,7 +2284,10 @@ def evidence_session(app_dir: Path, operation: str, *, locks: tuple[str, ...]) -
             signal.signal(number, _cancel_signal_handler)
     try:
         yield session
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        safe_payload = safe_error_payload(exc)
+        if safe_payload.get("cleanup_status") == "unproven":
+            session.record_cleanup(safe_payload.get("database_id"))
         session.finish("cancelled", error_class="cancelled")
         raise
     except BackupLockConflict:
@@ -2561,10 +2565,12 @@ def run_offsite(
         Path(args.backup_dir), getattr(args, "dump", None),
         max_age_hours=float(args.max_age_hours), apply=bool(args.apply),
     )
-    work = Path(tempfile.mkdtemp(prefix="oldsparky-offsite-"))
-    work.chmod(0o700)
+    work: Path | None = None
     encrypted: Any | None = None
+    primary: BaseException | None = None
     try:
+        work = Path(tempfile.mkdtemp(prefix="oldsparky-offsite-"))
+        work.chmod(0o700)
         with held_backup_pair(backup.dump_path, backup.metadata_path) as held:
             pair = held.snapshot
             # Selection happened by pathname.  Refuse a selected object whose
@@ -2662,6 +2668,9 @@ def run_offsite(
             )
             _lock_boundary_validate(lock)
             return result
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
         if encrypted is not None and getattr(encrypted, "fd", None) is not None:
             try:
@@ -2669,10 +2678,16 @@ def run_offsite(
             except OSError:
                 pass
         # The temporary ciphertext is deliberately private and never becomes
-        # evidence.  Keep cleanup bounded to the supervisor-owned directory.
-        import shutil
-
-        shutil.rmtree(work, ignore_errors=True)
+        # evidence.  A failed removal is machine-detectable but never masks a
+        # more important operation failure.
+        if work is not None:
+            try:
+                shutil.rmtree(work)
+            except OSError as cleanup_error:
+                if primary is None:
+                    raise BackupCleanupUnproven() from cleanup_error
+                setattr(primary, "backup_cleanup_unproven", "")
+                primary.add_note("offsite temporary ciphertext cleanup was not proven")
 
 
 def run_production_restore(*_args: object, **_kwargs: object) -> None:

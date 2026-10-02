@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+from contextlib import contextmanager
 import dataclasses
 import datetime as dt
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +16,7 @@ import re
 import secrets
 import stat
 import sys
+import time
 import urllib.parse
 import uuid
 from typing import Any
@@ -64,6 +68,16 @@ DEFAULT_OPERATION_TIMEOUT_SECONDS = 1500.0
 LOCAL_DATABASE_HOSTS = {None, "", "127.0.0.1", "localhost", "::1"}
 REQUIRED_PLATFORM_EXTENSIONS = REQUIRED_EXTENSIONS
 ALEMBIC_REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+# Every platform-owned restore creator/replacer uses this fixed lock for the
+# complete temporary-database lifecycle.  The inode is intentionally retained
+# after release so a sticky /run/lock directory cannot swap a new pathname
+# between proof and drop.
+RESTORE_LIFECYCLE_LOCK_PATH = pathlib.Path(
+    "/run/lock/oldsparky-platform-restore-lifecycle.lock"
+)
+RESTORE_LIFECYCLE_LOCK_MODE = 0o600
+RESTORE_LIFECYCLE_LOCK_OWNER = 0
+RESTORE_LIFECYCLE_LOCK_GROUP = 0
 
 
 def _trusted_alembic_head(source_root: pathlib.Path | None = None) -> str:
@@ -701,7 +715,128 @@ def _require_supervisor_capability(capability: object | None) -> None:
     supervisor.require_mutation_capability(capability, "maintenance")
 
 
+@contextmanager
+def _restore_lifecycle_lock(deadline: float):
+    """Serialize every in-scope temporary database creator and replacer.
+
+    PostgreSQL has no conditional ``DROP DATABASE`` primitive that binds a
+    name to a previously observed OID.  This lock is therefore a mandatory
+    application boundary, not an assertion of database-level atomicity.  An
+    independent DBA/superuser that creates or replaces a matching name while
+    ignoring this lock is outside the automation trust boundary; we fail
+    closed on lock refusal and never claim to protect that actor.
+    """
+
+    path = RESTORE_LIFECYCLE_LOCK_PATH
+    parent = path.parent
+    try:
+        parent_metadata = parent.lstat()
+        if (
+            parent.resolve(strict=True) != parent
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != RESTORE_LIFECYCLE_LOCK_OWNER
+            or parent_metadata.st_gid != RESTORE_LIFECYCLE_LOCK_GROUP
+            or (
+                parent_metadata.st_mode & 0o022
+                and not parent_metadata.st_mode & stat.S_ISVTX
+            )
+        ):
+            raise OSError(errno.EPERM, "unsafe restore lifecycle lock directory")
+        descriptor = os.open(
+            path,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            RESTORE_LIFECYCLE_LOCK_MODE,
+        )
+    except OSError as exc:
+        raise supervisor.BackupCleanupUnproven() from exc
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+            current = path.lstat()
+        except OSError as exc:
+            raise supervisor.BackupCleanupUnproven() from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != RESTORE_LIFECYCLE_LOCK_OWNER
+            or metadata.st_gid != RESTORE_LIFECYCLE_LOCK_GROUP
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != RESTORE_LIFECYCLE_LOCK_MODE
+            or (
+                current.st_dev,
+                current.st_ino,
+                current.st_nlink,
+            )
+            != (metadata.st_dev, metadata.st_ino, metadata.st_nlink)
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+        ):
+            raise supervisor.BackupCleanupUnproven()
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise supervisor.BackupCleanupUnproven() from exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise supervisor.BackupCommandTimeout(
+                        "restore lifecycle lock deadline exceeded"
+                    ) from exc
+                time.sleep(min(0.01, remaining))
+        try:
+            acquired_path = path.lstat()
+        except OSError as exc:
+            raise supervisor.BackupCleanupUnproven() from exc
+        if (
+            stat.S_ISLNK(acquired_path.st_mode)
+            or not stat.S_ISREG(acquired_path.st_mode)
+            or acquired_path.st_nlink != 1
+            or (
+                acquired_path.st_dev,
+                acquired_path.st_ino,
+            )
+            != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise supervisor.BackupCleanupUnproven()
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def perform_restore_drill(
+    dump_path: pathlib.Path,
+    *,
+    app_target: DatabaseTarget,
+    admin_target: DatabaseTarget | None,
+    helpers: supervisor.TrustedPostgresHelpers,
+    timestamp_slug: str,
+    trusted_alembic_head: object | None = None,
+    expected_alembic_head: str | None = None,
+    source_root: pathlib.Path | None = None,
+    deadline: float,
+) -> int:
+    with _restore_lifecycle_lock(supervisor.cleanup_deadline(deadline)):
+        return _perform_restore_drill_unlocked(
+            dump_path,
+            app_target=app_target,
+            admin_target=admin_target,
+            helpers=helpers,
+            timestamp_slug=timestamp_slug,
+            trusted_alembic_head=trusted_alembic_head,
+            expected_alembic_head=expected_alembic_head,
+            source_root=source_root,
+            deadline=deadline,
+        )
+
+
+def _perform_restore_drill_unlocked(
     dump_path: pathlib.Path,
     *,
     app_target: DatabaseTarget,
@@ -815,6 +950,8 @@ def perform_restore_drill(
                 identity_result.stdout,
                 expected_name=drill_database,
             )
+            if created_identity.owner != app_target.username:
+                raise supervisor.BackupCleanupUnproven(database_id=drill_database)
         except (KeyboardInterrupt, SystemExit, supervisor.BackupCleanupUnproven):
             raise
         except Exception as exc:
@@ -946,12 +1083,20 @@ def perform_restore_drill(
                 if current_identity != created_identity:
                     raise ValueError("temporary restore database identity changed")
                 invoke(drop_command, target=admin_command_target, cleanup=True)
-            except (KeyboardInterrupt, SystemExit):
+            except (KeyboardInterrupt, SystemExit) as cleanup_error:
+                setattr(cleanup_error, "backup_cleanup_unproven", drill_database)
+                cleanup_error.add_note(
+                    "restore-drill cleanup was not proven; "
+                    f"database_id={drill_database}; operator_action="
+                    f"{supervisor.CLEANUP_OPERATOR_ACTION}"
+                )
                 if primary is None:
                     raise
                 setattr(primary, "backup_cleanup_unproven", drill_database)
                 primary.add_note(
-                    f"restore-drill cleanup was not proven; database_id={drill_database}"
+                    "restore-drill cleanup was not proven; "
+                    f"database_id={drill_database}; operator_action="
+                    f"{supervisor.CLEANUP_OPERATOR_ACTION}"
                 )
             except BaseException as cleanup_error:
                 if primary is None:
@@ -1114,6 +1259,7 @@ def create_backup(
     temporary_dump_fd: int | None = None
     temporary_dump_created = False
     metadata_written = False
+    cancelled_restore: BaseException | None = None
 
     try:
         try:
@@ -1230,6 +1376,15 @@ def create_backup(
                 cleanup_status = restore_payload.get("cleanup_status")
                 cleanup_database_id = restore_payload.get("database_id")
                 cleanup_operator_action = restore_payload.get("operator_action")
+            except BaseException as exc:
+                restore_payload = supervisor.safe_error_payload(exc)
+                if restore_payload.get("cleanup_status") != "unproven":
+                    raise
+                restore_error = _safe_restore_error(exc)
+                cleanup_status = restore_payload.get("cleanup_status")
+                cleanup_database_id = restore_payload.get("database_id")
+                cleanup_operator_action = restore_payload.get("operator_action")
+                cancelled_restore = exc
 
         completed_at = utc_now()
         metadata = build_manifest(
@@ -1268,6 +1423,8 @@ def create_backup(
             "alembic_revision": alembic_revision or "unknown",
         }
         if restore_error is not None:
+            if cancelled_restore is not None:
+                raise cancelled_restore
             wrapped = RuntimeError(
                 f"Platform backup was created but restore verification failed: {restore_error}"
             )

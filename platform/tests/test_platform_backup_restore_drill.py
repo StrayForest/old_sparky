@@ -13,6 +13,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from unittest import mock
@@ -76,6 +77,21 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         )
         self._ensure_monitor_patch.start()
         self.addCleanup(self._ensure_monitor_patch.stop)
+        self._restore_lock_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._restore_lock_dir.cleanup)
+        restore_lock_path = pathlib.Path(self._restore_lock_dir.name) / "restore-lifecycle.lock"
+        self._restore_lock_path_patch = mock.patch.object(
+            backup_drill, "RESTORE_LIFECYCLE_LOCK_PATH", restore_lock_path
+        )
+        self._restore_lock_path_patch.start()
+        self.addCleanup(self._restore_lock_path_patch.stop)
+        for name, value in (
+            ("RESTORE_LIFECYCLE_LOCK_OWNER", os.geteuid()),
+            ("RESTORE_LIFECYCLE_LOCK_GROUP", os.getegid()),
+        ):
+            patcher = mock.patch.object(backup_drill, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _creator_args(self, output_dir: pathlib.Path, *, dump_only: bool = True) -> argparse.Namespace:
         return argparse.Namespace(
@@ -359,6 +375,139 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     for call in run_command.call_args_list
                 ]
                 self.assertNotIn("dropdb", command_names)
+
+    def test_restore_lifecycle_lock_blocks_an_in_scope_second_creator(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            lock_path = pathlib.Path(temporary_dir) / "restore-lifecycle.lock"
+            with mock.patch.object(backup_drill, "RESTORE_LIFECYCLE_LOCK_PATH", lock_path):
+                with backup_drill._restore_lifecycle_lock(time.monotonic() + 5):
+                    with mock.patch.object(backup_drill, "run_command") as run_command:
+                        with self.assertRaises(platform_backup_supervisor.BackupCommandTimeout):
+                            backup_drill.perform_restore_drill(
+                                pathlib.Path("/tmp/backup.dump"),
+                                app_target=target,
+                                admin_target=None,
+                                helpers=TEST_HELPERS,
+                                timestamp_slug="ignored",
+                                deadline=time.monotonic() + 2.2,
+                            )
+                        run_command.assert_not_called()
+
+    def test_restore_drill_rejects_initial_owner_mismatch_without_adoption(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "e" * 32
+        with (
+            mock.patch.object(
+                backup_drill,
+                "run_command",
+                side_effect=[
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess(
+                        [], 0, self._identity_json(database, owner="other_owner"), ""
+                    ),
+                ],
+            ) as run_command,
+            mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+            mock.patch.object(backup_drill.secrets, "token_hex", return_value="e" * 32),
+        ):
+            with self.assertRaises(
+                platform_backup_supervisor.BackupCleanupUnproven
+            ) as raised:
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/tmp/backup.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    helpers=TEST_HELPERS,
+                    timestamp_slug="ignored",
+                    expected_alembic_head="head",
+                    deadline=platform_backup_supervisor.operation_deadline(30.0),
+                )
+        self.assertEqual(raised.exception.database_id, database)
+        self.assertEqual(run_command.call_count, 3)
+
+    def test_cleanup_cancellation_keeps_sanitized_identity_for_primary_and_cleanup(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "f" * 32
+        for cancellation in (KeyboardInterrupt, SystemExit):
+            with self.subTest(cancellation=cancellation):
+                responses = [
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, self._identity_json(database), ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    RuntimeError("restore failed"),
+                    cancellation(),
+                ]
+                with (
+                    mock.patch.object(backup_drill, "run_command", side_effect=responses),
+                    mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+                    mock.patch.object(backup_drill.secrets, "token_hex", return_value="f" * 32),
+                    mock.patch.object(backup_drill, "REQUIRED_PLATFORM_EXTENSIONS", ()),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "restore failed") as raised:
+                        backup_drill.perform_restore_drill(
+                            pathlib.Path("/tmp/backup.dump"),
+                            app_target=target,
+                            admin_target=None,
+                            helpers=TEST_HELPERS,
+                            timestamp_slug="ignored",
+                            expected_alembic_head="head",
+                            deadline=platform_backup_supervisor.operation_deadline(30.0),
+                        )
+                self.assertEqual(
+                    getattr(raised.exception, "backup_cleanup_unproven", None), database
+                )
+
+    def test_cleanup_only_cancellation_keeps_sanitized_identity(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "1" * 32
+        for cancellation in (KeyboardInterrupt, SystemExit):
+            with self.subTest(cancellation=cancellation):
+                responses = [
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, self._identity_json(database), ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "", ""),
+                    subprocess.CompletedProcess([], 0, "1\n", ""),
+                    subprocess.CompletedProcess([], 0, "1\n", ""),
+                    subprocess.CompletedProcess([], 0, "head\n", ""),
+                    subprocess.CompletedProcess([], 0, "0\n", ""),
+                    cancellation(),
+                ]
+                with (
+                    mock.patch.object(backup_drill, "run_command", side_effect=responses),
+                    mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"),
+                    mock.patch.object(backup_drill.secrets, "token_hex", return_value="1" * 32),
+                    mock.patch.object(backup_drill, "REQUIRED_PLATFORM_EXTENSIONS", ()),
+                ):
+                    with self.assertRaises(cancellation) as raised:
+                        backup_drill.perform_restore_drill(
+                            pathlib.Path("/tmp/backup.dump"),
+                            app_target=target,
+                            admin_target=None,
+                            helpers=TEST_HELPERS,
+                            timestamp_slug="ignored",
+                            expected_alembic_head="head",
+                            deadline=platform_backup_supervisor.operation_deadline(30.0),
+                        )
+                self.assertEqual(
+                    getattr(raised.exception, "backup_cleanup_unproven", None), database
+                )
+                payload = platform_backup_supervisor.safe_error_payload(raised.exception)
+                self.assertEqual(payload["cleanup_status"], "unproven")
+                self.assertEqual(payload["database_id"], database)
 
     def test_restore_drill_identity_capture_rejects_absent_ambiguous_and_timeout(self) -> None:
         target = backup_drill.DatabaseTarget(

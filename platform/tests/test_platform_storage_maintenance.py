@@ -279,6 +279,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn("14", run.call_args_list[0].args[0])
         self.assertIn("--check-latest", run.call_args_list[1].args[0])
         self.assertIn("24.0", run.call_args_list[1].args[0])
+        for call in run.call_args_list:
+            self.assertFalse(call.kwargs["shell"])
+            self.assertGreater(call.kwargs["timeout"], 0)
+            self.assertNotIn("SECRET", call.kwargs["env"])
         self.assertTrue(result["restore_verified"])
         self.assertTrue(result["alembic_revision_verified"])
         self.assertTrue(result["checksum_present"])

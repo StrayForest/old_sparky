@@ -450,6 +450,9 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             with self.assertRaises(supervisor.BackupCleanupUnproven):
                 supervisor._read_monitor_status(bytearray(payload), overflow)
         for payload in (
+            b'[]\n',
+            b'{"schema":1,"status":[]}\n',
+            b'{"schema":1,"status":{}}\n',
             b'{"schema":true,"status":"probe-ok"}\n',
             b'{"schema":1,"status":"probe-ok","returncode":0}\n',
             b'{"schema":1,"status":"completed"}\n',
@@ -460,6 +463,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         ):
             with self.assertRaises(supervisor.BackupCleanupUnproven):
                 supervisor._read_monitor_status(bytearray(payload))
+
         self.assertEqual(
             supervisor._read_monitor_status(
                 bytearray(b'{"schema":1,"status":"completed","returncode":0}\n')
@@ -545,6 +549,32 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                 self.assertRaises(supervisor.BackupCleanupUnproven, supervisor.run_database_command, [sys.executable, "-c", "pass"], deadline=supervisor.operation_deadline(8))
                 emit("completed", exit_code=9)
                 self.assertRaises(supervisor.BackupCleanupUnproven, supervisor.run_database_command, [sys.executable, "-c", "pass"], deadline=supervisor.operation_deadline(8))
+
+    def test_keyboard_interrupt_cleanup_identity_is_persisted_in_evidence(self) -> None:
+        database_id = "platform_restore_drill_" + "c" * 32
+        for cancellation_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(cancellation_type=cancellation_type):
+                cancellation = cancellation_type()
+                cancellation.backup_cleanup_unproven = database_id
+                with tempfile.TemporaryDirectory() as temporary_dir:
+                    app_dir = Path(temporary_dir)
+                    (app_dir / "shared").mkdir()
+                    with self.assertRaises(cancellation_type):
+                        with supervisor.evidence_session(
+                            app_dir, "local-backup", locks=supervisor.LOCK_ORDER
+                        ):
+                            raise cancellation
+                    evidence = supervisor.read_latest_evidence(app_dir)
+                    self.assertEqual(
+                        evidence["status"],
+                        "cancelled" if cancellation_type is KeyboardInterrupt else "failed",
+                    )
+                    self.assertEqual(evidence["recovery"]["cleanup_status"], "unproven")
+                    self.assertEqual(evidence["recovery"]["database_id"], database_id)
+                    self.assertEqual(
+                        evidence["recovery"]["operator_action"],
+                        supervisor.CLEANUP_OPERATOR_ACTION,
+                    )
 
     def test_namespace_setup_failure_publishes_status_before_target_spawn(self) -> None:
         from tools import platform_backup_process_monitor as monitor

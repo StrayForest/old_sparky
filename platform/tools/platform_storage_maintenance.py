@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from typing import Any, Iterator
 
 
@@ -438,8 +439,36 @@ def disk_snapshot(path: Path) -> dict[str, int | float]:
     return disk_snapshot_for_path(path).as_dict()
 
 
-def _run_backup_command(command: list[str]) -> dict[str, Any]:
-    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+def _run_backup_command(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    try:
+        from . import platform_backup_supervisor as supervisor
+    except ImportError:
+        import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+    interpreter = supervisor._trusted_executable(
+        sys.executable, supervisor._sanitized_env(None)
+    )
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("backup command timeout must be finite and positive")
+    if not command or command[0] != interpreter:
+        raise RuntimeError("Platform backup interpreter is not trusted.")
+    try:
+        completed = subprocess.run(  # nosec B603 - fixed trusted script argv
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=supervisor._sanitized_env(None),
+            shell=False,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise supervisor.BackupCommandTimeout(
+            "platform backup command did not complete in its budget"
+        ) from exc
     try:
         result = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
@@ -460,10 +489,18 @@ def _run_backup_legacy(
         raise ValueError("backup max age must be finite and positive")
     if not math.isfinite(backup_timeout_seconds) or backup_timeout_seconds <= 0:
         raise ValueError("backup timeout must be finite and positive")
+    deadline = time.monotonic() + backup_timeout_seconds
     script = Path(__file__).with_name("platform_backup_restore_drill.py")
+    try:
+        from . import platform_backup_supervisor as supervisor
+    except ImportError:
+        import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+    interpreter = supervisor._trusted_executable(
+        sys.executable, supervisor._sanitized_env(None)
+    )
     shared_dir = app_dir / "shared"
     create_command = [
-        sys.executable,
+        interpreter,
         str(script),
         "--env-file",
         str(shared_dir / ".env.platform"),
@@ -475,10 +512,17 @@ def _run_backup_legacy(
         str(backup_timeout_seconds),
         "--json",
     ]
-    result = _run_backup_command(create_command)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise supervisor.BackupCommandTimeout("legacy backup deadline expired")
+    create_command[create_command.index("--timeout-seconds") + 1] = str(remaining)
+    result = _run_backup_command(create_command, timeout_seconds=remaining)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise supervisor.BackupCommandTimeout("legacy backup deadline expired")
     check_result = _run_backup_command(
         [
-            sys.executable,
+            interpreter,
             str(script),
             "--env-file",
             str(shared_dir / ".env.platform"),
@@ -488,9 +532,10 @@ def _run_backup_legacy(
             "--max-age-hours",
             str(max_age_hours),
             "--timeout-seconds",
-            str(backup_timeout_seconds),
+            str(remaining),
             "--json",
-        ]
+        ],
+        timeout_seconds=remaining,
     )
     if result.get("restore_verified") is not True or check_result.get("restore_verified") is not True:
         raise RuntimeError("Platform backup was not restore-verified.")

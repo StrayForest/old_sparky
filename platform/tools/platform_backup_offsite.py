@@ -572,7 +572,12 @@ def select_verified_backup(
     )
 
 
-def _run_gpg(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _run_gpg(
+    command: list[str],
+    *,
+    check: bool = True,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
     try:
         # Every argv is built by this module; no shell parsing is involved.
         return subprocess.run(  # nosec B603
@@ -585,6 +590,7 @@ def _run_gpg(command: list[str], *, check: bool = True) -> subprocess.CompletedP
                 "LC_ALL": "C",
                 "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
             },
+            pass_fds=pass_fds,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise OffsiteBackupError(
@@ -978,6 +984,7 @@ def encrypt_backup_from_fd(
                 f"/proc/self/fd/{output_fd}",
             ],
             check=False,
+            pass_fds=(output_fd,),
         )
         has_public_key_packet = ":pubkey enc packet:" in packet_result.stdout
         has_encrypted_data_packet = any(
