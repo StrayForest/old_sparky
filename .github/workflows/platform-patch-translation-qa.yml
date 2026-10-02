@@ -63,6 +63,7 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/dev"
           trusted_ref="$RUNNER_TEMP/platform-trusted-translation-ref.json"
           curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -147,7 +148,9 @@ jobs:
             install -d -m 700 "$pages_dir"
             while :; do
               page_path="$pages_dir/page-${page}.json"
-              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              curl --fail-with-body --silent --show-error \
+                --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 1048576 \
+                "${api_headers[@]}" \
                 "${base_url}?per_page=100&page=${page}" --output "$page_path"
               count="$(/usr/bin/python3 - "$page_path" "$kind" <<'PY'
           import json
@@ -194,10 +197,14 @@ jobs:
           fetch_snapshot() {
             local snapshot_dir="$1"
             install -d -m 700 "$snapshot_dir"
-            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
+              "${api_headers[@]}" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml" \
               --output "$snapshot_dir/workflow.json"
-            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
+              "${api_headers[@]}" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
               --output "$snapshot_dir/run.json"
             fetch_rows \
@@ -390,13 +397,28 @@ jobs:
         run: |
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
-          curl --fail-with-body --silent --show-error \
+          status_response="$(mktemp "$RUNNER_TEMP/platform-patch-translation-pending-response.XXXXXX")"
+          trap 'rm -f -- "$status_response"' EXIT
+          if ! curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"pending\",\"context\":\"platform-patch-translation-warmup\",\"description\":\"Controlled four-patch Russian translation warm-up is running\",\"target_url\":\"${run_url}\"}"
+            --output "$status_response" \
+            --data "{\"state\":\"pending\",\"context\":\"platform-patch-translation-warmup\",\"description\":\"Controlled four-patch Russian translation warm-up is running\",\"target_url\":\"${run_url}\"}"; then
+            echo "translation QA pending status request failed" >&2
+            exit 1
+          fi
+          status_response_bytes="$(wc -c < "$status_response")"
+          case "$status_response_bytes" in
+            ''|*[!0-9]*) echo "translation QA pending status response size is malformed" >&2; exit 1 ;;
+          esac
+          (( status_response_bytes <= 65536 )) || {
+            echo "translation QA pending status response is oversized" >&2
+            exit 1
+          }
 
       - name: Configure SSH
         if: ${{ success() && needs.validate-translation-inputs.outputs.deploy_ready == 'true' }}
@@ -812,11 +834,26 @@ jobs:
               "target_url": sys.argv[3],
           }, separators=(",", ":")))
           PY
-          curl --fail-with-body --silent --show-error \
+          status_response="$(mktemp "$RUNNER_TEMP/platform-patch-translation-final-response.XXXXXX")"
+          trap 'rm -f -- "$status_response"' EXIT
+          if ! curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data-binary @"$RUNNER_TEMP/platform-translation-qa-status.json"
+            --output "$status_response" \
+            --data-binary @"$RUNNER_TEMP/platform-translation-qa-status.json"; then
+            echo "translation QA final status request failed" >&2
+            exit 1
+          fi
+          status_response_bytes="$(wc -c < "$status_response")"
+          case "$status_response_bytes" in
+            ''|*[!0-9]*) echo "translation QA final status response size is malformed" >&2; exit 1 ;;
+          esac
+          (( status_response_bytes <= 65536 )) || {
+            echo "translation QA final status response is oversized" >&2
+            exit 1
+          }
           rm -f -- "$RUNNER_TEMP/platform-translation-qa-status.json"

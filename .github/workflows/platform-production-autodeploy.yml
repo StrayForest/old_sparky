@@ -78,18 +78,21 @@ jobs:
           metadata_dir="$(mktemp -d "$RUNNER_TEMP/platform-security-metadata.XXXXXX")"
           trap 'rm -rf -- "$metadata_dir"' EXIT
           curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${SECURITY_WORKFLOW_FILE}" \
             --output "$metadata_dir/workflow.json"
           curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
             --output "$metadata_dir/run.json"
           curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 1048576 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -144,6 +147,7 @@ jobs:
             while :; do
               page_path="$pages_dir/page-${page}.json"
               curl --fail-with-body --silent --show-error \
+                --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 4194304 \
                 --header "Authorization: Bearer $GH_TOKEN" \
                 --header "Accept: application/vnd.github+json" \
                 --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -264,6 +268,7 @@ jobs:
           PY
           )"
           curl --fail-with-body --silent --show-error --location \
+            --connect-timeout 5 --max-time 60 --retry 0 --max-filesize 8388608 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -461,6 +466,7 @@ jobs:
 
           branch_json="$(
             curl --fail-with-body --silent --show-error \
+              --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -504,7 +510,9 @@ jobs:
             install -d -m 700 "$pages_dir"
             while :; do
               page_path="$pages_dir/page-${page}.json"
-              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              curl --fail-with-body --silent --show-error \
+                --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 1048576 \
+                "${api_headers[@]}" \
                 "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=${page}" \
                 --output "$page_path"
               count="$(/usr/bin/python3 - "$page_path" <<'PY'
@@ -555,10 +563,14 @@ jobs:
           fetch_security_snapshot() {
             local snapshot_dir="$1"
             install -d -m 700 "$snapshot_dir"
-            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
+              "${api_headers[@]}" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${SECURITY_WORKFLOW_FILE}" \
               --output "$snapshot_dir/workflow.json"
-            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+            curl --fail-with-body --silent --show-error \
+              --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
+              "${api_headers[@]}" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
               --output "$snapshot_dir/run.json"
             fetch_statuses "$snapshot_dir/statuses.json"
