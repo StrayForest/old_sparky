@@ -35,6 +35,23 @@ def _jobs(source: str) -> dict[str, str]:
     return {match.group("name"): match.group("body") for match in matches}
 
 
+def _curl_commands(source: str) -> list[str]:
+    """Join each backslash-continued curl command for argv policy checks."""
+
+    lines = source.splitlines()
+    commands: list[str] = []
+    for index, line in enumerate(lines):
+        command = line.strip()
+        if not re.match(r"^curl(?:\s|\\)", command):
+            continue
+        next_index = index
+        while command.endswith("\\") and next_index + 1 < len(lines):
+            command = f"{command[:-1].rstrip()} {lines[next_index + 1].strip()}"
+            next_index += 1
+        commands.append(command)
+    return commands
+
+
 def _pass_truth_table(state: dict[str, object]) -> bool:
     """Model the final gate's authoritative status inputs."""
 
@@ -67,6 +84,36 @@ def _pass_truth_table(state: dict[str, object]) -> bool:
             state["provenance_status"] == "0",
         )
     )
+
+
+def _ssh_file_commands(body: str, executable: str) -> list[str]:
+    """Extract each ``ssh/scp -F`` invocation without merging ``&&`` calls."""
+
+    lines = body.splitlines()
+    commands: list[str] = []
+    marker = f"{executable} -F "
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#") or marker not in stripped:
+            continue
+        command = stripped[stripped.index(marker) :]
+        next_index = index
+        while command.endswith("\\") and next_index + 1 < len(lines):
+            next_line = lines[next_index + 1].strip()
+            if marker in next_line and not next_line.startswith(("'", '"')):
+                break
+            command = f"{command[:-1].rstrip()} {next_line}"
+            next_index += 1
+        commands.append(command)
+    return commands
+
+
+def _scp_commands(body: str) -> list[str]:
+    return _ssh_file_commands(body, "scp")
+
+
+def _ssh_commands(body: str) -> list[str]:
+    return _ssh_file_commands(body, "ssh")
 
 
 class ExternalLoadWorkflowContractTests(unittest.TestCase):
@@ -228,6 +275,80 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("test -n \"$artifact_id\" && test -n \"$artifact_digest\"", self.source)
         self.assertIn("if-no-files-found: error", self.source)
 
+    def test_trusted_fixture_transfers_have_exact_liveness_bounds_and_barriers(self) -> None:
+        expected_options = (
+            "-o ConnectTimeout=10",
+            "-o ServerAliveInterval=15",
+            "-o ServerAliveCountMax=3",
+        )
+
+        def assert_transfer_policy(source: str) -> None:
+            jobs = _jobs(source)
+            for job_name, expected_counts in (
+                ("fixture-setup", {"ssh": 2, "scp": 2}),
+                ("fixture-finalize", {"ssh": 6, "scp": 3}),
+            ):
+                commands_by_type = {
+                    "ssh": _ssh_commands(jobs[job_name]),
+                    "scp": _scp_commands(jobs[job_name]),
+                }
+                for executable, commands in commands_by_type.items():
+                    self.assertEqual(expected_counts[executable], len(commands), job_name)
+                    for command in commands:
+                        remote_index = command.index('"$PROD_SSH_USER@$PROD_SSH_HOST')
+                        positions = []
+                        for option in expected_options:
+                            self.assertEqual(1, command.count(option), command)
+                            position = command.index(option)
+                            self.assertLess(position, remote_index, command)
+                            positions.append(position)
+                        self.assertEqual(sorted(positions), positions, command)
+
+            setup = jobs["fixture-setup"]
+            ready_marker = '$export_dir/ready" "$artifact_dir/ready"'
+            manifest_marker = '$export_dir/manifest.json" "$manifest_path"'
+            self.assertIn(ready_marker, setup)
+            self.assertIn(manifest_marker, setup)
+            ready_position = setup.index(ready_marker)
+            manifest_position = setup.index(manifest_marker)
+            self.assertLess(ready_position, manifest_position)
+            self.assertIn("&& scp -F", setup[ready_position:manifest_position])
+
+            finalize = jobs["fixture-finalize"].split(
+                "- name: Signal fixture completion and collect origin evidence", 1
+            )[1].split("- name: Exact cleanup of external fixture", 1)[0]
+            summary_position = finalize.index("$export_dir/matrix-summary.json")
+            exit_position = finalize.index("$export_dir/supervisor.exit")
+            self.assertLess(summary_position, exit_position)
+            self.assertIn("&& bounded_download", finalize[summary_position:exit_position])
+
+        assert_transfer_policy(self.source)
+        for label, mutated in (
+            (
+                "changed connect timeout",
+                self.source.replace("-o ConnectTimeout=10", "-o ConnectTimeout=11", 1),
+            ),
+            (
+                "removed keepalive interval",
+                self.source.replace("-o ServerAliveInterval=15 ", "", 1),
+            ),
+            (
+                "changed keepalive count",
+                self.source.replace("-o ServerAliveCountMax=3", "-o ServerAliveCountMax=2", 1),
+            ),
+            (
+                "reordered setup barriers",
+                self.source.replace(
+                    '"$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/ready" "$artifact_dir/ready"',
+                    '"$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path"',
+                    1,
+                ),
+            ),
+        ):
+            with self.subTest(mutation=label):
+                with self.assertRaises(AssertionError):
+                    assert_transfer_policy(mutated)
+
     def test_evaluator_cannot_hide_upstream_failure_or_publish_success(self) -> None:
         evaluator = self.jobs["evaluate-load"]
         self.assertIn("upstream_ready=0", evaluator)
@@ -281,34 +402,54 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn('MANIFEST_VALIDATION_STATUS:-1', setup)
 
     def test_network_transfers_have_bounded_arguments_without_retry(self) -> None:
-        workflows = (
-            self.source,
+        def assert_external_curl_policy(source: str) -> None:
+            commands = _curl_commands(source)
+            self.assertTrue(commands)
+            for command in commands:
+                is_artifact_download = "--location" in command
+                expected = (
+                    ("--connect-timeout 10", "--max-time 30", "--max-filesize 67108864")
+                    if is_artifact_download
+                    else ("--connect-timeout 5", "--max-time 15", "--max-filesize 65536")
+                )
+                for option in expected:
+                    self.assertEqual(1, command.count(option), command)
+                self.assertEqual(1, command.count("--retry"), command)
+                self.assertIn("--retry 0", command)
+                self.assertNotIn("--retry 1", command)
+
+        for source in (self.source, self.recovery_source):
+            assert_external_curl_policy(source)
+
+        for source in (
             (REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup-trusted.yml").read_text(
                 encoding="utf-8"
             ),
             (REPO_ROOT / ".github/workflows/platform-production-retained-load-abort-trusted.yml").read_text(
                 encoding="utf-8"
             ),
-        )
-        for source in workflows:
-            curl_calls = re.findall(r"(?m)^\s*curl(?:\s|\\)", source)
-            ssh_calls = re.findall(r"(?m)^\s*(?:if\s+)?ssh(?:\s|\\)", source)
-            scp_calls = re.findall(
-                r"(?m)(?:^\s*(?:if\s+)?scp|&&\s+scp)(?:\s|\\)",
-                source,
-            )
-            self.assertTrue(curl_calls or ssh_calls or scp_calls)
-            if curl_calls:
-                self.assertEqual(source.count("--connect-timeout 10"), len(curl_calls))
-                self.assertEqual(source.count("--max-time 30"), len(curl_calls))
-            transfer_count = len(ssh_calls) + len(scp_calls)
-            for option in (
-                "-o ConnectTimeout=10",
-                "-o ServerAliveInterval=15",
-                "-o ServerAliveCountMax=3",
-            ):
-                self.assertGreaterEqual(source.count(option), transfer_count, option)
+        ):
+            commands = _curl_commands(source)
+            self.assertTrue(commands)
+            self.assertEqual(source.count("--connect-timeout 10"), len(commands))
+            self.assertEqual(source.count("--max-time 30"), len(commands))
             self.assertNotIn("--retry", source)
+
+        for workflow_name, source in (
+            ("trusted", self.source),
+            ("recovery", self.recovery_source),
+        ):
+            for label, mutated in (
+                ("metadata connect timeout", source.replace("--connect-timeout 5", "--connect-timeout 6", 1)),
+                ("metadata absolute timeout", source.replace("--max-time 15", "--max-time 30", 1)),
+                ("enabled retry", source.replace("--retry 0", "--retry 1", 1)),
+                ("removed retry", source.replace("--retry 0 ", "", 1)),
+                ("metadata response cap", source.replace("--max-filesize 65536", "--max-filesize 65537", 1)),
+                ("artifact absolute timeout", source.replace("--max-time 30", "--max-time 31", 1)),
+            ):
+                with self.subTest(workflow=workflow_name, mutation=label):
+                    with self.assertRaises(AssertionError):
+                        assert_external_curl_policy(mutated)
 
     def test_fake_transfer_argv_contains_the_boundaries_from_source(self) -> None:
         """Exercise representative source command argv through fake binaries."""
@@ -348,10 +489,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(trace.read_text(encoding="utf-8").splitlines(), argv)
                 if command == "curl":
-                    self.assertIn("--connect-timeout", argv)
-                    self.assertIn("10", argv)
-                    self.assertIn("--max-time", argv)
-                    self.assertIn("30", argv)
+                    self.assertEqual(argv[argv.index("--connect-timeout") + 1], "5")
+                    self.assertEqual(argv[argv.index("--max-time") + 1], "15")
+                    self.assertEqual(argv[argv.index("--retry") + 1], "0")
+                    self.assertEqual(argv[argv.index("--max-filesize") + 1], "65536")
                 else:
                     for option in (
                         "ConnectTimeout=10",
@@ -493,6 +634,12 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         job = self.entry_document["jobs"]["trusted-external-load"]
         uses = job["uses"]
         self.assertRegex(uses, r"^StrayForest/old_sparky/\.github/workflows/platform-production-external-load-trusted\.yml@[0-9a-f]{40}$")
+        self.assertEqual(
+            uses,
+            "StrayForest/old_sparky/.github/workflows/"
+            "platform-production-external-load-trusted.yml@"
+            "0a607e80bec74f48a1f57326c98aa5b5fcb9019e",
+        )
         self.assertNotIn("runs-on", job)
         self.assertNotIn("environment", job)
         self.assertNotIn("steps", job)
