@@ -327,6 +327,36 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         with self.assertRaises(supervisor.BackupCommandError):
             supervisor._validate_command(["pg_dump"], {"PATH": "/tmp"})
 
+    def test_postgres_helper_metadata_mutations_fail_closed(self) -> None:
+        for name in ("createdb", "dropdb", "psql", "pg_dump", "pg_restore"):
+            canonical = Path("/usr/bin") / name
+            self.assertEqual(supervisor.trusted_executable(name), str(canonical))
+            self.assertEqual(
+                supervisor._secure_executable(canonical), canonical.resolve(strict=True)
+            )
+            with tempfile.TemporaryDirectory(dir="/root") as temporary_dir:
+                root = Path(temporary_dir)
+                helper = root / name
+                helper.symlink_to(canonical)
+                self.assertEqual(
+                    supervisor._secure_executable(helper), canonical.resolve(strict=True)
+                )
+
+                root.chmod(0o777)
+                with self.assertRaises(supervisor.BackupCommandError):
+                    supervisor._secure_executable(helper)
+                root.chmod(0o700)
+
+                os.chown(helper, 65534, 65534, follow_symlinks=False)
+                with self.assertRaises(supervisor.BackupCommandError):
+                    supervisor._secure_executable(helper)
+
+                helper.unlink()
+                helper.write_bytes(canonical.read_bytes())
+                helper.chmod(0o775)
+                with self.assertRaises(supervisor.BackupCommandError):
+                    supervisor._secure_executable(helper)
+
     def test_monitor_protocol_rejects_malformed_oversized_and_nonzero_status(self) -> None:
         for payload, overflow in ((b"not-json", False), (b"{}", False), (b"{}", True)):
             with self.assertRaises(supervisor.BackupCleanupUnproven):
