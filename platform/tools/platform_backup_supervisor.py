@@ -130,6 +130,17 @@ class BackupMonitorUnavailable(BackupSupervisorError):
 class BackupCleanupUnproven(BackupSupervisorError):
     code = "backup_cleanup_unproven"
 
+    def __init__(
+        self,
+        message: str = "backup cleanup was not proven",
+        *,
+        database_id: str | None = None,
+    ) -> None:
+        self.database_id = database_id
+        if database_id is not None:
+            message += f"; database_id={database_id}"
+        super().__init__(message)
+
 
 @dataclass(frozen=True, slots=True)
 class DatabaseCommandResult:
@@ -217,6 +228,7 @@ def _monitor_path(path: Path | None = None) -> Path:
     if path.is_symlink():
         raise BackupMonitorUnavailable("backup process monitor must not be a symlink")
     try:
+        path = path.resolve(strict=True)
         _secure_executable(path)
     except BackupCommandError as exc:
         raise BackupMonitorUnavailable("backup process monitor metadata is unsafe") from exc
@@ -450,23 +462,25 @@ def _read_monitor_status(data: bytearray, overflow: bool = False) -> dict[str, o
     if not isinstance(value, dict) or value.get("schema") != 1:
         raise BackupCleanupUnproven("backup monitor status schema is invalid")
     status = value.get("status")
-    if status not in {"completed", "timeout", "cancelled", "namespace_unavailable", "protocol_error", "monitor_error"}:
+    if status not in {"completed", "timeout", "cancelled", "probe-ok", "namespace_unavailable", "protocol_error", "monitor_error"}:
         raise BackupCleanupUnproven("backup monitor status is invalid")
     if status in {"completed", "cancelled", "timeout"} and (not isinstance(value.get("returncode"), int) or isinstance(value.get("returncode"), bool)):
         raise BackupCleanupUnproven("backup monitor return code is invalid")
     return value
 
 
-def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, stdout_fd: int | None, pass_fds: tuple[int, ...], deadline: float, cleanup_reserve_seconds: float) -> DatabaseCommandResult:
+def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, stdout_fd: int | None, pass_fds: tuple[int, ...], deadline: float, cleanup_reserve_seconds: float, probe: bool = False) -> DatabaseCommandResult | None:
     work = cleanup_deadline(deadline, reserve_seconds=cleanup_reserve_seconds)
     caller_deadline = deadline + MONITOR_JOIN_GRACE_SECONDS
     status_read, status_write = os.pipe()
     inherited_values = [*pass_fds, status_write] + ([] if stdout_fd is None else [stdout_fd])
     inherited = tuple(dict.fromkeys(inherited_values))
     args = [sys.executable, str(_monitor_path()), "--status-fd", str(status_write), "--deadline-ns", str(int(deadline * 1e9)), "--cleanup-reserve-ns", str(int(cleanup_reserve_seconds * 1e9)), *[f"--pass-fd={fd}" for fd in inherited if fd != status_write]]
+    if probe:
+        args.append("--probe")
     if stdout_fd is not None:
         args += ["--stdout-fd", str(stdout_fd)]
-    args += ["--", *command]
+    args += ["--", *(() if probe else command)]
     process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
     status, overflow = bytearray(), [False]
@@ -507,6 +521,10 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
                 if remaining > 0:
                     selector.select(min(remaining, 0.02))
         parsed = _read_monitor_status(status, overflow[0])
+        if parsed["status"] == "probe-ok":
+            if process.returncode != 0:
+                raise BackupMonitorUnavailable("PID namespace probe failed")
+            return None
         if process.returncode != 0:
             if parsed["status"] == "namespace_unavailable":
                 raise BackupMonitorUnavailable("PID namespace is unavailable")
@@ -557,6 +575,21 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
                 os.close(status_write)
             except OSError:
                 pass
+
+
+def ensure_process_monitor(*, deadline: float | None = None) -> None:
+    """Prove the PID namespace contour before a mutating backup operation."""
+
+    effective = deadline if deadline is not None else operation_deadline(DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    _run_monitor_client(
+        [],
+        env=None,
+        stdout_fd=None,
+        pass_fds=(),
+        deadline=effective,
+        cleanup_reserve_seconds=COMMAND_CLEANUP_RESERVE_SECONDS,
+        probe=True,
+    )
 
 
 def run_database_command(command: list[str], *, env: Mapping[str, str] | None = None, stdout_fd: int | None = None, pass_fds: tuple[int, ...] = (), deadline: float | None = None, cleanup_reserve_seconds: float = COMMAND_CLEANUP_RESERVE_SECONDS) -> DatabaseCommandResult:
@@ -2268,6 +2301,7 @@ def _restore_args(
     env_file: Path | None = None,
     output_dir: Path | None = None,
     admin_database_url: str | None = None,
+    backup_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
 ) -> argparse.Namespace:
     shared = Path(app_dir) / "shared"
     return SimpleNamespace(
@@ -2276,6 +2310,7 @@ def _restore_args(
         keep=keep,
         admin_database_url=admin_database_url,
         dump_only=False,
+        timeout_seconds=backup_timeout_seconds,
     )
 
 
@@ -2292,6 +2327,7 @@ def run_local_backup(
     capability: object,
     lock: BackupLockHandle,
     evidence: EvidenceSession,
+    backup_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Create, verify, and prune one local backup under the final lock."""
 
@@ -2315,6 +2351,7 @@ def run_local_backup(
         env_file=env_file,
         output_dir=output_dir,
         admin_database_url=admin_database_url,
+        backup_timeout_seconds=backup_timeout_seconds,
     )
     # The supervisor, not the low-level producer, owns rotation.  This path
     # passes the in-process capability and explicitly disables nested pruning.
@@ -2537,6 +2574,13 @@ def _operation_error_status(exc: BaseException) -> tuple[str, str]:
         return "blocked", "production_restore_disabled"
     if isinstance(exc, KeyboardInterrupt):
         return "cancelled", "cancelled"
+    code = getattr(exc, "code", None)
+    if code in {
+        "backup_cleanup_unproven",
+        "backup_command_timeout",
+        "backup_monitor_unavailable",
+    }:
+        return "failed", str(code)
     return "failed", "operation_failed"
 
 
@@ -2568,6 +2612,10 @@ def run_backup_entrypoint(
     app_dir: Path,
     source_release_dir: Path | None = None,
 ) -> dict[str, Any]:
+    timeout_seconds = float(
+        getattr(args, "backup_timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    )
+    ensure_process_monitor(deadline=operation_deadline(timeout_seconds))
     requirements = operation_lock_requirements("local-backup")
     with evidence_session(app_dir, "local-backup", locks=requirements) as evidence:
         with ordered_backup_lock_scope(
@@ -2589,6 +2637,7 @@ def run_backup_entrypoint(
                     capability=capability,
                     lock=lock,
                     evidence=evidence,
+                    backup_timeout_seconds=timeout_seconds,
                 ),
             )
 
@@ -2596,6 +2645,10 @@ def run_backup_entrypoint(
 def run_maintenance_entrypoint(args: argparse.Namespace) -> dict[str, Any]:
     """Route the production maintenance unit through this supervisor."""
 
+    timeout_seconds = float(
+        getattr(args, "backup_timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS)
+    )
+    ensure_process_monitor(deadline=operation_deadline(timeout_seconds))
     app_dir = Path(args.app_dir).resolve(strict=True)
     requirements = operation_lock_requirements("maintenance")
     with evidence_session(app_dir, "maintenance", locks=requirements) as evidence:
@@ -2641,6 +2694,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     maintenance.add_argument("--web-artifact-dir", type=Path, default=Path("/root/old_sparky/platform/apps/platform_web"))
     maintenance.add_argument("--backup-keep", type=int, default=14)
     maintenance.add_argument("--backup-max-age-hours", type=float, default=24.0)
+    maintenance.add_argument(
+        "--backup-timeout-seconds",
+        type=float,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    )
     maintenance.add_argument("--release-keep", type=int, default=5)
     maintenance.add_argument("--test-artifact-max-age-days", type=int, default=7)
     maintenance.add_argument("--screenshot-max-age-days", type=int, default=30)
@@ -2659,6 +2717,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     backup.add_argument("--backup-keep", "--keep", dest="keep", type=int, default=14)
     backup.add_argument(
         "--backup-max-age-hours", "--max-age-hours", dest="max_age_hours", type=float, default=24.0
+    )
+    backup.add_argument(
+        "--backup-timeout-seconds",
+        type=float,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
     )
     backup.add_argument("--env-file", type=Path)
     backup.add_argument("--output-dir", type=Path)

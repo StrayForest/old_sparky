@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-09-29
+- Last reviewed: 2026-10-02
 
 ## Runtime checks
 

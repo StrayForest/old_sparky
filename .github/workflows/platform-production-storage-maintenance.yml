@@ -154,6 +154,12 @@ jobs:
             && test ! -L "$current/tools/platform_backup_supervisor.py" \
             && test -x "$current/tools/platform_backup_supervisor.py" \
             || fail "Installed backup supervisor is missing."
+          monitor_tool="$current/tools/platform_backup_process_monitor.py"
+          test -f "$monitor_tool" && test ! -L "$monitor_tool" \
+            && test -x "$monitor_tool" \
+            && test "$(stat -c '%u:%F:%a' "$monitor_tool")" = "0:regular file:755" \
+            && test "$(readlink -f -- "$monitor_tool")" = "$(readlink -f -- "$current")/tools/platform_backup_process_monitor.py" \
+            || fail "Installed backup process monitor is missing or unsafe."
           test -f "$summary_tool" && test ! -L "$summary_tool" \
             || fail "Storage evidence summary helper is missing or unsafe."
 

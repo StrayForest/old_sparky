@@ -125,6 +125,12 @@ The backup manifest producer/consumer regression module
 alongside the restore-drill and offsite-selection tests. Its fixtures are
 local-only and do not enable the offsite timer or contact R2.
 
+Backup containment tests keep the namespace probe, monitor protocol and
+temporary-database ownership paths in the existing supervisor/restore-drill
+modules. The privileged contour is the only place for a real PID-namespace
+probe; unit tests use mocked command results and never connect to production
+PostgreSQL or R2.
+
 Every aggregate and backend sub-contour is guarded before test discovery by
 one pure, fail-closed resource validator. It requires the exact values
 `PLATFORM_ENVIRONMENT=test`, `PLATFORM_DB_SCHEMA=platform`, database

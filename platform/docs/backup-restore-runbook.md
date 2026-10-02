@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-01
+- Last reviewed: 2026-10-02
 
 ## Local verified backup
 
@@ -19,6 +19,24 @@ explicitly and fail closed if it is unavailable. The restore drill binds the
 database to the exact single Alembic head derived from the deployed
 `alembic/versions` graph; a missing, branched or mismatched graph is not a
 successful verification.
+
+Before any database backup, restore, archive rotation or retention deletion,
+the supervisor proves the installed PID-namespace monitor. The maintenance
+unit permits only PID namespaces (`RestrictNamespaces=pid`); the off-site unit
+does not run database commands and therefore keeps its stricter namespace and
+empty capability contract. The monitor path must be a root-owned, regular,
+non-symlink executable with safe parent directories.
+
+The operation timeout is one canonical 1500-second budget, passed from the
+supervisor CLI through storage to the restore drill. Two seconds are reserved
+for bounded cleanup. A restore drill uses a cryptographically random strict
+database identifier and first proves that it is absent. A create collision,
+non-zero result or timeout does not prove ownership, so the database is never
+dropped; machine-readable output records `cleanup_unproven` with the safe
+identifier and instructs the operator to inspect ownership before any drop.
+Once creation returns success, cleanup uses only the reserved interval. A
+cleanup failure is recorded as `cleanup_unproven` and never turns the backup
+green.
 
 The manifest is the closed, versioned v2 contract implemented by
 [`platform_backup_manifest.py`](../tools/platform_backup_manifest.py). It
@@ -95,6 +113,7 @@ cd /opt/oldsparky/platform/current
   --app-dir /opt/oldsparky/platform \
   --source-release-dir /opt/oldsparky/platform/dist/releases \
   --backup-keep 14 --backup-max-age-hours 24 \
+  --backup-timeout-seconds 1500 \
   --backup-only --apply --json
 ```
 

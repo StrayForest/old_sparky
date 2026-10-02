@@ -261,6 +261,19 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                     cleanup_reserve_seconds=0.02,
                 )
 
+    def test_namespace_probe_precedes_mutation_contour(self) -> None:
+        with mock.patch.object(supervisor, "_run_monitor_client", return_value=None) as client:
+            supervisor.ensure_process_monitor(deadline=time.monotonic() + 5)
+        self.assertTrue(client.call_args.kwargs["probe"])
+
+    def test_cleanup_reason_does_not_claim_database_ownership(self) -> None:
+        monitor_error = supervisor.BackupCleanupUnproven("monitor protocol failed")
+        self.assertIsNone(monitor_error.database_id)
+        self.assertEqual(str(monitor_error), "monitor protocol failed")
+        database_error = supervisor.BackupCleanupUnproven(database_id="platform_restore_drill_abc123")
+        self.assertEqual(database_error.database_id, "platform_restore_drill_abc123")
+        self.assertIn("database_id=platform_restore_drill_abc123", str(database_error))
+
     def test_namespace_timeout_kills_detached_double_fork_without_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             marker = Path(temporary_dir) / "late-marker"

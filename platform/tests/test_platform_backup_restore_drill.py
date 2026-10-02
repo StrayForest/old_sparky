@@ -69,6 +69,13 @@ def _trusted_source(source_root: pathlib.Path) -> pathlib.Path:
 
 
 class PlatformBackupRestoreDrillTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._ensure_monitor_patch = mock.patch.object(
+            platform_backup_supervisor, "ensure_process_monitor"
+        )
+        self._ensure_monitor_patch.start()
+        self.addCleanup(self._ensure_monitor_patch.stop)
+
     def _creator_args(self, output_dir: pathlib.Path, *, dump_only: bool = True) -> argparse.Namespace:
         return argparse.Namespace(
             env_file=str(output_dir / ".env.platform"),
@@ -95,7 +102,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     args,
                     capability=capability,
                     trusted_alembic_head=trusted_head,
-                ),
+                )
             )
 
     def _creator_environment(self) -> dict[str, str]:
@@ -198,6 +205,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         )
         responses = [
             subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, "CREATE EXTENSION\n", ""),
             subprocess.CompletedProcess([], 0, "CREATE SCHEMA\n", ""),
             subprocess.CompletedProcess([], 0, "", ""),
@@ -224,11 +232,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             )
 
         self.assertEqual(table_count, 22)
-        self.assertTrue(run_command.call_args_list[1].kwargs["capture_output"])
         self.assertTrue(run_command.call_args_list[2].kwargs["capture_output"])
-        self.assertIn("CREATE SCHEMA platform", run_command.call_args_list[2].args[0][-1])
-        self.assertIn("--schema=platform", run_command.call_args_list[3].args[0])
-        self.assertIn("--schema=public", run_command.call_args_list[4].args[0])
+        self.assertTrue(run_command.call_args_list[3].kwargs["capture_output"])
+        self.assertIn("CREATE SCHEMA platform", run_command.call_args_list[3].args[0][-1])
+        self.assertIn("--schema=platform", run_command.call_args_list[4].args[0])
+        self.assertIn("--schema=public", run_command.call_args_list[5].args[0])
 
     def test_restore_drill_rejects_explicit_head_not_in_trusted_graph(self) -> None:
         target = backup_drill.DatabaseTarget(
@@ -251,6 +259,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
         trusted_head.assert_called_once_with(source_root)
         run_command.assert_not_called()
+
+    def test_ambiguous_create_never_attempts_drop(self) -> None:
+        target = backup_drill.DatabaseTarget("127.0.0.1", 5432, "platform_user", None, "platformdb")
+        with mock.patch.object(backup_drill, "_trusted_alembic_head", return_value="head"), mock.patch.object(
+            backup_drill, "run_command", side_effect=[subprocess.CompletedProcess([], 0, "", ""), platform_backup_supervisor.BackupCommandTimeout()]
+        ) as run_command:
+            with self.assertRaises(platform_backup_supervisor.BackupCleanupUnproven) as error:
+                backup_drill.perform_restore_drill(pathlib.Path("/tmp/backup.dump"), app_target=target, admin_target=None, timestamp_slug="ignored")
+        self.assertRegex(error.exception.database_id or "", backup_drill.DATABASE_IDENTIFIER_RE)
+        self.assertEqual(run_command.call_count, 2)
 
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -628,8 +646,10 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     backup_drill.os.write(stdout, b"PGDMP new-backup")
                     return subprocess.CompletedProcess(command, 0, "", "")
                 if command[0] == "pg_restore":
-                    return subprocess.CompletedProcess(command, 0, "", "")
-                raise RuntimeError("restore failed")
+                    if "--list" in command:
+                        return subprocess.CompletedProcess(command, 0, "", "")
+                    raise RuntimeError("restore failed")
+                return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
                 mock.patch.dict(

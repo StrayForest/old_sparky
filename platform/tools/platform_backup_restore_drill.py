@@ -10,6 +10,8 @@ import json
 import os
 import pathlib
 import re
+import secrets
+import shutil
 import stat
 import sys
 import urllib.parse
@@ -60,6 +62,7 @@ DEFAULT_OPERATION_TIMEOUT_SECONDS = 1500.0
 LOCAL_DATABASE_HOSTS = {None, "", "127.0.0.1", "localhost", "::1"}
 REQUIRED_PLATFORM_EXTENSIONS = REQUIRED_EXTENSIONS
 ALEMBIC_REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+DATABASE_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 def _trusted_alembic_head(source_root: pathlib.Path | None = None) -> str:
@@ -488,6 +491,18 @@ def local_postgres_admin_command(
     elif action == "drop":
         executable = helpers.executable("dropdb")
         command = [executable, "--if-exists", database]
+    elif action == "probe":
+        executable = helpers.executable("psql")
+        command = [
+            executable,
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--dbname",
+            "postgres",
+            "--command",
+            f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{database}';",
+        ]
     else:  # pragma: no cover - internal programming error
         raise ValueError(f"Unsupported database admin action: {action}")
     return [helpers.executable("runuser"), "-u", "postgres", "--", *command]
@@ -507,6 +522,17 @@ def remote_admin_command(
     if action == "drop":
         executable = helpers.executable("dropdb")
         return [executable, *base, "--if-exists", database]
+    if action == "probe":
+        executable = helpers.executable("psql")
+        return [
+            executable,
+            *connection_args(admin_target),
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{database}';",
+        ]
     raise ValueError(f"Unsupported database admin action: {action}")
 
 
@@ -618,7 +644,10 @@ def perform_restore_drill(
         kwargs["cleanup_reserve_seconds"] = 0.0 if cleanup else kwargs.get("cleanup_reserve_seconds", cleanup_reserve)
         return run_command(command, deadline=cleanup_deadline, **kwargs)
 
-    drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
+    del timestamp_slug
+    drill_database = f"platform_restore_drill_{secrets.token_hex(16)}"
+    if DATABASE_IDENTIFIER_RE.fullmatch(drill_database) is None:
+        raise RuntimeError("temporary restore database identifier is invalid")
     use_local_admin = (
         admin_target is None
         and os.geteuid() == 0
@@ -626,6 +655,9 @@ def perform_restore_drill(
         and helpers.runuser is not None
     )
     if use_local_admin:
+        probe_command = local_postgres_admin_command(
+            "probe", app_target, drill_database, helpers
+        )
         create_command = local_postgres_admin_command(
             "create", app_target, drill_database, helpers
         )
@@ -635,6 +667,9 @@ def perform_restore_drill(
         admin_command_target = None
     else:
         effective_admin = admin_target or app_target.with_database("postgres")
+        probe_command = remote_admin_command(
+            "probe", effective_admin, app_target, drill_database, helpers
+        )
         create_command = remote_admin_command(
             "create", effective_admin, app_target, drill_database, helpers
         )
@@ -646,7 +681,24 @@ def perform_restore_drill(
     created = False
     primary: BaseException | None = None
     try:
-        invoke(create_command, target=admin_command_target)
+        try:
+            probe_result = invoke(probe_command, target=admin_command_target, capture_output=True)
+            if probe_result.returncode != 0 or probe_result.stdout.strip():
+                raise supervisor.BackupCleanupUnproven(database_id=drill_database)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            if isinstance(exc, supervisor.BackupCleanupUnproven):
+                raise
+            raise supervisor.BackupCleanupUnproven(database_id=drill_database) from exc
+        try:
+            create_result = invoke(create_command, target=admin_command_target)
+            if create_result.returncode != 0:
+                raise supervisor.BackupCommandError(result=create_result)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            raise supervisor.BackupCleanupUnproven(database_id=drill_database) from exc
         created = True
         restore_target = app_target.with_database(drill_database)
         for extension in REQUIRED_PLATFORM_EXTENSIONS:
@@ -762,8 +814,13 @@ def perform_restore_drill(
                 invoke(drop_command, target=admin_command_target, cleanup=True)
             except BaseException as cleanup_error:
                 if primary is None:
-                    raise supervisor.BackupCleanupUnproven("restore-drill cleanup was not proven") from cleanup_error
-                primary.add_note(f"restore-drill cleanup was not proven: {cleanup_error}")
+                    raise supervisor.BackupCleanupUnproven(
+                        database_id=drill_database
+                    ) from cleanup_error
+                setattr(primary, "backup_cleanup_unproven", drill_database)
+                primary.add_note(
+                    f"restore-drill cleanup was not proven; database_id={drill_database}"
+                )
 
 
 def require_commands(
@@ -774,6 +831,25 @@ def require_commands(
         return supervisor.resolve_trusted_postgres_helpers(*commands, optional=optional)
     except supervisor.BackupCommandError as exc:
         raise RuntimeError(str(exc)) from None
+
+
+def _safe_restore_error(exc: BaseException) -> str:
+    """Persist only stable error classes and the validated temporary DB id."""
+
+    database_id = getattr(exc, "backup_cleanup_unproven", None)
+    if not isinstance(database_id, str):
+        database_id = getattr(exc, "database_id", None)
+    if getattr(exc, "code", None) == "backup_cleanup_unproven" or database_id is not None:
+        if isinstance(database_id, str) and DATABASE_IDENTIFIER_RE.fullmatch(database_id):
+            return (
+                "cleanup_unproven database_id="
+                f"{database_id} operator_action=inspect_ownership_before_drop"
+            )
+        return "cleanup_unproven operator_action=inspect_ownership_before_drop"
+    code = getattr(exc, "code", None)
+    if code in {"backup_command_timeout", "backup_monitor_unavailable"}:
+        return str(code)
+    return "restore_verification_failed"
 
 
 def _new_backup_identity(
@@ -872,6 +948,7 @@ def create_backup(
     deadline = supervisor.operation_deadline(
         float(getattr(args, "timeout_seconds", DEFAULT_OPERATION_TIMEOUT_SECONDS))
     )
+    supervisor.ensure_process_monitor(deadline=deadline)
 
     try:
         output_dir_stat = output_dir.lstat()
@@ -1011,7 +1088,7 @@ def create_backup(
             except supervisor.BackupCleanupUnproven:
                 raise
             except Exception as exc:
-                restore_error = str(exc)
+                restore_error = _safe_restore_error(exc)
 
         completed_at = utc_now()
         metadata = build_manifest(
@@ -1047,6 +1124,16 @@ def create_backup(
             "alembic_revision": alembic_revision or "unknown",
         }
         if restore_error is not None:
+            if restore_error.startswith("cleanup_unproven"):
+                database_id = next(
+                    (
+                        part.split("=", 1)[1]
+                        for part in restore_error.split()
+                        if part.startswith("database_id=")
+                    ),
+                    None,
+                )
+                raise supervisor.BackupCleanupUnproven(database_id=database_id)
             raise RuntimeError(f"Platform backup was created but restore verification failed: {restore_error}")
         return result
     except BaseException:
@@ -1101,13 +1188,22 @@ def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
         "psql",
         optional=("runuser",) if local_admin_candidate else (),
     )
-    run_command(["pg_restore", "--list", str(dump_path)], capture_output=True)
+    deadline = supervisor.operation_deadline(
+        float(getattr(args, "timeout_seconds", DEFAULT_OPERATION_TIMEOUT_SECONDS))
+    )
+    supervisor.ensure_process_monitor(deadline=deadline)
+    run_command(
+        [helpers.executable("pg_restore"), "--list", str(dump_path)],
+        capture_output=True,
+        deadline=deadline,
+    )
     table_count = perform_restore_drill(
         dump_path,
         app_target=app_target,
         admin_target=admin_target,
         helpers=helpers,
         timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
+        deadline=deadline,
     )
     return {
         "ok": True,
@@ -1150,6 +1246,7 @@ def main() -> int:
                     env_file=pathlib.Path(args.env_file),
                     output_dir=pathlib.Path(args.output_dir),
                     admin_database_url=args.admin_database_url,
+                    timeout_seconds=args.timeout_seconds,
                     as_json=args.as_json,
                 ),
                 app_dir=pathlib.Path(args.output_dir).resolve().parents[1],

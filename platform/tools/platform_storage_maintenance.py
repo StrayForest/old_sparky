@@ -450,10 +450,16 @@ def _run_backup_command(command: list[str]) -> dict[str, Any]:
 
 
 def _run_backup_legacy(
-    app_dir: Path, *, keep: int, max_age_hours: float = 24.0
+    app_dir: Path,
+    *,
+    keep: int,
+    max_age_hours: float = 24.0,
+    backup_timeout_seconds: float = 1500.0,
 ) -> dict[str, Any]:
     if not math.isfinite(max_age_hours) or max_age_hours <= 0:
         raise ValueError("backup max age must be finite and positive")
+    if not math.isfinite(backup_timeout_seconds) or backup_timeout_seconds <= 0:
+        raise ValueError("backup timeout must be finite and positive")
     script = Path(__file__).with_name("platform_backup_restore_drill.py")
     shared_dir = app_dir / "shared"
     create_command = [
@@ -465,6 +471,8 @@ def _run_backup_legacy(
         str(shared_dir / "backups"),
         "--keep",
         str(keep),
+        "--timeout-seconds",
+        str(backup_timeout_seconds),
         "--json",
     ]
     result = _run_backup_command(create_command)
@@ -479,6 +487,8 @@ def _run_backup_legacy(
             "--check-latest",
             "--max-age-hours",
             str(max_age_hours),
+            "--timeout-seconds",
+            str(backup_timeout_seconds),
             "--json",
         ]
     )
@@ -517,6 +527,7 @@ def run_backup(
     *,
     keep: int,
     max_age_hours: float = 24.0,
+    backup_timeout_seconds: float = 1500.0,
     capability: object | None = None,
     lock: Any | None = None,
     evidence: Any | None = None,
@@ -530,7 +541,10 @@ def run_backup(
 
     if capability is None:
         return _run_backup_legacy(
-            app_dir, keep=keep, max_age_hours=max_age_hours
+            app_dir,
+            keep=keep,
+            max_age_hours=max_age_hours,
+            backup_timeout_seconds=backup_timeout_seconds,
         )
     try:
         from . import platform_backup_supervisor as supervisor
@@ -551,6 +565,7 @@ def run_backup(
             capability=scoped_capability,
             lock=lock,
             evidence=evidence,
+            backup_timeout_seconds=backup_timeout_seconds,
         ),
     )
 
@@ -666,6 +681,7 @@ def _plan_and_maybe_apply(
             backup_kwargs: dict[str, Any] = {
                 "keep": args.backup_keep,
                 "max_age_hours": getattr(args, "backup_max_age_hours", 24.0),
+                "backup_timeout_seconds": getattr(args, "backup_timeout_seconds", 1500.0),
             }
             if capability is not None:
                 backup_kwargs.update(
@@ -789,6 +805,7 @@ def run_maintenance(
             backup_kwargs: dict[str, Any] = {
                 "keep": BACKUP_ONLY_KEEP,
                 "max_age_hours": getattr(args, "backup_max_age_hours", 24.0),
+                "backup_timeout_seconds": getattr(args, "backup_timeout_seconds", 1500.0),
             }
             if _supervisor_capability is not None:
                 backup_kwargs.update(

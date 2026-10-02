@@ -486,6 +486,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             app_dir,
             keep=14,
             max_age_hours=24.0,
+            backup_timeout_seconds=1500.0,
         )
         live_qa_prune.assert_not_called()
         retention_plan.assert_not_called()
@@ -608,12 +609,14 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_backup_supervisor.py maintenance --app-dir "
                 "/opt/oldsparky/platform --source-release-dir "
                 "/opt/oldsparky/platform/dist/releases --apply --backup-keep 14 "
-                "--release-keep 5 --test-artifact-max-age-days 7 "
+                "--backup-timeout-seconds 1500 --release-keep 5 "
+                "--test-artifact-max-age-days 7 "
                 "--screenshot-max-age-days 30 --failed-build-max-age-days 1 "
                 "--minimum-free-gib 5 --maximum-used-percent 85"
             ],
         )
         self.assertNotIn("prune-runtime-cache", service)
+        self.assertIn("RestrictNamespaces=pid", service)
         retention = (
             REPO_ROOT / "platform/tools/platform_release_retention.py"
         ).read_text()
