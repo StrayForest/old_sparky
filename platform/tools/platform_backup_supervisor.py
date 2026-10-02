@@ -1221,13 +1221,11 @@ def _build_authority_broker():
         try:
             restore = _restore_module if _restore_module is not None else load_restore_module()
             trusted_source = Path(source_root or (Path(app_dir) / "current"))
-            trusted_head = None
-            if not bool(getattr(args, "dump_only", False)):
-                trusted_head = resolve_trusted_head(
-                    trusted_source,
-                    restore=restore,
-                    scope_state=scope_state,
-                )
+            trusted_head = resolve_trusted_head(
+                trusted_source,
+                restore=restore,
+                scope_state=scope_state,
+            )
             capability = make_capability("maintenance", scope_state)
             return public_result(callback(capability, trusted_head, restore))
         finally:
@@ -2423,7 +2421,6 @@ def _restore_args(
         output_dir=str(output_dir or (shared / "backups")),
         keep=keep,
         admin_database_url=admin_database_url,
-        dump_only=False,
         timeout_seconds=backup_timeout_seconds,
     )
 
@@ -2688,6 +2685,18 @@ def run_offsite(
                     raise BackupCleanupUnproven() from cleanup_error
                 setattr(primary, "backup_cleanup_unproven", "")
                 primary.add_note("offsite temporary ciphertext cleanup was not proven")
+            except BaseException as cleanup_error:
+                setattr(cleanup_error, "backup_cleanup_unproven", "")
+                cleanup_error.add_note(
+                    "offsite temporary ciphertext cleanup was not proven"
+                )
+                if primary is None:
+                    raise
+                setattr(primary, "backup_cleanup_unproven", "")
+                primary.add_note(
+                    "offsite temporary ciphertext cleanup raised a cancellation; "
+                    "the primary failure was retained"
+                )
 
 
 def run_production_restore(*_args: object, **_kwargs: object) -> None:

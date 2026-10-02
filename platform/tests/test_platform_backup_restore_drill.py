@@ -93,34 +93,58 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _creator_args(self, output_dir: pathlib.Path, *, dump_only: bool = True) -> argparse.Namespace:
-        return argparse.Namespace(
+    def _creator_args(self, output_dir: pathlib.Path, *, real_restore: bool = False) -> argparse.Namespace:
+        args = argparse.Namespace(
             env_file=str(output_dir / ".env.platform"),
             output_dir=str(output_dir),
             keep=2,
             admin_database_url=None,
-            dump_only=dump_only,
         )
+        if real_restore:
+            args._real_restore = True
+        return args
 
     def _create_backup(
         self,
         args: argparse.Namespace,
         *,
         source_root: pathlib.Path | None = None,
+        mock_restore: bool = True,
     ) -> dict[str, object]:
+        if source_root is None and not getattr(args, "_real_restore", False):
+            source_root = pathlib.Path(args.output_dir).parent / "trusted-source"
+            versions = source_root / "alembic" / "versions"
+            versions.mkdir(parents=True, exist_ok=True)
+            (versions / "001.py").write_text(
+                "revision = '20260913_0053'\ndown_revision = None\n",
+                encoding="utf-8",
+            )
         with _held_test_lock() as lock:
-            return platform_backup_supervisor._run_local_backup_scope(
-                args,
-                app_dir=pathlib.Path(args.output_dir),
-                source_root=source_root,
-                _restore_module=backup_drill,
-                lock=lock,
-                callback=lambda capability, trusted_head, _restore: backup_drill.create_backup(
+            def callback(capability, trusted_head, _restore):
+                return backup_drill.create_backup(
                     args,
                     capability=capability,
                     trusted_alembic_head=trusted_head,
                 )
-            )
+
+            if getattr(args, "_real_restore", False) or not mock_restore:
+                return platform_backup_supervisor._run_local_backup_scope(
+                    args,
+                    app_dir=pathlib.Path(args.output_dir),
+                    source_root=source_root,
+                    _restore_module=backup_drill,
+                    lock=lock,
+                    callback=callback,
+                )
+            with mock.patch.object(backup_drill, "perform_restore_drill", return_value=1):
+                return platform_backup_supervisor._run_local_backup_scope(
+                    args,
+                    app_dir=pathlib.Path(args.output_dir),
+                    source_root=source_root,
+                    _restore_module=backup_drill,
+                    lock=lock,
+                    callback=callback,
+                )
 
     def _creator_environment(self) -> dict[str, str]:
         return {
@@ -256,7 +280,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 app_target=target,
                 admin_target=None,
                 helpers=TEST_HELPERS,
-                timestamp_slug="20260720T120000Z",
                 expected_alembic_head="20260801_0036",
                 deadline=platform_backup_supervisor.operation_deadline(30.0),
             )
@@ -304,7 +327,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     app_target=target,
                     admin_target=None,
                     helpers=TEST_HELPERS,
-                    timestamp_slug="ignored",
                     expected_alembic_head="head",
                     deadline=platform_backup_supervisor.operation_deadline(30.0),
                 ),
@@ -358,7 +380,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                             app_target=target,
                             admin_target=None,
                             helpers=TEST_HELPERS,
-                            timestamp_slug="ignored",
                             expected_alembic_head="head",
                             deadline=platform_backup_supervisor.operation_deadline(30.0),
                         )
@@ -391,7 +412,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                                 app_target=target,
                                 admin_target=None,
                                 helpers=TEST_HELPERS,
-                                timestamp_slug="ignored",
                                 deadline=time.monotonic() + 2.2,
                             )
                         run_command.assert_not_called()
@@ -424,7 +444,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     app_target=target,
                     admin_target=None,
                     helpers=TEST_HELPERS,
-                    timestamp_slug="ignored",
                     expected_alembic_head="head",
                     deadline=platform_backup_supervisor.operation_deadline(30.0),
                 )
@@ -458,7 +477,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                             app_target=target,
                             admin_target=None,
                             helpers=TEST_HELPERS,
-                            timestamp_slug="ignored",
                             expected_alembic_head="head",
                             deadline=platform_backup_supervisor.operation_deadline(30.0),
                         )
@@ -498,7 +516,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                             app_target=target,
                             admin_target=None,
                             helpers=TEST_HELPERS,
-                            timestamp_slug="ignored",
                             expected_alembic_head="head",
                             deadline=platform_backup_supervisor.operation_deadline(30.0),
                         )
@@ -508,6 +525,52 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 payload = platform_backup_supervisor.safe_error_payload(raised.exception)
                 self.assertEqual(payload["cleanup_status"], "unproven")
                 self.assertEqual(payload["database_id"], database)
+
+    def test_create_and_identity_cancellation_persist_real_cleanup_evidence(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", None, "platformdb"
+        )
+        database = "platform_restore_drill_" + "2" * 32
+        for phase in ("create", "identity"):
+            for cancellation in (KeyboardInterrupt, SystemExit):
+                with self.subTest(phase=phase, cancellation=cancellation):
+                    with tempfile.TemporaryDirectory() as temporary_dir:
+                        app_dir = pathlib.Path(temporary_dir)
+                        (app_dir / "shared").mkdir()
+                        responses = [subprocess.CompletedProcess([], 0, "", "")]
+                        if phase == "identity":
+                            responses.append(subprocess.CompletedProcess([], 0, "", ""))
+                        responses.append(cancellation())
+                        with (
+                            mock.patch.object(backup_drill, "run_command", side_effect=responses),
+                            mock.patch.object(
+                                backup_drill, "_trusted_alembic_head", return_value="head"
+                            ),
+                            mock.patch.object(
+                                backup_drill.secrets, "token_hex", return_value="2" * 32
+                            ),
+                        ):
+                            with self.assertRaises(cancellation):
+                                with platform_backup_supervisor.evidence_session(
+                                    app_dir,
+                                    "local-backup",
+                                    locks=platform_backup_supervisor.LOCK_ORDER,
+                                ):
+                                    backup_drill.perform_restore_drill(
+                                        pathlib.Path("/tmp/backup.dump"),
+                                        app_target=target,
+                                        admin_target=None,
+                                        helpers=TEST_HELPERS,
+                                        expected_alembic_head="head",
+                                        deadline=platform_backup_supervisor.operation_deadline(30.0),
+                                    )
+                        evidence = platform_backup_supervisor.read_latest_evidence(app_dir)
+                        self.assertEqual(evidence["recovery"]["cleanup_status"], "unproven")
+                        self.assertEqual(evidence["recovery"]["database_id"], database)
+                        self.assertEqual(
+                            evidence["recovery"]["operator_action"],
+                            platform_backup_supervisor.CLEANUP_OPERATOR_ACTION,
+                        )
 
     def test_restore_drill_identity_capture_rejects_absent_ambiguous_and_timeout(self) -> None:
         target = backup_drill.DatabaseTarget(
@@ -546,7 +609,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                             app_target=target,
                             admin_target=None,
                             helpers=TEST_HELPERS,
-                            timestamp_slug="ignored",
                             expected_alembic_head="head",
                             deadline=platform_backup_supervisor.operation_deadline(30.0),
                         )
@@ -571,7 +633,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     app_target=target,
                     admin_target=None,
                     helpers=TEST_HELPERS,
-                    timestamp_slug="ignored",
                     expected_alembic_head="head",
                     deadline=platform_backup_supervisor.operation_deadline(30.0),
                 )
@@ -582,7 +643,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             output_dir = pathlib.Path(temporary_dir) / "backups"
             output_dir.mkdir()
             trusted_source = _trusted_source(pathlib.Path(temporary_dir) / "trusted-source")
-            args = self._creator_args(output_dir, dump_only=False)
+            args = self._creator_args(output_dir, real_restore=True)
             database = "platform_restore_drill_" + "d" * 32
             calls: list[list[str]] = []
 
@@ -659,6 +720,69 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             ]
             self.assertNotIn("dropdb", command_names)
 
+    def test_manifest_write_failure_retains_cleanup_identity_in_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            output_dir = root / "backups"
+            output_dir.mkdir()
+            args = self._creator_args(output_dir, real_restore=True)
+            trusted_source = _trusted_source(root / "trusted-source")
+            database = "platform_restore_drill_" + "e" * 32
+
+            def fake_run_command(
+                command: list[str], *, stdout: int | None = None, **_: object
+            ) -> subprocess.CompletedProcess[str]:
+                if pathlib.Path(command[0]).name == "pg_dump":
+                    assert stdout is not None
+                    os.write(stdout, b"PGDMP manifest failure")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.dict(
+                    backup_drill.os.environ, self._creator_environment(), clear=False
+                ),
+                mock.patch.object(
+                    backup_drill, "load_env", return_value=self._creator_environment()
+                ),
+                mock.patch.object(
+                    backup_drill, "require_commands", return_value=TEST_HELPERS
+                ),
+                mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
+                mock.patch.object(
+                    backup_drill,
+                    "perform_restore_drill",
+                    side_effect=platform_backup_supervisor.BackupCleanupUnproven(
+                        database_id=database
+                    ),
+                ),
+                mock.patch.object(
+                    backup_drill,
+                    "write_manifest",
+                    side_effect=backup_drill.BackupManifestError("manifest write failed"),
+                ),
+            ):
+                with self.assertRaises(backup_drill.BackupManifestError) as raised:
+                    with platform_backup_supervisor.evidence_session(
+                        root,
+                        "local-backup",
+                        locks=platform_backup_supervisor.LOCK_ORDER,
+                    ):
+                        self._create_backup(args, source_root=trusted_source)
+
+            payload = platform_backup_supervisor.safe_error_payload(raised.exception)
+            self.assertEqual(payload["cleanup_status"], "unproven")
+            self.assertEqual(payload["database_id"], database)
+            self.assertEqual(
+                payload["operator_action"],
+                platform_backup_supervisor.CLEANUP_OPERATOR_ACTION,
+            )
+            evidence = platform_backup_supervisor.read_latest_evidence(root)
+            self.assertEqual(evidence["recovery"]["database_id"], database)
+            self.assertEqual(
+                evidence["recovery"]["operator_action"],
+                platform_backup_supervisor.CLEANUP_OPERATOR_ACTION,
+            )
+
     def test_restore_drill_rejects_explicit_head_not_in_trusted_graph(self) -> None:
         target = backup_drill.DatabaseTarget(
             "127.0.0.1", 5432, "platform_user", "secret", "platformdb"
@@ -673,7 +797,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     app_target=target,
                     admin_target=None,
                     helpers=TEST_HELPERS,
-                    timestamp_slug="20261001T120000Z",
                     expected_alembic_head="not-current-head",
                     source_root=source_root,
                     deadline=platform_backup_supervisor.operation_deadline(30.0),
@@ -682,70 +805,10 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         trusted_head.assert_called_once_with(source_root)
         run_command.assert_not_called()
 
-    def test_verify_existing_dump_forwards_one_absolute_deadline(self) -> None:
-        sentinel = 12345.678
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            root = pathlib.Path(temporary_dir)
-            dump_path = root / "existing.dump"
-            dump_path.write_bytes(b"custom-format-backup")
-            args = argparse.Namespace(
-                verify_dump=str(dump_path),
-                env_file=str(root / ".env.platform"),
-                admin_database_url=None,
-                timeout_seconds=37.5,
-            )
-            monitor = platform_backup_supervisor.ensure_process_monitor
-            monitor.reset_mock()
-            with (
-                mock.patch.dict(
-                    backup_drill.os.environ,
-                    {
-                        "PLATFORM_DATABASE_URL": (
-                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
-                        )
-                    },
-                    clear=True,
-                ),
-                mock.patch.object(
-                    backup_drill,
-                    "load_env",
-                    return_value={
-                        "PLATFORM_DATABASE_URL": (
-                            "postgresql://platform_user@127.0.0.1:5432/platformdb"
-                        )
-                    },
-                ),
-                mock.patch.object(
-                    backup_drill, "require_commands", return_value=TEST_HELPERS
-                ),
-                mock.patch.object(
-                    platform_backup_supervisor,
-                    "operation_deadline",
-                    return_value=sentinel,
-                ) as operation_deadline,
-                mock.patch.object(
-                    backup_drill,
-                    "run_command",
-                    return_value=subprocess.CompletedProcess([], 0, "", ""),
-                ) as run_command,
-                mock.patch.object(
-                    backup_drill, "perform_restore_drill", return_value=7
-                ) as restore_drill,
-            ):
-                result = backup_drill.verify_existing_dump(args)
-
-        operation_deadline.assert_called_once_with(37.5)
-        monitor.assert_called_once_with(deadline=sentinel)
-        self.assertEqual(run_command.call_args.kwargs["deadline"], sentinel)
-        self.assertEqual(restore_drill.call_args.kwargs["deadline"], sentinel)
-        self.assertEqual(result["restored_table_count"], 7)
-
     def test_main_forwards_legacy_timeout_to_supervisor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             args = argparse.Namespace(
                 check_latest=False,
-                dump_only=False,
-                verify_dump=None,
                 output_dir=str(pathlib.Path(temporary_dir) / "backups"),
                 keep=2,
                 max_age_hours=24.0,
@@ -780,7 +843,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     app_target=target,
                     admin_target=None,
                     helpers=TEST_HELPERS,
-                    timestamp_slug="ignored",
                     deadline=platform_backup_supervisor.operation_deadline(30.0),
                 )
         self.assertRegex(error.exception.database_id or "", platform_backup_supervisor.RESTORE_DRILL_DATABASE_ID_RE)
@@ -788,7 +850,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
     def test_json_cli_errors_use_bounded_shared_payload(self) -> None:
         args = argparse.Namespace(
-            check_latest=True, dump_only=False, verify_dump=None, output_dir="/tmp",
+            check_latest=True, output_dir="/tmp",
             max_age_hours=24.0, as_json=True,
         )
         human_args = argparse.Namespace(**{**vars(args), "as_json": False})
@@ -1034,11 +1096,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     ),
                     mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
                     mock.patch.object(backup_drill, "utc_now", return_value=fixed_now),
+                    mock.patch.object(backup_drill, "perform_restore_drill", return_value=1),
                 ):
                     results = list(
                         executor.map(
                             lambda _index: self._create_backup(
-                                self._creator_args(output_dir)
+                                self._creator_args(output_dir),
+                                mock_restore=False,
                             ),
                             range(2),
                         )
@@ -1235,7 +1299,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 output_dir=str(output_dir),
                 keep=1,
                 admin_database_url=None,
-                dump_only=False,
+                _real_restore=True,
             )
             trusted_source = _trusted_source(output_dir / "trusted-source")
 
@@ -1328,7 +1392,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                       mock.patch.object(backup_drill, "perform_restore_drill", side_effect=failure)):
                     with self.assertRaisesRegex(RuntimeError, "restore verification failed") as raised:
                         self._create_backup(
-                            self._creator_args(case_dir, dump_only=False),
+                            self._creator_args(case_dir, real_restore=True),
                             source_root=_trusted_source(case_dir / "trusted-source"),
                         )
                 wrapped = platform_backup_supervisor.safe_error_payload(raised.exception)

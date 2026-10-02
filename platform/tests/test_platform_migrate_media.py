@@ -400,7 +400,7 @@ class PlatformMediaMigrationIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     checkpoint=checkpoint,
                     storage=self.storage,
                     backup_checker=lambda _path, *, max_age_hours: {
-                        "format_version": 1,
+                        "format_version": 2,
                         "restore_verified": True,
                         "metadata_file": "/safe/legacy-platformdb-test.json",
                         "age_hours": min(max_age_hours, 1),
@@ -418,7 +418,7 @@ class PlatformMediaMigrationIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 checkpoint=checkpoint,
                 storage=self.storage,
                 backup_checker=lambda _path, *, max_age_hours: {
-                    "format_version": 2,
+                    "format_version": 3,
                     "restore_verified": True,
                     "alembic_revision_verified": True,
                     "metadata_file": "/safe/platformdb-test.json",

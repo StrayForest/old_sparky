@@ -56,8 +56,8 @@ The local and remote `createdb`/`dropdb` argv builders in
 creator, replacer and dropper, and every caller reaches them through
 `perform_restore_drill`, which holds the lifecycle lock. The supervisor-owned
 `create_backup` path additionally requires its unforgeable mutation capability;
-the read-only-archive verification mode may create only its locked temporary
-drill database. `platform_prepare_test_runtime.py` is a separate local-test
+the `--check-latest` health mode is read-only and creates no database.
+`platform_prepare_test_runtime.py` is a separate local-test
 bootstrap: its fixed `platformdb_test` create and `ALTER DATABASE` operations
 are not a production backup path and must never be used to administer a
 production temporary database. No in-repository production database-rename

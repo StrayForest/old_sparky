@@ -188,19 +188,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--dump-only",
-        action="store_true",
-        help="Create and validate the archive without performing the restore drill.",
-    )
-    parser.add_argument(
         "--check-latest",
         action="store_true",
         help="Only verify the newest retained backup metadata and checksum.",
-    )
-    parser.add_argument(
-        "--verify-dump",
-        default=None,
-        help="Restore and verify an existing custom-format platform backup, then remove the test DB.",
     )
     parser.add_argument("--max-age-hours", type=float, default=24.0)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_OPERATION_TIMEOUT_SECONDS)
@@ -816,7 +806,6 @@ def perform_restore_drill(
     app_target: DatabaseTarget,
     admin_target: DatabaseTarget | None,
     helpers: supervisor.TrustedPostgresHelpers,
-    timestamp_slug: str,
     trusted_alembic_head: object | None = None,
     expected_alembic_head: str | None = None,
     source_root: pathlib.Path | None = None,
@@ -828,7 +817,6 @@ def perform_restore_drill(
             app_target=app_target,
             admin_target=admin_target,
             helpers=helpers,
-            timestamp_slug=timestamp_slug,
             trusted_alembic_head=trusted_alembic_head,
             expected_alembic_head=expected_alembic_head,
             source_root=source_root,
@@ -842,7 +830,6 @@ def _perform_restore_drill_unlocked(
     app_target: DatabaseTarget,
     admin_target: DatabaseTarget | None,
     helpers: supervisor.TrustedPostgresHelpers,
-    timestamp_slug: str,
     trusted_alembic_head: object | None = None,
     expected_alembic_head: str | None = None,
     source_root: pathlib.Path | None = None,
@@ -913,7 +900,12 @@ def _perform_restore_drill_unlocked(
             probe_result = invoke(probe_command, target=admin_command_target, capture_output=True)
             if probe_result.returncode != 0 or probe_result.stdout.strip():
                 raise supervisor.BackupCleanupUnproven(database_id=drill_database)
-        except (KeyboardInterrupt, SystemExit, supervisor.BackupCleanupUnproven):
+        except (
+            KeyboardInterrupt,
+            SystemExit,
+            supervisor.BackupCleanupUnproven,
+        ) as exc:
+            _mark_cleanup_unproven(exc, drill_database)
             raise
         except Exception as exc:
             raise supervisor.BackupCleanupUnproven(database_id=drill_database) from exc
@@ -921,7 +913,12 @@ def _perform_restore_drill_unlocked(
             create_result = invoke(create_command, target=admin_command_target)
             if create_result.returncode != 0:
                 raise supervisor.BackupCommandError(result=create_result)
-        except (KeyboardInterrupt, SystemExit, supervisor.BackupCleanupUnproven):
+        except (
+            KeyboardInterrupt,
+            SystemExit,
+            supervisor.BackupCleanupUnproven,
+        ) as exc:
+            _mark_cleanup_unproven(exc, drill_database)
             raise
         except Exception as exc:
             raise supervisor.BackupCleanupUnproven(database_id=drill_database) from exc
@@ -952,7 +949,12 @@ def _perform_restore_drill_unlocked(
             )
             if created_identity.owner != app_target.username:
                 raise supervisor.BackupCleanupUnproven(database_id=drill_database)
-        except (KeyboardInterrupt, SystemExit, supervisor.BackupCleanupUnproven):
+        except (
+            KeyboardInterrupt,
+            SystemExit,
+            supervisor.BackupCleanupUnproven,
+        ) as exc:
+            _mark_cleanup_unproven(exc, drill_database)
             raise
         except Exception as exc:
             raise supervisor.BackupCleanupUnproven(database_id=drill_database) from exc
@@ -1119,6 +1121,20 @@ def require_commands(
         raise RuntimeError(str(exc)) from None
 
 
+def _mark_cleanup_unproven(exc: BaseException, database_id: str) -> None:
+    """Attach only the allowlisted cleanup identity before a DB mutation can escape."""
+
+    if not supervisor.RESTORE_DRILL_DATABASE_ID_RE.fullmatch(database_id):
+        return
+    if isinstance(exc, supervisor.BackupCleanupUnproven):
+        exc.database_id = database_id
+    setattr(exc, "backup_cleanup_unproven", database_id)
+    exc.add_note(
+        "restore-drill cleanup was not proven; "
+        f"database_id={database_id}; operator_action={supervisor.CLEANUP_OPERATOR_ACTION}"
+    )
+
+
 def _safe_restore_error(exc: BaseException) -> str:
     """Persist the allowlisted primary code; cleanup stays structured."""
 
@@ -1197,9 +1213,7 @@ def create_backup(
         except ImportError:
             import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
     supervisor.require_mutation_capability(capability, "maintenance")
-    trusted_head = None
-    if not args.dump_only:
-        trusted_head = supervisor.require_trusted_alembic_head(trusted_alembic_head)
+    trusted_head = supervisor.require_trusted_alembic_head(trusted_alembic_head)
     env_file = pathlib.Path(args.env_file)
     output_dir = pathlib.Path(args.output_dir)
     file_env = load_env(env_file)
@@ -1211,12 +1225,9 @@ def create_backup(
     app_target = parse_database_url(database_url)
     admin_url = args.admin_database_url or merged_env.get("PLATFORM_BACKUP_ADMIN_URL")
     admin_target = parse_database_url(admin_url, require_platformdb=False) if admin_url else None
-    required = ["pg_dump", "pg_restore"]
-    if not args.dump_only:
-        required.extend(["createdb", "dropdb", "psql"])
+    required = ["pg_dump", "pg_restore", "createdb", "dropdb", "psql"]
     local_admin_candidate = (
-        not args.dump_only
-        and admin_target is None
+        admin_target is None
         and os.geteuid() == 0
         and app_target.host in LOCAL_DATABASE_HOSTS
     )
@@ -1356,54 +1367,56 @@ def create_backup(
         except OSError as exc:
             raise RuntimeError("Could not fsync the backup directory after publishing the dump.") from exc
 
-        if not args.dump_only:
-            try:
-                restored_table_count = perform_restore_drill(
-                    dump_path,
-                    app_target=app_target,
-                    admin_target=admin_target,
-                    helpers=helpers,
-                    timestamp_slug=timestamp_slug,
-                    trusted_alembic_head=trusted_head,
-                    deadline=deadline,
-                )
-                restore_verified = True
-                assert trusted_head is not None
-                alembic_revision = trusted_head.value
-            except Exception as exc:
-                restore_payload = supervisor.safe_error_payload(exc)
-                restore_error = _safe_restore_error(exc)
-                cleanup_status = restore_payload.get("cleanup_status")
-                cleanup_database_id = restore_payload.get("database_id")
-                cleanup_operator_action = restore_payload.get("operator_action")
-            except BaseException as exc:
-                restore_payload = supervisor.safe_error_payload(exc)
-                if restore_payload.get("cleanup_status") != "unproven":
-                    raise
-                restore_error = _safe_restore_error(exc)
-                cleanup_status = restore_payload.get("cleanup_status")
-                cleanup_database_id = restore_payload.get("database_id")
-                cleanup_operator_action = restore_payload.get("operator_action")
-                cancelled_restore = exc
+        try:
+            restored_table_count = perform_restore_drill(
+                dump_path,
+                app_target=app_target,
+                admin_target=admin_target,
+                helpers=helpers,
+                trusted_alembic_head=trusted_head,
+                deadline=deadline,
+            )
+            restore_verified = True
+            alembic_revision = trusted_head.value
+        except Exception as exc:
+            restore_payload = supervisor.safe_error_payload(exc)
+            restore_error = _safe_restore_error(exc)
+            cleanup_status = restore_payload.get("cleanup_status")
+            cleanup_database_id = restore_payload.get("database_id")
+            cleanup_operator_action = restore_payload.get("operator_action")
+        except BaseException as exc:
+            restore_payload = supervisor.safe_error_payload(exc)
+            if restore_payload.get("cleanup_status") != "unproven":
+                raise
+            restore_error = _safe_restore_error(exc)
+            cleanup_status = restore_payload.get("cleanup_status")
+            cleanup_database_id = restore_payload.get("database_id")
+            cleanup_operator_action = restore_payload.get("operator_action")
+            cancelled_restore = exc
 
         completed_at = utc_now()
-        metadata = build_manifest(
-            run_id=run_id,
-            dump_file=dump_path.name,
-            size_bytes=dump_stat.st_size,
-            sha256=archive_sha256,
-            started_at_utc=started_at,
-            completed_at_utc=completed_at,
-            duration_seconds=round((completed_at - started_at).total_seconds(), 3),
-            restore_verified=restore_verified,
-            alembic_revision_verified=restore_verified,
-            restored_table_count=restored_table_count,
-            restore_error=restore_error,
-            cleanup_status=cleanup_status,
-            database_id=cleanup_database_id,
-            operator_action=cleanup_operator_action,
-        )
-        write_manifest(metadata_path, metadata)
+        try:
+            metadata = build_manifest(
+                run_id=run_id,
+                dump_file=dump_path.name,
+                size_bytes=dump_stat.st_size,
+                sha256=archive_sha256,
+                started_at_utc=started_at,
+                completed_at_utc=completed_at,
+                duration_seconds=round((completed_at - started_at).total_seconds(), 3),
+                restore_verified=restore_verified,
+                alembic_revision_verified=restore_verified,
+                restored_table_count=restored_table_count,
+                restore_error=restore_error,
+                cleanup_status=cleanup_status,
+                database_id=cleanup_database_id,
+                operator_action=cleanup_operator_action,
+            )
+            write_manifest(metadata_path, metadata)
+        except BaseException as manifest_error:
+            if cleanup_status == "unproven" and cleanup_database_id:
+                _mark_cleanup_unproven(manifest_error, cleanup_database_id)
+            raise
         metadata_written = True
         removed: list[str] = []
         if restore_verified and prune:
@@ -1463,71 +1476,10 @@ def print_result(result: dict[str, Any], *, as_json: bool) -> None:
         print(f"[OK] Backup age: {result['age_hours']} hours")
 
 
-def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
-    dump_path = pathlib.Path(args.verify_dump).resolve()
-    if not dump_path.is_file() or dump_path.suffix != ".dump":
-        raise RuntimeError("--verify-dump must reference an existing .dump archive.")
-    file_env = load_env(pathlib.Path(args.env_file))
-    merged_env = {**file_env, **os.environ}
-    database_url = merged_env.get("PLATFORM_DATABASE_URL")
-    if not database_url:
-        raise RuntimeError("PLATFORM_DATABASE_URL is required to run a restore drill.")
-    app_target = parse_database_url(database_url)
-    admin_url = args.admin_database_url or merged_env.get("PLATFORM_BACKUP_ADMIN_URL")
-    admin_target = parse_database_url(admin_url, require_platformdb=False) if admin_url else None
-    local_admin_candidate = (
-        admin_target is None
-        and os.geteuid() == 0
-        and app_target.host in LOCAL_DATABASE_HOSTS
-    )
-    helpers = require_commands(
-        "pg_restore",
-        "createdb",
-        "dropdb",
-        "psql",
-        optional=("runuser",) if local_admin_candidate else (),
-    )
-    deadline = supervisor.operation_deadline(
-        float(getattr(args, "timeout_seconds", DEFAULT_OPERATION_TIMEOUT_SECONDS))
-    )
-    supervisor.ensure_process_monitor(deadline=deadline)
-    run_command(
-        [helpers.executable("pg_restore"), "--list", str(dump_path)],
-        capture_output=True,
-        deadline=deadline,
-    )
-    table_count = perform_restore_drill(
-        dump_path,
-        app_target=app_target,
-        admin_target=admin_target,
-        helpers=helpers,
-        timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
-        deadline=deadline,
-    )
-    return {
-        "ok": True,
-        "dump_file": str(dump_path),
-        "sha256": sha256_file(dump_path),
-        "restore_verified": True,
-        "alembic_revision_verified": True,
-        "restored_table_count": table_count,
-    }
-
-
 def main() -> int:
     args = parse_args()
     try:
-        selected_modes = int(args.check_latest) + int(args.dump_only) + int(args.verify_dump is not None)
-        if selected_modes > 1:
-            raise ValueError("--dump-only, --check-latest, and --verify-dump are mutually exclusive.")
-        if args.verify_dump is not None:
-            # A production restore drill is a supervisor-owned mutation.  The
-            # read-only ``--check-latest`` path below remains available to
-            # health/preflight diagnostics.
-            raise RuntimeError(
-                "--verify-dump is a supervisor-owned restore drill; use platform_backup_supervisor"
-            )
-        elif args.check_latest:
+        if args.check_latest:
             result = check_latest_backup(pathlib.Path(args.output_dir), max_age_hours=args.max_age_hours)
         else:
             # No environment variable or numeric FD is accepted as a

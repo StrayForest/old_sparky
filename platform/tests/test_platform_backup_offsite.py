@@ -237,7 +237,6 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 output_dir=str(output_dir),
                 keep=2,
                 admin_database_url=None,
-                dump_only=False,
             )
 
             def fake_run_command(
@@ -289,7 +288,6 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                 output_dir=str(output_dir),
                 keep=2,
                 admin_database_url=None,
-                dump_only=False,
             )
 
             def fake_run_command(
@@ -621,6 +619,95 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
             payload = platform_backup_supervisor.safe_error_payload(raised.exception)
             self.assertEqual(payload["cleanup_status"], "unproven")
             self.assertNotIn("database_id", payload)
+
+    def test_offsite_cleanup_cancellation_is_re_raised_with_durable_evidence(self) -> None:
+        for cancellation in (KeyboardInterrupt, SystemExit):
+            with self.subTest(cancellation=cancellation), tempfile.TemporaryDirectory() as temporary_dir:
+                root = Path(temporary_dir)
+                (root / "shared").mkdir()
+                dump, _manifest = _create_verified_backup(root)
+                backup = offsite.select_verified_backup(
+                    root, dump, max_age_hours=24, apply=False
+                )
+                cipher_path = root / "cipher.gpg"
+                cipher_path.write_bytes(b"ciphertext")
+                cipher_fd = os.open(cipher_path, os.O_RDONLY)
+                encrypted = SimpleNamespace(
+                    fd=cipher_fd,
+                    sha256="a" * 64,
+                    size_bytes=10,
+                )
+                key_path = root / "recovery.asc"
+                key_path.write_text("public key", encoding="utf-8")
+                fake_offsite = SimpleNamespace(
+                    select_verified_backup=lambda *_args, **_kwargs: backup,
+                    load_config=lambda *_args, **_kwargs: _config(key_path),
+                    encrypt_backup_from_fd=lambda *_args, **_kwargs: encrypted,
+                    object_key=offsite.object_key,
+                )
+                restore = SimpleNamespace(
+                    expected_alembic_head=lambda _source_root: "20260913_0053"
+                )
+                args = argparse.Namespace(
+                    backup_dir=str(root),
+                    dump=str(dump),
+                    max_age_hours=24.0,
+                    apply=False,
+                    env_file=str(root / ".env.backup"),
+                    platform_env_file=str(root / ".env.platform"),
+                    timeout=8.0,
+                )
+                evidence = SimpleNamespace(
+                    payload={"alembic": {}},
+                    update_pair=lambda _pair: None,
+                    update_remote=lambda **_kwargs: None,
+                )
+                real_import_module = platform_backup_supervisor.importlib.import_module
+
+                def import_module(name: str):
+                    if name in {"tools.platform_backup_offsite", "platform_backup_offsite"}:
+                        return fake_offsite
+                    return real_import_module(name)
+
+                with (
+                    mock.patch.object(
+                        platform_backup_supervisor.importlib,
+                        "import_module",
+                        side_effect=import_module,
+                    ),
+                    mock.patch.object(
+                        platform_backup_supervisor.shutil,
+                        "rmtree",
+                        side_effect=cancellation,
+                    ),
+                ):
+                    with self.assertRaises(cancellation):
+                        with platform_backup_supervisor.evidence_session(
+                            root,
+                            "offsite",
+                            locks=platform_backup_supervisor.operation_lock_requirements(
+                                "offsite"
+                            ),
+                        ):
+                            with _held_test_lock() as lock:
+                                platform_backup_supervisor._run_offsite_scope(
+                                    args,
+                                    app_dir=root,
+                                    lock=lock,
+                                    _restore_module=restore,
+                                    callback=lambda capability, trusted_head, _restore: platform_backup_supervisor.run_offsite(
+                                        args,
+                                        app_dir=root,
+                                        trusted_alembic_head=trusted_head,
+                                        capability=capability,
+                                        lock=lock,
+                                        evidence=evidence,
+                                    ),
+                                )
+                with self.assertRaises(OSError):
+                    os.fstat(cipher_fd)
+                persisted = platform_backup_supervisor.read_latest_evidence(root)
+                self.assertEqual(persisted["recovery"]["cleanup_status"], "unproven")
 
     def test_encrypt_uses_ephemeral_keyring_and_produces_mode_0600_ciphertext(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

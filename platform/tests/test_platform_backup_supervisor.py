@@ -612,7 +612,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         restore.create_backup.side_effect = RuntimeError("pg_dump sentinel")
         app_dir = Path("/tmp/oldsparky-supervisor-head-regression")
         evidence = mock.Mock()
-        args = SimpleNamespace(dump_only=False)
+        args = SimpleNamespace()
         observed_head: dict[str, object] = {}
         captured_head: list[object] = []
         sentinel_deadline = 54321.0
@@ -700,7 +700,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                     supervisor.BackupSupervisorError, "trusted Alembic head"
                 ):
                     supervisor._run_local_backup_scope(
-                        SimpleNamespace(dump_only=False),
+                        SimpleNamespace(),
                         app_dir=app_dir,
                         lock=lock,
                         callback=lambda capability, _trusted_head, _restore: supervisor.run_local_backup(
@@ -715,7 +715,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                     supervisor.BackupSupervisorError, "mutation capability"
                 ):
                     supervisor._run_local_backup_scope(
-                        SimpleNamespace(dump_only=False),
+                        SimpleNamespace(),
                         app_dir=app_dir,
                         lock=lock,
                         callback=lambda capability, _trusted_head, _restore: supervisor.require_mutation_capability(
@@ -867,7 +867,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         with mock.patch.object(supervisor.importlib, "import_module") as import_module:
             with self.assertRaises(supervisor.BackupSupervisorError):
                 supervisor._run_local_backup_scope(
-                    SimpleNamespace(dump_only=False),
+                    SimpleNamespace(),
                     app_dir=Path("/tmp/oldsparky-no-lock"),
                     lock=FakeLock(),
                     callback=callback,
@@ -879,7 +879,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         with mock.patch.object(supervisor.importlib, "import_module") as import_module:
             with self.assertRaises(supervisor.BackupSupervisorError):
                 supervisor._run_local_backup_scope(
-                    SimpleNamespace(dump_only=False),
+                    SimpleNamespace(),
                     app_dir=Path("/tmp/oldsparky-forged-lock"),
                     lock=forged_lock,
                     callback=callback,
@@ -891,7 +891,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             released_lock.close()
             with self.assertRaises(supervisor.BackupSupervisorError):
                 supervisor._run_local_backup_scope(
-                    SimpleNamespace(dump_only=False),
+                    SimpleNamespace(),
                     app_dir=Path("/tmp/oldsparky-released-lock"),
                     lock=released_lock,
                     callback=callback,
@@ -909,7 +909,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                     os.replace(replacement, lock_path)
                     with self.assertRaises(supervisor.BackupSupervisorError):
                         supervisor._run_local_backup_scope(
-                            SimpleNamespace(dump_only=False),
+                            SimpleNamespace(),
                             app_dir=Path("/tmp/oldsparky-replaced-lock"),
                             lock=replaced_lock,
                             callback=callback,
@@ -923,7 +923,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             with mock.patch.object(supervisor.importlib, "import_module", return_value=restore):
                 with self.assertRaises(supervisor.BackupSupervisorError):
                     supervisor._run_local_backup_scope(
-                        SimpleNamespace(dump_only=False),
+                        SimpleNamespace(),
                         app_dir=Path("/tmp/oldsparky-missing-source"),
                         lock=lock,
                         callback=producer,

@@ -7,6 +7,15 @@ from tools import platform_cleanup_orphaned_integration as cleanup
 
 
 class PlatformCleanupOrphanedIntegrationTests(unittest.TestCase):
+    def test_backup_gate_requires_current_manifest_version(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "format-3"):
+            cleanup.require_current_backup(
+                {"format_version": 2, "alembic_revision_verified": True}
+            )
+        cleanup.require_current_backup(
+            {"format_version": 3, "alembic_revision_verified": True}
+        )
+
     def test_inventory_contract_accepts_only_bounded_test_identities(self) -> None:
         marker = "it-deadlock-2077c391"
         users = [

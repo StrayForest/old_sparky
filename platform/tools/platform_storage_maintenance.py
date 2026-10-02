@@ -600,7 +600,7 @@ def run_backup(
         raise RuntimeError("supervisor backup capability requires held lock and evidence")
     supervisor.require_mutation_capability(capability, "maintenance")
     return supervisor._run_local_backup_scope(
-        argparse.Namespace(dump_only=False),
+        argparse.Namespace(),
         app_dir=app_dir,
         lock=lock,
         callback=lambda scoped_capability, trusted_head, _restore: supervisor.run_local_backup(
