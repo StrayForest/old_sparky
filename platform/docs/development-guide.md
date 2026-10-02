@@ -82,10 +82,12 @@ invocations are required because the runtime and CI contours intentionally pin
 some shared packages to different versions. The audit uses
 `--disable-pip --require-hashes --strict`, so it reads and audits the resolved
 pins without installing a second target environment; the normal CI installer
-and release wheelhouse validation remain the hash-integrity owners. Missing,
-malformed, timed-out or vulnerable lock audits fail the gate. The unhashed
-direct input files remain generator/release inputs rather than additional
-security-audit targets.
+and release wheelhouse validation remain the hash-integrity owners. The gate
+reads each lock through a no-follow descriptor walk and passes `pip-audit` a
+private snapshot of the exact bytes that passed parsing, never the mutable
+repository pathname. Missing, malformed, timed-out or vulnerable lock audits
+fail the gate. The unhashed direct input files remain generator/release inputs
+rather than additional security-audit targets.
 
 To verify the current CI lock, run the generator on the same Python 3.12 Linux
 x86_64 contract:

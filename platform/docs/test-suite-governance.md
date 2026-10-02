@@ -411,8 +411,11 @@ intentional because runtime and CI can pin a shared package to different
 versions. The gate uses `pip-audit --disable-pip --require-hashes --strict`
 with bounded network and subprocess timeouts, fails closed on a missing or
 malformed lock, and runs every listed lock before returning an aggregate
-failure. Direct unhashed input files remain owned by the CI-lock generator and
-release wheelhouse validator rather than being treated as resolved lockfiles.
+failure. Each lock is read through a no-follow descriptor walk, validated from
+bounded stable bytes, and audited from a private snapshot of those exact bytes;
+the mutable repository pathname is never passed to `pip-audit`. Direct
+unhashed input files remain owned by the CI-lock generator and release
+wheelhouse validator rather than being treated as resolved lockfiles.
 
 Each job's setup-python cache is keyed by the lock path, so lock changes
 invalidate dependency artifacts without sharing a mutable virtualenv between

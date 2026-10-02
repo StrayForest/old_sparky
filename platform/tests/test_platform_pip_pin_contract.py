@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -92,6 +93,7 @@ class PlatformPipPinContractTests(unittest.TestCase):
         self.assertEqual(verifier.SECURITY_DEPENDENCY_LOCK_MAX_BYTES, 1024 * 1024)
 
         command_calls: list[tuple[str, list[str], dict[str, object]]] = []
+        snapshot_evidence: list[tuple[Path, bytes, int, int]] = []
 
         def fake_run(
             label: str,
@@ -99,6 +101,15 @@ class PlatformPipPinContractTests(unittest.TestCase):
             **kwargs: object,
         ) -> int:
             command_calls.append((label, command, kwargs))
+            snapshot = Path(command[4])
+            snapshot_evidence.append(
+                (
+                    snapshot,
+                    snapshot.read_bytes(),
+                    stat.S_IMODE(snapshot.stat().st_mode),
+                    stat.S_IMODE(snapshot.parent.stat().st_mode),
+                )
+            )
             return 0
 
         with mock.patch.object(verifier, "_run", side_effect=fake_run):
@@ -109,11 +120,17 @@ class PlatformPipPinContractTests(unittest.TestCase):
             label, command, kwargs = command_calls[index]
             self.assertEqual(label, f"security/dependency-audit/{lock_path}")
             self.assertEqual(command[1:4], ["-m", "pip_audit", "-r"])
-            self.assertEqual(command[4], lock_path)
+            snapshot = Path(command[4])
+            self.assertNotEqual(snapshot, PLATFORM_ROOT / lock_path)
+            _, snapshot_bytes, snapshot_mode, directory_mode = snapshot_evidence[index]
+            self.assertEqual(snapshot_bytes, (PLATFORM_ROOT / lock_path).read_bytes())
+            self.assertEqual(snapshot_mode, 0o400)
+            self.assertEqual(directory_mode, 0o700)
             self.assertEqual(command[5:], list(EXPECTED_PIP_AUDIT_FLAGS))
             self.assertEqual(kwargs, {"timeout_seconds": 120})
             self.assertNotIn("install", command)
             self.assertNotIn("--fix", command)
+            self.assertFalse(snapshot.exists())
 
     def test_security_dependency_audits_all_locks_after_a_failure(self) -> None:
         for failing_path, expected_status in (
@@ -125,7 +142,7 @@ class PlatformPipPinContractTests(unittest.TestCase):
             def fake_run(label: str, command: list[str], **kwargs: object) -> int:
                 calls.append(label)
                 self.assertEqual(kwargs, {"timeout_seconds": 120})
-                return expected_status if command[4] == failing_path else 0
+                return expected_status if label.endswith(failing_path) else 0
 
             with mock.patch.object(verifier, "_run", side_effect=fake_run):
                 self.assertEqual(verifier._run_security_dependency_audits(), expected_status)
@@ -179,22 +196,18 @@ class PlatformPipPinContractTests(unittest.TestCase):
 
                     with mock.patch.object(verifier, "PLATFORM_ROOT", root):
                         if name == "read-failure":
-                            original_open = Path.open
+                            original_open = os.open
 
-                            def fail_one(
-                                path: Path,
-                                mode: str = "r",
-                                buffering: int = -1,
-                                encoding: str | None = None,
-                                errors: str | None = None,
-                                newline: str | None = None,
-                            ):
-                                if path == invalid_path:
+                            def fail_one(path, flags, *args, **kwargs):
+                                if (
+                                    kwargs.get("dir_fd") is not None
+                                    and path == invalid_path.name
+                                ):
                                     raise OSError("blocked")
-                                return original_open(path, mode, buffering, encoding, errors, newline)
+                                return original_open(path, flags, *args, **kwargs)
 
                             with mock.patch.object(
-                                Path, "open", autospec=True, side_effect=fail_one
+                                verifier.os, "open", side_effect=fail_one
                             ):
                                 with mock.patch.object(verifier, "_run", side_effect=fake_run):
                                     status = verifier._run_security_dependency_audits()
@@ -204,6 +217,142 @@ class PlatformPipPinContractTests(unittest.TestCase):
 
                     self.assertNotEqual(status, 0)
                     self.assertEqual(calls, remaining_labels)
+
+    def test_security_dependency_audit_uses_exact_snapshot_after_source_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative_path in EXPECTED_SECURITY_DEPENDENCY_LOCKS:
+                target = root / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(PLATFORM_ROOT / relative_path, target)
+            source = root / EXPECTED_SECURITY_DEPENDENCY_LOCKS[0]
+            expected = source.read_bytes()
+            observed: list[tuple[Path, bytes]] = []
+
+            def fake_run(label: str, command: list[str], **kwargs: object) -> int:
+                snapshot = Path(command[4])
+                source.unlink()
+                source.write_bytes(b"")
+                observed.append((snapshot, snapshot.read_bytes()))
+                return 0
+
+            with mock.patch.object(verifier, "PLATFORM_ROOT", root):
+                with mock.patch.object(verifier, "_run", side_effect=fake_run):
+                    self.assertEqual(verifier._run_security_dependency_audits(), 0)
+
+            self.assertEqual(observed[0][1], expected)
+            self.assertEqual(source.read_bytes(), b"")
+            self.assertFalse(observed[0][0].exists())
+
+    def test_security_dependency_reader_rejects_in_place_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / EXPECTED_SECURITY_DEPENDENCY_LOCKS[0]
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(PLATFORM_ROOT / EXPECTED_SECURITY_DEPENDENCY_LOCKS[0], source)
+            original_read = verifier.os.read
+            mutated = False
+
+            def mutate_after_read(descriptor: int, count: int) -> bytes:
+                nonlocal mutated
+                payload = original_read(descriptor, count)
+                if not mutated:
+                    mutated = True
+                    source.write_bytes(b"")
+                return payload
+
+            with mock.patch.object(verifier.os, "read", side_effect=mutate_after_read):
+                payload, failure = verifier._read_stable_security_dependency_lock(
+                    root,
+                    EXPECTED_SECURITY_DEPENDENCY_LOCKS[0],
+                )
+            self.assertIsNone(payload)
+            self.assertEqual(failure, "changed-during-read")
+
+    def test_security_dependency_reader_rejects_parent_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "platform_draft").mkdir()
+            source = outside / "platform_draft" / "requirements-assets.lock.txt"
+            shutil.copyfile(
+                PLATFORM_ROOT / "apps/platform_draft/requirements-assets.lock.txt",
+                source,
+            )
+            apps = root / "apps"
+            apps.symlink_to(outside, target_is_directory=True)
+
+            payload, failure = verifier._read_stable_security_dependency_lock(
+                root,
+                "apps/platform_draft/requirements-assets.lock.txt",
+            )
+
+            self.assertIsNone(payload)
+            self.assertIn(failure, {"unreadable", "unsafe-parent"})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            apps = root / "apps"
+            source = apps / "platform_draft" / "requirements-assets.lock.txt"
+            source.parent.mkdir(parents=True)
+            shutil.copyfile(
+                PLATFORM_ROOT / "apps/platform_draft/requirements-assets.lock.txt",
+                source,
+            )
+            expected = source.read_bytes()
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "platform_draft").mkdir()
+            (outside / "platform_draft" / "requirements-assets.lock.txt").write_bytes(b"")
+            original_open = verifier.os.open
+            swapped = False
+
+            def swap_parent_after_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if path == "apps" and kwargs.get("dir_fd") is not None and not swapped:
+                    swapped = True
+                    apps.rename(root / "apps-original")
+                    apps.symlink_to(outside, target_is_directory=True)
+                return descriptor
+
+            with mock.patch.object(verifier.os, "open", side_effect=swap_parent_after_open):
+                payload, failure = verifier._read_stable_security_dependency_lock(
+                    root,
+                    "apps/platform_draft/requirements-assets.lock.txt",
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual(payload, expected)
+            self.assertIsNone(failure)
+
+    def test_security_dependency_snapshot_cleanup_survives_audit_failure(self) -> None:
+        for expected_status in (17, 124):
+            with self.subTest(expected_status=expected_status):
+                captured: list[Path] = []
+
+                def failing_run(label: str, command: list[str], **kwargs: object) -> int:
+                    captured.append(Path(command[4]))
+                    return expected_status
+
+                with mock.patch.object(verifier, "_run", side_effect=failing_run):
+                    self.assertEqual(verifier._run_security_dependency_audits(), expected_status)
+                self.assertEqual(len(captured), len(EXPECTED_SECURITY_DEPENDENCY_LOCKS))
+                self.assertTrue(all(not path.exists() for path in captured))
+
+    def test_security_dependency_snapshot_cleanup_survives_interrupt(self) -> None:
+        captured: list[Path] = []
+
+        def interrupting_run(label: str, command: list[str], **kwargs: object) -> int:
+            captured.append(Path(command[4]))
+            raise KeyboardInterrupt
+
+        with mock.patch.object(verifier, "_run", side_effect=interrupting_run):
+            with self.assertRaises(KeyboardInterrupt):
+                verifier._run_security_dependency_audits()
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(captured[0].exists())
 
     def test_ci_lock_covers_runtime_quality_and_bootstrap_inputs(self) -> None:
         runtime = _direct_pins(PLATFORM_ROOT / "requirements-platform.txt")
