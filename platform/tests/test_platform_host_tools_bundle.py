@@ -2126,6 +2126,22 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             self.assertEqual(payload["security_run"]["head_sha"], "2" * 40)
             self.assertEqual(payload["tested_merge"]["sha"], "3" * 40)
 
+        event, _run, _pr = self._candidate_event_fixture()
+        with tempfile.TemporaryDirectory() as temporary:
+            event_path = Path(temporary) / "event.json"
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            direct_dev = candidate.inspect_event(event_path)
+            self.assertEqual(direct_dev.association_base_ref, "dev")
+            self.assertEqual(direct_dev.pull_request, "115")
+
+            stacked_event = json.loads(json.dumps(event))
+            stacked_event["workflow_run"]["pull_requests"][0]["base"]["ref"] = (
+                "codex/dependency-remediation"
+            )
+            event_path.write_text(json.dumps(stacked_event), encoding="utf-8")
+            with self.assertRaisesRegex(candidate.CandidateError, "base is not dev"):
+                candidate.inspect_event(event_path)
+
     def test_candidate_context_rejects_empty_multiple_and_wrong_pr_associations(self) -> None:
         event, run, pr = self._candidate_event_fixture()
         payload_mutations = (
@@ -2838,6 +2854,8 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         self.assertIn("Attest exact inner host-tools ZIP", workflow)
         self.assertIn("Verify uploaded evidence artifact envelope", workflow)
         self.assertIn("github.ref == 'refs/heads/dev'", workflow)
+        base_guard = "github.event.workflow_run.pull_requests[0].base.ref == 'dev'"
+        self.assertIn(base_guard, workflow)
         self.assertIn("Recheck PR, security run, attempt, and head before attestation", workflow)
         self.assertIn("Recheck PR, security run, attempt, and head before upload", workflow)
         self.assertNotRegex(workflow, r"python3[^\n]*candidate-data/platform/")
@@ -2854,6 +2872,13 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         self.assertNotIn(candidate.CANDIDATE_ARTIFACT_PREFIX, production_text)
         self.assertNotIn(candidate.EVIDENCE_ARTIFACT_PREFIX, production_text)
         self.assertEqual(host_tools_candidate_workflow_issues(), [])
+        missing_base_guard = workflow.replace(f"      {base_guard} &&\n", "", 1)
+        self.assertTrue(
+            any(
+                "pull_requests[0].base.ref == 'dev'" in issue
+                for issue in host_tools_candidate_workflow_issues(missing_base_guard)
+            )
+        )
         candidate_job = re.search(
             r"^  build-candidate:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,

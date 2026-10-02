@@ -1518,6 +1518,7 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         "cancel-in-progress: true",
         "github.ref == 'refs/heads/dev'",
         "github.event.workflow_run.event == 'pull_request'",
+        "github.event.workflow_run.pull_requests[0].base.ref == 'dev'",
         "github.event.workflow_run.head_repository.full_name == 'StrayForest/old_sparky'",
         "github.event.workflow_run.workflow_id == 339062797",
         "github.event.workflow_run.path == '.github/workflows/platform-security.yml'",
