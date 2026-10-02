@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+import errno
 import io
 import hashlib
 import json
@@ -11,8 +13,8 @@ import stat
 import subprocess
 import sys
 import tarfile
+import threading
 import unittest
-import time
 from pathlib import Path
 import tempfile
 import textwrap
@@ -135,6 +137,135 @@ _EXPECTED_ACTIONLINT_CHECKSUM_FIXTURE_SHA256 = (
     "433028cf0ba3c42163ea1a668dedce30fcdbe84fe912b1a5e288c006eab8a4f5"
 )
 _EXPECTED_ACTIONLINT_MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
+
+
+class _Sigusr1WatchdogExpired(AssertionError):
+    """The independent test watchdog fired before SIGALRM."""
+
+
+class _Sigusr1Watchdog:
+    """Bounded SIGUSR1 watchdog with identity-safe signal-state teardown."""
+
+    def __init__(self, *, timeout: float = 0.8, join_timeout: float = 0.5) -> None:
+        if timeout <= 0 or join_timeout <= 0:
+            raise ValueError("watchdog timeouts must be positive")
+        self.timeout = timeout
+        self.join_timeout = join_timeout
+        self._previous_handler: object | None = None
+        self._previous_mask: set[signal.Signals] | None = None
+        self._previous_pending: set[signal.Signals] = set()
+        self._stop = threading.Event()
+        self._sender_done = threading.Event()
+        self._sender_fired = threading.Event()
+        self._send_lock = threading.Lock()
+        self._sender_error: BaseException | None = None
+        self._thread: threading.Thread | None = None
+        self._handler_installed = False
+        self.restored = False
+
+    def _handler(self, _signum: int, _frame: object) -> None:
+        raise _Sigusr1WatchdogExpired(
+            "SIGALRM did not fire before watchdog deadline"
+        )
+
+    def _send(self) -> None:
+        try:
+            if self._stop.wait(self.timeout):
+                return
+            with self._send_lock:
+                if self._stop.is_set():
+                    return
+                self._sender_fired.set()
+                os.kill(os.getpid(), signal.SIGUSR1)
+        except BaseException as error:
+            self._sender_error = error
+        finally:
+            self._sender_done.set()
+
+    def __enter__(self) -> "_Sigusr1Watchdog":
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError("SIGUSR1 watchdog requires the main thread")
+        self._previous_handler = signal.getsignal(signal.SIGUSR1)
+        self._previous_mask = set(
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        )
+        self._previous_pending = set(signal.sigpending())
+        if signal.SIGUSR1 in self._previous_pending:
+            signal.pthread_sigmask(signal.SIG_SETMASK, self._previous_mask)
+            raise RuntimeError("preexisting SIGUSR1 is pending")
+        try:
+            signal.signal(signal.SIGUSR1, self._handler)
+            self._handler_installed = True
+            self._thread = threading.Thread(
+                target=self._send,
+                name="verification-sigusr1-watchdog",
+            )
+            self._thread.start()
+            active_mask = self._previous_mask - {signal.SIGUSR1}
+            signal.pthread_sigmask(signal.SIG_SETMASK, active_mask)
+        except BaseException:
+            if self._thread is not None:
+                self._stop.set()
+                self._thread.join(timeout=self.join_timeout)
+                if self._thread.is_alive():
+                    raise AssertionError(
+                        "SIGUSR1 watchdog setup thread did not join"
+                    )
+            if self._handler_installed:
+                signal.signal(signal.SIGUSR1, self._previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, self._previous_mask)
+            raise
+        return self
+
+    def _teardown(self) -> None:
+        previous_mask = self._previous_mask
+        previous_handler = self._previous_handler
+        thread = self._thread
+        if previous_mask is None or previous_handler is None or thread is None:
+            raise AssertionError("SIGUSR1 watchdog was not fully installed")
+
+        # Block first so a sender racing with cancellation cannot execute the
+        # temporary handler while state is being restored.
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        self._stop.set()
+        with self._send_lock:
+            pass
+        if not self._sender_done.wait(self.join_timeout):
+            raise AssertionError("SIGUSR1 watchdog sender did not finish")
+        thread.join(timeout=self.join_timeout)
+        if thread.is_alive() or not self._sender_done.is_set():
+            raise AssertionError("SIGUSR1 watchdog thread did not join")
+        if self._sender_error is not None:
+            raise AssertionError("SIGUSR1 watchdog sender failed") from self._sender_error
+
+        pending = signal.sigpending()
+        if signal.SIGUSR1 in pending:
+            if not self._sender_fired.is_set():
+                raise AssertionError("unowned SIGUSR1 became pending")
+            signal.sigwait({signal.SIGUSR1})
+            if signal.SIGUSR1 in signal.sigpending():
+                raise AssertionError("SIGUSR1 remained pending after consumption")
+
+        # Do not claim restoration until the sender is joined and pending state
+        # is proven clean.  A failure above intentionally leaves this state
+        # blocked and owned by the watchdog for fail-closed diagnostics.
+        signal.signal(signal.SIGUSR1, previous_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        self.restored = True
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        try:
+            self._teardown()
+        except BaseException as cleanup_error:
+            if exc_value is not None:
+                raise cleanup_error from exc_value
+            raise
+        return False
 
 
 def _write_backend_component_fixture(root: Path) -> None:
@@ -1081,7 +1212,7 @@ except lock.VerificationLockError as exc:
         self.assertEqual(subreaper_state, 0)
 
         # SIGALRM and its prior timer/handler are restored around both a
-        # delayed pre-spawn call and a child-created-then-interrupted call.
+        # pre-spawn pause and a child-created-then-interrupted call.
         previous_handler = signal.getsignal(signal.SIGALRM)
         previous_timer = signal.getitimer(signal.ITIMER_REAL)
 
@@ -1093,45 +1224,189 @@ except lock.VerificationLockError as exc:
             signal.signal(signal.SIGALRM, marker)
             signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
 
-            def delayed_spawn(*args: object, **kwargs: object) -> int:
-                time.sleep(2.0)
-                return real_spawn(*args, **kwargs)
+            def run_pre_spawn_alarm_case(*, disable_timer: bool) -> None:
+                def alarm_before_spawn(*args: object, **kwargs: object) -> int:
+                    signal.pause()
+                    return real_spawn(*args, **kwargs)
 
-            with patch.object(containment.os, "posix_spawnp", side_effect=delayed_spawn):
-                with self.assertRaises(ChildTimeoutError):
-                    BoundedChild(
-                        [sys.executable, "-c", "raise SystemExit(99)"],
-                        deadline_seconds=0.4,
-                    ).__enter__()
+                timer_patch = (
+                    patch.object(
+                        containment.signal,
+                        "setitimer",
+                        side_effect=lambda *_args, **_kwargs: None,
+                    )
+                    if disable_timer
+                    else nullcontext()
+                )
+                expected_error = (
+                    _Sigusr1WatchdogExpired if disable_timer else ChildTimeoutError
+                )
+                watchdog = _Sigusr1Watchdog()
+                with watchdog, timer_patch, patch.object(
+                    containment.os,
+                    "posix_spawnp",
+                    side_effect=alarm_before_spawn,
+                ), patch.object(
+                    # This fixture deliberately never enters the real spawn
+                    # syscall, so its no-child recovery result is deterministic.
+                    # The real child-created path below exercises procfs/PID
+                    # recovery without this patch.
+                    BoundedChild,
+                    "_recover_spawned_child",
+                ) as recover_spawned_child:
+                    with self.assertRaises(expected_error):
+                        BoundedChild(
+                            [sys.executable, "-c", "raise SystemExit(99)"],
+                            deadline_seconds=0.4,
+                        ).__enter__()
+                self.assertTrue(watchdog.restored)
+                self.assertFalse(watchdog._thread.is_alive())
+                recover_spawned_child.assert_called_once()
+
+            run_pre_spawn_alarm_case(disable_timer=False)
+            self.assertIs(signal.getsignal(signal.SIGALRM), marker)
+            self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+            started = containment.time.monotonic()
+            run_pre_spawn_alarm_case(disable_timer=True)
+            self.assertLess(containment.time.monotonic() - started, 2.0)
             self.assertIs(signal.getsignal(signal.SIGALRM), marker)
             self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
             spawned_pids: list[int] = []
+            expected_identity: list[tuple[int, int]] = []
 
-            def spawn_then_delay(*args: object, **kwargs: object) -> int:
+            def spawn_then_alarm(*args: object, **kwargs: object) -> int:
                 pid = real_spawn(*args, **kwargs)
+                if (record := containment._read_proc_record(pid).record) is None:
+                    raise AssertionError("spawned child identity was not readable")
+                expected_identity.append(record.identity)
                 spawned_pids.append(pid)
-                time.sleep(2.0)
+                # Keep the real child creation, then interrupt before the
+                # mocked call returns so recovery must adopt its exact PID.
+                signal.raise_signal(signal.SIGALRM)
                 return pid
 
             interrupted_child = BoundedChild(
-                [sys.executable, "-c", "import os; os.read(0, 1)"],
+                [sys.executable, "-c", "import signal; signal.pause()"],
                 deadline_seconds=0.8,
                 stdin_mode="pipe",
             )
-            with patch.object(
-                containment.os,
-                "posix_spawnp",
-                side_effect=spawn_then_delay,
+            opened_pidfds: list[tuple[int, tuple[int, int], int, str]] = []
+            real_open_pidfd = interrupted_child._open_pidfd
+
+            def capture_pidfd(pid: int) -> int | None:
+                pidfd = real_open_pidfd(pid)
+                if pidfd is not None:
+                    record = containment._read_proc_record(pid).record
+                    if record is None:
+                        raise AssertionError("pidfd target identity was not readable")
+                    opened_pidfds.append((pid, record.identity, pidfd, Path(f"/proc/self/fdinfo/{pidfd}").read_text()))
+                return pidfd
+
+            with (
+                patch.object(
+                    interrupted_child,
+                    "_open_pidfd",
+                    side_effect=capture_pidfd,
+                ),
+                patch.object(
+                    containment.os,
+                    "posix_spawnp",
+                    side_effect=spawn_then_alarm,
+                ),
             ):
                 with self.assertRaises(ChildTimeoutError):
                     interrupted_child.__enter__()
             self.assertTrue(interrupted_child.cleanup_proven)
             self.assertEqual(len(spawned_pids), 1)
+            self.assertEqual(interrupted_child._leader_pid, spawned_pids[0])
+            self.assertIsNotNone(interrupted_child._leader_identity)
+            assert interrupted_child._leader_identity is not None
+            self.assertEqual(interrupted_child._leader_identity.pid, spawned_pids[0])
+            self.assertEqual(interrupted_child._leader_identity.identity, expected_identity[0])
+            if opened_pidfds:
+                self.assertTrue(
+                    any(
+                        (pid, identity) == (expected_identity[0][0], expected_identity[0])
+                        and f"Pid:\t{pid}" in fdinfo.splitlines()
+                        for pid, identity, _pidfd, fdinfo in opened_pidfds
+                    ),
+                    "recovered child did not retain an exact pidfd",
+                )
+
+            for pidfd_error in (errno.ENOSYS, errno.EOPNOTSUPP, errno.EPERM):
+                with self.subTest(pidfd_error=pidfd_error):
+                    fallback_child = BoundedChild(
+                        [sys.executable, "-c", "import os; os.read(0, 1)"],
+                        deadline_seconds=0.8,
+                        stdin_mode="pipe",
+                    )
+                    with (
+                        patch.object(
+                            containment.os,
+                            "pidfd_open",
+                            side_effect=OSError(pidfd_error, "pidfd unavailable"),
+                            create=True,
+                        ),
+                        patch.object(containment.os, "kill") as numeric_kill,
+                    ):
+                        with fallback_child:
+                            self.assertIsNotNone(fallback_child._leader_pid)
+                            self.assertIsNone(
+                                fallback_child._open_pidfd(fallback_child._leader_pid)
+                            )
+                    self.assertTrue(fallback_child.cleanup_proven)
+                    numeric_kill.assert_not_called()
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
             signal.signal(signal.SIGALRM, previous_handler)
             signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+        # The reusable watchdog must restore a sentinel handler and a
+        # pre-blocked mask after both normal cancellation and BaseException.
+        previous_watchdog_handler = signal.getsignal(signal.SIGUSR1)
+        previous_watchdog_mask = set(
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        )
+        blocked_watchdog_mask = previous_watchdog_mask | {signal.SIGUSR1}
+
+        def sentinel_watchdog_handler(_signum: int, _frame: object) -> None:
+            return None
+
+        def assert_watchdog_clean(watchdog: _Sigusr1Watchdog) -> None:
+            self.assertTrue(watchdog.restored)
+            assert watchdog._thread is not None
+            self.assertFalse(watchdog._thread.is_alive())
+            self.assertTrue(watchdog._sender_done.is_set())
+            self.assertFalse(watchdog._sender_fired.is_set())
+            self.assertIs(signal.getsignal(signal.SIGUSR1), sentinel_watchdog_handler)
+            observed_mask = set(
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+            )
+            self.assertEqual(observed_mask, blocked_watchdog_mask)
+            signal.pthread_sigmask(signal.SIG_SETMASK, observed_mask)
+            self.assertNotIn(signal.SIGUSR1, signal.sigpending())
+
+        signal.signal(signal.SIGUSR1, sentinel_watchdog_handler)
+        try:
+            with _Sigusr1Watchdog() as normal_watchdog:
+                pass
+            assert_watchdog_clean(normal_watchdog)
+
+            class WatchdogCancellation(BaseException):
+                pass
+
+            with self.assertRaises(WatchdogCancellation):
+                with _Sigusr1Watchdog() as cancelled_watchdog:
+                    raise WatchdogCancellation()
+            assert_watchdog_clean(cancelled_watchdog)
+        finally:
+            signal.signal(signal.SIGUSR1, previous_watchdog_handler)
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK,
+                previous_watchdog_mask,
+            )
 
         # Timer restoration is phase-preserving.  These deterministic checks
         # avoid sleeping while covering one-shot, crossed-deadline and
