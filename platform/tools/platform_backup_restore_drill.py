@@ -10,7 +10,6 @@ import json
 import os
 import pathlib
 import re
-import shutil
 import stat
 import sys
 import urllib.parse
@@ -479,12 +478,14 @@ def check_latest_backup(output_dir: pathlib.Path, *, max_age_hours: float) -> di
 
 def local_postgres_admin_command(action: str, target: DatabaseTarget, database: str) -> list[str]:
     if action == "create":
-        command = ["createdb", "--owner", target.username, database]
+        executable = supervisor.trusted_executable("createdb")
+        command = [executable, "--owner", target.username, database]
     elif action == "drop":
-        command = ["dropdb", "--if-exists", database]
+        executable = supervisor.trusted_executable("dropdb")
+        command = [executable, "--if-exists", database]
     else:  # pragma: no cover - internal programming error
         raise ValueError(f"Unsupported database admin action: {action}")
-    return ["runuser", "-u", "postgres", "--", *command]
+    return [supervisor.trusted_executable("runuser"), "-u", "postgres", "--", *command]
 
 
 def remote_admin_command(
@@ -495,9 +496,11 @@ def remote_admin_command(
 ) -> list[str]:
     base = connection_args(admin_target, include_database=False)
     if action == "create":
-        return ["createdb", *base, "--owner", app_target.username, database]
+        executable = supervisor.trusted_executable("createdb")
+        return [executable, *base, "--owner", app_target.username, database]
     if action == "drop":
-        return ["dropdb", *base, "--if-exists", database]
+        executable = supervisor.trusted_executable("dropdb")
+        return [executable, *base, "--if-exists", database]
     raise ValueError(f"Unsupported database admin action: {action}")
 
 
@@ -613,7 +616,7 @@ def perform_restore_drill(
         admin_target is None
         and os.geteuid() == 0
         and app_target.host in LOCAL_DATABASE_HOSTS
-        and shutil.which("runuser") is not None
+        and _trusted_command_available("runuser")
     )
     if use_local_admin:
         create_command = local_postgres_admin_command("create", app_target, drill_database)
@@ -749,9 +752,19 @@ def perform_restore_drill(
 
 
 def require_commands(*commands: str) -> None:
-    missing = [command for command in commands if shutil.which(command) is None]
+    missing = [command for command in commands if not _trusted_command_available(command)]
     if missing:
-        raise RuntimeError(f"Missing required PostgreSQL command(s): {', '.join(missing)}")
+        raise RuntimeError(
+            f"Missing or untrusted required PostgreSQL command(s): {', '.join(missing)}"
+        )
+
+
+def _trusted_command_available(command: str) -> bool:
+    try:
+        supervisor.trusted_executable(command)
+    except supervisor.BackupCommandError:
+        return False
+    return True
 
 
 def _new_backup_identity(

@@ -128,15 +128,17 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
     def test_local_admin_commands_use_postgres_os_user(self) -> None:
         target = backup_drill.DatabaseTarget("127.0.0.1", 5432, "platform_user", None, "platformdb")
+        runuser = platform_backup_supervisor.trusted_executable("runuser")
+        createdb = platform_backup_supervisor.trusted_executable("createdb")
 
         self.assertEqual(
             backup_drill.local_postgres_admin_command("create", target, "platform_restore_drill_test"),
             [
-                "runuser",
+                runuser,
                 "-u",
                 "postgres",
                 "--",
-                "createdb",
+                createdb,
                 "--owner",
                 "platform_user",
                 "platform_restore_drill_test",

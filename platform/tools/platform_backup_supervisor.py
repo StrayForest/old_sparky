@@ -264,6 +264,12 @@ def _trusted_executable(value: str, env: Mapping[str, str]) -> str:
     return str(path)
 
 
+def trusted_executable(value: str, env: Mapping[str, str] | None = None) -> str:
+    """Return an absolute executable alias after the production trust checks."""
+
+    return _trusted_executable(value, _sanitized_env(env))
+
+
 def _validate_command(command: list[str], env: Mapping[str, str]) -> list[str]:
     if not command or any(not isinstance(value, str) or not value for value in command):
         raise BackupCommandError("backup command is invalid")
