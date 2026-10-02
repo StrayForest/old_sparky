@@ -27,6 +27,7 @@ jobs:
     name: Draft static and state checks
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -49,7 +50,7 @@ jobs:
           }
           trap cleanup_audit EXIT
           set +e
-          timeout 30s npm audit \
+          /usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit \
             --registry=https://registry.npmjs.org/ \
             --package-lock-only \
             --omit=dev \
@@ -63,48 +64,7 @@ jobs:
             >"$audit_report" 2>"$audit_stderr"
           audit_rc=$?
           set -e
-          node - "$audit_report" "$audit_rc" "$audit_stderr" <<'NODE'
-          const fs = require("node:fs");
-
-          const [reportPath, rawExit, stderrPath] = process.argv.slice(2);
-          const auditExit = Number(rawExit);
-          let report;
-          try {
-            report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-          } catch {
-            console.error("Draft npm audit failed: missing or malformed JSON report");
-            process.exit(1);
-          }
-          const vulnerabilities = report?.metadata?.vulnerabilities;
-          const fields = ["info", "low", "moderate", "high", "critical", "total"];
-          if (
-            !vulnerabilities ||
-            fields.some((field) => !Number.isInteger(vulnerabilities[field]))
-          ) {
-            console.error("Draft npm audit failed: report has no valid vulnerability summary");
-            process.exit(1);
-          }
-          const summary = fields.map((field) => `${field}=${vulnerabilities[field]}`).join(" ");
-          let stderrBytes = 0;
-          try {
-            stderrBytes = fs.statSync(stderrPath).size;
-          } catch {
-            // The report is authoritative; missing diagnostics do not make a failure pass.
-          }
-          console.log(`Draft npm audit: ${summary} exit=${auditExit} stderr_bytes=${stderrBytes}`);
-          if (auditExit !== 0) {
-            console.error(
-              auditExit === 124
-                ? "Draft npm audit failed: 30-second timeout"
-                : "Draft npm audit failed: npm returned a non-zero status",
-            );
-            process.exit(1);
-          }
-          if (vulnerabilities.high > 0 || vulnerabilities.critical > 0) {
-            console.error("Draft npm audit failed: high or critical vulnerabilities remain");
-            process.exit(1);
-          }
-          NODE
+          node tools/validate_npm_audit_report.mjs "$audit_report" "$audit_rc" "$audit_stderr"
       - name: Check JavaScript syntax
         working-directory: platform/apps/platform_draft
         run: npm run check
@@ -210,7 +170,7 @@ jobs:
           }
           trap cleanup_audit EXIT
           set +e
-          timeout 30s npm audit \
+          /usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit \
             --registry=https://registry.npmjs.org/ \
             --package-lock-only \
             --omit=dev \
@@ -224,48 +184,7 @@ jobs:
             >"$audit_report" 2>"$audit_stderr"
           audit_rc=$?
           set -e
-          node - "$audit_report" "$audit_rc" "$audit_stderr" <<'NODE'
-          const fs = require("node:fs");
-
-          const [reportPath, rawExit, stderrPath] = process.argv.slice(2);
-          const auditExit = Number(rawExit);
-          let report;
-          try {
-            report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-          } catch {
-            console.error("Draft npm audit failed: missing or malformed JSON report");
-            process.exit(1);
-          }
-          const vulnerabilities = report?.metadata?.vulnerabilities;
-          const fields = ["info", "low", "moderate", "high", "critical", "total"];
-          if (
-            !vulnerabilities ||
-            fields.some((field) => !Number.isInteger(vulnerabilities[field]))
-          ) {
-            console.error("Draft npm audit failed: report has no valid vulnerability summary");
-            process.exit(1);
-          }
-          const summary = fields.map((field) => `${field}=${vulnerabilities[field]}`).join(" ");
-          let stderrBytes = 0;
-          try {
-            stderrBytes = fs.statSync(stderrPath).size;
-          } catch {
-            // The report is authoritative; missing diagnostics do not make a failure pass.
-          }
-          console.log(`Draft npm audit: ${summary} exit=${auditExit} stderr_bytes=${stderrBytes}`);
-          if (auditExit !== 0) {
-            console.error(
-              auditExit === 124
-                ? "Draft npm audit failed: 30-second timeout"
-                : "Draft npm audit failed: npm returned a non-zero status",
-            );
-            process.exit(1);
-          }
-          if (vulnerabilities.high > 0 || vulnerabilities.critical > 0) {
-            console.error("Draft npm audit failed: high or critical vulnerabilities remain");
-            process.exit(1);
-          }
-          NODE
+          node tools/validate_npm_audit_report.mjs "$audit_report" "$audit_rc" "$audit_stderr"
       - name: Build and test Draft candidate
         working-directory: platform/apps/platform_draft
         run: |

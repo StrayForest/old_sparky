@@ -49,7 +49,8 @@ The path-scoped GitHub Actions workflow owns the Draft dependency boundary. It
 audits the committed lockfile with npm's JSON report before running the PR
 checks or installing the release Wrangler runtime. The audit uses the pinned
 public registry, production dependencies (`--omit=dev`), a 10-second fetch
-timeout and a 30-second command deadline; network errors, malformed reports,
+timeout, no retries and a 30-second command deadline followed by a 5-second
+TERM-to-KILL grace; network errors, malformed or inconsistent v2 reports,
 timeouts and high/critical findings fail closed. The later `npm ci` keeps
 `--no-audit` because the bounded audit has already covered the exact lockfile.
 The reviewed Wrangler version is `4.146.0`; its lockfile and immutable runtime

@@ -50,9 +50,11 @@ The Draft edge package has a separate path-scoped dependency boundary in
 `npm audit` against the committed Draft lockfile before checks or installation.
 The gate pins the npm registry, audits production dependencies with
 `--omit=dev`, disables offline and prefer-offline behavior, allows no retries,
-uses a 10-second fetch timeout and a 30-second command deadline. A missing or
-malformed report, network/timeout failure, non-zero npm status, or high/critical
-finding fails closed. The subsequent hash-locked `npm ci --no-audit` is
+uses a 10-second fetch timeout and a 30-second command deadline followed by a
+5-second TERM-to-KILL grace. Its canonical Node validator requires the npm v2
+report shape, exact nonnegative integer counters and a matching severity sum. A
+missing, malformed or inconsistent report, network/timeout failure, non-zero
+npm status, or high/critical finding fails closed. The subsequent hash-locked `npm ci --no-audit` is
 intentional: it avoids a second uncontrolled audit while the dedicated gate
 owns the report. The release job also verifies the generated Wrangler runtime
 manifest and lock digests before the credential-bearing publish job consumes
