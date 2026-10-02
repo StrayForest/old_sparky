@@ -199,11 +199,20 @@ Dispatch only after the exact deployed `dev` SHA is confirmed. The workflow
 creates no fixture until the release lock, active-SHA check, host-installed
 supervisor/helper, bundle and browser preflight checks pass.
 
-The launch workflow accepts only an exact `workflow_dispatch` from
-`refs/heads/dev`. It validates `base_url`, `provision` and the optional marker
-with the canonical bounded-ASCII workflow-input parser before it creates any
-SSH key file or performs keyscan. It hands the accepted values to the remote
-host as private mode-0600 JSON on stdin; the SSH command contains only the
+The launch workflow first runs a secret-free authority job. That job requires
+the canonical repository/server/API, the exact workflow name/path/ref, a
+`workflow_dispatch` on `refs/heads/dev`, and a lower-case full `github.sha`.
+It performs one authenticated, bounded GitHub API read of
+`refs/heads/dev` (`connect-timeout=5`, `max-time=10`, `retry=0`) and rejects
+malformed responses or any current-dev SHA other than the workflow SHA. The
+workflow serializes runs by that immutable SHA with
+`cancel-in-progress: false`; a failed or skipped authority cannot reach
+checkout, the production environment or production secrets.
+
+After authority succeeds, the launch workflow validates `base_url`,
+`provision` and the optional marker with the canonical bounded-ASCII workflow-
+input parser before it creates any SSH key file or performs keyscan. It hands
+the accepted values to the remote host as private mode-0600 JSON on stdin; the SSH command contains only the
 literal `live-launch` dispatcher mode. The remote dispatcher and
 `platform_live_launch_supervisor.sh` validate the values again and pass them to
 the supervisor as fixed-argv data. Shell punctuation, quotes, newlines,

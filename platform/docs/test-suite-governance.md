@@ -449,6 +449,16 @@ reviewed mailbox helper under the release lock, runs the browser scenario, and
 performs exact fixture cleanup. The dispatch and recovery procedure is defined
 in [the CSP live-QA runbook](csp-live-qa-runbook.md).
 
+The live-launch workflow has a separate secret-free authority job before any
+checkout, production environment or SSH secret. It binds the canonical
+repository/server/API and exact workflow name/path/ref to a
+`workflow_dispatch` on `dev`, reads the current `dev` ref with bounded
+authenticated API access, and requires that SHA to equal the workflow SHA.
+All downstream jobs consume its immutable SHA output; top-level concurrency
+serializes the same SHA without cancelling an active run. The executable
+contract and valid-YAML mutation coverage are owned by
+`test_platform_verification_contract.py` and `platform_verify_contract.py`.
+
 The `workflow_dispatch` `control_email` and live `marker` values cross the
 production boundary only after the dependency-free canonical parser applies a
 bounded ASCII grammar. The runner writes the accepted fields to a mode-0600

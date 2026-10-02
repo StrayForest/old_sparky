@@ -12,6 +12,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import yaml
+
 from tools.platform_test_catalog import (
     BACKEND_CONTOURS,
     CONTOUR_METADATA,
@@ -57,12 +59,14 @@ from tools.platform_verification_lock import (
 )
 from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
+    LIVE_LAUNCH_WORKFLOW,
     SECURITY_WORKFLOW,
     action_pin_issues,
     collect_issues,
     _ci_dependency_issues,
     extract_gate_invocations,
     host_tools_pin_verification_issues,
+    live_launch_workflow_issues,
     release_runtime_workflow_issues,
     security_status_permission_issues,
     workflow_level_permission_issues,
@@ -793,6 +797,188 @@ except lock.VerificationLockError as exc:
             extract_gate_invocations(text),
             ["backend", "no-such-gate"],
         )
+
+    def test_live_launch_authority_rejects_valid_yaml_mutations(self) -> None:
+        source = LIVE_LAUNCH_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(live_launch_workflow_issues(source), [])
+
+        mutations = (
+            (
+                "fork repository",
+                source.replace(
+                    'test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"',
+                    'test "$GITHUB_REPOSITORY" = "Other/old_sparky"',
+                    1,
+                ),
+            ),
+            (
+                "wrong server",
+                source.replace(
+                    'test "$GITHUB_SERVER_URL" = "https://github.com"',
+                    'test "$GITHUB_SERVER_URL" = "https://github.example"',
+                    1,
+                ),
+            ),
+            (
+                "wrong API",
+                source.replace(
+                    'test "$GITHUB_API_URL" = "https://api.github.com"',
+                    'test "$GITHUB_API_URL" = "https://api.example"',
+                    1,
+                ),
+            ),
+            (
+                "wrong workflow name",
+                source.replace(
+                    'test "$GITHUB_WORKFLOW" = "Platform live launch sanity"',
+                    'test "$GITHUB_WORKFLOW" = "Other workflow"',
+                    1,
+                ),
+            ),
+            (
+                "wrong workflow path/ref",
+                source.replace(
+                    "StrayForest/old_sparky/.github/workflows/platform-live-launch.yml@refs/heads/dev",
+                    "StrayForest/old_sparky/.github/workflows/other.yml@refs/heads/dev",
+                    1,
+                ),
+            ),
+            (
+                "malformed target SHA",
+                source.replace(
+                    '[[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]',
+                    '[[ "$GITHUB_SHA" =~ ^[0-9a-f]{39}$ ]]',
+                    1,
+                ),
+            ),
+            (
+                "wrong API ref",
+                source.replace(
+                    'payload.get("ref") != "refs/heads/dev"',
+                    'payload.get("ref") != "refs/heads/main"',
+                    1,
+                ),
+            ),
+            (
+                "missing JSON parser",
+                source.replace(
+                    'json.loads(response_path.read_text(encoding="utf-8"))',
+                    'json.loads_not(response_path.read_text(encoding="utf-8"))',
+                    1,
+                ),
+            ),
+            (
+                "wrong API object type",
+                source.replace(
+                    'obj.get("type") != "commit"',
+                    'obj.get("type") != "tree"',
+                    1,
+                ),
+            ),
+            (
+                "malformed current SHA parser",
+                source.replace(
+                    're.fullmatch(r"[0-9a-f]{40}", current_sha)',
+                    're.fullmatch(r"[0-9a-f]{39}", current_sha)',
+                    1,
+                ),
+            ),
+            (
+                "missing current SHA equality",
+                source.replace("current_sha != target_sha", "current_sha == target_sha", 1),
+            ),
+            (
+                "unbounded API call",
+                source.replace("--max-time 10", "--max-time 60", 1),
+            ),
+            (
+                "missing API response size cap",
+                source.replace("            --max-filesize 65536 \\\n", "", 1),
+            ),
+            (
+                "oversized API response cap",
+                source.replace("--max-filesize 65536", "--max-filesize 1048576", 1),
+            ),
+            (
+                "duplicate API response size cap",
+                source.replace(
+                    "            --max-filesize 65536 \\\n",
+                    "            --max-filesize 65536 \\\n            --max-filesize 65536 \\\n",
+                    1,
+                ),
+            ),
+            (
+                "API response size cap after URL",
+                source.replace("            --max-filesize 65536 \\\n", "", 1).replace(
+                    '            "https://api.github.com/repos/StrayForest/old_sparky/git/ref/heads/dev"\n',
+                    '            "https://api.github.com/repos/StrayForest/old_sparky/git/ref/heads/dev" --max-filesize 65536\n',
+                    1,
+                ),
+            ),
+            (
+                "retry policy bypass",
+                source.replace("--retry 0", "--retry 2", 1),
+            ),
+            (
+                "API failure bypass",
+                source.replace(
+                    '"https://api.github.com/repos/StrayForest/old_sparky/git/ref/heads/dev"\n',
+                    '"https://api.github.com/repos/StrayForest/old_sparky/git/ref/heads/dev" || true\n',
+                    1,
+                ),
+            ),
+            (
+                "authority always bypass",
+                source.replace(
+                    "  authority:\n    name:",
+                    "  authority:\n    if: ${{ always() }}\n    name:",
+                    1,
+                ),
+            ),
+            (
+                "validation needs bypass",
+                source.replace("    needs: authority", "    needs: []", 1),
+            ),
+            (
+                "live needs bypass",
+                source.replace(
+                    "      - authority\n      - validate-live-inputs",
+                    "      - validate-live-inputs",
+                    1,
+                ),
+            ),
+            (
+                "live always bypass",
+                source.replace(
+                    "if: ${{ needs.authority.result == 'success' && needs.validate-live-inputs.result == 'success' }}",
+                    "if: ${{ always() }}",
+                    1,
+                ),
+            ),
+            (
+                "split concurrency",
+                source.replace(
+                    "group: platform-live-launch-${{ github.sha }}",
+                    "group: platform-live-launch-${{ github.ref }}",
+                    1,
+                ),
+            ),
+            (
+                "missing concurrency",
+                source.replace(
+                    "concurrency:\n  group: platform-live-launch-${{ github.sha }}\n  cancel-in-progress: false\n\n",
+                    "",
+                    1,
+                ),
+            ),
+        )
+        for name, mutated in mutations:
+            with self.subTest(mutation=name):
+                self.assertIsInstance(yaml.safe_load(mutated), dict)
+                self.assertTrue(
+                    live_launch_workflow_issues(mutated),
+                    f"valid YAML mutation unexpectedly passed: {name}",
+                )
 
     def test_contract_self_test_is_clean(self) -> None:
         self.assertEqual(ALLOWED_ACTION_OWNERS, frozenset({"actions"}))
