@@ -266,19 +266,6 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             supervisor.ensure_process_monitor(deadline=time.monotonic() + 5)
         self.assertTrue(client.call_args.kwargs["probe"])
 
-    def test_cleanup_reason_does_not_claim_database_ownership(self) -> None:
-        valid_id = "platform_restore_drill_" + "a" * 32
-        for database_id in (valid_id, "arbitrary-secret"):
-            with (
-                mock.patch.object(supervisor, "run_backup_entrypoint", side_effect=supervisor.BackupCleanupUnproven(database_id=database_id)),
-                mock.patch("builtins.print") as printed,
-            ):
-                self.assertEqual(supervisor.main(["backup", "--json"]), 1)
-            payload = json.loads(printed.call_args.args[0])
-            self.assertEqual(payload.get("database_id"), database_id if database_id == valid_id else None)
-            self.assertEqual(payload.get("operator_action"), supervisor.CLEANUP_OPERATOR_ACTION if database_id == valid_id else None)
-            self.assertNotIn("arbitrary-secret", json.dumps(payload))
-
     def test_namespace_timeout_kills_detached_double_fork_without_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             marker = Path(temporary_dir) / "late-marker"

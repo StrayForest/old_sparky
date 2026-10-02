@@ -62,7 +62,6 @@ DEFAULT_OPERATION_TIMEOUT_SECONDS = 1500.0
 LOCAL_DATABASE_HOSTS = {None, "", "127.0.0.1", "localhost", "::1"}
 REQUIRED_PLATFORM_EXTENSIONS = REQUIRED_EXTENSIONS
 ALEMBIC_REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-DATABASE_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 def _trusted_alembic_head(source_root: pathlib.Path | None = None) -> str:
@@ -644,9 +643,8 @@ def perform_restore_drill(
         kwargs["cleanup_reserve_seconds"] = 0.0 if cleanup else kwargs.get("cleanup_reserve_seconds", cleanup_reserve)
         return run_command(command, deadline=cleanup_deadline, **kwargs)
 
-    del timestamp_slug
     drill_database = f"platform_restore_drill_{secrets.token_hex(16)}"
-    if DATABASE_IDENTIFIER_RE.fullmatch(drill_database) is None:
+    if supervisor.RESTORE_DRILL_DATABASE_ID_RE.fullmatch(drill_database) is None:
         raise RuntimeError("temporary restore database identifier is invalid")
     use_local_admin = (
         admin_target is None
@@ -685,17 +683,15 @@ def perform_restore_drill(
             probe_result = invoke(probe_command, target=admin_command_target, capture_output=True)
             if probe_result.returncode != 0 or probe_result.stdout.strip():
                 raise supervisor.BackupCleanupUnproven(database_id=drill_database)
-        except (KeyboardInterrupt, SystemExit):
+        except (KeyboardInterrupt, SystemExit, supervisor.BackupCleanupUnproven):
             raise
         except Exception as exc:
-            if isinstance(exc, supervisor.BackupCleanupUnproven):
-                raise
             raise supervisor.BackupCleanupUnproven(database_id=drill_database) from exc
         try:
             create_result = invoke(create_command, target=admin_command_target)
             if create_result.returncode != 0:
                 raise supervisor.BackupCommandError(result=create_result)
-        except (KeyboardInterrupt, SystemExit):
+        except (KeyboardInterrupt, SystemExit, supervisor.BackupCleanupUnproven):
             raise
         except Exception as exc:
             raise supervisor.BackupCleanupUnproven(database_id=drill_database) from exc
@@ -836,19 +832,14 @@ def require_commands(
 def _safe_restore_error(exc: BaseException) -> str:
     """Persist only stable error classes and the validated temporary DB id."""
 
-    database_id = getattr(exc, "backup_cleanup_unproven", None)
-    if not isinstance(database_id, str):
-        database_id = getattr(exc, "database_id", None)
-    if getattr(exc, "code", None) == "backup_cleanup_unproven" or database_id is not None:
-        if isinstance(database_id, str) and supervisor.RESTORE_DRILL_DATABASE_ID_RE.fullmatch(database_id):
-            return (
-                "cleanup_unproven database_id="
-                f"{database_id} operator_action=inspect_ownership_before_drop"
-            )
-        return "cleanup_unproven operator_action=inspect_ownership_before_drop"
-    code = getattr(exc, "code", None)
-    if code in {"backup_command_timeout", "backup_monitor_unavailable"}:
-        return str(code)
+    payload = supervisor.safe_error_payload(exc)
+    if payload["error_class"] == "backup_cleanup_unproven":
+        database_id = payload.get("database_id")
+        if isinstance(database_id, str):
+            return f"cleanup_unproven database_id={database_id} operator_action={payload['operator_action']}"
+        return f"cleanup_unproven operator_action={supervisor.CLEANUP_OPERATOR_ACTION}"
+    if payload["error_class"] in {"backup_command_timeout", "backup_monitor_unavailable"}:
+        return str(payload["error_class"])
     return "restore_verification_failed"
 
 
@@ -1231,10 +1222,6 @@ def main() -> int:
         elif args.check_latest:
             result = check_latest_backup(pathlib.Path(args.output_dir), max_age_hours=args.max_age_hours)
         else:
-            try:
-                from . import platform_backup_supervisor as supervisor
-            except ImportError:
-                import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
             # No environment variable or numeric FD is accepted as a
             # capability.  The supervisor calls ``create_backup`` in-process.
             result = supervisor.run_backup_entrypoint(
@@ -1255,7 +1242,7 @@ def main() -> int:
         return 0
     except Exception as exc:
         if args.as_json:
-            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
+            print(json.dumps(supervisor.safe_error_payload(exc), ensure_ascii=False, indent=2))
         else:
             print(f"[FAIL] {exc}", file=sys.stderr)
         return 1

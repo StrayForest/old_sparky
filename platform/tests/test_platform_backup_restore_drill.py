@@ -267,8 +267,33 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         ) as run_command:
             with self.assertRaises(platform_backup_supervisor.BackupCleanupUnproven) as error:
                 backup_drill.perform_restore_drill(pathlib.Path("/tmp/backup.dump"), app_target=target, admin_target=None, timestamp_slug="ignored")
-        self.assertRegex(error.exception.database_id or "", backup_drill.DATABASE_IDENTIFIER_RE)
+        self.assertRegex(error.exception.database_id or "", platform_backup_supervisor.RESTORE_DRILL_DATABASE_ID_RE)
         self.assertEqual(run_command.call_count, 2)
+
+    def test_json_cli_errors_use_bounded_shared_payload(self) -> None:
+        args = argparse.Namespace(
+            check_latest=True, dump_only=False, verify_dump=None, output_dir="/tmp",
+            max_age_hours=24.0, as_json=True,
+        )
+        valid_id = "platform_restore_drill_" + "a" * 32
+        failures = (
+            (platform_backup_supervisor.BackupCleanupUnproven(database_id=valid_id), valid_id),
+            (platform_backup_supervisor.BackupCleanupUnproven(database_id="secret-id"), None),
+            (RuntimeError("stderr=password https://user:secret@example.invalid/db"), None),
+        )
+        for failure, expected_id in failures:
+            with mock.patch.object(backup_drill, "parse_args", return_value=args), mock.patch.object(
+                backup_drill, "check_latest_backup", side_effect=failure
+            ), mock.patch("builtins.print") as printed:
+                self.assertEqual(backup_drill.main(), 1)
+            raw = printed.call_args.args[0]
+            payload = json.loads(raw)
+            self.assertNotRegex(raw, r"password|secret|postgres://")
+            self.assertEqual(payload.get("database_id"), expected_id)
+            self.assertEqual(
+                payload.get("operator_action"),
+                platform_backup_supervisor.CLEANUP_OPERATOR_ACTION if expected_id else None,
+            )
 
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

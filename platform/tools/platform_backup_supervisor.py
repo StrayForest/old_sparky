@@ -2589,6 +2589,20 @@ def _operation_error_status(exc: BaseException) -> tuple[str, str]:
     return "failed", "operation_failed"
 
 
+def safe_error_payload(exc: BaseException) -> dict[str, Any]:
+    """Return the bounded JSON error contract shared by backup CLIs."""
+
+    status, error_class = _operation_error_status(exc)
+    payload: dict[str, Any] = {"ok": False, "status": status, "error_class": error_class}
+    if (
+        isinstance(exc, BackupCleanupUnproven)
+        and isinstance(exc.database_id, str)
+        and RESTORE_DRILL_DATABASE_ID_RE.fullmatch(exc.database_id)
+    ):
+        payload.update(database_id=exc.database_id, operator_action=CLEANUP_OPERATOR_ACTION)
+    return payload
+
+
 def run_offsite_entrypoint(args: argparse.Namespace, *, app_dir: Path) -> dict[str, Any]:
     requirements = operation_lock_requirements("offsite")
     # Start evidence before attempting the non-blocking lock so a contention
@@ -2797,15 +2811,12 @@ def main(argv: list[str] | None = None) -> int:
             print("[OK] Platform backup supervisor completed")
         return 0 if result.get("ok", True) is not False else 1
     except BaseException as exc:
-        status, error_class = _operation_error_status(exc)
-        payload = {"ok": False, "status": status, "error_class": error_class}
-        if isinstance(exc, BackupCleanupUnproven) and isinstance(exc.database_id, str) and RESTORE_DRILL_DATABASE_ID_RE.fullmatch(exc.database_id):
-            payload.update(database_id=exc.database_id, operator_action=CLEANUP_OPERATOR_ACTION)
+        payload = safe_error_payload(exc)
         if getattr(args, "as_json", False):
             print(json.dumps(payload, sort_keys=True))
         else:
-            print(f"[FAIL] Platform backup supervisor ({error_class})", file=os.sys.stderr)
-        return STATUS_EXIT_CODES.get(status, 1)
+            print(f"[FAIL] Platform backup supervisor ({payload['error_class']})", file=os.sys.stderr)
+        return STATUS_EXIT_CODES.get(payload["status"], 1)
 
 
 if __name__ == "__main__":
