@@ -35,16 +35,22 @@ non-zero result or timeout does not prove ownership, so the database is never
 dropped; machine-readable JSON records `cleanup_unproven` and emits separate
 `database_id`/`operator_action` fields only for the exact generated ID and
 fixed action `inspect_ownership_before_drop`; invalid IDs are omitted.
-Once creation returns success, cleanup uses only the reserved interval. A
-cleanup failure is recorded as `cleanup_unproven` and never turns the backup
-green.
+The operation phase captures a strict identity (temporary name, PostgreSQL OID
+and owner) after creation. Cleanup then uses only the reserved interval and
+re-checks that identity immediately before `dropdb`. A missing, replaced or
+owner-mismatched identity never permits a drop. A cleanup failure is recorded
+as `cleanup_unproven` and never turns the backup green.
 
-The manifest is the closed, versioned v2 contract implemented by
+The manifest is the closed, versioned v3 contract implemented by
 [`platform_backup_manifest.py`](../tools/platform_backup_manifest.py). It
 requires the ordered `schemas: ["platform", "public"]` value, the exact
 `required_extensions: ["pg_trgm"]` list, a unique 32-character `run_id`,
 archive size and SHA-256, restore/Alembic status and UTC timing fields. The retired singular
 `schema` field is invalid; it is not migrated or interpreted as `schemas`.
+The parser accepts the exact former v2 shape only for read-only inspection;
+writers reject it, and health checks, retention and off-site selection reject
+legacy manifests rather than silently upgrading them. Current v3 writers
+include the explicit cleanup fields described below.
 The archive and manifest use the same timestamp plus run ID, so two runs in
 one second cannot share a dump/manifest pair. Manifest publication is
 temporary-file + file fsync + atomic rename + backup-directory fsync. Readers
@@ -91,7 +97,10 @@ green. A final publication or directory-fsync failure removes the final
 receipt and retains an unknown `.inprogress` record; readers reject a final
 receipt while any matching in-progress record exists. Evidence contains only bounded release/manifest/checksum, lock,
 Alembic, recovery and remote-transport fields—never credentials, raw stderr,
-private paths or PIDs.
+private paths or PIDs. Legacy schema-1 evidence is accepted only as a
+read-only shape; current schema-2 evidence adds cleanup status, the exact
+temporary database identity and the fixed operator action whenever cleanup is
+unproven.
 
 The offsite timer remains disabled. Enabling it requires a separate reviewed
 operator gate after the offline recovery drill. Destructive production restore
@@ -165,7 +174,7 @@ Off-host backup remains incomplete until all of these are evidenced:
 
 `platform_backup_offsite.py` validates and encrypts locally by default, deletes
 its temporary ciphertext and makes no remote write. Supervisor `--apply`
-uploads only the newest canonical v2 restore-verified archive and verifies
+uploads only the newest canonical v3 restore-verified archive and verifies
 size/SHA/metadata. It consumes the same manifest parser as the creator and
 never deletes remote objects.
 

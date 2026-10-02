@@ -165,6 +165,80 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             self.assertNotIn("pid", json.dumps(published).lower())
             self.assertNotIn("password", json.dumps(published).lower())
 
+    def test_evidence_cleanup_fields_and_legacy_shape_are_closed(self) -> None:
+        payload = supervisor._empty_evidence(
+            operation="local-backup",
+            operation_id="0" * 32,
+            status="started",
+            started_at="unknown",
+        )
+        supervisor.validate_evidence(payload)
+        payload["recovery"].update(
+            {
+                "cleanup_status": "unproven",
+                "database_id": "platform_restore_drill_" + "a" * 32,
+                "operator_action": supervisor.CLEANUP_OPERATOR_ACTION,
+            }
+        )
+        supervisor.validate_evidence(payload)
+
+        legacy = copy.deepcopy(payload)
+        legacy["schema"] = supervisor.LEGACY_EVIDENCE_SCHEMA
+        legacy["recovery"] = {
+            "restore_drill": "unknown",
+            "production_restore": "disabled",
+        }
+        supervisor.validate_evidence(legacy)
+
+        payload["recovery"]["operator_action"] = "unsafe arbitrary action"
+        with self.assertRaises(supervisor.BackupEvidenceError):
+            supervisor.validate_evidence(payload)
+
+    def test_monitor_probe_failure_is_durable_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            app_dir = Path(temporary_dir)
+            (app_dir / "shared").mkdir()
+            args = SimpleNamespace(backup_timeout_seconds=8.0)
+            failure = supervisor.BackupMonitorUnavailable("probe unavailable")
+            with mock.patch.object(
+                supervisor, "ensure_process_monitor", side_effect=failure
+            ), self.assertRaises(supervisor.BackupMonitorUnavailable):
+                supervisor.run_backup_entrypoint(args, app_dir=app_dir)
+
+            evidence = supervisor.read_latest_evidence(app_dir)
+            self.assertEqual(evidence["status"], "failed")
+            self.assertEqual(evidence["error_class"], "backup_monitor_unavailable")
+
+    def test_workflow_persists_cleanup_unproven_identity_in_evidence(self) -> None:
+        database_id = "platform_restore_drill_" + "b" * 32
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            app_dir = Path(temporary_dir)
+            (app_dir / "shared").mkdir()
+            lock_scope = mock.MagicMock()
+            lock_scope.__enter__.return_value = (object(), None)
+            failure = supervisor.BackupCleanupUnproven(database_id=database_id)
+            args = SimpleNamespace(backup_timeout_seconds=8.0)
+            with (
+                mock.patch.object(supervisor, "ensure_process_monitor"),
+                mock.patch.object(
+                    supervisor, "ordered_backup_lock_scope", return_value=lock_scope
+                ),
+                mock.patch.object(
+                    supervisor, "_run_local_backup_scope", side_effect=failure
+                ),
+                self.assertRaises(supervisor.BackupCleanupUnproven),
+            ):
+                supervisor.run_backup_entrypoint(args, app_dir=app_dir)
+
+            evidence = supervisor.read_latest_evidence(app_dir)
+            self.assertEqual(evidence["status"], "failed")
+            self.assertEqual(evidence["recovery"]["cleanup_status"], "unproven")
+            self.assertEqual(evidence["recovery"]["database_id"], database_id)
+            self.assertEqual(
+                evidence["recovery"]["operator_action"],
+                supervisor.CLEANUP_OPERATOR_ACTION,
+            )
+
     def test_stale_inprogress_is_recovered_as_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             app_dir = Path(temporary_dir)
@@ -375,6 +449,23 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         for payload, overflow in ((b"not-json", False), (b"{}", False), (b"{}", True)):
             with self.assertRaises(supervisor.BackupCleanupUnproven):
                 supervisor._read_monitor_status(bytearray(payload), overflow)
+        for payload in (
+            b'{"schema":true,"status":"probe-ok"}\n',
+            b'{"schema":1,"status":"probe-ok","returncode":0}\n',
+            b'{"schema":1,"status":"completed"}\n',
+            b'{"schema":1,"status":"completed","returncode":true}\n',
+            b'{"schema":1,"status":"completed","returncode":0,"extra":1}\n',
+            b'{"schema":1,"status":"completed","returncode":0,"returncode":0}\n',
+            b'{"schema":1,"status":"completed","returncode":0}',
+        ):
+            with self.assertRaises(supervisor.BackupCleanupUnproven):
+                supervisor._read_monitor_status(bytearray(payload))
+        self.assertEqual(
+            supervisor._read_monitor_status(
+                bytearray(b'{"schema":1,"status":"completed","returncode":0}\n')
+            )["returncode"],
+            0,
+        )
         from tools import platform_backup_process_monitor as monitor
         valid = b'{"schema":1,"status":"timeout","returncode":124}\n'
         with mock.patch.object(monitor.os, "read", return_value=valid), mock.patch.object(monitor.os, "write", side_effect=[1, InterruptedError(4, "interrupted"), BlockingIOError(11, "try again"), len(valid) - 1]):
@@ -426,6 +517,20 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                 for _ in range(32):
                     self.assertRaises(supervisor.BackupMonitorUnavailable, supervisor._run_monitor_client, ["echo"], env=None, stdout_fd=None, pass_fds=(), deadline=time.monotonic() + 1, cleanup_reserve_seconds=0.1)
             self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        with mock.patch.object(
+            supervisor,
+            "_trusted_executable",
+            side_effect=supervisor.BackupCommandError("unsafe interpreter"),
+        ):
+            with self.assertRaises(supervisor.BackupMonitorUnavailable):
+                supervisor._run_monitor_client(
+                    ["echo"],
+                    env=None,
+                    stdout_fd=None,
+                    pass_fds=(),
+                    deadline=time.monotonic() + 1,
+                    cleanup_reserve_seconds=0.1,
+                )
         with tempfile.TemporaryDirectory() as temporary_dir:
             fake = Path(temporary_dir) / "fake-monitor.py"
             def emit(status: str, returncode: int = 0, *, exit_code: int | None = None) -> None:
@@ -480,6 +585,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         args = SimpleNamespace(dump_only=False)
         observed_head: dict[str, object] = {}
         captured_head: list[object] = []
+        sentinel_deadline = 54321.0
 
         with _held_test_lock() as lock:
             def invoke(
@@ -516,6 +622,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
                     capability=capability,
                     lock=lock,
                     evidence=evidence,
+                    deadline=sentinel_deadline,
                 )
 
             with mock.patch.object(
@@ -531,6 +638,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
 
         restore.expected_alembic_head.assert_called_once_with(app_dir / "current")
         restore.create_backup.assert_called_once()
+        self.assertIs(restore.create_backup.call_args.kwargs["deadline"], sentinel_deadline)
         self.assertEqual(observed_head["value"], "20260913_0053")
         self.assertEqual(observed_head["source"], (app_dir / "current").resolve(strict=False))
         with self.assertRaises(supervisor.BackupSupervisorError):
@@ -596,6 +704,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         evidence_context = mock.MagicMock()
         evidence_context.__enter__.return_value = evidence
         observed_head: dict[str, object] = {}
+        sentinel_deadline = 12345.678
 
         @contextmanager
         def real_ordered_scope(*_args: object, **_kwargs: object):
@@ -608,6 +717,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             trusted_head = kwargs["trusted_alembic_head"]
             observed_head["value"] = trusted_head.value
             observed_head["source"] = trusted_head.source_root
+            observed_head["deadline"] = kwargs["deadline"]
             return {"ok": True}
 
         args = SimpleNamespace(
@@ -620,8 +730,14 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
 
         with (
             mock.patch.object(
+                supervisor,
+                "operation_deadline",
+                return_value=sentinel_deadline,
+            ) as operation_deadline,
+            mock.patch.object(
                 supervisor, "evidence_session", return_value=evidence_context
             ),
+            mock.patch.object(supervisor, "ensure_process_monitor"),
             mock.patch.object(
                 supervisor, "ordered_backup_lock_scope", side_effect=real_ordered_scope
             ),
@@ -636,6 +752,10 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             result = supervisor.run_backup_entrypoint(args, app_dir=app_dir)
 
         self.assertEqual(result, {"ok": True})
+        operation_deadline.assert_called_once_with(
+            supervisor.DEFAULT_COMMAND_TIMEOUT_SECONDS
+        )
+        self.assertIs(observed_head["deadline"], sentinel_deadline)
         restore.expected_alembic_head.assert_called_once_with(app_dir / "current")
         self.assertEqual(observed_head["value"], expected_head)
         self.assertEqual(observed_head["source"], (app_dir / "current").resolve(strict=False))

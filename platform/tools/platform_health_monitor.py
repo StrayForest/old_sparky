@@ -73,6 +73,7 @@ except ImportError:  # Direct execution from the tools directory.
 try:
     from .platform_backup_manifest import (
         BackupManifestError,
+        MANIFEST_FORMAT_VERSION,
         read_manifest_file,
         sha256_private_file,
     )
@@ -80,12 +81,14 @@ except ImportError:  # Direct execution from the tools directory.
     try:
         from tools.platform_backup_manifest import (
             BackupManifestError,
+            MANIFEST_FORMAT_VERSION,
             read_manifest_file,
             sha256_private_file,
         )
     except ImportError:
         _backup_manifest = _load_staged_backup_manifest()
         BackupManifestError = _backup_manifest.BackupManifestError
+        MANIFEST_FORMAT_VERSION = _backup_manifest.MANIFEST_FORMAT_VERSION
         read_manifest_file = _backup_manifest.read_manifest_file
         sha256_private_file = _backup_manifest.sha256_private_file
 
@@ -273,6 +276,8 @@ def check_backup(directory: Path, *, max_age_hours: float, now: datetime | None 
             expected_dump_file=metadata_path.with_suffix(".dump").name,
         )
         manifest = manifest_file.manifest
+        if manifest.format_version != MANIFEST_FORMAT_VERSION:
+            raise ValueError("latest backup uses a legacy manifest")
         if not manifest.restore_verified or not manifest.alembic_revision_verified:
             raise ValueError("latest backup is not restore verified")
         dump_path = directory / manifest.dump_file

@@ -43,18 +43,49 @@ def _payload(*, run_id: str = "d" * 32) -> dict[str, object]:
 
 
 class PlatformBackupManifestTests(unittest.TestCase):
-    def test_valid_v2_manifest_models_ordered_production_schemas(self) -> None:
+    def test_valid_v3_manifest_models_ordered_production_schemas(self) -> None:
         payload = _payload()
 
         parsed = manifest.parse_manifest_payload(payload)
 
-        self.assertEqual(parsed.format_version, 2)
+        self.assertEqual(parsed.format_version, 3)
         self.assertEqual(parsed.schemas, ("platform", "public"))
         self.assertEqual(parsed.required_extensions, ("pg_trgm",))
         self.assertEqual(parsed.run_id, "d" * 32)
 
         with self.assertRaisesRegex(manifest.BackupManifestError, "selected archive"):
             manifest.parse_manifest_payload(payload, expected_dump_file="other.dump")
+
+    def test_v2_manifest_is_read_only_legacy_shape(self) -> None:
+        payload = _payload()
+        legacy = {key: value for key, value in payload.items() if key in manifest.LEGACY_MANIFEST_KEY_SET}
+        legacy["format_version"] = 2
+
+        parsed = manifest.parse_manifest_payload(legacy)
+
+        self.assertEqual(parsed.format_version, 2)
+        self.assertIsNone(parsed.cleanup_status)
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            path = Path(temporary_dir) / payload["dump_file"].replace(".dump", ".json")
+            with self.assertRaisesRegex(manifest.BackupManifestError, "writer accepts"):
+                manifest.write_manifest(path, legacy)
+
+    def test_v3_manifest_requires_explicit_cleanup_fields(self) -> None:
+        payload = _payload()
+        payload.pop("cleanup_status")
+
+        with self.assertRaisesRegex(manifest.BackupManifestError, "closed"):
+            manifest.parse_manifest_payload(payload)
+
+    def test_restore_error_is_a_bounded_allowlisted_code(self) -> None:
+        payload = _payload()
+        payload["restore_verified"] = False
+        payload["alembic_revision_verified"] = False
+        payload["restored_table_count"] = None
+        payload["restore_error"] = "secret database URL"
+
+        with self.assertRaisesRegex(manifest.BackupManifestError, "allowlisted"):
+            manifest.parse_manifest_payload(payload)
 
     def test_singular_legacy_schema_is_rejected_explicitly(self) -> None:
         payload = _payload()
@@ -93,7 +124,7 @@ class PlatformBackupManifestTests(unittest.TestCase):
 
     def test_duplicate_json_keys_are_rejected(self) -> None:
         raw = json.dumps(_payload()).replace(
-            '"format_version": 2,', '"format_version": 2, "format_version": 2,', 1
+            '"format_version": 3,', '"format_version": 3, "format_version": 3,', 1
         )
 
         with self.assertRaisesRegex(manifest.BackupManifestError, "duplicate"):
@@ -122,7 +153,7 @@ class PlatformBackupManifestTests(unittest.TestCase):
     def test_partial_metadata_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             path = Path(temporary_dir) / "partial.json"
-            path.write_text('{"format_version": 2', encoding="utf-8")
+            path.write_text('{"format_version": 3', encoding="utf-8")
             path.chmod(0o600)
 
             with self.assertRaises(manifest.BackupManifestError):

@@ -20,6 +20,7 @@ from typing import Any
 try:
     from .platform_backup_manifest import (
         BackupManifestError,
+        MANIFEST_FORMAT_VERSION,
         REQUIRED_EXTENSIONS,
         build_manifest,
         read_private_prefix,
@@ -31,6 +32,7 @@ except ImportError:  # Direct execution from the tools directory.
     try:
         from tools.platform_backup_manifest import (
             BackupManifestError,
+            MANIFEST_FORMAT_VERSION,
             REQUIRED_EXTENSIONS,
             build_manifest,
             read_private_prefix,
@@ -41,6 +43,7 @@ except ImportError:  # Direct execution from the tools directory.
     except ImportError:
         from platform_backup_manifest import (  # type: ignore[no-redef]
             BackupManifestError,
+            MANIFEST_FORMAT_VERSION,
             REQUIRED_EXTENSIONS,
             build_manifest,
             read_private_prefix,
@@ -143,6 +146,15 @@ class DatabaseTarget:
         return dataclasses.replace(self, database=database)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class DatabaseIdentity:
+    """The exact temporary database identity bound to cleanup."""
+
+    name: str
+    oid: int
+    owner: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -238,6 +250,60 @@ def command_env(target: DatabaseTarget) -> dict[str, str]:
     else:
         env.pop("PGPASSWORD", None)
     return env
+
+
+def _database_identity_query(database: str) -> str:
+    if supervisor.RESTORE_DRILL_DATABASE_ID_RE.fullmatch(database) is None:
+        raise ValueError("temporary restore database identifier is invalid")
+    return (
+        "SELECT json_build_object('name', datname, 'oid', oid, "
+        "'owner', pg_get_userbyid(datdba))::text "
+        "FROM pg_catalog.pg_database "
+        f"WHERE datname = '{database}';"
+    )
+
+
+def _reject_duplicate_identity_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("temporary restore database identity has duplicate keys")
+        result[key] = value
+    return result
+
+
+def _parse_database_identity(
+    stdout: str,
+    *,
+    expected_name: str,
+) -> DatabaseIdentity:
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise ValueError("temporary restore database identity is absent or ambiguous")
+    try:
+        payload = json.loads(
+            lines[0], object_pairs_hook=_reject_duplicate_identity_keys
+        )
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("temporary restore database identity is malformed") from exc
+    if (
+        type(payload) is not dict
+        or set(payload) != {"name", "oid", "owner"}
+        or type(payload.get("name")) is not str
+        or type(payload.get("oid")) is not int
+        or isinstance(payload.get("oid"), bool)
+        or not 0 < payload["oid"] <= 2**32 - 1
+        or type(payload.get("owner")) is not str
+        or not payload["owner"]
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in payload["owner"])
+        or payload["name"] != expected_name
+    ):
+        raise ValueError("temporary restore database identity is invalid")
+    return DatabaseIdentity(
+        name=payload["name"], oid=payload["oid"], owner=payload["owner"]
+    )
 
 
 def run_command(
@@ -437,6 +503,8 @@ def check_latest_backup(output_dir: pathlib.Path, *, max_age_hours: float) -> di
             f"Latest platform backup manifest is invalid: {metadata_path}: {exc}"
         ) from exc
     manifest = manifest_file.manifest
+    if manifest.format_version != MANIFEST_FORMAT_VERSION:
+        raise RuntimeError("latest backup uses a legacy manifest and is not eligible")
     if not manifest.restore_verified:
         raise RuntimeError(f"Latest platform backup was not restore-verified: {metadata_path}.")
     if not manifest.alembic_revision_verified:
@@ -501,6 +569,18 @@ def local_postgres_admin_command(
             "--command",
             f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{database}';",
         ]
+    elif action == "identity":
+        executable = helpers.executable("psql")
+        command = [
+            executable,
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--dbname",
+            "postgres",
+            "--command",
+            _database_identity_query(database),
+        ]
     else:  # pragma: no cover - internal programming error
         raise ValueError(f"Unsupported database admin action: {action}")
     return [helpers.executable("runuser"), "-u", "postgres", "--", *command]
@@ -530,6 +610,17 @@ def remote_admin_command(
             "--no-align",
             "--command",
             f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{database}';",
+        ]
+    if action == "identity":
+        executable = helpers.executable("psql")
+        return [
+            executable,
+            *connection_args(admin_target),
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            _database_identity_query(database),
         ]
     raise ValueError(f"Unsupported database admin action: {action}")
 
@@ -574,6 +665,8 @@ def prune_unverified_backups(
                 expected_dump_file=metadata_path.with_suffix(".dump").name,
             )
         except BackupManifestError:
+            continue
+        if manifest_file.manifest.format_version != MANIFEST_FORMAT_VERSION:
             continue
         if manifest_file.manifest.restore_verified:
             continue
@@ -678,6 +771,7 @@ def perform_restore_drill(
         admin_command_target = effective_admin
 
     created = False
+    created_identity: DatabaseIdentity | None = None
     primary: BaseException | None = None
     try:
         try:
@@ -692,6 +786,35 @@ def perform_restore_drill(
             create_result = invoke(create_command, target=admin_command_target)
             if create_result.returncode != 0:
                 raise supervisor.BackupCommandError(result=create_result)
+        except (KeyboardInterrupt, SystemExit, supervisor.BackupCleanupUnproven):
+            raise
+        except Exception as exc:
+            raise supervisor.BackupCleanupUnproven(database_id=drill_database) from exc
+        try:
+            identity_command = (
+                local_postgres_admin_command(
+                    "identity", app_target, drill_database, helpers
+                )
+                if use_local_admin
+                else remote_admin_command(
+                    "identity",
+                    effective_admin,
+                    app_target,
+                    drill_database,
+                    helpers,
+                )
+            )
+            identity_result = invoke(
+                identity_command,
+                target=admin_command_target,
+                capture_output=True,
+            )
+            if identity_result.returncode != 0:
+                raise supervisor.BackupCommandError(result=identity_result)
+            created_identity = _parse_database_identity(
+                identity_result.stdout,
+                expected_name=drill_database,
+            )
         except (KeyboardInterrupt, SystemExit, supervisor.BackupCleanupUnproven):
             raise
         except Exception as exc:
@@ -806,9 +929,30 @@ def perform_restore_drill(
         primary = exc
         raise
     finally:
-        if created:
+        if created and created_identity is not None:
             try:
+                current_identity_result = invoke(
+                    identity_command,
+                    target=admin_command_target,
+                    capture_output=True,
+                    cleanup=True,
+                )
+                if current_identity_result.returncode != 0:
+                    raise supervisor.BackupCommandError(result=current_identity_result)
+                current_identity = _parse_database_identity(
+                    current_identity_result.stdout,
+                    expected_name=drill_database,
+                )
+                if current_identity != created_identity:
+                    raise ValueError("temporary restore database identity changed")
                 invoke(drop_command, target=admin_command_target, cleanup=True)
+            except (KeyboardInterrupt, SystemExit):
+                if primary is None:
+                    raise
+                setattr(primary, "backup_cleanup_unproven", drill_database)
+                primary.add_note(
+                    f"restore-drill cleanup was not proven; database_id={drill_database}"
+                )
             except BaseException as cleanup_error:
                 if primary is None:
                     raise supervisor.BackupCleanupUnproven(
@@ -1080,8 +1224,6 @@ def create_backup(
                 restore_verified = True
                 assert trusted_head is not None
                 alembic_revision = trusted_head.value
-            except supervisor.BackupCleanupUnproven:
-                raise
             except Exception as exc:
                 restore_payload = supervisor.safe_error_payload(exc)
                 restore_error = _safe_restore_error(exc)
@@ -1132,6 +1274,7 @@ def create_backup(
             if restore_error in {"backup_command_timeout", "backup_monitor_unavailable"}:
                 wrapped.code = restore_error
             if cleanup_status == "unproven":
+                wrapped.code = "backup_cleanup_unproven"
                 setattr(wrapped, "backup_cleanup_unproven", cleanup_database_id or "")
             raise wrapped from None
         return result

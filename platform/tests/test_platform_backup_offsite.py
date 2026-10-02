@@ -394,6 +394,28 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
                     root, dump, max_age_hours=24, apply=False
                 )
 
+    def test_select_verified_backup_rejects_read_only_legacy_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            dump, manifest_path = _create_verified_backup(root)
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            legacy = {
+                key: value
+                for key, value in payload.items()
+                if key in manifest_contract.LEGACY_MANIFEST_KEY_SET
+            }
+            legacy["format_version"] = manifest_contract.LEGACY_MANIFEST_FORMAT_VERSION
+            _write_private(manifest_path, json.dumps(legacy) + "\n")
+
+            with self.assertRaisesRegex(offsite.OffsiteBackupError, "current-format"):
+                offsite.select_verified_backup(
+                    root, dump, max_age_hours=24, apply=False
+                )
+            with self.assertRaisesRegex(offsite.OffsiteBackupError, "current-format"):
+                offsite.select_verified_backup(
+                    root, None, max_age_hours=24, apply=False
+                )
+
     def test_public_key_validation_rejects_private_key_material(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Canonical version-2 contract for local platform database backup manifests.
+"""Canonical version-3 contract for local platform database backup manifests.
 
 The backup creator and every local consumer use this module for the same
-closed, versioned contract.  A manifest is deliberately not a compatibility
-format: the retired singular ``schema`` field is rejected rather than being
-silently interpreted as the v2 ordered ``schemas`` field.
+closed, versioned contract.  Version 2 is accepted only as a read-only
+legacy shape; writers always emit version 3 with explicit cleanup fields.
+The retired singular ``schema`` field is rejected rather than being silently
+interpreted as the ordered ``schemas`` field.
 """
 
 from __future__ import annotations
@@ -22,7 +23,8 @@ import tempfile
 from typing import Any, Mapping
 
 
-MANIFEST_FORMAT_VERSION = 2
+MANIFEST_FORMAT_VERSION = 3
+LEGACY_MANIFEST_FORMAT_VERSION = 2
 DATABASE_NAME = "platformdb"
 EXPECTED_SCHEMAS: tuple[str, ...] = ("platform", "public")
 REQUIRED_EXTENSIONS: tuple[str, ...] = ("pg_trgm",)
@@ -36,12 +38,19 @@ BACKUP_NAME_RE = re.compile(
 )
 MAX_MANIFEST_BYTES = 128 * 1024
 MAX_DUMP_BYTES = 5 * 1024 * 1024 * 1024
-MAX_ERROR_BYTES = 16 * 1024
 RESTORE_DRILL_DATABASE_ID_RE = re.compile(r"^platform_restore_drill_[0-9a-f]{32}$")
 CLEANUP_OPERATOR_ACTION = "inspect_ownership_before_drop"
+RESTORE_ERROR_CODES = frozenset(
+    {
+        "cleanup_unproven",
+        "backup_command_timeout",
+        "backup_monitor_unavailable",
+        "restore_verification_failed",
+    }
+)
 
-# This is the one v2 top-level shape.  Keep the order stable in creator output;
-# parsers intentionally do not make JSON object member order semantic.
+# This is the one current top-level shape.  Keep the order stable in creator
+# output; parsers intentionally do not make JSON object member order semantic.
 MANIFEST_KEYS: tuple[str, ...] = (
     "format_version",
     "database",
@@ -170,17 +179,18 @@ def parse_manifest_payload(
     *,
     expected_dump_file: str | None = None,
 ) -> BackupManifest:
-    """Validate and model one canonical v2 manifest payload."""
+    """Validate one current manifest or the exact read-only legacy shape."""
 
     if type(payload) is not dict:
         raise BackupManifestError("backup manifest must be a JSON object")
     if any(type(key) is not str for key in payload):
         raise BackupManifestError("backup manifest keys must be strings")
     keys = frozenset(payload)
+    is_legacy = keys == LEGACY_MANIFEST_KEY_SET
     if keys not in {MANIFEST_KEY_SET, LEGACY_MANIFEST_KEY_SET}:
         if "schema" in keys and "schemas" not in keys:
             raise BackupManifestError(
-                'legacy singular "schema" is not accepted by manifest format v2'
+                'legacy singular "schema" is not accepted by the manifest contract'
             )
         missing = sorted(MANIFEST_KEY_SET - keys)
         extra = sorted(keys - MANIFEST_KEY_SET)
@@ -192,8 +202,11 @@ def parse_manifest_payload(
         raise BackupManifestError("backup manifest keys are not closed: " + "; ".join(details))
 
     format_version = _strict_int(payload["format_version"], field="format_version")
-    if format_version != MANIFEST_FORMAT_VERSION:
-        raise BackupManifestError("unsupported backup manifest format_version")
+    expected_version = (
+        LEGACY_MANIFEST_FORMAT_VERSION if is_legacy else MANIFEST_FORMAT_VERSION
+    )
+    if format_version != expected_version:
+        raise BackupManifestError("manifest format_version does not match its key shape")
     if payload["database"] != DATABASE_NAME or type(payload["database"]) is not str:
         raise BackupManifestError("manifest database must be platformdb")
 
@@ -261,10 +274,8 @@ def parse_manifest_payload(
             raise BackupManifestError("manifest restored_table_count is invalid")
     restore_error = payload["restore_error"]
     if restore_error is not None:
-        if type(restore_error) is not str or not restore_error:
-            raise BackupManifestError("manifest restore_error must be null or a non-empty string")
-        if len(restore_error.encode("utf-8")) > MAX_ERROR_BYTES:
-            raise BackupManifestError("manifest restore_error is too large")
+        if type(restore_error) is not str or restore_error not in RESTORE_ERROR_CODES:
+            raise BackupManifestError("manifest restore_error is not an allowlisted code")
     if restore_verified and restore_error is not None:
         raise BackupManifestError("verified manifest cannot contain restore_error")
 
@@ -642,7 +653,17 @@ def build_manifest(
 def write_manifest(path: Path, payload: Mapping[str, Any]) -> BackupManifest:
     """Write a validated manifest with fsync, atomic rename and dir fsync."""
 
-    manifest = parse_manifest_payload(dict(payload), expected_dump_file=str(path.with_suffix(".dump").name))
+    candidate = dict(payload)
+    if (
+        frozenset(candidate) != MANIFEST_KEY_SET
+        or candidate.get("format_version") != MANIFEST_FORMAT_VERSION
+    ):
+        raise BackupManifestError(
+            "manifest writer accepts only the current version-3 shape"
+        )
+    manifest = parse_manifest_payload(
+        candidate, expected_dump_file=str(path.with_suffix(".dump").name)
+    )
     canonical_payload = {key: manifest.as_dict()[key] for key in MANIFEST_KEYS}
     raw_bytes = (json.dumps(canonical_payload, ensure_ascii=True, indent=2) + "\n").encode(
         "utf-8"

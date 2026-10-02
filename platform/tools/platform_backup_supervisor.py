@@ -55,7 +55,8 @@ BACKUP_LOCK_PATH = Path("/run/lock/oldsparky-platform-backup.lock")
 _BACKUP_SINGLETON_NAME = b"\0oldsparky-platform-backup-v1"
 LOCK_ROOT = Path("/run/lock")
 BACKUP_EVIDENCE_DIRNAME = "backup-evidence"
-EVIDENCE_SCHEMA = 1
+EVIDENCE_SCHEMA = 2
+LEGACY_EVIDENCE_SCHEMA = 1
 EVIDENCE_KIND = "platform_backup"
 EVIDENCE_STATUSES = frozenset(
     {"started", "passed", "failed", "blocked", "cancelled", "unknown"}
@@ -454,19 +455,52 @@ def _cancel_monitor(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _reject_duplicate_status_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate monitor status key")
+        result[key] = value
+    return result
+
+
 def _read_monitor_status(data: bytearray, overflow: bool = False) -> dict[str, object]:
     if overflow:
         raise BackupCleanupUnproven("backup monitor status exceeded protocol limit")
+    raw = bytes(data)
+    if raw.count(b"\n") != 1 or not raw.endswith(b"\n"):
+        raise BackupCleanupUnproven("backup monitor status framing is invalid")
     try:
-        value = json.loads(bytes(data).decode("utf-8"))
+        value = json.loads(
+            raw[:-1].decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_status_keys,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BackupCleanupUnproven("backup monitor status is malformed") from exc
-    if not isinstance(value, dict) or value.get("schema") != 1:
+    except ValueError as exc:
+        raise BackupCleanupUnproven("backup monitor status is malformed") from exc
+    if (
+        not isinstance(value, dict)
+        or type(value.get("schema")) is not int
+        or value.get("schema") != 1
+    ):
         raise BackupCleanupUnproven("backup monitor status schema is invalid")
     status = value.get("status")
-    if status not in {"completed", "timeout", "cancelled", "probe-ok", "namespace_unavailable", "protocol_error", "monitor_error"}:
+    allowed = {
+        "completed": {"schema", "status", "returncode"},
+        "timeout": {"schema", "status", "returncode"},
+        "cancelled": {"schema", "status", "returncode"},
+        "probe-ok": {"schema", "status"},
+        "namespace_unavailable": {"schema", "status"},
+        "protocol_error": {"schema", "status"},
+        "monitor_error": {"schema", "status"},
+    }
+    if status not in allowed or set(value) != allowed[status]:
         raise BackupCleanupUnproven("backup monitor status is invalid")
-    if status in {"completed", "cancelled", "timeout"} and (not isinstance(value.get("returncode"), int) or isinstance(value.get("returncode"), bool)):
+    if status in {"completed", "cancelled", "timeout"} and (
+        not isinstance(value.get("returncode"), int)
+        or isinstance(value.get("returncode"), bool)
+    ):
         raise BackupCleanupUnproven("backup monitor return code is invalid")
     return value
 
@@ -475,10 +509,24 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
     work = cleanup_deadline(deadline, reserve_seconds=cleanup_reserve_seconds)
     caller_deadline = deadline + MONITOR_JOIN_GRACE_SECONDS
     monitor_path = _monitor_path()
+    try:
+        interpreter = _trusted_executable(sys.executable, _sanitized_env(None))
+    except BackupCommandError as exc:
+        raise BackupMonitorUnavailable("backup monitor interpreter metadata is unsafe") from exc
     status_read, status_write = os.pipe()
     inherited_values = [*pass_fds, status_write] + ([] if stdout_fd is None else [stdout_fd])
     inherited = tuple(dict.fromkeys(inherited_values))
-    args = [sys.executable, str(monitor_path), "--status-fd", str(status_write), "--deadline-ns", str(int(deadline * 1e9)), "--cleanup-reserve-ns", str(int(cleanup_reserve_seconds * 1e9)), *[f"--pass-fd={fd}" for fd in inherited if fd != status_write]]
+    args = [
+        interpreter,
+        str(monitor_path),
+        "--status-fd",
+        str(status_write),
+        "--deadline-ns",
+        str(int(deadline * 1e9)),
+        "--cleanup-reserve-ns",
+        str(int(cleanup_reserve_seconds * 1e9)),
+        *[f"--pass-fd={fd}" for fd in inherited if fd != status_write],
+    ]
     if probe:
         args.append("--probe")
     if stdout_fd is not None:
@@ -1567,7 +1615,8 @@ def held_backup_pair(
         except Exception as exc:
             raise BackupSupervisorError("backup manifest is invalid") from exc
         if (
-            not parsed.restore_verified
+            parsed.format_version != manifest_module.MANIFEST_FORMAT_VERSION
+            or not parsed.restore_verified
             or not parsed.alembic_revision_verified
             or parsed.sha256 != dump_sha
             or parsed.size_bytes != dump_stat.st_size
@@ -1749,12 +1798,25 @@ def _empty_evidence(
         "recovery": {
             "restore_drill": "unknown",
             "production_restore": "disabled",
+            "cleanup_status": None,
+            "database_id": None,
+            "operator_action": None,
         },
         "error_class": None,
     }
 
 
 EVIDENCE_KEYS = frozenset(_empty_evidence(operation="x", operation_id="0" * 32, status="started", started_at="x"))
+LEGACY_RECOVERY_KEYS = frozenset({"restore_drill", "production_restore"})
+CURRENT_RECOVERY_KEYS = frozenset(
+    {
+        "restore_drill",
+        "production_restore",
+        "cleanup_status",
+        "database_id",
+        "operator_action",
+    }
+)
 EVIDENCE_SECTION_KEYS = {
     "source": frozenset({"dump_file", "sha256", "size_bytes"}),
     "manifest": frozenset({"file", "sha256", "run_id"}),
@@ -1764,7 +1826,7 @@ EVIDENCE_SECTION_KEYS = {
     "remote_transport": frozenset(
         {"attempted", "uploaded", "head_verified", "object"}
     ),
-    "recovery": frozenset({"restore_drill", "production_restore"}),
+    "recovery": CURRENT_RECOVERY_KEYS,
 }
 REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
@@ -1795,7 +1857,12 @@ def _validate_section_keys(
 def validate_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     if set(payload) != EVIDENCE_KEYS:
         raise BackupEvidenceError("backup evidence schema keys are not closed")
-    if payload.get("schema") != EVIDENCE_SCHEMA or payload.get("kind") != EVIDENCE_KIND:
+    schema = payload.get("schema")
+    if (
+        type(schema) is not int
+        or schema not in {LEGACY_EVIDENCE_SCHEMA, EVIDENCE_SCHEMA}
+        or payload.get("kind") != EVIDENCE_KIND
+    ):
         raise BackupEvidenceError("backup evidence schema version is invalid")
     if payload.get("operation") not in OPERATION_LOCK_MATRIX:
         raise BackupEvidenceError("backup evidence operation is invalid")
@@ -1857,11 +1924,35 @@ def validate_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     _validate_public_text(
         remote["object"], pattern=SAFE_EVIDENCE_NAME_RE, label="remote object"
     )
-    recovery = _validate_section_keys(payload, "recovery")
+    recovery = payload.get("recovery")
+    expected_recovery_keys = (
+        LEGACY_RECOVERY_KEYS if schema == LEGACY_EVIDENCE_SCHEMA else CURRENT_RECOVERY_KEYS
+    )
+    if not isinstance(recovery, dict) or set(recovery) != expected_recovery_keys:
+        raise BackupEvidenceError("backup evidence recovery schema is not closed")
     if recovery["restore_drill"] not in EVIDENCE_STATUSES - {"started"}:
         raise BackupEvidenceError("backup evidence restore state is invalid")
     if recovery["production_restore"] != "disabled":
         raise BackupEvidenceError("backup evidence production restore state is invalid")
+    if schema == EVIDENCE_SCHEMA:
+        cleanup_status = recovery["cleanup_status"]
+        cleanup_id = recovery["database_id"]
+        cleanup_action = recovery["operator_action"]
+        if cleanup_status not in {None, "unproven"}:
+            raise BackupEvidenceError("backup evidence cleanup state is invalid")
+        if cleanup_id is not None and (
+            type(cleanup_id) is not str
+            or RESTORE_DRILL_DATABASE_ID_RE.fullmatch(cleanup_id) is None
+        ):
+            raise BackupEvidenceError("backup evidence cleanup identity is invalid")
+        if cleanup_action not in {None, CLEANUP_OPERATOR_ACTION}:
+            raise BackupEvidenceError("backup evidence cleanup action is invalid")
+        if cleanup_status is None and (cleanup_id is not None or cleanup_action is not None):
+            raise BackupEvidenceError("backup evidence cleanup fields require unproven status")
+        if cleanup_status == "unproven" and (
+            (cleanup_id is None) != (cleanup_action is None)
+        ):
+            raise BackupEvidenceError("backup evidence cleanup fields are incomplete")
     error_class = payload.get("error_class")
     if error_class is not None and (
         not isinstance(error_class, str) or SAFE_ERROR_RE.fullmatch(error_class) is None
@@ -2124,6 +2215,15 @@ class EvidenceSession:
         if "object" in values:
             section["object"] = _safe_public_name(values["object"])
 
+    def record_cleanup(self, database_id: object) -> None:
+        recovery = self.payload["recovery"]
+        recovery["cleanup_status"] = "unproven"
+        recovery["database_id"] = None
+        recovery["operator_action"] = None
+        if isinstance(database_id, str) and RESTORE_DRILL_DATABASE_ID_RE.fullmatch(database_id):
+            recovery["database_id"] = database_id
+            recovery["operator_action"] = CLEANUP_OPERATOR_ACTION
+
     def mark_terminal(self, status: str, *, error_class: str | None = None) -> None:
         if status not in EVIDENCE_STATUSES - {"started"}:
             raise BackupEvidenceError("invalid requested evidence status")
@@ -2192,7 +2292,12 @@ def evidence_session(app_dir: Path, operation: str, *, locks: tuple[str, ...]) -
     except BaseException as exc:
         # Never serialize exception text: it may contain paths, credentials,
         # SQL, or child-process stderr.  The type is intentionally coarse.
-        error_class = "cancelled" if isinstance(exc, (SystemExit,)) else "operation_failed"
+        safe_payload = safe_error_payload(exc)
+        if safe_payload.get("cleanup_status") == "unproven":
+            session.record_cleanup(safe_payload.get("database_id"))
+        error_class = (
+            "cancelled" if isinstance(exc, SystemExit) else safe_payload["error_class"]
+        )
         session.finish("failed", error_class=error_class)
         raise
     else:
@@ -2373,10 +2478,12 @@ def run_local_backup(
     manifest = dump.with_suffix(".json")
     pair = snapshot_backup_pair(dump, manifest)
     evidence.update_pair(pair)
-    evidence.payload["recovery"] = {
-        "restore_drill": "passed" if created.get("restore_verified") else "failed",
-        "production_restore": "disabled",
-    }
+    evidence.payload["recovery"].update(
+        {
+            "restore_drill": "passed" if created.get("restore_verified") else "failed",
+            "production_restore": "disabled",
+        }
+    )
     evidence.payload["alembic"] = {
         "revision": (
             created.get("alembic_revision")
@@ -2640,9 +2747,9 @@ def run_backup_entrypoint(
         getattr(args, "backup_timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS)
     )
     deadline = operation_deadline(timeout_seconds)
-    ensure_process_monitor(deadline=deadline)
     requirements = operation_lock_requirements("local-backup")
     with evidence_session(app_dir, "local-backup", locks=requirements) as evidence:
+        ensure_process_monitor(deadline=deadline)
         with ordered_backup_lock_scope(
             app_dir, source_release_dir=source_release_dir, include_predecessors=True
         ) as (lock, _live_qa_lock_fd):
@@ -2675,10 +2782,10 @@ def run_maintenance_entrypoint(args: argparse.Namespace) -> dict[str, Any]:
         getattr(args, "backup_timeout_seconds", DEFAULT_COMMAND_TIMEOUT_SECONDS)
     )
     deadline = operation_deadline(timeout_seconds)
-    ensure_process_monitor(deadline=deadline)
     app_dir = Path(args.app_dir).resolve(strict=True)
     requirements = operation_lock_requirements("maintenance")
     with evidence_session(app_dir, "maintenance", locks=requirements) as evidence:
+        ensure_process_monitor(deadline=deadline)
         with ordered_backup_lock_scope(
             app_dir,
             source_release_dir=getattr(args, "source_release_dir", None),

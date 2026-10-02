@@ -30,6 +30,7 @@ try:
     from .platform_backup_manifest import (
         BACKUP_NAME_RE,
         BackupManifestError,
+        MANIFEST_FORMAT_VERSION,
         read_private_prefix,
         read_manifest_file,
         sha256_private_file,
@@ -39,6 +40,7 @@ except ImportError:  # Direct execution from the tools directory.
         from tools.platform_backup_manifest import (
             BACKUP_NAME_RE,
             BackupManifestError,
+            MANIFEST_FORMAT_VERSION,
             read_private_prefix,
             read_manifest_file,
             sha256_private_file,
@@ -47,6 +49,7 @@ except ImportError:  # Direct execution from the tools directory.
         from platform_backup_manifest import (  # type: ignore[no-redef]
             BACKUP_NAME_RE,
             BackupManifestError,
+            MANIFEST_FORMAT_VERSION,
             read_private_prefix,
             read_manifest_file,
             sha256_private_file,
@@ -455,13 +458,14 @@ def select_verified_backup(
         ) from exc
     manifest = manifest_file.manifest
     if (
-        manifest.database != "platformdb"
+        manifest.format_version != MANIFEST_FORMAT_VERSION
+        or manifest.database != "platformdb"
         or manifest.schemas != ("platform", "public")
         or not manifest.restore_verified
         or not manifest.alembic_revision_verified
     ):
         raise OffsiteBackupError(
-            "Only a format-v2, Alembic-checked, restore-verified platformdb backup may be uploaded.",
+            "Only a current-format, Alembic-checked, restore-verified platformdb backup may be uploaded.",
             ExitCode.SOURCE_BACKUP,
         )
     try:
