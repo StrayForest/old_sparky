@@ -434,13 +434,25 @@ never replaces `TESTED_SHA`; the trusted default-branch SHA used to check out
 the classifier is separate implementation provenance. A local pass is neither
 necessary nor sufficient for deployment.
 
-The default-branch `workflow_run` reconciler checks out only the resolved
-immutable trusted `dev` SHA and invokes the same status tool with an API-only
-client; its bounded pagination, exact source identity, newer-run check,
-terminal-failure classification and duplicate-status guard are covered by
-injected-client unit tests. It never consumes source-run code or artifacts.
-Both writers suppress only an existing same-context status for the exact
-canonical attempt URL and desired terminal state. An older success or
+The default-branch `workflow_run` reconciler has a read-only authority job
+before its checkout or status writer. That job validates the canonical
+repository/server/API, source and head repositories, exact security workflow
+ID `339062797`, name/path, `push`/`dev`/`completed` envelope, lowercase head
+SHA and positive run identity, then performs bounded authenticated GETs for
+the exact run, workflow metadata and trusted immutable `dev` ref. The writer
+needs authority success, consumes the validated source identity and trusted
+checkout SHA, and is the only job with `statuses: write`. The authority does
+not compare the source SHA with the current `dev` head: it must close an
+older exact run's pending status after `dev` advances. This finalizer is a
+status-reconciliation boundary only and has no deployment or source-run
+checkout authority.
+
+The reconciler invokes the same status tool with an API-only client; its
+bounded pagination, exact source identity, newer-run check, terminal-failure
+classification and duplicate-status guard are covered by injected-client and
+workflow-envelope contract tests. It never consumes source-run code or
+artifacts. Both writers suppress only an existing same-context status for the
+exact canonical attempt URL and desired terminal state. An older success or
 different target cannot suppress a current failure, while a newer success or
 running run suppresses an older writer. TODO (Phase B2): after the helper has
 landed on trusted `dev` and received a separate reviewed release, switch the

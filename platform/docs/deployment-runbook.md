@@ -133,23 +133,23 @@ claim that the evaluator is trusted implementation provenance. The separate
 `statuses: write` token and invokes the reviewed
 [`platform_security_status.py`](../tools/platform_security_status.py) publisher.
 Both jobs preserve the `platform-security-build` context, exact `TESTED_SHA`
-target and fixed pass or fail descriptions. The separate default-branch
-`workflow_run` finalizer checks out only its resolved immutable default-branch
-tool and is an API-only recovery boundary with `actions: read`, `contents: read`
-and `statuses: write`; it never checks out source-run code or reads run
-artifacts.
-It ignores `pull_request` and `merge_group` source events, accepts only a
-`dev` push/dispatch with a well-formed exact head SHA, and validates the exact
-run URL and attempt through the API. It paginates all matching workflow runs
-with a bounded total and skips publication when a newer run or attempt owns
-the same workflow and SHA. A cancelled, timed-out, action-required, stale,
-unknown-conclusion or incomplete run can receive only the fixed terminal
-failure status, targeted at that exact attempt; a successful run leaves the
-success publication to `status-publish`. Before that write it inspects the
-same commit's status context and canonical target URL, skipping only a
-duplicate desired terminal state for that exact attempt. An older success or
-different target cannot suppress a current failure, and a newer run or
-attempt suppresses an older publisher/reconciler.
+target and fixed descriptions. The default-branch `workflow_run` finalizer
+starts with read-only `authority`: before checkout or any status permission it
+requires canonical GitHub repository/server/API, same source/head repository,
+workflow ID `339062797`, name/path, `push`/`dev`/`completed` fields, lowercase
+head SHA and positive run identity. It performs bounded authenticated GETs for
+the exact run, workflow and immutable trusted `dev` ref (connect 5s, total 15s,
+zero retries, 64 KiB cap). Only after authority succeeds does the writer get
+`statuses: write`, check out its trusted SHA and invoke the reconciler; the
+finalizer has no deployment, source-run checkout or artifact authority.
+
+Authority deliberately does not require source SHA to equal current `dev`: an
+older exact run may still have a pending status after `dev` advances. The
+canonical completed security `push` envelope, exact run URL/attempt, bounded
+matching-run pagination, newer-run suppression, terminal-failure mapping and
+same-attempt duplicate guard remain unchanged. A successful run leaves success
+publication to `status-publish`; cancelled or incomplete runs can receive only
+the fixed failure status for their exact attempt.
 
 TODO (Phase B2): after `platform_security_status.py` lands on trusted `dev`
 and receives a reviewed release, switch `status-final` to that helper while
