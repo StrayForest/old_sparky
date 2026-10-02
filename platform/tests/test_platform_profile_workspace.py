@@ -109,7 +109,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                 (getattr(criterion, "left", None), getattr(criterion, "right", None)),
                 (getattr(criterion, "right", None), getattr(criterion, "left", None)),
             ):
-                if not hasattr(column, "compare") or not column.compare(User.id):
+                if not hasattr(column, "compare") or not column.compare(User.__table__.c.id):
                     continue
                 if getattr(value, "value", object()) == user_id:
                     return True
@@ -144,6 +144,22 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
             self.assertFalse(
                 self._is_user_owner_lock_statement(
                     select(User).where(User.email == user_id).with_for_update(),
+                    user_id,
+                )
+            )
+            self.assertFalse(
+                self._is_user_owner_lock_statement(
+                    select(PlayerProfile)
+                    .where(PlayerProfile.user_id == user_id)
+                    .with_for_update(),
+                    user_id,
+                )
+            )
+            self.assertFalse(
+                self._is_user_owner_lock_statement(
+                    select(User)
+                    .where(DeadlockDreamSlot.user_id == user_id)
+                    .with_for_update(),
                     user_id,
                 )
             )
