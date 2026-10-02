@@ -27,6 +27,7 @@ jobs:
     name: Draft static and state checks
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -37,6 +38,33 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
+      - name: Audit locked Draft dependencies
+        working-directory: platform/apps/platform_draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_report="$(mktemp "${RUNNER_TEMP}/draft-npm-audit.XXXXXX.json")"
+          audit_stderr="${audit_report}.stderr"
+          cleanup_audit() {
+            rm -f -- "$audit_report" "$audit_stderr"
+          }
+          trap cleanup_audit EXIT
+          set +e
+          /usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit \
+            --registry=https://registry.npmjs.org/ \
+            --package-lock-only \
+            --omit=dev \
+            --audit-level=high \
+            --json \
+            --no-fund \
+            --offline=false \
+            --prefer-offline=false \
+            --fetch-retries=0 \
+            --fetch-timeout=10000 \
+            >"$audit_report" 2>"$audit_stderr"
+          audit_rc=$?
+          set -e
+          node tools/validate_npm_audit_report.mjs "$audit_report" "$audit_rc" "$audit_stderr"
       - name: Check JavaScript syntax
         working-directory: platform/apps/platform_draft
         run: npm run check
@@ -130,6 +158,33 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
+      - name: Audit locked Draft dependencies
+        working-directory: platform/apps/platform_draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_report="$(mktemp "${RUNNER_TEMP}/draft-npm-audit.XXXXXX.json")"
+          audit_stderr="${audit_report}.stderr"
+          cleanup_audit() {
+            rm -f -- "$audit_report" "$audit_stderr"
+          }
+          trap cleanup_audit EXIT
+          set +e
+          /usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit \
+            --registry=https://registry.npmjs.org/ \
+            --package-lock-only \
+            --omit=dev \
+            --audit-level=high \
+            --json \
+            --no-fund \
+            --offline=false \
+            --prefer-offline=false \
+            --fetch-retries=0 \
+            --fetch-timeout=10000 \
+            >"$audit_report" 2>"$audit_stderr"
+          audit_rc=$?
+          set -e
+          node tools/validate_npm_audit_report.mjs "$audit_report" "$audit_rc" "$audit_stderr"
       - name: Build and test Draft candidate
         working-directory: platform/apps/platform_draft
         run: |
@@ -143,7 +198,7 @@ jobs:
       - name: Install hash-locked Wrangler without Cloudflare credentials
         working-directory: platform/apps/platform_draft
         env:
-          WRANGLER_LOCK_SHA256: 17d717b60ee2f9edf5bbf1c21d0e99c787e974aa347eea0dedb896d36dcff145
+          WRANGLER_LOCK_SHA256: 77f835c82e07589aa27ab9b81dc259805e3d2c6b3a98546083e52a5ba234e0cd
         run: |
           set -euo pipefail
           printf '%s  %s\n' "$WRANGLER_LOCK_SHA256" package-lock.json | sha256sum --check --status -
@@ -152,7 +207,7 @@ jobs:
         shell: bash
         env:
           TARGET_SHA: ${{ needs.detect-release.outputs.target_sha }}
-          WRANGLER_LOCK_SHA256: 17d717b60ee2f9edf5bbf1c21d0e99c787e974aa347eea0dedb896d36dcff145
+          WRANGLER_LOCK_SHA256: 77f835c82e07589aa27ab9b81dc259805e3d2c6b3a98546083e52a5ba234e0cd
         run: |
           set -euo pipefail
           bundle="$RUNNER_TEMP/draft-release-bundle"
@@ -226,7 +281,7 @@ jobs:
                       raise SystemExit("Wrangler runtime member name is unsafe")
                   size = path.stat().st_size
                   total_bytes += size
-                  if size > 64 * 1024 * 1024 or total_bytes > 300 * 1024 * 1024:
+                  if size > 192 * 1024 * 1024 or total_bytes > 300 * 1024 * 1024:
                       raise SystemExit("Wrangler runtime exceeds its size bound")
                   files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
           if len(files) < 100 or len(files) > 4096:
@@ -237,7 +292,7 @@ jobs:
           payload = {
               "schema": 1,
               "package": "wrangler",
-              "version": "4.129.0",
+              "version": "4.146.0",
               "lockfile_sha256": expected_lock_sha,
               "files": files,
           }
@@ -246,7 +301,7 @@ jobs:
               json.dumps({**payload, "digest": digest}, sort_keys=True, separators=(",", ":")) + "\n",
               encoding="ascii",
           )
-          if digest != "c27608e7efe705b963aee2f3b2d5ef15ac7d7e51816f086836aac071ea59ad6a":
+          if digest != "30bd79b0b490096eb3d69b46629b507c810db1574eecd62b293390c5b0e5bfbf":
               raise SystemExit("Wrangler runtime manifest digest is not the reviewed value")
           PY
       - name: Upload digest-bound Draft bundle
@@ -350,8 +405,8 @@ jobs:
       - name: Validate immutable Wrangler runtime
         shell: bash
         env:
-          EXPECTED_WRANGLER_LOCK_SHA256: 17d717b60ee2f9edf5bbf1c21d0e99c787e974aa347eea0dedb896d36dcff145
-          EXPECTED_WRANGLER_MANIFEST_SHA256: c27608e7efe705b963aee2f3b2d5ef15ac7d7e51816f086836aac071ea59ad6a
+          EXPECTED_WRANGLER_LOCK_SHA256: 77f835c82e07589aa27ab9b81dc259805e3d2c6b3a98546083e52a5ba234e0cd
+          EXPECTED_WRANGLER_MANIFEST_SHA256: 30bd79b0b490096eb3d69b46629b507c810db1574eecd62b293390c5b0e5bfbf
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/draft-wrangler-runtime"
@@ -371,7 +426,7 @@ jobs:
               raise SystemExit("Wrangler runtime manifest is missing")
           manifest = json.loads(manifest_path.read_text(encoding="ascii"))
           expected_keys = {"schema", "package", "version", "lockfile_sha256", "files", "digest"}
-          if set(manifest) != expected_keys or manifest.get("schema") != 1 or manifest.get("package") != "wrangler" or manifest.get("version") != "4.129.0":
+          if set(manifest) != expected_keys or manifest.get("schema") != 1 or manifest.get("package") != "wrangler" or manifest.get("version") != "4.146.0":
               raise SystemExit("Wrangler runtime manifest schema is not closed")
           if manifest.get("lockfile_sha256") != expected_lock_sha:
               raise SystemExit("Wrangler runtime lockfile digest mismatch")
@@ -400,7 +455,7 @@ jobs:
               if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1:
                   raise SystemExit("Wrangler runtime member is not a regular file")
               total_bytes += metadata.st_size
-              if metadata.st_size > 64 * 1024 * 1024 or total_bytes > 300 * 1024 * 1024:
+              if metadata.st_size > 192 * 1024 * 1024 or total_bytes > 300 * 1024 * 1024:
                   raise SystemExit("Wrangler runtime member exceeds its size bound")
               if hashlib.sha256(path.read_bytes()).hexdigest() != expected_digest:
                   raise SystemExit("Wrangler runtime member digest mismatch")

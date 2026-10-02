@@ -45,6 +45,22 @@ The repository workflow expects GitHub Actions secrets:
 The token needs the minimum permissions required to deploy the Worker/Durable Object and manage the route for `old-sparky.com`.
 Mutable Draft UI assets are sent with `no-store` cache headers so a previous CDN copy cannot keep an old interface live. The Worker labels the cache status returned by its internal Static Assets fetch as `X-Old-Sparky-Draft-Asset-Cache-Status` instead of exposing it as the outer response's `CF-Cache-Status`; the release smoke-check compares each live mutable asset byte-for-byte with the just-built artifact. Hero objects remain immutable under their versioned R2 namespace.
 
+The path-scoped GitHub Actions workflow owns the Draft dependency boundary. It
+audits the committed lockfile with npm's JSON report before running the PR
+checks or installing the release Wrangler runtime. The audit uses the pinned
+public registry, production dependencies (`--omit=dev`), a 10-second fetch
+timeout, no retries and a 30-second command deadline followed by a 5-second
+TERM-to-KILL grace; network errors, malformed or inconsistent v2 reports,
+timeouts and high/critical findings fail closed. The later `npm ci` keeps
+`--no-audit` because the bounded audit has already covered the exact lockfile.
+The reviewed Wrangler version is `4.146.0`; its lockfile and immutable runtime
+manifest digests are checked before the release job receives any Cloudflare
+credentials. The reviewed runtime reconstruction is 1,648 regular files and
+the manifest digest is `30bd79b0b490096eb3d69b46629b507c810db1574eecd62b293390c5b0e5bfbf`;
+the builder's literal `node_modules/*` shell glob intentionally excludes npm's
+hidden `.package-lock.json`. Including that hidden file would produce a
+different, unreviewed inventory and digest.
+
 Local development/deploy uses Wrangler, for example:
 
 ```bash

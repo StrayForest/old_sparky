@@ -34,6 +34,33 @@ def _job_blocks(source: str) -> dict[str, str]:
 
 
 class SecretArtifactBoundaryTests(unittest.TestCase):
+    def _assert_draft_dependency_audit(self, job: str) -> None:
+        audit_start = job.index("/usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit")
+        validator = 'node tools/validate_npm_audit_report.mjs "$audit_report" "$audit_rc" "$audit_stderr"'
+        validator_index = job.index(validator, audit_start)
+        audit_command = job[audit_start:validator_index]
+        ordered_flags = (
+            "/usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit \\",
+            "--registry=https://registry.npmjs.org/",
+            "--package-lock-only",
+            "--omit=dev",
+            "--audit-level=high",
+            "--json",
+            "--offline=false",
+            "--prefer-offline=false",
+            "--fetch-retries=0",
+            "--fetch-timeout=10000",
+        )
+        for flag in ordered_flags:
+            with self.subTest(flag=flag):
+                self.assertIn(flag, audit_command)
+        positions = [audit_command.index(flag) for flag in ordered_flags]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotRegex(job, r"(?m)^\s+--offline(?:\s|$)")
+        self.assertNotRegex(job, r"(?m)^\s+--prefer-offline(?:\s|$)")
+        self.assertIn(validator, job)
+        self.assertNotIn('node - "$audit_report" "$audit_rc" "$audit_stderr"', job)
+
     def test_owned_secret_jobs_are_fresh_and_do_not_load_candidate_code(self) -> None:
         for workflow_name, expected_jobs in OWNED_SECRET_WORKFLOWS.items():
             source = (WORKFLOW_ROOT / workflow_name).read_text(encoding="utf-8")
@@ -56,6 +83,12 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
             encoding="utf-8"
         )
         jobs = _job_blocks(source)
+        self._assert_draft_dependency_audit(jobs["verify-pr"])
+        self._assert_draft_dependency_audit(jobs["build-release"])
+        verify_audit = jobs["verify-pr"].index("/usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit")
+        self.assertLess(verify_audit, jobs["verify-pr"].index("Check JavaScript syntax"))
+        self.assertIn("timeout-minutes: 10", jobs["verify-pr"])
+        self.assertIn("timeout-minutes: 25", jobs["build-release"])
         self.assertIn("actions/checkout@", jobs["build-release"])
         self.assertNotRegex(jobs["build-release"], r"CLOUDFLARE_(?:API_TOKEN|ACCOUNT_ID)")
         self.assertIn("npm ci --ignore-scripts --no-audit --no-fund --omit=dev", jobs["build-release"])
@@ -64,7 +97,25 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         lock_check = jobs["build-release"].index("sha256sum --check")
         npm_install = jobs["build-release"].index("npm ci --ignore-scripts")
         self.assertLess(lock_check, npm_install)
-        self.assertIn("c27608e7efe705b963aee2f3b2d5ef15ac7d7e51816f086836aac071ea59ad6a", jobs["build-release"])
+        audit = jobs["build-release"].index("/usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit")
+        self.assertLess(audit, npm_install)
+        self.assertIn("for entry in platform/apps/platform_draft/node_modules/*; do", jobs["build-release"])
+        self.assertNotIn("node_modules/.", jobs["build-release"])
+        self.assertNotIn("dotglob", jobs["build-release"])
+        self.assertEqual(
+            source.count("/usr/bin/timeout --signal=TERM --kill-after=5s 30s npm audit"),
+            2,
+        )
+        self.assertEqual(source.count("node tools/validate_npm_audit_report.mjs"), 2)
+        self.assertEqual(source.count("77f835c82e07589aa27ab9b81dc259805e3d2c6b3a98546083e52a5ba234e0cd"), 3)
+        self.assertEqual(source.count("30bd79b0b490096eb3d69b46629b507c810db1574eecd62b293390c5b0e5bfbf"), 2)
+        self.assertNotIn("17d717b60ee2f9edf5bbf1c21d0e99c787e974aa347eea0dedb896d36dcff145", source)
+        self.assertNotIn("c27608e7efe705b963aee2f3b2d5ef15ac7d7e51816f086836aac071ea59ad6a", source)
+        self.assertEqual(source.count("size > 192 * 1024 * 1024 or total_bytes > 300 * 1024 * 1024"), 2)
+        self.assertIn("30bd79b0b490096eb3d69b46629b507c810db1574eecd62b293390c5b0e5bfbf", jobs["build-release"])
+        self.assertNotIn("4.129.0", source)
+        self.assertIn('"wrangler": "4.146.0"', (REPO_ROOT / "platform/apps/platform_draft/package.json").read_text(encoding="utf-8"))
+        self.assertIn('"version": "4.146.0"', (REPO_ROOT / "platform/apps/platform_draft/package-lock.json").read_text(encoding="utf-8"))
         release = jobs["release"]
         self.assertNotIn("actions/checkout@", release)
         self.assertIn("actions/download-artifact@", release)
