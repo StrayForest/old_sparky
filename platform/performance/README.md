@@ -241,9 +241,22 @@ concurrency 512 (64 KiB per live capture), plus an estimated 30 MiB of compact
 numeric arrays at the largest accounted sample population. The exact unique
 `cf_rays` counter remains bounded by the completed action/attempt count, not by
 concurrency, because preserving its report-compatible uniqueness requires
-retaining one bounded identity per observed ray. These are static bounds;
-real-RSS CI evidence is still pending. Completed request objects, response
-bodies and parsed payloads are released immediately. Read/page routes retain
+retaining one bounded identity per observed ray. These are static bounds; the
+CI-only `ExternalLoadTests.test_real_rss_probe...` acceptance now measures the
+two live phases in one fresh Linux child at `C=512, N=4096` with independent
+64 KiB synthetic payloads, then a separate child reduces four accumulators at
+`N=16384` each with unique `cf_ray` and full timing fields. It reads
+`/proc/self/status` (`VmRSS`/`VmHWM`) and `resource.ru_maxrss`, verifies exact
+submitted/completed/peak-pending/live-payload counters, native-thread
+restoration, direct-child absence and process-group reap, and emits only
+bounded JSON. The independent acceptance limits are `VmHWM`/`ru_maxrss` delta
+`<192 MiB` for live phases and `<24 MiB` for the accumulator child; the probe
+has an absolute 15-second supervisor deadline. The existing sliding-window
+pending bound remains the mutation contract: the former submit-all
+implementation fails when pending work reaches `N`. This is local/CI evidence
+only and does not authorize a production load run. Completed request objects,
+response bodies and parsed payloads are released immediately. Read/page routes
+retain
 only status, ETag, byte count, timing and the allowlisted
 `AUTHENTICATED_READ_OVERLOADED` code; Ready Vote retains only `code`,
 `retryable`, `retry_after_ms`, `changed` and the state-read

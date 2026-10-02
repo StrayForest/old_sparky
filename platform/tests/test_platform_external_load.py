@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -24,10 +28,84 @@ from tools.platform_external_load import (
     percentile,
     run_load,
     run_phase,
+    run_rate_phase,
     spread_offsets,
     summarize_logical_results,
     summarize_results,
 )
+
+
+RSS_PROBE = Path(__file__).with_name("fixtures") / "external_load_rss_probe.py"
+RSS_DEADLINE_SECONDS = 15.0
+LIVE_HWM_LIMIT_BYTES = 192 * 1024 * 1024
+ACCUMULATOR_HWM_LIMIT_BYTES = 24 * 1024 * 1024
+PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
+
+
+def _run_rss_probe(mode: str) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as directory:
+        stdout_path, stderr_path = Path(directory) / "out", Path(directory) / "err"
+        started = time.monotonic()
+        deadline = started + RSS_DEADLINE_SECONDS
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            process = subprocess.Popen(
+                [sys.executable, str(RSS_PROBE), mode],
+                cwd=Path(__file__).parents[1],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                close_fds=True,
+                start_new_session=True,
+                preexec_fn=(
+                    (lambda: signal.signal(signal.SIGTERM, signal.SIG_IGN) or os.write(1, b"hostile-ready\n"))
+                    if mode == "hostile" else None
+                ),
+            )
+            pgid = process.pid
+            cleanup_budget = min(0.5, RSS_DEADLINE_SECONDS / 2)
+            def signal_group(sig: int) -> None:
+                try:
+                    if process.poll() is None:
+                        if os.getpgid(process.pid) != pgid:
+                            raise AssertionError("probe process-group identity changed")
+                        os.killpg(pgid, sig)
+                except ProcessLookupError:
+                    pass
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic() - cleanup_budget))
+            except subprocess.TimeoutExpired:
+                signal_group(signal.SIGTERM)
+                try:
+                    process.wait(timeout=max(0.0, min(0.25, cleanup_budget / 2, deadline - time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    signal_group(signal.SIGKILL)
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            finally:
+                signal_group(signal.SIGKILL)
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        elapsed = time.monotonic() - started
+        if elapsed > RSS_DEADLINE_SECONDS:
+            raise AssertionError("RSS probe exceeded its absolute deadline")
+        if os.path.exists(f"/proc/{pgid}"):
+            raise AssertionError("RSS probe process was not reaped")
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("RSS probe process group survived cleanup")
+        if mode == "hostile" and b"hostile-ready\n" not in stdout_path.read_bytes():
+            raise AssertionError("RSS probe ready marker missing")
+        if process.returncode != 0:
+            raise AssertionError(f"RSS probe failed (returncode={process.returncode}, stdout_bytes={min(stdout_path.stat().st_size, PROBE_OUTPUT_LIMIT_BYTES)}, stderr_bytes={min(stderr_path.stat().st_size, PROBE_OUTPUT_LIMIT_BYTES)})")
+        if stdout_path.stat().st_size > PROBE_OUTPUT_LIMIT_BYTES or stderr_path.stat().st_size > PROBE_OUTPUT_LIMIT_BYTES:
+            raise AssertionError("RSS probe output exceeded its cap")
+        if stderr_path.read_bytes():
+            raise AssertionError("RSS probe emitted stderr")
+        report = json.loads(stdout_path.read_text(encoding="utf-8"))
+        if not isinstance(report, dict) or report.get("mode") != mode:
+            raise AssertionError("RSS probe report is invalid")
+        return report
 
 
 def manifest_payload() -> dict[str, object]:
@@ -258,6 +336,63 @@ class ExternalLoadTests(unittest.TestCase):
                 for thread in threading.enumerate()
             )
         )
+
+    def test_no_consumer_phase_compatibility_keeps_exact_results_and_threads(self) -> None:
+        users = [VirtualUser(f"compat-{index}", "synthetic", "s", "c") for index in range(8)]
+        baseline = {thread.name for thread in threading.enumerate() if thread.name.startswith("external-load")}
+        for name, runner, option in (("run_phase", run_phase, {"spread_seconds": 0}), ("run_rate_phase", run_rate_phase, {"duration_seconds": 0})):
+            returned = runner("http://synthetic.invalid", users, phase=name, concurrency=2, timeout=1, request_builder=lambda _origin, user, phase, _timeout: RequestResult(phase=phase, method="GET", path="/synthetic/compat", status=200, elapsed_ms=1, ok=True, response_bytes=1, response_json=user.user_id), **option)
+            self.assertEqual(sorted(result.response_json for result in (returned[0] if name == "run_rate_phase" else returned)), [f"compat-{index}" for index in range(8)])
+            self.assertEqual({thread.name for thread in threading.enumerate() if thread.name.startswith("external-load")}, baseline)
+
+    def test_rss_supervisor_reaps_hostile_child_with_short_deadline(self) -> None:
+        with patch.object(sys.modules[__name__], "RSS_DEADLINE_SECONDS", 0.5), patch.object(os, "killpg", wraps=os.killpg) as killpg, self.assertRaisesRegex(AssertionError, "RSS probe failed"):
+            _run_rss_probe("hostile")
+        self.assertEqual([call.args[1] for call in killpg.call_args_list[:2]], [signal.SIGTERM, signal.SIGKILL])
+
+    def test_real_rss_probe_bounds_live_phases_and_accumulators(self) -> None:
+        parent_fd_count = len(os.listdir("/proc/self/fd"))
+        live = _run_rss_probe("live")
+        accumulator = _run_rss_probe("accumulator")
+        self.assertLessEqual(len(os.listdir("/proc/self/fd")), parent_fd_count)
+
+        self.assertEqual(live["requests"], 4096)
+        self.assertEqual(live["concurrency"], 512)
+        self.assertEqual(live["payload_bytes"], 64 * 1024)
+        self.assertEqual(live["baseline_external_thread_ids"], [])
+        self.assertEqual(live["after_external_thread_ids"], [])
+        self.assertEqual(live["baseline_thread_ids"], live["after_thread_ids"])
+        self.assertEqual(live["direct_children_before"], [])
+        self.assertEqual(live["direct_children_after"], [])
+        for phase in live["runs"]:
+            self.assertEqual(phase["submitted"], 4096)
+            self.assertEqual(phase["completed"], 4096)
+            self.assertLessEqual(phase["peak_pending"], 512)
+            self.assertLessEqual(phase["peak_live_payloads"], 512)
+            self.assertEqual(phase["pending_after"], 0)
+            self.assertEqual(phase["live_payloads_after"], 0)
+            self.assertTrue(phase["ready"])
+            self.assertEqual(phase["returned_results"], 0)
+
+        self.assertEqual(accumulator["accumulators"], 4)
+        self.assertEqual(accumulator["requests_per_accumulator"], 16384)
+        self.assertEqual(accumulator["completed"], 4 * 16384)
+        self.assertEqual(accumulator["unique_cf_rays"], 4 * 16384)
+        self.assertTrue(accumulator["timing_complete"])
+        self.assertEqual(accumulator["after_external_thread_ids"], [])
+        self.assertEqual(accumulator["baseline_thread_ids"], accumulator["after_thread_ids"])
+        self.assertEqual(accumulator["direct_children_before"], [])
+        self.assertEqual(accumulator["direct_children_after"], [])
+        fields = ("dns_ms", "tcp_connect_ms", "tls_handshake_ms", "request_write_ms", "edge_wait_ms", "ttfb_ms", "body_receive_ms", "total_ms")
+        self.assertEqual(accumulator["transport_field_counts"], {field: 4 * 16384 for field in fields})
+        for report, limit in ((live, LIVE_HWM_LIMIT_BYTES), (accumulator, ACCUMULATOR_HWM_LIMIT_BYTES)):
+            before, after = report["baseline"], report["after"]
+            for sample in (before, after):
+                self.assertGreaterEqual(sample["VmHWM"], sample["VmRSS"])
+            self.assertEqual(report["rss_delta_bytes"], after["VmRSS"] - before["VmRSS"])
+            self.assertEqual(report["hwm_delta_bytes"], max(after[key] - before[key] for key in ("VmHWM", "ru_maxrss")))
+            self.assertLess(report["hwm_delta_bytes"], limit)
+            self.assertLessEqual(report["after_fd_count"], report["baseline_fd_count"])
 
     def test_request_projects_only_route_correctness_fields(self) -> None:
         class FakeResponse:
