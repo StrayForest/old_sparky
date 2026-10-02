@@ -36,7 +36,7 @@ import selectors
 import signal
 import socket
 import stat
-import shutil, subprocess
+import subprocess
 import sys
 import tempfile
 import time
@@ -138,7 +138,9 @@ COMMAND_DIAGNOSTIC_BYTES, COMMAND_DIAGNOSTIC_CHUNK = 32 * 1024, 8192
 COMMAND_CLEANUP_RESERVE_SECONDS, DEFAULT_COMMAND_TIMEOUT_SECONDS = 2.0, 1500.0
 MONITOR_STATUS_BYTES = 4096
 _TRUSTED_PG_TOOLS = frozenset({"createdb", "dropdb", "psql", "pg_dump", "pg_restore"})
-_SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+_PG_WRAPPER = Path("/usr/share/postgresql-common/pg_wrapper")
+_TRUSTED_RUNUSER = frozenset({Path("/usr/sbin/runuser"), Path("/usr/bin/runuser"), Path("/bin/runuser")})
 _ENV_KEYS = frozenset({"PATH", "LANG", "LC_ALL", "PGPASSWORD", "PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGSERVICE", "PGSSLMODE", "PGOPTIONS", "HOME", "TMPDIR"})
 
 
@@ -186,7 +188,7 @@ def _monitor_path() -> Path:
 
 def _sanitized_env(env: Mapping[str, str] | None) -> dict[str, str]:
     source = dict(env or {})
-    result = {"PATH": source.get("PATH", _SAFE_PATH), "LC_ALL": source.get("LC_ALL", "C")}
+    result = {"PATH": _SAFE_PATH, "LC_ALL": source.get("LC_ALL") if isinstance(source.get("LC_ALL"), str) else "C"}
     for key in _ENV_KEYS - {"PATH", "LC_ALL"}:
         value = source.get(key)
         if isinstance(value, str) and "\x00" not in value and len(value) <= 4096:
@@ -203,30 +205,48 @@ def _validate_fd(fd: object) -> int:
     return fd
 
 
-def _trusted_executable(value: str, env: Mapping[str, str]) -> str:
-    if not isinstance(value, str) or not value:
-        raise BackupCommandError("backup helper executable is invalid")
-    path = Path(value)
-    if path.is_absolute():
-        try: resolved = path.resolve(strict=True)
-        except OSError as exc:
-            raise BackupCommandError("backup helper executable is unavailable") from exc
-    else:
-        found = shutil.which(value, path=env.get("PATH", _SAFE_PATH))
-        if found is None:
-            raise BackupCommandError("backup helper executable is unavailable")
-        try: resolved = Path(found).resolve(strict=True)
-        except OSError as exc: raise BackupCommandError("backup helper executable is unavailable") from exc
-    name = resolved.name
-    interpreter = Path(sys.executable).resolve(strict=False)
-    if (name not in _TRUSTED_PG_TOOLS and name != "runuser" and resolved != interpreter) or (name == "runuser" and resolved != Path(shutil.which("runuser", path=env.get("PATH", _SAFE_PATH)) or "/nonexistent").resolve()):
-        raise BackupCommandError("unsupported backup helper")
-    try: metadata = resolved.stat()
+def _secure_executable(path: Path, *, interpreter: bool = False) -> Path:
+    try:
+        source = path.lstat()
+        resolved = path.resolve(strict=True)
+        target = resolved.stat()
     except OSError as exc:
         raise BackupCommandError("backup helper executable is unavailable") from exc
-    if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
+    if not stat.S_ISREG(target.st_mode) or target.st_uid != 0 or stat.S_IMODE(target.st_mode) & 0o022:
+        raise BackupCommandError("backup helper executable metadata is unsafe")
+    if (source.st_uid != 0 and not (interpreter and stat.S_ISLNK(source.st_mode))) or (stat.S_ISREG(source.st_mode) and stat.S_IMODE(source.st_mode) & 0o022):
+        raise BackupCommandError("backup helper source metadata is unsafe")
+    for directory in (*path.parents, *resolved.parents):
+        try: metadata = directory.lstat()
+        except OSError as exc: raise BackupCommandError("backup helper path is unavailable") from exc
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise BackupCommandError("backup helper path metadata is unsafe")
+    if not os.access(resolved, os.X_OK):
         raise BackupCommandError("backup helper executable is not executable")
-    return str(resolved)
+    return resolved
+
+
+def _trusted_executable(value: str, env: Mapping[str, str]) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise BackupCommandError("backup helper executable is invalid")
+    path = Path(value) if os.path.isabs(value) else next((Path(root) / value for root in _SAFE_PATH.split(":") if (Path(root) / value).exists()), None)
+    if path is None:
+        raise BackupCommandError("backup helper executable is unavailable")
+    supplied_path = env.get("PATH", _SAFE_PATH)
+    if not os.path.isabs(value) and supplied_path != _SAFE_PATH:
+        raise BackupCommandError("backup helper PATH is not trusted")
+    interpreter_path = Path(sys.executable); interpreter = interpreter_path.resolve(strict=False)
+    name = path.name
+    is_interpreter = path == interpreter_path or (path == interpreter and path.parent in {Path(item) for item in _SAFE_PATH.split(":")})
+    allowed_pg, allowed_runuser = (name in _TRUSTED_PG_TOOLS and path in {Path("/usr/bin") / name, Path("/bin") / name}, name == "runuser" and path in _TRUSTED_RUNUSER)
+    if not (allowed_pg or allowed_runuser or is_interpreter):
+        raise BackupCommandError("unsupported backup helper")
+    resolved = _secure_executable(path, interpreter=is_interpreter)
+    if allowed_pg and resolved != _PG_WRAPPER.resolve(strict=False):
+        raise BackupCommandError("PostgreSQL helper is not the trusted Debian wrapper")
+    if allowed_runuser and resolved != path.resolve(strict=True):
+        raise BackupCommandError("runuser executable is not canonical")
+    return str(path)
 
 
 def _validate_command(command: list[str], env: Mapping[str, str]) -> list[str]:
@@ -241,10 +261,12 @@ def _validate_command(command: list[str], env: Mapping[str, str]) -> list[str]:
         except ValueError as exc:
             raise BackupCommandError("runuser command is missing its separator") from exc
         nested = command[separator + 1 :]
-        if not nested or Path(nested[0]).name not in _TRUSTED_PG_TOOLS:
+        if not nested:
             raise BackupCommandError("runuser target is not a PostgreSQL helper")
-        if any(item not in {"-u", "postgres"} for item in command[1:separator]):
+        if command[1:separator] != ["-u", "postgres"]:
             raise BackupCommandError("runuser options are not trusted")
+        nested_command = _validate_command(nested, env)
+        return [executable, *command[1:separator], "--", *nested_command]
     if name == "psql" and any(item in command for item in (r"\!", r"\copy", r"\watch")):
         raise BackupCommandError("unsupported psql command")
     return [executable, *command[1:]]
@@ -257,7 +279,10 @@ def _drain(selector: selectors.BaseSelector, buffers: Mapping[str, _CommandBuffe
         fd = stream if isinstance(stream, int) else stream.fileno()
         try:
             chunk = os.read(fd, COMMAND_DIAGNOSTIC_CHUNK)
-        except (BlockingIOError, OSError):
+        except BlockingIOError:
+            continue
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR): continue
             chunk = b""
         if chunk:
             if label == "status":
@@ -293,8 +318,9 @@ def _cancel_monitor(process: subprocess.Popen[bytes]) -> None:
     if process.stdin is None or process.stdin.closed:
         return
     try:
-        process.stdin.write(b"C")
-        process.stdin.flush()
+        descriptor = process.stdin.fileno()
+        os.set_blocking(descriptor, False)
+        os.write(descriptor, b"C")
     except (BrokenPipeError, OSError, ValueError):
         pass
     try: process.stdin.close()
@@ -366,12 +392,13 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
         return DatabaseCommandResult(int(parsed["returncode"]), out.text(), err.text(), out.total, err.total, out.truncated, err.truncated)
     except BaseException:
         if process is not None and process.poll() is None:
-            _cancel_monitor(process)
-            try: process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            try: _cancel_monitor(process)
+            except BaseException: pass
+            try: process.wait(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
             except BaseException:
                 try: process.kill()
                 except OSError: pass
-                try: process.wait()
+                try: process.wait(timeout=0.5)
                 except BaseException: pass
         raise
     finally:

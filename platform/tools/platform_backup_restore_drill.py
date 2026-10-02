@@ -52,10 +52,7 @@ except ImportError:  # Direct execution from the tools directory.
 try:
     from tools import platform_backup_supervisor as supervisor
 except ImportError:
-    try:
-        from . import platform_backup_supervisor as supervisor
-    except ImportError:
-        import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
+    import platform_backup_supervisor as supervisor  # type: ignore[no-redef]
 
 
 DEFAULT_ENV_FILE = pathlib.Path("/opt/oldsparky/platform/shared/.env.platform")
@@ -603,10 +600,11 @@ def perform_restore_drill(
                 "Expected Alembic head does not match the trusted deployed source graph."
             )
         expected_head = trusted_head
-    deadline = deadline if deadline is not None else supervisor.operation_deadline(DEFAULT_OPERATION_TIMEOUT_SECONDS)
+    cleanup_deadline = deadline if deadline is not None else supervisor.operation_deadline(DEFAULT_OPERATION_TIMEOUT_SECONDS); operation_deadline = supervisor.cleanup_deadline(cleanup_deadline); cleanup_reserve = cleanup_deadline - operation_deadline
 
-    def invoke(command: list[str], **kwargs: Any) -> Any:
-        return run_command(command, deadline=deadline, **kwargs)
+    def invoke(command: list[str], *, cleanup: bool = False, **kwargs: Any) -> Any:
+        kwargs["cleanup_reserve_seconds"] = 0.0 if cleanup else kwargs.get("cleanup_reserve_seconds", cleanup_reserve)
+        return run_command(command, deadline=cleanup_deadline, **kwargs)
 
     drill_database = f"platform_restore_drill_{timestamp_slug.lower()}_{os.getpid()}"
     use_local_admin = (
@@ -626,6 +624,7 @@ def perform_restore_drill(
         admin_command_target = effective_admin
 
     created = False
+    primary: BaseException | None = None
     try:
         invoke(create_command, target=admin_command_target)
         created = True
@@ -734,9 +733,15 @@ def perform_restore_drill(
         if int(extension_count_result.stdout.strip()) != len(REQUIRED_PLATFORM_EXTENSIONS):
             raise RuntimeError("Restore drill is missing a required platform PostgreSQL extension.")
         return table_count
+    except BaseException as exc: primary = exc; raise
     finally:
         if created:
-            invoke(drop_command, target=admin_command_target, cleanup_reserve_seconds=0.0)
+            try:
+                invoke(drop_command, target=admin_command_target, cleanup=True)
+            except BaseException as cleanup_error:
+                if primary is None:
+                    raise supervisor.BackupCleanupUnproven("restore-drill cleanup was not proven") from cleanup_error
+                primary.add_note(f"restore-drill cleanup was not proven: {cleanup_error}")
 
 
 def require_commands(*commands: str) -> None:
@@ -967,6 +972,8 @@ def create_backup(
                 restore_verified = True
                 assert trusted_head is not None
                 alembic_revision = trusted_head.value
+            except supervisor.BackupCleanupUnproven:
+                raise
             except Exception as exc:
                 restore_error = str(exc)
 

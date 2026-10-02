@@ -8,7 +8,6 @@ import hashlib
 import os
 import pickle
 from pathlib import Path
-import signal
 import subprocess
 import sys
 import tempfile
@@ -244,14 +243,16 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
     def test_foreign_caller_child_survives_and_pass_fds_reach_target(self) -> None:
         foreign = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(3)"])
         try:
-            with tempfile.TemporaryFile() as output:
+            with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as captured:
+                target_fd = os.dup2(output.fileno(), 17)
                 result = supervisor.run_database_command(
-                    [sys.executable, "-c", "import os;os.write(3,b'fd-ok')"],
-                    pass_fds=(output.fileno(),), deadline=supervisor.operation_deadline(8),
+                    [sys.executable, "-c", f"import os;os.write({target_fd},b'fd-ok');print('stdout-fd-ok')"],
+                    pass_fds=(target_fd,), stdout_fd=captured.fileno(), deadline=supervisor.operation_deadline(8),
                 )
-                self.assertEqual(result.returncode, 0)
+                os.close(target_fd)
                 output.seek(0)
                 self.assertEqual(output.read(), b"fd-ok")
+                captured.seek(0); self.assertEqual(captured.read(), b"stdout-fd-ok\n")
             self.assertIsNone(foreign.poll())
         finally:
             foreign.terminate()
@@ -261,15 +262,25 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         env = supervisor._sanitized_env({"PATH": os.environ["PATH"], "SECRET": "must-not-pass"})
         command = supervisor._validate_command(["runuser", "-u", "postgres", "--", "createdb"], env)
         self.assertTrue(Path(command[0]).is_absolute())
+        self.assertEqual(supervisor._trusted_executable("pg_dump", env), "/usr/bin/pg_dump")
         self.assertNotIn("SECRET", env)
-        for bad in (["sh", "-c", "true"], [sys.executable, "--jobs"]):
+        for bad in (["sh", "-c", "true"], [sys.executable, "--jobs"], ["/tmp/pg_dump"]):
             with self.assertRaises(supervisor.BackupCommandError):
                 supervisor._validate_command(bad, env)
+        with self.assertRaises(supervisor.BackupCommandError):
+            supervisor._validate_command(["pg_dump"], {"PATH": "/tmp"})
 
     def test_monitor_protocol_rejects_malformed_oversized_and_nonzero_status(self) -> None:
         for payload, overflow in ((b"not-json", False), (b"{}", False), (b"{}", True)):
             with self.assertRaises(supervisor.BackupCleanupUnproven):
                 supervisor._read_monitor_status(bytearray(payload), overflow)
+        from tools import platform_backup_process_monitor as monitor
+        self.assertEqual(monitor._parse(["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--", "echo", "--pass-fd=9", "--probe"])[0][-2:], ["--pass-fd=9", "--probe"])
+        for args in (["--status-fd", "4", "--status-fd", "5", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--", "echo"], ["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--stdout-fd", "--", "echo"], ["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "10", "--", "echo"]): self.assertRaises(ValueError, monitor._parse, args)
+        with mock.patch.object(monitor.select, "select", return_value=([9], [], [])), mock.patch.object(monitor.os, "read", side_effect=BlockingIOError): self.assertFalse(monitor._cancelled(9))
+        selector = mock.Mock(); selector.select.return_value = [(SimpleNamespace(fileobj=9, data="status"), None)]
+        with mock.patch.object(supervisor.os, "read", side_effect=BlockingIOError): supervisor._drain(selector, {}, bytearray(), [False])
+        selector.unregister.assert_not_called()
 
     def test_namespace_setup_failure_publishes_status_before_target_spawn(self) -> None:
         from tools import platform_backup_process_monitor as monitor
