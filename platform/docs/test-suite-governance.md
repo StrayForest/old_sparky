@@ -44,6 +44,21 @@ and
 `tools/platform_web_npm.sh --prefix apps/platform_web run test:ssr-stream-diagnostics`
 from `platform/`; the helper fails closed unless Node 26.3.1 is selected.
 
+The Draft edge package has a separate path-scoped dependency boundary in
+`.github/workflows/platform-draft-cloudflare.yml`. Both its pull-request
+`verify-pr` job and credential-free `build-release` job run a bounded JSON
+`npm audit` against the committed Draft lockfile before checks or installation.
+The gate pins the npm registry, audits production dependencies with
+`--omit=dev`, disables offline and prefer-offline behavior, allows no retries,
+uses a 10-second fetch timeout and a 30-second command deadline. A missing or
+malformed report, network/timeout failure, non-zero npm status, or high/critical
+finding fails closed. The subsequent hash-locked `npm ci --no-audit` is
+intentional: it avoids a second uncontrolled audit while the dedicated gate
+owns the report. The release job also verifies the generated Wrangler runtime
+manifest and lock digests before the credential-bearing publish job consumes
+the artifact. This contour has no Cloudflare credentials in `verify-pr` or
+`build-release` and is not substituted by the general `web-quality` gate.
+
 The first eight gates are deterministic and always part of the normal CI
 aggregate. The conditional `release-runtime` gate is deterministic as well,
 but is intentionally excluded from `platform_verify.py ci`: the classifier
