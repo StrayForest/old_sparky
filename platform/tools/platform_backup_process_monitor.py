@@ -3,13 +3,23 @@
 
 from __future__ import annotations
 
-import ctypes, errno, json, os, select, signal, subprocess, sys, time
+import ctypes
+import errno
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
 
 CLONE_NEWPID = 0x20000000
 PR_SET_PDEATHSIG = 1
 STATUS_LIMIT = 4096
 TERM_GRACE_NS = 250_000_000
 MONITOR_ERROR_EXIT = 125
+
+
 def _pdeath(parent: int) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     call = libc.prctl
@@ -24,12 +34,17 @@ def _emit(fd: int, status: str, returncode: int | None = None) -> None:
     if returncode is not None:
         payload["returncode"] = int(returncode)
     data = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+    fallback = b'{"schema":1,"status":"protocol_error"}\n'
     try:
-        os.write(fd, data if len(data) <= STATUS_LIMIT else b'{"schema":1,"status":"protocol_error"}\n')
+        os.write(fd, data if len(data) <= STATUS_LIMIT else fallback)
     except OSError:
         pass
 def _rc(status: int) -> int:
-    return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status) if os.WIFSIGNALED(status) else MONITOR_ERROR_EXIT
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return MONITOR_ERROR_EXIT
 def _reap(target: int, target_rc: int | None) -> tuple[int | None, bool]:
     while True:
         try:
@@ -43,6 +58,8 @@ def _reap(target: int, target_rc: int | None) -> tuple[int | None, bool]:
         if pid == target:
             target_rc = _rc(status)
 def _kill_all(signum: int) -> None:
+    if os.getpid() != 1:
+        raise RuntimeError("namespace process cleanup requires PID 1")
     try:
         os.kill(-1, signum)  # PID 1 is excluded; detached namespace children are not.
     except OSError:
@@ -70,12 +87,18 @@ def _cancelled(fd: int) -> bool:
             return False
         os.read(fd, 4096)
         return True
-    except BlockingIOError: return False
+    except BlockingIOError:
+        return False
     except OSError as exc:
         return exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR)
     except ValueError:
         return True
-def _pid1(control: int, status_fd: int, command: list[str], pass_fds: tuple[int, ...], stdout_fd: int | None, work_deadline: int, deadline: int, env: dict[str, str] | None) -> None:
+def _pid1(
+    control: int, status_fd: int, command: list[str],
+    pass_fds: tuple[int, ...], stdout_fd: int | None,
+    work_deadline: int, cleanup_deadline: int,
+    env: dict[str, str] | None,
+) -> None:
     try:
         _pdeath(os.getppid())
         if os.getpid() != 1 or not command or any(not isinstance(item, str) or not item for item in command):
@@ -88,7 +111,12 @@ def _pid1(control: int, status_fd: int, command: list[str], pass_fds: tuple[int,
         if _cancelled(control) or time.monotonic_ns() >= work_deadline:
             _emit(status_fd, "timeout", 124)
             return
-        target = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout_fd, stderr=None, env=env, close_fds=True, pass_fds=pass_fds, start_new_session=True, shell=False, preexec_fn=lambda: _pdeath(os.getppid()))
+        target = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=stdout_fd,
+            stderr=None, env=env, close_fds=True, pass_fds=pass_fds,
+            start_new_session=True, shell=False,
+            preexec_fn=lambda: _pdeath(os.getppid()),
+        )
         target_rc: int | None = None
         cancelled = False
         while target_rc is None:
@@ -101,7 +129,7 @@ def _pid1(control: int, status_fd: int, command: list[str], pass_fds: tuple[int,
             remaining = min(work_deadline - time.monotonic_ns(), 50_000_000)
             if remaining > 0:
                 select.select([control], [], [], remaining / 1_000_000_000)
-        target_rc, cleaned = _cleanup(target.pid, target_rc, deadline)
+        target_rc, cleaned = _cleanup(target.pid, target_rc, cleanup_deadline)
         if not cleaned:
             _emit(status_fd, "monitor_error")
         elif time.monotonic_ns() >= work_deadline:
@@ -118,8 +146,13 @@ def _pid1(control: int, status_fd: int, command: list[str], pass_fds: tuple[int,
                 os.close(fd)
             except OSError:
                 pass
-def _monitor(command: list[str], pass_fds: tuple[int, ...], stdout_fd: int | None, status_fd: int, deadline: int, reserve: int, env: dict[str, str] | None) -> int:
+def _monitor(
+    command: list[str], pass_fds: tuple[int, ...], stdout_fd: int | None,
+    status_fd: int, cleanup_deadline: int, reserve: int,
+    env: dict[str, str] | None,
+) -> int:
     control_write = -1
+    work_deadline = cleanup_deadline - reserve
     try:
         _pdeath(os.getppid())
         libc = ctypes.CDLL(None, use_errno=True)
@@ -130,7 +163,8 @@ def _monitor(command: list[str], pass_fds: tuple[int, ...], stdout_fd: int | Non
         child = os.fork()
         if child == 0:
             os.close(control_write)
-            _pid1(control_read, status_fd, command, pass_fds, stdout_fd, deadline - reserve, deadline, env)
+            _pid1(control_read, status_fd, command, pass_fds, stdout_fd,
+                  work_deadline, cleanup_deadline, env)
             os._exit(0)
         os.close(control_read)
         cancelled = cancel_sent = False
@@ -143,7 +177,8 @@ def _monitor(command: list[str], pass_fds: tuple[int, ...], stdout_fd: int | Non
                 continue
             if result == child:
                 return 0 if os.WIFEXITED(child_status) and os.WEXITSTATUS(child_status) == 0 else MONITOR_ERROR_EXIT
-            if not cancelled and time.monotonic_ns() >= deadline:
+            now = time.monotonic_ns()
+            if not cancelled and now >= work_deadline:
                 cancelled = True
             if not cancelled:
                 ready, _, _ = select.select([0], [], [], 0.02)
@@ -152,7 +187,8 @@ def _monitor(command: list[str], pass_fds: tuple[int, ...], stdout_fd: int | Non
                         os.read(0, 4096)
                     except BlockingIOError:
                         pass
-                    except OSError as exc: cancelled = exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR)
+                    except OSError as exc:
+                        cancelled = exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR)
                     else:
                         cancelled = True
             if cancelled and not cancel_sent:
@@ -161,13 +197,13 @@ def _monitor(command: list[str], pass_fds: tuple[int, ...], stdout_fd: int | Non
                     os.write(control_write, b"C")
                 except OSError:
                     pass
-                if time.monotonic_ns() >= deadline:
-                    try:
-                        os.kill(child, signal.SIGKILL)
-                    except OSError:
-                        pass
-                    os.waitpid(child, 0)
-                    return MONITOR_ERROR_EXIT
+            if cancelled and time.monotonic_ns() >= cleanup_deadline:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except OSError:
+                    pass
+                os.waitpid(child, 0)
+                return MONITOR_ERROR_EXIT
     except BaseException:
         _emit(status_fd, "monitor_error")
         return MONITOR_ERROR_EXIT
@@ -184,7 +220,8 @@ def _monitor(command: list[str], pass_fds: tuple[int, ...], stdout_fd: int | Non
 def _parse(argv: list[str]) -> tuple[list[str], tuple[int, ...], int | None, int, int, int]:
     if "--" not in argv:
         raise ValueError("backup monitor target is missing")
-    controls, command = argv[: argv.index("--")], argv[argv.index("--") + 1 :]
+    separator = argv.index("--")
+    controls, command = argv[:separator], argv[separator + 1 :]
     values: dict[str, str] = {}
     pass_fds: list[int] = []
     index = 0
@@ -211,9 +248,10 @@ def _parse(argv: list[str]) -> tuple[list[str], tuple[int, ...], int | None, int
         stdout_fd = int(values["--stdout-fd"]) if "--stdout-fd" in values else None
     except (KeyError, ValueError) as exc:
         raise ValueError("backup monitor protocol is invalid") from exc
-    if not command or status_fd < 0 or deadline <= 0 or reserve < 0 or reserve >= deadline or any(fd < 0 for fd in pass_fds) or len(pass_fds) != len(set(pass_fds)) or (stdout_fd is not None and stdout_fd < 0):
+    if not command or status_fd < 0 or deadline <= 0 or reserve < 0 or reserve >= deadline or any(fd < 0 for fd in pass_fds) or len(pass_fds) != len(set(pass_fds)) or (stdout_fd is not None and stdout_fd < 0) or status_fd in pass_fds or (stdout_fd is not None and stdout_fd == status_fd):
         raise ValueError("backup monitor protocol is invalid")
     return command, tuple(pass_fds), stdout_fd, status_fd, deadline, reserve
+
 
 def main(argv: list[str] | None = None) -> int:
     try:

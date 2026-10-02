@@ -117,10 +117,18 @@ class ProductionRestoreDisabled(BackupSupervisorError):
 class BackupCommandError(BackupSupervisorError):
     code = "backup_command_failed"
     def __init__(self, message: str = "backup database command failed", *, result: Any = None) -> None:
-        super().__init__(message); self.result = result
-class BackupCommandTimeout(BackupSupervisorError): code = "backup_command_timeout"
-class BackupMonitorUnavailable(BackupSupervisorError): code = "backup_monitor_unavailable"
-class BackupCleanupUnproven(BackupSupervisorError): code = "backup_cleanup_unproven"
+        super().__init__(message)
+        self.result = result
+class BackupCommandTimeout(BackupSupervisorError):
+    code = "backup_command_timeout"
+
+
+class BackupMonitorUnavailable(BackupSupervisorError):
+    code = "backup_monitor_unavailable"
+
+
+class BackupCleanupUnproven(BackupSupervisorError):
+    code = "backup_cleanup_unproven"
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +149,8 @@ _TRUSTED_PG_TOOLS = frozenset({"createdb", "dropdb", "psql", "pg_dump", "pg_rest
 _SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _PG_WRAPPER = Path("/usr/share/postgresql-common/pg_wrapper")
 _TRUSTED_RUNUSER = frozenset({Path("/usr/sbin/runuser"), Path("/usr/bin/runuser"), Path("/bin/runuser")})
+_PSQL_FLAGS = frozenset({"--no-psqlrc", "--tuples-only", "--no-align"})
+_PSQL_VALUE_OPTIONS = frozenset({"--host", "--port", "--username", "--dbname", "--command", "-c"})
 _ENV_KEYS = frozenset({"PATH", "LANG", "LC_ALL", "PGPASSWORD", "PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGSERVICE", "PGSSLMODE", "PGOPTIONS", "HOME", "TMPDIR"})
 
 
@@ -167,7 +177,7 @@ def operation_deadline(timeout_seconds: float) -> float:
 
 
 def cleanup_deadline(deadline: float, *, reserve_seconds: float = COMMAND_CLEANUP_RESERVE_SECONDS) -> float:
-    if not math.isfinite(float(deadline)) or reserve_seconds < 0 or not math.isfinite(float(reserve_seconds)):
+    if isinstance(deadline, bool) or isinstance(reserve_seconds, bool) or not isinstance(deadline, (int, float)) or not isinstance(reserve_seconds, (int, float)) or not math.isfinite(float(deadline)) or reserve_seconds < 0 or not math.isfinite(float(reserve_seconds)):
         raise ValueError("backup cleanup deadline is invalid")
     work = float(deadline) - float(reserve_seconds)
     if work <= time.monotonic():
@@ -199,7 +209,8 @@ def _sanitized_env(env: Mapping[str, str] | None) -> dict[str, str]:
 def _validate_fd(fd: object) -> int:
     if not isinstance(fd, int) or isinstance(fd, bool) or fd < 0:
         raise BackupCommandError("backup command file descriptor is invalid")
-    try: os.fstat(fd)
+    try:
+        os.fstat(fd)
     except OSError as exc:
         raise BackupCommandError("backup command file descriptor is not open") from exc
     return fd
@@ -217,8 +228,10 @@ def _secure_executable(path: Path, *, interpreter: bool = False) -> Path:
     if (source.st_uid != 0 and not (interpreter and stat.S_ISLNK(source.st_mode))) or (stat.S_ISREG(source.st_mode) and stat.S_IMODE(source.st_mode) & 0o022):
         raise BackupCommandError("backup helper source metadata is unsafe")
     for directory in (*path.parents, *resolved.parents):
-        try: metadata = directory.lstat()
-        except OSError as exc: raise BackupCommandError("backup helper path is unavailable") from exc
+        try:
+            metadata = directory.lstat()
+        except OSError as exc:
+            raise BackupCommandError("backup helper path is unavailable") from exc
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
             raise BackupCommandError("backup helper path metadata is unsafe")
     if not os.access(resolved, os.X_OK):
@@ -235,7 +248,8 @@ def _trusted_executable(value: str, env: Mapping[str, str]) -> str:
     supplied_path = env.get("PATH", _SAFE_PATH)
     if not os.path.isabs(value) and supplied_path != _SAFE_PATH:
         raise BackupCommandError("backup helper PATH is not trusted")
-    interpreter_path = Path(sys.executable); interpreter = interpreter_path.resolve(strict=False)
+    interpreter_path = Path(sys.executable)
+    interpreter = interpreter_path.resolve(strict=False)
     name = path.name
     is_interpreter = path == interpreter_path or (path == interpreter and path.parent in {Path(item) for item in _SAFE_PATH.split(":")})
     allowed_pg, allowed_runuser = (name in _TRUSTED_PG_TOOLS and path in {Path("/usr/bin") / name, Path("/bin") / name}, name == "runuser" and path in _TRUSTED_RUNUSER)
@@ -257,7 +271,8 @@ def _validate_command(command: list[str], env: Mapping[str, str]) -> list[str]:
     executable = _trusted_executable(command[0], env)
     name = Path(executable).name
     if name == "runuser":
-        try: separator = command.index("--")
+        try:
+            separator = command.index("--")
         except ValueError as exc:
             raise BackupCommandError("runuser command is missing its separator") from exc
         nested = command[separator + 1 :]
@@ -267,9 +282,33 @@ def _validate_command(command: list[str], env: Mapping[str, str]) -> list[str]:
             raise BackupCommandError("runuser options are not trusted")
         nested_command = _validate_command(nested, env)
         return [executable, *command[1:separator], "--", *nested_command]
-    if name == "psql" and any(item in command for item in (r"\!", r"\copy", r"\watch")):
-        raise BackupCommandError("unsupported psql command")
+    if name == "psql":
+        _validate_psql(command)
     return [executable, *command[1:]]
+
+
+def _validate_psql(command: list[str]) -> None:
+    index = 1
+    while index < len(command):
+        token = command[index]
+        if token in _PSQL_FLAGS:
+            index += 1
+            continue
+        if token in _PSQL_VALUE_OPTIONS:
+            if index + 1 >= len(command):
+                raise BackupCommandError("psql option is missing its value")
+            value = command[index + 1]
+            if not value or "\\" in value:
+                raise BackupCommandError("psql meta-command or path is not trusted")
+            index += 2
+            continue
+        if token.startswith("--command=") or token.startswith("-c") and len(token) > 2:
+            value = token.split("=", 1)[1] if token.startswith("--command=") else token[2:]
+            if not value or "\\" in value:
+                raise BackupCommandError("psql meta-command or path is not trusted")
+            index += 1
+            continue
+        raise BackupCommandError("psql option is outside the production contract")
 
 
 def _drain(selector: selectors.BaseSelector, buffers: Mapping[str, _CommandBuffer], status: bytearray, overflow: list[bool]) -> None:
@@ -282,7 +321,8 @@ def _drain(selector: selectors.BaseSelector, buffers: Mapping[str, _CommandBuffe
         except BlockingIOError:
             continue
         except OSError as exc:
-            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR): continue
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                continue
             chunk = b""
         if chunk:
             if label == "status":
@@ -294,8 +334,10 @@ def _drain(selector: selectors.BaseSelector, buffers: Mapping[str, _CommandBuffe
             else:
                 buffers[label].append(chunk)
             continue
-        try: selector.unregister(stream)
-        except Exception: pass
+        try:
+            selector.unregister(stream)
+        except Exception:
+            pass
         try:
             stream.close() if hasattr(stream, "close") else os.close(fd)
         except OSError:
@@ -305,8 +347,10 @@ def _drain(selector: selectors.BaseSelector, buffers: Mapping[str, _CommandBuffe
 def _close_selector(selector: selectors.BaseSelector) -> None:
     for key in tuple(selector.get_map().values()):
         stream = key.fileobj
-        try: selector.unregister(stream)
-        except Exception: pass
+        try:
+            selector.unregister(stream)
+        except Exception:
+            pass
         try:
             stream.close() if hasattr(stream, "close") else os.close(stream)
         except OSError:
@@ -323,8 +367,10 @@ def _cancel_monitor(process: subprocess.Popen[bytes]) -> None:
         os.write(descriptor, b"C")
     except (BrokenPipeError, OSError, ValueError):
         pass
-    try: process.stdin.close()
-    except (OSError, ValueError): pass
+    try:
+        process.stdin.close()
+    except (OSError, ValueError):
+        pass
 
 
 def _read_monitor_status(data: bytearray, overflow: bool = False) -> dict[str, object]:
@@ -350,7 +396,8 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
     inherited_values = [*pass_fds, status_write] + ([] if stdout_fd is None else [stdout_fd])
     inherited = tuple(dict.fromkeys(inherited_values))
     args = [sys.executable, str(_monitor_path()), "--status-fd", str(status_write), "--deadline-ns", str(int(deadline * 1e9)), "--cleanup-reserve-ns", str(int(cleanup_reserve_seconds * 1e9)), *[f"--pass-fd={fd}" for fd in inherited if fd != status_write]]
-    if stdout_fd is not None: args += ["--stdout-fd", str(stdout_fd)]
+    if stdout_fd is not None:
+        args += ["--stdout-fd", str(stdout_fd)]
     args += ["--", *command]
     process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
@@ -358,65 +405,96 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
     buffers = {"stdout": _CommandBuffer(bytearray()), "stderr": _CommandBuffer(bytearray())}
     try:
         process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_sanitized_env(env), pass_fds=inherited, close_fds=True, start_new_session=True, shell=False)
-        os.close(status_write); status_write = -1
-        selector = selectors.DefaultSelector(); selector.register(status_read, selectors.EVENT_READ, "status")
+        os.close(status_write)
+        status_write = -1
+        selector = selectors.DefaultSelector()
+        selector.register(status_read, selectors.EVENT_READ, "status")
         for label, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
-            if stream is not None: os.set_blocking(stream.fileno(), False); selector.register(stream, selectors.EVENT_READ, label)
+            if stream is not None:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, label)
         while process.poll() is None or selector.get_map():
             _drain(selector, buffers, status, overflow)
             remaining = deadline - time.monotonic()
-            if remaining <= 0: _cancel_monitor(process); break
+            if remaining <= 0:
+                _cancel_monitor(process)
+                break
             selector.select(min(remaining, 0.05))
         while process.poll() is None and time.monotonic() < deadline:
-            _drain(selector, buffers, status, overflow); selector.select(min(deadline - time.monotonic(), 0.02))
+            _drain(selector, buffers, status, overflow)
+            selector.select(min(deadline - time.monotonic(), 0.02))
         if process.poll() is None:
             _cancel_monitor(process)
-            try: process.kill()
-            except OSError: pass
+            try:
+                process.kill()
+            except OSError:
+                pass
             process.wait()
             raise BackupCleanupUnproven("backup monitor did not finish cleanup")
         process.wait()
         for _ in range(4):
             _drain(selector, buffers, status, overflow)
-            if not selector.get_map(): break
+            if not selector.get_map():
+                break
             selector.select(0)
         parsed = _read_monitor_status(status, overflow[0])
         if process.returncode != 0:
-            if parsed["status"] == "namespace_unavailable": raise BackupMonitorUnavailable("PID namespace is unavailable")
+            if parsed["status"] == "namespace_unavailable":
+                raise BackupMonitorUnavailable("PID namespace is unavailable")
             raise BackupCleanupUnproven("backup monitor exited before proving cleanup")
-        if parsed["status"] == "namespace_unavailable": raise BackupMonitorUnavailable("PID namespace is unavailable")
-        if parsed["status"] in {"timeout", "cancelled"}: raise BackupCommandTimeout("backup database command exceeded its deadline")
-        if parsed["status"] in {"monitor_error", "protocol_error"}: raise BackupCleanupUnproven("backup monitor protocol failed")
-        if time.monotonic() >= work: raise BackupCommandTimeout("backup command completed after its work deadline")
+        if parsed["status"] == "namespace_unavailable":
+            raise BackupMonitorUnavailable("PID namespace is unavailable")
+        if parsed["status"] in {"timeout", "cancelled"}:
+            raise BackupCommandTimeout("backup database command exceeded its deadline")
+        if parsed["status"] in {"monitor_error", "protocol_error"}:
+            raise BackupCleanupUnproven("backup monitor protocol failed")
+        if time.monotonic() >= work:
+            raise BackupCommandTimeout("backup command completed after its work deadline")
         out, err = buffers["stdout"], buffers["stderr"]
         return DatabaseCommandResult(int(parsed["returncode"]), out.text(), err.text(), out.total, err.total, out.truncated, err.truncated)
     except BaseException:
         if process is not None and process.poll() is None:
-            try: _cancel_monitor(process)
-            except BaseException: pass
-            try: process.wait(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
+            try:
+                _cancel_monitor(process)
             except BaseException:
-                try: process.kill()
-                except OSError: pass
-                try: process.wait(timeout=0.5)
-                except BaseException: pass
+                pass
+            try:
+                process.wait(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
+            except BaseException:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=0.5)
+                except BaseException:
+                    pass
         raise
     finally:
         if process is not None and process.stdin is not None and not process.stdin.closed:
-            try: process.stdin.close()
-            except OSError: pass
-        if selector is not None: _close_selector(selector)
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if selector is not None:
+            _close_selector(selector)
         else:
-            try: os.close(status_read)
-            except OSError: pass
+            try:
+                os.close(status_read)
+            except OSError:
+                pass
         if status_write >= 0:
-            try: os.close(status_write)
-            except OSError: pass
+            try:
+                os.close(status_write)
+            except OSError:
+                pass
 
 
 def run_database_command(command: list[str], *, env: Mapping[str, str] | None = None, stdout_fd: int | None = None, pass_fds: tuple[int, ...] = (), deadline: float | None = None, cleanup_reserve_seconds: float = COMMAND_CLEANUP_RESERVE_SECONDS) -> DatabaseCommandResult:
     safe_env = _sanitized_env(env)
-    validated_fds = tuple(dict.fromkeys(_validate_fd(fd) for fd in pass_fds))
+    validated_fds = tuple(_validate_fd(fd) for fd in pass_fds)
+    if len(validated_fds) != len(set(validated_fds)):
+        raise BackupCommandError("backup command file descriptors are duplicated")
     if stdout_fd is not None:
         stdout_fd = _validate_fd(stdout_fd)
         validated_fds = tuple(dict.fromkeys((*validated_fds, stdout_fd)))

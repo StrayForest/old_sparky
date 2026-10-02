@@ -600,7 +600,9 @@ def perform_restore_drill(
                 "Expected Alembic head does not match the trusted deployed source graph."
             )
         expected_head = trusted_head
-    cleanup_deadline = deadline if deadline is not None else supervisor.operation_deadline(DEFAULT_OPERATION_TIMEOUT_SECONDS); operation_deadline = supervisor.cleanup_deadline(cleanup_deadline); cleanup_reserve = cleanup_deadline - operation_deadline
+    cleanup_deadline = deadline if deadline is not None else supervisor.operation_deadline(DEFAULT_OPERATION_TIMEOUT_SECONDS)
+    operation_deadline = supervisor.cleanup_deadline(cleanup_deadline)
+    cleanup_reserve = cleanup_deadline - operation_deadline
 
     def invoke(command: list[str], *, cleanup: bool = False, **kwargs: Any) -> Any:
         kwargs["cleanup_reserve_seconds"] = 0.0 if cleanup else kwargs.get("cleanup_reserve_seconds", cleanup_reserve)
@@ -733,7 +735,9 @@ def perform_restore_drill(
         if int(extension_count_result.stdout.strip()) != len(REQUIRED_PLATFORM_EXTENSIONS):
             raise RuntimeError("Restore drill is missing a required platform PostgreSQL extension.")
         return table_count
-    except BaseException as exc: primary = exc; raise
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
         if created:
             try:

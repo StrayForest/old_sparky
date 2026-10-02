@@ -245,14 +245,17 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         try:
             with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as captured:
                 target_fd = os.dup2(output.fileno(), 17)
-                result = supervisor.run_database_command(
-                    [sys.executable, "-c", f"import os;os.write({target_fd},b'fd-ok');print('stdout-fd-ok')"],
-                    pass_fds=(target_fd,), stdout_fd=captured.fileno(), deadline=supervisor.operation_deadline(8),
-                )
-                os.close(target_fd)
+                try:
+                    supervisor.run_database_command(
+                        [sys.executable, "-c", f"import os;os.write({target_fd},b'fd-ok');print('stdout-fd-ok')"],
+                        pass_fds=(target_fd,), stdout_fd=captured.fileno(), deadline=supervisor.operation_deadline(8),
+                    )
+                finally:
+                    os.close(target_fd)
                 output.seek(0)
                 self.assertEqual(output.read(), b"fd-ok")
-                captured.seek(0); self.assertEqual(captured.read(), b"stdout-fd-ok\n")
+                captured.seek(0)
+                self.assertEqual(captured.read(), b"stdout-fd-ok\n")
             self.assertIsNone(foreign.poll())
         finally:
             foreign.terminate()
@@ -264,7 +267,7 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
         self.assertTrue(Path(command[0]).is_absolute())
         self.assertEqual(supervisor._trusted_executable("pg_dump", env), "/usr/bin/pg_dump")
         self.assertNotIn("SECRET", env)
-        for bad in (["sh", "-c", "true"], [sys.executable, "--jobs"], ["/tmp/pg_dump"]):
+        for bad in (["sh", "-c", "true"], [sys.executable, "--jobs"], ["/tmp/pg_dump"], ["psql", "-c", r"\copy x"], ["psql", "--command=\\!"], ["psql", "--file", "/tmp/x"], ["runuser", "-u", "postgres", "--", "psql", "-c", r"\!"]):
             with self.assertRaises(supervisor.BackupCommandError):
                 supervisor._validate_command(bad, env)
         with self.assertRaises(supervisor.BackupCommandError):
@@ -275,26 +278,66 @@ class PlatformBackupSupervisorTests(unittest.TestCase):
             with self.assertRaises(supervisor.BackupCleanupUnproven):
                 supervisor._read_monitor_status(bytearray(payload), overflow)
         from tools import platform_backup_process_monitor as monitor
-        self.assertEqual(monitor._parse(["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--", "echo", "--pass-fd=9", "--probe"])[0][-2:], ["--pass-fd=9", "--probe"])
-        for args in (["--status-fd", "4", "--status-fd", "5", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--", "echo"], ["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--stdout-fd", "--", "echo"], ["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "10", "--", "echo"]): self.assertRaises(ValueError, monitor._parse, args)
-        with mock.patch.object(monitor.select, "select", return_value=([9], [], [])), mock.patch.object(monitor.os, "read", side_effect=BlockingIOError): self.assertFalse(monitor._cancelled(9))
-        selector = mock.Mock(); selector.select.return_value = [(SimpleNamespace(fileobj=9, data="status"), None)]
-        with mock.patch.object(supervisor.os, "read", side_effect=BlockingIOError): supervisor._drain(selector, {}, bytearray(), [False])
+        self.assertEqual(
+            monitor._parse(
+                [
+                    "--status-fd", "4", "--deadline-ns", "10",
+                    "--cleanup-reserve-ns", "1", "--", "echo",
+                    "--pass-fd=9", "--probe",
+                ]
+            )[0][-2:], ["--pass-fd=9", "--probe"]
+        )
+        invalid_args = (
+            ["--status-fd", "4", "--status-fd", "5", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--", "echo"],
+            ["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--stdout-fd", "--", "echo"],
+            ["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "10", "--", "echo"],
+            ["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--pass-fd=4", "--", "echo"],
+            ["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--stdout-fd", "4", "--", "echo"],
+            ["--status-fd", "4", "--deadline-ns", "10", "--cleanup-reserve-ns", "1", "--pass-fd=5", "--pass-fd=5", "--", "echo"],
+        )
+        for args in invalid_args:
+            self.assertRaises(ValueError, monitor._parse, args)
+        with (
+            mock.patch.object(monitor.select, "select", return_value=([9], [], [])),
+            mock.patch.object(monitor.os, "read", side_effect=BlockingIOError),
+        ):
+            self.assertFalse(monitor._cancelled(9))
+        selector = mock.Mock()
+        selector.select.return_value = [(SimpleNamespace(fileobj=9, data="status"), None)]
+        with mock.patch.object(supervisor.os, "read", side_effect=BlockingIOError):
+            supervisor._drain(selector, {}, bytearray(), [False])
         selector.unregister.assert_not_called()
+        for invalid in ((True, 1), (1, True)):
+            self.assertRaises(
+                ValueError,
+                supervisor.cleanup_deadline,
+                invalid[0],
+                reserve_seconds=invalid[1],
+            )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            fake = Path(temporary_dir) / "fake-monitor.py"
+            fake.write_text("#!/usr/bin/python3\nimport os,sys\nfd=int(sys.argv[sys.argv.index('--status-fd')+1])\nos.write(fd,b'{\"schema\":1,\"status\":\"completed\",\"returncode\":0}\\n')\nraise SystemExit(9)\n", encoding="utf-8")
+            fake.chmod(0o755)
+            with mock.patch.object(supervisor, "_monitor_path", return_value=fake):
+                with self.assertRaises(supervisor.BackupCleanupUnproven):
+                    supervisor.run_database_command([sys.executable, "-c", "pass"], deadline=supervisor.operation_deadline(8))
 
     def test_namespace_setup_failure_publishes_status_before_target_spawn(self) -> None:
         from tools import platform_backup_process_monitor as monitor
 
+        with mock.patch.object(monitor.os, "kill") as kill:
+            with self.assertRaises(RuntimeError):
+                monitor._kill_all(monitor.signal.SIGTERM)
+            kill.assert_not_called()
         read_fd, write_fd = os.pipe()
         fake_libc = SimpleNamespace(unshare=lambda _flags: -1)
         with mock.patch.object(monitor, "_pdeath"), mock.patch.object(monitor.ctypes, "CDLL", return_value=fake_libc):
-            result = monitor._monitor(
+            monitor._monitor(
                 [sys.executable, "-c", "raise SystemExit(99)"], (), None, write_fd,
                 time.monotonic_ns() + 1_000_000_000, 0, None,
             )
         payload = os.read(read_fd, 4096)
         os.close(read_fd)
-        self.assertNotEqual(result, 0)
         self.assertIn(b"namespace_unavailable", payload)
 
     def test_caller_base_exception_closes_monitor_and_preserves_primary(self) -> None:
