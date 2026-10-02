@@ -93,6 +93,19 @@ def _cancelled(fd: int) -> bool:
         return exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR)
     except ValueError:
         return True
+
+
+def _forward_status(source: int, destination: int) -> bool:
+    try:
+        payload = os.read(source, STATUS_LIMIT + 1)
+        if not payload or len(payload) > STATUS_LIMIT or not payload.endswith(b"\n"):
+            return False
+        os.write(destination, payload)
+        return True
+    except OSError:
+        return False
+
+
 def _pid1(
     control: int, status_fd: int, command: list[str],
     pass_fds: tuple[int, ...], stdout_fd: int | None,
@@ -151,7 +164,7 @@ def _monitor(
     status_fd: int, cleanup_deadline: int, reserve: int,
     env: dict[str, str] | None,
 ) -> int:
-    control_write = -1
+    control_write = status_read = status_write = -1
     work_deadline = cleanup_deadline - reserve
     try:
         _pdeath(os.getppid())
@@ -159,14 +172,18 @@ def _monitor(
         if libc.unshare(CLONE_NEWPID) != 0:
             _emit(status_fd, "namespace_unavailable")
             return MONITOR_ERROR_EXIT
+        status_read, status_write = os.pipe()
         control_read, control_write = os.pipe()
         child = os.fork()
         if child == 0:
             os.close(control_write)
-            _pid1(control_read, status_fd, command, pass_fds, stdout_fd,
+            os.close(status_read)
+            _pid1(control_read, status_write, command, pass_fds, stdout_fd,
                   work_deadline, cleanup_deadline, env)
             os._exit(0)
         os.close(control_read)
+        os.close(status_write)
+        status_write = -1
         cancelled = cancel_sent = False
         os.set_blocking(0, False)
         os.set_blocking(control_write, False)
@@ -176,7 +193,8 @@ def _monitor(
             except InterruptedError:
                 continue
             if result == child:
-                return 0 if os.WIFEXITED(child_status) and os.WEXITSTATUS(child_status) == 0 else MONITOR_ERROR_EXIT
+                forwarded = _forward_status(status_read, status_fd)
+                return 0 if forwarded and os.WIFEXITED(child_status) and os.WEXITSTATUS(child_status) == 0 else MONITOR_ERROR_EXIT
             now = time.monotonic_ns()
             if not cancelled and now >= work_deadline:
                 cancelled = True
@@ -202,8 +220,13 @@ def _monitor(
                     os.kill(child, signal.SIGKILL)
                 except OSError:
                     pass
-                os.waitpid(child, 0)
-                return MONITOR_ERROR_EXIT
+                try:
+                    os.waitpid(child, 0)
+                except ChildProcessError:
+                    pass
+                if not _forward_status(status_read, status_fd):
+                    _emit(status_fd, "timeout", 124)
+                return 0
     except BaseException:
         _emit(status_fd, "monitor_error")
         return MONITOR_ERROR_EXIT
@@ -213,6 +236,12 @@ def _monitor(
                 os.close(control_write)
             except OSError:
                 pass
+        for fd in (status_read, status_write):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         try:
             os.close(status_fd)
         except OSError:

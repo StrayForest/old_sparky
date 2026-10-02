@@ -434,11 +434,12 @@ def _run_monitor_client(command: list[str], *, env: Mapping[str, str] | None, st
             process.wait()
             raise BackupCleanupUnproven("backup monitor did not finish cleanup")
         process.wait()
-        for _ in range(4):
+        while selector.get_map() and time.monotonic() < caller_deadline:
             _drain(selector, buffers, status, overflow)
-            if not selector.get_map():
-                break
-            selector.select(0)
+            if selector.get_map():
+                remaining = caller_deadline - time.monotonic()
+                if remaining > 0:
+                    selector.select(min(remaining, 0.02))
         parsed = _read_monitor_status(status, overflow[0])
         if process.returncode != 0:
             if parsed["status"] == "namespace_unavailable":
