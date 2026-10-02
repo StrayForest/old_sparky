@@ -351,27 +351,6 @@ jobs:
           sudo usermod -a -G oldsparky-media oldsparky-api
           sudo usermod -a -G oldsparky-media oldsparky-worker
           getent group oldsparky-media
-      - name: Diagnose trusted PostgreSQL helper paths
-        run: |
-          sudo -n env PATH=/usr/sbin:/usr/bin:/sbin:/bin bash -c '
-            set -u
-            for helper in runuser createdb dropdb psql pg_dump pg_restore; do
-              path="$(command -v "$helper" 2>/dev/null || true)"
-              if [ -z "$path" ]; then
-                echo "helper=$helper status=missing"
-                continue
-              fi
-              resolved="$(realpath -e -- "$path" 2>/dev/null || true)"
-              echo "helper=$helper path=$path resolved=$resolved"
-              stat -c "source=%n type=%F uid=%u gid=%g mode=%a" -- "$path" || true
-              if [ -n "$resolved" ]; then
-                stat -c "target=%n type=%F uid=%u gid=%g mode=%a" -- "$resolved" || true
-              fi
-              if command -v namei >/dev/null 2>&1; then
-                namei -l -- "$path" || true
-              fi
-            done
-          '
       - name: Run serial privileged catalog contour exactly once as root
         run: >-
           sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
