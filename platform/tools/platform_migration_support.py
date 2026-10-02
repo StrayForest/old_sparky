@@ -9,11 +9,18 @@ Alembic/SQLAlchemy only when a resource-bearing caller actually needs them.
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import ipaddress
+import os
 from pathlib import Path
+import re
+import selectors
+import signal
 import subprocess
-from typing import Sequence
+import time
+from typing import Mapping, Sequence
 from urllib.parse import urlsplit
 
 
@@ -22,7 +29,12 @@ ALEMBIC_INI = PLATFORM_ROOT / "alembic.ini"
 ALEMBIC_SCRIPT_LOCATION = PLATFORM_ROOT / "alembic"
 MIGRATION_SCHEMA = "platform"
 DISPOSABLE_DATABASE_NAME = "platformdb_test"
-MIGRATION_SUBPROCESS_TIMEOUT_SECONDS = 180.0
+MIGRATION_SCENARIO_DEADLINE_SECONDS = 180.0
+MIGRATION_GATE_TIMEOUT_SECONDS = 210.0
+MIGRATION_DIAGNOSTIC_BYTES = 4096
+
+_ACTIVE_DEADLINE: ContextVar[float | None] = ContextVar("platform_migration_deadline", default=None)
+_MIGRATION_ENV_KEYS = frozenset("PATH HOME LANG LC_ALL PYTHONPATH PLATFORM_ENVIRONMENT PLATFORM_DATABASE_URL PLATFORM_DB_SCHEMA PLATFORM_SECRET_KEY PLATFORM_REDIS_URL PLATFORM_OBJECT_STORAGE_BACKEND PLATFORM_DB_CONNECT_TIMEOUT_SECONDS PLATFORM_DB_COMMAND_TIMEOUT_SECONDS PLATFORM_DB_STATEMENT_TIMEOUT_MS PLATFORM_DB_LOCK_TIMEOUT_MS PLATFORM_ALEMBIC_DB_CONNECT_TIMEOUT_SECONDS PLATFORM_ALEMBIC_DB_COMMAND_TIMEOUT_SECONDS PLATFORM_ALEMBIC_DB_STATEMENT_TIMEOUT_MS PLATFORM_ALEMBIC_DB_LOCK_TIMEOUT_MS".split())
 
 
 class MigrationContractError(RuntimeError):
@@ -47,9 +59,9 @@ class MigrationCommandError(MigrationContractError):
         self.label = label
         self.command = tuple(command)
         self.returncode = returncode
-        self.output = output
+        self.output = _redact_diagnostic(output)
         super().__init__(
-            f"{label} returned {returncode}; output:\n{output[-4000:]}"
+            f"{label} returned {returncode}; output:\n{self.output}"
         )
 
 
@@ -61,16 +73,20 @@ class MigrationCommandTimeout(MigrationContractError):
         *,
         label: str,
         command: Sequence[str],
-        timeout_seconds: float = MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+        timeout_seconds: float = MIGRATION_SCENARIO_DEADLINE_SECONDS,
         output: str = "",
     ) -> None:
         self.label = label
         self.command = tuple(command)
         self.timeout_seconds = timeout_seconds
-        self.output = output
+        self.output = _redact_diagnostic(output)
         super().__init__(
-            f"{label} exceeded {timeout_seconds:g}s; output:\n{output[-4000:]}"
+            f"{label} exceeded {timeout_seconds:g}s; output:\n{self.output}"
         )
+
+
+class MigrationCleanupUnproven(MigrationContractError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,42 +357,132 @@ def assert_single_head_state(
     return state
 
 
+def _redact_diagnostic(output: object, env: Mapping[str, str] | None = None) -> str:
+    text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+    if env:
+        for key, value in env.items():
+            if value and re.search(r"PASSWORD|SECRET|TOKEN|PRIVATE|API[_-]?KEY|DATABASE_URL|REDIS_URL", key, re.I):
+                text = text.replace(value, "<redacted>")
+    text = re.sub(r"(?i)(password|secret|token|private[_-]?key|api[_-]?key)\s*[=:]\s*[^\s,;]+", r"\1=<redacted>", text)
+    return text[-MIGRATION_DIAGNOSTIC_BYTES:]
+
+
+def migration_command_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    return {key: value for key, value in (os.environ if env is None else env).items() if key in _MIGRATION_ENV_KEYS}
+
+
+@contextmanager
+def migration_scenario_deadline(seconds: float = MIGRATION_SCENARIO_DEADLINE_SECONDS):
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or seconds <= 0:
+        raise ValueError("migration scenario deadline must be positive")
+    deadline = time.monotonic() + float(seconds)
+    token = _ACTIVE_DEADLINE.set(deadline)
+    try:
+        yield deadline
+    finally:
+        _ACTIVE_DEADLINE.reset(token)
+
+
 def run_migration_subprocess(
     command: Sequence[str],
     *,
     label: str,
-    timeout_seconds: float = MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
-    env: dict[str, str] | None = None,
+    deadline: float | None = None,
+    timeout_seconds: float | None = None,
+    env: Mapping[str, str] | None = None,
     check: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one migration-owned subprocess with a typed hard timeout."""
+    """Run a controlled migration child under one absolute deadline."""
+    active = _ACTIVE_DEADLINE.get()
+    if active is not None and (deadline is not None or timeout_seconds is not None):
+        raise MigrationContractError("migration subprocesses must share one deadline")
+    timeout = MIGRATION_SCENARIO_DEADLINE_SECONDS if timeout_seconds is None else float(timeout_seconds)
+    deadline = active if active is not None else deadline or time.monotonic() + timeout
+    child_env = migration_command_env(env)
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    tail = bytearray()
+
+    def pump(until: float) -> bool:
+        while True:
+            for key, _ in selector.select(0):
+                stream = key.fileobj
+                try:
+                    chunk = os.read(stream.fileno(), 4096)
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    raise MigrationCleanupUnproven(f"{label} cleanup could not be proven") from exc
+                if chunk:
+                    tail.extend(chunk)
+                    del tail[:-MIGRATION_DIAGNOSTIC_BYTES]
+                else:
+                    selector.unregister(stream)
+                    stream.close()
+            if process.poll() is not None and not selector.get_map():
+                process.wait()
+                return True
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return False
+            selector.select(min(remaining, 0.05))
+
+    def stop() -> None:
+        if process is not None and process.poll() is None:
+            if deadline - time.monotonic() > 1.0:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                if pump(min(deadline, time.monotonic() + 1.0)):
+                    return
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        if not pump(deadline):
+            raise MigrationCleanupUnproven(
+                f"{label} cleanup could not be proven; {_redact_diagnostic(bytes(tail), child_env)}"
+            )
 
     try:
-        result = subprocess.run(
-            list(command),
-            cwd=PLATFORM_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=timeout_seconds,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        output = exc.stdout or exc.stderr or ""
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", errors="replace")
-        raise MigrationCommandTimeout(
-            label=label,
-            command=command,
-            timeout_seconds=timeout_seconds,
-            output=str(output),
-        ) from exc
-    if check and result.returncode:
-        raise MigrationCommandError(
-            label=label,
-            command=command,
-            returncode=result.returncode,
-            output=result.stdout,
-        )
-    return result
+        if deadline <= time.monotonic():
+            raise MigrationCommandTimeout(label=label, command=command, timeout_seconds=timeout)
+        try:
+            process = subprocess.Popen(list(command), cwd=PLATFORM_ROOT, env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, bufsize=0)
+        except OSError as exc:
+            raise MigrationCommandError(
+                label=label, command=command, returncode=-1,
+                output=f"{type(exc).__name__}: executable unavailable",
+            ) from exc
+        if process.stdout is None:
+            raise MigrationCleanupUnproven(f"{label} cleanup could not be proven")
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        if not pump(max(time.monotonic(), deadline - min(2.0, max(0.0, deadline - time.monotonic()) / 10))):
+            stop()
+            raise MigrationCommandTimeout(
+                label=label, command=command, timeout_seconds=timeout,
+                output=_redact_diagnostic(bytes(tail), child_env),
+            )
+        output = _redact_diagnostic(bytes(tail), child_env)
+        result = subprocess.CompletedProcess(list(command), process.returncode, output, None)
+        if check and result.returncode:
+            raise MigrationCommandError(
+                label=label, command=command, returncode=result.returncode, output=output,
+            )
+        return result
+    except BaseException as primary:
+        if process is not None and process.poll() is None:
+            try:
+                stop()
+            except BaseException as cleanup_error:
+                if hasattr(primary, "add_note"):
+                    primary.add_note("migration subprocess cleanup could not be proven")
+                raise primary from cleanup_error
+        raise
+    finally:
+        selector.close()
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
