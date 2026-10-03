@@ -12,9 +12,9 @@ generation.  The immutable path is:
 The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
-is the only source for `HOST_TOOLS_SHA`; the reviewed C3 change pins generation
-`8dc6e58b6d89830c284a32d26cf755056d4a5997`. This repository pin is not
-evidence that the generation is installed: production remains on C2 until a
+is the only source for `HOST_TOOLS_SHA`; the reviewed C4 change pins generation
+`7b87e2a996270e818f3b1f0c95c03fe98ab53916`. This repository pin is not
+evidence that the generation is installed: production remains on C3 until a
 root-console provisioning receipt verifies the new path. The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable

@@ -87,7 +87,7 @@ to `dev`. The chain is:
    `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` generation. It
    requires the configured SSH identity to be root and checks the generation's
    owner, mode, link count, type, capabilities and every digest with fixed
-   absolute tools. The C3 capability contract requires
+   absolute tools. The C4 generation retains the C3 capability contract:
    `dispatcher=3`, `supervisor=3`, `release_baseline=1` and
    `python_bytecode_disabled=1`; every immutable dispatcher call uses
    `/usr/bin/python3.12 -I -B`. This is a read-only gate: it never SCPs or executes the
@@ -222,9 +222,10 @@ revalidates the artifact and invokes the guarded release state machine. Record
 the Actions run URL/ID, target SHA, release slug and final smoke result in the
 handoff. Record both `TARGET_SHA` and `HOST_TOOLS_SHA` in the release receipt.
 
-The production Alembic wrapper keeps the exact `upgrade head` allowlist and,
-after the release transaction has quiesced writers, runs the catalog recovery
-helper. The helper acts only when `alembic_version` is exactly `20260901_0050`
+The production Alembic wrapper keeps the exact `upgrade head` allowlist. Its
+candidate-bound read-only revision check runs under quiesced locks before the
+catalog recovery helper, as defined by the [migration guard ADR](adr/candidate-forward-migration-guard.md).
+The helper acts only when `alembic_version` is exactly `20260901_0050`
 and a table matching the historical 0051 schema is present. It validates the
 table and constraints, idempotently backfills the projection, and repairs only
 invalid/unfinished concurrent indexes before stamping 0051. A valid index with
@@ -239,8 +240,7 @@ checked-in Alembic environment applies 30-second asyncpg connect and command
 bounds plus PostgreSQL `statement_timeout` and `lock_timeout` to each
 `current`, `heads` and `upgrade` command; recovery and preflight engines use
 the same settings. Strict environment overrides may only remain within this
-bounded contract. These are defense-in-depth within the same operation
-boundary. A timeout exits
+bounded contract; these are defense-in-depth within the same operation boundary. A timeout exits
 nonzero (124 from `timeout(1)`) while retaining the durable
 `migration-pending` receipt; operators must inspect the database and resume or
 abort through the release state machine rather than retrying or downgrading.
