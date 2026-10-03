@@ -159,7 +159,7 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         validation = jobs["validate-dispatch"]
         self.assertIn("if: ${{ always() }}", validation)
         self.assertIn('case "$DEPLOY_MODE" in', validation)
-        self.assertIn("preflight|deploy)", validation)
+        self.assertIn("preflight|deploy|baseline-reconcile)", validation)
         self.assertIn("platform_workflow_input_guard.py deployment", validation)
         for argument in (
             "--classifier-run-id",
