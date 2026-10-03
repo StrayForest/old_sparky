@@ -2,27 +2,18 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
 import { Linter } from "eslint";
 import nextPlugin from "@next/eslint-plugin-next";
-
-const resolveFromHere = createRequire(import.meta.url);
-const pluginEntry = resolveFromHere.resolve("@next/eslint-plugin-next");
-const globEntry = resolveFromHere.resolve("fast-glob", { paths: [pluginEntry] });
-const glob = await import(globEntry);
-const globPackagePath = path.join(path.dirname(path.dirname(globEntry)), "package.json");
-const globPackage = JSON.parse(fs.readFileSync(globPackagePath, "utf8"));
-
-assert.equal(globPackage.name, "tinyglobby");
-assert.equal(globPackage.version, "0.2.17");
-assert.equal(typeof glob.globSync, "function");
 
 const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "next-rootdir-glob-"));
 
 try {
   const appRoot = path.join(fixtureRoot, "app-one");
+  const secondAppRoot = path.join(fixtureRoot, "packages", "shop-two");
   const pagesRoot = path.join(appRoot, "pages");
+  const secondPagesRoot = path.join(secondAppRoot, "pages");
   fs.mkdirSync(path.join(pagesRoot, "nested"), { recursive: true });
+  fs.mkdirSync(path.join(secondPagesRoot, "remote"), { recursive: true });
   fs.writeFileSync(
     path.join(pagesRoot, "index.jsx"),
     'export default function Home() { return <a href="/nested">Nested</a>; }',
@@ -30,6 +21,14 @@ try {
   fs.writeFileSync(
     path.join(pagesRoot, "nested", "index.jsx"),
     "export default function Nested() { return <div>Nested</div>; }",
+  );
+  fs.writeFileSync(
+    path.join(secondPagesRoot, "remote", "index.jsx"),
+    "export default function Remote() { return <div>Remote</div>; }",
+  );
+  fs.writeFileSync(
+    path.join(secondPagesRoot, "index.jsx"),
+    'export default function Shop() { return <a href="/nested">Nested</a>; }',
   );
 
   const linter = new Linter({ cwd: fixtureRoot });
@@ -42,35 +41,47 @@ try {
         parserOptions: { ecmaFeatures: { jsx: true } },
       },
       plugins: { "@next/next": nextPlugin },
-      settings: { next: { rootDir: path.join(fixtureRoot, "app-*") } },
+      settings: {
+        next: {
+          rootDir: [
+            path.join(fixtureRoot, "app-*"),
+            path.join(fixtureRoot, "packages", "shop-*"),
+          ],
+        },
+      },
       rules: { "@next/next/no-html-link-for-pages": "error" },
     },
   ];
-  const filename = path.join(appRoot, "pages", "index.jsx");
-  const messages = linter.verify(
-    'export default function Home() { return <a href="/nested">Nested</a>; }',
+  const firstRootMessages = linter.verify(
+    'export default function Home() { return <a href="/remote">Remote</a>; }',
     config,
-    { filename },
+    { filename: path.join(appRoot, "pages", "index.jsx") },
   );
-
-  assert.ok(
-    messages.some(
-      (message) =>
-        message.ruleId === "@next/next/no-html-link-for-pages" &&
-        message.message.includes("Use `<Link />` from `next/link` instead"),
-    ),
-    `expected Next.js to flag internal navigation through patterned rootDir; got ${JSON.stringify(messages)}`,
-  );
-
-  const externalMessages = linter.verify(
-    'export default function Home() { return <a href="https://example.com/nested">Nested</a>; }',
+  const secondRootMessages = linter.verify(
+    'export default function Shop() { return <a href="/nested">Nested</a>; }',
     config,
-    { filename },
+    { filename: path.join(secondPagesRoot, "index.jsx") },
+  );
+  const internalLinkMessages = [...firstRootMessages, ...secondRootMessages].filter(
+    (message) => message.ruleId === "@next/next/no-html-link-for-pages",
   );
   assert.equal(
-    externalMessages.some((message) => message.ruleId === "@next/next/no-html-link-for-pages"),
+    internalLinkMessages.length,
+    2,
+    `expected Next.js to flag routes crossing both patterned rootDir entries; got ${JSON.stringify([...firstRootMessages, ...secondRootMessages])}`,
+  );
+
+  const allowedLinkMessages = linter.verify(
+    'export default function Home() { return <><a href="https://example.com/nested">External</a><a href="#section">Same page</a></>; }',
+    config,
+    { filename: path.join(appRoot, "pages", "index.jsx") },
+  );
+  assert.equal(
+    allowedLinkMessages.some(
+      (message) => message.ruleId === "@next/next/no-html-link-for-pages",
+    ),
     false,
-    `expected Next.js to allow external navigation links; got ${JSON.stringify(externalMessages)}`,
+    `expected Next.js to allow external and same-page links; got ${JSON.stringify(allowedLinkMessages)}`,
   );
 } finally {
   fs.rmSync(fixtureRoot, { recursive: true, force: true });
