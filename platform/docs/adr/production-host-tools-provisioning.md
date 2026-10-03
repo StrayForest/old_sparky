@@ -256,17 +256,17 @@ and `HOST_TOOLS_SHA=C` names the bytes installed at the generation path. Never
 require `TARGET_SHA == HOST_TOOLS_SHA`; verify the exact producer run,
 artifact identity, ancestry and closure instead.
 
-After the signed **C** bundle is installed and its receipt is recorded, the
-bootstrap-only range is activated through the automatic
-`mode=baseline-reconcile` path. That path validates the exact successful
-full-CI source, authenticates the current host release against its successful
-deployment proof, reclassifies the complete first-parent range and repeats the
-baseline check under both production locks before any write. A bootstrap-only
-range ends as a verified no-op; a mixed range proceeds only if the complete
-range satisfies the ordinary full deployable route, including runtime gates
-when required. An absent/mismatched generation or unproven baseline fails
-closed. The ordinary `mode=deploy` route is not manually dispatched to
-activate this bootstrap change.
+Provisioning **C** alone does not authorize an application release. Activation
+requires the separately reviewed Phase B baseline-reconcile capability. That
+capability is not available from the Phase A host-tools change alone; do not
+manually dispatch or assume that `mode=baseline-reconcile` is enabled until
+its workflow, pinned host code, exact tests and full CI have been reviewed and
+published. Phase B must authenticate the current host release against its
+successful deployment proof, reclassify the complete first-parent range and
+repeat the baseline check under both production locks before any write. A
+bootstrap-only range must end as a verified no-op; a mixed range may proceed
+only if the complete range satisfies the ordinary full deployable route,
+including runtime gates when required.
 
 ## Intentional host-tools bump lifecycle
 

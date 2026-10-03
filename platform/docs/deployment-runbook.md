@@ -41,11 +41,12 @@ to `dev`. The chain is:
    security run, validates its schema, digest, target SHA and non-fallback
    route, then consumes its `deployable` bit: a deployable `full` route
    proceeds while a valid full CI-only route completes as a no-op. A route
-   classified specifically as recovery-bootstrap-only may dispatch the
-   read-only `baseline-reconcile` mode; it cannot authorize normal deployment
-   unless that mode independently authenticates the active baseline and
-   classifies the complete baseline-to-target range as an ordinary deployable
-   full route. It then
+   classified specifically as recovery-bootstrap-only remains non-deployable
+   until the separately reviewed Phase B baseline-reconcile capability is
+   implemented and provisioned. That future read-only mode cannot authorize
+   normal deployment unless it independently authenticates the active baseline
+   and classifies the complete baseline-to-target range as an ordinary
+   deployable full route. It then
    re-reads the current `dev` HEAD and refuses a stale successful CI result.
    The source run and both status snapshots are
    checked by the shared dependency-free
@@ -57,9 +58,10 @@ to `dev`. The chain is:
    object. It then requires `platform-security-build=success` and skips a SHA that already
    reports `platform-production-deploy=success` only when the matching
    successful deploy attempt has its exact bot-authored marker.
-4. Auto-deploy dispatches `mode=deploy` for ordinary full routes or
-   `mode=baseline-reconcile` for recovery-bootstrap-only routes; reconciliation
-   may deploy only after independent baseline reclassification passes.
+4. The current automatic chain dispatches `mode=deploy` only for ordinary
+   deployable full routes. A recovery-bootstrap-only route is a no-op/hold
+   until the Phase B baseline-reconcile capability is separately implemented,
+   reviewed and provisioned.
 5. A secret-free prerequisite independently downloads and validates the exact
    classifier artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
@@ -101,30 +103,17 @@ to `dev`. The chain is:
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
 
-### Recovery-bootstrap baseline reconciliation
+### Planned Phase B: recovery-bootstrap baseline reconciliation
 
-`baseline-reconcile` is automatic-chain-only and requires exact full CI. Its
-bootstrap-only classifier artifact remains non-authorizing. The pinned
-immutable host helper reads the root-owned current-release identity and
-pending-transaction state; the workflow validates the exact successful deploy
-proof for that SHA and reclassifies the complete first-parent baseline-to-target
-range. It never runs tools from the active or candidate release.
-
-A bootstrap-only range ends as a verified no-op. A mixed range may continue
-through the same run's normal build and deployment only after it independently
-passes the ordinary deployable full-route check. Under the canonical release
-and retained-load locks, the immutable supervisor re-reads the full host
-identity and requires a clean state, unchanged target SHA and unchanged
-baseline before it launches candidate code. Missing or ambiguous proof,
-pending transaction or changed source fails closed; use the documented
-recovery/rollback procedure. Reconciliation considers only the source reported
-by the active host, which must have its own exact successful deploy proof
-after rollback. See the
-[ADR](adr/recovery-bootstrap-retained-abort.md#authenticated-baseline-reconciliation-for-bootstrap-only-source-ranges)
-for the proof and tuple contract, and
-[production host-tools provisioning](adr/production-host-tools-provisioning.md)
-for the required C→P, signed preflight-artifact, out-of-band provisioning and
-baseline-activation sequence.
+This capability is not implemented or available from Phase A. Do not manually
+dispatch or attempt to activate it. If separately reviewed, merged and
+provisioned, it will require exact full CI, an authenticated active-release
+baseline, complete first-parent reclassification and a lock-held host-state
+recheck. Missing, ambiguous or changed state must fail closed; bootstrap-only
+ranges remain a verified no-op. See the
+[baseline-reconcile ADR](adr/recovery-bootstrap-retained-abort.md#authenticated-baseline-reconciliation-for-bootstrap-only-source-ranges)
+and [host-tools provisioning ADR](adr/production-host-tools-provisioning.md)
+for the full contracts and C/P provenance.
 
 ### Non-deployable pull-request host-tools candidate
 

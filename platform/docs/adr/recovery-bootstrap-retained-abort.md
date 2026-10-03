@@ -154,13 +154,19 @@ cleanup authority.
 
 ## Authenticated baseline reconciliation for bootstrap-only source ranges
 
+Status: proposed Phase B capability; not implemented or available for use.
+This section specifies a future, separately reviewed authorization path. Until
+its workflow and pinned host implementation are merged, fully gated, and
+provisioned, a bootstrap-only range remains non-deployable and must not be
+activated by manual workflow dispatch.
+
 A successful recovery-bootstrap-only classifier artifact is not deployment
-authority. It may enter only the `baseline-reconcile` mode of the existing
-production deploy workflow, and only after the exact target SHA has passed the
-full `Platform security and build` gates. This mode does not accept operator
-supplied source identities, does not use the target release's tools to inspect
-the active release, and cannot publish a successful deployment marker by
-itself.
+authority. If Phase B is implemented, its automatic chain may enter only the
+`baseline-reconcile` mode of the production deploy workflow, and only after the
+exact target SHA has passed the full `Platform security and build` gates. That
+mode must not accept operator-supplied source identities, use target-release
+tools to inspect the active release, or publish a successful deployment
+marker by itself.
 
 The workflow obtains the active release source SHA and transaction state from a
 new, read-only command in the pinned immutable host-tools generation. That
