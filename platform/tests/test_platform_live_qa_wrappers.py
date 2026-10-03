@@ -53,6 +53,27 @@ BROWSER_WRAPPERS = WRAPPERS[1:3]
 
 
 class LiveQaWrapperContractTests(unittest.TestCase):
+    def test_release_baseline_input_requires_an_exact_integer_schema(self) -> None:
+        valid = {
+            "schema": 1,
+            "source_sha": "a" * 40,
+            "release_slug": "gha-35511236041-1-87547df2abd4",
+            "release_json_sha256": "b" * 64,
+            "current_link_dev": 1,
+            "current_link_ino": 2,
+            "release_dev": 3,
+            "release_ino": 4,
+            "pending_operation": False,
+        }
+        self.assertEqual(
+            platform_workflow_input_guard.validate_release_baseline_payload(valid),
+            valid,
+        )
+        with self.assertRaises(WorkflowInputError):
+            platform_workflow_input_guard.validate_release_baseline_payload(
+                {**valid, "schema": True}
+            )
+
     def test_host_tools_handoff_is_closed_and_binds_contract(self) -> None:
         valid = {
             "schema": 1,

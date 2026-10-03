@@ -494,7 +494,11 @@ def validate_release_baseline_payload(payload: Mapping[str, Any]) -> dict[str, A
         "pending_operation",
     }
     _require_exact_keys(payload, keys)
-    if payload.get("schema") != 1 or payload.get("pending_operation") is not False:
+    if (
+        type(payload.get("schema")) is not int
+        or payload.get("schema") != 1
+        or payload.get("pending_operation") is not False
+    ):
         raise _invalid()
     source_sha = _require_string(payload, "source_sha")
     release_slug = _require_string(payload, "release_slug")
