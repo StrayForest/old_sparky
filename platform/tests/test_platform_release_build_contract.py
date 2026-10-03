@@ -2432,8 +2432,9 @@ cleanup
 
         with tempfile.TemporaryDirectory(prefix="host-handoff-owner-") as temporary:
             root = Path(temporary)
-            root.chmod(0o777)
-            handoff_path = root / "handoff.json"
+            root.chmod(0o711)
+            handoff_dir = root / "runner-owned"
+            handoff_dir.mkdir()
             drop_privileges = None
             if os.geteuid() == 0:
                 import pwd
@@ -2446,8 +2447,11 @@ cleanup
                     os.setuid(unprivileged.pw_uid)
 
                 expected_uid = unprivileged.pw_uid
+                os.chown(handoff_dir, unprivileged.pw_uid, unprivileged.pw_gid)
             else:
                 expected_uid = os.geteuid()
+            handoff_dir.chmod(0o700)
+            handoff_path = handoff_dir / "handoff.json"
 
             writer = (
                 "import sys; "
@@ -2525,11 +2529,11 @@ cleanup
             handoff_path.chmod(0o640)
             self.assertNotEqual(check_handoff(handoff_path).returncode, 0)
             handoff_path.chmod(0o600)
-            hard_link = root / "handoff-hard-link.json"
+            hard_link = handoff_dir / "handoff-hard-link.json"
             os.link(handoff_path, hard_link)
             self.assertNotEqual(check_handoff(handoff_path).returncode, 0)
             hard_link.unlink()
-            symlink = root / "handoff-symlink.json"
+            symlink = handoff_dir / "handoff-symlink.json"
             symlink.symlink_to(handoff_path)
             self.assertNotEqual(check_handoff(symlink).returncode, 0)
 
