@@ -917,7 +917,12 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
     def test_deploy_marker_capture_keeps_bounded_timeout_cleanup(self) -> None:
         expected = ("deploy", "gha-123456-2-aaaaaaaaaaaa", "a" * 40)
-        child_code = "import os\nwhile True: os.write(1, b'x' * 4096)"
+        child_code = (
+            "import os,time\n"
+            "while True:\n"
+            " try: os.write(1, b'x' * 4096)\n"
+            " except BrokenPipeError: time.sleep(30)\n"
+        )
         stdout = StringIO()
         with redirect_stdout(stdout):
             result = platform_workflow_remote_dispatch._run_bounded_child(
@@ -930,7 +935,12 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
     def test_deploy_marker_selector_failure_terminates_and_closes_child(self) -> None:
         expected = ("deploy", "gha-123456-2-aaaaaaaaaaaa", "a" * 40)
-        child_code = "import os\nwhile True: os.write(1, b'x' * 4096)"
+        child_code = (
+            "import os,time\n"
+            "while True:\n"
+            " try: os.write(1, b'x' * 4096)\n"
+            " except BrokenPipeError: time.sleep(30)\n"
+        )
         children: list[subprocess.Popen[bytes]] = []
         real_popen = platform_workflow_remote_dispatch.subprocess.Popen
 
