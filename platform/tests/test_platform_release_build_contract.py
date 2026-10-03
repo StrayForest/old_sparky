@@ -2551,6 +2551,149 @@ cleanup
                 root_owned.chmod(0o600)
                 self.assertNotEqual(check_handoff(root_owned).returncode, 0)
 
+    def test_host_tools_handoff_digest_matches_action_and_api_formats(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        deploy = self._workflow_step_run(
+            workflow, "Revalidate host-tools contract before production side effects"
+        )
+        self.assertIn(
+            "host_tools_handoff_artifact_digest: ${{ steps.publish-host-tools-handoff.outputs.artifact-digest }}",
+            workflow,
+        )
+        action_digest_check = re.search(
+            r'^\[\[ "\$HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST" =~ (?P<pattern>.+?) \]\]$',
+            deploy,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(action_digest_check)
+        self.assertEqual(action_digest_check.group("pattern"), r"^[0-9a-f]{64}$")
+
+        with tempfile.TemporaryDirectory(prefix="host-tools-action-digest-") as temporary:
+            handoff_path = Path(temporary) / "handoff.json"
+            from tools.platform_workflow_input_guard import main as input_guard_main
+
+            artifact_id = "123456"
+            run_id = artifact_id
+            attempt = "2"
+            target_sha = "a" * 40
+            raw_digest = "c" * 64
+            self.assertEqual(
+                input_guard_main(
+                    [
+                        "host-tools",
+                        "--output",
+                        str(handoff_path),
+                        "--target-sha",
+                        target_sha,
+                        "--host-tools-sha",
+                        "b" * 40,
+                        "--artifact-id",
+                        artifact_id,
+                        "--artifact-name",
+                        f"platform-host-tools-bundle-{run_id}-{attempt}",
+                        "--artifact-size",
+                        "4096",
+                        "--artifact-digest",
+                        raw_digest,
+                        "--bundle-sha256",
+                        "d" * 64,
+                        "--manifest-sha256",
+                        "e" * 64,
+                        "--capabilities-sha256",
+                        "f" * 64,
+                        "--files-contract-sha256",
+                        "0" * 64,
+                        "--modes-contract-sha256",
+                        "1" * 64,
+                        "--signer-workflow",
+                        "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml",
+                        "--source-ref",
+                        "refs/heads/dev",
+                        "--source-digest",
+                        target_sha,
+                        "--attestation-run-id",
+                        run_id,
+                        "--attestation-run-attempt",
+                        attempt,
+                        "--attestation-job-id",
+                        "654321",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(json.loads(handoff_path.read_text())["artifact_digest"], raw_digest)
+
+            shell_check = (
+                '[[ "$HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST" =~ '
+                f'{action_digest_check.group("pattern")} ]]'
+            )
+            accepted_action_digest = subprocess.run(
+                ["bash", "-c", shell_check],
+                env={**os.environ, "HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST": raw_digest},
+                check=False,
+            )
+            self.assertEqual(accepted_action_digest.returncode, 0)
+            prefixed_action_digest = subprocess.run(
+                ["bash", "-c", shell_check],
+                env={
+                    **os.environ,
+                    "HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST": f"sha256:{raw_digest}",
+                },
+                check=False,
+            )
+            self.assertNotEqual(prefixed_action_digest.returncode, 0)
+
+            parser_match = re.search(
+                r'/usr/bin/python3 - "\$handoff_metadata".*?<<\'PY\'\n(?P<script>.*?)\nPY\n',
+                deploy,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(parser_match)
+            parser = textwrap.dedent(parser_match.group("script"))
+            metadata_path = Path(temporary) / "api-artifact.json"
+            metadata = {
+                "id": int(artifact_id),
+                "name": f"platform-host-tools-handoff-{run_id}-{attempt}",
+                "expired": False,
+                "digest": f"sha256:{raw_digest}",
+                "workflow_run": {
+                    "id": int(run_id),
+                    "run_attempt": int(attempt),
+                    "head_sha": target_sha,
+                    "head_branch": "dev",
+                },
+            }
+
+            def validate_api_metadata() -> subprocess.CompletedProcess[str]:
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                return subprocess.run(
+                    [
+                        "/usr/bin/python3",
+                        "-c",
+                        parser,
+                        str(metadata_path),
+                        artifact_id,
+                        raw_digest,
+                        run_id,
+                        attempt,
+                        target_sha,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            accepted_api_digest = validate_api_metadata()
+            self.assertEqual(accepted_api_digest.returncode, 0, accepted_api_digest.stderr)
+            metadata["digest"] = "sha256:" + "9" * 64
+            rejected_api_digest = validate_api_metadata()
+            self.assertNotEqual(rejected_api_digest.returncode, 0)
+            metadata["digest"] = raw_digest
+            rejected_unprefixed_api_digest = validate_api_metadata()
+            self.assertNotEqual(rejected_unprefixed_api_digest.returncode, 0)
+
     def test_external_load_checked_out_client_has_no_ssh_material_or_persisted_creds(
         self,
     ) -> None:
