@@ -2251,6 +2251,7 @@ jobs:
       security_ready: ${{ steps.security_provenance.outputs.security_ready }}
       security_digest: ${{ steps.security_provenance.outputs.security_digest }}
     if: >-
+      !cancelled() &&
       needs.validate-dispatch.result == 'success' &&
       needs.build-release.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
