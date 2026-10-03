@@ -16,6 +16,10 @@ from python_packages.platform_infra.models import (
     User,
 )
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_integration_password import (
+    INTEGRATION_PASSWORD,
+    patch_integration_registration_hash,
+)
 
 
 class PlatformTournamentParticipantExclusionIntegrationTests(
@@ -23,7 +27,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
 ):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-exclude-{uuid4().hex[:8]}"
-        self.password = "integration-pass-123"
+        self.password = INTEGRATION_PASSWORD
         self.base_url = "http://testserver"
         self.app = create_app()
         self.clients = AsyncExitStack()
@@ -77,17 +81,18 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
     async def _register_user(self, label: str) -> dict[str, object]:
         client = await self._new_client()
         email = f"{self.prefix}-{label}@example.com"
-        payload = self._assert_status(
-            await client.post(
-                "/api/v1/auth/register",
-                json={
-                    "email": email,
-                    "password": self.password,
-                    "display_name": f"exclude-{label}"[:15],
-                },
-            ),
-            201,
-        )
+        with patch_integration_registration_hash():
+            payload = self._assert_status(
+                await client.post(
+                    "/api/v1/auth/register",
+                    json={
+                        "email": email,
+                        "password": self.password,
+                        "display_name": f"exclude-{label}"[:15],
+                    },
+                ),
+                201,
+            )
         return {
             "client": client,
             "user_id": payload["user"]["id"],

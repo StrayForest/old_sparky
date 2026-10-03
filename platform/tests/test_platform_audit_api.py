@@ -12,6 +12,10 @@ from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import AuditLog, User
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_integration_password import (
+    INTEGRATION_PASSWORD,
+    patch_integration_registration_hash,
+)
 
 
 class PlatformAuditApiTests(PlatformIsolatedAsyncioTestCase):
@@ -48,14 +52,15 @@ class PlatformAuditApiTests(PlatformIsolatedAsyncioTestCase):
 
     async def _register(self, label: str) -> tuple[httpx.AsyncClient, str]:
         client = await self._client()
-        response = await client.post(
-            "/api/v1/auth/register",
-            json={
-                "email": f"{self.prefix}-{label}@example.com",
-                "password": "integration-pass-123",
-                "display_name": f"audit-{label}",
-            },
-        )
+        with patch_integration_registration_hash():
+            response = await client.post(
+                "/api/v1/auth/register",
+                json={
+                    "email": f"{self.prefix}-{label}@example.com",
+                    "password": INTEGRATION_PASSWORD,
+                    "display_name": f"audit-{label}",
+                },
+            )
         self.assertEqual(response.status_code, 201, response.text)
         return client, response.json()["user"]["id"]
 

@@ -11,12 +11,16 @@ from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import AuditLog, Tournament, User
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_integration_password import (
+    INTEGRATION_PASSWORD,
+    patch_integration_registration_hash,
+)
 
 
 class PlatformPublicDataBoundaryTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-as05-{uuid4().hex[:8]}"
-        self.password = "integration-pass-123"
+        self.password = INTEGRATION_PASSWORD
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup_test_data()
@@ -58,14 +62,15 @@ class PlatformPublicDataBoundaryTests(PlatformIsolatedAsyncioTestCase):
 
     async def _register_user(self, label: str) -> dict[str, object]:
         client = await self._new_client()
-        response = await client.post(
-            "/api/v1/auth/register",
-            json={
-                "email": f"{self.prefix}-{label}@example.com",
-                "password": self.password,
-                "display_name": f"as05-{label}"[:15],
-            },
-        )
+        with patch_integration_registration_hash():
+            response = await client.post(
+                "/api/v1/auth/register",
+                json={
+                    "email": f"{self.prefix}-{label}@example.com",
+                    "password": self.password,
+                    "display_name": f"as05-{label}"[:15],
+                },
+            )
         self.assertEqual(response.status_code, 201, response.text)
         payload = response.json()
         return {

@@ -23,12 +23,16 @@ from python_packages.platform_infra.models import (
     UserRole,
 )
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_integration_password import (
+    INTEGRATION_PASSWORD,
+    patch_integration_registration_hash,
+)
 
 
 class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-bg-{uuid4().hex[:8]}"
-        self.password = "integration-pass-123"
+        self.password = INTEGRATION_PASSWORD
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup()
@@ -74,17 +78,18 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
 
     async def _register(self, label: str) -> dict[str, object]:
         client = await self._client()
-        payload = self._payload(
-            await client.post(
-                "/api/v1/auth/register",
-                json={
-                    "email": f"{self.prefix}-{label}@example.com",
-                    "password": self.password,
-                    "display_name": f"test-{label}"[:15],
-                },
-            ),
-            201,
-        )
+        with patch_integration_registration_hash():
+            payload = self._payload(
+                await client.post(
+                    "/api/v1/auth/register",
+                    json={
+                        "email": f"{self.prefix}-{label}@example.com",
+                        "password": self.password,
+                        "display_name": f"test-{label}"[:15],
+                    },
+                ),
+                201,
+            )
         return {"client": client, "user_id": payload["user"]["id"]}
 
     async def _grant_role(self, user_id: str, role_slug: str) -> None:
