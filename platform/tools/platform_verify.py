@@ -499,6 +499,16 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
                 ],
             ),
             (
+                "web-quality/next-rootdir-glob",
+                [
+                    _tool("platform_web_npm.sh"),
+                    "--prefix",
+                    "apps/platform_web",
+                    "run",
+                    "test:next-rootdir-glob",
+                ],
+            ),
+            (
                 "web-quality/dependency-audit",
                 [_tool("platform_web_npm.sh"), "--prefix", "apps/platform_web", "audit", "--audit-level=high"],
             ),
