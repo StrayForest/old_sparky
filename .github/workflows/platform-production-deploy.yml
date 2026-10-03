@@ -1053,24 +1053,29 @@ jobs:
           build = "https://github.com/StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev"
           repo = "https://github.com/StrayForest/old_sparky"
           runner = f"https://github.com/StrayForest/old_sparky/actions/runs/{run_id}/attempts/{attempt}"
+          matches = 0
           for item in values:
               if not isinstance(item, dict):
                   continue
               result = item.get("verificationResult")
               signature = result.get("signature") if isinstance(result, dict) else None
               certificate = signature.get("certificate") if isinstance(signature, dict) else None
-              extensions = certificate.get("extensions") if isinstance(certificate, dict) else None
+              claims = (
+                  certificate.get("extensions", certificate)
+                  if isinstance(certificate, dict)
+                  else None
+              )
               statement = result.get("statement") if isinstance(result, dict) else None
-              if not isinstance(extensions, dict) or not isinstance(statement, dict):
+              if not isinstance(claims, dict) or not isinstance(statement, dict):
                   continue
               if (
-                  extensions.get("issuer") != "https://token.actions.githubusercontent.com"
-                  or extensions.get("sourceRepositoryURI") != repo
-                  or extensions.get("sourceRepositoryRef") != "refs/heads/dev"
-                  or extensions.get("sourceRepositoryDigest") != source
-                  or extensions.get("buildConfigURI") != build
-                  or extensions.get("buildSignerURI") != build
-                  or extensions.get("runInvocationURI") != runner
+                  claims.get("issuer") != "https://token.actions.githubusercontent.com"
+                  or claims.get("sourceRepositoryURI") != repo
+                  or claims.get("sourceRepositoryRef") != "refs/heads/dev"
+                  or claims.get("sourceRepositoryDigest") != source
+                  or claims.get("buildConfigURI") != build
+                  or claims.get("buildSignerURI") != build
+                  or claims.get("runInvocationURI") != runner
               ):
                   continue
               subjects = statement.get("subject")
@@ -1078,8 +1083,8 @@ jobs:
                   continue
               digest = subjects[0].get("digest")
               if isinstance(digest, dict) and set(digest) == {"sha256"} and digest.get("sha256") == expected_bundle:
-                  break
-          else:
+                  matches += 1
+          if matches != 1:
               raise SystemExit("host-tools attestation certificate/source/run/subject policy failed")
           PY
           handoff="$RUNNER_TEMP/platform-host-tools-handoff.json"
@@ -2515,25 +2520,29 @@ jobs:
           build_uri = "https://github.com/StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev"
           repository_uri = "https://github.com/StrayForest/old_sparky"
           invocation_uri = f"https://github.com/StrayForest/old_sparky/actions/runs/{attestation_run_id}/attempts/{attestation_attempt}"
-          attestation_ok = False
+          attestation_matches = 0
           for item in attestations:
               if not isinstance(item, dict):
                   continue
               result = item.get("verificationResult")
               signature = result.get("signature") if isinstance(result, dict) else None
               certificate = signature.get("certificate") if isinstance(signature, dict) else None
-              extensions = certificate.get("extensions") if isinstance(certificate, dict) else None
+              claims = (
+                  certificate.get("extensions", certificate)
+                  if isinstance(certificate, dict)
+                  else None
+              )
               statement = result.get("statement") if isinstance(result, dict) else None
-              if not isinstance(extensions, dict) or not isinstance(statement, dict):
+              if not isinstance(claims, dict) or not isinstance(statement, dict):
                   continue
               if (
-                  extensions.get("issuer") != "https://token.actions.githubusercontent.com"
-                  or extensions.get("sourceRepositoryURI") != repository_uri
-                  or extensions.get("sourceRepositoryRef") != source_ref
-                  or extensions.get("sourceRepositoryDigest") != target_sha
-                  or extensions.get("buildConfigURI") != build_uri
-                  or extensions.get("buildSignerURI") != build_uri
-                  or extensions.get("runInvocationURI") != invocation_uri
+                  claims.get("issuer") != "https://token.actions.githubusercontent.com"
+                  or claims.get("sourceRepositoryURI") != repository_uri
+                  or claims.get("sourceRepositoryRef") != source_ref
+                  or claims.get("sourceRepositoryDigest") != target_sha
+                  or claims.get("buildConfigURI") != build_uri
+                  or claims.get("buildSignerURI") != build_uri
+                  or claims.get("runInvocationURI") != invocation_uri
               ):
                   continue
               subjects = statement.get("subject")
@@ -2541,9 +2550,8 @@ jobs:
                   continue
               digest = subjects[0].get("digest")
               if isinstance(digest, dict) and set(digest) == {"sha256"} and digest.get("sha256") == bundle_sha:
-                  attestation_ok = True
-                  break
-          if not attestation_ok:
+                  attestation_matches += 1
+          if attestation_matches != 1:
               raise SystemExit("host-tools attestation certificate/source/run/subject policy failed")
 
           expected_files = {

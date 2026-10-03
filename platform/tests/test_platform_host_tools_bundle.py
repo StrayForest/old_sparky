@@ -12,6 +12,7 @@ import resource
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import threading
@@ -416,6 +417,181 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertIn('--target-sha "$TARGET_SHA"', verification)
         self.assertIn('--expected-repository "$EXPECTED_REPOSITORY"', verification)
         self.assertIn("test ! -e \"$pin_output\"", verification)
+
+    def test_host_attestation_policy_accepts_flat_verified_certificate_claims(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
+            "  build-release:", 1
+        )[0]
+        handoff_steps = [
+            step
+            for step in _workflow_step_blocks(preflight)
+            if "- name: Create closed host-tools handoff after final verification" in step
+        ]
+        self.assertEqual(len(handoff_steps), 1)
+        marker = (
+            "          /usr/bin/python3 - \"$attestation_json\" \"$bundle_sha256\" "
+            "\"$GITHUB_RUN_ID\" \"$GITHUB_RUN_ATTEMPT\" \"$TARGET_SHA\" "
+            "\"$HOST_TOOLS_ARTIFACT_NAME\" <<'PY'\n"
+        )
+        self.assertIn(marker, handoff_steps[0])
+        policy = handoff_steps[0].split(marker, 1)[1].split("\n          PY", 1)[0]
+        policy = "\n".join(
+            line[10:] if line.startswith("          ") else line
+            for line in policy.splitlines()
+        )
+        production = workflow.split("  production:", 1)[1]
+        self.assertEqual(handoff_steps[0].count('certificate.get("extensions", certificate)'), 1)
+        self.assertEqual(production.count('certificate.get("extensions", certificate)'), 1)
+        production_policy_start = production.index("          attestation_matches = 0\n")
+        production_policy_end = production.index("\n          expected_files = {", production_policy_start)
+        production_policy = "\n".join(
+            line[10:] if line.startswith("          ") else line
+            for line in production[production_policy_start:production_policy_end].splitlines()
+        )
+
+        source_sha = "a" * 40
+        bundle_sha = "b" * 64
+        run_id = "123456789"
+        attempt = "2"
+        artifact_name = f"platform-host-tools-bundle-{run_id}-{attempt}"
+        build_uri = (
+            "https://github.com/StrayForest/old_sparky/.github/workflows/"
+            "platform-production-deploy.yml@refs/heads/dev"
+        )
+        stale_result = {
+            "verificationResult": {
+                "signature": {
+                    "certificate": {
+                        "issuer": "https://token.actions.githubusercontent.com",
+                        "sourceRepositoryURI": "https://github.com/StrayForest/old_sparky",
+                        "sourceRepositoryRef": "refs/heads/dev",
+                        "sourceRepositoryDigest": "c" * 40,
+                        "buildConfigURI": build_uri,
+                        "buildSignerURI": build_uri,
+                        "runInvocationURI": "https://github.com/StrayForest/old_sparky/actions/runs/1/attempts/1",
+                    }
+                },
+                "statement": {"subject": [{"digest": {"sha256": bundle_sha}}]},
+            }
+        }
+        current_result = {
+            "verificationResult": {
+                "signature": {
+                    "certificate": {
+                        "issuer": "https://token.actions.githubusercontent.com",
+                        "sourceRepositoryURI": "https://github.com/StrayForest/old_sparky",
+                        "sourceRepositoryRef": "refs/heads/dev",
+                        "sourceRepositoryDigest": source_sha,
+                        "buildConfigURI": build_uri,
+                        "buildSignerURI": build_uri,
+                        "runInvocationURI": (
+                            "https://github.com/StrayForest/old_sparky/actions/runs/"
+                            f"{run_id}/attempts/{attempt}"
+                        ),
+                    }
+                },
+                "statement": {"subject": [{"digest": {"sha256": bundle_sha}}]},
+            }
+        }
+        legacy_stale_result = json.loads(json.dumps(stale_result))
+        legacy_current_result = json.loads(json.dumps(current_result))
+        for legacy_result in (legacy_stale_result, legacy_current_result):
+            certificate = legacy_result["verificationResult"]["signature"]["certificate"]
+            legacy_result["verificationResult"]["signature"]["certificate"] = {
+                "extensions": certificate
+            }
+
+        def changed_result(path: tuple[object, ...], value: object) -> dict[str, object]:
+            changed = json.loads(json.dumps(current_result))
+            target: object = changed
+            for part in path[:-1]:
+                target = target[part]  # type: ignore[index]
+            target[path[-1]] = value  # type: ignore[index]
+            return changed
+
+        arguments = [
+            bundle_sha,
+            run_id,
+            attempt,
+            source_sha,
+            artifact_name,
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            attestation_path = Path(temporary) / "verified-attestations.json"
+
+            def run_policy(values: list[dict[str, object]]) -> subprocess.CompletedProcess[str]:
+                attestation_path.write_text(json.dumps(values), encoding="utf-8")
+                return subprocess.run(
+                    [sys.executable, "-c", policy, str(attestation_path), *arguments],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            result = run_policy([stale_result, current_result])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            legacy_result = run_policy([legacy_stale_result, legacy_current_result])
+            self.assertEqual(legacy_result.returncode, 0, legacy_result.stderr)
+            duplicate_result = run_policy([current_result, current_result])
+            self.assertNotEqual(duplicate_result.returncode, 0)
+            for invalid_result in (
+                changed_result(
+                    ("verificationResult", "signature", "certificate", "sourceRepositoryDigest"),
+                    "c" * 40,
+                ),
+                changed_result(
+                    ("verificationResult", "signature", "certificate", "runInvocationURI"),
+                    "https://github.com/StrayForest/old_sparky/actions/runs/9/attempts/1",
+                ),
+                changed_result(
+                    ("verificationResult", "statement", "subject", 0, "digest", "sha256"),
+                    "d" * 64,
+                ),
+            ):
+                self.assertNotEqual(run_policy([invalid_result]).returncode, 0)
+
+        def run_production_policy(values: list[dict[str, object]]) -> None:
+            namespace = {
+                "attestations": values,
+                "build_uri": build_uri,
+                "repository_uri": "https://github.com/StrayForest/old_sparky",
+                "invocation_uri": (
+                    "https://github.com/StrayForest/old_sparky/actions/runs/"
+                    f"{run_id}/attempts/{attempt}"
+                ),
+                "source_ref": "refs/heads/dev",
+                "target_sha": source_sha,
+                "bundle_sha": bundle_sha,
+            }
+            exec(production_policy, namespace)
+
+        run_production_policy([stale_result, current_result])
+        run_production_policy([legacy_stale_result, legacy_current_result])
+        with self.assertRaisesRegex(
+            SystemExit, "host-tools attestation certificate/source/run/subject policy failed"
+        ):
+            run_production_policy([current_result, current_result])
+        for invalid_result in (
+            changed_result(
+                ("verificationResult", "signature", "certificate", "sourceRepositoryDigest"),
+                "c" * 40,
+            ),
+            changed_result(
+                ("verificationResult", "signature", "certificate", "runInvocationURI"),
+                "https://github.com/StrayForest/old_sparky/actions/runs/9/attempts/1",
+            ),
+            changed_result(
+                ("verificationResult", "statement", "subject", 0, "digest", "sha256"),
+                "d" * 64,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                SystemExit, "host-tools attestation certificate/source/run/subject policy failed"
+            ):
+                run_production_policy([invalid_result])
 
     def _source_fixture(self, root: Path) -> Path:
         source_root = root / "source"
