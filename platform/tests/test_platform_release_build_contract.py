@@ -1725,6 +1725,78 @@ fail 'private stderr must not cross the public channel'
         ).read_text(encoding="utf-8")
         self.assertIn("phase=(artifact|provenance|preflight|candidate|readiness)", workflow)
         self.assertIn("reason=(internal|host_tools_invalid|lock|environment", workflow)
+        self.assertIn(
+            "lock_stage=(helper_metadata|release_supervise|release_open|retained_supervise|retained_open)",
+            workflow,
+        )
+
+    def test_supervisor_lock_marker_reports_only_closed_boundary_and_clears_stage(self) -> None:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        marker_start = supervisor.index('failure_class="preflight"')
+        marker_end = supervisor.index("\nvalidate_systemctl_binary()", marker_start)
+        marker_functions = supervisor[marker_start:marker_end]
+        fixture = f"""set -u
+target_sha={'a' * 40}
+release_slug=gha-10917370996-1-aaaaaaaaaaaa
+{marker_functions}
+set +e
+set_lock_failure_context release_open
+fail 'private lock detail must not cross the public channel'
+"""
+        failed_lock = subprocess.run(
+            ["/bin/bash"],
+            input=fixture,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(failed_lock.returncode, 1)
+        self.assertEqual(
+            failed_lock.stdout,
+            "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+            "phase=preflight reason=lock lock_stage=release_open "
+            f"release_slug=gha-10917370996-1-aaaaaaaaaaaa source_sha={'a' * 40}\n",
+        )
+        self.assertEqual(failed_lock.stderr, "ERROR: deployment failed\n")
+        self.assertNotIn("private lock detail", failed_lock.stdout + failed_lock.stderr)
+
+        cleared_fixture = fixture.replace(
+            "fail 'private lock detail must not cross the public channel'",
+            "set_failure_context preflight preflight environment\n"
+            "fail 'private environment detail must not cross the public channel'",
+        )
+        failed_environment = subprocess.run(
+            ["/bin/bash"],
+            input=cleared_fixture,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(failed_environment.returncode, 1)
+        self.assertEqual(
+            failed_environment.stdout,
+            "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+            "phase=preflight reason=environment "
+            f"release_slug=gha-10917370996-1-aaaaaaaaaaaa source_sha={'a' * 40}\n",
+        )
+        self.assertNotIn("lock_stage=", failed_environment.stdout)
+        self.assertEqual(failed_environment.stderr, "ERROR: deployment failed\n")
+
+        stages = {
+            "helper_metadata": 'if [[ ! -f "$lock_helper"',
+            "release_supervise": "platform_release_lock_supervise",
+            "release_open": "platform_release_lock_open ||",
+            "retained_supervise": "platform_retained_load_lock_supervise",
+            "retained_open": "platform_retained_load_lock_open \\",
+        }
+        for stage, operation in stages.items():
+            with self.subTest(lock_stage=stage):
+                self.assertLess(
+                    supervisor.index(f"set_lock_failure_context {stage}"),
+                    supervisor.index(operation),
+                )
 
     def test_supervisor_cleanup_covers_upload_failures_and_closes_locks(self) -> None:
         supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")

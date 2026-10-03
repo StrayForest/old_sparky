@@ -59,11 +59,20 @@ artifact_identity_owned=""
 failure_class="preflight"
 failure_phase="preflight"
 failure_reason="internal"
+failure_lock_stage=""
 
 set_failure_context() {
   failure_class="$1"
   failure_phase="$2"
   failure_reason="$3"
+  failure_lock_stage=""
+}
+
+set_lock_failure_context() {
+  failure_class="preflight"
+  failure_phase="preflight"
+  failure_reason="lock"
+  failure_lock_stage="$1"
 }
 
 run_nginx_config_test() {
@@ -94,8 +103,13 @@ fail() {
   # Failure detail remains private machine state. The runner only
   # accepts the fixed, token-only RELEASE_DEPLOY line below.
   printf '%s\n' 'ERROR: deployment failed' >&2
-  printf 'RELEASE_DEPLOY schema=1 status=failed class=%s phase=%s reason=%s release_slug=%s source_sha=%s\n' \
-    "$failure_class" "$failure_phase" "$failure_reason" "$release_slug" "$target_sha"
+  if [[ -n "$failure_lock_stage" ]]; then
+    printf 'RELEASE_DEPLOY schema=1 status=failed class=%s phase=%s reason=%s lock_stage=%s release_slug=%s source_sha=%s\n' \
+      "$failure_class" "$failure_phase" "$failure_reason" "$failure_lock_stage" "$release_slug" "$target_sha"
+  else
+    printf 'RELEASE_DEPLOY schema=1 status=failed class=%s phase=%s reason=%s release_slug=%s source_sha=%s\n' \
+      "$failure_class" "$failure_phase" "$failure_reason" "$release_slug" "$target_sha"
+  fi
   exit 1
 }
 
@@ -343,18 +357,19 @@ for name, record in records.items():
 PY
 fi
 
-set_failure_context preflight preflight lock
 # Lock order is release -> retained-load.  Both locks use the shared pathname
 # supervisors with util-linux `--close`, so this body and every candidate child
 # have no release or retained-load lock FD.  Each supervised body revalidates
 # the exact exclusive WRITE FLOCK owner in /proc/locks before mutation.
 lock_helper="$host_tools_dir/platform_release_lock.sh"
+set_lock_failure_context helper_metadata
 if [[ ! -f "$lock_helper" || -L "$lock_helper" || ! -x "$lock_helper" ]]; then
   fail "the canonical release lock helper is missing or unsafe"
 fi
 ORIGINAL_ARGS=("$@")
 # shellcheck source=/dev/null
 source "$lock_helper"
+set_lock_failure_context release_supervise
 platform_release_lock_supervise "${ORIGINAL_ARGS[@]}" || {
   lock_status=$?
   if [[ "$lock_status" -eq "$PLATFORM_RELEASE_LOCK_CONFLICT_EXIT_CODE" ]]; then
@@ -365,12 +380,15 @@ platform_release_lock_supervise "${ORIGINAL_ARGS[@]}" || {
 if [[ "${PLATFORM_RELEASE_LOCK_SUPERVISED:-}" != "1" ]]; then
   exit 0
 fi
+set_lock_failure_context release_open
 platform_release_lock_open || fail "the canonical release lock could not be validated"
+set_lock_failure_context retained_supervise
 platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}" || \
   fail "the retained-load lock supervisor could not be started"
 if [[ "${PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED:-}" != "1" ]]; then
   exit 0
 fi
+set_lock_failure_context retained_open
 platform_retained_load_lock_open \
   || fail "the retained-load lock could not be opened or is already held"
 

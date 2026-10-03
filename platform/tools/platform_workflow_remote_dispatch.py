@@ -136,7 +136,9 @@ RELEASE_MARKER_RE = re.compile(
     rb"artifact_count_invalid|checksum_missing|provenance_missing|"
     rb"artifact_name_invalid|release_slug_mismatch|checksum_mismatch|"
     rb"validation_failed|provenance_invalid|candidate_missing|"
-    rb"activation_failed|lock_lost|runtime_profile_failed))? "
+    rb"activation_failed|lock_lost|runtime_profile_failed)"
+    rb"(?: lock_stage=(?P<lock_stage>helper_metadata|release_supervise|"
+    rb"release_open|retained_supervise|retained_open))?)? "
     rb"release_slug=(?P<release_slug>[A-Za-z0-9][A-Za-z0-9._-]{0,179}) "
     rb"source_sha=(?P<source_sha>[0-9a-f]{40,64})\n\Z"
 )
@@ -562,17 +564,25 @@ def _release_marker_is_valid(
     marker_class = match.group("class").decode("ascii")
     phase = match.group("phase")
     reason = match.group("reason")
+    lock_stage = match.group("lock_stage")
     if status == "passed":
         expected_class = "preflight" if mode == "preflight" else "deployment"
         return (
             marker_class == expected_class
             and phase is None
             and reason is None
+            and lock_stage is None
             and child_status == 0
         )
     if child_status == 0 or (mode == "preflight" and marker_class != "preflight"):
         return False
     if phase is None or reason is None:
+        return False
+    if lock_stage is not None and (
+        marker_class != "preflight"
+        or phase.decode("ascii") != "preflight"
+        or reason.decode("ascii") != "lock"
+    ):
         return False
     return reason.decode("ascii") in RELEASE_FAILURE_REASONS.get(
         (marker_class, phase.decode("ascii")), frozenset()
