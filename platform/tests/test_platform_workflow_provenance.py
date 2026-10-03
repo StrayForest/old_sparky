@@ -12,6 +12,9 @@ WORKFLOW_DIR = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 sys.path.insert(0, str(TOOLS))
 
 from tools.platform_workflow_provenance import (  # noqa: E402
+    AUTODEPLOY_DISPATCH_STEP_NAME,
+    AUTODEPLOY_WORKFLOW_NAME,
+    AUTODEPLOY_WORKFLOW_PATH,
     DEPLOY_WORKFLOW_NAME,
     DEPLOY_WORKFLOW_PATH,
     DEPLOY_STATUS_CONTEXT,
@@ -22,6 +25,7 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     parse_status_timestamp,
     validate_deployment_event,
     validate_deployment_marker,
+    validate_autodeploy_dispatch,
 )
 from tools.platform_deploy_baseline import (  # noqa: E402
     validate_active_baseline,
@@ -94,6 +98,139 @@ class WorkflowProvenanceTests(unittest.TestCase):
             "release_ino": 910002,
             "pending_operation": False,
         }
+
+    def _autodeploy_payload(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
+        run_id = 5678
+        attempt = 3
+        workflow = {
+            "id": 88,
+            "path": AUTODEPLOY_WORKFLOW_PATH,
+            "name": AUTODEPLOY_WORKFLOW_NAME,
+        }
+        run = {
+            "id": run_id,
+            "workflow_id": 88,
+            "name": AUTODEPLOY_WORKFLOW_NAME,
+            "run_attempt": attempt,
+            "event": "workflow_run",
+            "head_branch": "dev",
+            "head_sha": self.SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": f"https://github.com/StrayForest/old_sparky/actions/runs/{run_id}",
+            "repository": {
+                "full_name": "StrayForest/old_sparky",
+                "name": "old_sparky",
+                "owner": {"login": "StrayForest"},
+            },
+        }
+        jobs = [
+            {
+                "id": 9901,
+                "name": "dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "steps": [
+                    {"name": "Checkout", "status": "completed", "conclusion": "success"},
+                    {
+                        "name": AUTODEPLOY_DISPATCH_STEP_NAME,
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ],
+            }
+        ]
+        return workflow, run, jobs
+
+    def test_exact_autodeploy_dispatch_attempt_is_accepted(self) -> None:
+        workflow, run, jobs = self._autodeploy_payload()
+        self.assertEqual(
+            validate_autodeploy_dispatch(
+                workflow,
+                run,
+                jobs,
+                expected_run_id=5678,
+                expected_attempt=3,
+                expected_target_sha=self.SHA,
+            ),
+            "https://github.com/StrayForest/old_sparky/actions/runs/5678/attempts/3",
+        )
+
+    def test_autodeploy_dispatch_requires_exact_run_job_and_step_success(self) -> None:
+        for field, value in (
+            ("path", ".github/workflows/other.yml"),
+            ("name", "Other workflow"),
+        ):
+            workflow, run, jobs = self._autodeploy_payload()
+            workflow[field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(ProvenanceError):
+                    validate_autodeploy_dispatch(
+                        workflow,
+                        run,
+                        jobs,
+                        expected_run_id=5678,
+                        expected_attempt=3,
+                        expected_target_sha=self.SHA,
+                    )
+
+        for field, value in (
+            ("id", 5679),
+            ("run_attempt", 2),
+            ("event", "workflow_dispatch"),
+            ("head_branch", "feature/test"),
+            ("head_sha", "b" * 40),
+            ("status", "in_progress"),
+            ("conclusion", "failure"),
+        ):
+            workflow, run, jobs = self._autodeploy_payload()
+            run[field] = value
+            with self.subTest(run_field=field):
+                with self.assertRaises(ProvenanceError):
+                    validate_autodeploy_dispatch(
+                        workflow,
+                        run,
+                        jobs,
+                        expected_run_id=5678,
+                        expected_attempt=3,
+                        expected_target_sha=self.SHA,
+                    )
+
+        workflow, run, jobs = self._autodeploy_payload()
+        for candidate_jobs in (
+            [],
+            jobs + [{**jobs[0], "id": 9902}],
+            [{**jobs[0], "conclusion": "failure"}],
+            [{**jobs[0], "steps": []}],
+            [
+                {
+                    **jobs[0],
+                    "steps": jobs[0]["steps"]
+                    + [dict(jobs[0]["steps"][1], number=3)],
+                }
+            ],
+            [
+                {
+                    **jobs[0],
+                    "steps": [
+                        jobs[0]["steps"][0],
+                        {**jobs[0]["steps"][1], "conclusion": "failure"},
+                    ],
+                }
+            ],
+        ):
+            with self.subTest(jobs=candidate_jobs):
+                with self.assertRaises(ProvenanceError):
+                    validate_autodeploy_dispatch(
+                        workflow,
+                        run,
+                        candidate_jobs,
+                        expected_run_id=5678,
+                        expected_attempt=3,
+                        expected_target_sha=self.SHA,
+                    )
 
     def test_active_baseline_accepts_old_exact_deployment_proof(self) -> None:
         workflow, run, jobs, statuses = self._payload()

@@ -34,6 +34,10 @@ SECURITY_WORKFLOW_PATH = ".github/workflows/platform-security.yml"
 SECURITY_WORKFLOW_NAME = "Platform security and build"
 DEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-deploy.yml"
 DEPLOY_WORKFLOW_NAME = "Platform production deploy"
+AUTODEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-autodeploy.yml"
+AUTODEPLOY_WORKFLOW_NAME = "Platform production auto-deploy"
+AUTODEPLOY_JOB_NAME = "dispatch"
+AUTODEPLOY_DISPATCH_STEP_NAME = "Dispatch production deployment or baseline reconciliation"
 DEPLOY_JOB_NAME = "Deploy production"
 PREFLIGHT_JOB_NAME = "Production preflight"
 SECURITY_STATUS_CONTEXT = "platform-security-build"
@@ -259,6 +263,62 @@ def validate_workflow_run(
         expected_attempt=expected_attempt,
         server_url=server_url,
     )
+
+
+def validate_autodeploy_dispatch(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    server_url: str = GITHUB_SERVER_URL,
+) -> str:
+    """Authenticate the exact auto-deploy attempt that dispatched a release.
+
+    The production workflow consumes this only for automatic baseline
+    reconciliation. The run must be the canonical successful workflow_run
+    attempt for the target SHA, and its one dispatch job and exact dispatch
+    step must both have completed successfully.
+    """
+
+    _validate_job_rows(jobs)
+    attempt_url = validate_workflow_run(
+        workflow,
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=expected_target_sha,
+        expected_event="workflow_run",
+        expected_branch="dev",
+        expected_path=AUTODEPLOY_WORKFLOW_PATH,
+        expected_name=AUTODEPLOY_WORKFLOW_NAME,
+        server_url=server_url,
+    )
+    matching_jobs = [job for job in jobs if job.get("name") == AUTODEPLOY_JOB_NAME]
+    if len(matching_jobs) != 1:
+        raise _fail("auto-deploy dispatch job is missing or ambiguous")
+    job = matching_jobs[0]
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        raise _fail("auto-deploy dispatch job did not complete successfully")
+    steps = job.get("steps")
+    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
+        raise _fail("auto-deploy dispatch step list is malformed")
+    if any(
+        not isinstance(step, Mapping) or not isinstance(step.get("name"), str)
+        for step in steps
+    ):
+        raise _fail("auto-deploy dispatch step row is malformed")
+    matching_steps = [
+        step for step in steps if step.get("name") == AUTODEPLOY_DISPATCH_STEP_NAME
+    ]
+    if len(matching_steps) != 1:
+        raise _fail("auto-deploy dispatch step is missing or ambiguous")
+    step = matching_steps[0]
+    if step.get("status") != "completed" or step.get("conclusion") != "success":
+        raise _fail("auto-deploy dispatch step did not complete successfully")
+    return attempt_url
 
 
 def latest_context_status(
