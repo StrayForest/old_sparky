@@ -18,6 +18,18 @@ from python_packages.platform_infra.ready_vote_admission import (
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
+_ADMISSION_OBSERVER_TIMEOUT_SECONDS = 0.5
+
+
+async def _cancel_and_reap(task: asyncio.Task) -> None:
+    if not task.done():
+        task.cancel()
+    await asyncio.wait_for(
+        asyncio.gather(task, return_exceptions=True),
+        timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+    )
+
+
 class ReadyVoteAdmissionControllerTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.controllers: list[ReadyVoteAdmissionController] = []
@@ -90,21 +102,55 @@ class ReadyVoteAdmissionControllerTests(PlatformIsolatedAsyncioTestCase):
         )
         first = await controller.acquire()
         self.assertIsNotNone(first)
-        waiter = asyncio.create_task(controller.acquire())
-        await asyncio.sleep(0)
-        self.assertEqual(controller.snapshot().waiters, 1)
+        first_held = first
+        wait_started = asyncio.Event()
+        original_wait = controller._capacity_event.wait
 
-        shed = await controller.acquire()
-        self.assertIsNone(shed)
-        self.assertEqual(controller.snapshot().shed_total, 1)
+        async def observed_wait() -> None:
+            wait_started.set()
+            await original_wait()
 
-        assert first is not None
-        await first.release(service_ms=20.0, pool_wait_ms=0.0)
-        admitted = await asyncio.wait_for(waiter, timeout=0.2)
-        self.assertIsNotNone(admitted)
-        assert admitted is not None
-        self.assertLessEqual(admitted.wait_ms, 50.0)
-        await admitted.release(service_ms=20.0, pool_wait_ms=0.0)
+        waiter: asyncio.Task | None = None
+        admitted_held = None
+        try:
+            with patch.object(
+                controller._capacity_event,
+                "wait",
+                side_effect=observed_wait,
+            ):
+                waiter = asyncio.create_task(controller.acquire())
+                await asyncio.wait_for(
+                    wait_started.wait(),
+                    timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(controller.snapshot().waiters, 1)
+
+                shed = await controller.acquire()
+                self.assertIsNone(shed)
+                self.assertEqual(controller.snapshot().shed_total, 1)
+
+                assert first_held is not None
+                await first_held.release(service_ms=20.0, pool_wait_ms=0.0)
+                first_held = None
+                admitted = await asyncio.wait_for(
+                    asyncio.shield(waiter),
+                    timeout=_ADMISSION_OBSERVER_TIMEOUT_SECONDS,
+                )
+                self.assertIsNotNone(admitted)
+                assert admitted is not None
+                admitted_held = admitted
+                self.assertLessEqual(admitted.wait_ms, 50.0)
+                await admitted_held.release(service_ms=20.0, pool_wait_ms=0.0)
+                admitted_held = None
+        finally:
+            if waiter is not None:
+                await _cancel_and_reap(waiter)
+            if admitted_held is not None and not admitted_held.released:
+                await admitted_held.release(service_ms=20.0, pool_wait_ms=0.0)
+            if first_held is not None and not first_held.released:
+                await first_held.release(service_ms=20.0, pool_wait_ms=0.0)
+            self.assertEqual(controller.snapshot().inflight, 0)
+            self.assertEqual(controller.snapshot().waiters, 0)
 
     async def test_sustained_cpu_pressure_reduces_and_health_recovers_limit_slowly(self) -> None:
         controller = self.controller(
