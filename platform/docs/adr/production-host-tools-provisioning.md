@@ -13,7 +13,7 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
 is the only source for `HOST_TOOLS_SHA`; it currently pins the reviewed
-generation `a5139603106263bbc68606a03efd44418fb04c48`. This repository pin is
+generation `e23ac34a4a712104307e573d2ca8f879ddd54185`. This repository pin is
 not evidence that the generation is installed: production remains on its
 previous generation until a root-console provisioning receipt verifies the
 new path. The pin records the

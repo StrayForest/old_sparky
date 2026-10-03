@@ -15,8 +15,8 @@ Use this document for the normal immutable release path. CSP mode changes and pr
    run for the current `dev` HEAD is the normal production release signal and
    is consumed by the automatic deployment workflow; a docs-only,
    out-of-scope or candidate-packaging-only full-route run is a successful
-   non-deployable no-op. Recovery-bootstrap full runs may reconcile, but their
-   classifier artifacts never authorize release. Do not substitute local tests.
+   non-deployable no-op. Recovery-bootstrap-only runs remain a no-op until the
+   separately reviewed Phase B capability exists. Do not substitute local tests.
 3. Confirm migration expand/rollback compatibility.
 4. Confirm services are healthy, disk has at least 5 GiB available and is at
    most 85% conservative use, and `current`/`previous` releases are protected.
@@ -248,9 +248,9 @@ or when diagnosing the automatic contour. The same exact-SHA
 `platform-security-build=success` and deployable classifier artifact gates still
 apply to `mode=deploy`; provide the originating security `run_id` and
 `run_attempt`. A missing, malformed, fallback or non-deployable manifest blocks
-deployment. `mode=baseline-reconcile` is automatic-chain-only and is not an
-operator fallback. `mode=preflight` remains available without that release
-artifact guard and performs no install.
+deployment. `mode=baseline-reconcile` is a planned Phase B mode, not currently
+available and never an operator fallback. `mode=preflight` remains available
+without that release artifact guard and performs no install.
 
 Both `mode=deploy` and the read-only `mode=preflight` require the immutable
 host-tools capability gate. For a bump, first require full exact-SHA CI on the
