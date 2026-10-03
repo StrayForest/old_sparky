@@ -234,10 +234,12 @@ class WorkflowProvenanceTests(unittest.TestCase):
             ],
             expected_target_sha=self.SHA,
         )
-        self.assertTrue(cumulative["runtime_sensitive"])
-        self.assertTrue(cumulative["deployable"])
-        self.assertEqual(cumulative["class"], "full")
-        self.assertFalse(cumulative["fallback"])
+        self.assertFalse(cumulative["no_op"])
+        manifest = cumulative["manifest"]
+        self.assertTrue(manifest["runtime_sensitive"])
+        self.assertTrue(manifest["deployable"])
+        self.assertEqual(manifest["class"], "full")
+        self.assertFalse(manifest["fallback"])
 
     def test_cumulative_baseline_rejects_incomplete_or_non_deployable_paths(self) -> None:
         incremental_path = ".github/workflows/platform-production-deploy.yml"
@@ -247,12 +249,42 @@ class WorkflowProvenanceTests(unittest.TestCase):
         cases = (
             ([], "missing path list"),
             (["platform/tools/platform_build_release.sh"], "omitted incremental path"),
-            ([incremental_path], "bootstrap-only cumulative route"),
         )
         for paths, label in cases:
             with self.subTest(label=label), self.assertRaises(ProvenanceError):
                 classify_cumulative_baseline(
                     incremental, paths, expected_target_sha=self.SHA
+                )
+
+        bootstrap_no_op = classify_cumulative_baseline(
+            incremental, [incremental_path], expected_target_sha=self.SHA
+        )
+        self.assertTrue(bootstrap_no_op["no_op"])
+        self.assertFalse(bootstrap_no_op["manifest"]["deployable"])
+        self.assertFalse(bootstrap_no_op["manifest"]["runtime_sensitive"])
+
+        runtime_overlap_path = "platform/tools/platform_live_qa_guard.py"
+        runtime_overlap_incremental = classify(
+            [runtime_overlap_path],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertTrue(runtime_overlap_incremental["runtime_sensitive"])
+        runtime_overlap_no_op = classify_cumulative_baseline(
+            runtime_overlap_incremental,
+            [runtime_overlap_path],
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(runtime_overlap_no_op["no_op"])
+        self.assertTrue(runtime_overlap_no_op["manifest"]["runtime_sensitive"])
+
+        for unsafe_paths in (
+            [incremental_path, "unowned/private-secret.txt"],
+        ):
+            with self.subTest(paths=unsafe_paths), self.assertRaises(ProvenanceError):
+                classify_cumulative_baseline(
+                    incremental, unsafe_paths, expected_target_sha=self.SHA
                 )
 
         ordinary_incremental = classify(

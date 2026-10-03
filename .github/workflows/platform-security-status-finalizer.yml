@@ -46,12 +46,12 @@ jobs:
             --header "Accept: application/vnd.github+json"
             --header "X-GitHub-Api-Version: 2022-11-28"
           )
-          curl --fail-with-body --silent --show-error --location --max-filesize 4194304 \
+          curl --fail-with-body --silent --show-error --max-filesize 4194304 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}" \
             --output "$metadata_dir/run.json"
           chmod 600 "$metadata_dir/run.json"
-          curl --fail-with-body --silent --show-error --location --max-filesize 4194304 \
+          curl --fail-with-body --silent --show-error --max-filesize 4194304 \
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${SOURCE_WORKFLOW_ID}" \
             --output "$metadata_dir/workflow.json"

@@ -240,7 +240,7 @@ jobs:
           )
           fetch() {
             local url="$1" destination="$2"
-            curl --fail-with-body --silent --show-error --location \
+            curl --fail-with-body --silent --show-error \
               --max-filesize 4194304 "${api_headers[@]}" "$url" --output "$destination"
             chmod 600 "$destination"
           }
@@ -456,7 +456,7 @@ jobs:
     steps:
       - name: Mark platform security build pending
         shell: bash
-      env:
+        env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           PROOF_MODE: ${{ inputs.proof_mode || 'standard' }}
@@ -1666,13 +1666,14 @@ jobs:
             else
               status_context=platform-security-build
             fi
-            curl --fail-with-body --silent --show-error \
-              --request POST \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
-              --data "$(/usr/bin/python3 - "$state" "$description" "$run_url" "$status_context" <<'PY'
+            if [[ "$EVENT_NAME" != "workflow_dispatch" || "$PROOF_MODE" != "baseline-runtime" ]]; then
+              curl --fail-with-body --silent --show-error \
+                --request POST \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
+                --data "$(/usr/bin/python3 - "$state" "$description" "$run_url" "$status_context" <<'PY'
           import json
           import sys
           print(json.dumps({
@@ -1682,7 +1683,8 @@ jobs:
               "target_url": sys.argv[3],
           }))
           PY
-              )"
+                )"
+            fi
           fi
           [[ "$state" == "success" ]] || exit 1
 

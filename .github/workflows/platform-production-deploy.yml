@@ -1,5 +1,8 @@
 name: Platform production deploy
 
+run-name: >-
+  ${{ inputs.mode == 'baseline-reconcile' && format('Platform production deploy mode=baseline-reconcile target={0} source={1}.{2} auto={3}.{4}', github.sha, inputs.classifier_run_id, inputs.classifier_run_attempt, inputs.autodeploy_run_id, inputs.autodeploy_run_attempt) || 'Platform production deploy' }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -189,6 +192,8 @@ jobs:
   # the immutable default-branch commit; the deployment candidate is never run.
   validate-classifier:
     name: Validate exact classifier artifact before build
+    outputs:
+      incremental_manifest_b64: ${{ steps.validate_manifest.outputs.manifest_b64 }}
     needs: validate-dispatch
     if: >-
       needs.validate-dispatch.result == 'success' &&
@@ -201,7 +206,10 @@ jobs:
       contents: read
     env:
       TARGET_SHA: ${{ github.sha }}
-      DEPLOY_MODE: ${{ inputs.mode }}
+      # The closed input handoff remains mode=deploy for both deploy routes;
+      # baseline-reconcile selects the extra proof gates above, not a new
+      # release-builder mode.
+      DEPLOY_MODE: deploy
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
       AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
@@ -271,7 +279,7 @@ jobs:
           proof_dir="$(mktemp -d "$RUNNER_TEMP/platform-autodeploy-proof.XXXXXX")"
           trap 'rm -rf -- "$proof_dir"' EXIT
           workflow_path="$proof_dir/workflow.json"
-          curl --fail-with-body --silent --show-error --location --max-filesize 262144 \
+          curl --fail-with-body --silent --show-error --max-filesize 262144 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -288,7 +296,9 @@ jobs:
           from pathlib import Path
           import sys
           import time
-          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
 
           trusted_platform, workflow_path, run_path, run_id, attempt, target_sha, token, api_url, repository = sys.argv[1:]
           sys.path.insert(0, trusted_platform)
@@ -299,15 +309,25 @@ jobs:
           )
           from tools.platform_deploy_baseline import wait_for_autodeploy_completion  # noqa: E402
 
+          class RejectRedirect(HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, new_url):
+                  raise URLError("GitHub API redirects are disabled for authenticated metadata requests")
+
+          api_opener = build_opener(RejectRedirect())
+
+          def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate JSON key")
+                  result[key] = value
+              return result
+
           def read_json(path: str) -> object:
-              def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
-                  result: dict[str, object] = {}
-                  for key, value in pairs:
-                      if key in result:
-                          raise ValueError("duplicate JSON key")
-                      result[key] = value
-                  return result
-              return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=unique)
+              return json.loads(
+                  Path(path).read_text(encoding="utf-8"),
+                  object_pairs_hook=unique_object,
+              )
 
           workflow = read_json(workflow_path)
           if (
@@ -329,11 +349,23 @@ jobs:
                       "X-GitHub-Api-Version": "2022-11-28",
                   },
               )
-              with urlopen(request, timeout=10) as response:
-                  raw = response.read(1_048_577)
+              try:
+                  with api_opener.open(request, timeout=10) as response:
+                      final_url = urlsplit(response.geturl())
+                      if (
+                          response.geturl() != url
+                          or final_url.scheme != "https"
+                          or final_url.hostname != "api.github.com"
+                          or final_url.username is not None
+                          or final_url.password is not None
+                      ):
+                          raise ProvenanceError("auto-deploy attempt response URL is not canonical")
+                      raw = response.read(1_048_577)
+              except (HTTPError, URLError, TimeoutError, OSError):
+                  raise ProvenanceError("auto-deploy attempt request failed") from None
               if len(raw) > 1_048_576:
                   raise ProvenanceError("auto-deploy attempt response exceeds its bound")
-              payload = json.loads(raw, object_pairs_hook=lambda pairs: dict(pairs))
+              payload = json.loads(raw, object_pairs_hook=unique_object)
               if not isinstance(payload, dict):
                   raise ProvenanceError("auto-deploy attempt response is malformed")
               return payload
@@ -359,7 +391,7 @@ jobs:
           expected_total=""
           while :; do
             page_path="$jobs_dir/page-${page}.json"
-            curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+            curl --fail-with-body --silent --show-error --max-filesize 1048576 \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -437,6 +469,7 @@ jobs:
           }
           echo "Authenticated exact automatic deployment caller attempt after bounded completion wait."
       - name: Validate exact classifier artifact before candidate build
+        id: validate_manifest
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -512,13 +545,14 @@ jobs:
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
             --output "$route_dir/artifact.zip"
+          manifest_args=(--target-sha "$TARGET_SHA" --emit-manifest-base64)
           if [[ "$DEPLOY_MODE" == "baseline-reconcile" ]]; then
-            /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" \
-              --target-sha "$TARGET_SHA" --require-recovery-bootstrap
-          else
-            /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" \
-              --target-sha "$TARGET_SHA"
+            manifest_args+=(--require-recovery-bootstrap)
           fi
+          manifest_b64="$(/usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" "${manifest_args[@]}")"
+          (( ${#manifest_b64} > 0 && ${#manifest_b64} <= 350000 ))
+          [[ "$manifest_b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          printf 'manifest_b64=%s\n' "$manifest_b64" >> "$GITHUB_OUTPUT"
       - name: Remove trusted classifier validator
         if: ${{ always() }}
         shell: bash
@@ -1539,18 +1573,493 @@ jobs:
   # Candidate checkout and release construction are isolated from the
   # environment-approved deployment jobs.  This job never receives SSH
   # material and only publishes an immutable archive plus provenance.
+  validate-active-baseline:
+    name: Authenticate active production baseline and cumulative route
+    needs:
+      - validate-dispatch
+      - validate-classifier
+      - host-capability-preflight
+    if: >-
+      !cancelled() &&
+      needs.validate-dispatch.result == 'success' &&
+      needs.validate-classifier.result == 'success' &&
+      needs.host-capability-preflight.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'baseline-reconcile'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      statuses: read
+    outputs:
+      runtime_required: ${{ steps.cumulative.outputs.runtime_required }}
+      cumulative_no_op: ${{ steps.cumulative.outputs.cumulative_no_op }}
+      cumulative_manifest_sha256: ${{ steps.cumulative.outputs.manifest_sha256 }}
+      active_baseline_sha: ${{ steps.cumulative.outputs.active_baseline_sha }}
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      ACTIVE_BASELINE_JSON: ${{ needs.host-capability-preflight.outputs.baseline_identity }}
+      INCREMENTAL_MANIFEST_B64: ${{ needs.validate-classifier.outputs.incremental_manifest_b64 }}
+      SOURCE_SECURITY_RUN_ID: ${{ inputs.classifier_run_id }}
+      SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt }}
+      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+    steps:
+      - name: Checkout exact reviewed target for bounded first-parent diff
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Authenticate live baseline and reclassify all undelivered paths
+        id: cumulative
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
+          /usr/bin/python3 - <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          class RejectRedirect(HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, new_url):
+                  raise URLError("GitHub API redirects are disabled for authenticated metadata requests")
+
+          api_opener = build_opener(RejectRedirect())
+
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_deploy_baseline import (  # noqa: E402
+              DEPLOY_STATUS_CONTEXT,
+              classify_cumulative_baseline,
+              validate_active_baseline,
+          )
+          from tools.platform_workflow_provenance import (  # noqa: E402
+              latest_context_status,
+              validate_autodeploy_dispatch,
+              validate_security_marker,
+          )
+
+          api_url = os.environ.get("GITHUB_API_URL", "")
+          repository = os.environ.get("GITHUB_REPOSITORY", "")
+          token = os.environ.get("GH_TOKEN", "")
+          target = os.environ.get("TARGET_SHA", "")
+          if (api_url != "https://api.github.com" or repository != "StrayForest/old_sparky"
+                  or re.fullmatch(r"[0-9a-f]{40}", target) is None or not token):
+              raise SystemExit("baseline reconciliation identity is malformed")
+          source_run_id = os.environ.get("SOURCE_SECURITY_RUN_ID", "")
+          source_attempt = os.environ.get("SOURCE_SECURITY_RUN_ATTEMPT", "")
+          auto_run_id = os.environ.get("AUTODEPLOY_RUN_ID", "")
+          auto_attempt = os.environ.get("AUTODEPLOY_RUN_ATTEMPT", "")
+          decimal_pattern = re.compile(r"[1-9][0-9]{0,31}\Z")
+          if any(decimal_pattern.fullmatch(value) is None for value in (
+              source_run_id, source_attempt, auto_run_id, auto_attempt
+          )):
+              raise SystemExit("baseline caller attempt identity is malformed")
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate JSON key")
+                  result[key] = value
+              return result
+
+          def fetch_json(path, *, limit=4 * 1024 * 1024):
+              if not path.startswith("/") or ".." in path.split("/"):
+                  raise SystemExit("baseline API path is invalid")
+              request = Request(
+                  api_url + "/repos/" + repository + path,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with api_opener.open(request, timeout=20) as response:
+                      final_url = urlsplit(response.geturl())
+                      if (
+                          response.geturl() != request.full_url
+                          or final_url.scheme != "https"
+                          or final_url.hostname != "api.github.com"
+                          or final_url.username is not None
+                          or final_url.password is not None
+                      ):
+                          raise SystemExit("baseline API response URL is not canonical")
+                      raw = response.read(limit + 1)
+              except (HTTPError, URLError, TimeoutError, OSError):
+                  raise SystemExit("baseline GitHub API request failed") from None
+              if len(raw) > limit:
+                  raise SystemExit("baseline API response exceeded its bound")
+              try:
+                  return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+              except (UnicodeError, json.JSONDecodeError, ValueError):
+                  raise SystemExit("baseline API response is malformed") from None
+
+          def fetch_statuses(commit_sha):
+              rows = []
+              ids = set()
+              for page in range(1, 101):
+                  payload = fetch_json(f"/commits/{commit_sha}/statuses?per_page=100&page={page}")
+                  if not isinstance(payload, list) or len(payload) > 100:
+                      raise SystemExit("baseline deployment statuses are malformed")
+                  for row in payload:
+                      if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0 or row["id"] in ids:
+                          raise SystemExit("baseline deployment status identity is duplicated or invalid")
+                      ids.add(row["id"])
+                      rows.append(row)
+                      if len(rows) > 10000:
+                          raise SystemExit("baseline deployment status snapshot exceeded its bound")
+                  if len(payload) < 100:
+                      return rows, True
+              raise SystemExit("baseline deployment status pagination exceeded its bound")
+
+          def fetch_jobs(run_id, attempt):
+              rows = []
+              ids = set()
+              expected_total = None
+              for page in range(1, 101):
+                  payload = fetch_json(
+                      f"/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100&page={page}"
+                  )
+                  if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+                      raise SystemExit("baseline deployment jobs are malformed")
+                  page_rows = payload["jobs"]
+                  total = payload.get("total_count")
+                  if type(total) is not int or not 0 <= total <= 10000 or len(page_rows) > 100:
+                      raise SystemExit("baseline deployment job page is malformed")
+                  if expected_total is not None and total != expected_total:
+                      raise SystemExit("baseline deployment job total changed during pagination")
+                  expected_total = total
+                  for row in page_rows:
+                      if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0 or row["id"] in ids:
+                          raise SystemExit("baseline deployment job identity is duplicated or invalid")
+                      ids.add(row["id"])
+                      rows.append(row)
+                  if len(page_rows) < 100:
+                      break
+              else:
+                  raise SystemExit("baseline deployment job pagination exceeded its bound")
+              if len(rows) != expected_total:
+                  raise SystemExit("baseline deployment job pagination is incomplete")
+              return rows, True
+
+          try:
+              baseline = json.loads(os.environ["ACTIVE_BASELINE_JSON"], object_pairs_hook=unique_object)
+              incremental = json.loads(base64.b64decode(
+                  os.environ["INCREMENTAL_MANIFEST_B64"], validate=True
+              ).decode("utf-8"), object_pairs_hook=unique_object)
+          except (KeyError, UnicodeError, json.JSONDecodeError, ValueError):
+              raise SystemExit("baseline handoff is malformed") from None
+          if not isinstance(baseline, dict) or not isinstance(incremental, dict):
+              raise SystemExit("baseline handoff is malformed")
+
+          branch = fetch_json("/branches/dev")
+          commit = branch.get("commit") if isinstance(branch, dict) else None
+          current_dev = commit.get("sha") if isinstance(commit, dict) else None
+          if (branch.get("name") != "dev" if isinstance(branch, dict) else True) or current_dev != target:
+              raise SystemExit("target is no longer the exact current dev head")
+
+          first_parent = subprocess.run(
+              ["git", "rev-list", "--first-parent", "--max-count=8193", target],
+              check=True, capture_output=True, text=True, encoding="ascii",
+          ).stdout.splitlines()
+          if len(first_parent) > 8192:
+              raise SystemExit("baseline first-parent ancestry exceeds its bound")
+          baseline_sha = baseline.get("source_sha")
+          if not isinstance(baseline_sha, str) or baseline_sha not in first_parent:
+              raise SystemExit("active production source is not a bounded first-parent ancestor")
+
+          status_rows, statuses_complete = fetch_statuses(baseline_sha)
+          deployment_marker = latest_context_status(
+              status_rows, context=DEPLOY_STATUS_CONTEXT, max_age=None
+          )
+          target_url = deployment_marker.get("target_url")
+          match = re.fullmatch(
+              r"https://github\.com/StrayForest/old_sparky/actions/runs/([1-9][0-9]{0,31})/attempts/([1-9][0-9]{0,31})",
+              target_url if isinstance(target_url, str) else "",
+          )
+          if match is None:
+              raise SystemExit("active deployment status target is not an exact attempt URL")
+          deployment_id, deployment_attempt = match.groups()
+          workflow = fetch_json("/actions/workflows/platform-production-deploy.yml")
+          run = fetch_json(f"/actions/runs/{deployment_id}/attempts/{deployment_attempt}")
+          jobs, jobs_complete = fetch_jobs(deployment_id, deployment_attempt)
+          validate_active_baseline(
+              baseline,
+              workflow,
+              run,
+              jobs,
+              status_rows,
+              expected_target_sha=target,
+              current_dev_sha=current_dev,
+              first_parent_shas=first_parent,
+              statuses_complete=statuses_complete,
+              jobs_complete=jobs_complete,
+          )
+
+          # Authenticate the original exact push CI marker and its successful
+          # automatic dispatch attempt even when cumulative paths do not need
+          # the extra runtime-only proof lane.
+          security_workflow = fetch_json("/actions/workflows/platform-security.yml")
+          source_run = fetch_json(
+              f"/actions/runs/{source_run_id}/attempts/{source_attempt}"
+          )
+          source_status_rows, source_statuses_complete = fetch_statuses(target)
+          if not source_statuses_complete:
+              raise SystemExit("source security status snapshot is incomplete")
+          validate_security_marker(
+              security_workflow,
+              source_run,
+              source_status_rows,
+              expected_run_id=int(source_run_id),
+              expected_attempt=int(source_attempt),
+              expected_target_sha=target,
+              expected_run_url=f"https://github.com/{repository}/actions/runs/{source_run_id}",
+          )
+          auto_workflow = fetch_json("/actions/workflows/platform-production-autodeploy.yml")
+          auto_run = fetch_json(
+              f"/actions/runs/{auto_run_id}/attempts/{auto_attempt}"
+          )
+          auto_jobs, auto_jobs_complete = fetch_jobs(auto_run_id, auto_attempt)
+          if not auto_jobs_complete:
+              raise SystemExit("auto-deploy job snapshot is incomplete")
+          validate_autodeploy_dispatch(
+              auto_workflow,
+              auto_run,
+              auto_jobs,
+              expected_run_id=int(auto_run_id),
+              expected_attempt=int(auto_attempt),
+              expected_target_sha=target,
+          )
+
+          cumulative_raw = subprocess.run(
+              ["git", "diff", "--name-only", "-z", "--no-renames", baseline_sha, target],
+              check=True, capture_output=True,
+          ).stdout
+          try:
+              cumulative_paths = [item.decode("utf-8", "strict") for item in cumulative_raw.split(b"\0") if item]
+          except UnicodeDecodeError:
+              raise SystemExit("cumulative path list contains invalid UTF-8") from None
+          cumulative_result = classify_cumulative_baseline(
+              incremental, cumulative_paths, expected_target_sha=target
+          )
+          if not isinstance(cumulative_result, dict) or set(cumulative_result) != {"manifest", "no_op"}:
+              raise SystemExit("cumulative classifier result is malformed")
+          cumulative = cumulative_result["manifest"]
+          cumulative_no_op = cumulative_result["no_op"]
+          if not isinstance(cumulative, dict) or type(cumulative_no_op) is not bool:
+              raise SystemExit("cumulative classifier result is malformed")
+          manifest_bytes = json.dumps(
+              cumulative, sort_keys=True, separators=(",", ":")
+          ).encode("utf-8")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              runtime_required = not cumulative_no_op and cumulative["runtime_sensitive"] is True
+              output.write(f"runtime_required={str(runtime_required).lower()}\n")
+              output.write(f"cumulative_no_op={str(cumulative_no_op).lower()}\n")
+              output.write(f"manifest_sha256={hashlib.sha256(manifest_bytes).hexdigest()}\n")
+              output.write(f"active_baseline_sha={baseline_sha}\n")
+          print("Authenticated exact source CI, auto-dispatch, live baseline, and cumulative classifier route.")
+          PY
+
+      - name: Remove target checkout
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_source="$GITHUB_WORKSPACE"
+          test "$(git -C "$target_source" rev-parse HEAD)" = "$TARGET_SHA"
+          git -C "$target_source" status --porcelain=v1 --untracked-files=all -- platform
+
+  dispatch-baseline-runtime:
+    name: Dispatch exact-target baseline runtime proof
+    needs:
+      - validate-dispatch
+      - validate-classifier
+      - validate-active-baseline
+    if: >-
+      !cancelled() &&
+      needs.validate-dispatch.result == 'success' &&
+      needs.validate-classifier.result == 'success' &&
+      needs.validate-active-baseline.result == 'success' &&
+      needs.validate-active-baseline.outputs.runtime_required == 'true' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'baseline-reconcile'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      SOURCE_SECURITY_RUN_ID: ${{ inputs.classifier_run_id }}
+      SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt }}
+      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+    steps:
+      - name: Dispatch exact-target baseline runtime proof
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_SECURITY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$SOURCE_SECURITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$AUTODEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$AUTODEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          branch_json="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
+          dev_sha="$(printf '%s' "$branch_json" | /usr/bin/python3 -c 'import json,sys; p=json.load(sys.stdin); s=p.get("commit",{}).get("sha"); assert p.get("name")=="dev" and isinstance(s,str) and len(s)==40 and all(c in "0123456789abcdef" for c in s); print(s)')"
+          test "$dev_sha" = "$TARGET_SHA" || { echo "dev changed before runtime proof dispatch" >&2; exit 1; }
+          payload="$RUNNER_TEMP/platform-baseline-runtime-dispatch.json"
+          umask 077
+          /usr/bin/python3 - "$payload" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          names = (
+              "TARGET_SHA", "SOURCE_SECURITY_RUN_ID", "SOURCE_SECURITY_RUN_ATTEMPT",
+              "AUTODEPLOY_RUN_ID", "AUTODEPLOY_RUN_ATTEMPT", "GITHUB_RUN_ID",
+              "GITHUB_RUN_ATTEMPT",
+          )
+          values = {name: os.environ[name] for name in names}
+          if re.fullmatch(r"[0-9a-f]{40}", values["TARGET_SHA"]) is None:
+              raise SystemExit("runtime proof target SHA is malformed")
+          if any(re.fullmatch(r"[1-9][0-9]{0,31}", value) is None for name, value in values.items() if name != "TARGET_SHA"):
+              raise SystemExit("runtime proof correlation identity is malformed")
+          inputs = {
+              "proof_mode": "baseline-runtime",
+              "target_sha": values["TARGET_SHA"],
+              "source_security_run_id": values["SOURCE_SECURITY_RUN_ID"],
+              "source_security_run_attempt": values["SOURCE_SECURITY_RUN_ATTEMPT"],
+              "autodeploy_run_id": values["AUTODEPLOY_RUN_ID"],
+              "autodeploy_run_attempt": values["AUTODEPLOY_RUN_ATTEMPT"],
+              "production_deploy_run_id": values["GITHUB_RUN_ID"],
+              "production_deploy_run_attempt": values["GITHUB_RUN_ATTEMPT"],
+          }
+          path = Path(sys.argv[1])
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(fd, "w", encoding="ascii") as stream:
+              json.dump({"ref": "dev", "inputs": inputs}, stream, sort_keys=True, separators=(",", ":"))
+              stream.write("\n")
+          os.chmod(path, 0o600)
+          PY
+          curl --fail-with-body --silent --show-error --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --header "Content-Type: application/json" \
+            --data-binary "@$payload" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-security.yml/dispatches"
+          rm -f -- "$payload"
+
+  validate-baseline-runtime-proof:
+    name: Validate exact-target baseline runtime proof
+    needs:
+      - validate-dispatch
+      - validate-classifier
+      - validate-active-baseline
+      - dispatch-baseline-runtime
+    if: >-
+      !cancelled() &&
+      needs.validate-dispatch.result == 'success' &&
+      needs.validate-classifier.result == 'success' &&
+      needs.validate-active-baseline.result == 'success' &&
+      needs.validate-active-baseline.outputs.runtime_required == 'true' &&
+      needs.dispatch-baseline-runtime.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'baseline-reconcile'
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    permissions:
+      actions: read
+      contents: read
+      statuses: read
+    outputs:
+      proof_run_id: ${{ steps.validate.outputs.baseline_runtime_child_run_id }}
+      proof_run_attempt: ${{ steps.validate.outputs.baseline_runtime_child_run_attempt }}
+      proof_receipt_digest: ${{ steps.validate.outputs.baseline_runtime_receipt_digest }}
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      SOURCE_SECURITY_RUN_ID: ${{ inputs.classifier_run_id }}
+      SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt }}
+      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+    steps:
+      - name: Checkout exact target proof validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Discover and validate exact child proof and receipt
+        id: validate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          /usr/bin/python3 -I -B platform/tools/platform_baseline_runtime_proof.py
+
   build-release:
     name: Build immutable release artifact in CI
     needs:
       - validate-dispatch
       - validate-classifier
       - host-capability-preflight
+      - validate-active-baseline
+      - validate-baseline-runtime-proof
     if: >-
+      !cancelled() &&
       needs.validate-dispatch.result == 'success' &&
       needs.validate-classifier.result == 'success' &&
       needs.host-capability-preflight.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      (inputs.mode == 'deploy' || inputs.mode == 'baseline-reconcile')
+      (
+        inputs.mode == 'deploy' ||
+        (
+          inputs.mode == 'baseline-reconcile' &&
+          needs.validate-active-baseline.result == 'success' &&
+          needs.validate-active-baseline.outputs.cumulative_no_op == 'false' &&
+          (
+            needs.validate-active-baseline.outputs.runtime_required == 'false' ||
+            (
+              needs.validate-active-baseline.outputs.runtime_required == 'true' &&
+              needs.validate-baseline-runtime-proof.result == 'success'
+            )
+          )
+        )
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -1560,7 +2069,7 @@ jobs:
       attestations: write
     env:
       TARGET_SHA: ${{ github.sha }}
-      DEPLOY_MODE: ${{ inputs.mode }}
+      DEPLOY_MODE: deploy
       RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
       PLATFORM_WEB_NEXT_COMPRESSION: ${{ inputs.web_compression == 'disabled' && 'false' || 'true' }}
       WEB_COMPRESSION: ${{ inputs.web_compression }}
@@ -2080,14 +2589,33 @@ jobs:
       - build-release
       - validate-security-provenance
       - host-capability-preflight
+      - validate-active-baseline
+      - validate-baseline-runtime-proof
     if: >-
+      !cancelled() &&
       needs.validate-dispatch.result == 'success' &&
       needs.validate-classifier.result == 'success' &&
       needs.build-release.result == 'success' &&
-      needs.validate-security-provenance.result == 'success' &&
       needs.host-capability-preflight.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      inputs.mode == 'deploy'
+      (
+        (
+          inputs.mode == 'deploy' &&
+          needs.validate-security-provenance.result == 'success'
+        ) ||
+        (
+          inputs.mode == 'baseline-reconcile' &&
+          needs.validate-active-baseline.result == 'success' &&
+          needs.validate-active-baseline.outputs.cumulative_no_op == 'false' &&
+          (
+            needs.validate-active-baseline.outputs.runtime_required == 'false' ||
+            (
+              needs.validate-active-baseline.outputs.runtime_required == 'true' &&
+              needs.validate-baseline-runtime-proof.result == 'success'
+            )
+          )
+        )
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production
@@ -2127,6 +2655,14 @@ jobs:
       HOST_TOOLS_ATTESTATION_JOB_ID: ${{ needs.host-capability-preflight.outputs.host_tools_attestation_job_id }}
       HOST_TOOLS_HANDOFF_ARTIFACT_ID: ${{ needs.host-capability-preflight.outputs.host_tools_handoff_artifact_id }}
       HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST: ${{ needs.host-capability-preflight.outputs.host_tools_handoff_artifact_digest }}
+      ACTIVE_BASELINE_JSON: ${{ needs.host-capability-preflight.outputs.baseline_identity }}
+      ACTIVE_BASELINE_SHA: ${{ needs.validate-active-baseline.outputs.active_baseline_sha }}
+      RECONCILE_MODE: ${{ inputs.mode == 'baseline-reconcile' && 'true' || 'false' }}
+      BASELINE_RUNTIME_REQUIRED: ${{ needs.validate-active-baseline.outputs.runtime_required }}
+      CUMULATIVE_MANIFEST_SHA256: ${{ needs.validate-active-baseline.outputs.cumulative_manifest_sha256 }}
+      BASELINE_RUNTIME_PROOF_RUN_ID: ${{ needs.validate-baseline-runtime-proof.outputs.proof_run_id }}
+      BASELINE_RUNTIME_PROOF_RUN_ATTEMPT: ${{ needs.validate-baseline-runtime-proof.outputs.proof_run_attempt }}
+      BASELINE_RUNTIME_PROOF_RECEIPT_DIGEST: ${{ needs.validate-baseline-runtime-proof.outputs.proof_receipt_digest }}
     steps:
       - name: Download closed deployment handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -2177,6 +2713,7 @@ jobs:
           PY
 
       - name: Require successful platform security build (shared provenance validator)
+        if: ${{ inputs.mode == 'deploy' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2188,6 +2725,25 @@ jobs:
           [[ "$security_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "security provenance handoff is malformed" >&2; exit 1; }
           test "${{ needs.validate-security-provenance.outputs.security_ready }}" = "true"
           echo "exact platform security provenance accepted: snapshot=$security_digest"
+
+      - name: Require cumulative baseline and exact runtime proof when applicable
+        if: ${{ inputs.mode == 'baseline-reconcile' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ACTIVE_BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CUMULATIVE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          case "$BASELINE_RUNTIME_REQUIRED" in
+            true)
+              [[ "$BASELINE_RUNTIME_PROOF_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+              [[ "$BASELINE_RUNTIME_PROOF_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+              [[ "$BASELINE_RUNTIME_PROOF_RECEIPT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+              ;;
+            false) ;;
+            *) echo "cumulative runtime requirement is missing or malformed" >&2; exit 1 ;;
+          esac
+          echo "authenticated baseline=$ACTIVE_BASELINE_SHA cumulative route=$CUMULATIVE_MANIFEST_SHA256 runtime_required=$BASELINE_RUNTIME_REQUIRED"
 
       - name: Resolve immutable default-branch classifier source
         id: trusted_classifier_default
@@ -2316,7 +2872,11 @@ jobs:
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
             --output "$route_dir/artifact.zip"
-          /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" --target-sha "$TARGET_SHA"
+          manifest_args=(--target-sha "$TARGET_SHA")
+          if [[ "$RECONCILE_MODE" == "true" ]]; then
+            manifest_args+=(--require-recovery-bootstrap)
+          fi
+          /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" "${manifest_args[@]}"
 
       - name: Remove trusted classifier validator
         if: ${{ always() }}
@@ -2933,7 +3493,46 @@ jobs:
           }
           if set(base) != legacy_keys or base.get("schema") not in (1, "1") or base.get("mode") != "deploy" or base.get("target_sha") != target_sha:
               raise SystemExit("deployment handoff cannot be upgraded safely")
-          base["schema"] = "2"
+          if os.environ.get("RECONCILE_MODE") == "true":
+              def _unique_pairs(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError("duplicate JSON key")
+                      result[key] = value
+                  return result
+
+              try:
+                  baseline = json.loads(
+                      os.environ["ACTIVE_BASELINE_JSON"],
+                      object_pairs_hook=_unique_pairs,
+                  )
+              except (KeyError, json.JSONDecodeError, ValueError):
+                  raise SystemExit("active baseline handoff is malformed") from None
+              expected_baseline_keys = {
+                  "schema", "source_sha", "release_slug", "release_json_sha256",
+                  "current_link_dev", "current_link_ino", "release_dev", "release_ino",
+                  "pending_operation",
+              }
+              if (
+                  not isinstance(baseline, dict) or set(baseline) != expected_baseline_keys
+                  or type(baseline.get("schema")) is not int or baseline["schema"] != 1
+                  or type(baseline.get("pending_operation")) is not bool or baseline["pending_operation"] is not False
+                  or not isinstance(baseline.get("source_sha"), str)
+                  or re.fullmatch(r"[0-9a-f]{40}", baseline["source_sha"]) is None
+                  or baseline["source_sha"] != os.environ.get("ACTIVE_BASELINE_SHA")
+                  or not isinstance(baseline.get("release_slug"), str)
+                  or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", baseline["release_slug"]) is None
+                  or not isinstance(baseline.get("release_json_sha256"), str)
+                  or re.fullmatch(r"[0-9a-f]{64}", baseline["release_json_sha256"]) is None
+                  or any(type(baseline.get(key)) is not int or baseline[key] < 0 for key in ("current_link_dev", "release_dev"))
+                  or any(type(baseline.get(key)) is not int or baseline[key] <= 0 for key in ("current_link_ino", "release_ino"))
+              ):
+                  raise SystemExit("active baseline handoff does not match the closed tuple")
+              base["schema"] = "3"
+              base["baseline_identity"] = baseline
+          else:
+              base["schema"] = "2"
           base["host_tools"] = handoff
           temporary = Path(input_path).with_name(Path(input_path).name + ".host-tools-verified")
           fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)

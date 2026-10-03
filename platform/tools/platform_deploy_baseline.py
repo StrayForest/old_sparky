@@ -184,6 +184,12 @@ def classify_cumulative_baseline(
     bounded first-parent diff and is reclassified here with the canonical
     router, so an incremental ``runtime_sensitive=false`` result cannot hide
     older runtime-sensitive changes still present in the candidate range.
+
+    The result is a closed wrapper containing the canonical cumulative
+    manifest and an explicit ``no_op`` flag. A pure recovery-bootstrap range
+    is a verified no-op; every other non-deployable or fallback result fails
+    closed. Callers must not build or activate an application release when
+    ``no_op`` is true.
     """
 
     try:
@@ -198,7 +204,7 @@ def classify_cumulative_baseline(
         or incremental_manifest.get("class") != "full"
         or incremental_manifest.get("expected_gates") != list(FULL_GATE_IDS)
         or incremental_manifest.get("fallback") is not False
-        or incremental_manifest.get("runtime_sensitive") is not False
+        or type(incremental_manifest.get("runtime_sensitive")) is not bool
         or incremental_manifest.get("deployable") is not False
         or incremental_manifest.get("reason") != RECOVERY_BOOTSTRAP_REASON
         or not isinstance(incremental_files, list)
@@ -230,14 +236,23 @@ def classify_cumulative_baseline(
             target_sha=expected_target_sha,
             repository_ready=True,
         )
-        validate_manifest(
-            cumulative,
-            expected_target_sha=expected_target_sha,
-            require_deployable=True,
-        )
+        validate_manifest(cumulative, expected_target_sha=expected_target_sha)
     except ClassifierError as exc:
         raise ProvenanceError(f"cumulative classifier route is unsafe: {exc}") from exc
-    return cumulative
+    if cumulative.get("deployable") is True:
+        if cumulative.get("fallback") is not False:
+            raise ProvenanceError("cumulative deployable route unexpectedly used fallback")
+        return {"manifest": cumulative, "no_op": False}
+    if (
+        cumulative.get("class") == "full"
+        and cumulative.get("expected_gates") == list(FULL_GATE_IDS)
+        and cumulative.get("fallback") is False
+        and type(cumulative.get("runtime_sensitive")) is bool
+        and cumulative.get("reason") == RECOVERY_BOOTSTRAP_REASON
+        and cumulative.get("deployable") is False
+    ):
+        return {"manifest": cumulative, "no_op": True}
+    raise ProvenanceError("cumulative classifier route is non-deployable and not a verified bootstrap no-op")
 
 
 def _expected_run_identity(value: object, field: str) -> str:

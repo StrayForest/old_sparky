@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-27
+- Last reviewed: 2026-10-03
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -15,8 +15,9 @@ Use this document for the normal immutable release path. CSP mode changes and pr
    run for the current `dev` HEAD is the normal production release signal and
    is consumed by the automatic deployment workflow; a docs-only,
    out-of-scope or candidate-packaging-only full-route run is a successful
-   non-deployable no-op. Recovery-bootstrap-only runs remain a no-op until the
-   separately reviewed Phase B capability exists. Do not substitute local tests.
+   non-deployable no-op. A recovery-bootstrap-only result remains
+   non-deployable by itself; the automatic chain may route it through the
+   baseline checks below. Do not substitute local tests.
 3. Confirm migration expand/rollback compatibility.
 4. Confirm services are healthy, disk has at least 5 GiB available and is at
    most 85% conservative use, and `current`/`previous` releases are protected.
@@ -41,13 +42,12 @@ to `dev`. The chain is:
    security run, validates its schema, digest, target SHA and non-fallback
    route, then consumes its `deployable` bit: a deployable `full` route
    proceeds while a valid full CI-only route completes as a no-op. A route
-   classified specifically as recovery-bootstrap-only remains non-deployable
-   until the separately reviewed Phase B baseline-reconcile capability is
-   implemented and provisioned. That future read-only mode cannot authorize
-   normal deployment unless it independently authenticates the active baseline
-   and classifies the complete baseline-to-target range as an ordinary
-   deployable full route. It then
-   re-reads the current `dev` HEAD and refuses a stale successful CI result.
+   classified specifically as recovery-bootstrap-only stays
+   `deployable=false`; the automatic chain may send it to the separate
+   `baseline-reconcile` path, which must independently authenticate the active
+   baseline and classify the complete baseline-to-target range before it can
+   authorize an application release. It then re-reads the current `dev` HEAD
+   and refuses a stale successful CI result.
    The source run and both status snapshots are
    checked by the shared dependency-free
    [`platform_workflow_provenance.py`](../tools/platform_workflow_provenance.py)
@@ -58,10 +58,12 @@ to `dev`. The chain is:
    object. It then requires `platform-security-build=success` and skips a SHA that already
    reports `platform-production-deploy=success` only when the matching
    successful deploy attempt has its exact bot-authored marker.
-4. The current automatic chain dispatches `mode=deploy` only for ordinary
-   deployable full routes. A recovery-bootstrap-only route is a no-op/hold
-   until the Phase B baseline-reconcile capability is separately implemented,
-   reviewed and provisioned.
+4. The automatic chain dispatches `mode=deploy` for ordinary deployable full
+   routes. For a recovery-bootstrap-only route it dispatches
+   `mode=baseline-reconcile` only as part of the validated automatic chain; the
+   production workflow authenticates the exact source-CI and caller attempts
+   before it reads the active baseline. Operators must not manually dispatch
+   that mode.
 5. A secret-free prerequisite independently downloads and validates the exact
    classifier artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
@@ -85,7 +87,8 @@ to `dev`. The chain is:
    `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` generation. It
    requires the configured SSH identity to be root and checks the generation's
    owner, mode, link count, type, capabilities and every digest with fixed
-   absolute tools. The v2 capability contract requires
+   absolute tools. The C2 capability contract requires
+   `dispatcher=3`, `supervisor=3`, `release_baseline=1` and
    `python_bytecode_disabled=1`; every immutable dispatcher call uses
    `/usr/bin/python3.12 -I -B`. This is a read-only gate: it never SCPs or executes the
    bundle and fails before release build, attestation, pending status or
@@ -103,17 +106,25 @@ to `dev`. The chain is:
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
 
-### Planned Phase B: recovery-bootstrap baseline reconciliation
+### Recovery-bootstrap baseline reconciliation
 
-This capability is not implemented or available from Phase A. Do not manually
-dispatch or attempt to activate it. If separately reviewed, merged and
-provisioned, it will require exact full CI, an authenticated active-release
-baseline, complete first-parent reclassification and a lock-held host-state
-recheck. Missing, ambiguous or changed state must fail closed; bootstrap-only
-ranges remain a verified no-op. See the
-[baseline-reconcile ADR](adr/recovery-bootstrap-retained-abort.md#authenticated-baseline-reconciliation-for-bootstrap-only-source-ranges)
-and [host-tools provisioning ADR](adr/production-host-tools-provisioning.md)
-for the full contracts and C/P provenance.
+This path is automatic-only; never dispatch it manually. It authenticates the
+exact source-CI, caller and parent attempts, then reads the pinned host baseline
+and proves its source SHA with complete bounded status/run/job snapshots and
+first-parent ancestry to the exact `dev` target. The trusted classifier
+recomputes cumulative paths; bootstrap-only is a verified no-op, while a
+deployable full route needs all canonical gates. Runtime-sensitive deploys
+also require exact-target runtime gates and an attempt-bound status/receipt;
+the parent waits for the child finalizer's terminal status. The separate
+context preserves the push `platform-security-build` marker.
+
+Only unique marker-bound temporary ingress and lock files may precede the
+comparison. Under both locks, the immutable supervisor requires an exact tuple
+match, no pending transaction and unchanged `dev` before application artifact
+validation/extraction, candidate execution or protected writes. Cleanup may
+remove only that identity-bound ingress; broad temporary cleanup is forbidden.
+Missing or changed state fails closed. See the [baseline-reconcile ADR](adr/recovery-bootstrap-retained-abort.md#authenticated-baseline-reconciliation-for-bootstrap-only-source-ranges)
+and [host-tools provisioning ADR](adr/production-host-tools-provisioning.md).
 
 ### Non-deployable pull-request host-tools candidate
 

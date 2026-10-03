@@ -154,19 +154,19 @@ cleanup authority.
 
 ## Authenticated baseline reconciliation for bootstrap-only source ranges
 
-Status: proposed Phase B capability; not implemented or available for use.
-This section specifies a future, separately reviewed authorization path. Until
-its workflow and pinned host implementation are merged, fully gated, and
-provisioned, a bootstrap-only range remains non-deployable and must not be
-activated by manual workflow dispatch.
+Status: implemented as an automatic-chain-only recovery path. A recovery-
+bootstrap classifier artifact remains non-deployable; only the production
+workflow's separately validated `baseline-reconcile` path can assess whether
+the complete undelivered baseline-to-target range is deployable. Operators must
+not dispatch this mode manually.
 
 A successful recovery-bootstrap-only classifier artifact is not deployment
-authority. If Phase B is implemented, its automatic chain may enter only the
-`baseline-reconcile` mode of the production deploy workflow, and only after the
-exact target SHA has passed the full `Platform security and build` gates. That
-mode must not accept operator-supplied source identities, use target-release
-tools to inspect the active release, or publish a successful deployment
-marker by itself.
+authority. The automatic chain may enter only the `baseline-reconcile` mode of
+the production deploy workflow, after the exact target SHA has passed the full
+`Platform security and build` gates and the exact successful automatic
+dispatcher attempt is authenticated. That mode does not accept
+operator-supplied source identities, use target-release tools to inspect the
+active release, or publish a successful deployment marker by itself.
 
 The workflow obtains the active release source SHA and transaction state from a
 new, read-only command in the pinned immutable host-tools generation. That
@@ -175,15 +175,31 @@ receipt using fixed host-side code, and reports only a bounded baseline tuple
 (source SHA, release slug, digest of the exact `RELEASE.json` bytes, and stable
 current-link/release-directory device and inode identities) and whether a
 release transaction is pending. It does not execute `current/tools`
-or any candidate-release code. Before the normal build or any production write,
-the workflow requires a clean transaction state and verifies the reported
-source SHA against an exact successful production deployment proof for that
-same SHA: the canonical production-deploy workflow and run attempt, its one
-completed successful deployment job, and the bot-authored success status
-pointing to that exact attempt. The source must also be present on the target's
-first-parent history. The proof lookup is bounded and consumes complete API
-responses; missing, stale, malformed, ambiguous, truncated or non-ancestor
-evidence fails closed.
+or any candidate-release code. The host query is read-only and may run before
+the production release locks are acquired. The deployment supervisor repeats
+it after acquiring both canonical release and retained-load locks; that
+lock-held tuple is the one compared with the workflow authorization. Both
+checks require a clean transaction state and the target to remain the exact
+reviewed `dev` head.
+
+Before that locked comparison, the workflow may create only a unique,
+mode-`0700`, marker-bound temporary ingress area and transfer the closed,
+checksummed input into it. It may also create the canonical lock files needed
+to acquire the two locks. These temporary preparations are not release
+artifacts or activation writes. The exact baseline tuple and no-pending state
+must match before the workflow validates or extracts the application release
+artifact, invokes candidate code, creates release/operation receipts, or makes
+any protected release, service or pointer write. An early failure may clean
+only the exact ingress tree whose marker and filesystem identity it created;
+no broad temporary-directory cleanup is permitted.
+
+The active source SHA must have an exact successful production deployment
+proof for that same SHA: the canonical production-deploy workflow and run
+attempt, its one completed successful deployment job, and the bot-authored
+success status pointing to that exact attempt. The source must also be present
+on the target's first-parent history. The proof lookup is bounded and consumes
+complete API responses; missing, stale, malformed, ambiguous, truncated or
+non-ancestor evidence fails closed.
 
 The success proof is not rejected solely because its run is old while the
 immutable host receipt still identifies that exact active release. Freshness
@@ -200,7 +216,23 @@ verified no-op: it does not build or transfer an application release, write a
 production pending status, or emit a successful deployment marker. If the set
 contains application or runtime changes, the same exact target must still
 classify as an ordinary deployable full route with all canonical gates passed.
-The bootstrap-only artifact never supplies this authority.
+The incremental classifier artifact is revalidated but is never used as the
+cumulative route. The trusted classifier recomputes `runtime_sensitive` from
+the full baseline-to-target file set, so an incremental non-sensitive result
+cannot suppress runtime proof required by earlier undelivered changes.
+
+When that cumulative route is runtime-sensitive, it also requires a distinct
+successful `Platform security and build` `workflow_dispatch` proof run on the
+exact target. That run retains the full canonical gate set and must pass both
+`release-runtime` and `release-runtime-real`. Its `platform-baseline-runtime`
+status context and receipt bind the proof attempt to the exact source security
+run, automatic dispatcher run and parent production run. The parent waits for
+the finalizer to publish the terminal status for that exact attempt, then
+accepts the proof only with the current bot-authored success status, complete
+job/status inventories and matching receipt artifact. This separate context
+preserves the original push `platform-security-build`
+evidence; a proof run cannot replace or refresh the source CI marker. The
+bootstrap-only artifact never supplies deployment authority.
 
 The immutable host query is repeated inside the pinned production deployment
 supervisor after it acquires the canonical release and retained-load locks and
@@ -209,19 +241,25 @@ release slug, receipt digest and clean transaction state must still match the
 baseline used for classification, and the exact target must still be the
 reviewed `dev` head. A
 changed source, pending transaction, failed read or ambiguous proof stops the
-operation before writes. The supervisor retains both locks across this check
-and candidate activation, so another release or recovery cannot change the
-baseline between authorization and mutation. Reconciliation never chooses a
-different historical marker to paper over a host mismatch. After a documented
-rollback or recovery, only the SHA reported by the active host is considered,
-and it still needs its own exact successful deployment proof and clean
-transaction state.
+operation before writes. The comparison occurs before release artifact
+validation or extraction, candidate execution, or any protected
+release/activation write; only marker-bound temporary ingress and lock-file
+preparation may precede it. The supervisor retains both locks across this
+check and candidate activation, so another release or recovery cannot change
+the baseline between authorization and mutation. Reconciliation never chooses
+a different historical marker to paper over a host mismatch. After a
+documented rollback or recovery, only the SHA reported by the active host is
+considered, and it still needs its own exact successful deployment proof and
+clean transaction state.
 
-Adding this capability follows the host-tools two-commit process. Commit A
-adds the fixed read-only helper, its closed dispatcher command, and contract
-tests. After A passes exact full CI, operators provision and verify its new
-content-addressed generation through the approved root-console procedure
-while retaining the prior generation. Commit B changes the reviewed pin and
-records A's exact closure baseline; it merges only after the generation is
-installed and the host capability contract passes. The reconciliation route
-must not dispatch against a pin that has not completed this sequence.
+The read-only baseline command and lock-held comparison are part of the pinned
+host-tools contract documented in
+[`production-host-tools-provisioning.md`](production-host-tools-provisioning.md).
+The workflow requires that exact installed generation to pass the normal
+read-only capability preflight before it can collect the baseline. It never
+installs or upgrades host tools as part of reconciliation. Any future change
+to immutable host code must follow the two-commit C/P pin process, exact merged
+full CI, signed `mode=preflight` artifact verification and atomic root-only
+provisioning before the workflow can use that new generation. A failed
+capability preflight is never readiness, and the reconcile mode remains
+unavailable to manual dispatch.

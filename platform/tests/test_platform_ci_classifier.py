@@ -593,6 +593,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("workflows: [Platform security and build]", workflow)
         self.assertIn("types: [completed]", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
+        self.assertNotIn("--location", workflow)
         self.assertIn("permissions:\n      actions: read\n      statuses: write", workflow)
         self.assertNotIn("actions/checkout", workflow)
         self.assertNotIn("secrets.", workflow)
@@ -640,6 +641,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("default: standard", workflow)
         self.assertIn("          - baseline-runtime", workflow)
         self.assertIn("platform-baseline-runtime-v1:", workflow)
+        self.assertNotIn("curl --fail-with-body --silent --show-error --location", workflow)
         self.assertIn("platform-security-standard-v1", workflow)
         self.assertIn("platform-security-push-v1", workflow)
         self.assertIn('test "$TARGET_SHA" = "$GITHUB_SHA"', workflow)
@@ -899,6 +901,105 @@ class PlatformCiClassifierTests(unittest.TestCase):
             )
             self.assertEqual(invalid.returncode, 0, invalid.stderr)
             self.assertEqual(invalid.stdout.strip(), "false")
+
+    def test_baseline_status_final_leaves_terminal_write_to_workflow_run_finalizer(self) -> None:
+        workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        status_final = workflow.split("  status-final:", 1)[1]
+        script_match = re.search(
+            r"(?ms)^[ ]{8}run: \|\n(?P<script>.*?)(?=^[ ]{6}- name:|\Z)",
+            status_final,
+        )
+        self.assertIsNotNone(script_match)
+        assert script_match is not None
+        script = textwrap.dedent(script_match.group("script"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            marker = root / "status-posted"
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$STATUS_WRITE_MARKER\"\n",
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            base_environment = os.environ.copy()
+            base_environment.update(
+                {
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "STATUS_WRITE_MARKER": str(marker),
+                    "CLASSIFIER_RESULT": "success",
+                    "EVENT_NAME": "workflow_dispatch",
+                    "PROOF_MODE": "baseline-runtime",
+                    "BASELINE_GUARD_RESULT": "success",
+                    "TARGET_SHA_INPUT": self.TARGET_SHA,
+                    "PROOF_RUN_ID": "12345",
+                    "PROOF_RUN_ATTEMPT": "1",
+                    "ROUTE_EVENT": "workflow_dispatch",
+                    "ROUTE_CLASS": "docs-only",
+                    "ROUTE_DEPLOYABLE": "false",
+                    "ROUTE_FALLBACK": "false",
+                    "ROUTE_RUNTIME_SENSITIVE": "false",
+                    "ROUTE_TARGET_SHA": self.TARGET_SHA,
+                    "ROUTE_DIGEST": "b" * 64,
+                    "ROUTE_REASON": "trusted docs route",
+                    "EXPECTED_GATES": json.dumps(["docs", "verification-contract"]),
+                    "TESTED_SHA": self.TARGET_SHA,
+                    "STATUS_START_RESULT": "success",
+                    "WORKFLOW_REF": "refs/heads/dev",
+                    "BACKEND_RESULT": "success",
+                    "PYTHON_QUALITY_RESULT": "success",
+                    "SECURITY_RESULT": "success",
+                    "WEB_QUALITY_RESULT": "success",
+                    "WEB_HERMETIC_RESULT": "success",
+                    "DOCS_RESULT": "success",
+                    "MIGRATION_RESULT": "success",
+                    "VERIFICATION_CONTRACT_RESULT": "success",
+                    "RELEASE_RUNTIME_RESULT": "success",
+                    "RELEASE_RUNTIME_REAL_RESULT": "success",
+                    "SUMMARY_PATH": str(root / "summary.json"),
+                    "GH_TOKEN": "test-token",
+                    "GITHUB_SERVER_URL": "https://github.com",
+                    "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                    "GITHUB_WORKSPACE": str(root),
+                    "GITHUB_RUN_ID": "12345",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_API_URL": "https://api.github.com",
+                }
+            )
+            baseline = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=base_environment,
+                timeout=10,
+            )
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+            self.assertFalse(marker.exists(), baseline.stdout + baseline.stderr)
+
+            standard_environment = dict(base_environment)
+            standard_environment.update(
+                {
+                    "PROOF_MODE": "standard",
+                    "RELEASE_RUNTIME_RESULT": "skipped",
+                    "RELEASE_RUNTIME_REAL_RESULT": "skipped",
+                    "SUMMARY_PATH": str(root / "standard-summary.json"),
+                }
+            )
+            standard = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=standard_environment,
+                timeout=10,
+            )
+            self.assertEqual(standard.returncode, 0, standard.stderr)
+            self.assertTrue(marker.exists())
+            self.assertEqual(marker.read_text(encoding="utf-8").count("\n"), 1)
+            self.assertIn('"context": "platform-security-build"', marker.read_text(encoding="utf-8"))
 
     def test_successful_reduced_routes_keep_canonical_status_and_noop_autodeploy(self) -> None:
         security = SECURITY_WORKFLOW.read_text(encoding="utf-8")
