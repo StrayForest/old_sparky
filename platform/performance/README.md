@@ -2,17 +2,18 @@
 
 - Status: Active reference
 - Owner: Platform performance
-- Last reviewed: 2026-09-11
+- Last reviewed: 2026-10-01
 
-The JSON files in `profiles/` are the only authored canonical load contracts
-(schema 2). `tools/platform_load.py` validates, fingerprints and dispatches
-them; `tools/platform_external_load.py` remains the external HTTP
+The top-level JSON files in `profiles/` are the only authored canonical load
+contracts (schema 2). `tools/platform_load.py` validates, fingerprints and
+dispatches them; `tools/platform_external_load.py` remains the external HTTP
 implementation detail. `tools/platform_load_acceptance.py` owns the shared
 SLO, capacity, spike and stress decisions.
 
-The pre-separation v1 contracts remain under `profiles/retained-v1/` solely as
-historical semantics for interpreting retained evidence. That directory is
-outside the active registry and is not selectable by the production workflow.
+The pre-separation v1 contracts and retired saturation sweeps remain under
+[`profiles/retained-v1/`](profiles/retained-v1/README.md) solely as historical
+semantics for interpreting retained evidence. That directory is outside the
+active registry and is not selectable by the production workflow.
 
 ## Canonical profiles
 
@@ -20,9 +21,6 @@ outside the active registry and is not selectable by the production workflow.
 | --- | --- | --- |
 | `ready-vote-slo-v2` | default/active | 500-user human-shaped Ready Vote supported-load contract |
 | `ready-vote-capacity-ramp-v2` | default/active | 20–80 logical Ready Vote actions/s, 30s steady phases |
-| `ready-vote-saturation-ramp-v1` | diagnostic/deprecated | 80–120 logical Ready Vote actions/s; retained evidence only |
-| `ready-vote-saturation-ramp-v2` | diagnostic/deprecated | 120–165 logical Ready Vote actions/s; retained evidence only |
-| `ready-vote-saturation-ramp-v3` | diagnostic/deprecated | 105–120 logical Ready Vote actions/s; retained evidence only |
 | `ready-vote-saturation-ramp-v4` | diagnostic/active | 120–135 logical Ready Vote actions/s, 30s steady phases |
 | `ready-vote-stress-15k-v2` | default/active | 15,000-user aggressive Ready Vote behavior test |
 | `ready-vote-stress-20k-v2` | diagnostic/active | Optional 20,000-user unresolved-question stress test |
@@ -32,17 +30,13 @@ outside the active registry and is not selectable by the production workflow.
 | `read-mix-concurrency-ramp-v1` | diagnostic/active | Full read mix at c16/c32/c48/c64/c80/c96/c112/c128 |
 | `authenticated-page-load-v1` | default/active | Full authenticated Next.js tournament HTML control |
 | `authenticated-page-load-v2` | diagnostic/active | HTTP/1.1 keep-alive transport comparison |
-| `tournament-lifecycle-slo-v1` | diagnostic/replacement-needed | Retained lifecycle SLO shape; not dispatchable until QA profile binding exists |
-| `tournament-lifecycle-scale-v1` | diagnostic/replacement-needed | Retained lifecycle waves; not dispatchable until QA profile binding exists |
-| `tournament-lifecycle-capacity-v1` | diagnostic/replacement-needed | Lifecycle capacity contour using the QA harness |
 
-The current source portfolio contains 11 active profiles that are dispatchable
-through the production external-load workflow, three diagnostic profiles that
-are deprecated and retained for historical interpretation, and three
-diagnostic lifecycle profiles marked `replacement-needed`. The deprecated
-profiles remain listable but are not runnable; lifecycle profiles remain
-QA/preproduction-only and non-dispatchable until their profile/digest binding
-is integrated. Derive this portfolio from the executable
+The current source portfolio contains 11 active profiles, all dispatchable
+through the production external-load workflow. The retired saturation v1–v3
+contracts are retained only under
+[`profiles/retained-v1/`](profiles/retained-v1/README.md); lifecycle QA has no
+canonical JSON placeholder in this registry and remains a separate
+preproduction harness concern. Derive this portfolio from the executable
 [profile registry](../tools/platform_load.py)
 and the reviewed [production workflow choices](../../.github/workflows/platform-production-external-load.yml),
 not from retained report counts.
@@ -52,9 +46,72 @@ logical actions, HTTP concurrency, spread, timeout, retry policy, expected
 statuses, correctness requirements, latency/failure/resource budgets and exact
 cleanup contour. The portfolio block additionally records owner, hypothesis,
 class/status, cadence, environment, request/cost budget and last accepted
-evidence. Deprecated profiles remain for interpreting old reports but are
-blocked by the runner; only active profiles are runnable. Its SHA-256 digest is
-recorded with every retained result.
+evidence. Only active profiles are runnable. Its SHA-256 digest is recorded
+with every retained result.
+
+### Runtime deadlines and kill boundary
+
+`portfolio.request_budget.max_duration_seconds` and
+`portfolio.cost_budget.max_runner_minutes` select one absolute monotonic wall
+deadline. A bounded reserve inside that deadline covers worker startup,
+wrapper wait, TERM/KILL, captured-chain and namespace reaping, report
+read/validation/publication and the final acceptance gate; no teardown phase
+extends the budget. The reserve includes a one-second post-watchdog-KILL reap
+interval for the hosted-runner sudo monitor to reparent and for the supervisor
+to reap the namespace PID1 and captured chain, in addition to the configured
+TERM grace; short profiles therefore fail closed rather than spending their
+entire wall budget on measured work. The deadline starts before the trace and
+first measured I/O.
+
+`platform_load.py run` is only a supervisor. On the pinned `ubuntu-24.04`
+runner it first probes the mandatory Linux PID-namespace contour, then starts
+the complete load engine through the absolute system chain
+`/usr/bin/sudo -n /usr/bin/setpriv --pdeathsig SIGKILL --
+/usr/bin/unshare --pid --fork --mount-proc --kill-child=SIGKILL`. No
+checkout-controlled helper runs as root. The inner absolute `setpriv` drops to
+the original runner UID/GID, clears groups, sets `--no-new-privs`, and clears
+inheritable/ambient/bounding capabilities before it execs the Python worker as
+namespace PID 1. The probe and entry check all real/effective/saved UID/GID
+values, groups, PID 1/PPID 0, all capability fields and `NoNewPrivs=1`; the
+stdio READY/ACK handshake does not depend on inherited descriptors that sudo
+could close. A failed probe is non-authoritative and there is no unsafe
+process-group fallback; the runtime rejects before mkdir/stale cleanup/config
+write/temp-directory creation and returns only an in-memory error/exit on a
+root/local runner. The supervisor passes the same absolute deadlines to the
+worker and sends `TERM` followed by `KILL` after only the remaining grace.
+It tracks wrapper and namespace identities by pidfd/start-time, waits for the
+wrapper, reaps a zombie namespace PID 1 when needed, and verifies closure
+before publishing the report. Every report has mandatory boolean
+`namespace_closed`; only the parent sets it true after closure. A killed,
+malformed or incomplete worker produces a failed report with
+`partial_work=true` and `inflight_unknown=true`; a missing child report cannot
+replace the primary timeout or containment reason. A teardown, report-parser
+or publication overrun is always a failed envelope and never `reason=none` or
+success. The finalizer blocks all
+cleanup on missing/false `namespace_closed` and exposes a separate manual
+emergency barrier. Linux namespace workers set `PR_SET_PDEATHSIG=SIGKILL` as
+an orphan guard. A non-root pidfd watchdog additionally reclaims the complete
+sudo/setpriv/unshare descendant chain when the supervisor disappears, because
+a setuid sudo exec may clear the signal across that transition. The hosted
+canary uses an eight-second synthetic window with teardown margin, creates a
+TERM-ignoring setsid/double-fork/nested descendant tree, records outer
+PID/start-time identities and proves heartbeat plus every captured identity
+stop after closure. The non-root watchdog wraps sudo in the absolute system
+`setpriv --pdeathsig SIGKILL` where the system implementation preserves that
+signal; PID1 pidfd signalling and the bounded full-chain reap remain the
+authoritative closure proof when setuid sudo clears it.
+
+DNS resolution, TCP connect, TLS, request writes, response headers/body,
+retry backoff and executor futures all consume the same absolute budget. The
+HTTP/1.1 candidate keeps one connection per load-worker thread and does not
+spawn a subprocess per request; a blocked resolver or socket remains
+reclaimable because the entire engine is inside the killable PID namespace.
+
+The external-load workflow publishes a closed candidate report whenever one is
+available, regardless of the client exit status. Its independent finalizer
+still runs with `always()` and owns fixture cleanup; only the later evaluation,
+sanitization and exact cleanup gates can produce a successful evidence
+artifact.
 
 The external runner preserves schema-1 report fields and adds measurement
 schema 2. Compatibility `latency` remains service latency; the additive timing
@@ -91,9 +148,8 @@ phase populations (`read_mix`, optional `manual_refresh`, or
 `authenticated_page_load`) and exact planned action counts. Their producer
 summaries must contain those phases in the same order, with complete logical
 and raw timing boundaries. The authoritative `evaluate` boundary applies the
-profile dispatchability gate first, so deprecated, replacement-needed and
-lifecycle evidence remains inspectable but can only be retained as
-non-authoritative evidence.
+profile dispatchability gate before accepting evidence; retained historical
+reports remain inspectable but cannot become authoritative current results.
 
 The evaluator also recomputes every logical and raw-HTTP outcome from strict
 integer counters: successes plus failures must equal actions, successful
@@ -168,6 +224,53 @@ before signalling. Stale/reused PIDs or an ambiguous/restarting tree are not
 profiled. See the [observer implementation](../tools/platform_external_load_observer.py)
 and the [workflow binding check](../../.github/workflows/platform-production-external-load.yml).
 
+### External-load memory and diagnostic bounds
+
+The external client uses a sliding `FIRST_COMPLETED` window: at most the
+configured HTTP concurrency worth of futures/results is live, and the next
+action is submitted only after one completion has been reduced. A streaming
+phase accumulator keeps counters and compact eight-byte numeric sample arrays;
+the historical sorted linear-interpolation percentile algorithm is unchanged.
+Its sample population is bounded by the selected profile's planned attempt
+count, and the report is rendered only after those accounted samples are
+reduced. The former submit-all implementation had a theoretical body-retention
+ceiling of about 332 GiB at the 170,000-attempt envelope (170,000 × the 2 MiB
+body cap), before parsed-JSON and object overhead. Standard API projection
+buffers now retain at most about 8 MiB at concurrency 128 or 32 MiB at
+concurrency 512 (64 KiB per live capture), plus an estimated 30 MiB of compact
+numeric arrays at the largest accounted sample population. The exact unique
+`cf_rays` counter remains bounded by the completed action/attempt count, not by
+concurrency, because preserving its report-compatible uniqueness requires
+retaining one bounded identity per observed ray. These are static bounds; the
+CI-only `ExternalLoadTests.test_real_rss_probe...` acceptance now measures the
+two live phases in one fresh Linux child at `C=512, N=4096` with independent
+64 KiB synthetic payloads, then a separate child reduces four accumulators at
+`N=16384` each with unique `cf_ray` and full timing fields. It reads
+`/proc/self/status` (`VmRSS`/`VmHWM`) and `resource.ru_maxrss`, verifies exact
+submitted/completed/peak-pending/live-payload counters, native-thread
+restoration, direct-child absence and process-group reap, and emits only
+bounded JSON. The independent acceptance limits are `VmHWM`/`ru_maxrss` delta
+`<192 MiB` for live phases and `<24 MiB` for the accumulator child; live and
+hostile probes have absolute 15-second and 0.5-second supervisor deadlines,
+respectively, while the accumulator probe has a 30-second deadline. The
+existing sliding-window
+pending bound remains the mutation contract: the former submit-all
+implementation fails when pending work reaches `N`. This is local/CI evidence
+only and does not authorize a production load run. Completed request objects,
+response bodies and parsed payloads are released immediately. Read/page routes
+retain
+only status, ETag, byte count, timing and the allowlisted
+`AUTHENTICATED_READ_OVERLOADED` code; Ready Vote retains only `code`,
+`retryable`, `retry_after_ms`, `changed` and the state-read
+`active_round.ready_count` correctness fields.
+
+`error_samples` and `timeout_diagnostics` retain the deterministic first 25
+rows per summary. The corresponding `*_total` and `*_truncated` counters make
+discarded diagnostics explicit; no response body, secret, raw URL or
+diagnostic identifier is added to those rows. These bounds do not change the
+profile rates, durations, thresholds, status counters, correctness checks or
+percentile math.
+
 CPU-profile files whose PID is not among the workers armed for this observer
 window are ignored for the private authoritative summary, never deleted, and
 remain caller/host retention artifacts. The private observer reports that
@@ -197,14 +300,13 @@ accepted latency percentiles, throughput/goodput, status/error classes, pool
 waits, DB wait-state counts, CPU/RSS, and observer completion/binding checks
 remain mandatory acceptance inputs.
 
-The tournament-lifecycle profiles are retained as diagnostic,
-replacement-needed portfolio entries and are executed only by
-`platform_production_qa.py` against the configured QA/preprod origin. They are
-explicitly non-dispatchable until that harness records the selected profile ID
-and digest; they do not invoke
-the external 15k/20k workflows. The harness reports each lifecycle phase with
-full HTTP request/success/error/percentile/throughput/goodput/response-byte
-metrics plus the existing system sampler and diagnostic `request_perf` data.
+The tournament-lifecycle QA contour is intentionally separate from this
+registry and is executed only by `platform_production_qa.py` against the
+configured QA/preprod origin. It has no selectable production-load profile and
+must not invoke the external 15k/20k workflows. The harness reports each
+lifecycle phase with full HTTP request/success/error/percentile/throughput/
+goodput/response-byte metrics plus the existing system sampler and diagnostic
+`request_perf` data.
 
 The v2 SLO profile applies the supported-load contract: accepted request
 p50/p90/p95/p99 of 250/400/600/1000 ms, logical p95/p99 of 600/1000 ms,
@@ -529,7 +631,10 @@ weakened.
 
 The production reference was restored from baseline `e70d1e7869e36aa401f6dc9c7fd5b38fea20a597` to `ready-vote-static-8` (deploy run `33332517609`). The final measured runtime source was `e0d27295dc7990250dd0a37f0b2210ee15e5b111`; the later documentation-only release keeps the same runtime behavior. Static-8 is exact per worker: minimum/initial/maximum admission concurrency `8/8/8`, with two API workers. API pool size `24`, `max_overflow=0`, checkout timeout `10s`, Redis and the database/worker budgets were unchanged.
 
-Canonical profile fingerprints used for the retained evidence are:
+Canonical profile fingerprints used for the retained evidence are listed
+below. The retired saturation v1–v3 rows refer to the historical files under
+[`profiles/retained-v1/`](profiles/retained-v1/README.md), not the active
+registry:
 
 These are historical report digests from before the portfolio metadata block
 was added; current registry digests intentionally differ and must be recorded
@@ -539,9 +644,9 @@ in new reports rather than rewriting retained evidence.
 | --- | ---: | --- |
 | `ready-vote-slo-v2` | 2 | `c13851df4526bb4e32ddd49b93cf2810cca2da42b19c569a2c2bc7843757543a` |
 | `ready-vote-capacity-ramp-v2` | 2 | `f4956f9f0e282c44ce3adc72eeeb342cce650979336f737e032df47567ea533c` |
-| `ready-vote-saturation-ramp-v1` | 1 | `804c6c5f882fc41ceef6087706e3cd61db7b9c4c1c629773ad2fa32744a6451f` |
-| `ready-vote-saturation-ramp-v2` | 2 | `47452144eb575bd6bee2184710b8d325e43499b921875b94400a7160877a0d54` |
-| `ready-vote-saturation-ramp-v3` | 3 | `d34c2537469daa6be0fdefa065306a7b82db911aaf151ffaba8480fb08d65fd8` |
+| [`ready-vote-saturation-ramp-v1`](profiles/retained-v1/ready-vote-saturation-ramp-v1.json) | 1 | `804c6c5f882fc41ceef6087706e3cd61db7b9c4c1c629773ad2fa32744a6451f` |
+| [`ready-vote-saturation-ramp-v2`](profiles/retained-v1/ready-vote-saturation-ramp-v2.json) | 2 | `47452144eb575bd6bee2184710b8d325e43499b921875b94400a7160877a0d54` |
+| [`ready-vote-saturation-ramp-v3`](profiles/retained-v1/ready-vote-saturation-ramp-v3.json) | 3 | `d34c2537469daa6be0fdefa065306a7b82db911aaf151ffaba8480fb08d65fd8` |
 | `ready-vote-saturation-ramp-v4` | 4 | `be8a2da8bab1ab966acfc90863c646d011eae36fd19034bbf2df1c91e8622e17` |
 | `ready-vote-stress-15k-v2` | 2 | `a9fb7897fd228a8314ee0e02bef5c11e9149045adaecddd13ee3cc4f022cc8c8` |
 | `ready-vote-spike-v1` | 1 | `6351a06a342b6170bb9f7bb2a280bd4bbbdf34443b90dc5df39698a0a52c6895` |
@@ -631,8 +736,9 @@ PostgreSQL/Redis/DB-pool budgets and the same GitHub-hosted external runner.
 The 15k stress result is retained as stress evidence only; it is not the
 canonical saturation ceiling.
 
-The baseline rate sweep was split across `ready-vote-saturation-ramp-v1`
-(`33368575458`) and the refinement `ready-vote-saturation-ramp-v4`
+The baseline rate sweep was split across the retained
+[`ready-vote-saturation-ramp-v1`](profiles/retained-v1/ready-vote-saturation-ramp-v1.json)
+(`33368575458`) and the active refinement `ready-vote-saturation-ramp-v4`
 (`33374294139`). The table is the phase evidence used for the envelope:
 
 | Offered target | Actual offered | Goodput | Accepted p95/p99 ms | Logical p95/p99 ms | Shed / retry / final fail | Source |

@@ -757,6 +757,10 @@ PUBLIC_SUMMARY_INT_FIELDS = frozenset(
         "mismatches",
         "cf_ray_present",
         "cf_ray_count",
+        "error_sample_total",
+        "error_sample_truncated",
+        "timeout_diagnostic_total",
+        "timeout_diagnostic_truncated",
     }
 )
 PUBLIC_SUMMARY_NUMBER_FIELDS = frozenset(
@@ -996,6 +1000,7 @@ PUBLIC_DECISIONS = frozenset(
         "STRESS BEHAVIOR PASS",
         "STRESS BEHAVIOR FAIL",
         "LOAD RUN FAILED",
+        "LOAD RUNTIME BUDGET EXCEEDED",
         "LOAD REPORT BINDING FAIL",
         "LOAD PROFILE NON-AUTHORITATIVE",
         "LEGACY DIAGNOSTIC NON-AUTHORITATIVE",
@@ -1782,6 +1787,39 @@ def _project_external_load(value: Any) -> dict[str, Any]:
         flag = _copy_bool(source, key)
         if flag is not None:
             output[key] = flag
+    inflight_unknown = _copy_bool(source, "inflight_unknown")
+    if inflight_unknown is not None:
+        output["inflight_unknown"] = inflight_unknown
+    runtime = _mapping(source.get("runtime_budget"))
+    runtime_output: dict[str, Any] = {}
+    max_duration = _copy_int(runtime, "max_duration_seconds")
+    if max_duration is not None:
+        runtime_output["max_duration_seconds"] = max_duration
+    for key in (
+        "max_runner_minutes",
+        "actual_elapsed_seconds",
+        "actual_runner_seconds",
+        "actual_runner_minutes",
+    ):
+        number = _copy_number(runtime, key)
+        if number is not None:
+            runtime_output[key] = number
+    for key in (
+        "within_duration_budget",
+        "within_runner_budget",
+        "budget_exceeded",
+    ):
+        flag = _copy_bool(runtime, key)
+        if flag is not None:
+            runtime_output[key] = flag
+    runtime_phase = safe_phase(runtime.get("phase"))
+    if runtime_phase != "other":
+        runtime_output["phase"] = runtime_phase
+    runtime_reason = runtime.get("reason")
+    if runtime_reason in {"none", "max_duration_seconds", "max_runner_minutes"}:
+        runtime_output["reason"] = runtime_reason
+    if runtime_output:
+        output["runtime_budget"] = runtime_output
     scenario = source.get("scenario_kind")
     if _allowed_string(
         scenario, frozenset({"slo", "stress", "spike", "capacity", "other"})

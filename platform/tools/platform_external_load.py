@@ -11,8 +11,9 @@ must come from a versioned profile through ``platform_load.py``.
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from array import array
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import http.client
@@ -24,13 +25,16 @@ import random
 import re
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
     from tools.platform_http_transport import HTTP11KeepAliveClient
+    from tools.platform_load_runtime import (
+        LoadRuntimeBudget,
+    )
     from tools.platform_load_acceptance import (
         derive_expected_phase_plan,
         evaluate_acceptance,
@@ -38,6 +42,7 @@ try:
     )
 except ModuleNotFoundError:  # Direct execution from platform/tools.
     from platform_http_transport import HTTP11KeepAliveClient
+    from platform_load_runtime import LoadRuntimeBudget
     from platform_load_acceptance import (
         derive_expected_phase_plan,
         evaluate_acceptance,
@@ -75,7 +80,9 @@ MAX_TOURNAMENTS = 64
 MAX_CONCURRENCY = 512
 RESPONSE_BODY_LIMIT = 2 * 1024 * 1024
 ERROR_SAMPLE_LIMIT = 25
+TIMEOUT_DIAGNOSTIC_LIMIT = 25
 DIAGNOSTIC_HEADER_LIMIT = 128
+RESPONSE_JSON_CAPTURE_LIMIT = 64 * 1024
 MAX_MEASUREMENT = 1_000_000_000_000.0
 DEFAULT_CLIENT_TRANSPORT = "urllib-http1-close"
 HTTP11_KEEPALIVE_TRANSPORT = "http1-keepalive"
@@ -137,6 +144,9 @@ class RequestResult:
     schedule_delay_ms: float | None = None
     late_start_ms: float | None = None
     user_observed_elapsed_ms: float | None = None
+    # Internal submission order used only to make bounded diagnostics
+    # deterministic.  It is never serialized into a report.
+    submission_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -154,6 +164,7 @@ class LogicalRequestResult:
     schedule_delay_ms: float | None = None
     late_start_ms: float | None = None
     user_observed_elapsed_ms: float | None = None
+    submission_index: int | None = None
 
     @property
     def final(self) -> RequestResult:
@@ -167,7 +178,14 @@ class LogicalRequestResult:
 def percentile(values: list[float], percent: float) -> float | None:
     if not values:
         return None
-    ordered = sorted(values)
+    return _percentile_from_ordered(sorted(values), percent)
+
+
+def _percentile_from_ordered(ordered: list[float], percent: float) -> float | None:
+    """Apply the historical linear interpolation to an already sorted list."""
+
+    if not ordered:
+        return None
     if len(ordered) == 1:
         return ordered[0]
     rank = (len(ordered) - 1) * percent / 100
@@ -193,12 +211,39 @@ def _finite_nonnegative_measurement(value: Any) -> float | None:
     )
 
 
-def metric_stats(values: list[float]) -> dict[str, Any]:
-    valid_values: list[float] = []
+class _NumericSamples:
+    """Compact exact percentile samples.
+
+    A Python float in a list costs several times more than its eight-byte
+    payload.  The runner keeps only these compact arrays while a phase is
+    active; request/result objects and response bodies are released after each
+    completion.  The configured workload bounds the number of samples (the
+    profile's planned attempt count), so this is an accounted metric buffer,
+    not an unbounded object population.  Percentiles still use the historical
+    sorted linear-interpolation algorithm in :func:`percentile`.
+    """
+
+    __slots__ = ("values",)
+
+    def __init__(self) -> None:
+        self.values = array("d")
+
+    def append(self, value: float) -> None:
+        self.values.append(float(value))
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+
+def metric_stats(values: Iterable[float]) -> dict[str, Any]:
+    valid_values = array("d")
     for value in values:
         numeric = _finite_nonnegative_measurement(value)
         if numeric is not None:
-            valid_values.append(numeric)
+            valid_values.append(float(numeric))
     values = valid_values
     if not values:
         return {
@@ -210,14 +255,15 @@ def metric_stats(values: list[float]) -> dict[str, Any]:
             "p99_ms": None,
             "max_ms": None,
         }
+    ordered = sorted(valid_values)
     return {
         "count": len(values),
-        "avg_ms": round(sum(values) / len(values), 3),
-        "p50_ms": round(percentile(values, 50) or 0, 3),
-        "p90_ms": round(percentile(values, 90) or 0, 3),
-        "p95_ms": round(percentile(values, 95) or 0, 3),
-        "p99_ms": round(percentile(values, 99) or 0, 3),
-        "max_ms": round(max(values), 3),
+        "avg_ms": round(sum(valid_values) / len(valid_values), 3),
+        "p50_ms": round(_percentile_from_ordered(ordered, 50) or 0, 3),
+        "p90_ms": round(_percentile_from_ordered(ordered, 90) or 0, 3),
+        "p95_ms": round(_percentile_from_ordered(ordered, 95) or 0, 3),
+        "p99_ms": round(_percentile_from_ordered(ordered, 99) or 0, 3),
+        "max_ms": round(max(valid_values), 3),
     }
 
 
@@ -315,22 +361,48 @@ def _annotate_timing(
     return result
 
 
-def _timing_summary(
-    results: list[Any],
-    *,
-    unit: str,
-    expected_count: int | None = None,
-    submitted_count: int | None = None,
-) -> dict[str, Any]:
-    """Return additive arrival/queue/user-observed measurements.
+class _TimingAccumulator:
+    """Streaming timing summary with compact exact percentile samples."""
 
-    ``unit`` is either ``requests`` or ``logical_actions`` and only affects
-    the names of the throughput fields.  Existing ``latency`` fields remain
-    service/end-to-end compatibility fields; callers can opt into this
-    measurement schema explicitly.
-    """
+    __slots__ = (
+        "service_latency",
+        "observed",
+        "queue_wait",
+        "schedule_delay",
+        "late_start",
+        "starts",
+        "finishes",
+        "scheduled",
+        "started",
+        "response_completions",
+        "user_observed_count",
+        "scheduled_count",
+        "missing_schedule_context",
+        "missing_timing_context",
+        "invalid_timing_context",
+        "completed_count",
+    )
 
-    def finite_timestamp(value: Any) -> float | None:
+    def __init__(self) -> None:
+        self.service_latency = _NumericSamples()
+        self.observed = _NumericSamples()
+        self.queue_wait = _NumericSamples()
+        self.schedule_delay = _NumericSamples()
+        self.late_start = _NumericSamples()
+        self.starts = _NumericSamples()
+        self.finishes = _NumericSamples()
+        self.scheduled = _NumericSamples()
+        self.started = 0
+        self.response_completions = 0
+        self.user_observed_count = 0
+        self.scheduled_count = 0
+        self.missing_schedule_context = 0
+        self.missing_timing_context = 0
+        self.invalid_timing_context = 0
+        self.completed_count = 0
+
+    @staticmethod
+    def _finite_timestamp(value: Any) -> float | None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
         try:
@@ -341,149 +413,538 @@ def _timing_summary(
             return None
         return numeric
 
-    def finite_elapsed(value: Any) -> float | None:
-        numeric = finite_timestamp(value)
-        return numeric
-
-    observed: list[float] = []
-    queue_wait: list[float] = []
-    schedule_delay: list[float] = []
-    late_start: list[float] = []
-    starts: list[float] = []
-    finishes: list[float] = []
-    scheduled: list[float] = []
-    started = 0
-    response_completions = 0
-    user_observed_count = 0
-    scheduled_count = 0
-    missing_schedule_context = 0
-    missing_timing_context = 0
-    invalid_timing_context = 0
-    service_latency: list[float] = []
-    for result in results:
+    def add(self, result: Any) -> None:
+        self.completed_count += 1
         service_value = _finite_nonnegative_measurement(
             getattr(result, "elapsed_ms", None)
         )
         if service_value is not None:
-            service_latency.append(service_value)
-        scheduled_at = finite_timestamp(getattr(result, "scheduled_at_monotonic", None))
-        enqueued_at = finite_timestamp(getattr(result, "enqueued_at_monotonic", None))
-        started_at = finite_timestamp(getattr(result, "started_at_monotonic", None))
-        finished_at = finite_timestamp(getattr(result, "finished_at_monotonic", None))
-        user_observed = finite_elapsed(getattr(result, "user_observed_elapsed_ms", None))
+            self.service_latency.append(service_value)
+        scheduled_at = self._finite_timestamp(
+            getattr(result, "scheduled_at_monotonic", None)
+        )
+        enqueued_at = self._finite_timestamp(
+            getattr(result, "enqueued_at_monotonic", None)
+        )
+        started_at = self._finite_timestamp(
+            getattr(result, "started_at_monotonic", None)
+        )
+        finished_at = self._finite_timestamp(
+            getattr(result, "finished_at_monotonic", None)
+        )
+        user_observed = self._finite_timestamp(
+            getattr(result, "user_observed_elapsed_ms", None)
+        )
 
         if scheduled_at is None or enqueued_at is None:
-            missing_schedule_context += 1
+            self.missing_schedule_context += 1
         else:
-            scheduled_count += 1
-            scheduled.append(scheduled_at)
+            self.scheduled_count += 1
+            self.scheduled.append(scheduled_at)
         if started_at is not None:
-            started += 1
-            starts.append(started_at)
+            self.started += 1
+            self.starts.append(started_at)
         if finished_at is not None:
-            response_completions += 1
-            finishes.append(finished_at)
+            self.response_completions += 1
+            self.finishes.append(finished_at)
         if user_observed is not None:
-            user_observed_count += 1
-            observed.append(user_observed)
+            self.user_observed_count += 1
+            self.observed.append(user_observed)
 
-        queue = finite_elapsed(getattr(result, "executor_queue_wait_ms", None))
+        queue = self._finite_timestamp(
+            getattr(result, "executor_queue_wait_ms", None)
+        )
         if queue is not None:
-            queue_wait.append(queue)
-        delay = finite_elapsed(getattr(result, "schedule_delay_ms", None))
+            self.queue_wait.append(queue)
+        delay = self._finite_timestamp(getattr(result, "schedule_delay_ms", None))
         if delay is not None:
-            schedule_delay.append(delay)
-        late = finite_elapsed(getattr(result, "late_start_ms", None))
+            self.schedule_delay.append(delay)
+        late = self._finite_timestamp(getattr(result, "late_start_ms", None))
         if late is not None:
-            late_start.append(late)
+            self.late_start.append(late)
 
-        if any(value is None for value in (scheduled_at, enqueued_at, started_at, finished_at, user_observed)):
-            missing_timing_context += 1
+        if any(
+            value is None
+            for value in (scheduled_at, enqueued_at, started_at, finished_at, user_observed)
+        ):
+            self.missing_timing_context += 1
         elif finished_at < started_at:
-            invalid_timing_context += 1
-    arrival_window = (
-        max(0.001, max(starts) - min(starts))
-        if len(starts) >= 2
-        else (0.001 if starts else None)
+            self.invalid_timing_context += 1
+
+    @staticmethod
+    def _window(values: _NumericSamples) -> float | None:
+        if len(values) >= 2:
+            return max(0.001, max(values.values) - min(values.values))
+        return 0.001 if values else None
+
+    def summary(
+        self,
+        *,
+        unit: str,
+        expected_count: int | None = None,
+        submitted_count: int | None = None,
+    ) -> dict[str, Any]:
+        arrival_window = self._window(self.starts)
+        requests_per_second = (
+            self.started / arrival_window if arrival_window is not None else None
+        )
+        offered_window = self._window(self.scheduled)
+        offered_per_second = (
+            self.scheduled_count / offered_window
+            if offered_window is not None
+            else None
+        )
+        completion_window = self._window(self.finishes)
+        completed_count = self.completed_count
+        expected = completed_count if expected_count is None else max(0, int(expected_count))
+        submitted = (
+            completed_count
+            if submitted_count is None
+            else max(0, int(submitted_count))
+        )
+        dropped_work = max(0, expected - self.started)
+        timing_counts = (
+            expected,
+            submitted,
+            completed_count,
+            self.scheduled_count,
+            self.started,
+            self.response_completions,
+            self.user_observed_count,
+        )
+        partial = (
+            len(set(timing_counts)) != 1
+            or self.missing_schedule_context > 0
+            or self.missing_timing_context > 0
+            or self.invalid_timing_context > 0
+            or dropped_work != 0
+        )
+        late_count = sum(value > 0 for value in self.late_start)
+        return {
+            "timing_schema": 2,
+            "service_latency": metric_stats(self.service_latency),
+            "user_observed_latency": metric_stats(self.observed),
+            "executor_queue_wait": metric_stats(self.queue_wait),
+            "schedule_delay": metric_stats(self.schedule_delay),
+            "late_start": metric_stats(self.late_start),
+            "late_start_count": late_count,
+            "late_start_percent": round(
+                late_count * 100 / max(1, completed_count),
+                4,
+            ),
+            "expected_count": expected,
+            "submitted_count": submitted,
+            "completed_count": completed_count,
+            "partial": partial,
+            "scheduled_count": self.scheduled_count,
+            "started_count": self.started,
+            "actual_request_start_count": self.started,
+            "actual_start_count": self.started,
+            "response_completion_count": self.response_completions,
+            "user_observed_count": self.user_observed_count,
+            "response_completion_window_seconds": (
+                round(completion_window, 6)
+                if completion_window is not None
+                else None
+            ),
+            "dropped_work": dropped_work,
+            "missing_schedule_context": self.missing_schedule_context,
+            "missing_timing_context": self.missing_timing_context,
+            "invalid_timing_context": self.invalid_timing_context,
+            "actual_arrival_window_seconds": (
+                round(arrival_window, 6) if arrival_window is not None else None
+            ),
+            "offered_arrival_window_seconds": (
+                round(offered_window, 6) if offered_window is not None else None
+            ),
+            f"offered_{unit}_per_second": (
+                round(offered_per_second, 3)
+                if offered_per_second is not None
+                else None
+            ),
+            f"actual_arrival_{unit}_per_second": (
+                round(requests_per_second, 3)
+                if requests_per_second is not None
+                else None
+            ),
+        }
+
+
+def _append_measurement(samples: _NumericSamples, value: Any) -> None:
+    numeric = _finite_nonnegative_measurement(value)
+    if numeric is not None:
+        samples.append(numeric)
+
+
+class _ResultAccumulator:
+    """Reduce each completed HTTP result without retaining the result object."""
+
+    __slots__ = (
+        "status_counts",
+        "by_route",
+        "latencies",
+        "errors",
+        "temporary_overloads",
+        "retry_attempts",
+        "error_kinds",
+        "cf_error_types",
+        "cf_error_origins",
+        "error_sample_entries",
+        "timeout_diagnostic_entries",
+        "error_sample_total",
+        "timeout_diagnostic_total",
+        "first_byte_times",
+        "response_bytes_count",
+        "response_bytes_total",
+        "response_bytes_max",
+        "changed",
+        "transport_names",
+        "transport_http_versions",
+        "transport_reused",
+        "transport_new",
+        "transport_phase_values",
+        "cf_rays",
+        "timing",
+        "requests",
     )
-    requests_per_second = (
-        started / arrival_window if arrival_window is not None else None
+
+    def __init__(self) -> None:
+        self.status_counts: Counter[str] = Counter()
+        self.by_route: dict[str, _NumericSamples] = {}
+        self.latencies = _NumericSamples()
+        self.errors = 0
+        self.temporary_overloads = 0
+        self.retry_attempts = 0
+        self.error_kinds: Counter[str] = Counter()
+        self.cf_error_types: Counter[str] = Counter()
+        self.cf_error_origins: Counter[str] = Counter()
+        self.error_sample_entries: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.timeout_diagnostic_entries: list[
+            tuple[tuple[Any, ...], dict[str, Any]]
+        ] = []
+        self.error_sample_total = 0
+        self.timeout_diagnostic_total = 0
+        self.first_byte_times = _NumericSamples()
+        self.response_bytes_count = 0
+        self.response_bytes_total = 0
+        self.response_bytes_max: int | None = None
+        self.changed: Counter[str] = Counter()
+        self.transport_names: Counter[str] = Counter()
+        self.transport_http_versions: Counter[str] = Counter()
+        self.transport_reused = 0
+        self.transport_new = 0
+        self.transport_phase_values: dict[str, _NumericSamples] = {}
+        self.cf_rays: set[str] = set()
+        self.timing = _TimingAccumulator()
+        self.requests = 0
+
+    @staticmethod
+    def _append_route_sample(
+        by_route: dict[str, _NumericSamples], route: str, value: float
+    ) -> None:
+        samples = by_route.setdefault(route, _NumericSamples())
+        samples.append(value)
+
+    def add(self, result: RequestResult) -> None:
+        self.requests += 1
+        self.timing.add(result)
+        status_counts = self.status_counts
+        status_counts[str(safe_status(result.status))] += 1
+        route = safe_route_key(result.method, result.path)
+        elapsed = _finite_nonnegative_measurement(result.elapsed_ms)
+        if elapsed is not None:
+            self._append_route_sample(self.by_route, route, elapsed)
+            self.latencies.append(elapsed)
+        if (
+            isinstance(result.response_bytes, int)
+            and not isinstance(result.response_bytes, bool)
+            and result.response_bytes >= 0
+        ):
+            self.response_bytes_count += 1
+            self.response_bytes_total += result.response_bytes
+            self.response_bytes_max = (
+                result.response_bytes
+                if self.response_bytes_max is None
+                else max(self.response_bytes_max, result.response_bytes)
+            )
+        _append_measurement(self.first_byte_times, result.time_to_first_byte_ms)
+        if result.transport_timing:
+            transport = result.transport_timing
+            transport_name = transport.get("transport")
+            if transport_name in SUPPORTED_PAGE_TRANSPORTS:
+                self.transport_names[str(transport_name)] += 1
+            elif transport_name is not None:
+                self.transport_names["other"] += 1
+            http_version = transport.get("http_version")
+            if http_version in {"1.0", "1.1", "2", "3"}:
+                self.transport_http_versions[str(http_version)] += 1
+            elif http_version is not None:
+                self.transport_http_versions["other"] += 1
+            if transport.get("connection_reused") is True:
+                self.transport_reused += 1
+            elif transport.get("connection_reused") is False:
+                self.transport_new += 1
+            for key in (
+                "dns_ms",
+                "tcp_connect_ms",
+                "tls_handshake_ms",
+                "request_write_ms",
+                "edge_wait_ms",
+                "ttfb_ms",
+                "body_receive_ms",
+                "total_ms",
+            ):
+                value = _finite_nonnegative_measurement(transport.get(key))
+                if value is not None:
+                    self.transport_phase_values.setdefault(key, _NumericSamples()).append(value)
+        if (
+            isinstance(result.attempt_number, int)
+            and not isinstance(result.attempt_number, bool)
+            and result.attempt_number > 1
+        ):
+            self.retry_attempts += 1
+        if _ready_vote_overload(result) or _authenticated_read_overload(result):
+            self.temporary_overloads += 1
+        if result.ok is not True:
+            self.errors += 1
+            kind = safe_error_class(result.error_kind or "unexpected", status=result.status)
+            self.error_kinds[kind] += 1
+            self.error_sample_total += 1
+            error_sample = {
+                "phase": safe_phase(result.phase),
+                "method": safe_method(result.method),
+                "route_class": safe_route_class(result.path),
+                "status": safe_status(result.status),
+                "error_class": kind,
+                "cf_error_class": safe_cf_error_class(result.cf_error_type),
+                "cf_error_origin_class": safe_cf_error_class(result.cf_error_origin),
+                "ttfb_ms": finite_number(result.time_to_first_byte_ms),
+                "elapsed_ms": finite_number(result.elapsed_ms),
+            }
+            order = (
+                safe_phase(result.phase),
+                result.submission_index
+                if isinstance(result.submission_index, int)
+                and not isinstance(result.submission_index, bool)
+                else self.error_sample_total,
+                result.attempt_number
+                if isinstance(result.attempt_number, int)
+                and not isinstance(result.attempt_number, bool)
+                else 1,
+            )
+            self.error_sample_entries.append((order, error_sample))
+            self.error_sample_entries.sort(key=lambda item: item[0])
+            del self.error_sample_entries[ERROR_SAMPLE_LIMIT:]
+            if result.diagnostic_id and kind == "timeout":
+                self.timeout_diagnostic_total += 1
+                timeout_diagnostic = {
+                    "phase": safe_phase(result.phase),
+                    "method": safe_method(result.method),
+                    "route_class": safe_route_class(result.path),
+                    "status": safe_status(result.status),
+                    "error_class": "timeout",
+                    "cf_error_class": safe_cf_error_class(result.cf_error_type),
+                    "cf_error_origin_class": safe_cf_error_class(result.cf_error_origin),
+                    "ttfb_ms": finite_number(result.time_to_first_byte_ms),
+                    "elapsed_ms": finite_number(result.elapsed_ms),
+                }
+                timeout_order = (
+                    safe_phase(result.phase),
+                    result.submission_index
+                    if isinstance(result.submission_index, int)
+                    and not isinstance(result.submission_index, bool)
+                    else self.timeout_diagnostic_total,
+                    result.attempt_number
+                    if isinstance(result.attempt_number, int)
+                    and not isinstance(result.attempt_number, bool)
+                    else 1,
+                )
+                self.timeout_diagnostic_entries.append(
+                    (timeout_order, timeout_diagnostic)
+                )
+                self.timeout_diagnostic_entries.sort(key=lambda item: item[0])
+                del self.timeout_diagnostic_entries[TIMEOUT_DIAGNOSTIC_LIMIT:]
+            if result.cf_error_type:
+                self.cf_error_types[safe_cf_error_class(result.cf_error_type)] += 1
+            if result.cf_error_origin:
+                self.cf_error_origins[safe_cf_error_class(result.cf_error_origin)] += 1
+        if (
+            isinstance(result.response_json, dict)
+            and type(result.response_json.get("changed")) is bool
+        ):
+            self.changed[str(result.response_json["changed"])] += 1
+        if result.cf_ray:
+            self.cf_rays.add(result.cf_ray)
+
+    def summary(
+        self,
+        *,
+        expected_count: int | None = None,
+        submitted_count: int | None = None,
+    ) -> dict[str, Any]:
+        error_samples = [row for _, row in self.error_sample_entries]
+        timeout_diagnostics = [
+            row for _, row in self.timeout_diagnostic_entries
+        ]
+        return {
+            "scope": "full_population",
+            "requests": self.requests,
+            "errors": self.errors,
+            "successful_responses": self.requests - self.errors,
+            "final_failure_rate_percent": round(
+                self.errors * 100 / max(1, self.requests), 4
+            ),
+            "temporary_overload_responses": self.temporary_overloads,
+            "temporary_overload_rate_percent": round(
+                self.temporary_overloads * 100 / max(1, self.requests), 4
+            ),
+            "retry_attempts": self.retry_attempts,
+            "total_retries": self.retry_attempts,
+            "retry_amplification_percent": round(
+                self.retry_attempts * 100 / max(1, self.requests - self.retry_attempts),
+                4,
+            ),
+            "unexpected_statuses": max(0, self.errors - self.temporary_overloads),
+            "status_counts": dict(sorted(self.status_counts.items())),
+            "error_kinds": dict(sorted(self.error_kinds.items())),
+            "cf_error_type_counts": dict(sorted(self.cf_error_types.items())),
+            "cf_error_origin_counts": dict(sorted(self.cf_error_origins.items())),
+            "changed_counts": dict(sorted(self.changed.items())),
+            "latency": metric_stats(self.latencies),
+            "timing": self.timing.summary(
+                unit="requests",
+                expected_count=expected_count,
+                submitted_count=submitted_count,
+            ),
+            "time_to_first_byte": metric_stats(self.first_byte_times),
+            "response_bytes": {
+                "count": self.response_bytes_count,
+                "avg_bytes": round(
+                    self.response_bytes_total / self.response_bytes_count, 3
+                )
+                if self.response_bytes_count
+                else None,
+                "max_bytes": self.response_bytes_max,
+            },
+            "transport": {
+                "names": dict(sorted(self.transport_names.items())),
+                "http_versions": dict(sorted(self.transport_http_versions.items())),
+                "connection_reused": self.transport_reused,
+                "connection_new": self.transport_new,
+                "phase_timings": {
+                    key: metric_stats(values)
+                    for key, values in sorted(self.transport_phase_values.items())
+                },
+            },
+            "by_route": {
+                route: metric_stats(values)
+                for route, values in sorted(
+                    self.by_route.items(),
+                    key=lambda item: (len(item[1]), max(item[1])),
+                    reverse=True,
+                )
+            },
+            "cf_ray_count": len(self.cf_rays),
+            "error_samples": error_samples,
+            "error_sample_total": self.error_sample_total,
+            "error_sample_truncated": max(
+                0, self.error_sample_total - len(error_samples)
+            ),
+            "timeout_diagnostics": timeout_diagnostics,
+            "timeout_diagnostic_total": self.timeout_diagnostic_total,
+            "timeout_diagnostic_truncated": max(
+                0, self.timeout_diagnostic_total - len(timeout_diagnostics)
+            ),
+        }
+
+
+class _LogicalAccumulator:
+    """Streaming reduction for Ready Vote logical actions."""
+
+    __slots__ = (
+        "actions",
+        "final_successes",
+        "total_retries",
+        "final_status_counts",
+        "changed",
+        "end_to_end_latency",
+        "accepted_request_latency",
+        "timing",
     )
-    offered_window = (
-        max(0.001, max(scheduled) - min(scheduled))
-        if len(scheduled) >= 2
-        else (0.001 if scheduled else None)
-    )
-    offered_per_second = (
-        len(scheduled) / offered_window if offered_window is not None else None
-    )
-    completion_window = (
-        max(0.001, max(finishes) - min(finishes))
-        if len(finishes) >= 2
-        else (0.001 if finishes else None)
-    )
-    completed_count = len(results)
-    expected = completed_count if expected_count is None else max(0, int(expected_count))
-    submitted = completed_count if submitted_count is None else max(0, int(submitted_count))
-    dropped_work = max(0, expected - started)
-    timing_counts = (
-        expected,
-        submitted,
-        completed_count,
-        scheduled_count,
-        started,
-        response_completions,
-        user_observed_count,
-    )
-    partial = (
-        len(set(timing_counts)) != 1
-        or missing_schedule_context > 0
-        or missing_timing_context > 0
-        or invalid_timing_context > 0
-        or dropped_work != 0
-    )
-    return {
-        "timing_schema": 2,
-        "service_latency": metric_stats(service_latency),
-        "user_observed_latency": metric_stats(observed),
-        "executor_queue_wait": metric_stats(queue_wait),
-        "schedule_delay": metric_stats(schedule_delay),
-        "late_start": metric_stats(late_start),
-        "late_start_count": sum(value > 0 for value in late_start),
-        "late_start_percent": round(
-            sum(value > 0 for value in late_start) * 100 / max(1, len(results)),
-            4,
-        ),
-        "expected_count": expected,
-        "submitted_count": submitted,
-        "completed_count": completed_count,
-        "partial": partial,
-        "scheduled_count": scheduled_count,
-        "started_count": started,
-        "actual_request_start_count": started,
-        "actual_start_count": started,
-        "response_completion_count": response_completions,
-        "user_observed_count": user_observed_count,
-        "response_completion_window_seconds": (
-            round(completion_window, 6) if completion_window is not None else None
-        ),
-        "dropped_work": dropped_work,
-        "missing_schedule_context": missing_schedule_context,
-        "missing_timing_context": missing_timing_context,
-        "invalid_timing_context": invalid_timing_context,
-        "actual_arrival_window_seconds": (
-            round(arrival_window, 6) if arrival_window is not None else None
-        ),
-        "offered_arrival_window_seconds": (
-            round(offered_window, 6) if offered_window is not None else None
-        ),
-        f"offered_{unit}_per_second": (
-            round(offered_per_second, 3) if offered_per_second is not None else None
-        ),
-        f"actual_arrival_{unit}_per_second": (
-            round(requests_per_second, 3) if requests_per_second is not None else None
-        ),
-    }
+
+    def __init__(self) -> None:
+        self.actions = 0
+        self.final_successes = 0
+        self.total_retries = 0
+        self.final_status_counts: Counter[str] = Counter()
+        self.changed: Counter[str] = Counter()
+        self.end_to_end_latency = _NumericSamples()
+        self.accepted_request_latency = _NumericSamples()
+        self.timing = _TimingAccumulator()
+
+    def add(self, result: LogicalRequestResult) -> None:
+        self.actions += 1
+        self.timing.add(result)
+        self.total_retries += result.retry_count
+        if not result.attempts:
+            return
+        final = result.final
+        self.final_status_counts[str(final.status)] += 1
+        _append_measurement(self.end_to_end_latency, result.elapsed_ms)
+        if final.ok is True:
+            self.final_successes += 1
+            _append_measurement(self.accepted_request_latency, final.elapsed_ms)
+        if (
+            isinstance(final.response_json, dict)
+            and type(final.response_json.get("changed")) is bool
+        ):
+            self.changed[str(final.response_json["changed"])] += 1
+
+    def summary(
+        self,
+        *,
+        expected_count: int | None = None,
+        submitted_count: int | None = None,
+    ) -> dict[str, Any]:
+        failures = self.actions - self.final_successes
+        return {
+            "scope": "logical_user_actions",
+            "actions": self.actions,
+            "final_successes": self.final_successes,
+            "final_failures": failures,
+            "final_failure_rate_percent": round(
+                failures * 100 / max(1, self.actions), 4
+            ),
+            "total_retries": self.total_retries,
+            "retry_amplification_percent": round(
+                self.total_retries * 100 / max(1, self.actions), 4
+            ),
+            "retries_per_action": round(
+                self.total_retries / max(1, self.actions), 4
+            ),
+            "final_status_counts": dict(sorted(self.final_status_counts.items())),
+            "changed_counts": dict(sorted(self.changed.items())),
+            "end_to_end_latency": metric_stats(self.end_to_end_latency),
+            "accepted_request_latency": metric_stats(self.accepted_request_latency),
+            "timing": self.timing.summary(
+                unit="logical_actions",
+                expected_count=expected_count,
+                submitted_count=submitted_count,
+            ),
+        }
+
+
+def _release_result_payload(result: Any) -> None:
+    """Drop response payloads as soon as a streaming consumer has reduced them."""
+
+    if isinstance(result, LogicalRequestResult):
+        for attempt in result.attempts:
+            attempt.response_json = None
+            attempt.transport_timing = None
+        result.attempts.clear()
+    elif isinstance(result, RequestResult):
+        result.response_json = None
+        result.transport_timing = None
 
 
 def spread_offsets(count: int, spread_seconds: float) -> list[float]:
@@ -630,7 +1091,14 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], list[VirtualUser]]:
     return payload, users
 
 
-def _trace(origin: str, timeout: float) -> dict[str, Any]:
+def _trace(
+    origin: str,
+    timeout: float,
+    *,
+    budget: LoadRuntimeBudget | None = None,
+) -> dict[str, Any]:
+    if budget is not None:
+        timeout = budget.bound_timeout(timeout, "trace", operation="trace_io")
     request = Request(
         f"{origin}/cdn-cgi/trace",
         method="GET",
@@ -644,9 +1112,118 @@ def _trace(origin: str, timeout: float) -> dict[str, Any]:
             # other unique request metadata which is useful only transiently
             # while debugging a live request.
             response.read(16_384)
+            if budget is not None:
+                budget.check("trace", operation="trace_body_complete")
             return {"available": True, "status": safe_status(response.status)}
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
         return {"available": False, "status": 0, "error_class": safe_error_class(type(exc).__name__)}
+
+
+def _response_json_projection(
+    *,
+    method: str,
+    path: str,
+    body: bytes,
+) -> dict[str, Any] | None:
+    """Keep only the small correctness fields needed by the load contract."""
+
+    is_vote = method == "POST" and path.endswith("/deadlock/ready-check/vote")
+    is_state = method == "GET" and path.endswith("/deadlock/ready-check")
+    is_authenticated_read = _is_authenticated_read_route(method, path)
+    if not body or not (is_vote or is_state or is_authenticated_read):
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if is_vote:
+        projection: dict[str, Any] = {}
+        code = payload.get("code")
+        if isinstance(code, str):
+            projection["code"] = code[:128]
+        retryable = payload.get("retryable")
+        if type(retryable) is bool:
+            projection["retryable"] = retryable
+        retry_after_ms = payload.get("retry_after_ms")
+        if isinstance(retry_after_ms, (int, float)) and not isinstance(
+            retry_after_ms, bool
+        ):
+            try:
+                retry_after_numeric = float(retry_after_ms)
+            except (ValueError, TypeError, OverflowError):
+                retry_after_numeric = None
+            if retry_after_numeric is not None and math.isfinite(retry_after_numeric):
+                projection["retry_after_ms"] = retry_after_ms
+        changed = payload.get("changed")
+        if type(changed) is bool:
+            projection["changed"] = changed
+        return projection or None
+    if is_authenticated_read:
+        if payload.get("code") == "AUTHENTICATED_READ_OVERLOADED":
+            return {"code": "AUTHENTICATED_READ_OVERLOADED"}
+        return None
+    active_round = payload.get("active_round")
+    if not isinstance(active_round, dict):
+        return None
+    ready_count = active_round.get("ready_count")
+    if (
+        isinstance(ready_count, int)
+        and not isinstance(ready_count, bool)
+        and ready_count >= 0
+    ):
+        return {"active_round": {"ready_count": ready_count}}
+    return None
+
+
+def _is_authenticated_read_route(method: str, path: str) -> bool:
+    """Identify API/page GET paths that can emit read-admission overloads."""
+
+    return (
+        method == "GET"
+        and not path.endswith("/deadlock/ready-check")
+        and (
+            path == "/users/me"
+            or path == "/tournaments"
+            or path.startswith("/tournaments/")
+        )
+    )
+
+
+def _response_requires_json_projection(method: str, path: str) -> bool:
+    return (
+        method == "POST" and path.endswith("/deadlock/ready-check/vote")
+    ) or (method == "GET" and path.endswith("/deadlock/ready-check")) or (
+        _is_authenticated_read_route(method, path)
+    )
+
+
+def _read_bounded_response(
+    response: Any,
+    *,
+    first_chunk: bytes,
+    capture_json: bool,
+) -> tuple[int, bytes]:
+    """Drain at most the historical body cap without retaining read bodies."""
+
+    response_bytes = min(len(first_chunk), RESPONSE_BODY_LIMIT)
+    captured = bytearray()
+    if capture_json and first_chunk:
+        captured.extend(first_chunk[:RESPONSE_JSON_CAPTURE_LIMIT])
+    while response_bytes < RESPONSE_BODY_LIMIT:
+        chunk = response.read(min(64 * 1024, RESPONSE_BODY_LIMIT - response_bytes))
+        if not chunk:
+            break
+        accepted = min(len(chunk), RESPONSE_BODY_LIMIT - response_bytes)
+        response_bytes += accepted
+        if capture_json and len(captured) < RESPONSE_JSON_CAPTURE_LIMIT:
+            captured.extend(
+                chunk[: min(accepted, RESPONSE_JSON_CAPTURE_LIMIT - len(captured))]
+            )
+        if accepted < len(chunk):
+            break
+    return response_bytes, bytes(captured)
 
 
 def _request(
@@ -665,7 +1242,10 @@ def _request(
     attempt_number: int = 1,
     url_prefix: str = "/api/v1",
     diagnostic_id: str | None = None,
+    budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
+    if budget is not None:
+        timeout = budget.bound_timeout(timeout, phase, operation="http_io")
     body = None
     headers = {
         "Accept": "application/json",
@@ -724,31 +1304,37 @@ def _request(
             response_etag = response.headers.get("etag", "")[:512] or None
             first_chunk = response.read(1)
             time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
-            raw_body = first_chunk + response.read(
-                max(0, RESPONSE_BODY_LIMIT - len(first_chunk))
+            response_bytes, captured_body = _read_bounded_response(
+                response,
+                first_chunk=first_chunk,
+                capture_json=_response_requires_json_projection(method, path),
             )
-            response_bytes = len(raw_body)
-            if raw_body:
-                try:
-                    response_json = json.loads(raw_body.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    response_json = None
+            if budget is not None:
+                budget.check(phase, operation="body_complete")
+            response_json = _response_json_projection(
+                method=method,
+                path=path,
+                body=captured_body,
+            )
     except HTTPError as exc:
         status = int(exc.code)
         cf_ray = exc.headers.get("cf-ray", "")[:128] or None
         cf_error_type, cf_error_origin, retry_after = diagnostic_headers(exc.headers)
         first_chunk = exc.read(1)
         time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
-        with_error_body = first_chunk + exc.read(
-            max(0, RESPONSE_BODY_LIMIT - len(first_chunk))
+        response_bytes, captured_body = _read_bounded_response(
+            exc,
+            first_chunk=first_chunk,
+            capture_json=_response_requires_json_projection(method, path),
         )
-        response_bytes = len(with_error_body)
+        if budget is not None:
+            budget.check(phase, operation="error_body_complete")
         error_kind = "http_error"
-        if with_error_body:
-            try:
-                response_json = json.loads(with_error_body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                response_json = None
+        response_json = _response_json_projection(
+            method=method,
+            path=path,
+            body=captured_body,
+        )
     except (URLError, TimeoutError, OSError) as exc:
         exception_at_utc = datetime.now(UTC).isoformat()
         error_kind = type(exc).__name__
@@ -795,6 +1381,7 @@ def _page_request(
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
     transport: str = DEFAULT_CLIENT_TRANSPORT,
+    budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     """Measure the real Next.js HTML response, including server TTFB."""
 
@@ -807,6 +1394,7 @@ def _page_request(
             session_cookie_name=session_cookie_name,
             csrf_cookie_name=csrf_cookie_name,
             diagnostic_id=diagnostic_id,
+            budget=budget,
         )
     if transport != DEFAULT_CLIENT_TRANSPORT:
         raise ExternalLoadError(f"unsupported page-load transport: {transport}")
@@ -824,6 +1412,7 @@ def _page_request(
         extra_headers={"Accept": "text/html"},
         url_prefix="",
         diagnostic_id=diagnostic_id,
+        budget=budget,
     )
 
 
@@ -854,6 +1443,7 @@ def _page_request_http11_keepalive(
     session_cookie_name: str,
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
+    budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     """Measure a page request over explicit HTTP/1.1 per-thread keep-alive."""
 
@@ -869,11 +1459,31 @@ def _page_request_http11_keepalive(
         "X-CSRF-Token": user.csrf_token,
         "X-Platform-QA-Phase": phase,
     }
+    if budget is not None:
+        timeout = budget.bound_timeout(timeout, phase, operation="http_io")
     client = _http11_keepalive_client(origin, timeout)
+    if budget is not None:
+        client.set_timeout(timeout)
     started_at = time.monotonic()
     started_at_utc = datetime.now(UTC).isoformat()
     try:
-        response = client.get(path, headers=request_headers)
+        response = client.get(
+            path,
+            headers=request_headers,
+            timeout=timeout,
+            deadline=(
+                min(
+                    budget.scenario_deadline_monotonic,
+                    budget.runner_deadline_monotonic,
+                )
+                if budget is not None and budget.runner_deadline_monotonic is not None
+                else budget.scenario_deadline_monotonic
+                if budget is not None
+                else None
+            ),
+        )
+        if budget is not None:
+            budget.check(phase, operation="body_complete")
         finished_at = time.monotonic()
         status = response.status
         error_kind = None if status == 200 else "unexpected_status"
@@ -963,39 +1573,118 @@ def run_phase(
     concurrency: int,
     timeout: float,
     request_builder,
+    budget: LoadRuntimeBudget | None = None,
+    result_consumer=None,
 ) -> list[Any]:
+    """Run a phase with at most ``concurrency`` live futures.
+
+    When ``result_consumer`` is supplied, each result is reduced and released
+    before the next future is submitted.  The no-consumer return-list mode is
+    retained for small diagnostic callers and focused compatibility tests.
+    """
+
+    if budget is not None:
+        budget.check(phase, operation="phase_start")
     offsets = spread_offsets(len(users), spread_seconds)
     phase_started_at = time.monotonic()
     results: list[Any] = []
-    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load") as executor:
-        futures: list[Future[Any]] = []
-        for user, offset in zip(users, offsets, strict=True):
-            delay = phase_started_at + offset - time.monotonic()
-            if delay > 0:
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load")
+    in_flight: dict[Future[Any], int] = {}
+    next_index = 0
+
+    def submit_next() -> bool:
+        nonlocal next_index
+        if next_index >= len(users):
+            return False
+        user = users[next_index]
+        offset = offsets[next_index]
+        submission_index = next_index
+        next_index += 1
+        delay = phase_started_at + offset - time.monotonic()
+        if delay > 0:
+            if budget is not None:
+                budget.sleep(delay, phase, operation="phase_pacing")
+            else:
                 time.sleep(delay)
-            enqueued_at = time.monotonic()
-            scheduled_at = phase_started_at + offset
+        if budget is not None:
+            budget.check(phase, operation="request_submit")
+        enqueued_at = time.monotonic()
+        scheduled_at = phase_started_at + offset
 
-            def invoke(
-                *,
-                user: VirtualUser = user,
-                scheduled_at: float = scheduled_at,
-                enqueued_at: float = enqueued_at,
-            ) -> Any:
-                fallback_started_at = time.monotonic()
-                result = request_builder(origin, user, phase, timeout)
-                fallback_finished_at = time.monotonic()
-                return _annotate_timing(
-                    result,
-                    scheduled_at=scheduled_at,
-                    enqueued_at=enqueued_at,
-                    fallback_started_at=fallback_started_at,
-                    fallback_finished_at=fallback_finished_at,
+        def invoke(
+            *,
+            user: VirtualUser = user,
+            scheduled_at: float = scheduled_at,
+            enqueued_at: float = enqueued_at,
+            submission_index: int = submission_index,
+        ) -> Any:
+            fallback_started_at = time.monotonic()
+            result = request_builder(origin, user, phase, timeout)
+            fallback_finished_at = time.monotonic()
+            result = _annotate_timing(
+                result,
+                scheduled_at=scheduled_at,
+                enqueued_at=enqueued_at,
+                fallback_started_at=fallback_started_at,
+                fallback_finished_at=fallback_finished_at,
+            )
+            if isinstance(result, (RequestResult, LogicalRequestResult)):
+                result.submission_index = submission_index
+                if isinstance(result, LogicalRequestResult):
+                    for attempt in result.attempts:
+                        attempt.submission_index = submission_index
+            return result
+
+        future = executor.submit(invoke)
+        in_flight[future] = submission_index
+        return True
+
+    try:
+        while len(in_flight) < concurrency and submit_next():
+            pass
+        while in_flight:
+            if budget is None:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            else:
+                budget.check(phase, operation="future_wait")
+                remaining = budget.remaining_seconds()
+                runner_remaining = budget.remaining_runner_seconds()
+                if runner_remaining is not None:
+                    remaining = min(remaining, runner_remaining)
+                done, _ = wait(
+                    in_flight,
+                    timeout=max(0.0, remaining),
+                    return_when=FIRST_COMPLETED,
                 )
-
-            futures.append(executor.submit(invoke))
-        for future in as_completed(futures):
-            results.append(future.result())
+                if not done:
+                    budget.check(phase, operation="future_wait")
+            if budget is not None:
+                budget.check(phase, operation="future_complete")
+            for future in sorted(done, key=in_flight.__getitem__):
+                in_flight.pop(future, None)
+                result = future.result()
+                if result_consumer is None:
+                    results.append(result)
+                else:
+                    try:
+                        result_consumer(result)
+                    finally:
+                        _release_result_payload(result)
+                # Refill one slot immediately after reduction.  The pacing
+                # schedule remains deterministic while live work stays O(c).
+                submit_next()
+    except BaseException:
+        for future in in_flight:
+            future.cancel()
+        # A thread blocked in DNS/socket I/O cannot be joined safely here.  The
+        # process supervisor owns the kill boundary; do not let executor
+        # context-manager shutdown consume the remaining cleanup window.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    if budget is not None:
+        budget.check(phase, operation="phase_complete")
     return results
 
 
@@ -1008,6 +1697,8 @@ def run_rate_phase(
     concurrency: int,
     timeout: float,
     request_builder,
+    budget: LoadRuntimeBudget | None = None,
+    result_consumer=None,
 ) -> tuple[list[Any], float]:
     """Run a paced phase and return its submission window separately from drain time."""
 
@@ -1015,37 +1706,102 @@ def run_rate_phase(
     phase_started_at = time.monotonic()
     first_submission_at: float | None = None
     last_submission_at: float | None = None
-    futures: list[Future[Any]] = []
-    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load") as executor:
-        for user, offset in zip(users, offsets, strict=True):
-            delay = phase_started_at + offset - time.monotonic()
-            if delay > 0:
+    results: list[Any] = []
+    in_flight: dict[Future[Any], int] = {}
+    next_index = 0
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load")
+
+    def submit_next() -> bool:
+        nonlocal next_index, first_submission_at, last_submission_at
+        if next_index >= len(users):
+            return False
+        user = users[next_index]
+        offset = offsets[next_index]
+        submission_index = next_index
+        next_index += 1
+        delay = phase_started_at + offset - time.monotonic()
+        if delay > 0:
+            if budget is not None:
+                budget.sleep(delay, phase, operation="phase_pacing")
+            else:
                 time.sleep(delay)
-            submitted_at = time.monotonic()
-            if first_submission_at is None:
-                first_submission_at = submitted_at
-            last_submission_at = submitted_at
-            scheduled_at = phase_started_at + offset
+        if budget is not None:
+            budget.check(phase, operation="request_submit")
+        submitted_at = time.monotonic()
+        if first_submission_at is None:
+            first_submission_at = submitted_at
+        last_submission_at = submitted_at
+        scheduled_at = phase_started_at + offset
 
-            def invoke(
-                *,
-                user: VirtualUser = user,
-                scheduled_at: float = scheduled_at,
-                enqueued_at: float = submitted_at,
-            ) -> Any:
-                fallback_started_at = time.monotonic()
-                result = request_builder(origin, user, phase, timeout)
-                fallback_finished_at = time.monotonic()
-                return _annotate_timing(
-                    result,
-                    scheduled_at=scheduled_at,
-                    enqueued_at=enqueued_at,
-                    fallback_started_at=fallback_started_at,
-                    fallback_finished_at=fallback_finished_at,
+        def invoke(
+            *,
+            user: VirtualUser = user,
+            scheduled_at: float = scheduled_at,
+            enqueued_at: float = submitted_at,
+            submission_index: int = submission_index,
+        ) -> Any:
+            fallback_started_at = time.monotonic()
+            result = request_builder(origin, user, phase, timeout)
+            fallback_finished_at = time.monotonic()
+            result = _annotate_timing(
+                result,
+                scheduled_at=scheduled_at,
+                enqueued_at=enqueued_at,
+                fallback_started_at=fallback_started_at,
+                fallback_finished_at=fallback_finished_at,
+            )
+            if isinstance(result, (RequestResult, LogicalRequestResult)):
+                result.submission_index = submission_index
+                if isinstance(result, LogicalRequestResult):
+                    for attempt in result.attempts:
+                        attempt.submission_index = submission_index
+            return result
+
+        future = executor.submit(invoke)
+        in_flight[future] = submission_index
+        return True
+
+    try:
+        while len(in_flight) < concurrency and submit_next():
+            pass
+        while in_flight:
+            if budget is None:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            else:
+                budget.check(phase, operation="future_wait")
+                remaining = budget.remaining_seconds()
+                runner_remaining = budget.remaining_runner_seconds()
+                if runner_remaining is not None:
+                    remaining = min(remaining, runner_remaining)
+                done, _ = wait(
+                    in_flight,
+                    timeout=max(0.0, remaining),
+                    return_when=FIRST_COMPLETED,
                 )
-
-            futures.append(executor.submit(invoke))
-        results = [future.result() for future in as_completed(futures)]
+                if not done:
+                    budget.check(phase, operation="future_wait")
+            if budget is not None:
+                budget.check(phase, operation="future_complete")
+            for future in sorted(done, key=in_flight.__getitem__):
+                in_flight.pop(future, None)
+                result = future.result()
+                if result_consumer is None:
+                    results.append(result)
+                else:
+                    try:
+                        result_consumer(result)
+                    finally:
+                        _release_result_payload(result)
+                submit_next()
+    except BaseException:
+        for future in in_flight:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    if budget is not None:
+        budget.check(phase, operation="phase_complete")
     if first_submission_at is None or last_submission_at is None:
         submission_window_seconds = 0.001
     elif len(users) == 1:
@@ -1056,185 +1812,18 @@ def run_rate_phase(
 
 
 def summarize_results(
-    results: list[RequestResult],
+    results: Iterable[RequestResult],
     *,
     expected_count: int | None = None,
     submitted_count: int | None = None,
 ) -> dict[str, Any]:
-    status_counts: Counter[str] = Counter()
-    by_route: dict[str, list[float]] = defaultdict(list)
-    latencies: list[float] = []
-    errors = 0
-    temporary_overloads = 0
-    retry_attempts = 0
-    error_kinds: Counter[str] = Counter()
-    cf_error_types: Counter[str] = Counter()
-    cf_error_origins: Counter[str] = Counter()
-    error_samples: list[dict[str, Any]] = []
-    timeout_diagnostics: list[dict[str, Any]] = []
-    first_byte_times: list[float] = []
-    response_sizes: list[int] = []
-    changed = Counter()
-    transport_names: Counter[str] = Counter()
-    transport_http_versions: Counter[str] = Counter()
-    transport_reused = 0
-    transport_new = 0
-    transport_phase_values: dict[str, list[float]] = defaultdict(list)
+    accumulator = _ResultAccumulator()
     for result in results:
-        status_counts[str(safe_status(result.status))] += 1
-        route = safe_route_key(result.method, result.path)
-        elapsed = _finite_nonnegative_measurement(result.elapsed_ms)
-        if elapsed is not None:
-            by_route[route].append(elapsed)
-            latencies.append(elapsed)
-        if (
-            isinstance(result.response_bytes, int)
-            and not isinstance(result.response_bytes, bool)
-            and result.response_bytes >= 0
-        ):
-            response_sizes.append(result.response_bytes)
-        if result.time_to_first_byte_ms is not None:
-            first_byte_times.append(result.time_to_first_byte_ms)
-        if result.transport_timing:
-            transport = result.transport_timing
-            transport_name = transport.get("transport")
-            if transport_name in SUPPORTED_PAGE_TRANSPORTS:
-                transport_names[str(transport_name)] += 1
-            elif transport_name is not None:
-                transport_names["other"] += 1
-            http_version = transport.get("http_version")
-            if http_version in {"1.0", "1.1", "2", "3"}:
-                transport_http_versions[str(http_version)] += 1
-            elif http_version is not None:
-                transport_http_versions["other"] += 1
-            if transport.get("connection_reused") is True:
-                transport_reused += 1
-            elif transport.get("connection_reused") is False:
-                transport_new += 1
-            for key in (
-                "dns_ms",
-                "tcp_connect_ms",
-                "tls_handshake_ms",
-                "request_write_ms",
-                "edge_wait_ms",
-                "ttfb_ms",
-                "body_receive_ms",
-                "total_ms",
-            ):
-                value = _finite_nonnegative_measurement(transport.get(key))
-                if value is not None:
-                    transport_phase_values[key].append(value)
-        if (
-            isinstance(result.attempt_number, int)
-            and not isinstance(result.attempt_number, bool)
-            and result.attempt_number > 1
-        ):
-            retry_attempts += 1
-        if _ready_vote_overload(result) or _authenticated_read_overload(result):
-            temporary_overloads += 1
-        if result.ok is not True:
-            errors += 1
-            kind = safe_error_class(result.error_kind or "unexpected", status=result.status)
-            error_kinds[kind] += 1
-            if len(error_samples) < ERROR_SAMPLE_LIMIT:
-                error_sample = {
-                    "phase": safe_phase(result.phase),
-                    "method": safe_method(result.method),
-                    "route_class": safe_route_class(result.path),
-                    "status": safe_status(result.status),
-                    "error_class": kind,
-                    "cf_error_class": safe_cf_error_class(result.cf_error_type),
-                    "cf_error_origin_class": safe_cf_error_class(result.cf_error_origin),
-                    "ttfb_ms": finite_number(result.time_to_first_byte_ms),
-                    "elapsed_ms": finite_number(result.elapsed_ms),
-                }
-                error_samples.append(error_sample)
-            if result.diagnostic_id and kind == "timeout":
-                timeout_diagnostics.append(
-                    {
-                        "phase": safe_phase(result.phase),
-                        "method": safe_method(result.method),
-                        "route_class": safe_route_class(result.path),
-                        "status": safe_status(result.status),
-                        "error_class": "timeout",
-                        "cf_error_class": safe_cf_error_class(result.cf_error_type),
-                        "cf_error_origin_class": safe_cf_error_class(result.cf_error_origin),
-                        "ttfb_ms": finite_number(result.time_to_first_byte_ms),
-                        "elapsed_ms": finite_number(result.elapsed_ms),
-                    }
-                )
-            if result.cf_error_type:
-                cf_error_types[safe_cf_error_class(result.cf_error_type)] += 1
-            if result.cf_error_origin:
-                cf_error_origins[safe_cf_error_class(result.cf_error_origin)] += 1
-        if (
-            isinstance(result.response_json, dict)
-            and type(result.response_json.get("changed")) is bool
-        ):
-            changed[str(result.response_json["changed"])] += 1
-    return {
-        "scope": "full_population",
-        "requests": len(results),
-        "errors": errors,
-        "successful_responses": len(results) - errors,
-        "final_failure_rate_percent": round(
-            errors * 100 / max(1, len(results)),
-            4,
-        ),
-        "temporary_overload_responses": temporary_overloads,
-        "temporary_overload_rate_percent": round(
-            temporary_overloads * 100 / max(1, len(results)),
-            4,
-        ),
-        "retry_attempts": retry_attempts,
-        "total_retries": retry_attempts,
-        "retry_amplification_percent": round(
-            retry_attempts * 100 / max(1, len(results) - retry_attempts),
-            4,
-        ),
-        "unexpected_statuses": max(0, errors - temporary_overloads),
-        "status_counts": dict(sorted(status_counts.items())),
-        "error_kinds": dict(sorted(error_kinds.items())),
-        "cf_error_type_counts": dict(sorted(cf_error_types.items())),
-        "cf_error_origin_counts": dict(sorted(cf_error_origins.items())),
-        "changed_counts": dict(sorted(changed.items())),
-        "latency": metric_stats(latencies),
-        "timing": _timing_summary(
-            results,
-            unit="requests",
-            expected_count=expected_count,
-            submitted_count=submitted_count,
-        ),
-        "time_to_first_byte": metric_stats(first_byte_times),
-        "response_bytes": {
-            "count": len(response_sizes),
-            "avg_bytes": round(sum(response_sizes) / len(response_sizes), 3)
-            if response_sizes
-            else None,
-            "max_bytes": max(response_sizes) if response_sizes else None,
-        },
-        "transport": {
-            "names": dict(sorted(transport_names.items())),
-            "http_versions": dict(sorted(transport_http_versions.items())),
-            "connection_reused": transport_reused,
-            "connection_new": transport_new,
-            "phase_timings": {
-                key: metric_stats(values)
-                for key, values in sorted(transport_phase_values.items())
-            },
-        },
-        "by_route": {
-            route: metric_stats(values)
-            for route, values in sorted(
-                by_route.items(),
-                key=lambda item: (len(item[1]), max(item[1])),
-                reverse=True,
-            )
-        },
-        "cf_ray_count": len({result.cf_ray for result in results if result.cf_ray}),
-        "error_samples": error_samples,
-        "timeout_diagnostics": timeout_diagnostics,
-    }
+        accumulator.add(result)
+    return accumulator.summary(
+        expected_count=expected_count,
+        submitted_count=submitted_count,
+    )
 
 
 def _add_measured_goodput(summary: dict[str, Any], wall_seconds: float) -> None:
@@ -1326,6 +1915,7 @@ def _ready_vote_request(
     session_cookie_name: str,
     csrf_cookie_name: str,
     attempt_number: int = 1,
+    budget: LoadRuntimeBudget | None = None,
 ) -> RequestResult:
     return _request(
         origin,
@@ -1338,6 +1928,7 @@ def _ready_vote_request(
         csrf_cookie_name=csrf_cookie_name,
         json_payload={"choice": "yes"},
         attempt_number=attempt_number,
+        budget=budget,
     )
 
 
@@ -1390,6 +1981,7 @@ def _ready_vote_action(
     session_cookie_name: str,
     csrf_cookie_name: str,
     retry_policy: dict[str, Any] | None = None,
+    budget: LoadRuntimeBudget | None = None,
 ) -> LogicalRequestResult:
     """Issue one request plus only the profile's explicit overload retries."""
 
@@ -1397,6 +1989,8 @@ def _ready_vote_action(
     attempts: list[RequestResult] = []
     max_retries = 2 if retry_policy is None else int(retry_policy["max_retries"])
     for retry_index in range(max_retries + 1):
+        if budget is not None:
+            budget.check(phase, operation="retry_start")
         result = _ready_vote_request(
             origin,
             user,
@@ -1405,13 +1999,16 @@ def _ready_vote_action(
             session_cookie_name=session_cookie_name,
             csrf_cookie_name=csrf_cookie_name,
             attempt_number=retry_index + 1,
+            budget=budget,
         )
         attempts.append(result)
         if not _ready_vote_overload(result) or retry_index >= max_retries:
             break
-        time.sleep(
-            _ready_vote_retry_delay_ms(result, retry_index, retry_policy) / 1000
-        )
+        delay = _ready_vote_retry_delay_ms(result, retry_index, retry_policy) / 1000
+        if budget is not None:
+            budget.sleep(delay, phase, operation="retry_backoff")
+        else:
+            time.sleep(delay)
     finished_at = time.monotonic()
     return LogicalRequestResult(
         attempts=attempts,
@@ -1423,56 +2020,19 @@ def _ready_vote_action(
     )
 
 
-def _flatten_logical_results(results: list[LogicalRequestResult]) -> list[RequestResult]:
-    return [attempt for result in results for attempt in result.attempts]
-
-
 def summarize_logical_results(
-    results: list[LogicalRequestResult],
+    results: Iterable[LogicalRequestResult],
     *,
     expected_count: int | None = None,
     submitted_count: int | None = None,
 ) -> dict[str, Any]:
-    finals = [result.final for result in results if result.attempts]
-    successful = [result for result in results if result.final.ok is True]
-    accepted_request_latencies = [result.final.elapsed_ms for result in successful]
-    changed = Counter(
-        str(result.final.response_json["changed"])
-        for result in results
-        if isinstance(result.final.response_json, dict)
-        and type(result.final.response_json.get("changed")) is bool
+    accumulator = _LogicalAccumulator()
+    for result in results:
+        accumulator.add(result)
+    return accumulator.summary(
+        expected_count=expected_count,
+        submitted_count=submitted_count,
     )
-    return {
-        "scope": "logical_user_actions",
-        "actions": len(results),
-        "final_successes": len(successful),
-        "final_failures": len(results) - len(successful),
-        "final_failure_rate_percent": round(
-            (len(results) - len(successful)) * 100 / max(1, len(results)),
-            4,
-        ),
-        "total_retries": sum(result.retry_count for result in results),
-        "retry_amplification_percent": round(
-            sum(result.retry_count for result in results) * 100 / max(1, len(results)),
-            4,
-        ),
-        "retries_per_action": round(
-            sum(result.retry_count for result in results) / max(1, len(results)),
-            4,
-        ),
-        "final_status_counts": dict(
-            sorted(Counter(str(result.status) for result in finals).items())
-        ),
-        "changed_counts": dict(sorted(changed.items())),
-        "end_to_end_latency": metric_stats([result.elapsed_ms for result in results]),
-        "accepted_request_latency": metric_stats(accepted_request_latencies),
-        "timing": _timing_summary(
-            results,
-            unit="logical_actions",
-            expected_count=expected_count,
-            submitted_count=submitted_count,
-        ),
-    }
 
 
 def _has_partial_timing(value: Any) -> bool:
@@ -1529,7 +2089,10 @@ def run_load(
     timeout_diagnostics_run_id: str | None = None,
     client_transport: str = DEFAULT_CLIENT_TRANSPORT,
     max_http_attempts: int | None = None,
+    runtime_budget: LoadRuntimeBudget | None = None,
 ) -> dict[str, Any]:
+    if runtime_budget is not None:
+        runtime_budget.check("preflight", operation="run_start")
     for value, field in (
         (duplicate_count, "duplicate_count"),
         (manual_refresh_count, "manual_refresh_count"),
@@ -1771,9 +2334,18 @@ def run_load(
     session_cookie_name = str(manifest["session_cookie_name"])
     csrf_cookie_name = str(manifest["csrf_cookie_name"])
     started_at = datetime.now(UTC)
-    trace = _trace(origin, timeout=min(timeout, 10.0))
+    if runtime_budget is None:
+        trace = _trace(origin, timeout=min(timeout, 10.0))
+    else:
+        trace = _trace(
+            origin,
+            timeout=min(timeout, 10.0),
+            budget=runtime_budget,
+        )
+    if runtime_budget is not None:
+        runtime_budget.check("trace", operation="trace_complete")
     phase_results: dict[str, dict[str, Any]] = {}
-    all_results: list[RequestResult] = []
+    overall_raw_acc = _ResultAccumulator()
 
     if mode == "ready-vote":
         def vote_builder(
@@ -1788,10 +2360,49 @@ def run_load(
             }
             if retry_policy is not None:
                 kwargs["retry_policy"] = retry_policy
-            return _ready_vote_action(origin_value, user, phase, request_timeout, **kwargs)
+            if runtime_budget is not None:
+                kwargs["budget"] = runtime_budget
+            return _ready_vote_action(
+                origin_value,
+                user,
+                phase,
+                request_timeout,
+                **kwargs,
+            )
 
         primary_started_at = time.monotonic()
-        primary: list[LogicalRequestResult] = []
+        primary_logical_acc = _LogicalAccumulator()
+        primary_raw_acc = _ResultAccumulator()
+        combined_logical_acc = _LogicalAccumulator()
+        action_raw_acc = _ResultAccumulator()
+        duplicate_logical_acc = _LogicalAccumulator()
+        duplicate_raw_acc = _ResultAccumulator()
+        successful_primary_ids: set[str] = set()
+        successful_primary_by_slug: Counter[str] = Counter()
+        user_by_id = {user.user_id: user for user in users}
+
+        def make_vote_consumer(
+            logical_acc: _LogicalAccumulator,
+            raw_acc: _ResultAccumulator,
+            *,
+            mark_primary_success: bool = False,
+        ):
+            def consume(action: LogicalRequestResult) -> None:
+                logical_acc.add(action)
+                combined_logical_acc.add(action)
+                if mark_primary_success and action.attempts and action.final.ok is True:
+                    if action.user_id:
+                        successful_primary_ids.add(action.user_id)
+                        user = user_by_id.get(action.user_id)
+                        if user is not None:
+                            successful_primary_by_slug[user.tournament_slug] += 1
+                for attempt in action.attempts:
+                    raw_acc.add(attempt)
+                    action_raw_acc.add(attempt)
+                    overall_raw_acc.add(attempt)
+
+            return consume
+
         primary_users = users
         if phase_plan:
             cursor = 0
@@ -1819,7 +2430,22 @@ def run_load(
                 cursor += action_count
                 phase_started_at_utc = datetime.now(UTC)
                 phase_started = time.monotonic()
-                phase_results_for_users, phase_submission_window = run_rate_phase(
+                phase_logical_acc = _LogicalAccumulator()
+                phase_raw_acc = _ResultAccumulator()
+
+                phase_consumer = make_vote_consumer(
+                    phase_logical_acc,
+                    phase_raw_acc,
+                    mark_primary_success=True,
+                )
+
+                def consume_primary_phase(action: LogicalRequestResult) -> None:
+                    phase_consumer(action)
+                    primary_logical_acc.add(action)
+                    for attempt in action.attempts:
+                        primary_raw_acc.add(attempt)
+
+                _, phase_submission_window = run_rate_phase(
                     origin,
                     phase_users,
                     phase=f"write_external_vote_{phase_name}",
@@ -1827,15 +2453,15 @@ def run_load(
                     concurrency=concurrency,
                     timeout=timeout,
                     request_builder=vote_builder,
+                    budget=runtime_budget,
+                    result_consumer=consume_primary_phase,
                 )
                 offered_window_seconds += phase_submission_window
-                phase_attempts = _flatten_logical_results(phase_results_for_users)
                 phase_wall_seconds = max(0.001, time.monotonic() - phase_started)
                 phase_finished_at_utc = datetime.now(UTC)
-                phase_logical = summarize_logical_results(
-                    phase_results_for_users,
+                phase_logical = phase_logical_acc.summary(
                     expected_count=action_count,
-                    submitted_count=len(phase_results_for_users),
+                    submitted_count=phase_logical_acc.actions,
                 )
                 phase_logical["wall_seconds"] = round(phase_wall_seconds, 6)
                 phase_logical["target_logical_actions_per_second"] = target_rate
@@ -1852,20 +2478,19 @@ def run_load(
                     / phase_wall_seconds,
                     3,
                 )
-                phase_raw = summarize_results(phase_attempts)
+                phase_raw = phase_raw_acc.summary()
                 _add_measured_goodput(phase_raw, phase_wall_seconds)
                 phase_raw["attempts_per_second"] = round(
                     float(phase_raw.get("requests") or 0) / phase_submission_window,
                     3,
                 )
+                submitted_actions = phase_logical_acc.actions
                 planned_phases[phase_name] = {
                     "configured_actions": action_count,
-                    "submitted_actions": len(phase_results_for_users),
-                    "missing_actions": max(
-                        0, action_count - len(phase_results_for_users)
-                    ),
+                    "submitted_actions": submitted_actions,
+                    "missing_actions": max(0, action_count - submitted_actions),
                     "complete": (
-                        len(phase_results_for_users) == action_count
+                        submitted_actions == action_count
                         and timing_summary_is_complete(phase_logical.get("timing"))
                         and timing_summary_is_complete(phase_raw.get("timing"))
                     ),
@@ -1877,7 +2502,6 @@ def run_load(
                     "raw_http": phase_raw,
                     "logical": phase_logical,
                 }
-                primary.extend(phase_results_for_users)
             primary_users = users[:cursor]
             phase_results["ramp"] = {
                 "phases": planned_phases,
@@ -1885,7 +2509,7 @@ def run_load(
                 "offered_window_seconds": round(offered_window_seconds, 3),
             }
         else:
-            primary = run_phase(
+            run_phase(
                 origin,
                 users,
                 phase="write_external_vote",
@@ -1893,17 +2517,21 @@ def run_load(
                 concurrency=concurrency,
                 timeout=timeout,
                 request_builder=vote_builder,
+                budget=runtime_budget,
+                result_consumer=make_vote_consumer(
+                    primary_logical_acc,
+                    primary_raw_acc,
+                    mark_primary_success=True,
+                ),
             )
-        primary_attempts = _flatten_logical_results(primary)
         primary_wall_seconds = max(0.001, time.monotonic() - primary_started_at)
-        primary_logical = summarize_logical_results(
-            primary,
+        primary_logical = primary_logical_acc.summary(
             expected_count=(
                 sum(int(phase.get("logical_actions") or 0) for phase in phase_plan)
                 if phase_plan
                 else len(users)
             ),
-            submitted_count=len(primary),
+            submitted_count=primary_logical_acc.actions,
         )
         primary_logical["wall_seconds"] = round(primary_wall_seconds, 6)
         primary_logical["successful_goodput_actions_per_second"] = round(
@@ -1912,22 +2540,13 @@ def run_load(
         )
         if phase_plan:
             primary_logical["offered_logical_actions_per_second"] = round(
-                len(primary) / max(0.001, offered_window_seconds),
+                primary_logical_acc.actions / max(0.001, offered_window_seconds),
                 3,
             )
-        primary_raw = summarize_results(primary_attempts)
+        primary_raw = primary_raw_acc.summary()
         _add_measured_goodput(primary_raw, primary_wall_seconds)
-        phase_results["primary"] = {
-            "raw_http": primary_raw,
-            "logical": primary_logical,
-        }
-        all_results.extend(primary_attempts)
+        phase_results["primary"] = {"raw_http": primary_raw, "logical": primary_logical}
 
-        successful_primary_ids = {
-            result.user_id
-            for result in primary
-            if result.attempts and result.final.ok is True and result.user_id
-        }
         # Idempotency checks are meaningful only for actions that completed
         # successfully.  Bind the duplicate candidate pool to that exact
         # primary population for every scenario, including normal SLO runs.
@@ -1942,7 +2561,7 @@ def run_load(
         # mark the phase incomplete when any duplicate action is missing.
         duplicate_users = duplicate_candidates[:duplicate_count]
         duplicate_started_at = time.monotonic()
-        duplicates = run_phase(
+        run_phase(
             origin,
             duplicate_users,
             phase="write_external_vote_duplicate",
@@ -1950,12 +2569,12 @@ def run_load(
             concurrency=concurrency,
             timeout=timeout,
             request_builder=vote_builder,
+            budget=runtime_budget,
+            result_consumer=make_vote_consumer(duplicate_logical_acc, duplicate_raw_acc),
         )
-        duplicate_attempts = _flatten_logical_results(duplicates)
-        duplicate_logical = summarize_logical_results(
-            duplicates,
+        duplicate_logical = duplicate_logical_acc.summary(
             expected_count=duplicate_count,
-            submitted_count=len(duplicates),
+            submitted_count=duplicate_logical_acc.actions,
         )
         duplicate_wall_seconds = max(0.001, time.monotonic() - duplicate_started_at)
         duplicate_logical["wall_seconds"] = round(duplicate_wall_seconds, 6)
@@ -1964,12 +2583,12 @@ def run_load(
             / duplicate_wall_seconds,
             3,
         )
-        duplicate_raw = summarize_results(duplicate_attempts)
+        duplicate_raw = duplicate_raw_acc.summary()
         _add_measured_goodput(duplicate_raw, duplicate_wall_seconds)
         duplicate_raw["configured_logical_actions"] = duplicate_count
-        duplicate_raw["submitted_logical_actions"] = len(duplicates)
+        duplicate_raw["submitted_logical_actions"] = duplicate_logical_acc.actions
         duplicate_raw["missing_logical_actions"] = max(
-            0, duplicate_count - len(duplicates)
+            0, duplicate_count - duplicate_logical_acc.actions
         )
         duplicate_phase_complete = (
             len(duplicate_users) == duplicate_count
@@ -1978,11 +2597,11 @@ def run_load(
         phase_results["duplicate"] = {
             "configured_actions": duplicate_count,
             "candidate_actions": len(duplicate_candidates),
-            "submitted_actions": len(duplicates),
+            "submitted_actions": duplicate_logical_acc.actions,
             "completed_actions": int(
                 (duplicate_logical.get("timing") or {}).get("completed_count") or 0
             ),
-            "missing_actions": max(0, duplicate_count - len(duplicates)),
+            "missing_actions": max(0, duplicate_count - duplicate_logical_acc.actions),
             "complete": duplicate_phase_complete,
             "status": "complete" if duplicate_phase_complete else "incomplete",
             "incomplete_reason": (
@@ -1995,7 +2614,6 @@ def run_load(
             "raw_http": duplicate_raw,
             "logical": duplicate_logical,
         }
-        all_results.extend(duplicate_attempts)
 
         # State reads are planned per manifest tournament, not merely for the
         # subset that happened to receive a primary action in a capacity
@@ -2004,18 +2622,13 @@ def run_load(
         # bound to the selected fixture plan.
         users_by_slug: dict[str, VirtualUser] = {}
         expected_by_slug: Counter[str] = Counter()
-        successful_primary_by_slug: Counter[str] = Counter()
-        for result in primary:
-            if result.attempts and result.final.ok is True:
-                slug = result.final.path.split("/", 3)[2]
-                successful_primary_by_slug[slug] += 1
         for user in users:
             users_by_slug.setdefault(user.tournament_slug, user)
             expected_by_slug[user.tournament_slug] = successful_primary_by_slug.get(
                 user.tournament_slug,
                 0,
             )
-        state_results: list[RequestResult] = []
+        state_acc = _ResultAccumulator()
         # Slugs are needed transiently to select the request fixture, but they
         # must never become evidence keys.  The acceptance contract only needs
         # a one-to-one bounded map, so expose deterministic numeric slots.
@@ -2035,6 +2648,7 @@ def run_load(
                 timeout=timeout,
                 session_cookie_name=session_cookie_name,
                 csrf_cookie_name=csrf_cookie_name,
+                **({"budget": runtime_budget} if runtime_budget is not None else {}),
             )
             result = _annotate_timing(
                 result,
@@ -2071,20 +2685,21 @@ def run_load(
             )
             if not result.ok and result.error_kind is None:
                 result.error_kind = "authoritative_state_mismatch"
-            state_results.append(result)
-        state_summary = summarize_results(
-            state_results,
+            state_acc.add(result)
+            overall_raw_acc.add(result)
+            _release_result_payload(result)
+        state_summary = state_acc.summary(
             expected_count=len(users_by_slug),
-            submitted_count=len(state_results),
+            submitted_count=state_acc.requests,
         )
         state_summary.update(
             {
                 "configured_reads": len(users_by_slug),
-                "submitted_reads": len(state_results),
-                "completed_reads": len(state_results),
-                "missing_reads": max(0, len(users_by_slug) - len(state_results)),
+                "submitted_reads": state_acc.requests,
+                "completed_reads": state_acc.requests,
+                "missing_reads": max(0, len(users_by_slug) - state_acc.requests),
                 "complete": (
-                    len(state_results) == len(users_by_slug)
+                    state_acc.requests == len(users_by_slug)
                     and timing_summary_is_complete(state_summary.get("timing"))
                     and state_ready_count_mismatches == 0
                 ),
@@ -2099,7 +2714,6 @@ def run_load(
             }
         )
         phase_results["state"] = state_summary
-        all_results.extend(state_results)
         primary_summary = phase_results["primary"]["logical"]
         duplicate_summary = phase_results.get("duplicate", {}).get("logical", {})
         changed_counts = primary_summary.get("changed_counts", {})
@@ -2160,11 +2774,18 @@ def run_load(
                 user,
                 phase,
                 request_timeout,
+                **({"budget": runtime_budget} if runtime_budget is not None else {}),
                 **request_kwargs,
             )
 
         page_started_at = time.monotonic()
-        page_results = run_phase(
+        page_acc = _ResultAccumulator()
+
+        def consume_page(result: RequestResult) -> None:
+            page_acc.add(result)
+            overall_raw_acc.add(result)
+
+        run_phase(
             origin,
             users,
             phase="authenticated_page_load",
@@ -2172,11 +2793,12 @@ def run_load(
             concurrency=concurrency,
             timeout=timeout,
             request_builder=page_builder,
+            budget=runtime_budget,
+            result_consumer=consume_page,
         )
-        page_summary = summarize_results(
-            page_results,
+        page_summary = page_acc.summary(
             expected_count=len(users),
-            submitted_count=len(page_results),
+            submitted_count=page_acc.requests,
         )
         page_wall_seconds = max(0.001, time.monotonic() - page_started_at)
         page_summary["wall_seconds"] = round(page_wall_seconds, 6)
@@ -2185,7 +2807,6 @@ def run_load(
             3,
         )
         phase_results["authenticated_page_load"] = page_summary
-        all_results.extend(page_results)
         page_summary = phase_results["authenticated_page_load"]
         contract_ok = (
             page_summary["requests"] == len(users)
@@ -2194,7 +2815,14 @@ def run_load(
         )
     else:
         user_indexes = {user.user_id: index for index, user in enumerate(users)}
+        refresh_users = [
+            user
+            for user in users
+            if user_indexes[user.user_id] % 10 < 5
+        ][:manual_refresh_count]
+        refresh_user_ids = {user.user_id for user in refresh_users}
         initial_workspace_etags: dict[str, str] = {}
+        read_acc = _ResultAccumulator()
 
         def read_builder(origin_value: str, user: VirtualUser, phase: str, request_timeout: float) -> RequestResult:
             index = user_indexes[user.user_id]
@@ -2207,17 +2835,24 @@ def run_load(
                 timeout=request_timeout,
                 session_cookie_name=session_cookie_name,
                 csrf_cookie_name=csrf_cookie_name,
+                **({"budget": runtime_budget} if runtime_budget is not None else {}),
             )
-            if index % 10 < 5 and result.response_etag:
+            if user.user_id in refresh_user_ids and result.response_etag:
                 initial_workspace_etags[user.user_id] = result.response_etag
             return result
 
-        read_results: list[RequestResult] = []
         read_started_at = time.monotonic()
         ramp_stages: dict[str, dict[str, Any]] = {}
         for stage_concurrency in read_concurrency_stages:
             stage_started_at = time.monotonic()
-            stage_results = run_phase(
+            stage_acc = _ResultAccumulator()
+
+            def consume_read(result: RequestResult) -> None:
+                stage_acc.add(result)
+                read_acc.add(result)
+                overall_raw_acc.add(result)
+
+            run_phase(
                 origin,
                 users,
                 phase=f"scale_external_read_mix_c{stage_concurrency}",
@@ -2225,12 +2860,12 @@ def run_load(
                 concurrency=stage_concurrency,
                 timeout=timeout,
                 request_builder=read_builder,
+                budget=runtime_budget,
+                result_consumer=consume_read,
             )
-            read_results.extend(stage_results)
-            stage_summary = summarize_results(
-                stage_results,
+            stage_summary = stage_acc.summary(
                 expected_count=len(users),
-                submitted_count=len(stage_results),
+                submitted_count=stage_acc.requests,
             )
             stage_wall_seconds = max(0.001, time.monotonic() - stage_started_at)
             stage_summary["wall_seconds"] = round(stage_wall_seconds, 6)
@@ -2244,10 +2879,9 @@ def run_load(
                 3,
             )
             ramp_stages[str(stage_concurrency)] = stage_summary
-        read_summary = summarize_results(
-            read_results,
+        read_summary = read_acc.summary(
             expected_count=len(users) * len(read_concurrency_stages),
-            submitted_count=len(read_results),
+            submitted_count=read_acc.requests,
         )
         read_wall_seconds = max(0.001, time.monotonic() - read_started_at)
         read_summary["wall_seconds"] = round(read_wall_seconds, 6)
@@ -2262,13 +2896,7 @@ def run_load(
                 "stages": ramp_stages,
                 "analysis": analyze_concurrency_ramp(ramp_stages),
             }
-        all_results.extend(read_results)
-        refresh_users = [
-            user
-            for user in users
-            if user_indexes[user.user_id] % 10 < 5
-        ][:manual_refresh_count]
-        refresh_results: list[RequestResult] = []
+        refresh_acc = _ResultAccumulator()
         if manual_refresh_count:
             def refresh_builder(
                 origin_value: str,
@@ -2300,10 +2928,16 @@ def run_load(
                     csrf_cookie_name=csrf_cookie_name,
                     expected_statuses=frozenset({200, 304}),
                     extra_headers={"If-None-Match": etag},
+                    **({"budget": runtime_budget} if runtime_budget is not None else {}),
                 )
 
             refresh_started_at = time.monotonic()
-            refresh_results = run_phase(
+
+            def consume_refresh(result: RequestResult) -> None:
+                refresh_acc.add(result)
+                overall_raw_acc.add(result)
+
+            run_phase(
                 origin,
                 refresh_users,
                 phase="manual_workspace_refresh",
@@ -2311,11 +2945,12 @@ def run_load(
                 concurrency=concurrency,
                 timeout=timeout,
                 request_builder=refresh_builder,
+                budget=runtime_budget,
+                result_consumer=consume_refresh,
             )
-            refresh_summary = summarize_results(
-                refresh_results,
+            refresh_summary = refresh_acc.summary(
                 expected_count=manual_refresh_count,
-                submitted_count=len(refresh_results),
+                submitted_count=refresh_acc.requests,
             )
             refresh_wall_seconds = max(0.001, time.monotonic() - refresh_started_at)
             refresh_summary["wall_seconds"] = round(refresh_wall_seconds, 6)
@@ -2325,7 +2960,6 @@ def run_load(
                 3,
             )
             phase_results["manual_refresh"] = refresh_summary
-            all_results.extend(refresh_results)
         read_mix_summary = phase_results["read_mix"]
         strict_read_contract = scenario_kind not in {"stress", "spike"}
         expected_read_requests = len(users) * len(read_concurrency_stages)
@@ -2344,7 +2978,9 @@ def run_load(
                 or (
                     phase_results["manual_refresh"]["requests"] == manual_refresh_count
                     and phase_results["manual_refresh"]["errors"] == 0
-                    and all(result.status in {200, 304} for result in refresh_results)
+                    and set(phase_results["manual_refresh"]["status_counts"]).issubset(
+                        {"200", "304"}
+                    )
                 )
             )
         )
@@ -2354,27 +2990,24 @@ def run_load(
         # Never turn a partial result set into a green experiment merely
         # because the rows that did complete met their latency thresholds.
         contract_ok = False
-    overall = summarize_results(all_results)
+    overall = overall_raw_acc.summary()
     if mode == "ready-vote":
         primary_logical_result = phase_results.get("primary", {}).get("logical", {})
         duplicate_logical_result = phase_results.get("duplicate", {}).get("logical", {})
-        primary_action_results = primary
-        duplicate_action_results = duplicates
-        logical_summary = summarize_logical_results(
-            primary_action_results + duplicate_action_results,
+        logical_summary = combined_logical_acc.summary(
             expected_count=(
                 int(
                     (primary_logical_result.get("timing") or {}).get(
                         "expected_count"
                     )
-                    or len(primary)
+                    or primary_logical_acc.actions
                 )
                 + duplicate_count
             ),
-            submitted_count=len(primary_action_results) + len(duplicate_action_results),
+            submitted_count=combined_logical_acc.actions,
         )
-        logical_summary["primary_actions"] = len(primary_action_results)
-        logical_summary["duplicate_actions"] = len(duplicate_action_results)
+        logical_summary["primary_actions"] = primary_logical_acc.actions
+        logical_summary["duplicate_actions"] = duplicate_logical_acc.actions
         logical_summary["configured_duplicate_actions"] = duplicate_count
         logical_summary["duplicate_phase_complete"] = bool(
             phase_results.get("duplicate", {}).get("complete")
@@ -2387,21 +3020,20 @@ def run_load(
         logical_summary["offered_logical_actions_per_second"] = (
             primary_logical_result.get("offered_logical_actions_per_second")
         )
-        action_attempts = primary_attempts + duplicate_attempts
-        raw_http_summary = summarize_results(action_attempts)
+        raw_http_summary = action_raw_acc.summary()
         raw_http_summary["configured_duplicate_actions"] = duplicate_count
-        raw_http_summary["submitted_duplicate_actions"] = len(duplicate_action_results)
+        raw_http_summary["submitted_duplicate_actions"] = duplicate_logical_acc.actions
         raw_http_summary["missing_duplicate_actions"] = max(
-            0, duplicate_count - len(duplicate_action_results)
+            0, duplicate_count - duplicate_logical_acc.actions
         )
     else:
         logical_summary = overall
         raw_http_summary = overall
         if mode == "read-mix":
-            logical_summary["primary_actions"] = len(read_results)
-            logical_summary["manual_refresh_actions"] = len(refresh_results)
+            logical_summary["primary_actions"] = read_acc.requests
+            logical_summary["manual_refresh_actions"] = refresh_acc.requests
         elif mode == "page-load":
-            logical_summary["primary_actions"] = len(page_results)
+            logical_summary["primary_actions"] = page_acc.requests
     finished_at = datetime.now(UTC)
     wall_seconds = max(0.001, (finished_at - started_at).total_seconds())
     _add_measured_goodput(overall, wall_seconds)
@@ -2420,7 +3052,7 @@ def run_load(
             float(logical_summary.get("final_successes") or 0) / wall_seconds,
             3,
         )
-        raw_http_summary["state_read_requests"] = len(state_results)
+        raw_http_summary["state_read_requests"] = state_acc.requests
         raw_http_summary["total_requests_including_state"] = int(
             overall.get("requests") or 0
         )
@@ -2559,7 +3191,9 @@ def run_load(
         "trace": trace,
         "timeout_path_diagnostics": {
             "enabled": timeout_diagnostics_run_id is not None,
-            "request_count": len(all_results) if timeout_diagnostics_run_id else 0,
+            "request_count": overall.get("requests", 0)
+            if timeout_diagnostics_run_id
+            else 0,
         },
         "phases": phase_results,
         "overall": overall,
