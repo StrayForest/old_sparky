@@ -73,6 +73,16 @@ async function expectRawRobots(
   expectedRobots: RegExp | null,
 ) {
   const response = await page.request.get(path);
+  await expectRawRobotsResponse(response, expectedStatus, expectedRobots);
+}
+
+async function expectRawRobotsResponse(
+  response: { status(): number; text(): Promise<string> } | null,
+  expectedStatus: number,
+  expectedRobots: RegExp | null,
+) {
+  expect(response).not.toBeNull();
+  if (!response) return;
   expect(response.status()).toBe(expectedStatus);
   const html = await response.text();
   const robotsTags = html.match(/<meta\b[^>]*\bname=["']robots["'][^>]*>/giu) ?? [];
@@ -767,7 +777,10 @@ test("unknown tournament detail and bracket stay 404 while the API is delayed", 
     expect(navigation?.status()).toBe(404);
     await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
     await expectRobotsTag(page, /^noindex$/u);
-    await expectRawRobots(page, path, 404, /^noindex$/u);
+    // Inspect the response from the same navigation; the delayed API fixture
+    // already exercises a live server render, so a second network request adds
+    // no coverage and can race the standalone server under the mobile matrix.
+    await expectRawRobotsResponse(navigation, 404, /^noindex$/u);
   }
 });
 
