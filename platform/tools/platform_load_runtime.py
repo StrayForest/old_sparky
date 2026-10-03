@@ -839,6 +839,7 @@ def _closed_failure_report(
     partial_work: bool,
     inflight_unknown: bool,
     report_error: str | None = None,
+    watchdog_error: str | None = None,
     runtime_budget: Mapping[str, Any] | None = None,
     descendants_reaped: bool = True,
     namespace_closed: bool = False,
@@ -876,6 +877,7 @@ def _closed_failure_report(
             "inflight_unknown": bool(inflight_unknown),
             "descendants_reaped": bool(descendants_reaped),
             "report_error": report_error,
+            **({"watchdog_error": watchdog_error} if watchdog_error is not None else {}),
         },
         "partial_work": bool(partial_work),
         "inflight_unknown": bool(inflight_unknown),
@@ -1733,8 +1735,11 @@ def run_supervised(
                         pass
         if watchdog_diagnostic_read_fd is not None:
             try:
-                if os.read(watchdog_diagnostic_read_fd, 1) == b"\x01":
-                    watchdog_diagnostic = "watchdog_pidfd_signal_eperm"
+                diagnostic_code = os.read(watchdog_diagnostic_read_fd, 1)
+                watchdog_diagnostic = {
+                    b"\x01": "pidfd_signal_eperm_trusted_mediator_skipped",
+                    b"\x02": "pidfd_signal_eperm_unclassified",
+                }.get(diagnostic_code)
             except OSError:
                 pass
             finally:
@@ -1790,10 +1795,6 @@ def run_supervised(
     if acceptance_gate_reason is not None and reason != "external_signal":
         reason = acceptance_gate_reason
         report_error = report_error or "wall_deadline_before_acceptance"
-    # Keep the deadline as the primary reason while surfacing the watchdog's
-    # fixed, bounded pidfd signal diagnostic when present.
-    if watchdog_diagnostic is not None:
-        report_error = watchdog_diagnostic
     successful_worker = (
         worker_report is not None
         and reason == "worker_failed"
@@ -1877,6 +1878,7 @@ def run_supervised(
         partial_work=partial_work,
         inflight_unknown=inflight_unknown,
         report_error=report_error,
+        watchdog_error=watchdog_diagnostic,
         runtime_budget=runtime_status,
         descendants_reaped=namespace_closed,
         namespace_closed=namespace_closed,

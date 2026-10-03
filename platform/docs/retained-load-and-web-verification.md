@@ -113,11 +113,20 @@ where the system implementation preserves that signal. PID1 pidfd signalling,
 start-time checks and bounded full-chain reap remain mandatory proofs when
 setuid sudo clears it; the namespace worker and inner setpriv also arm
 `SIGKILL` parent-death handling.
-If the watchdog's identity-pinned `pidfd_send_signal` returns `EPERM`, it
-fails closed and the supervisor records the fixed
-`runtime_supervisor.report_error=watchdog_pidfd_signal_eperm` diagnostic while
-preserving the original deadline or containment reason. No numeric-PID retry
-or permission-error suppression is allowed.
+If the watchdog's identity-pinned `pidfd_send_signal` returns `EPERM` during a
+parent-alive termination, it may skip only a PIDFD/start-time-pinned process
+whose `/proc/<pid>/status` proves effective UID 0 and an exact `Name` of
+`sudo`, `setpriv` or `unshare`, with exactly one `NSpid` entry (outer PID
+namespace only). The watchdog itself forked and execs only the fixed absolute
+system chain above. It continues
+signalling the remaining captured identities, and the parent still requires
+independent wrapper and PID 1 closure proof before publishing a report that
+claims namespace closure or allowing cleanup to proceed. This skip is
+disabled on the parent-death path; unreadable, malformed, non-root or
+unknown identities remain fail-closed. The bounded
+`runtime_supervisor.watchdog_error` enum records either
+`pidfd_signal_eperm_trusted_mediator_skipped` or
+`pidfd_signal_eperm_unclassified` without exposing PIDs or paths.
 
 Load/QA evidence is a fixed, privacy-bounded set: route classes/templates,
 numeric timings/counts/statuses and allowlisted error/backend/wait classes. It

@@ -474,12 +474,14 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 runner_minutes=0.05,
             )
             self.assertEqual(result.reason, 'max_runner_minutes')
-            self.assertNotEqual(
-                result.report.get('runtime_supervisor', {}).get('report_error'),
-                'watchdog_pidfd_signal_eperm',
+            self.assertIn(
+                result.report.get('runtime_supervisor', {}).get('watchdog_error'),
+                (None, 'pidfd_signal_eperm_trusted_mediator_skipped'),
                 f"watchdog signal diagnostic: {result.report.get('runtime_supervisor')}",
             )
             self.assertLess(result.returncode or 0, 0)
+            self.assertTrue(result.namespace_closed)
+            self.assertTrue(result.report['runtime_supervisor']['descendants_reaped'])
             self.assertEqual(
                 result.report['acceptance']['decision'],
                 'LOAD RUNTIME BUDGET EXCEEDED',
@@ -505,9 +507,9 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             )
             # The namespace wrapper owns the descendant kill boundary; TERM
             # may close the wrapper itself while --kill-child reclaims PID 1.
-            self.assertNotEqual(
-                result.report.get('runtime_supervisor', {}).get('report_error'),
-                'watchdog_pidfd_signal_eperm',
+            self.assertIn(
+                result.report.get('runtime_supervisor', {}).get('watchdog_error'),
+                (None, 'pidfd_signal_eperm_trusted_mediator_skipped'),
                 f"watchdog signal diagnostic: {result.report.get('runtime_supervisor')}",
             )
             self.assertIn(result.returncode, (-signal.SIGTERM, -signal.SIGKILL))
@@ -693,12 +695,88 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             ),
             patch.object(namespace.os, "write") as write,
             patch.object(namespace.os, "kill") as numeric_kill,
+            patch.object(namespace, "_is_trusted_root_mediator", return_value=True),
         ):
             with self.assertRaisesRegex(
                 NamespaceIntegrityError,
                 "watchdog_pidfd_signal_eperm",
             ):
                 namespace._kill_tree_with_diagnostic(100, signal.SIGKILL, 17)
+
+        close.assert_called_once_with(11)
+        write.assert_called_once_with(17, b"\x02")
+        numeric_kill.assert_not_called()
+
+    def test_watchdog_skips_only_verified_trusted_mediator_permission_denial(self) -> None:
+        from tools import platform_load_namespace as namespace
+
+        with patch.object(namespace, "_read_process_starttime", return_value=10):
+            with patch.object(
+                namespace.Path,
+                "read_text",
+                return_value="Name:\tsudo\nUid:\t1001\t0\t0\t0\nNSpid:\t1234\n",
+            ):
+                self.assertTrue(namespace._is_trusted_root_mediator(100, 10))
+            with patch.object(
+                namespace.Path,
+                "read_text",
+                return_value="Name:\tpython\nUid:\t1001\t0\t0\t0\nNSpid:\t1234\n",
+            ):
+                self.assertFalse(namespace._is_trusted_root_mediator(100, 10))
+            with patch.object(
+                namespace.Path,
+                "read_text",
+                return_value="Name:\tsudo\nUid:\t1001\t1001\t1001\t1001\nNSpid:\t1234\n",
+            ):
+                self.assertFalse(namespace._is_trusted_root_mediator(100, 10))
+            with patch.object(
+                namespace.Path,
+                "read_text",
+                return_value="Name:\tsudo\nUid:\t1001\t0\t0\t0\nNSpid:\t1234\t1\n",
+            ):
+                self.assertFalse(namespace._is_trusted_root_mediator(100, 10))
+            with patch.object(
+                namespace.Path,
+                "read_text",
+                return_value="Name:\tsudo\nUid:\t1001\t0\t0\t0\nNSpid:\t1234\t5678\n",
+            ):
+                self.assertFalse(namespace._is_trusted_root_mediator(100, 10))
+            with patch.object(
+                namespace.Path,
+                "read_text",
+                side_effect=PermissionError("proc status hidden"),
+            ):
+                self.assertFalse(namespace._is_trusted_root_mediator(100, 10))
+        with (
+            patch.object(namespace, "_read_process_starttime", side_effect=(10, 11)),
+            patch.object(
+                namespace.Path,
+                "read_text",
+                return_value="Name:\tsudo\nUid:\t1001\t0\t0\t0\nNSpid:\t1234\n",
+            ),
+        ):
+            self.assertFalse(namespace._is_trusted_root_mediator(100, 10))
+
+        with (
+            patch.object(namespace, "_read_process_descendants", return_value=()),
+            patch.object(namespace, "_read_process_starttime", return_value=10),
+            patch.object(namespace.os, "pidfd_open", return_value=11),
+            patch.object(namespace.os, "close") as close,
+            patch.object(
+                namespace.signal,
+                "pidfd_send_signal",
+                side_effect=PermissionError(errno.EPERM, "operation not permitted"),
+            ),
+            patch.object(namespace.os, "write") as write,
+            patch.object(namespace.os, "kill") as numeric_kill,
+            patch.object(namespace, "_is_trusted_root_mediator", return_value=True),
+        ):
+            namespace._kill_tree_with_diagnostic(
+                100,
+                signal.SIGTERM,
+                17,
+                allow_trusted_root_mediator_eperm=True,
+            )
 
         close.assert_called_once_with(11)
         write.assert_called_once_with(17, b"\x01")

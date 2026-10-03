@@ -70,13 +70,51 @@ def _config(path: Path, *, verify_worker_identity: bool = True) -> dict[str, obj
     return payload
 
 
-def _kill_tree(root_pid: int, signum: int) -> None:
+_TRUSTED_ROOT_MEDIATOR_NAMES = frozenset({"sudo", "setpriv", "unshare"})
+
+
+def _is_trusted_root_mediator(pid: int, starttime: int) -> bool:
+    """Recognize only root system mediators under the captured exec chain."""
+
+    status_path = Path(f"/proc/{pid}/status")
+    try:
+        before = _read_process_starttime(pid)
+        lines = status_path.read_text(encoding="ascii").splitlines()
+        status = {
+            line.partition(":")[0]: line.partition(":")[2].strip()
+            for line in lines
+        }
+        uid_fields = status["Uid"].split()
+        namespace_pids = status["NSpid"].split()
+        name = status["Name"]
+        effective_uid = int(uid_fields[1])
+        namespace_pid = int(namespace_pids[-1])
+        after = _read_process_starttime(pid)
+    except (IndexError, KeyError, OSError, UnicodeError, ValueError):
+        return False
+    return (
+        before == starttime
+        and after == starttime
+        and effective_uid == 0
+        and name in _TRUSTED_ROOT_MEDIATOR_NAMES
+        and len(namespace_pids) == 1
+        and namespace_pid != 1
+    )
+
+
+def _kill_tree(
+    root_pid: int,
+    signum: int,
+    *,
+    allow_trusted_root_mediator_eperm: bool = False,
+) -> bool:
     """Signal only captured sudo-chain identities through their pidfds."""
 
     if not callable(getattr(signal, "pidfd_send_signal", None)):
         raise NamespaceIntegrityError("pidfd signalling is unavailable")
 
-    records: list[tuple[int, int]] = []
+    records: list[tuple[int, int, int]] = []
+    skipped_trusted_mediator = False
     try:
         for pid in (*_read_process_descendants(root_pid), root_pid):
             pidfd: int | None = None
@@ -86,7 +124,7 @@ def _kill_tree(root_pid: int, signum: int) -> None:
                 if _read_process_starttime(pid) != starttime:
                     os.close(pidfd)
                     continue
-                records.append((starttime, pidfd))
+                records.append((pid, starttime, pidfd))
             except ProcessLookupError:
                 if pidfd is not None:
                     os.close(pidfd)
@@ -97,13 +135,19 @@ def _kill_tree(root_pid: int, signum: int) -> None:
                 if isinstance(exc, NamespaceIntegrityError):
                     continue
                 raise NamespaceIntegrityError("pidfd capture failed") from exc
-        for _starttime, pidfd in reversed(records):
+        for pid, starttime, pidfd in reversed(records):
             try:
                 signal.pidfd_send_signal(pidfd, signum)
             except ProcessLookupError:
                 continue
             except PermissionError as exc:
                 if exc.errno == errno.EPERM:
+                    if (
+                        allow_trusted_root_mediator_eperm
+                        and _is_trusted_root_mediator(pid, starttime)
+                    ):
+                        skipped_trusted_mediator = True
+                        continue
                     raise NamespaceIntegrityError(
                         "watchdog_pidfd_signal_eperm"
                     ) from exc
@@ -111,11 +155,12 @@ def _kill_tree(root_pid: int, signum: int) -> None:
             except OSError as exc:
                 raise NamespaceIntegrityError("pidfd signal failed") from exc
     finally:
-        for _starttime, pidfd in records:
+        for _pid, _starttime, pidfd in records:
             try:
                 os.close(pidfd)
             except OSError:
                 pass
+    return skipped_trusted_mediator
 
 
 def _wait_child(child_pid: int, *, timeout: float) -> int | None:
@@ -139,13 +184,24 @@ def _kill_tree_with_diagnostic(
     root_pid: int,
     signum: int,
     diagnostic_fd: int,
+    *,
+    allow_trusted_root_mediator_eperm: bool = False,
 ) -> None:
     try:
-        _kill_tree(root_pid, signum)
+        skipped = _kill_tree(
+            root_pid,
+            signum,
+            allow_trusted_root_mediator_eperm=allow_trusted_root_mediator_eperm,
+        )
+        if skipped:
+            try:
+                os.write(diagnostic_fd, b"\x01")
+            except OSError:
+                pass
     except NamespaceIntegrityError as exc:
         if str(exc) == "watchdog_pidfd_signal_eperm":
             try:
-                os.write(diagnostic_fd, b"\x01")
+                os.write(diagnostic_fd, b"\x02")
             except OSError:
                 pass
         raise
@@ -211,7 +267,10 @@ def _wrapper_watchdog(args: argparse.Namespace) -> int:
                     signal.SIGKILL,
                     args.diagnostic_fd,
                 )
-                _wait_child(child_pid, timeout=2.0)
+                if _wait_child(child_pid, timeout=2.0) is None:
+                    raise NamespaceIntegrityError(
+                        "watchdog_child_did_not_reap_after_parent_death"
+                    )
                 return 137
             if pending_signal[0] is not None:
                 requested = pending_signal[0]
@@ -219,12 +278,14 @@ def _wrapper_watchdog(args: argparse.Namespace) -> int:
                     child_pid,
                     requested,
                     args.diagnostic_fd,
+                    allow_trusted_root_mediator_eperm=True,
                 )
                 if _wait_child(child_pid, timeout=0.25) is None:
                     _kill_tree_with_diagnostic(
                         child_pid,
                         signal.SIGKILL,
                         args.diagnostic_fd,
+                        allow_trusted_root_mediator_eperm=True,
                     )
                     _wait_child(child_pid, timeout=2.0)
                 # Preserve the signal-shaped return code seen by the parent.
