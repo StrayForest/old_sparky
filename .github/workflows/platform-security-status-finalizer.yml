@@ -101,15 +101,13 @@ jobs:
           workflow = read_json("workflow.json")
           display_title = run.get("display_title", "")
           expected_base_url = f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{run_id}"
-          expected_run_path_prefix = ".github/workflows/platform-security.yml@"
+          expected_run_path = ".github/workflows/platform-security.yml"
           if (
               type(run.get("id")) is not int or run["id"] != int(run_id)
               or run.get("run_attempt") != int(attempt)
               or type(run.get("workflow_id")) is not int or run["workflow_id"] != workflow_id
               or run.get("head_sha") != target
-              or not isinstance(run.get("path"), str)
-              or not run["path"].startswith(expected_run_path_prefix)
-              or not run["path"][len(expected_run_path_prefix):]
+              or run.get("path") != expected_run_path
               or not isinstance(display_title, str)
               or event_run_url != expected_base_url
               or run.get("html_url") != expected_base_url
@@ -130,8 +128,7 @@ jobs:
                   parsed = baseline_title.fullmatch(display_title)
                   if parsed is None or parsed.group("target") != target or run.get("name") != display_title:
                       raise SystemExit("internal baseline run-name marker is malformed or mismatched")
-                  run_path_ref = run["path"].rsplit("@", 1)[1]
-                  if run.get("event") != "workflow_dispatch" or run.get("head_branch") != "dev" or run.get("head_sha") != parsed.group("target") or branch != "dev" or run_path_ref not in {"dev", "refs/heads/dev"}:
+                  if run.get("event") != "workflow_dispatch" or run.get("head_branch") != "dev" or run.get("head_sha") != parsed.group("target") or branch != "dev":
                       raise SystemExit("internal baseline run is not bound to exact trusted dev")
                   terminal_conclusions = {
                       "success", "failure", "cancelled", "skipped", "timed_out",

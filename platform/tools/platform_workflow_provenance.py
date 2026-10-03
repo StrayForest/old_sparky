@@ -236,6 +236,8 @@ def validate_workflow_run(
         raise _fail("workflow path is not canonical")
     if workflow.get("name") != expected_name:
         raise _fail("workflow name is not canonical")
+    if run.get("path") != expected_path:
+        raise _fail("run workflow path is not canonical")
     validate_repository_identity(run)
     if _positive_int(run.get("workflow_id"), "run workflow id") != workflow_id:
         raise _fail("run belongs to a different workflow")
@@ -320,6 +322,8 @@ def validate_autodeploy_dispatch(
         expected_name=AUTODEPLOY_WORKFLOW_NAME,
         server_url=server_url,
     )
+    if run.get("display_title") != AUTODEPLOY_WORKFLOW_NAME:
+        raise _fail("auto-deploy run title is not canonical")
     matching_jobs = [job for job in jobs if job.get("name") == AUTODEPLOY_JOB_NAME]
     if len(matching_jobs) != 1:
         raise _fail("auto-deploy dispatch job is missing or ambiguous")
