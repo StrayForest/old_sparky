@@ -630,6 +630,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_internal_baseline_runtime_lane_is_closed_and_uses_a_distinct_status(self) -> None:
         workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
         finalizer = STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8")
         for input_name in (
             "proof_mode", "target_sha", "source_security_run_id",
@@ -642,8 +643,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("          - baseline-runtime", workflow)
         self.assertIn("platform-baseline-runtime-v1:", workflow)
         self.assertNotIn("curl --fail-with-body --silent --show-error --location", workflow)
-        self.assertIn("platform-security-standard-v1", workflow)
-        self.assertIn("platform-security-push-v1", workflow)
+        self.assertIn("|| 'Platform security and build'", workflow)
+        self.assertNotIn("platform-security-standard-v1", workflow)
+        self.assertNotIn("platform-security-push-v1", workflow)
         self.assertIn('test "$TARGET_SHA" = "$GITHUB_SHA"', workflow)
         self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', workflow)
         self.assertIn('"baseline proof target is not the exact current dev head"', workflow)
@@ -659,7 +661,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('context=platform-baseline-runtime', workflow)
         self.assertIn('baseline-runtime) status_context=platform-baseline-runtime', workflow)
         self.assertIn('status_context = "platform-baseline-runtime"', finalizer)
-        self.assertIn('display_title == "platform-security-standard-v1"', finalizer)
+        self.assertIn('run.get("name") != display_title', finalizer)
+        self.assertIn('run.get("name") != "Platform security and build"', finalizer)
+        self.assertIn('display_title == "Platform security and build"', finalizer)
+        self.assertIn("inputs.mode == 'baseline-reconcile'", production)
+        self.assertIn("|| 'Platform production deploy'", production)
         self.assertIn('is_baseline_candidate = display_title.startswith("platform-baseline-runtime-v1:")', finalizer)
         self.assertIn('raise SystemExit("workflow-dispatch run mode is unavailable; no status will be published")', finalizer)
         self.assertIn('required = {', finalizer)

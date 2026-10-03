@@ -34,6 +34,12 @@ SECURITY_WORKFLOW_PATH = ".github/workflows/platform-security.yml"
 SECURITY_WORKFLOW_NAME = "Platform security and build"
 DEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-deploy.yml"
 DEPLOY_WORKFLOW_NAME = "Platform production deploy"
+DEPLOY_BASELINE_RUN_NAME_RE = re.compile(
+    r"Platform production deploy mode=baseline-reconcile "
+    r"target=(?P<target>[0-9a-f]{40}) "
+    r"source=(?P<source_id>[1-9][0-9]{0,31})\.(?P<source_attempt>[1-9][0-9]{0,31}) "
+    r"auto=(?P<auto_id>[1-9][0-9]{0,31})\.(?P<auto_attempt>[1-9][0-9]{0,31})\Z"
+)
 AUTODEPLOY_WORKFLOW_PATH = ".github/workflows/platform-production-autodeploy.yml"
 AUTODEPLOY_WORKFLOW_NAME = "Platform production auto-deploy"
 AUTODEPLOY_JOB_NAME = "dispatch"
@@ -220,6 +226,7 @@ def validate_workflow_run(
     expected_branch: str,
     expected_path: str,
     expected_name: str,
+    expected_run_name: str | None = None,
     server_url: str = GITHUB_SERVER_URL,
 ) -> str:
     """Validate workflow metadata and return its exact attempt URL."""
@@ -232,7 +239,8 @@ def validate_workflow_run(
     validate_repository_identity(run)
     if _positive_int(run.get("workflow_id"), "run workflow id") != workflow_id:
         raise _fail("run belongs to a different workflow")
-    if run.get("name") != expected_name:
+    accepted_run_name = expected_name if expected_run_name is None else expected_run_name
+    if run.get("name") != accepted_run_name:
         raise _fail("run name is not canonical")
     if _run_id(run.get("id"), "run id") != _run_id(
         expected_run_id, "run id"
@@ -263,6 +271,22 @@ def validate_workflow_run(
         expected_attempt=expected_attempt,
         server_url=server_url,
     )
+
+
+def _expected_deployment_run_name(run: Mapping[str, Any], target_sha: str) -> str:
+    """Accept the ordinary fixed name or the exact automatic reconcile marker."""
+
+    run_name = run.get("name")
+    if run_name == DEPLOY_WORKFLOW_NAME:
+        title = run.get("display_title")
+        if title not in (None, DEPLOY_WORKFLOW_NAME):
+            raise _fail("ordinary deployment run title is not canonical")
+        return DEPLOY_WORKFLOW_NAME
+    title = run.get("display_title")
+    match = DEPLOY_BASELINE_RUN_NAME_RE.fullmatch(title) if isinstance(title, str) else None
+    if match is None or run_name != title or match.group("target") != target_sha:
+        raise _fail("deployment run name is not a canonical mode marker")
+    return title
 
 
 def validate_autodeploy_dispatch(
@@ -604,6 +628,7 @@ def validate_deployment_marker(
         expected_branch="dev",
         expected_path=DEPLOY_WORKFLOW_PATH,
         expected_name=DEPLOY_WORKFLOW_NAME,
+        expected_run_name=_expected_deployment_run_name(run, expected_target_sha),
         server_url=server_url,
     )
     if expected_run_url is not None and run.get("html_url") != expected_run_url:
@@ -669,6 +694,7 @@ def validate_deployment_event(
         expected_branch="dev",
         expected_path=DEPLOY_WORKFLOW_PATH,
         expected_name=DEPLOY_WORKFLOW_NAME,
+        expected_run_name=_expected_deployment_run_name(run, expected_target_sha),
         server_url=server_url,
     )
     if expected_run_url is not None and run.get("html_url") != expected_run_url:
