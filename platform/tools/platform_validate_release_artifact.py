@@ -79,6 +79,14 @@ RELEASE_KEYS = {
     "node_version",
     "npm_version",
 }
+LEGACY_RUNTIME_LAYOUT = {
+    "app_dir": "/opt/oldsparky/platform",
+    "current_symlink": "/opt/oldsparky/platform/current",
+    "previous_symlink": "/opt/oldsparky/platform/previous",
+    "shared_dir": "/opt/oldsparky/platform/shared",
+    "shared_env_file": "/opt/oldsparky/platform/shared/.env.platform",
+    "shared_venv_dir": "/opt/oldsparky/platform/shared/venv",
+}
 
 
 class ArtifactError(RuntimeError):
@@ -245,15 +253,29 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _parse_release_json(raw: bytes, *, release_slug: str) -> dict[str, object]:
+def _parse_release_json(
+    raw: bytes,
+    *,
+    release_slug: str,
+    allow_legacy_runtime_layout: bool = False,
+) -> dict[str, object]:
     try:
         parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
     except ArtifactError:
         raise
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ArtifactError("RELEASE.json is invalid") from exc
-    if not isinstance(parsed, dict) or set(parsed) != RELEASE_KEYS:
+    if not isinstance(parsed, dict):
         raise ArtifactError("RELEASE.json schema is invalid")
+    keys = set(parsed)
+    if keys != RELEASE_KEYS:
+        legacy_keys = RELEASE_KEYS | {"runtime_layout"}
+        if (
+            not allow_legacy_runtime_layout
+            or keys != legacy_keys
+            or parsed.get("runtime_layout") != LEGACY_RUNTIME_LAYOUT
+        ):
+            raise ArtifactError("RELEASE.json schema is invalid")
     if (
         type(parsed["artifact_format_version"]) is not int
         or parsed["artifact_format_version"] != 1

@@ -45,7 +45,258 @@ PIN_SHA = json.loads(
 ARTIFACT_DIGEST = "sha256:" + "e" * 64
 
 
+def _release_receipt(
+    slug: str,
+    source_sha: str,
+    *,
+    legacy_runtime_layout: object | None = None,
+    extra_field: bool = False,
+) -> bytes:
+    payload: dict[str, object] = {
+        "artifact_format_version": 1,
+        "release_slug": slug,
+        "built_at_utc": "20260920T123932Z",
+        "release_ref": slug,
+        "source_git_commit": source_sha,
+        "python_requirements_file": "requirements-platform.txt",
+        "python_lock_file": "requirements-platform.lock.txt",
+        "python_freeze_file": "requirements-platform.freeze.txt",
+        "python_wheelhouse_dir": "wheelhouse",
+        "python_wheelhouse_manifest_file": "wheelhouse/WHEELHOUSE.sha256",
+        "web_package_lock_file": "apps/platform_web/package-lock.json",
+        "web_build_id": "fixture-build-id",
+        "node_version": "26.3.1",
+        "npm_version": "11.16.0",
+    }
+    if legacy_runtime_layout is not None:
+        payload["runtime_layout"] = legacy_runtime_layout
+    if extra_field:
+        payload["unexpected"] = "rejected"
+    return (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+
+
 class HostToolsBundleTests(unittest.TestCase):
+    def test_active_release_baseline_reader_returns_stable_closed_tuple(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "runtime"
+            release = runtime / "releases" / "gha-35511236041-1-87547df2abd4"
+            (runtime / "releases").mkdir(parents=True)
+            (runtime / "shared").mkdir()
+            release.mkdir()
+            receipt = _release_receipt(
+                release.name,
+                "87547df2abd4aa06a07f4dd4b4f730e9912707e1",
+                legacy_runtime_layout={
+                    "app_dir": "/opt/oldsparky/platform",
+                    "current_symlink": "/opt/oldsparky/platform/current",
+                    "previous_symlink": "/opt/oldsparky/platform/previous",
+                    "shared_dir": "/opt/oldsparky/platform/shared",
+                    "shared_env_file": "/opt/oldsparky/platform/shared/.env.platform",
+                    "shared_venv_dir": "/opt/oldsparky/platform/shared/venv",
+                },
+            )
+            (release / "RELEASE.json").write_bytes(receipt)
+            (release / "RELEASE.json").chmod(0o444)
+            (runtime / "current").symlink_to("releases/gha-35511236041-1-87547df2abd4")
+
+            with (
+                patch.object(dispatcher, "RUNTIME_ROOT", runtime),
+                patch.object(
+                    dispatcher,
+                    "_stable_host_file",
+                    return_value=(TOOLS_ROOT / "platform_validate_release_artifact.py").read_bytes(),
+                ),
+            ):
+                baseline = dispatcher._release_baseline()
+
+            self.assertEqual(
+                set(baseline),
+                {
+                    "schema", "source_sha", "release_slug", "release_json_sha256",
+                    "current_link_dev", "current_link_ino", "release_dev", "release_ino",
+                    "pending_operation",
+                },
+            )
+            self.assertEqual(baseline["schema"], 1)
+            self.assertEqual(baseline["source_sha"], "87547df2abd4aa06a07f4dd4b4f730e9912707e1")
+            self.assertEqual(baseline["release_slug"], release.name)
+            self.assertEqual(baseline["release_json_sha256"], hashlib.sha256(receipt).hexdigest())
+            self.assertIs(baseline["pending_operation"], False)
+            for key in ("current_link_dev", "current_link_ino", "release_dev", "release_ino"):
+                self.assertIs(type(baseline[key]), int)
+                self.assertGreaterEqual(baseline[key], 0)
+
+    def test_release_validator_accepts_only_the_exact_legacy_runtime_layout(self) -> None:
+        validator_path = TOOLS_ROOT / "platform_validate_release_artifact.py"
+        namespace: dict[str, object] = {"__name__": "_release_validator_fixture"}
+        exec(compile(validator_path.read_bytes(), str(validator_path), "exec"), namespace)
+        parser = namespace["_parse_release_json"]
+        artifact_error = namespace["ArtifactError"]
+        source_sha = "87547df2abd4aa06a07f4dd4b4f730e9912707e1"
+        slug = "gha-35511236041-1-87547df2abd4"
+        valid_layout = {
+            "app_dir": "/opt/oldsparky/platform",
+            "current_symlink": "/opt/oldsparky/platform/current",
+            "previous_symlink": "/opt/oldsparky/platform/previous",
+            "shared_dir": "/opt/oldsparky/platform/shared",
+            "shared_env_file": "/opt/oldsparky/platform/shared/.env.platform",
+            "shared_venv_dir": "/opt/oldsparky/platform/shared/venv",
+        }
+        legacy_receipt = _release_receipt(
+            slug, source_sha, legacy_runtime_layout=valid_layout
+        )
+        with self.assertRaises(artifact_error):
+            parser(legacy_receipt, release_slug=slug)
+        self.assertEqual(
+            parser(
+                legacy_receipt,
+                release_slug=slug,
+                allow_legacy_runtime_layout=True,
+            )["runtime_layout"],
+            valid_layout,
+        )
+        wrong_layout = {**valid_layout, "app_dir": "/tmp/platform"}
+        for receipt in (
+            _release_receipt(slug, source_sha, legacy_runtime_layout=wrong_layout),
+            _release_receipt(
+                slug,
+                source_sha,
+                legacy_runtime_layout=valid_layout,
+                extra_field=True,
+            ),
+        ):
+            with self.subTest(receipt=receipt), self.assertRaises(artifact_error):
+                parser(
+                    receipt,
+                    release_slug=slug,
+                    allow_legacy_runtime_layout=True,
+                )
+
+    def test_active_release_baseline_reader_rejects_duplicate_receipt_keys_and_pending_state(self) -> None:
+        for receipt, pending_name in (
+            (b'{"source_git_commit":"87547df2abd4aa06a07f4dd4b4f730e9912707e1",'
+             b'"source_git_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n', False),
+            (_release_receipt("gha-35511236041-1-87547df2abd4", "87547df2abd4aa06a07f4dd4b4f730e9912707e1"), ".release-operation.json"),
+            (_release_receipt("gha-35511236041-1-87547df2abd4", "87547df2abd4aa06a07f4dd4b4f730e9912707e1"), ".release-systemd-state.json"),
+        ):
+            with self.subTest(pending=pending_name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    runtime = Path(temporary) / "runtime"
+                    release = runtime / "releases" / "gha-35511236041-1-87547df2abd4"
+                    (runtime / "releases").mkdir(parents=True)
+                    shared = runtime / "shared"
+                    shared.mkdir()
+                    release.mkdir()
+                    (release / "RELEASE.json").write_bytes(receipt)
+                    (release / "RELEASE.json").chmod(0o444)
+                    (runtime / "current").symlink_to("releases/gha-35511236041-1-87547df2abd4")
+                    if pending_name:
+                        (shared / pending_name).write_text("{}", encoding="ascii")
+                    with (
+                        patch.object(dispatcher, "RUNTIME_ROOT", runtime),
+                        patch.object(
+                            dispatcher,
+                            "_stable_host_file",
+                            return_value=(TOOLS_ROOT / "platform_validate_release_artifact.py").read_bytes(),
+                        ),
+                    ):
+                        with self.assertRaises(OSError):
+                            dispatcher._release_baseline()
+
+    def test_active_release_baseline_reader_rejects_mutable_or_misdirected_receipts(self) -> None:
+        mutations = ("writable", "hardlink", "symlink", "wrong_slug", "outside_pointer")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                runtime = Path(temporary) / "runtime"
+                releases = runtime / "releases"
+                release = releases / "gha-35511236041-1-87547df2abd4"
+                releases.mkdir(parents=True)
+                (runtime / "shared").mkdir()
+                release.mkdir()
+                receipt_path = release / "RELEASE.json"
+                receipt = _release_receipt(
+                    release.name, "87547df2abd4aa06a07f4dd4b4f730e9912707e1"
+                )
+                receipt_path.write_bytes(receipt)
+                receipt_path.chmod(0o444)
+                current_target = "releases/gha-35511236041-1-87547df2abd4"
+                if mutation == "writable":
+                    receipt_path.chmod(0o644)
+                elif mutation == "hardlink":
+                    os.link(receipt_path, runtime / "shared" / "receipt-copy")
+                elif mutation == "symlink":
+                    receipt_path.unlink()
+                    receipt_path.symlink_to("../shared/receipt-copy")
+                    (runtime / "shared" / "receipt-copy").write_bytes(receipt)
+                elif mutation == "wrong_slug":
+                    receipt_path.chmod(0o644)
+                    receipt_path.write_bytes(_release_receipt(
+                        "gha-35511236041-1-aaaaaaaaaaaa",
+                        "87547df2abd4aa06a07f4dd4b4f730e9912707e1",
+                    ))
+                    receipt_path.chmod(0o444)
+                elif mutation == "outside_pointer":
+                    current_target = "../outside-release"
+                    (runtime / "outside-release").mkdir()
+                (runtime / "current").symlink_to(current_target)
+
+                with (
+                    patch.object(dispatcher, "RUNTIME_ROOT", runtime),
+                    patch.object(
+                        dispatcher,
+                        "_stable_host_file",
+                        return_value=(TOOLS_ROOT / "platform_validate_release_artifact.py").read_bytes(),
+                    ),
+                ):
+                    with self.assertRaises(OSError):
+                        dispatcher._release_baseline()
+
+    def test_active_release_baseline_identity_comparison_is_closed_and_typed(self) -> None:
+        baseline: dict[str, object] = {
+            "schema": 1,
+            "source_sha": "87547df2abd4aa06a07f4dd4b4f730e9912707e1",
+            "release_slug": "gha-35511236041-1-87547df2abd4",
+            "release_json_sha256": "a" * 64,
+            "current_link_dev": 8,
+            "current_link_ino": 9,
+            "release_dev": 8,
+            "release_ino": 10,
+            "pending_operation": False,
+        }
+        self.assertTrue(dispatcher._baseline_identity_matches(baseline, dict(baseline)))
+        for field, changed in (
+            ("source_sha", "a" * 40),
+            ("release_slug", "gha-35511236041-1-aaaaaaaaaaaa"),
+            ("release_json_sha256", "b" * 64),
+            ("current_link_ino", 99),
+            ("release_ino", 99),
+            ("pending_operation", True),
+            ("current_link_dev", True),
+            ("schema", True),
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(
+                    dispatcher._baseline_identity_matches(
+                        baseline, {**baseline, field: changed}
+                    )
+                )
+        self.assertFalse(
+            dispatcher._baseline_identity_matches(
+                baseline, {**baseline, "extra": "unexpected"}
+            )
+        )
+        with self.assertRaises(OSError):
+            dispatcher._strict_baseline_json(
+                b'{"schema":1,"schema":1}'
+            )
+
     def _assert_artifact_zip_transport_contract(self) -> None:
         with BytesIO() as buffer:
             with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -968,8 +1219,8 @@ raise SystemExit(module.main(["host-capabilities"]))
 
             expected = (
                 f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
-                "dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 "
-                "python_isolated=1 python_bytecode_disabled=1\n"
+                "dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 "
+                "release_baseline=1 python_isolated=1 python_bytecode_disabled=1\n"
             )
             bounded = limited_run("-I", "-B")
             self.assertEqual(bounded.returncode, 0, bounded.stderr)

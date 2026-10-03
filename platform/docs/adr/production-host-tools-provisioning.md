@@ -70,9 +70,15 @@ to a delimiter-encoded shell string.
 
 The release build is downstream of this gate.  The production consumer invokes
 only the exact immutable dispatcher path with `/usr/bin/python3.12 -I -B`.
-Toolset v2 publishes the explicit `python_bytecode_disabled` capability.  The
-dispatcher also rejects a host-generation invocation that omits `-B` before
-loading its sibling guard, so a failed caller cannot leave a truncated
+Toolset v2 publishes the explicit `python_bytecode_disabled` capability. The
+reviewed baseline-capable generation also publishes `release_baseline=1` and
+provides the fixed `host-release-baseline` command. That query is root-only and
+read-only; it validates the current release receipt with the pinned artifact
+validator, rejects an active release/systemd transaction, and emits only the
+bounded source/release/pointer identity tuple used by the deployment
+supervisor's under-lock recheck. It does not read or execute application code.
+The dispatcher also rejects a host-generation invocation that omits `-B`
+before loading its sibling guard, so a failed caller cannot leave a truncated
 `__pycache__` member in the generation:
 
 `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>/platform_workflow_remote_dispatch.py`
@@ -207,11 +213,13 @@ self-test is the fixed installed entrypoint, with no candidate input:
 ```bash
 /usr/bin/python3.12 -I -B \
   /opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA/platform_workflow_remote_dispatch.py \
-  host-capabilities
+host-capabilities
 ```
 
 The self-test must print only the bounded `HOST_TOOLS schema=1 ...` contract,
-including `python_bytecode_disabled=1`, and return zero.  It must not create
+including `release_baseline=1` and `python_bytecode_disabled=1`, and return
+zero. The baseline query is separately exercised only after the capability
+gate confirms this exact generation. It must not create
 `__pycache__` or `.pyc` entries.  A non-zero result, any metadata/digest mismatch or an
 interrupted staging action is a failed provisioning attempt: quarantine/remove
 only that identified incomplete staging/generation through the approved

@@ -10,15 +10,18 @@ filesystem mutation is reached.  Values then cross only a local
 from __future__ import annotations
 
 import importlib.util
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import stat
 import subprocess  # nosec B404 - all argv below is fixed or validated data.
 import sys
+import time
 
 
 def _is_immutable_host_tools_dispatcher(path: Path) -> bool:
@@ -123,6 +126,50 @@ ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS = 120.0
 LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 300.0
 LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0
 CHILD_TERMINATION_GRACE_SECONDS = 5.0
+RELEASE_MARKER_MAX_BYTES = 512
+RELEASE_MARKER_RE = re.compile(
+    rb"RELEASE_DEPLOY schema=1 status=(?P<status>passed|failed) "
+    rb"class=(?P<class>preflight|artifact|deployment)"
+    rb"(?: phase=(?P<phase>preflight|artifact|provenance|candidate|readiness)"
+    rb" reason=(?P<reason>internal|host_tools_invalid|lock|environment|"
+    rb"service_state|nginx_config|preflight_failed|artifact_missing|"
+    rb"artifact_count_invalid|checksum_missing|provenance_missing|"
+    rb"artifact_name_invalid|release_slug_mismatch|checksum_mismatch|"
+    rb"validation_failed|provenance_invalid|candidate_missing|"
+    rb"activation_failed|lock_lost|runtime_profile_failed))? "
+    rb"release_slug=(?P<release_slug>[A-Za-z0-9][A-Za-z0-9._-]{0,179}) "
+    rb"source_sha=(?P<source_sha>[0-9a-f]{40,64})\n\Z"
+)
+RELEASE_FAILURE_REASONS = {
+    ("preflight", "preflight"): frozenset(
+        {
+            "internal",
+            "host_tools_invalid",
+            "lock",
+            "environment",
+            "service_state",
+            "nginx_config",
+            "preflight_failed",
+        }
+    ),
+    ("artifact", "artifact"): frozenset(
+        {
+            "artifact_missing",
+            "artifact_count_invalid",
+            "checksum_missing",
+            "artifact_name_invalid",
+            "checksum_mismatch",
+            "validation_failed",
+        }
+    ),
+    ("artifact", "provenance"): frozenset(
+        {"provenance_missing", "release_slug_mismatch", "provenance_invalid"}
+    ),
+    ("deployment", "candidate"): frozenset(
+        {"candidate_missing", "activation_failed", "lock_lost"}
+    ),
+    ("deployment", "readiness"): frozenset({"runtime_profile_failed"}),
+}
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 HOST_GENERATION_RE = re.compile(r"^[0-9a-f]{40}$")
 HOST_TOOL_FILES = (
@@ -142,6 +189,265 @@ HOST_TOOL_FILES = (
 )
 HOST_TOOLS_INVENTORY = frozenset((*HOST_TOOL_FILES, "manifest.json", "capabilities.txt"))
 HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+MAX_RELEASE_JSON_BYTES = 64 * 1024
+
+
+def _parse_active_release_receipt(raw: bytes, *, release_slug: str) -> dict[str, object]:
+    """Validate the live receipt with the pinned artifact validator contract."""
+
+    validator_path = ACTIVE_TOOLS_DIR / "platform_validate_release_artifact.py"
+    validator_source = _stable_host_file(validator_path, mode=0o555)
+    if validator_source is None:
+        raise OSError("pinned release validator is unavailable")
+    namespace: dict[str, object] = {"__file__": str(validator_path), "__name__": "_pinned_release_validator"}
+    try:
+        exec(compile(validator_source, str(validator_path), "exec"), namespace)
+        parser = namespace.get("_parse_release_json")
+        if not callable(parser):
+            raise OSError("pinned release validator is invalid")
+        parsed = parser(
+            raw,
+            release_slug=release_slug,
+            allow_legacy_runtime_layout=True,
+        )
+    except Exception as exc:
+        raise OSError("active release receipt is invalid") from exc
+    if not isinstance(parsed, dict):
+        raise OSError("active release receipt is invalid")
+    return parsed
+
+
+def _release_baseline() -> dict[str, object]:
+    """Read the exact active release identity without trusting release code."""
+
+    if os.geteuid() != 0:
+        raise OSError("baseline query requires root")
+    runtime = RUNTIME_ROOT
+    shared = runtime / "shared"
+    releases = runtime / "releases"
+    current = runtime / "current"
+    pending_paths = (
+        shared / ".release-operation.json",
+        shared / ".release-systemd-state.json",
+    )
+
+    def trusted_directory(path: Path) -> os.stat_result:
+        metadata = path.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink < 2
+            or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise OSError("baseline directory metadata is unsafe")
+        return metadata
+
+    def pending_absent() -> None:
+        for pending in pending_paths:
+            try:
+                pending.lstat()
+            except FileNotFoundError:
+                continue
+            raise OSError("pending release transaction exists")
+
+    if runtime == Path("/opt/oldsparky/platform"):
+        trusted_directory(Path("/"))
+        trusted_directory(Path("/opt"))
+        trusted_directory(Path("/opt/oldsparky"))
+    trusted_directory(runtime)
+    trusted_directory(releases)
+    trusted_directory(shared)
+    pending_absent()
+
+    link_before = current.lstat()
+    if (
+        not stat.S_ISLNK(link_before.st_mode)
+        or link_before.st_uid != 0
+        or link_before.st_gid != 0
+        or link_before.st_nlink != 1
+    ):
+        raise OSError("active release pointer is unsafe")
+    release = current.resolve(strict=True)
+    if release.parent != releases or RELEASE_SLUG_RE.fullmatch(release.name) is None:
+        raise OSError("active release path is invalid")
+    release_before = trusted_directory(release)
+    shared_before = shared.lstat()
+    release_json = release / "RELEASE.json"
+    json_before = release_json.lstat()
+    if (
+        not stat.S_ISREG(json_before.st_mode)
+        or stat.S_ISLNK(json_before.st_mode)
+        or json_before.st_uid != 0
+        or json_before.st_gid != 0
+        or json_before.st_nlink != 1
+        or json_before.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+        or stat.S_IMODE(json_before.st_mode) & 0o022
+        or stat.S_IMODE(json_before.st_mode) != 0o444
+        or json_before.st_size > MAX_RELEASE_JSON_BYTES
+    ):
+        raise OSError("active release receipt is unsafe")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("no-follow opens are unavailable")
+    descriptor = os.open(
+        release_json,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != 0
+            or opened.st_gid != 0
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+            != (json_before.st_dev, json_before.st_ino, json_before.st_size, json_before.st_mtime_ns, json_before.st_ctime_ns)
+        ):
+            raise OSError("active release receipt changed while opening")
+        chunks: list[bytes] = []
+        remaining = MAX_RELEASE_JSON_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(raw) > MAX_RELEASE_JSON_BYTES
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+            or release_json.lstat().st_ino != opened.st_ino
+        ):
+            raise OSError("active release receipt changed while reading")
+    finally:
+        os.close(descriptor)
+    payload = _parse_active_release_receipt(raw, release_slug=release.name)
+    source_sha = payload.get("source_git_commit")
+    if not isinstance(source_sha, str) or SOURCE_SHA_RE.fullmatch(source_sha) is None:
+        raise OSError("active release source SHA is malformed")
+
+    link_after = current.lstat()
+    release_after = release.lstat()
+    shared_after = shared.lstat()
+    if (
+        (link_before.st_dev, link_before.st_ino, link_before.st_ctime_ns)
+        != (link_after.st_dev, link_after.st_ino, link_after.st_ctime_ns)
+        or (
+            release_before.st_dev,
+            release_before.st_ino,
+            release_before.st_uid,
+            release_before.st_gid,
+            release_before.st_nlink,
+            release_before.st_mode,
+            release_before.st_ctime_ns,
+        )
+        != (
+            release_after.st_dev,
+            release_after.st_ino,
+            release_after.st_uid,
+            release_after.st_gid,
+            release_after.st_nlink,
+            release_after.st_mode,
+            release_after.st_ctime_ns,
+        )
+        or (
+            shared_before.st_dev,
+            shared_before.st_ino,
+            shared_before.st_uid,
+            shared_before.st_gid,
+            shared_before.st_mode,
+            shared_before.st_ctime_ns,
+        )
+        != (
+            shared_after.st_dev,
+            shared_after.st_ino,
+            shared_after.st_uid,
+            shared_after.st_gid,
+            shared_after.st_mode,
+            shared_after.st_ctime_ns,
+        )
+    ):
+        raise OSError("active release identity changed during query")
+    pending_absent()
+    return {
+        "schema": 1,
+        "source_sha": source_sha,
+        "release_slug": release.name,
+        "release_json_sha256": hashlib.sha256(raw).hexdigest(),
+        "current_link_dev": link_after.st_dev,
+        "current_link_ino": link_after.st_ino,
+        "release_dev": release_after.st_dev,
+        "release_ino": release_after.st_ino,
+        "pending_operation": False,
+    }
+
+
+def _baseline_identity_matches(expected: object, actual: object) -> bool:
+    """Require the exact, typed, closed tuple returned by the pinned reader."""
+
+    keys = {
+        "schema",
+        "source_sha",
+        "release_slug",
+        "release_json_sha256",
+        "current_link_dev",
+        "current_link_ino",
+        "release_dev",
+        "release_ino",
+        "pending_operation",
+    }
+
+    def valid(payload: object) -> bool:
+        if not isinstance(payload, dict) or set(payload) != keys:
+            return False
+        if type(payload.get("schema")) is not int or payload["schema"] != 1:
+            return False
+        if payload.get("pending_operation") is not False:
+            return False
+        if (
+            type(payload.get("source_sha")) is not str
+            or SOURCE_SHA_RE.fullmatch(payload["source_sha"]) is None
+            or type(payload.get("release_slug")) is not str
+            or RELEASE_SLUG_RE.fullmatch(payload["release_slug"]) is None
+            or type(payload.get("release_json_sha256")) is not str
+            or HEX_DIGEST_RE.fullmatch(payload["release_json_sha256"]) is None
+        ):
+            return False
+        return all(
+            type(payload.get(name)) is int
+            and 0 <= payload[name] <= 2**63 - 1
+            for name in (
+                "current_link_dev",
+                "current_link_ino",
+                "release_dev",
+                "release_ino",
+            )
+        )
+
+    return valid(expected) and valid(actual) and expected == actual
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _strict_baseline_json(raw: bytes) -> object:
+    try:
+        return json.loads(raw.decode("ascii"), object_pairs_hook=_reject_duplicate_json_keys)
+    except (UnicodeError, json.JSONDecodeError, ValueError):
+        raise OSError("baseline tuple is malformed") from None
 
 
 def _fail() -> int:
@@ -156,11 +462,16 @@ def _run_sudo(
     arguments: list[str],
     *,
     timeout_seconds: float,
+    expected_release_marker: tuple[str, str, str] | None = None,
 ) -> int:
     if not _trusted_helper(helper):
         return 2
     command = [SUDO, "-n", "--", str(helper), *arguments]
-    return _run_bounded_child(command, timeout_seconds=timeout_seconds)
+    return _run_bounded_child(
+        command,
+        timeout_seconds=timeout_seconds,
+        expected_release_marker=expected_release_marker,
+    )
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -191,25 +502,157 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _run_bounded_child(command: list[str], *, timeout_seconds: float) -> int:
+def _run_bounded_child(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+    expected_release_marker: tuple[str, str, str] | None = None,
+) -> int:
     """Run one synchronous privileged child with process-group cleanup."""
 
     try:
         process = subprocess.Popen(  # nosec B603
             command,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=(
+                subprocess.PIPE
+                if expected_release_marker is not None
+                else subprocess.DEVNULL
+            ),
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
         )
     except OSError:
         return 2
+    if expected_release_marker is not None:
+        return _wait_for_release_marker(
+            process,
+            timeout_seconds=timeout_seconds,
+            expected=expected_release_marker,
+        )
     try:
         return process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         _terminate_process_group(process)
         return 124
+
+
+def _release_marker_is_valid(
+    output: bytes,
+    *,
+    child_status: int,
+    expected: tuple[str, str, str],
+) -> bool:
+    """Validate the one public deploy marker against its exact handoff."""
+
+    if len(output) > RELEASE_MARKER_MAX_BYTES:
+        return False
+    match = RELEASE_MARKER_RE.fullmatch(output)
+    if match is None:
+        return False
+    mode, release_slug, source_sha = expected
+    if (
+        match.group("release_slug").decode("ascii") != release_slug
+        or match.group("source_sha").decode("ascii") != source_sha
+    ):
+        return False
+
+    status = match.group("status").decode("ascii")
+    marker_class = match.group("class").decode("ascii")
+    phase = match.group("phase")
+    reason = match.group("reason")
+    if status == "passed":
+        expected_class = "preflight" if mode == "preflight" else "deployment"
+        return (
+            marker_class == expected_class
+            and phase is None
+            and reason is None
+            and child_status == 0
+        )
+    if child_status == 0 or (mode == "preflight" and marker_class != "preflight"):
+        return False
+    if phase is None or reason is None:
+        return False
+    return reason.decode("ascii") in RELEASE_FAILURE_REASONS.get(
+        (marker_class, phase.decode("ascii")), frozenset()
+    )
+
+
+def _wait_for_release_marker(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: float,
+    expected: tuple[str, str, str],
+) -> int:
+    """Drain a bounded supervisor marker while discarding all other bytes."""
+
+    stdout = process.stdout
+    if stdout is None:
+        _terminate_process_group(process)
+        return 2
+    output = bytearray()
+    oversized = False
+    eof = False
+    try:
+        descriptor = stdout.fileno()
+        os.set_blocking(descriptor, False)
+    except (OSError, ValueError):
+        _terminate_process_group(process)
+        return 2
+
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            child_status = process.poll()
+            if child_status is not None and eof:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process_group(process)
+                return 124
+            events = selector.select(min(remaining, 0.1))
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fd, 4096)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    oversized = True
+                    chunk = b""
+                if not chunk:
+                    try:
+                        selector.unregister(key.fd)
+                    except (KeyError, ValueError):
+                        pass
+                    eof = True
+                    continue
+                if not oversized:
+                    if len(output) + len(chunk) > RELEASE_MARKER_MAX_BYTES:
+                        output.clear()
+                        oversized = True
+                    else:
+                        output.extend(chunk)
+        child_status = process.returncode
+        if child_status is None:
+            return 2
+        if oversized or not _release_marker_is_valid(
+            bytes(output),
+            child_status=child_status,
+            expected=expected,
+        ):
+            return child_status if child_status != 0 else 2
+        sys.stdout.write(output.decode("ascii"))
+        sys.stdout.flush()
+        return child_status
+    except (OSError, ValueError):
+        _terminate_process_group(process)
+        return 2
+    finally:
+        selector.close()
+        stdout.close()
 
 
 def _run_trusted_live_launch(arguments: list[str]) -> int:
@@ -455,10 +898,32 @@ def _host_capabilities() -> int:
     print(
         "HOST_TOOLS schema=1 "
         f"source_sha={ACTIVE_TOOLS_DIR.name} generation={ACTIVE_TOOLS_DIR.name} "
-        "dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 "
-        "python_isolated=1 python_bytecode_disabled=1"
+        "dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 "
+        "release_baseline=1 python_isolated=1 python_bytecode_disabled=1"
     )
     return 0
+
+
+def _host_baseline_generation_ready() -> bool:
+    if (
+        not _trusted_generation()
+        or not _trusted_data(ACTIVE_TOOLS_DIR / "manifest.json")
+        or not _trusted_data(ACTIVE_TOOLS_DIR / "capabilities.txt")
+    ):
+        return False
+    manifest_bytes = _stable_host_file(ACTIVE_TOOLS_DIR / "manifest.json", mode=0o444)
+    capability_bytes = _stable_host_file(ACTIVE_TOOLS_DIR / "capabilities.txt", mode=0o444)
+    if manifest_bytes is None or capability_bytes is None:
+        return False
+    return _verify_host_tools_contract(
+        {
+            "host_tools": {
+                "host_tools_sha": ACTIVE_TOOLS_DIR.name,
+                "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                "capabilities_sha256": hashlib.sha256(capability_bytes).hexdigest(),
+            }
+        }
+    ) and b"capability=release_baseline" in capability_bytes.splitlines()
 
 
 def _trusted_live_launch_helper() -> bool:
@@ -738,6 +1203,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if arguments == ["host-capabilities"]:
         return _host_capabilities()
+    if arguments == ["host-release-baseline"] or (
+        arguments and arguments[0] == "host-release-baseline-match"
+    ):
+        if not _host_baseline_generation_ready():
+            return _fail()
+        try:
+            actual = _release_baseline()
+            if arguments == ["host-release-baseline"]:
+                print(json.dumps(actual, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+                return 0
+            if len(arguments) != 2 or not isinstance(arguments[1], str) or len(arguments[1]) > 4096:
+                return _fail()
+            expected_raw = base64.b64decode(arguments[1], validate=True)
+            expected = _strict_baseline_json(expected_raw)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            return _fail()
+        if not _baseline_identity_matches(expected, actual):
+            return _fail()
+        print("HOST_RELEASE_BASELINE status=match")
+        return 0
     if arguments == ["external-fixture"]:
         mode = "external"
     elif arguments == ["external-finalize"]:
@@ -812,6 +1297,17 @@ def main(argv: list[str] | None = None) -> int:
         if arguments == ["production-deploy"]:
             if payload["mode"] == "deploy" and not _verify_host_tools_contract(payload):
                 return _fail()
+            baseline_argument: list[str] = []
+            if "baseline_identity" in payload:
+                if payload["mode"] != "deploy" or "host_tools" not in payload:
+                    return _fail()
+                baseline_json = json.dumps(
+                    payload["baseline_identity"],
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+                baseline_argument = [base64.b64encode(baseline_json).decode("ascii")]
             return _run_sudo(
                 DEPLOY_HELPER,
                 [
@@ -829,8 +1325,14 @@ def main(argv: list[str] | None = None) -> int:
                         if "host_tools" in payload
                         else []
                     ),
+                    *baseline_argument,
                 ],
                 timeout_seconds=DEPLOY_OPERATION_TIMEOUT_SECONDS,
+                expected_release_marker=(
+                    payload["mode"],
+                    payload["release_slug"],
+                    payload["target_sha"],
+                ),
             )
         if arguments == ["live-user-qa"]:
             if (

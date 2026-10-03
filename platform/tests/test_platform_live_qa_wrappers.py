@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO, TextIOWrapper
 import json
 import os
@@ -10,6 +10,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -751,22 +752,20 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 BytesIO((json.dumps(valid_deploy) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
-            child = Mock(pid=1235)
-            child.wait.return_value = 0
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_root), \
                 patch.object(platform_workflow_remote_dispatch, "DEPLOY_HELPER", helper), \
                 patch.object(platform_workflow_remote_dispatch, "_trusted_generation", return_value=True), \
                 patch.object(platform_workflow_remote_dispatch, "_verify_host_tools_contract", return_value=True), \
                 patch.object(
-                    platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child
-                ) as popen:
+                    platform_workflow_remote_dispatch, "_run_bounded_child", return_value=0
+                ) as run_child:
                 self.assertEqual(
                     platform_workflow_remote_dispatch.main(["production-deploy"]),
                     0,
                 )
             self.assertEqual(
-                popen.call_args.args[0],
+                run_child.call_args.args[0],
                 [
                     "/usr/bin/sudo",
                     "-n",
@@ -781,6 +780,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     host_tools["manifest_sha256"],
                     host_tools["capabilities_sha256"],
                 ],
+            )
+            self.assertEqual(
+                run_child.call_args.kwargs,
+                {
+                    "timeout_seconds": platform_workflow_remote_dispatch.DEPLOY_OPERATION_TIMEOUT_SECONDS,
+                    "expected_release_marker": (
+                        valid_deploy["mode"],
+                        valid_deploy["release_slug"],
+                        valid_deploy["target_sha"],
+                    ),
+                },
             )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -820,6 +830,103 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     valid["artifact_remote_dir"],
                 ],
             )
+            self.assertIs(
+                popen.call_args.kwargs["stdout"],
+                subprocess.DEVNULL,
+            )
+
+    def test_deploy_marker_capture_is_exact_bounded_and_status_preserving(self) -> None:
+        source_sha = "a" * 40
+        release_slug = "gha-123456-2-aaaaaaaaaaaa"
+        expected = ("deploy", release_slug, source_sha)
+        passed = (
+            "RELEASE_DEPLOY schema=1 status=passed class=deployment "
+            f"release_slug={release_slug} source_sha={source_sha}\n"
+        )
+        failed = (
+            "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+            "phase=preflight reason=environment "
+            f"release_slug={release_slug} source_sha={source_sha}\n"
+        )
+
+        def run_child(
+            output: bytes,
+            *,
+            status: int = 0,
+            stderr: bytes = b"",
+            expected_marker: tuple[str, str, str] = expected,
+        ) -> tuple[int, str, str]:
+            child_code = (
+                "import os,sys; "
+                f"os.write(1, bytes.fromhex({output.hex()!r})); "
+                f"os.write(2, bytes.fromhex({stderr.hex()!r})); "
+                f"raise SystemExit({status})"
+            )
+            stdout = StringIO()
+            captured_stderr = StringIO()
+            popen_kwargs: list[dict[str, object]] = []
+            real_popen = platform_workflow_remote_dispatch.subprocess.Popen
+
+            def launch_child(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+                popen_kwargs.append(kwargs)
+                return real_popen(*args, **kwargs)  # type: ignore[arg-type]
+
+            with redirect_stdout(stdout), redirect_stderr(captured_stderr):
+                with patch.object(
+                    platform_workflow_remote_dispatch.subprocess,
+                    "Popen",
+                    side_effect=launch_child,
+                ):
+                    child_status = platform_workflow_remote_dispatch._run_bounded_child(
+                        [sys.executable, "-c", child_code],
+                        timeout_seconds=5,
+                        expected_release_marker=expected_marker,
+                    )
+            self.assertEqual(len(popen_kwargs), 1)
+            self.assertIs(popen_kwargs[0]["stdin"], subprocess.DEVNULL)
+            self.assertIs(popen_kwargs[0]["stdout"], subprocess.PIPE)
+            self.assertIs(popen_kwargs[0]["stderr"], subprocess.DEVNULL)
+            self.assertTrue(popen_kwargs[0]["start_new_session"])
+            self.assertTrue(popen_kwargs[0]["close_fds"])
+            return child_status, stdout.getvalue(), captured_stderr.getvalue()
+
+        self.assertEqual(run_child(passed.encode()), (0, passed, ""))
+        self.assertEqual(run_child(failed.encode(), status=7), (7, failed, ""))
+        self.assertEqual(run_child(passed.encode(), stderr=b"private child stderr"), (0, passed, ""))
+        preflight = (
+            "RELEASE_DEPLOY schema=1 status=passed class=preflight "
+            f"release_slug={release_slug} source_sha={source_sha}\n"
+        )
+        self.assertEqual(
+            run_child(preflight.encode(), expected_marker=("preflight", release_slug, source_sha)),
+            (0, preflight, ""),
+        )
+
+        malformed = (
+            passed.replace("class=deployment", "class=preflight").encode(),
+            passed.replace(release_slug, "gha-123456-2-bbbbbbbbbbbb").encode(),
+            passed.replace(source_sha, "b" * 40).encode(),
+            passed.encode() + passed.encode(),
+            b"x" * (platform_workflow_remote_dispatch.RELEASE_MARKER_MAX_BYTES + 4096),
+        )
+        for output in malformed:
+            with self.subTest(output_length=len(output)):
+                self.assertEqual(run_child(output), (2, "", ""))
+        self.assertEqual(run_child(passed.encode(), status=9), (9, "", ""))
+        self.assertEqual(run_child(failed.encode()), (2, "", ""))
+
+    def test_deploy_marker_capture_keeps_bounded_timeout_cleanup(self) -> None:
+        expected = ("deploy", "gha-123456-2-aaaaaaaaaaaa", "a" * 40)
+        child_code = "import os\nwhile True: os.write(1, b'x' * 4096)"
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            result = platform_workflow_remote_dispatch._run_bounded_child(
+                [sys.executable, "-c", child_code],
+                timeout_seconds=0.05,
+                expected_release_marker=expected,
+            )
+        self.assertEqual(result, 124)
+        self.assertEqual(stdout.getvalue(), "")
 
     def test_bounded_dispatch_child_terminates_process_group_on_timeout(self) -> None:
         child = Mock(pid=9876)

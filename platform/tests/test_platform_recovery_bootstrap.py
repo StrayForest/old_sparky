@@ -101,15 +101,19 @@ RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
     "6d5ae25eb5321a99bd872c64d793f7b754214962abe08bd35538a625769a063d"
 )
 
-# These two paths are deliberately present in the recovery route allowlist for
-# compatibility with the retained-release boundary, but were not changed by
-# this patch.  The remaining allowlisted paths plus the documentation files
-# below derive the complete committed patch fixture without consulting the
-# mutable checkout's git history.
+# These paths are deliberately present in the recovery route allowlist but are
+# outside this historical patch fixture. The remaining allowlisted paths plus
+# the documentation files below derive the complete committed patch fixture
+# without consulting the mutable checkout's git history.
 RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES = frozenset(
     {
         "platform/tests/test_platform_live_qa_guard.py",
         "platform/tools/platform_release_lock.sh",
+        "platform/tests/test_platform_workflow_provenance.py",
+        "platform/tools/platform_deploy_baseline.py",
+        "platform/tools/platform_host_tools_bundle.py",
+        "platform/tools/platform_validate_release_artifact.py",
+        "platform/tools/platform_workflow_provenance.py",
     }
 )
 RECOVERY_BOOTSTRAP_PATCH_DOCS = frozenset(

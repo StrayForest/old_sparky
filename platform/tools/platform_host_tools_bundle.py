@@ -63,6 +63,7 @@ CAPABILITIES = (
     "production_dispatcher",
     "production_supervisor",
     "production_deploy_control",
+    "release_baseline",
     "python_isolated",
     "python_bytecode_disabled",
 )
