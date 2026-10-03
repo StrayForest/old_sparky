@@ -1412,6 +1412,9 @@ def run_supervised(
             pass
         return early_failure(setup_deadline_reason, "setup_deadline_exceeded")
     process: subprocess.Popen[bytes] | None = None
+    watchdog_diagnostic_read_fd: int | None = None
+    watchdog_diagnostic_write_fd: int | None = None
+    watchdog_diagnostic: str | None = None
     wrapper_pidfd: int | None = None
     wrapper_starttime: int | None = None
     namespace_init_pid: int | None = None
@@ -1480,16 +1483,26 @@ def run_supervised(
             "--parent-pidfd-fd",
             str(parent_pidfd),
         )
+        watchdog_diagnostic_read_fd, watchdog_diagnostic_write_fd = os.pipe2(
+            os.O_CLOEXEC | os.O_NONBLOCK
+        )
+        watchdog_command = (
+            *watchdog_command,
+            "--diagnostic-fd",
+            str(watchdog_diagnostic_write_fd),
+        )
         process = subprocess.Popen(
             watchdog_command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             close_fds=True,
-            pass_fds=(parent_pidfd,),
+            pass_fds=(parent_pidfd, watchdog_diagnostic_write_fd),
             start_new_session=True,
             env=child_env,
         )
+        os.close(watchdog_diagnostic_write_fd)
+        watchdog_diagnostic_write_fd = None
         worker_started = True
         try:
             wrapper_pidfd = os.pidfd_open(process.pid, 0)
@@ -1718,6 +1731,19 @@ def run_supervised(
                         stream.close()
                     except OSError:
                         pass
+        if watchdog_diagnostic_read_fd is not None:
+            try:
+                if os.read(watchdog_diagnostic_read_fd, 1) == b"\x01":
+                    watchdog_diagnostic = "watchdog_pidfd_signal_eperm"
+            except OSError:
+                pass
+            finally:
+                os.close(watchdog_diagnostic_read_fd)
+        if watchdog_diagnostic_write_fd is not None:
+            try:
+                os.close(watchdog_diagnostic_write_fd)
+            except OSError:
+                pass
         try:
             config_path.unlink()
         except FileNotFoundError:
@@ -1764,6 +1790,10 @@ def run_supervised(
     if acceptance_gate_reason is not None and reason != "external_signal":
         reason = acceptance_gate_reason
         report_error = report_error or "wall_deadline_before_acceptance"
+    # Keep the deadline as the primary reason while surfacing the watchdog's
+    # fixed, bounded pidfd signal diagnostic when present.
+    if watchdog_diagnostic is not None:
+        report_error = watchdog_diagnostic
     successful_worker = (
         worker_report is not None
         and reason == "worker_failed"

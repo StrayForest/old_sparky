@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -473,6 +474,11 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 runner_minutes=0.05,
             )
             self.assertEqual(result.reason, 'max_runner_minutes')
+            self.assertNotEqual(
+                result.report.get('runtime_supervisor', {}).get('report_error'),
+                'watchdog_pidfd_signal_eperm',
+                f"watchdog signal diagnostic: {result.report.get('runtime_supervisor')}",
+            )
             self.assertLess(result.returncode or 0, 0)
             self.assertEqual(
                 result.report['acceptance']['decision'],
@@ -499,6 +505,11 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             )
             # The namespace wrapper owns the descendant kill boundary; TERM
             # may close the wrapper itself while --kill-child reclaims PID 1.
+            self.assertNotEqual(
+                result.report.get('runtime_supervisor', {}).get('report_error'),
+                'watchdog_pidfd_signal_eperm',
+                f"watchdog signal diagnostic: {result.report.get('runtime_supervisor')}",
+            )
             self.assertIn(result.returncode, (-signal.SIGTERM, -signal.SIGKILL))
             self.assertTrue(result.namespace_closed)
             self.assertTrue(started_file.exists(), 'worker never entered descendant mode')
@@ -665,6 +676,32 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             [call.args for call in close.call_args_list],
             [(12,), (11,)],
         )
+        numeric_kill.assert_not_called()
+
+    def test_watchdog_pidfd_permission_denial_emits_fixed_status_and_fails_closed(self) -> None:
+        from tools import platform_load_namespace as namespace
+
+        with (
+            patch.object(namespace, "_read_process_descendants", return_value=()),
+            patch.object(namespace, "_read_process_starttime", return_value=10),
+            patch.object(namespace.os, "pidfd_open", return_value=11),
+            patch.object(namespace.os, "close") as close,
+            patch.object(
+                namespace.signal,
+                "pidfd_send_signal",
+                side_effect=PermissionError(errno.EPERM, "operation not permitted"),
+            ),
+            patch.object(namespace.os, "write") as write,
+            patch.object(namespace.os, "kill") as numeric_kill,
+        ):
+            with self.assertRaisesRegex(
+                NamespaceIntegrityError,
+                "watchdog_pidfd_signal_eperm",
+            ):
+                namespace._kill_tree_with_diagnostic(100, signal.SIGKILL, 17)
+
+        close.assert_called_once_with(11)
+        write.assert_called_once_with(17, b"\x01")
         numeric_kill.assert_not_called()
 
     def test_watchdog_fails_closed_without_pidfd_signal_api(self) -> None:

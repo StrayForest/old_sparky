@@ -113,6 +113,11 @@ where the system implementation preserves that signal. PID1 pidfd signalling,
 start-time checks and bounded full-chain reap remain mandatory proofs when
 setuid sudo clears it; the namespace worker and inner setpriv also arm
 `SIGKILL` parent-death handling.
+If the watchdog's identity-pinned `pidfd_send_signal` returns `EPERM`, it
+fails closed and the supervisor records the fixed
+`runtime_supervisor.report_error=watchdog_pidfd_signal_eperm` diagnostic while
+preserving the original deadline or containment reason. No numeric-PID retry
+or permission-error suppression is allowed.
 
 Load/QA evidence is a fixed, privacy-bounded set: route classes/templates,
 numeric timings/counts/statuses and allowlisted error/backend/wait classes. It

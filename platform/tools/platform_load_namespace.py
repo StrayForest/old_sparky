@@ -11,6 +11,7 @@ bootstrap.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -101,6 +102,12 @@ def _kill_tree(root_pid: int, signum: int) -> None:
                 signal.pidfd_send_signal(pidfd, signum)
             except ProcessLookupError:
                 continue
+            except PermissionError as exc:
+                if exc.errno == errno.EPERM:
+                    raise NamespaceIntegrityError(
+                        "watchdog_pidfd_signal_eperm"
+                    ) from exc
+                raise NamespaceIntegrityError("pidfd signal failed") from exc
             except OSError as exc:
                 raise NamespaceIntegrityError("pidfd signal failed") from exc
     finally:
@@ -126,6 +133,22 @@ def _wait_child(child_pid: int, *, timeout: float) -> int | None:
             return 125
         time.sleep(0.01)
     return None
+
+
+def _kill_tree_with_diagnostic(
+    root_pid: int,
+    signum: int,
+    diagnostic_fd: int,
+) -> None:
+    try:
+        _kill_tree(root_pid, signum)
+    except NamespaceIntegrityError as exc:
+        if str(exc) == "watchdog_pidfd_signal_eperm":
+            try:
+                os.write(diagnostic_fd, b"\x01")
+            except OSError:
+                pass
+        raise
 
 
 def _wrapper_watchdog(args: argparse.Namespace) -> int:
@@ -167,6 +190,7 @@ def _wrapper_watchdog(args: argparse.Namespace) -> int:
     if child_pid == 0:
         try:
             os.close(args.parent_pidfd_fd)
+            os.close(args.diagnostic_fd)
             _set_parent_death_signal()
             os.execv(command[0], command)
         except BaseException:
@@ -182,14 +206,26 @@ def _wrapper_watchdog(args: argparse.Namespace) -> int:
     try:
         while True:
             if not _pidfd_is_live(args.parent_pidfd_fd):
-                _kill_tree(child_pid, signal.SIGKILL)
+                _kill_tree_with_diagnostic(
+                    child_pid,
+                    signal.SIGKILL,
+                    args.diagnostic_fd,
+                )
                 _wait_child(child_pid, timeout=2.0)
                 return 137
             if pending_signal[0] is not None:
                 requested = pending_signal[0]
-                _kill_tree(child_pid, requested)
+                _kill_tree_with_diagnostic(
+                    child_pid,
+                    requested,
+                    args.diagnostic_fd,
+                )
                 if _wait_child(child_pid, timeout=0.25) is None:
-                    _kill_tree(child_pid, signal.SIGKILL)
+                    _kill_tree_with_diagnostic(
+                        child_pid,
+                        signal.SIGKILL,
+                        args.diagnostic_fd,
+                    )
                     _wait_child(child_pid, timeout=2.0)
                 # Preserve the signal-shaped return code seen by the parent.
                 signal.signal(requested, signal.SIG_DFL)
@@ -205,6 +241,10 @@ def _wrapper_watchdog(args: argparse.Namespace) -> int:
     finally:
         try:
             os.close(args.parent_pidfd_fd)
+        except OSError:
+            pass
+        try:
+            os.close(args.diagnostic_fd)
         except OSError:
             pass
 
@@ -246,6 +286,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-parent-pid", type=int)
     parser.add_argument("--expected-parent-starttime", type=int)
     parser.add_argument("--parent-pidfd-fd", type=int)
+    parser.add_argument("--diagnostic-fd", type=int)
     return parser
 
 
@@ -256,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             args.expected_parent_pid is None
             or args.expected_parent_starttime is None
             or args.parent_pidfd_fd is None
+            or args.diagnostic_fd is None
         ):
             raise SystemExit("watchdog parent identity is required")
         return _wrapper_watchdog(args)
