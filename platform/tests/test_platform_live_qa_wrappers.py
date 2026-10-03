@@ -928,6 +928,40 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(result, 124)
         self.assertEqual(stdout.getvalue(), "")
 
+    def test_deploy_marker_selector_failure_terminates_and_closes_child(self) -> None:
+        expected = ("deploy", "gha-123456-2-aaaaaaaaaaaa", "a" * 40)
+        child_code = "import os\nwhile True: os.write(1, b'x' * 4096)"
+        children: list[subprocess.Popen[bytes]] = []
+        real_popen = platform_workflow_remote_dispatch.subprocess.Popen
+
+        def launch_child(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            child = real_popen(*args, **kwargs)  # type: ignore[arg-type]
+            children.append(child)
+            return child
+
+        with (
+            patch.object(
+                platform_workflow_remote_dispatch.subprocess,
+                "Popen",
+                side_effect=launch_child,
+            ),
+            patch.object(
+                platform_workflow_remote_dispatch.selectors,
+                "DefaultSelector",
+                side_effect=OSError(24, "too many open files"),
+            ),
+        ):
+            result = platform_workflow_remote_dispatch._run_bounded_child(
+                [sys.executable, "-c", child_code],
+                timeout_seconds=5,
+                expected_release_marker=expected,
+            )
+        self.assertEqual(result, 2)
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].poll())
+        self.assertIsNotNone(children[0].stdout)
+        self.assertTrue(children[0].stdout.closed)
+
     def test_bounded_dispatch_child_terminates_process_group_on_timeout(self) -> None:
         child = Mock(pid=9876)
         child.wait.side_effect = [

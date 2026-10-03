@@ -601,8 +601,9 @@ def _wait_for_release_marker(
         _terminate_process_group(process)
         return 2
 
-    selector = selectors.DefaultSelector()
+    selector: selectors.BaseSelector | None = None
     try:
+        selector = selectors.DefaultSelector()
         selector.register(descriptor, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout_seconds
         while True:
@@ -651,7 +652,8 @@ def _wait_for_release_marker(
         _terminate_process_group(process)
         return 2
     finally:
-        selector.close()
+        if selector is not None:
+            selector.close()
         stdout.close()
 
 
