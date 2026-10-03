@@ -259,9 +259,9 @@ or when diagnosing the automatic contour. The same exact-SHA
 `platform-security-build=success` and deployable classifier artifact gates still
 apply to `mode=deploy`; provide the originating security `run_id` and
 `run_attempt`. A missing, malformed, fallback or non-deployable manifest blocks
-deployment. `mode=baseline-reconcile` is a planned Phase B mode, not currently
-available and never an operator fallback. `mode=preflight` remains available
-without that release artifact guard and performs no install.
+deployment. `mode=baseline-reconcile` is accepted only from the validated
+automatic chain and is never an operator fallback. `mode=preflight` remains
+available without that release artifact guard and performs no install.
 
 Both `mode=deploy` and the read-only `mode=preflight` require the immutable
 host-tools capability gate. For a bump, first require full exact-SHA CI on the
