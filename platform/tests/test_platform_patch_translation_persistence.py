@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import unittest
 from datetime import UTC, datetime
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -417,19 +416,6 @@ class PatchTranslationPersistenceModelTests(unittest.TestCase):
         self.assertIn("translated_segments", table.c)
         self.assertIn("last_enqueued_at", table.c)
         self.assertIn("processing_started_at", table.c)
-
-    def test_migration_creates_and_removes_translation_table(self) -> None:
-        migration_path = (
-            Path(__file__).resolve().parents[1]
-            / "alembic"
-            / "versions"
-            / "20260829_0045_patch_translations.py"
-        )
-        migration_source = migration_path.read_text(encoding="utf-8")
-        self.assertIn('revision = "20260829_0045"', migration_source)
-        self.assertIn('op.create_table(\n        "patch_translations"', migration_source)
-        self.assertIn('op.drop_table("patch_translations", schema="platform")', migration_source)
-
 
 if __name__ == "__main__":
     unittest.main()

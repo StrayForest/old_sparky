@@ -465,9 +465,14 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
                 return status
         return 0
     if gate_id == "migration":
+        try:
+            from tools.platform_migration_support import MIGRATION_SUBPROCESS_TIMEOUT_SECONDS
+        except ModuleNotFoundError:  # Direct execution from platform/tools.
+            from platform_migration_support import MIGRATION_SUBPROCESS_TIMEOUT_SECONDS
         return _run(
             gate_id,
             [_python(), "tools/platform_migration_scenario.py"],
+            timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
         )
     if gate_id == "docs":
         return _run(gate_id, [_python(), "tools/platform_docs_check.py"])

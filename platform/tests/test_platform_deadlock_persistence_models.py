@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 import unittest
 
@@ -76,37 +75,6 @@ class DeadlockPersistenceModelTests(unittest.TestCase):
             assignment_indexes,
         )
         self.assertIn(("source_ready_round_id",), captain_unique_columns)
-
-    def test_migration_has_preflight_and_invalid_concurrent_index_recovery(self) -> None:
-        migration_path = (
-            Path(__file__).resolve().parents[1]
-            / "alembic"
-            / "versions"
-            / "20260822_0040_deadlock_workflow_integrity.py"
-        )
-        spec = importlib.util.spec_from_file_location("deadlock_integrity_migration_0040", migration_path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-        self.assertEqual(module.revision, "20260822_0040")
-        self.assertEqual(module.down_revision, "20260821_0039")
-        self.assertTrue(module._DATA_INVARIANT_CHECKS)
-        migration_source = migration_path.read_text(encoding="utf-8")
-        self.assertIn("pg_index.indisvalid", migration_source)
-        self.assertIn("SET visibility = 'invite_only'", migration_source)
-
-        public_name_migration = (
-            Path(__file__).resolve().parents[1]
-            / "alembic"
-            / "versions"
-            / "20260714_0031_public_tournament_name_uniqueness.py"
-        )
-        self.assertIn(
-            "_assert_no_normalized_public_name_duplicates",
-            public_name_migration.read_text(encoding="utf-8"),
-        )
-        self.assertIn("pg_index.indisvalid", public_name_migration.read_text(encoding="utf-8"))
 
     def test_participant_capacity_slots_are_bounded_and_released_by_status_trigger(self) -> None:
         constraints = {

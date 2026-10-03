@@ -245,14 +245,25 @@ def _integration_preflight_error(
     *,
     migration_heads: Sequence[str],
     role_slugs: Iterable[str],
-    expected_head: str,
+    expected_head: str | None = None,
+    source_heads: Sequence[str] | None = None,
+    version_rows: Sequence[str] | None = None,
 ) -> str | None:
     """Return a stable diagnostic when the shared integration DB is not ready."""
 
-    if tuple(migration_heads) != (expected_head,):
+    expected_heads = tuple(source_heads) if source_heads is not None else (
+        (expected_head,) if expected_head is not None else ()
+    )
+    if len(expected_heads) != 1 or tuple(migration_heads) != expected_heads:
         return (
             "backend-integration requires exactly one migrated Alembic head "
-            f"({expected_head}); run the migration gate before this contour"
+            f"({expected_heads[0] if len(expected_heads) == 1 else 'the source head'}); "
+            "run the migration gate before this contour"
+        )
+    if version_rows is not None and tuple(version_rows) != tuple(migration_heads):
+        return (
+            "backend-integration requires exactly one Alembic version-table row "
+            "matching the current head; run the migration gate before this contour"
         )
     missing_roles = sorted(INTEGRATION_REQUIRED_ROLE_SLUGS - set(role_slugs))
     if missing_roles:
@@ -265,13 +276,13 @@ def _integration_preflight_error(
 
 
 def _expected_integration_head() -> str:
-    """Read the migration scenario's single source of the disposable head."""
+    """Read the single source head through the shared Alembic graph helper."""
 
     try:
-        from platform_migration_scenario import HEAD_REVISION
+        from platform_migration_support import source_head
     except ModuleNotFoundError:  # Import as tools.platform_test_runner in tests.
-        from tools.platform_migration_scenario import HEAD_REVISION  # type: ignore[no-redef]
-    return HEAD_REVISION
+        from tools.platform_migration_support import source_head  # type: ignore[no-redef]
+    return source_head()
 
 
 def _require_integration_resources_ready() -> None:
@@ -299,32 +310,37 @@ def _require_integration_resources_ready() -> None:
             "LOCAL GATE BLOCKED: backend-integration preflight dependencies are unavailable."
         ) from exc
 
-    expected_head = _expected_integration_head()
+    try:
+        from platform_migration_support import inspect_database_heads, source_heads
+    except ModuleNotFoundError:  # Import as tools.platform_test_runner in tests.
+        from tools.platform_migration_support import (  # type: ignore[no-redef]
+            inspect_database_heads,
+            source_heads,
+        )
+    expected_source_heads = source_heads()
 
-    async def inspect_database() -> tuple[list[str], list[str]]:
+    async def inspect_database() -> tuple[object, list[str]]:
         async_engine = create_async_engine(configuration.database_url, pool_pre_ping=True)
         try:
             async with async_engine.connect() as connection:
-                heads = [
-                    str(value)
-                    for value in (
-                        await connection.scalars(
-                            text("SELECT version_num FROM public.alembic_version")
-                        )
-                    ).all()
-                ]
+                migration_state = await connection.run_sync(
+                    lambda sync_connection: inspect_database_heads(
+                        sync_connection,
+                        source=expected_source_heads,
+                    )
+                )
                 roles = [
                     str(value)
                     for value in (
                         await connection.scalars(text("SELECT slug FROM platform.roles"))
                     ).all()
                 ]
-                return heads, roles
+                return migration_state, roles
         finally:
             await async_engine.dispose()
 
     try:
-        migration_heads, role_slugs = asyncio.run(inspect_database())
+        migration_state, role_slugs = asyncio.run(inspect_database())
     except Exception as exc:
         raise SystemExit(
             "LOCAL GATE BLOCKED: backend-integration PostgreSQL preflight is unavailable; "
@@ -332,9 +348,10 @@ def _require_integration_resources_ready() -> None:
         ) from exc
 
     error = _integration_preflight_error(
-        migration_heads=migration_heads,
+        migration_heads=migration_state.database_heads,
         role_slugs=role_slugs,
-        expected_head=expected_head,
+        source_heads=migration_state.source_heads,
+        version_rows=migration_state.version_rows,
     )
     if error:
         raise SystemExit("LOCAL GATE BLOCKED: " + error)

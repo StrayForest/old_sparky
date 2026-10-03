@@ -107,8 +107,7 @@ Read this file for the current production baseline and next engineering priority
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
 - Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
 - Production Alembic head is `20260903_0052`, including Google external identities and browser-bound OAuth state alongside the tournament catalog
-  read-model and keyset-pagination revisions. The migration scenario records
-  this as the current head; see the [deployment runbook](deployment-runbook.md)
+  read-model and keyset-pagination revisions. The migration scenario resolves the repository source head at runtime and compares it with the disposable database before backend integration; see the [deployment runbook](deployment-runbook.md)
   for the exact release-SHA evidence.
 - On 2026-08-24 production was reset only after a restore-verified backup
   (`platformdb-20260824T173357Z.dump`, SHA-256
