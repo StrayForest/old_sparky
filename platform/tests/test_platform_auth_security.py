@@ -1751,41 +1751,96 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         reset_client = await self._new_client()
         login_reached_session_creation = asyncio.Event()
         allow_login_session_creation = asyncio.Event()
+        reset_user_lock_entered = asyncio.Event()
+        reset_user_lock_acquired = asyncio.Event()
+        reset_session: dict[str, object | None] = {"value": None}
         original_create_session = auth_routes.create_user_session
+        original_get_db_session = auth_routes.get_db_session
+        original_scalar = auth_routes.AsyncSession.scalar
+
+        async def observed_db_session(request: Request):
+            async for session in original_get_db_session(request):
+                if request.url.path == "/api/v1/auth/password-reset/confirm":
+                    reset_session["value"] = session
+                yield session
+
+        def is_locked_user_lookup(statement: object) -> bool:
+            descriptions = getattr(statement, "column_descriptions", ())
+            where = getattr(statement, "whereclause", None)
+            left = getattr(where, "left", None)
+            return bool(
+                getattr(statement, "_for_update_arg", None) is not None
+                and len(descriptions) == 1
+                and descriptions[0].get("entity") is User
+                and hasattr(left, "compare")
+                and left.compare(User.__table__.c.email)
+            )
+
+        async def observed_scalar(session, statement, *args, **kwargs):
+            observed = session is reset_session["value"] and is_locked_user_lookup(statement)
+            if observed:
+                reset_user_lock_entered.set()
+            result = await original_scalar(session, statement, *args, **kwargs)
+            if observed:
+                reset_user_lock_acquired.set()
+            return result
 
         async def paused_create_session(**kwargs):
             login_reached_session_creation.set()
             await allow_login_session_creation.wait()
             return await original_create_session(**kwargs)
 
-        with patch.object(auth_routes, "create_user_session", paused_create_session):
-            login_task = asyncio.create_task(
-                login_client.post(
-                    "/api/v1/auth/login",
-                    json={"email": email, "password": self.password},
+        login_task: asyncio.Task | None = None
+        reset_task: asyncio.Task | None = None
+        previous_db_override = self.app.dependency_overrides.get(auth_routes.get_db_session)
+        try:
+            self.app.dependency_overrides[auth_routes.get_db_session] = observed_db_session
+            with (
+                patch.object(auth_routes, "create_user_session", paused_create_session),
+                patch.object(auth_routes.AsyncSession, "scalar", observed_scalar),
+            ):
+                login_task = asyncio.create_task(
+                    login_client.post(
+                        "/api/v1/auth/login",
+                        json={"email": email, "password": self.password},
+                    )
                 )
-            )
-            await asyncio.wait_for(login_reached_session_creation.wait(), timeout=3)
-            reset_task = asyncio.create_task(
-                reset_client.post(
-                    "/api/v1/auth/password-reset/confirm",
-                    json={
-                        "email": email,
-                        "code": issued.code,
-                        "new_password": "race-safe-new-password-456",
-                    },
+                await asyncio.wait_for(login_reached_session_creation.wait(), timeout=3)
+                reset_task = asyncio.create_task(
+                    reset_client.post(
+                        "/api/v1/auth/password-reset/confirm",
+                        json={
+                            "email": email,
+                            "code": issued.code,
+                            "new_password": "race-safe-new-password-456",
+                        },
+                    )
                 )
-            )
-            await asyncio.sleep(0.05)
-            self.assertFalse(reset_task.done())
+                await asyncio.wait_for(reset_user_lock_entered.wait(), timeout=3)
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(reset_user_lock_acquired.wait(), timeout=0.1)
+                self.assertFalse(reset_user_lock_acquired.is_set())
+                allow_login_session_creation.set()
+                login_response, reset_response = await asyncio.gather(
+                    login_task,
+                    reset_task,
+                )
+        finally:
             allow_login_session_creation.set()
-            login_response, reset_response = await asyncio.gather(
-                login_task,
-                reset_task,
-            )
+            for task in (login_task, reset_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            pending = [task for task in (login_task, reset_task) if task is not None]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if previous_db_override is None:
+                self.app.dependency_overrides.pop(auth_routes.get_db_session, None)
+            else:
+                self.app.dependency_overrides[auth_routes.get_db_session] = previous_db_override
 
         self.assertEqual(login_response.status_code, 200, login_response.text)
         self.assertEqual(reset_response.status_code, 200, reset_response.text)
+        self.assertTrue(reset_user_lock_acquired.is_set())
         self.assertEqual((await login_client.get("/api/v1/auth/session")).status_code, 401)
 
     async def test_concurrent_reset_issuance_keeps_only_one_live_token(self) -> None:
