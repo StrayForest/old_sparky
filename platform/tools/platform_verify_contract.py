@@ -32,7 +32,6 @@ try:
         FULL_GATE_IDS,
         OUT_OF_SCOPE_GATE_IDS,
     )
-    from tools.platform_migration_support import MIGRATION_SUBPROCESS_TIMEOUT_SECONDS
     from tools.platform_verify import (
         CI_GATE_IDS,
         DETERMINISTIC_GATE_IDS,
@@ -61,7 +60,6 @@ except ModuleNotFoundError:  # Direct execution from platform/tools.
         FULL_GATE_IDS,
         OUT_OF_SCOPE_GATE_IDS,
     )
-    from platform_migration_support import MIGRATION_SUBPROCESS_TIMEOUT_SECONDS
     from platform_verify import (
         CI_GATE_IDS,
         DETERMINISTIC_GATE_IDS,
@@ -1265,15 +1263,18 @@ def _migration_contract_issues(security_text: str) -> list[str]:
         return [f"migration contract source is unreadable: {exc}"]
     if "HEAD_REVISION" in scenario:
         issues.append("migration scenario must not hardcode HEAD_REVISION")
-    if f"MIGRATION_SUBPROCESS_TIMEOUT_SECONDS = {MIGRATION_SUBPROCESS_TIMEOUT_SECONDS:g}.0" not in support:
+    inner = re.search(r"^MIGRATION_SCENARIO_DEADLINE_SECONDS = ([0-9.]+)$", support, re.MULTILINE)
+    outer = re.search(r"^MIGRATION_GATE_TIMEOUT_SECONDS = ([0-9.]+)$", support, re.MULTILINE)
+    if inner is None or float(inner.group(1)) != 180.0:
         issues.append("migration support must define the 180-second subprocess timeout")
+    if outer is None or float(outer.group(1)) != 210.0 or (inner is not None and float(outer.group(1)) <= float(inner.group(1))):
+        issues.append("migration outer timeout must be 210 seconds and exceed the inner deadline")
     for marker in ("MigrationCommandTimeout", "MigrationCommandError", "run_migration_subprocess"):
         if marker not in scenario and marker not in support:
             issues.append(f"migration timeout contract is missing {marker}")
-    if "timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS" not in scenario:
-        issues.append(
-            "migration timeout contract is missing timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS"
-        )
+    for marker in ("migration_scenario_deadline()", "start_new_session=True", "stdin=subprocess.DEVNULL", "selectors.DefaultSelector", "os.killpg", "signal.SIGKILL", "MIGRATION_DIAGNOSTIC_BYTES = 4096"):
+        if marker not in support and marker not in scenario:
+            issues.append(f"migration containment contract is missing {marker}")
     if 'operation == "current"' not in scenario or 'command.append("--check-heads")' not in scenario:
         issues.append("migration scenario must run Alembic current --check-heads")
     for marker in (
@@ -1296,8 +1297,10 @@ def _migration_contract_issues(security_text: str) -> list[str]:
             issues.append(f"migration scenario safety contract is missing {marker}")
     if "downgrade is an irreversible no-op" not in support:
         issues.append("migration support must reject no-op downgrade candidates")
-    if "timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS" not in verify:
-        issues.append("canonical migration gate must apply the 180-second timeout")
+    if "MIGRATION_GATE_TIMEOUT_SECONDS" not in support or "MIGRATION_GATE_TIMEOUT_SECONDS" not in verify:
+        issues.append("canonical migration gate must retain its 210-second outer timeout")
+    if "subprocess.run(" in support:
+        issues.append("migration subprocesses must use the bounded process-group helper")
 
     # These representative migration/tool/test/workflow paths must all remain
     # on the complete route.  A packaging-only path may be non-deployable, but

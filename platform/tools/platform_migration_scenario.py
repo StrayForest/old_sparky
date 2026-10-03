@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 from datetime import UTC, datetime
 import os
 from pathlib import Path
@@ -35,9 +36,9 @@ from tools.platform_tournament_list_read_model_recovery import (
     validate_projection_async,
 )
 from tools.platform_migration_support import (
-    MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
     MigrationCommandError,
     assert_single_head_state,
+    migration_scenario_deadline,
     run_migration_subprocess,
     select_reversible_range,
     source_head,
@@ -137,7 +138,6 @@ def _run_alembic(
     result = run_migration_subprocess(
         command,
         label=f"alembic {operation}{f' {revision}' if revision else ''}".strip(),
-        timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
         env=command_env,
     )
     if (result.returncode == 0) != expect_success:
@@ -164,7 +164,6 @@ def _run_recovery(*, expect_success: bool, extra_env: dict[str, str] | None = No
     result = run_migration_subprocess(
         command,
         label="tournament catalog recovery",
-        timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
         env=command_env,
     )
     if (result.returncode == 0) != expect_success:
@@ -943,7 +942,9 @@ async def _main() -> None:
         schema=settings.platform_db_schema,
     )
     try:
-        with verification_resource_lock("migration"):
+        with ExitStack() as stack:
+            stack.enter_context(migration_scenario_deadline())
+            stack.enter_context(verification_resource_lock("migration"))
             primary_error: BaseException | None = None
             cleanup_error: BaseException | None = None
             try:

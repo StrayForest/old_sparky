@@ -196,9 +196,11 @@ The source head is discovered at runtime; callers must not copy a `HEAD_REVISION
 constant. Backend integration preflight reuses the same source/database-head
 helper before test discovery.
 
-Every Alembic or migration-owned recovery subprocess has a typed 180-second
-timeout. The migration workflow keeps a five-minute job deadline, retains its
-loopback `platformdb_test` PostgreSQL service, and has no production URL or
+Every Alembic or migration-owned recovery subprocess shares one absolute
+monotonic 180-second scenario deadline; its process-group helper drains a
+bounded 4096-byte tail, redacts credentials, and TERM→KILL/reaps in-budget.
+The canonical outer gate is 210 seconds; the migration workflow keeps a
+five-minute deadline, its loopback `platformdb_test` service, and no production URL or
 database access. The scenario checks a compact critical schema contract from
 `information_schema` and `pg_catalog`, including `indisvalid`, `indisready` and
 `indislive` for required indexes.
