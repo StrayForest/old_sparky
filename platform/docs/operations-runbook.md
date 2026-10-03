@@ -328,12 +328,12 @@ gh workflow run platform-live-launch.yml \
 gh run watch <browser-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-For the full lifecycle at scale, use the QA/preprod owner route and the
-`tournament-lifecycle-scale-v1` contract: 20 tournaments × 500 users (10,000
-users), concurrent lifecycle waves, bracket match reports, conditional reads,
-terminal `completed` state and exact cleanup. It is intentionally not
-dispatchable through the production external-load workflow. The canonical
-harness command is:
+For the full lifecycle at scale, use the QA/preprod owner route and an
+explicitly reviewed harness plan: 20 tournaments × 500 users (10,000 users),
+concurrent lifecycle waves, bracket match reports, conditional reads, terminal
+`completed` state and exact cleanup. Lifecycle has no selectable placeholder in
+the production load-profile registry and is intentionally not dispatchable
+through the production external-load workflow. The canonical harness command is:
 
 ```bash
 python3 platform/tools/platform_production_qa.py \

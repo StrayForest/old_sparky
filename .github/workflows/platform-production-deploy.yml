@@ -1107,7 +1107,8 @@ jobs:
             --attestation-run-id "$GITHUB_RUN_ID" \
             --attestation-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --attestation-job-id "$build_job_id"
-          test "$(stat -c '%F:%u:%h:%a' -- "$handoff")" = "regular file:0:1:600"
+          expected_owner="$(id -u)"
+          test "$(stat -c '%F:%u:%h:%a' -- "$handoff")" = "regular file:${expected_owner}:1:600"
           /usr/bin/python3 -I -B "$inner_root/platform_workflow_input_guard.py" host-tools \
             --input "$handoff" >/dev/null
           /usr/bin/python3 - "$handoff" "$GITHUB_OUTPUT" <<'PY'

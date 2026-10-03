@@ -165,6 +165,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_live_qa_runtime_install
     test_platform_live_qa_wrappers
     test_platform_load_acceptance
+    test_platform_load_runtime
     test_platform_logging
     test_platform_manual_live_auth_qa
     test_platform_match_progression_api
@@ -294,6 +295,7 @@ PERFORMANCE_MODULES = frozenset(
         "test_platform_cpu_profile",
         "test_platform_external_load",
         "test_platform_load_acceptance",
+        "test_platform_load_runtime",
         "test_platform_performance_contract",
         "test_platform_production_qa_write_burst_profile",
         "test_platform_request_performance",
@@ -452,14 +454,14 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 159,
-    "module_digest": "8a1cc9c4955db7f302912378b845323f6a05cc87c2b94ee5107ddec658a0ca69",
-    "test_count": 1488,
-    "test_id_digest": "838f716dd71586ff948989fd48428b5bd48c839fce0409facd3ce3447ca38a46",
-    "backend_test_count": 1442,
-    "backend_test_id_digest": "1620bfafc3d924e6fdfc4ce675be528e169e34df32d47bbea17d38a6646ddc85",
-    "verification_test_count": 46,
-    "verification_test_id_digest": "9b296cfd7218173042ceda4102c58de02187024bbdc51b952e406cc729707d87",
+    "module_count": 160,
+    "module_digest": "3303d50b8d907fabf8df494b2a337abd1d8629c144ae00eabb6dcf2674adbb41",
+    "test_count": 1523,
+    "test_id_digest": "d17140022eb8b52ae167d391501c5c0810976e86d42072050dc061ac312c2dd1",
+    "backend_test_count": 1478,
+    "backend_test_id_digest": "ad402efb860cf9c315582c38f4b888faa77db17219f46f4e8251cada43049234",
+    "verification_test_count": 45,
+    "verification_test_id_digest": "41ecaed05d1677688a8d1fb11704d62ab4a18eb629ede197a3c71f57b35c3a3b",
     "verification_classifier_test_count": 23,
     "verification_classifier_test_id_digest": "9273fe85861db634d66f43be86290e9bc01540f43ad5a3dd357d845314b0227a",
 }
@@ -486,8 +488,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 44,
         "module_digest": "693edb2005c56249ac84c9d1d7367b64e2e3291ef18c6bc05e41ea98967ea406",
-        "test_count": 327,
-        "test_id_digest": "45cdb690769b6058c1102d1ee1fab318b0b0fe5eb7727ebf7c8f7ad700339c32",
+        "test_count": 329,
+        "test_id_digest": "6ecc7ab85567401acee0b48b31a56fb60fbe6dbe82186174cd2d83279f0d3b1e",
     },
     "backend-integration": {
         "module_count": 41,
@@ -498,20 +500,20 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 23,
         "module_digest": "2034d1a0a01dffe5b141118aa1b90c060268b28eadc0bf2165954c36c260dc1e",
-        "test_count": 438,
-        "test_id_digest": "731a9caf5b247612d12f2fe6bd7ed1c3ec2326dba7e79703e72701b01fdb500d",
+        "test_count": 439,
+        "test_id_digest": "de39609cd8be7de00c04040fd7f8f010f706aef6243cc74e4b239192a1f08389",
     },
     "performance-contract": {
-        "module_count": 10,
-        "module_digest": "5135af80b8695bc35d28c0670ce787c21f34ad541652cb9bedd2d3dd8ff17c4d",
-        "test_count": 131,
-        "test_id_digest": "98a0b1a8cdf1162756236f648eee202c89f2859b4e7987b83c6e8941afe9f0db",
+        "module_count": 11,
+        "module_digest": "ac879f1b292f00df28f399af5e34ed8995b39878e1961386b8eb055bb1d025e0",
+        "test_count": 164,
+        "test_id_digest": "0a3971ea208b63c8d2e1871859a0ff3e2f4da80b949baeb4f4518361f1f6526b",
     },
     VERIFICATION_CONTOUR: {
         "module_count": 2,
         "module_digest": "b2a31b179b655a3aafcfd5c2ebc5dd0f09645024663d5985815355c2a2b984ee",
-        "test_count": 46,
-        "test_id_digest": "9b296cfd7218173042ceda4102c58de02187024bbdc51b952e406cc729707d87",
+        "test_count": 45,
+        "test_id_digest": "41ecaed05d1677688a8d1fb11704d62ab4a18eb629ede197a3c71f57b35c3a3b",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])

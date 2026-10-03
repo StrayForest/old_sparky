@@ -15,6 +15,7 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-external-load.yml"
+CANARY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-load-containment-canary.yml"
 
 
 def _jobs(source: str) -> dict[str, str]:
@@ -38,6 +39,10 @@ def _pass_truth_table(state: dict[str, object]) -> bool:
             state["load_result"] == "success",
             state["load_status"] == "0",
             state["report_ready"] == "1",
+            state["namespace_barrier_result"] == "success",
+            state["namespace_closed_status"] == "0",
+            state["manual_barrier_result"] == "success",
+            state["manual_required"] == "0",
             state["finalize_result"] == "success",
             state["remote_status"] == "0",
             state["observer_ready"] == "1",
@@ -60,6 +65,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = WORKFLOW.read_text(encoding="utf-8")
         cls.jobs = _jobs(cls.source)
+        cls.canary_source = CANARY_WORKFLOW.read_text(encoding="utf-8")
 
     def test_dag_has_explicit_result_barriers_and_always_cleanup(self) -> None:
         self.assertIn("needs.fixture-setup.result == 'success'", self.jobs["load-client"])
@@ -69,6 +75,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("needs.fixture-setup.result", self.jobs["evaluate-load"])
         self.assertIn("needs.load-client.result", self.jobs["evaluate-load"])
         self.assertIn("needs.fixture-finalize.result", self.jobs["evaluate-load"])
+        self.assertIn("needs.namespace-containment-barrier.outputs.namespace_closed_status", self.jobs["fixture-finalize"])
+        self.assertIn("emergency/manual", self.jobs["namespace-containment-manual-barrier"])
         for name in ("Exact cleanup of external fixture", "Remove finalizer SSH material"):
             self.assertIn(f"- name: {name}", self.jobs["fixture-finalize"])
             step = self.jobs["fixture-finalize"].split(f"- name: {name}", 1)[1]
@@ -84,6 +92,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "needs.load-client.result",
             "needs.load-client.outputs.load_status",
             "needs.load-client.outputs.report_ready",
+            "needs.namespace-containment-barrier.result",
+            "needs.namespace-containment-barrier.outputs.namespace_closed_status",
+            "needs.namespace-containment-manual-barrier.result",
+            "needs.namespace-containment-manual-barrier.outputs.manual_required",
             "needs.fixture-finalize.result",
             "needs.fixture-finalize.outputs.remote_status",
             "needs.fixture-finalize.outputs.observer_ready",
@@ -112,6 +124,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "load_result": "success",
             "load_status": "0",
             "report_ready": "1",
+            "namespace_barrier_result": "success",
+            "namespace_closed_status": "0",
+            "manual_barrier_result": "success",
+            "manual_required": "0",
             "finalize_result": "success",
             "remote_status": "0",
             "observer_ready": "1",
@@ -146,6 +162,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "load_result": "success",
             "load_status": "0",
             "report_ready": "1",
+            "namespace_barrier_result": "success",
+            "namespace_closed_status": "0",
+            "manual_barrier_result": "success",
+            "manual_required": "0",
             "finalize_result": "success",
             "remote_status": "0",
             "observer_ready": "1",
@@ -192,10 +212,49 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("test -n \"$artifact_id\" && test -n \"$artifact_digest\"", self.source)
         self.assertIn("if-no-files-found: error", self.source)
 
+    def test_load_runner_is_pinned_and_has_containment_probe_margin(self) -> None:
+        self.assertNotIn("runs-on: ubuntu-latest", self.source)
+        for job_id in (
+            "validate-external-inputs",
+            "fixture-setup",
+            "load-client",
+            "fixture-finalize",
+            "evaluate-load",
+        ):
+            with self.subTest(job=job_id):
+                self.assertIn("runs-on: ubuntu-24.04", self.jobs[job_id])
+        load_client = self.jobs["load-client"]
+        self.assertIn("timeout-minutes: 270", load_client)
+        self.assertIn("Probe mandatory load PID-namespace containment", load_client)
+        self.assertIn("probe_pid_namespace_capability", load_client)
+        validator = self.jobs["validate-external-inputs"]
+        self.assertIn("before fixture setup", validator)
+        self.assertIn("probe_pid_namespace_capability", validator)
+
+    def test_containment_canary_is_safe_and_pinned(self) -> None:
+        self.assertIn("runs-on: ubuntu-24.04", self.canary_source)
+        self.assertIn("probe_pid_namespace_capability", self.canary_source)
+        self.assertIn("run_supervised", self.canary_source)
+        self.assertIn("namespace_closed", self.canary_source)
+        self.assertIn("os.setsid", self.canary_source)
+        self.assertIn("os.fork()", self.canary_source)
+        self.assertIn("nested-descendant", self.canary_source)
+        self.assertIn("double-fork-grandchild", self.canary_source)
+        self.assertIn("starttime", self.canary_source)
+        self.assertIn("heartbeat", self.canary_source)
+        self.assertIn("descendants_reaped", self.canary_source)
+        self.assertIn("runtime_supervisor", self.canary_source)
+        self.assertIn("max_duration_seconds=8.0", self.canary_source)
+        self.assertNotIn("secrets.", self.canary_source)
+        self.assertNotIn("platform_load.py run", self.canary_source)
+        self.assertNotIn("manifest", self.canary_source)
+        self.assertNotIn("fixture", self.canary_source)
+
     def test_evaluator_cannot_hide_upstream_failure_or_publish_success(self) -> None:
         evaluator = self.jobs["evaluate-load"]
         self.assertIn("upstream_ready=0", evaluator)
-        self.assertIn('needs.load-client.outputs.load_status }}\" == 0', evaluator)
+        self.assertIn('needs.load-client.outputs.report_ready }}\" == 1', evaluator)
+        self.assertNotIn('needs.load-client.outputs.load_status }}\" == 0', evaluator)
         self.assertIn('needs.fixture-finalize.outputs.cleanup_exports_status }}\" == 0', evaluator)
         publish = evaluator.split("- name: Publish external load evidence", 1)[1]
         self.assertIn("needs.load-client.result == 'success'", publish)

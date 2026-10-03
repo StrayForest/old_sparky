@@ -2,7 +2,7 @@
 
 - Status: Active reference and operator how-to
 - Owner: Performance and web verification owners
-- Last reviewed: 2026-09-19
+- Last reviewed: 2026-10-01
 
 This document owns the detailed retained-load cleanup, hermetic web verification,
 external-load workflow barrier and evidence-projection contracts. The
@@ -47,7 +47,7 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | Boundary | Passing value |
 | --- | --- |
 | dispatch, setup and load-client jobs | job result `success`; setup `setup_status=0` |
-| measured load | authoritative `load_status=0`; report present |
+| measured load | closed report present; a non-zero client status is retained as failed evidence and cannot pass evaluation |
 | remote/finalization | `remote_status=0`, `observer_ready=1`, `finalize_status=0` |
 | cleanup/export cleanup | `cleanup_status=0`, `cleanup_exports_status=0` |
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
@@ -56,6 +56,77 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 The evidence artifact is published only after every row passes; missing or
 mismatched artifacts and remote, projection, sanitizer or cleanup failures
 cannot be hidden by the evaluator.
+
+The measured client is supervised in a mandatory Linux PID namespace. The only
+privileged chain is the absolute system path `/usr/bin/sudo -n
+/usr/bin/setpriv --pdeathsig SIGKILL -- /usr/bin/unshare --pid --fork
+--mount-proc --kill-child=SIGKILL`; no checkout-controlled helper is executed
+as root and user-namespace flags are deliberately absent. Inside the namespace
+a second absolute `setpriv` immediately drops to the original runner UID/GID,
+clears groups, applies `--no-new-privs`, and clears inheritable, ambient and
+bounding capabilities before it execs the Python worker as PID 1. A validation
+preflight on the pinned `ubuntu-24.04` runner probes that exact non-root,
+stdin/stdout contour before any production fixture setup, and the load runner
+repeats the probe before candidate execution. The runtime also performs the
+same pure preflight before it creates report directories, removes stale paths,
+writes config, or creates its worker temporary directory; a root/local
+rejection is an in-memory error/exit and cannot mutate the caller's report
+path. Probe failure is a closed non-authoritative result and never falls back
+to a process group or an uncontained worker. The probe and namespace entry
+machine-check real/effective/saved UID/GID, supplementary groups, PID 1/PPID 0,
+all capability fields and `NoNewPrivs=1`.
+
+The scenario deadline and whole-runner deadline select one absolute monotonic
+wall deadline. A bounded reserve inside that deadline covers wrapper wait,
+`TERM`/`KILL`, captured-chain and namespace reaping, child-report read/validation
+and atomic publication; it includes a one-second post-watchdog-KILL reap
+interval for the hosted sudo monitor to reparent and for PID1/captured-chain
+reap, in addition to the configured TERM grace. Every phase checks the
+deadline before and after its bounded work; a short authored window fails
+closed rather than borrowing time from teardown. A blocked DNS/socket/body read or future is terminated with
+`TERM`, then `KILL` after only the remaining grace. The supervisor tracks the
+complete wrapper chain and namespace PID by pidfd/start-time, waits for the
+wrapper, reaps a zombie namespace PID 1 when necessary, and requires namespace
+closure before publishing the final report. The final acceptance gate is
+adjacent to atomic publication: a teardown, parser or write overrun always
+preserves the primary deadline reason and can never produce `reason=none` or a
+success envelope. Every report has mandatory boolean
+`namespace_closed`; only the parent may set it true after closure. A malformed
+or killed worker is represented by a failed report with partial/in-flight-
+unknown flags; the primary timeout/containment reason remains intact even when
+the child report is absent. The `always()` fixture finalizer has a separate
+fail-visible namespace barrier: cleanup never begins when the field is missing
+or false and a manual emergency action is required instead. Candidate report
+upload is independent of the client exit code, so a runtime timeout cannot
+skip cleanup or leave a background load mutating the fixture while cleanup
+begins.
+
+The hosted containment canary itself creates a TERM-ignoring `setsid`/double-
+fork/nested descendant tree, records each outer PID and `/proc` start-time, and
+proves heartbeat and every captured identity stop after closure. Because a
+setuid sudo exec may clear a parent-death signal, the non-root
+watchdog keeps the supervisor pidfd outside the privileged chain and
+identity-signals the entire captured sudo/setpriv/unshare descendant chain if
+that pidfd closes. This is a reclaim guard, not a process-group fallback; the
+watchdog wraps sudo in the absolute system `setpriv --pdeathsig SIGKILL`
+where the system implementation preserves that signal. PID1 pidfd signalling,
+start-time checks and bounded full-chain reap remain mandatory proofs when
+setuid sudo clears it; the namespace worker and inner setpriv also arm
+`SIGKILL` parent-death handling.
+If the watchdog's identity-pinned `pidfd_send_signal` returns `EPERM` during a
+parent-alive termination, it may skip only a PIDFD/start-time-pinned process
+whose `/proc/<pid>/status` proves effective UID 0 and an exact `Name` of
+`sudo`, `setpriv` or `unshare`, with exactly one `NSpid` entry (outer PID
+namespace only). The watchdog itself forked and execs only the fixed absolute
+system chain above. It continues
+signalling the remaining captured identities, and the parent still requires
+independent wrapper and PID 1 closure proof before publishing a report that
+claims namespace closure or allowing cleanup to proceed. This skip is
+disabled on the parent-death path; unreadable, malformed, non-root or
+unknown identities remain fail-closed. The bounded
+`runtime_supervisor.watchdog_error` enum records either
+`pidfd_signal_eperm_trusted_mediator_skipped` or
+`pidfd_signal_eperm_unclassified` without exposing PIDs or paths.
 
 Load/QA evidence is a fixed, privacy-bounded set: route classes/templates,
 numeric timings/counts/statuses and allowlisted error/backend/wait classes. It

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -15,13 +22,92 @@ from tools.platform_external_load import (
     analyze_concurrency_ramp,
     _ready_vote_action,
     _annotate_timing,
+    _ResultAccumulator,
     _request,
     load_manifest,
+    percentile,
     run_load,
+    run_phase,
+    run_rate_phase,
     spread_offsets,
     summarize_logical_results,
     summarize_results,
 )
+
+
+RSS_PROBE = Path(__file__).with_name("fixtures") / "external_load_rss_probe.py"
+RSS_DEADLINE_SECONDS = 15.0
+RSS_DEADLINES = {"live": RSS_DEADLINE_SECONDS, "accumulator": 30.0, "hostile": 0.5}
+LIVE_HWM_LIMIT_BYTES = 192 * 1024 * 1024
+ACCUMULATOR_HWM_LIMIT_BYTES = 24 * 1024 * 1024
+PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
+
+
+def _run_rss_probe(mode: str) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as directory:
+        stdout_path, stderr_path = Path(directory) / "out", Path(directory) / "err"
+        started = time.monotonic()
+        deadline_seconds = RSS_DEADLINES[mode]
+        deadline = started + deadline_seconds
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            process = subprocess.Popen(
+                [sys.executable, str(RSS_PROBE), mode],
+                cwd=Path(__file__).parents[1],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                close_fds=True,
+                start_new_session=True,
+                preexec_fn=(
+                    (lambda: signal.signal(signal.SIGTERM, signal.SIG_IGN) or os.write(1, b"hostile-ready\n"))
+                    if mode == "hostile" else None
+                ),
+            )
+            pgid = process.pid
+            cleanup_budget = min(0.5, deadline_seconds / 2)
+            def signal_group(sig: int) -> None:
+                try:
+                    if process.poll() is None:
+                        if os.getpgid(process.pid) != pgid:
+                            raise AssertionError("probe process-group identity changed")
+                        os.killpg(pgid, sig)
+                except ProcessLookupError:
+                    pass
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic() - cleanup_budget))
+            except subprocess.TimeoutExpired:
+                signal_group(signal.SIGTERM)
+                try:
+                    process.wait(timeout=max(0.0, min(0.25, cleanup_budget / 2, deadline - time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    signal_group(signal.SIGKILL)
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            finally:
+                signal_group(signal.SIGKILL)
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        elapsed = time.monotonic() - started
+        if elapsed > deadline_seconds:
+            raise AssertionError("RSS probe exceeded its absolute deadline")
+        if os.path.exists(f"/proc/{pgid}"):
+            raise AssertionError("RSS probe process was not reaped")
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("RSS probe process group survived cleanup")
+        if process.returncode != 0:
+            raise AssertionError(f"RSS probe failed (returncode={process.returncode}, stdout_bytes={min(stdout_path.stat().st_size, PROBE_OUTPUT_LIMIT_BYTES)}, stderr_bytes={min(stderr_path.stat().st_size, PROBE_OUTPUT_LIMIT_BYTES)})")
+        if stdout_path.stat().st_size > PROBE_OUTPUT_LIMIT_BYTES or stderr_path.stat().st_size > PROBE_OUTPUT_LIMIT_BYTES:
+            raise AssertionError("RSS probe output exceeded its cap")
+        if mode == "hostile" and b"hostile-ready\n" not in stdout_path.read_bytes():
+            raise AssertionError("RSS probe ready marker missing")
+        if stderr_path.read_bytes():
+            raise AssertionError("RSS probe emitted stderr")
+        report = json.loads(stdout_path.read_text(encoding="utf-8"))
+        if not isinstance(report, dict) or report.get("mode") != mode:
+            raise AssertionError("RSS probe report is invalid")
+        return report
 
 
 def manifest_payload() -> dict[str, object]:
@@ -62,6 +148,370 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_streaming_accumulator_preserves_high_cardinality_counts_and_percentiles(self) -> None:
+        accumulator = _ResultAccumulator()
+        latencies = [float((index * 37) % 1000) for index in range(4096)]
+        for index, elapsed_ms in enumerate(latencies):
+            accumulator.add(
+                RequestResult(
+                    phase="synthetic",
+                    method="GET",
+                    path="/health",
+                    status=200 if index % 17 else 503,
+                    elapsed_ms=elapsed_ms,
+                    ok=index % 17 != 0,
+                    response_bytes=index,
+                )
+            )
+
+        summary = accumulator.summary()
+
+        self.assertEqual(summary["requests"], 4096)
+        self.assertEqual(summary["errors"], 241)
+        self.assertEqual(summary["status_counts"], {"200": 3855, "503": 241})
+        self.assertEqual(
+            summary["latency"]["p95_ms"],
+            round(percentile(latencies, 95) or 0, 3),
+        )
+        self.assertEqual(summary["response_bytes"]["max_bytes"], 4095)
+
+    def test_sliding_phase_bounds_live_work_and_reduces_each_completion(self) -> None:
+        users = [
+            VirtualUser(f"user-{index:08d}", "qa-tournament", "s" * 64, "c" * 64)
+            for index in range(96)
+        ]
+        active = 0
+        peak_active = 0
+        completed = 0
+        last_result: RequestResult | None = None
+        lock = threading.Lock()
+
+        def builder(
+            _origin: str,
+            user: VirtualUser,
+            phase: str,
+            _timeout: float,
+        ) -> RequestResult:
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.001)
+            with lock:
+                active -= 1
+            return RequestResult(
+                phase=phase,
+                method="GET",
+                path=f"/users/{user.user_id}",
+                status=200,
+                elapsed_ms=1.0,
+                ok=True,
+                response_bytes=1,
+                response_json={"large": "x" * 4096},
+            )
+
+        def consume(result: RequestResult) -> None:
+            nonlocal completed, last_result
+            self.assertIsNotNone(result.response_json)
+            completed += 1
+            last_result = result
+
+        class TrackingExecutor(ThreadPoolExecutor):
+            last: "TrackingExecutor | None" = None
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.pending = set()
+                self.peak_pending = 0
+                self.submitted = 0
+                type(self).last = self
+
+            def submit(self, *args, **kwargs):
+                future = super().submit(*args, **kwargs)
+                self.submitted += 1
+                self.pending.add(future)
+                self.peak_pending = max(self.peak_pending, len(self.pending))
+
+                def discard(completed_future) -> None:
+                    self.pending.discard(completed_future)
+
+                future.add_done_callback(discard)
+                return future
+
+        before = {
+            thread.name
+            for thread in threading.enumerate()
+            if thread.name.startswith("external-load")
+        }
+        with patch(
+            "tools.platform_external_load.ThreadPoolExecutor", TrackingExecutor
+        ):
+            returned = run_phase(
+                "https://old-sparky.com",
+                users,
+                phase="synthetic",
+                spread_seconds=0,
+                concurrency=4,
+                timeout=1,
+                request_builder=builder,
+                result_consumer=consume,
+            )
+
+        self.assertEqual(returned, [])
+        self.assertEqual(completed, len(users))
+        self.assertLessEqual(peak_active, 4)
+        self.assertEqual(TrackingExecutor.last.submitted, len(users))
+        self.assertLessEqual(TrackingExecutor.last.peak_pending, 4)
+        self.assertEqual(TrackingExecutor.last.pending, set())
+        self.assertIsNotNone(last_result)
+        self.assertIsNone(last_result.response_json)
+        self.assertEqual(active, 0)
+        self.assertEqual(
+            {
+                thread.name
+                for thread in threading.enumerate()
+                if thread.name.startswith("external-load")
+            },
+            before,
+        )
+
+    def test_sliding_phase_cancels_pending_work_on_deadline_signal(self) -> None:
+        users = [
+            VirtualUser(f"user-{index:08d}", "qa-tournament", "s" * 64, "c" * 64)
+            for index in range(8)
+        ]
+        started = threading.Event()
+
+        class DeadlineBudget:
+            def check(self, _phase: str, *, operation: str) -> None:
+                if operation == "future_complete":
+                    raise RuntimeError("synthetic deadline")
+
+            def remaining_seconds(self) -> float:
+                return 1.0
+
+            def remaining_runner_seconds(self) -> float:
+                return 1.0
+
+            def sleep(self, delay: float, _phase: str, *, operation: str) -> None:
+                time.sleep(delay)
+
+        def builder(
+            _origin: str,
+            _user: VirtualUser,
+            phase: str,
+            _timeout: float,
+        ) -> RequestResult:
+            started.set()
+            time.sleep(0.01)
+            return RequestResult(
+                phase=phase,
+                method="GET",
+                path="/health",
+                status=200,
+                elapsed_ms=1.0,
+                ok=True,
+                response_bytes=1,
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic deadline"):
+            run_phase(
+                "https://old-sparky.com",
+                users,
+                phase="synthetic-deadline",
+                spread_seconds=0,
+                concurrency=2,
+                timeout=1,
+                request_builder=builder,
+                budget=DeadlineBudget(),
+            )
+        self.assertTrue(started.is_set())
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and any(
+            thread.name.startswith("external-load")
+            for thread in threading.enumerate()
+        ):
+            time.sleep(0.005)
+        self.assertFalse(
+            any(
+                thread.name.startswith("external-load")
+                for thread in threading.enumerate()
+            )
+        )
+
+    def test_no_consumer_phase_compatibility_keeps_exact_results_and_threads(self) -> None:
+        users = [VirtualUser(f"compat-{index}", "synthetic", "s", "c") for index in range(8)]
+        baseline = {thread.name for thread in threading.enumerate() if thread.name.startswith("external-load")}
+        for name, runner, option in (("run_phase", run_phase, {"spread_seconds": 0}), ("run_rate_phase", run_rate_phase, {"duration_seconds": 0})):
+            returned = runner("http://synthetic.invalid", users, phase=name, concurrency=2, timeout=1, request_builder=lambda _origin, user, phase, _timeout: RequestResult(phase=phase, method="GET", path="/synthetic/compat", status=200, elapsed_ms=1, ok=True, response_bytes=1, response_json=user.user_id), **option)
+            self.assertEqual(sorted(result.response_json for result in (returned[0] if name == "run_rate_phase" else returned)), [f"compat-{index}" for index in range(8)])
+            self.assertEqual({thread.name for thread in threading.enumerate() if thread.name.startswith("external-load")}, baseline)
+
+    def test_rss_supervisor_reaps_hostile_child_with_short_deadline(self) -> None:
+        with patch.object(os, "killpg", wraps=os.killpg) as killpg, self.assertRaisesRegex(AssertionError, "RSS probe failed"):
+            _run_rss_probe("hostile")
+        self.assertEqual([call.args[1] for call in killpg.call_args_list[:2]], [signal.SIGTERM, signal.SIGKILL])
+
+    def test_real_rss_probe_bounds_live_phases_and_accumulators(self) -> None:
+        parent_fd_count = len(os.listdir("/proc/self/fd"))
+        live = _run_rss_probe("live")
+        accumulator = _run_rss_probe("accumulator")
+        self.assertLessEqual(len(os.listdir("/proc/self/fd")), parent_fd_count)
+
+        self.assertEqual(live["requests"], 4096)
+        self.assertEqual(live["concurrency"], 512)
+        self.assertEqual(live["payload_bytes"], 64 * 1024)
+        self.assertEqual(live["baseline_external_thread_ids"], [])
+        self.assertEqual(live["after_external_thread_ids"], [])
+        self.assertEqual(live["baseline_thread_ids"], live["after_thread_ids"])
+        self.assertEqual(live["direct_children_before"], [])
+        self.assertEqual(live["direct_children_after"], [])
+        for phase in live["runs"]:
+            self.assertEqual(phase["submitted"], 4096)
+            self.assertEqual(phase["completed"], 4096)
+            self.assertLessEqual(phase["peak_pending"], 512)
+            self.assertLessEqual(phase["peak_live_payloads"], 512)
+            self.assertEqual(phase["pending_after"], 0)
+            self.assertEqual(phase["live_payloads_after"], 0)
+            self.assertTrue(phase["ready"])
+            self.assertEqual(phase["returned_results"], 0)
+
+        self.assertEqual(accumulator["accumulators"], 4)
+        self.assertEqual(accumulator["requests_per_accumulator"], 16384)
+        self.assertEqual(accumulator["completed"], 4 * 16384)
+        self.assertEqual(accumulator["unique_cf_rays"], 4 * 16384)
+        self.assertTrue(accumulator["timing_complete"])
+        self.assertEqual(accumulator["after_external_thread_ids"], [])
+        self.assertEqual(accumulator["baseline_thread_ids"], accumulator["after_thread_ids"])
+        self.assertEqual(accumulator["direct_children_before"], [])
+        self.assertEqual(accumulator["direct_children_after"], [])
+        fields = ("dns_ms", "tcp_connect_ms", "tls_handshake_ms", "request_write_ms", "edge_wait_ms", "ttfb_ms", "body_receive_ms", "total_ms")
+        self.assertEqual(accumulator["transport_field_counts"], {field: 4 * 16384 for field in fields})
+        for report, limit in ((live, LIVE_HWM_LIMIT_BYTES), (accumulator, ACCUMULATOR_HWM_LIMIT_BYTES)):
+            before, after = report["baseline"], report["after"]
+            for sample in (before, after):
+                self.assertGreaterEqual(sample["VmHWM"], sample["VmRSS"])
+            self.assertEqual(report["rss_delta_bytes"], after["VmRSS"] - before["VmRSS"])
+            self.assertEqual(report["hwm_delta_bytes"], max(after[key] - before[key] for key in ("VmHWM", "ru_maxrss")))
+            self.assertLess(report["hwm_delta_bytes"], limit)
+            self.assertLessEqual(report["after_fd_count"], report["baseline_fd_count"])
+
+    def test_request_projects_only_route_correctness_fields(self) -> None:
+        class FakeResponse:
+            headers = {"etag": '"etag-1"'}
+
+            def __init__(self, body: bytes, status: int = 200) -> None:
+                self.body = body
+                self.status = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, size: int) -> bytes:
+                chunk, self.body = self.body[:size], self.body[size:]
+                return chunk
+
+        user = VirtualUser("user-00000001", "qa-tournament", "s" * 64, "c" * 64)
+        def request_with(
+            body: bytes,
+            *,
+            method: str,
+            path: str,
+            status: int = 200,
+        ) -> RequestResult:
+            with patch(
+                "tools.platform_external_load.urlopen",
+                return_value=FakeResponse(body, status),
+            ):
+                return _request(
+                    "https://old-sparky.com",
+                    user,
+                    method=method,
+                    path=path,
+                    phase="synthetic",
+                    timeout=1.0,
+                    session_cookie_name="session",
+                    csrf_cookie_name="csrf",
+                )
+
+        read = request_with(
+            json.dumps({"secret": "must-not-survive", "changed": True}).encode(),
+            method="GET",
+            path="/tournaments/qa-tournament/workspace",
+        )
+        self.assertIsNone(read.response_json)
+        self.assertEqual(read.response_etag, '"etag-1"')
+        read_overload = request_with(
+            json.dumps(
+                {
+                    "code": "AUTHENTICATED_READ_OVERLOADED",
+                    "detail": "must-not-survive",
+                }
+            ).encode(),
+            method="GET",
+            path="/tournaments/qa-tournament/workspace",
+            status=503,
+        )
+        self.assertEqual(
+            read_overload.response_json,
+            {"code": "AUTHENTICATED_READ_OVERLOADED"},
+        )
+        unrelated = request_with(
+            json.dumps(
+                {"code": "OTHER_503", "detail": "must-not-survive"}
+            ).encode(),
+            method="GET",
+            path="/tournaments/qa-tournament/workspace",
+            status=503,
+        )
+        self.assertIsNone(unrelated.response_json)
+        overload_summary = summarize_results([read_overload])
+        self.assertEqual(overload_summary["temporary_overload_responses"], 1)
+        self.assertEqual(overload_summary["unexpected_statuses"], 0)
+        unrelated_summary = summarize_results([unrelated])
+        self.assertEqual(unrelated_summary["temporary_overload_responses"], 0)
+        self.assertEqual(unrelated_summary["unexpected_statuses"], 1)
+        vote = request_with(
+            json.dumps(
+                {
+                    "code": "READY_VOTE_OVERLOADED",
+                    "retryable": True,
+                    "retry_after_ms": 250,
+                    "changed": True,
+                    "secret": "must-not-survive",
+                }
+            ).encode(),
+            method="POST",
+            path="/tournaments/qa-tournament/deadlock/ready-check/vote",
+        )
+        self.assertEqual(
+            vote.response_json,
+            {
+                "code": "READY_VOTE_OVERLOADED",
+                "retryable": True,
+                "retry_after_ms": 250,
+                "changed": True,
+            },
+        )
+        self.assertNotIn("secret", json.dumps(vote.response_json))
+        huge_retry = request_with(
+            json.dumps(
+                {
+                    "code": "READY_VOTE_OVERLOADED",
+                    "retry_after_ms": 10**4000,
+                }
+            ).encode(),
+            method="POST",
+            path="/tournaments/qa-tournament/deadlock/ready-check/vote",
+        )
+        self.assertEqual(
+            huge_retry.response_json,
+            {"code": "READY_VOTE_OVERLOADED"},
+        )
+
     def test_read_mix_uses_the_current_tournament_page_request(self) -> None:
         route = _route_for_read(0, "qa-tournament")
 
@@ -311,7 +761,7 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertIsNotNone(result.exception_at_utc)
         self.assertIsNotNone(result.finished_at_utc)
 
-    def test_diagnostic_summary_keeps_every_failed_request_not_only_error_sample_cap(self) -> None:
+    def test_diagnostic_summary_caps_rows_and_reports_totals(self) -> None:
         results = [
             RequestResult(
                 phase="diagnostic",
@@ -330,7 +780,9 @@ class ExternalLoadTests(unittest.TestCase):
         summary = summarize_results(results)
 
         self.assertEqual(len(summary["error_samples"]), 25)
-        self.assertEqual(len(summary["timeout_diagnostics"]), 26)
+        self.assertEqual(len(summary["timeout_diagnostics"]), 25)
+        self.assertEqual(summary["timeout_diagnostic_total"], 26)
+        self.assertEqual(summary["timeout_diagnostic_truncated"], 1)
 
     def test_ready_vote_retries_only_explicit_overload_and_reports_logical_latency(self) -> None:
         _, users = load_manifest_from_payload(manifest_payload())

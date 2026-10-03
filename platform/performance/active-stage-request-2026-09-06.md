@@ -13,7 +13,8 @@ conclusion belongs in `platform/docs/CURRENT.md`.
 
 ## Context and baseline
 
-Полная production-нагрузочная матрица из 13 dispatchable-профилей завершена:
+На момент подготовки этого work order полная production-нагрузочная матрица из
+13 профилей, которые тогда были dispatchable, была завершена:
 
 - 10 PASS
 - 3 FAIL
