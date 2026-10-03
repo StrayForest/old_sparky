@@ -2453,11 +2453,20 @@ cleanup
             handoff_dir.chmod(0o700)
             handoff_path = handoff_dir / "handoff.json"
 
+            unprivileged_setup = (
+                "if os.geteuid() == 0:\n"
+                "    import pwd\n"
+                "    user = pwd.getpwnam('nobody')\n"
+                "    os.setgroups([])\n"
+                "    os.setgid(user.pw_gid)\n"
+                "    os.setuid(user.pw_uid)\n"
+            )
             writer = (
-                "import sys; "
-                f"sys.path.insert(0, {str(REPO_ROOT / 'platform')!r}); "
-                "from tools.platform_workflow_input_guard import main; "
-                "raise SystemExit(main(['host-tools', '--output', sys.argv[1], "
+                "import os\nimport sys\n"
+                f"sys.path.insert(0, {str(REPO_ROOT / 'platform')!r})\n"
+                "from tools.platform_workflow_input_guard import main\n"
+                + unprivileged_setup
+                + "raise SystemExit(main(['host-tools', '--output', sys.argv[1], "
                 "'--target-sha', 'a' * 40, '--host-tools-sha', 'b' * 40, "
                 "'--artifact-id', '123456', '--artifact-name', "
                 "'platform-host-tools-bundle-123456-2', '--artifact-size', '4096', "
@@ -2474,7 +2483,6 @@ cleanup
                 ["/usr/bin/python3", "-c", writer, str(handoff_path)],
                 capture_output=True,
                 text=True,
-                preexec_fn=drop_privileges,
                 check=False,
             )
             self.assertEqual(write_result.returncode, 0, write_result.stderr)
@@ -2487,15 +2495,15 @@ cleanup
                 [
                     "/usr/bin/python3",
                     "-c",
-                    "import sys; "
-                    f"sys.path.insert(0, {str(REPO_ROOT / 'platform')!r}); "
-                    "from tools.platform_workflow_input_guard import main; "
-                    "raise SystemExit(main(['host-tools', '--input', sys.argv[1]]))",
+                    "import os\nimport sys\n"
+                    f"sys.path.insert(0, {str(REPO_ROOT / 'platform')!r})\n"
+                    "from tools.platform_workflow_input_guard import main\n"
+                    + unprivileged_setup
+                    + "raise SystemExit(main(['host-tools', '--input', sys.argv[1]]))",
                     str(handoff_path),
                 ],
                 capture_output=True,
                 text=True,
-                preexec_fn=drop_privileges,
                 check=False,
             )
             self.assertEqual(roundtrip.returncode, 0, roundtrip.stderr)
