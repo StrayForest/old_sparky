@@ -2598,15 +2598,14 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake_python.chmod(0o755)
+        candidate_tools = candidate / "tools"
+        shutil.copytree(self.tools_dir, candidate_tools)
         script = ALEMBIC_SCRIPT.read_text(encoding="utf-8")
-        tools_needle = 'TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
-        self.assertIn(tools_needle, script)
-        script = script.replace(tools_needle, f'TOOLS_DIR="{self.tools_dir}"', 1)
         preflight_tool = '"$TOOLS_DIR/platform_release_preflight.sh"'
         self.assertIn(preflight_tool, script)
         script = script.replace(preflight_tool, "/usr/bin/true", 1)
         script = script.replace("/usr/bin/systemctl", str(systemctl))
-        migration = self.root / "first-install-run-alembic.sh"
+        migration = candidate_tools / "platform_run_alembic.sh"
         migration.write_text(script, encoding="utf-8")
         migration.chmod(0o755)
 

@@ -9,6 +9,7 @@ ALLOW_NO_PREVIOUS=0
 ALLOW_INITIAL_INSTALL=0
 REQUIRE_VERIFIED_BACKUP=0
 REQUIRE_EDGE_PARITY=0
+DEFER_ACTIVE_ALEMBIC_REVISION_CHECK=0
 BACKUP_MAX_AGE_HOURS="24"
 EXPECTED_NODE_VERSION="26.3.1"
 DB_TIMEOUT_BIN="/usr/bin/timeout"
@@ -45,6 +46,10 @@ while [[ $# -gt 0 ]]; do
       REQUIRE_EDGE_PARITY=1
       shift
       ;;
+    --defer-active-alembic-revision-check)
+      DEFER_ACTIVE_ALEMBIC_REVISION_CHECK=1
+      shift
+      ;;
     --backup-max-age-hours)
       if [[ $# -lt 2 ]]; then
         echo "--backup-max-age-hours requires a number." >&2
@@ -58,6 +63,7 @@ while [[ $# -gt 0 ]]; do
 Usage: platform_release_preflight.sh [--app-dir <path>] [--require-previous]
        [--allow-no-previous] [--allow-initial-install]
        [--require-verified-backup] [--require-edge-parity]
+       [--defer-active-alembic-revision-check]
        [--backup-max-age-hours <hours>]
 
 Validates the live platform release layout before or after a deploy.
@@ -382,22 +388,24 @@ pass
 # Do not route read-only Alembic introspection through the active release's
 # shell wrapper: during the transition deployment that wrapper may predate the
 # safe dotenv parser. The canonical env is already parsed and exported above.
-ALEMBIC_CURRENT="$(
-  cd "$CURRENT_TARGET" && \
-  PYTHONPATH="$CURRENT_TARGET" \
-  "$DB_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${DB_OPERATION_TIMEOUT_SECONDS}s" \
-  "$PYTHON_BIN" -B -m alembic current 2>/dev/null | tail -n 1 | awk '{print $1}'
-)"
-ALEMBIC_HEAD="$(
-  cd "$CURRENT_TARGET" && \
-  PYTHONPATH="$CURRENT_TARGET" \
-  "$DB_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${DB_OPERATION_TIMEOUT_SECONDS}s" \
-  "$PYTHON_BIN" -B -m alembic heads 2>/dev/null | tail -n 1 | awk '{print $1}'
-)"
+if [[ "$DEFER_ACTIVE_ALEMBIC_REVISION_CHECK" -eq 0 ]]; then
+  ALEMBIC_CURRENT="$(
+    cd "$CURRENT_TARGET" && \
+    PYTHONPATH="$CURRENT_TARGET" \
+    "$DB_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${DB_OPERATION_TIMEOUT_SECONDS}s" \
+    "$PYTHON_BIN" -B -m alembic current 2>/dev/null | tail -n 1 | awk '{print $1}'
+  )"
+  ALEMBIC_HEAD="$(
+    cd "$CURRENT_TARGET" && \
+    PYTHONPATH="$CURRENT_TARGET" \
+    "$DB_TIMEOUT_BIN" --signal=TERM --kill-after=5s "${DB_OPERATION_TIMEOUT_SECONDS}s" \
+    "$PYTHON_BIN" -B -m alembic heads 2>/dev/null | tail -n 1 | awk '{print $1}'
+  )"
 
-[[ -n "$ALEMBIC_CURRENT" ]] || fail "Could not resolve current Alembic revision."
-[[ -n "$ALEMBIC_HEAD" ]] || fail "Could not resolve Alembic head revision."
-[[ "$ALEMBIC_CURRENT" == "$ALEMBIC_HEAD" ]] || fail "Alembic current ($ALEMBIC_CURRENT) does not match head ($ALEMBIC_HEAD)."
+  [[ -n "$ALEMBIC_CURRENT" ]] || fail "Could not resolve current Alembic revision."
+  [[ -n "$ALEMBIC_HEAD" ]] || fail "Could not resolve Alembic head revision."
+  [[ "$ALEMBIC_CURRENT" == "$ALEMBIC_HEAD" ]] || fail "Alembic current ($ALEMBIC_CURRENT) does not match head ($ALEMBIC_HEAD)."
+fi
 pass
 
 if [[ "$REQUIRE_VERIFIED_BACKUP" -eq 1 ]]; then

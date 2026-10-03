@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import ast
 import io
@@ -30,6 +31,7 @@ from tools import platform_nginx_error_summary  # noqa: E402
 from tools import platform_media_migration_diagnostics_summary  # noqa: E402
 from tools import platform_web_runtime_diagnostics_summary  # noqa: E402
 from tools import platform_install_nginx  # noqa: E402
+from tools import platform_release_migration_guard  # noqa: E402
 
 
 class SafeEnvironmentTests(unittest.TestCase):
@@ -1931,6 +1933,313 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
             self.assertNotIn('. "$PLATFORM_ENV_FILE"', workflow, name)
             self.assertIn("platform_load_env_file", workflow, name)
+
+
+class ForwardMigrationRevisionStateTests(unittest.TestCase):
+    """Exercise the pure graph validator without Alembic or a database."""
+
+    @staticmethod
+    def migration_graph() -> dict[str, tuple[str, ...]]:
+        return {
+            "0052": (),
+            "0053": ("0052",),
+        }
+
+    def validate(
+        self,
+        current_revisions: tuple[str, ...],
+        revision_parents: dict[str, tuple[str, ...]] | None = None,
+        *,
+        allow_empty: bool = False,
+    ) -> dict[str, object]:
+        return platform_release_migration_guard.validate_forward_revision_state(
+            current_revisions,
+            self.migration_graph() if revision_parents is None else revision_parents,
+            allow_empty=allow_empty,
+        )
+
+    def test_accepts_current_revision_at_old_or_candidate_head(self) -> None:
+        expected = {
+            ("0052",): ("0052", "0053"),
+            ("0053",): ("0053", "0053"),
+        }
+        for current, (current_revision, head_revision) in expected.items():
+            with self.subTest(current=current):
+                state = self.validate(current)
+                self.assertEqual(state["current_revision"], current_revision)
+                self.assertEqual(state["head_revision"], head_revision)
+                self.assertIs(state["allow_empty"], False)
+
+    def test_empty_database_state_requires_explicit_allowance(self) -> None:
+        with self.assertRaises(ValueError):
+            self.validate(())
+
+        state = self.validate((), allow_empty=True)
+        self.assertEqual(state["current_revision"], None)
+        self.assertEqual(state["head_revision"], "0053")
+        self.assertIs(state["allow_empty"], True)
+
+    def test_rejects_unknown_revision_and_multiple_database_rows(self) -> None:
+        for revisions in (("9999",), ("0052", "0053")):
+            with self.subTest(revisions=revisions):
+                with self.assertRaises(ValueError):
+                    self.validate(revisions)
+
+    def test_rejects_graph_with_multiple_heads(self) -> None:
+        graph = {
+            "0052": (),
+            "0053": ("0052",),
+            "0099": (),
+        }
+        with self.assertRaises(ValueError):
+            self.validate(("0052",), graph)
+
+    def test_rejects_known_current_revision_on_divergent_branch(self) -> None:
+        graph = {
+            "0052": (),
+            "0053": ("0052",),
+            "0098": (),
+        }
+        with self.assertRaises(ValueError):
+            self.validate(("0098",), graph)
+
+    def test_rejects_malformed_or_cyclic_revision_graphs(self) -> None:
+        malformed = {
+            "0052": (),
+            "0053": ("missing-parent",),
+        }
+        cyclic = {
+            "0052": ("0053",),
+            "0053": ("0052",),
+        }
+        for graph in (malformed, cyclic):
+            with self.subTest(graph=graph):
+                with self.assertRaises(ValueError):
+                    self.validate(("0052",), graph)
+
+        malformed_metadata = (
+            {"": ()},
+            {"0052": ("0052", "0052")},
+        )
+        for graph in malformed_metadata:
+            with self.subTest(graph=graph):
+                with self.assertRaises(ValueError):
+                    self.validate(("0052",), graph)
+
+    def test_graph_validator_has_no_database_or_filesystem_io(self) -> None:
+        source = (TOOLS_DIR / "platform_release_migration_guard.py").read_text(
+            encoding="utf-8"
+        )
+        module = ast.parse(source)
+        validator = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "validate_forward_revision_state"
+        )
+        forbidden_imports = {"alembic", "asyncpg", "psycopg", "sqlalchemy"}
+        forbidden_calls = {
+            "connect",
+            "cursor",
+            "execute",
+            "open",
+            "read_text",
+            "run",
+            "write_text",
+        }
+        for node in ast.walk(validator):
+            if isinstance(node, ast.Import):
+                self.assertFalse(
+                    any(alias.name.split(".", 1)[0] in forbidden_imports for alias in node.names)
+                )
+            elif isinstance(node, ast.ImportFrom):
+                self.assertNotIn((node.module or "").split(".", 1)[0], forbidden_imports)
+            elif isinstance(node, ast.Call):
+                function = node.func
+                called_name = function.id if isinstance(function, ast.Name) else (
+                    function.attr if isinstance(function, ast.Attribute) else ""
+                )
+                self.assertNotIn(called_name, forbidden_calls)
+
+
+class CandidateMigrationDatabaseGuardTests(unittest.TestCase):
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Connection:
+        def __init__(self, identity, registries, revisions=()):
+            self.identity = identity
+            self.registries = registries
+            self.revisions = revisions
+            self.queries: list[str] = []
+            self.transaction_readonly: list[bool] = []
+            self.closed = False
+
+        def transaction(self, *, readonly=False):
+            self.transaction_readonly.append(readonly)
+            return CandidateMigrationDatabaseGuardTests.Transaction()
+
+        async def fetchrow(self, query):
+            self.queries.append(query)
+            return self.identity
+
+        async def fetch(self, query):
+            self.queries.append(query)
+            if "pg_catalog.pg_class" in query:
+                return self.registries
+            if "version_num" in query:
+                return self.revisions
+            raise AssertionError("migration guard issued an unexpected query")
+
+        async def close(self):
+            self.closed = True
+
+    @staticmethod
+    def identity(*, database="platformdb", schema="public", oid=17):
+        return {
+            "database_name": database,
+            "schema_name": schema,
+            "resolved_oid": oid,
+        }
+
+    @staticmethod
+    def registry(*, schema="public", oid=17, kind="r"):
+        return {"schema_name": schema, "oid": oid, "relkind": kind}
+
+    def read_revisions(self, connection, *, database_url=None, allow_empty=False):
+        import asyncpg
+
+        database_url = database_url or (
+            "postgresql+asyncpg://test:ignored@127.0.0.1:5432/platformdb"
+        )
+        with mock.patch.dict(
+            os.environ, {"PLATFORM_DATABASE_URL": database_url}, clear=False
+        ), mock.patch.object(
+            asyncpg, "connect", new=mock.AsyncMock(return_value=connection)
+        ) as connect:
+            revisions = asyncio.run(
+                platform_release_migration_guard._read_current_revisions(
+                    allow_empty=allow_empty
+                )
+            )
+        return revisions, connect
+
+    def test_revision_query_is_read_only_and_bound_to_platformdb_registry(self) -> None:
+        connection = self.Connection(
+            self.identity(),
+            [self.registry()],
+            [{"version_num": "20260913_0053"}],
+        )
+        revisions, connect = self.read_revisions(connection)
+        self.assertEqual(revisions, ("20260913_0053",))
+        self.assertEqual(connection.transaction_readonly, [True])
+        self.assertTrue(connection.closed)
+        self.assertEqual(len(connection.queries), 3)
+        self.assertIn("to_regclass('alembic_version')", connection.queries[0])
+        self.assertIn("c.relkind::text AS relkind", connection.queries[1])
+        self.assertIn('"public".alembic_version', connection.queries[2])
+        connect.assert_awaited_once()
+        self.assertEqual(connect.await_args.kwargs["timeout"], 10)
+        self.assertEqual(
+            connect.await_args.kwargs["server_settings"][
+                "default_transaction_read_only"
+            ],
+            "on",
+        )
+
+    def test_wrong_url_or_connected_database_fails_before_revision_query(self) -> None:
+        connection = self.Connection(
+            self.identity(database="otherdb"), [self.registry()], [{"version_num": "0053"}]
+        )
+        with self.assertRaises(ValueError):
+            self.read_revisions(connection)
+        self.assertEqual(len(connection.queries), 1)
+        self.assertTrue(connection.closed)
+
+        unused = self.Connection(self.identity(), [self.registry()], [])
+        with self.assertRaises(ValueError):
+            self.read_revisions(
+                unused,
+                database_url=(
+                    "postgresql+asyncpg://test:ignored@127.0.0.1:5432/otherdb"
+                ),
+            )
+        self.assertEqual(unused.queries, [])
+        self.assertFalse(unused.closed)
+
+    def test_registry_must_resolve_uniquely_inside_allowed_schema(self) -> None:
+        cases = (
+            (self.identity(schema="tenant"), [self.registry()]),
+            (
+                self.identity(),
+                [self.registry(), self.registry(schema="platform", oid=18)],
+            ),
+            (self.identity(oid=99), [self.registry()]),
+            (self.identity(), [self.registry(kind="v")]),
+            (self.identity(), [self.registry(schema="tenant")]),
+        )
+        for identity, registries in cases:
+            with self.subTest(identity=identity, registries=registries):
+                connection = self.Connection(
+                    identity, registries, [{"version_num": "0053"}]
+                )
+                with self.assertRaises(ValueError):
+                    self.read_revisions(connection)
+                self.assertNotIn("version_num", " ".join(connection.queries))
+
+    def test_missing_registry_is_empty_only_for_initial_install(self) -> None:
+        connection = self.Connection(self.identity(oid=None), [])
+        with self.assertRaises(ValueError):
+            self.read_revisions(connection)
+        self.assertNotIn("version_num", " ".join(connection.queries))
+
+        initial = self.Connection(self.identity(oid=None), [])
+        revisions, _connect = self.read_revisions(initial, allow_empty=True)
+        self.assertEqual(revisions, ())
+        self.assertEqual(len(initial.queries), 2)
+        self.assertTrue(initial.closed)
+
+    def test_candidate_script_directory_extracts_authenticated_graph_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary)
+            versions = candidate / "alembic" / "versions"
+            versions.mkdir(parents=True)
+            (candidate / "alembic.ini").write_text(
+                "[alembic]\nscript_location = %(here)s/alembic\n",
+                encoding="utf-8",
+            )
+            (versions / "0052_base.py").write_text(
+                "revision = '0052'\n"
+                "down_revision = None\n"
+                "branch_labels = None\n"
+                "depends_on = None\n"
+                "def upgrade(): pass\n"
+                "def downgrade(): pass\n",
+                encoding="utf-8",
+            )
+            (versions / "0053_retry.py").write_text(
+                "revision = '0053'\n"
+                "down_revision = '0052'\n"
+                "branch_labels = None\n"
+                "depends_on = None\n"
+                "def upgrade(): pass\n"
+                "def downgrade(): pass\n",
+                encoding="utf-8",
+            )
+
+            graph = platform_release_migration_guard._candidate_revision_parents(
+                candidate
+            )
+
+        self.assertEqual(graph, {"0053": ("0052",), "0052": ()})
+        state = platform_release_migration_guard.validate_forward_revision_state(
+            ("0052",), graph
+        )
+        self.assertEqual(state["head_revision"], "0053")
 
 
 if __name__ == "__main__":

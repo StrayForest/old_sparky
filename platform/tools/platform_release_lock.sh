@@ -16,9 +16,9 @@ PLATFORM_RELEASE_LOCK_PATH="$PLATFORM_RELEASE_LOCK_CANONICAL_PATH"
 PLATFORM_RETAINED_LOAD_LOCK_CANONICAL_PATH="/run/lock/oldsparky-retained-load-matrix.lock"
 PLATFORM_RETAINED_LOAD_LOCK_PATH="$PLATFORM_RETAINED_LOAD_LOCK_CANONICAL_PATH"
 
-# Keep lock acquisition failures distinct from the release body's exit status.
-# 73 is not used by any release entrypoint; callers translate it to their
-# public lock-contention status (3).
+# `flock -E` uses 73 when it cannot acquire the path lock. A callback can also
+# return 73, so a public `*_supervise` stage identifies only the boundary that
+# returned it; it does not prove that another process held the lock.
 PLATFORM_RELEASE_LOCK_CONFLICT_EXIT_CODE=73
 
 platform_release_lock_select_path() {

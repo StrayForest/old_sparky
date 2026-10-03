@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import redirect_stdout
 import fcntl
 import hashlib
 import importlib.util
@@ -16,6 +17,7 @@ import tempfile
 import stat
 import textwrap
 import unittest
+from unittest.mock import patch
 import zipfile
 
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
@@ -24,6 +26,7 @@ from tests.test_platform_validate_release_artifact import (
     RELEASE_SLUG,
     VALIDATOR_SCRIPT,
 )
+from tools import platform_workflow_remote_dispatch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1950,6 +1953,203 @@ fail 'private lock detail must not cross the public channel'
             self.assertNotEqual(cleaned.returncode, 0)
             self.assertFalse(artifact.exists())
             self.assertFalse(artifact.is_symlink())
+
+    def test_retained_lock_supervisor_preserves_callback_failure_marker(self) -> None:
+        """Nested flock callbacks preserve valid markers and fail closed."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            supervisor, release_lock, retained_lock, generation_dir = (
+                self._install_supervisor_fixture(fixture_root)
+            )
+
+            def cleanup_fixture() -> None:
+                for path in (release_lock, retained_lock):
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                if generation_dir.exists() or generation_dir.is_symlink():
+                    shutil.rmtree(generation_dir)
+
+            self.addCleanup(cleanup_fixture)
+            target_sha = "a" * 40
+            run_id = str(os.getpid())
+            artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            while artifact.exists() or artifact.is_symlink():
+                run_id = str(int(run_id) + 1)
+                artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            release_slug = f"gha-{run_id}-1-{target_sha[:12]}"
+            environment = {
+                **os.environ,
+                "PLATFORM_TEST_RUNTIME": str(fixture_root / "runtime"),
+            }
+            for variable in (
+                "PLATFORM_RELEASE_LOCK_FD",
+                "PLATFORM_RELEASE_LOCK_SUPERVISED",
+                "PLATFORM_RETAINED_LOAD_LOCK_FD",
+                "PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED",
+            ):
+                environment.pop(variable, None)
+
+            preflight_tool = generation_dir / "platform_release_preflight.sh"
+            preflight_tool.chmod(0o755)
+            preflight_tool.write_text("#!/bin/sh\nexit 17\n", encoding="utf-8")
+            preflight_tool.chmod(0o555)
+
+            def dispatch() -> tuple[int, str]:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    status = platform_workflow_remote_dispatch._run_bounded_child(
+                        [
+                            str(supervisor),
+                            target_sha,
+                            release_slug,
+                            "preflight",
+                            str(artifact),
+                            "baseline",
+                        ],
+                        timeout_seconds=20,
+                        expected_release_marker=("preflight", release_slug, target_sha),
+                    )
+                return status, output.getvalue()
+
+            expected_preflight_failure = (
+                "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+                "phase=preflight reason=preflight_failed "
+                f"release_slug={release_slug} source_sha={target_sha}\n"
+            )
+            with patch.dict(os.environ, environment, clear=True):
+                preflight_status, preflight_output = dispatch()
+            self.assertEqual(preflight_status, 1)
+            self.assertEqual(preflight_output, expected_preflight_failure)
+            self.assertNotIn("lock_stage=", preflight_output)
+
+            supervisor_source = supervisor.read_text(encoding="utf-8")
+            self.assertEqual(
+                supervisor_source.count(
+                    '|| fail "production preflight failed"'
+                ),
+                2,
+            )
+
+            original = supervisor.read_text(encoding="utf-8")
+
+            def inject_after_both_locks(body: str) -> None:
+                injected = original.replace(
+                    "trap cleanup EXIT\n", f"trap cleanup EXIT\n{body}\n", 1
+                )
+                self.assertNotEqual(injected, original)
+                supervisor.chmod(0o755)
+                supervisor.write_text(injected, encoding="utf-8")
+                supervisor.chmod(0o555)
+
+            # An unhandled callback exit has no trusted marker. The dispatcher
+            # must suppress all output and preserve the nonzero child status.
+            inject_after_both_locks("exit 7")
+            with patch.dict(os.environ, environment, clear=True):
+                missing_status, missing_output = dispatch()
+            self.assertEqual(missing_status, 7)
+            self.assertEqual(missing_output, "")
+
+            # flock's reserved 73 can also be a callback status. The accepted
+            # lock_stage identifies only the call boundary, not a proven holder.
+            inject_after_both_locks("exit 73")
+            with patch.dict(os.environ, environment, clear=True):
+                ambiguous_status, ambiguous_output = dispatch()
+            self.assertEqual(ambiguous_status, 1)
+            self.assertIn("reason=lock lock_stage=retained_supervise", ambiguous_output)
+            self.assertNotIn("held", ambiguous_output)
+
+    def test_candidate_revision_guard_follows_operational_preflight_and_quiesce(self) -> None:
+        preflight = (TOOLS_DIR / "platform_release_preflight.sh").read_text(
+            encoding="utf-8"
+        )
+        defer_block = preflight.index(
+            'if [[ "$DEFER_ACTIVE_ALEMBIC_REVISION_CHECK" -eq 0 ]]; then'
+        )
+        current_lookup = preflight.index('ALEMBIC_CURRENT="$(', defer_block)
+        self.assertLess(
+            preflight.index('DB_CHECK_OUTPUT="$('),
+            defer_block,
+            "operational DB readiness remains required before revision handling",
+        )
+        self.assertLess(defer_block, current_lookup)
+        self.assertIn(
+            '[[ "$ALEMBIC_CURRENT" == "$ALEMBIC_HEAD" ]] || fail',
+            preflight[current_lookup:],
+            "ordinary preflight must retain strict active-graph parity",
+        )
+
+        deploy = (TOOLS_DIR / "platform_release_deploy.sh").read_text(
+            encoding="utf-8"
+        )
+        first_deferred = deploy.index(
+            "run_release_preflight_quiet --defer-active-alembic-revision-check"
+        )
+        first_quiesce = deploy.index("quiesce_runtime_writers", first_deferred)
+        stage = deploy.index('"$INSTALL_TOOL" --stage-only', first_quiesce)
+        self.assertLess(first_deferred, first_quiesce)
+        self.assertLess(first_quiesce, stage)
+        second_deferred = deploy.index(
+            "release_preflight --defer-active-alembic-revision-check", stage
+        )
+        self.assertLess(stage, second_deferred)
+        post_activation_preflight = deploy.rfind("release_preflight")
+        self.assertGreater(post_activation_preflight, second_deferred)
+        self.assertNotIn(
+            "--defer-active-alembic-revision-check",
+            deploy[post_activation_preflight:],
+            "post-activation preflight must check the active candidate graph",
+        )
+
+        supervisor = (TOOLS_DIR / "platform_production_deploy_supervisor.sh").read_text(
+            encoding="utf-8"
+        )
+        mode_preflight_return = supervisor.index('if [[ "$deploy_mode" == "preflight" ]]')
+        mode_deploy_check = supervisor.index('[[ "$deploy_mode" == "deploy" ]] || fail')
+        first_host_preflight = supervisor.index('"$host_tools_dir/platform_release_preflight.sh"')
+        defer_mode_check = supervisor.index('if [[ "$deploy_mode" == "deploy" ]]; then')
+        second_host_preflight = supervisor.index(
+            '"$host_tools_dir/platform_release_preflight.sh"',
+            first_host_preflight + 1,
+        )
+        self.assertLess(defer_mode_check, first_host_preflight)
+        self.assertLess(first_host_preflight, mode_preflight_return)
+        self.assertLess(mode_preflight_return, mode_deploy_check)
+        self.assertLess(mode_deploy_check, second_host_preflight)
+        self.assertIn(
+            'active_revision_preflight_flag=(--defer-active-alembic-revision-check)',
+            supervisor,
+        )
+        self.assertIn(
+            '"${active_revision_preflight_flag[@]}"',
+            supervisor[ first_host_preflight : mode_preflight_return ],
+        )
+        self.assertIn(
+            "--defer-active-alembic-revision-check",
+            supervisor[second_host_preflight:],
+        )
+
+        alembic = (TOOLS_DIR / "platform_run_alembic.sh").read_text(
+            encoding="utf-8"
+        )
+        candidate_transaction_check = alembic.index(
+            'candidate_root="$(readlink -f -- "$PLATFORM_ROOT_DIR"'
+        )
+        deferred_preflight = alembic.index(
+            "--defer-active-alembic-revision-check"
+        )
+        stop = alembic.index(
+            "run_systemctl stop deadlock-api deadlock-worker deadlock-web"
+        )
+        guard = alembic.index("platform_release_migration_guard.py")
+        recovery = alembic.index('"$PLATFORM_PYTHON_BIN" "$recovery_tool"', guard)
+        migration = alembic.index('exec "$PLATFORM_PYTHON_BIN" -m alembic', recovery)
+        self.assertLess(deferred_preflight, stop)
+        self.assertLess(candidate_transaction_check, guard)
+        self.assertLess(stop, guard)
+        self.assertLess(guard, recovery)
+        self.assertLess(recovery, migration)
+        self.assertIn('migration_guard_args+=(--allow-empty-database)', alembic)
 
     def test_production_env_contract_matches_runtime_policy(self) -> None:
         example = (REPO_ROOT / "platform/.env.platform.example").read_text()
