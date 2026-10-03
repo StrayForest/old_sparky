@@ -295,7 +295,11 @@ jobs:
                   or value.get("event") != event
                   or value.get("head_branch") != branch
                   or value.get("head_sha") != target
-                  or value.get("path") is None
+                  or value.get("path") != {
+                      "security-run.json": ".github/workflows/platform-security.yml",
+                      "autodeploy-run.json": ".github/workflows/platform-production-autodeploy.yml",
+                      "deploy-run.json": ".github/workflows/platform-production-deploy.yml",
+                  }[name]
                   or not isinstance(value.get("repository"), dict)
                   or value["repository"].get("full_name") != "StrayForest/old_sparky"
               ):
@@ -319,16 +323,6 @@ jobs:
           security = run("security-run.json", security_workflow_id, security_id, security_attempt, event="push", branch="dev", conclusion="success")
           auto = run("autodeploy-run.json", auto_workflow_id, auto_id, auto_attempt, event="workflow_run", branch="dev", conclusion="success")
           parent = run("deploy-run.json", deploy_workflow_id, parent_id, parent_attempt, event="workflow_dispatch", branch="dev", conclusion="success", allow_in_progress=True)
-          if (
-              not isinstance(security.get("path"), str) or not security["path"].startswith(".github/workflows/platform-security.yml@")
-              or not isinstance(auto.get("path"), str) or not auto["path"].startswith(".github/workflows/platform-production-autodeploy.yml@")
-              or not isinstance(parent.get("path"), str) or not parent["path"].startswith(".github/workflows/platform-production-deploy.yml@")
-          ):
-              raise SystemExit("baseline proof run workflow path mismatch")
-          for value in (security, auto, parent):
-              path_ref = value["path"].rsplit("@", 1)[1]
-              if path_ref not in {"dev", "refs/heads/dev"}:
-                  raise SystemExit("baseline proof workflow path ref is not dev")
           expected_parent_title = f"Platform production deploy mode=baseline-reconcile target={target} source={security_id}.{security_attempt} auto={auto_id}.{auto_attempt}"
           if parent.get("name") != expected_parent_title or parent.get("display_title") != expected_parent_title:
               raise SystemExit("baseline proof parent mode marker mismatch")

@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import copy
+import ast
 from datetime import datetime, timezone
+import importlib
+import inspect
+import re
 import sys
+import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import yaml
 
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
@@ -34,6 +42,7 @@ from tools.platform_deploy_baseline import (  # noqa: E402
     classify_cumulative_baseline,
     validate_active_baseline,
     validate_baseline_runtime_proof,
+    wait_for_autodeploy_completion,
 )
 from tools.platform_ci_classifier import (  # noqa: E402
     classify,
@@ -56,6 +65,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             "id": run_id,
             "workflow_id": 77,
             "name": DEPLOY_WORKFLOW_NAME,
+            "path": DEPLOY_WORKFLOW_PATH,
             "run_attempt": attempt,
             "event": "workflow_dispatch",
             "head_branch": "dev",
@@ -127,7 +137,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             "id": run_id,
             "workflow_id": 77,
             "name": title,
-            "path": f"{SECURITY_WORKFLOW_PATH}@refs/heads/dev",
+            "path": SECURITY_WORKFLOW_PATH,
             "display_title": title,
             "run_attempt": attempt,
             "event": "workflow_dispatch",
@@ -339,6 +349,11 @@ class WorkflowProvenanceTests(unittest.TestCase):
         with self.assertRaises(ProvenanceError):
             self._validate_baseline_runtime_payload(candidate)
 
+        candidate = copy.deepcopy(baseline)
+        candidate[1]["path"] = f"{SECURITY_WORKFLOW_PATH}@refs/heads/dev"
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(candidate)
+
         title_mutations = (
             ("source_security_run_id", "s568.1"),
             ("autodeploy_run_id", "a679.1"),
@@ -451,6 +466,8 @@ class WorkflowProvenanceTests(unittest.TestCase):
             "id": run_id,
             "workflow_id": 88,
             "name": AUTODEPLOY_WORKFLOW_NAME,
+            "path": AUTODEPLOY_WORKFLOW_PATH,
+            "display_title": AUTODEPLOY_WORKFLOW_NAME,
             "run_attempt": attempt,
             "event": "workflow_run",
             "head_branch": "dev",
@@ -496,6 +513,139 @@ class WorkflowProvenanceTests(unittest.TestCase):
             "https://github.com/StrayForest/old_sparky/actions/runs/5678/attempts/3",
         )
 
+    def test_autodeploy_completion_wait_accepts_pending_then_exact_success(self) -> None:
+        _, completed, _ = self._autodeploy_payload()
+        pending = copy.deepcopy(completed)
+        pending["status"] = "in_progress"
+        pending["conclusion"] = None
+        snapshots = iter((pending, completed))
+        result = wait_for_autodeploy_completion(
+            lambda: next(snapshots),
+            expected_workflow_id=88,
+            expected_run_id=5678,
+            expected_attempt=3,
+            expected_target_sha=self.SHA,
+            timeout_seconds=1,
+            poll_interval_seconds=0.001,
+        )
+        self.assertIs(result, completed)
+
+    def test_autodeploy_completion_wait_rejects_wrong_path_and_terminal_failure(self) -> None:
+        _, completed, _ = self._autodeploy_payload()
+        for field, value in (
+            ("path", ".github/workflows/platform-production-autodeploy.yml@refs/heads/dev"),
+            ("head_sha", "b" * 40),
+            ("event", "push"),
+            ("run_attempt", 2),
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(completed)
+                candidate[field] = value
+                with self.assertRaises(ProvenanceError):
+                    wait_for_autodeploy_completion(
+                        lambda: candidate,
+                        expected_workflow_id=88,
+                        expected_run_id=5678,
+                        expected_attempt=3,
+                        expected_target_sha=self.SHA,
+                        timeout_seconds=0.01,
+                        poll_interval_seconds=0.001,
+                    )
+
+        failed = copy.deepcopy(completed)
+        failed["conclusion"] = "failure"
+        with self.assertRaises(ProvenanceError):
+            wait_for_autodeploy_completion(
+                lambda: failed,
+                expected_workflow_id=88,
+                expected_run_id=5678,
+                expected_attempt=3,
+                expected_target_sha=self.SHA,
+                timeout_seconds=0.01,
+                poll_interval_seconds=0.001,
+            )
+
+    def test_autodeploy_completion_wait_times_out_on_pending_attempt(self) -> None:
+        _, pending, _ = self._autodeploy_payload()
+        pending["status"] = "in_progress"
+        pending["conclusion"] = None
+        with patch(
+            "tools.platform_deploy_baseline.time.monotonic",
+            side_effect=(10.0, 11.0),
+        ):
+            with self.assertRaisesRegex(ProvenanceError, "timed out"):
+                wait_for_autodeploy_completion(
+                    lambda: pending,
+                    expected_workflow_id=88,
+                    expected_run_id=5678,
+                    expected_attempt=3,
+                    expected_target_sha=self.SHA,
+                    timeout_seconds=0.5,
+                    poll_interval_seconds=0.1,
+                )
+
+    def test_new_baseline_inline_imports_resolve_and_match_helper_signatures(self) -> None:
+        module_by_name = {
+            "tools.platform_deploy_baseline": importlib.import_module(
+                "tools.platform_deploy_baseline"
+            ),
+            "tools.platform_workflow_provenance": importlib.import_module(
+                "tools.platform_workflow_provenance"
+            ),
+        }
+        workflow_steps = (
+            (
+                WORKFLOW_DIR / "platform-production-deploy.yml",
+                "Authenticate automatic reconciliation caller",
+            ),
+            (
+                WORKFLOW_DIR / "platform-security.yml",
+                "Validate exact current target and correlated source runs",
+            ),
+        )
+        imports: dict[str, object] = {}
+        call_nodes: list[ast.Call] = []
+        for workflow_path, step_name in workflow_steps:
+            document = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+            steps = [
+                step
+                for job in document["jobs"].values()
+                for step in job.get("steps", [])
+                if isinstance(step, dict) and step.get("name") == step_name
+            ]
+            self.assertEqual(len(steps), 1, f"expected one step {step_name!r}")
+            script = steps[0].get("run")
+            self.assertIsInstance(script, str)
+            heredocs = re.findall(
+                r"<<['\"]PY['\"]\s*\n(.*?)^\s*PY\s*$",
+                script,
+                flags=re.MULTILINE | re.DOTALL,
+            )
+            self.assertTrue(heredocs, f"no Python heredoc in {step_name!r}")
+            trees = [ast.parse(textwrap.dedent(block)) for block in heredocs]
+            for tree in trees:
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom) and node.module in module_by_name:
+                        module = module_by_name[node.module]
+                        for alias in node.names:
+                            with self.subTest(step=step_name, symbol=alias.name):
+                                self.assertTrue(hasattr(module, alias.name))
+                            imports[alias.asname or alias.name] = getattr(module, alias.name)
+                    elif isinstance(node, ast.Call):
+                        call_nodes.append(node)
+
+        self.assertIn("wait_for_autodeploy_completion", imports)
+        for node in call_nodes:
+            if isinstance(node.func, ast.Name) and node.func.id in imports:
+                helper = imports[node.func.id]
+                if not callable(helper) or not inspect.isfunction(helper):
+                    continue
+                self.assertFalse(any(keyword.arg is None for keyword in node.keywords))
+                inspect.signature(helper).bind(
+                    *([object()] * len(node.args)),
+                    **{keyword.arg: object() for keyword in node.keywords},
+                )
+
     def test_autodeploy_dispatch_requires_exact_run_job_and_step_success(self) -> None:
         for field, value in (
             ("path", ".github/workflows/other.yml"),
@@ -520,6 +670,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             ("event", "workflow_dispatch"),
             ("head_branch", "feature/test"),
             ("head_sha", "b" * 40),
+            ("path", f"{AUTODEPLOY_WORKFLOW_PATH}@refs/heads/dev"),
             ("status", "in_progress"),
             ("conclusion", "failure"),
         ):

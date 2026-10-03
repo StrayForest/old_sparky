@@ -661,6 +661,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('context=platform-baseline-runtime', workflow)
         self.assertIn('baseline-runtime) status_context=platform-baseline-runtime', workflow)
         self.assertIn('status_context = "platform-baseline-runtime"', finalizer)
+        self.assertIn('expected_run_path = ".github/workflows/platform-security.yml"', finalizer)
+        self.assertNotIn('platform-security.yml@', finalizer)
         self.assertIn('run.get("name") != display_title', finalizer)
         self.assertIn('run.get("name") != "Platform security and build"', finalizer)
         self.assertIn('display_title == "Platform security and build"', finalizer)
@@ -1060,6 +1062,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                         "id": 1234,
                         "workflow_id": 77,
                         "name": SECURITY_WORKFLOW_NAME,
+                        "path": SECURITY_WORKFLOW_PATH,
                         "run_attempt": 2,
                         "event": "push",
                         "head_branch": "dev",
@@ -1189,6 +1192,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "id": 1234,
             "workflow_id": 77,
             "name": SECURITY_WORKFLOW_NAME,
+            "path": SECURITY_WORKFLOW_PATH,
             "run_attempt": 2,
             "event": "push",
             "head_branch": "dev",

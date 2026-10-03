@@ -196,10 +196,7 @@ require(
     and type(parent.get("id")) is int and str(parent["id"]) == parent_id
     and type(parent.get("run_attempt")) is int and str(parent["run_attempt"]) == parent_attempt
     and parent.get("workflow_id") == parent_workflow["id"]
-    and parent.get("path") in {
-        ".github/workflows/platform-production-deploy.yml@dev",
-        ".github/workflows/platform-production-deploy.yml@refs/heads/dev",
-    }
+    and parent.get("path") == ".github/workflows/platform-production-deploy.yml"
     and parent.get("name") == parent_title
     and parent.get("event") == "workflow_dispatch"
     and parent.get("head_branch") == "dev"
@@ -274,10 +271,7 @@ while time.monotonic() < deadline:
             type(row.get("id")) is int and str(row["id"]) == fields["proof_id"]
             and type(row.get("run_attempt")) is int and str(row["run_attempt"]) == fields["proof_attempt"]
             and row.get("workflow_id") == security_workflow["id"]
-            and row.get("path") in {
-                ".github/workflows/platform-security.yml@dev",
-                ".github/workflows/platform-security.yml@refs/heads/dev",
-            }
+            and row.get("path") == ".github/workflows/platform-security.yml"
             and row.get("name") == row.get("display_title")
             and row.get("event") == "workflow_dispatch"
             and row.get("head_branch") == "dev"
@@ -305,10 +299,7 @@ require(
     and child_run.get("id") == int(child_id)
     and child_run.get("run_attempt") == int(child_attempt)
     and child_run.get("workflow_id") == security_workflow["id"]
-    and child_run.get("path") in {
-        ".github/workflows/platform-security.yml@dev",
-        ".github/workflows/platform-security.yml@refs/heads/dev",
-    }
+    and child_run.get("path") == ".github/workflows/platform-security.yml"
     and child_run.get("event") == "workflow_dispatch"
     and child_run.get("head_branch") == "dev"
     and child_run.get("head_sha") == target

@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 import re
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -24,6 +25,8 @@ from tools.platform_ci_classifier import (
     validate_manifest,
 )
 from tools.platform_workflow_provenance import (
+    AUTODEPLOY_WORKFLOW_NAME,
+    AUTODEPLOY_WORKFLOW_PATH,
     DEPLOY_STATUS_CONTEXT,
     GITHUB_SERVER_URL,
     SHA_RE,
@@ -36,6 +39,7 @@ from tools.platform_workflow_provenance import (
     parse_run_id,
     validate_actions_bot_status,
     validate_deployment_marker,
+    validate_repository_identity,
     validate_workflow_run,
     _validate_job_rows,
 )
@@ -268,6 +272,89 @@ def _expected_run_identity(value: object, field: str) -> str:
     return str(value)
 
 
+def wait_for_autodeploy_completion(
+    fetch_attempt: Any,
+    *,
+    expected_workflow_id: int,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    timeout_seconds: float = 120,
+    poll_interval_seconds: float = 5,
+) -> Mapping[str, Any]:
+    """Wait boundedly for the exact auto-deploy attempt to finish successfully.
+
+    The production caller dispatches while its parent is still running, so the
+    corresponding ``workflow_run`` may briefly be queued or in progress. This
+    helper only tolerates those pending states; completion requires the
+    canonical API workflow path/name, exact target and attempt, repository,
+    event, branch, success conclusion, and canonical run URL.
+    """
+
+    if not callable(fetch_attempt):
+        raise ProvenanceError("auto-deploy attempt fetcher is invalid")
+    workflow_id = _expected_run_identity(expected_workflow_id, "auto-deploy workflow id")
+    run_id = _expected_run_identity(expected_run_id, "auto-deploy run id")
+    attempt = _expected_run_identity(expected_attempt, "auto-deploy run attempt")
+    if not isinstance(expected_target_sha, str) or SHA_RE.fullmatch(expected_target_sha) is None:
+        raise ProvenanceError("auto-deploy target SHA is invalid")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or timeout_seconds <= 0
+        or isinstance(poll_interval_seconds, bool)
+        or not isinstance(poll_interval_seconds, (int, float))
+        or poll_interval_seconds <= 0
+        or timeout_seconds > 600
+        or poll_interval_seconds > timeout_seconds
+    ):
+        raise ProvenanceError("auto-deploy completion wait bounds are invalid")
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        run = fetch_attempt()
+        if not isinstance(run, Mapping):
+            raise ProvenanceError("auto-deploy attempt response is malformed")
+        if (
+            _expected_run_identity(run.get("id"), "auto-deploy run id") != run_id
+            or _expected_run_identity(run.get("run_attempt"), "auto-deploy run attempt") != attempt
+            or _expected_run_identity(run.get("workflow_id"), "auto-deploy workflow id") != workflow_id
+            or run.get("path") != AUTODEPLOY_WORKFLOW_PATH
+            or run.get("name") != AUTODEPLOY_WORKFLOW_NAME
+            or run.get("event") != "workflow_run"
+            or run.get("head_branch") != "dev"
+            or run.get("head_sha") != expected_target_sha
+        ):
+            raise ProvenanceError("auto-deploy attempt identity is not canonical")
+        validate_repository_identity(run)
+        status = run.get("status")
+        if status == "completed":
+            if run.get("conclusion") != "success":
+                raise ProvenanceError("auto-deploy attempt did not complete successfully")
+            validate_workflow_run(
+                {
+                    "id": int(workflow_id),
+                    "path": AUTODEPLOY_WORKFLOW_PATH,
+                    "name": AUTODEPLOY_WORKFLOW_NAME,
+                },
+                run,
+                expected_run_id=int(run_id),
+                expected_attempt=int(attempt),
+                expected_target_sha=expected_target_sha,
+                expected_event="workflow_run",
+                expected_branch="dev",
+                expected_path=AUTODEPLOY_WORKFLOW_PATH,
+                expected_name=AUTODEPLOY_WORKFLOW_NAME,
+            )
+            return run
+        if status not in {"queued", "in_progress", "waiting", "pending", "requested"}:
+            raise ProvenanceError("auto-deploy attempt state is invalid")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProvenanceError("timed out waiting for auto-deploy attempt completion")
+        time.sleep(min(poll_interval_seconds, remaining))
+
+
 def validate_baseline_runtime_proof(
     workflow: Mapping[str, Any],
     run: Mapping[str, Any],
@@ -368,10 +455,7 @@ def validate_baseline_runtime_proof(
         expected_name=SECURITY_WORKFLOW_NAME,
         expected_run_name=expected_run_name,
     )
-    if run.get("path") not in {
-        f"{SECURITY_WORKFLOW_PATH}@dev",
-        f"{SECURITY_WORKFLOW_PATH}@refs/heads/dev",
-    }:
+    if run.get("path") != SECURITY_WORKFLOW_PATH:
         raise ProvenanceError("runtime proof workflow definition is not from trusted dev")
     title = run.get("display_title")
     match = BASELINE_RUNTIME_TITLE_RE.fullmatch(title) if isinstance(title, str) else None
