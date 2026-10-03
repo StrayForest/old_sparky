@@ -26,9 +26,17 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     validate_deployment_event,
     validate_deployment_marker,
     validate_autodeploy_dispatch,
+    SECURITY_WORKFLOW_NAME,
+    SECURITY_WORKFLOW_PATH,
 )
 from tools.platform_deploy_baseline import (  # noqa: E402
+    BASELINE_RUNTIME_GATE_NAMES,
+    classify_cumulative_baseline,
     validate_active_baseline,
+    validate_baseline_runtime_proof,
+)
+from tools.platform_ci_classifier import (  # noqa: E402
+    classify,
 )
 
 
@@ -98,6 +106,301 @@ class WorkflowProvenanceTests(unittest.TestCase):
             "release_ino": 910002,
             "pending_operation": False,
         }
+
+    def _baseline_runtime_payload(self):
+        run_id, attempt = 1234, 2
+        source_id, source_attempt = 567, 1
+        auto_id, auto_attempt = 678, 1
+        parent_id, parent_attempt = 789, 3
+        workflow = {
+            "id": 77,
+            "path": SECURITY_WORKFLOW_PATH,
+            "name": SECURITY_WORKFLOW_NAME,
+        }
+        base = f"https://github.com/StrayForest/old_sparky/actions/runs/{run_id}"
+        title = (
+            f"platform-baseline-runtime-v1:{self.SHA}:"
+            f"s{source_id}.{source_attempt}:a{auto_id}.{auto_attempt}:"
+            f"d{parent_id}.{parent_attempt}:r{run_id}.{attempt}"
+        )
+        run = {
+            "id": run_id,
+            "workflow_id": 77,
+            "name": SECURITY_WORKFLOW_NAME,
+            "display_title": title,
+            "run_attempt": attempt,
+            "event": "workflow_dispatch",
+            "head_branch": "dev",
+            "head_sha": self.SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": base,
+            "repository": {
+                "full_name": "StrayForest/old_sparky",
+                "name": "old_sparky",
+                "owner": {"login": "StrayForest"},
+            },
+        }
+        jobs = [
+            {
+                "id": 10000 + index,
+                "name": name,
+                "status": "completed",
+                "conclusion": "success",
+            }
+            for index, name in enumerate(sorted(BASELINE_RUNTIME_GATE_NAMES))
+        ]
+        jobs.extend(
+            [
+                {"id": 10100, "name": "Classifier", "status": "completed", "conclusion": "success"},
+                {"id": 10101, "name": "Baseline runtime guard", "status": "completed", "conclusion": "success"},
+            ]
+        )
+        statuses = [
+            {
+                "id": 20001,
+                "context": "platform-baseline-runtime",
+                "state": "success",
+                "description": "Platform security and build passed",
+                "target_url": f"{base}/attempts/{attempt}",
+                "updated_at": "2026-10-02T12:00:00Z",
+                "created_at": "2026-10-02T12:00:00Z",
+                "creator": {
+                    "login": "github-actions[bot]",
+                    "type": "Bot",
+                    "id": 41898282,
+                },
+            }
+        ]
+        receipt = {
+            "schema": 1,
+            "proof_mode": "baseline-runtime",
+            "target_sha": self.SHA,
+            "source_security_run_id": str(source_id),
+            "source_security_run_attempt": str(source_attempt),
+            "autodeploy_run_id": str(auto_id),
+            "autodeploy_run_attempt": str(auto_attempt),
+            "production_deploy_run_id": str(parent_id),
+            "production_deploy_run_attempt": str(parent_attempt),
+            "proof_run_id": str(run_id),
+            "proof_run_attempt": str(attempt),
+            "required_gates": [
+                "backend", "python-quality", "security", "migration", "docs",
+                "web-quality", "web-hermetic", "verification-contract",
+                "release-runtime", "release-runtime-real",
+            ],
+        }
+        correlation = {
+            "source_security_run_id": source_id,
+            "source_security_attempt": source_attempt,
+            "autodeploy_run_id": auto_id,
+            "autodeploy_attempt": auto_attempt,
+            "production_deploy_run_id": parent_id,
+            "production_deploy_attempt": parent_attempt,
+        }
+        return workflow, run, jobs, statuses, receipt, correlation
+
+    def _validate_baseline_runtime_payload(self, payload):
+        workflow, run, jobs, statuses, receipt, correlation = payload
+        return validate_baseline_runtime_proof(
+            workflow,
+            run,
+            jobs,
+            statuses,
+            receipt,
+            expected_target_sha=self.SHA,
+            **correlation,
+            jobs_complete=True,
+            statuses_complete=True,
+            now=datetime(2026, 10, 3, tzinfo=timezone.utc),
+        )
+
+    def test_cumulative_baseline_classification_rederives_runtime_sensitivity(self) -> None:
+        incremental = classify(
+            [".github/workflows/platform-production-deploy.yml"],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertFalse(incremental["runtime_sensitive"])
+        self.assertFalse(incremental["deployable"])
+
+        cumulative = classify_cumulative_baseline(
+            incremental,
+            [
+                ".github/workflows/platform-production-deploy.yml",
+                "platform/tools/platform_build_release.sh",
+            ],
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(cumulative["runtime_sensitive"])
+        self.assertTrue(cumulative["deployable"])
+        self.assertEqual(cumulative["class"], "full")
+        self.assertFalse(cumulative["fallback"])
+
+    def test_cumulative_baseline_rejects_incomplete_or_non_deployable_paths(self) -> None:
+        incremental_path = ".github/workflows/platform-production-deploy.yml"
+        incremental = classify(
+            [incremental_path], event="push", branch="dev", target_sha=self.SHA
+        )
+        cases = (
+            ([], "missing path list"),
+            (["platform/tools/platform_build_release.sh"], "omitted incremental path"),
+            ([incremental_path], "bootstrap-only cumulative route"),
+        )
+        for paths, label in cases:
+            with self.subTest(label=label), self.assertRaises(ProvenanceError):
+                classify_cumulative_baseline(
+                    incremental, paths, expected_target_sha=self.SHA
+                )
+
+        ordinary_incremental = classify(
+            ["platform/tools/platform_build_release.sh"],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                ordinary_incremental,
+                ["platform/tools/platform_build_release.sh"],
+                expected_target_sha=self.SHA,
+            )
+
+        tampered = dict(incremental)
+        tampered["runtime_sensitive"] = True
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                tampered,
+                [incremental_path, "platform/tools/platform_build_release.sh"],
+                expected_target_sha=self.SHA,
+            )
+
+    def test_exact_baseline_runtime_proof_is_accepted(self) -> None:
+        result = self._validate_baseline_runtime_payload(self._baseline_runtime_payload())
+        self.assertEqual(result["target_sha"], self.SHA)
+        self.assertEqual(
+            result["attempt_url"],
+            "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
+        )
+
+    def test_baseline_runtime_proof_requires_exact_parent_run_correlation(self) -> None:
+        baseline = self._baseline_runtime_payload()
+        for field, value in (
+            ("target_sha", "b" * 40),
+            ("source_security_run_id", "999"),
+            ("source_security_run_attempt", "9"),
+            ("autodeploy_run_id", "999"),
+            ("autodeploy_run_attempt", "9"),
+            ("production_deploy_run_id", "999"),
+            ("production_deploy_run_attempt", "9"),
+            ("proof_run_attempt", "9"),
+        ):
+            candidate = copy.deepcopy(baseline)
+            candidate[4][field] = value
+            with self.subTest(field=field), self.assertRaises(ProvenanceError):
+                self._validate_baseline_runtime_payload(candidate)
+
+        candidate = copy.deepcopy(baseline)
+        candidate[1]["display_title"] += ":stale"
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(candidate)
+
+        title_mutations = (
+            ("source_security_run_id", "s568.1"),
+            ("autodeploy_run_id", "a679.1"),
+            ("production_deploy_run_id", "d790.3"),
+        )
+        for label, replacement in title_mutations:
+            candidate = copy.deepcopy(baseline)
+            candidate[1]["display_title"] = candidate[1]["display_title"].replace(
+                {"source_security_run_id": "s567.1", "autodeploy_run_id": "a678.1", "production_deploy_run_id": "d789.3"}[label],
+                replacement,
+            )
+            with self.subTest(parent=label), self.assertRaises(ProvenanceError):
+                self._validate_baseline_runtime_payload(candidate)
+
+    def test_baseline_runtime_proof_rejects_wrong_workflow_ref_or_target(self) -> None:
+        baseline = self._baseline_runtime_payload()
+        mutations = (
+            (0, "path", ".github/workflows/other.yml"),
+            (0, "name", "Other workflow"),
+            (1, "event", "push"),
+            (1, "head_branch", "feature/other"),
+            (1, "head_sha", "b" * 40),
+            (1, "status", "in_progress"),
+            (1, "conclusion", "failure"),
+            (1, "run_attempt", 3),
+        )
+        for index, field, value in mutations:
+            candidate = copy.deepcopy(baseline)
+            candidate[index][field] = value
+            with self.subTest(index=index, field=field), self.assertRaises(ProvenanceError):
+                self._validate_baseline_runtime_payload(candidate)
+
+    def test_baseline_runtime_proof_requires_complete_exact_success_gates(self) -> None:
+        baseline = self._baseline_runtime_payload()
+        candidate = list(copy.deepcopy(baseline))
+        candidate[2] = [job for job in candidate[2] if job["name"] != "Trusted dev immutable release runtime"]
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(candidate)
+
+        candidate = copy.deepcopy(baseline)
+        next(job for job in candidate[2] if job["name"] == "Conditional release runtime fixture")["conclusion"] = "skipped"
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(candidate)
+
+        candidate = copy.deepcopy(baseline)
+        candidate[2].append(dict(candidate[2][0], id=30000))
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(candidate)
+
+        for complete_flag, jobs_complete, statuses_complete in (
+            ("jobs", False, True),
+            ("statuses", True, False),
+        ):
+            candidate = copy.deepcopy(baseline)
+            with self.subTest(incomplete=complete_flag), self.assertRaises(ProvenanceError):
+                validate_baseline_runtime_proof(
+                    candidate[0], candidate[1], candidate[2], candidate[3], candidate[4],
+                    expected_target_sha=self.SHA, **candidate[5],
+                    jobs_complete=jobs_complete, statuses_complete=statuses_complete,
+                )
+
+    def test_baseline_runtime_proof_requires_exact_latest_bot_status_and_receipt(self) -> None:
+        baseline = self._baseline_runtime_payload()
+        for mutation in (
+            lambda payload: payload[3][0].update({"target_url": "https://github.com/attacker"}),
+            lambda payload: payload[3][0].update({"state": "failure"}),
+            lambda payload: payload[3][0].update({"creator": {"login": "attacker", "type": "User", "id": 1}}),
+            lambda payload: payload[4].update({"proof_mode": "standard"}),
+            lambda payload: payload[4].update({"required_gates": ["backend"]}),
+            lambda payload: payload[4].update({"unexpected": True}),
+        ):
+            candidate = copy.deepcopy(baseline)
+            mutation(candidate)
+            with self.assertRaises(ProvenanceError):
+                self._validate_baseline_runtime_payload(candidate)
+
+        candidate = copy.deepcopy(baseline)
+        candidate[3].append({
+            **candidate[3][0],
+            "id": 20002,
+            "updated_at": "2026-10-02T12:00:00Z",
+        })
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(candidate)
+
+        candidate = copy.deepcopy(baseline)
+        candidate[3][0]["id"] = candidate[3][1]["id"] if len(candidate[3]) > 1 else 20001
+        candidate[3].append({**candidate[3][0], "updated_at": "2026-10-02T13:00:00Z"})
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(candidate)
+
+        candidate = copy.deepcopy(baseline)
+        candidate[3].clear()
+        with self.assertRaises(ProvenanceError):
+            self._validate_baseline_runtime_payload(candidate)
 
     def _autodeploy_payload(
         self,

@@ -126,6 +126,9 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
     }
 )
 DOCS_PREFIX = "platform/docs/"
+RECOVERY_BOOTSTRAP_REASON = (
+    "retained-release recovery-bootstrap change requires full verification and is non-deployable"
+)
 ALLOWED_REASONS = frozenset(
     {
         "metadata",
@@ -448,7 +451,12 @@ def _is_recovery_bootstrap_only(files: Sequence[object]) -> bool:
     )
 
 
-def validate_manifest(archive: Path, *, target_sha: str) -> None:
+def validate_manifest(
+    archive: Path,
+    *,
+    target_sha: str,
+    require_recovery_bootstrap: bool = False,
+) -> None:
     if SHA_RE.fullmatch(target_sha) is None:
         raise _fail("provenance")
     with tempfile.TemporaryDirectory(prefix="platform-classifier-") as temporary:
@@ -495,6 +503,15 @@ def validate_manifest(archive: Path, *, target_sha: str) -> None:
     ):
         raise _fail("manifest")
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
+    if type(require_recovery_bootstrap) is not bool:
+        raise _fail("manifest")
+    if require_recovery_bootstrap and (
+        not recovery_bootstrap_only
+        or manifest.get("reason") != RECOVERY_BOOTSTRAP_REASON
+        or manifest.get("class") != "full"
+        or manifest.get("deployable") is not False
+    ):
+        raise _fail("manifest")
     if type(manifest.get("deployable")) is not bool:
         raise _fail("manifest")
     if recovery_bootstrap_only:
@@ -528,6 +545,7 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("archive", type=Path)
     manifest.add_argument("--target-sha", required=True)
+    manifest.add_argument("--require-recovery-bootstrap", action="store_true")
     return parser
 
 
@@ -558,7 +576,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(artifact_id)
         else:
-            validate_manifest(arguments.archive, target_sha=arguments.target_sha)
+            validate_manifest(
+                arguments.archive,
+                target_sha=arguments.target_sha,
+                require_recovery_bootstrap=arguments.require_recovery_bootstrap,
+            )
             print("classifier manifest accepted")
     except ClassifierArtifactError as exc:
         print(f"classifier validation rejected: {exc.reason}", file=sys.stderr)

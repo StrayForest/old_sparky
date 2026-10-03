@@ -11,6 +11,7 @@ on:
         options:
           - preflight
           - deploy
+          - baseline-reconcile
       runtime_profile:
         description: "Reviewed runtime capacity profile to apply after deployment"
         required: true
@@ -58,6 +59,16 @@ on:
         required: false
         default: ""
         type: string
+      autodeploy_run_id:
+        description: "Exact automatic deployment dispatcher run ID (baseline reconciliation only)"
+        required: false
+        default: ""
+        type: string
+      autodeploy_run_attempt:
+        description: "Exact automatic deployment dispatcher attempt (baseline reconciliation only)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -81,10 +92,13 @@ jobs:
     env:
       TARGET_SHA: ${{ github.sha }}
       DEPLOY_MODE: ${{ inputs.mode }}
+      DISPATCH_ACTOR: ${{ github.actor }}
       RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
       WEB_COMPRESSION: ${{ inputs.web_compression }}
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
       RELEASE_SLUG_BASE: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -93,9 +107,25 @@ jobs:
         run: |
           set -euo pipefail
           case "$DEPLOY_MODE" in
-            preflight|deploy) ;;
+            preflight|deploy|baseline-reconcile) ;;
             *) echo "Unsupported deployment mode; refusing a green no-op." >&2; exit 1 ;;
           esac
+          if [[ "$DEPLOY_MODE" == "baseline-reconcile" ]]; then
+            [[ "$DISPATCH_ACTOR" == "github-actions[bot]" ]] || {
+              echo "Baseline reconciliation is restricted to the automatic deployment chain." >&2
+              exit 1
+            }
+            [[ "$CLASSIFIER_RUN_ID" != "$GITHUB_RUN_ID" ]] || {
+              echo "Baseline reconciliation requires a distinct successful security run." >&2
+              exit 1
+            }
+            [[ "$AUTODEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+              && "$AUTODEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
+              && "$AUTODEPLOY_RUN_ID" != "$GITHUB_RUN_ID" ]] || {
+              echo "Baseline reconciliation requires the exact automatic caller attempt." >&2
+              exit 1
+            }
+          fi
           case "$RUNTIME_PROFILE" in
             baseline|ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-cprofile|ready-vote-static-12|ready-vote-static-16|ready-vote-adaptive-v2|api-3x16|api-1x48|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|web-ssr-diagnostics|web-ssr-native-transport|web-ssr-workers-2|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24) ;;
             *) echo "Unsupported runtime profile." >&2; exit 1 ;;
@@ -124,9 +154,11 @@ jobs:
           }
           # The candidate parser is used only on this secret-free runner.  All
           # secret-bearing consumers independently validate the JSON schema.
+          handoff_mode="$DEPLOY_MODE"
+          [[ "$handoff_mode" != "baseline-reconcile" ]] || handoff_mode=deploy
           /usr/bin/python3 platform/tools/platform_workflow_input_guard.py deployment \
             --output "$RUNNER_TEMP/platform-production-deploy-input.json" \
-            --mode "$DEPLOY_MODE" \
+            --mode "$handoff_mode" \
             --runtime-profile "$RUNTIME_PROFILE" \
             --release-slug "$candidate_release_slug" \
             --target-sha "$TARGET_SHA" \
@@ -161,7 +193,7 @@ jobs:
     if: >-
       needs.validate-dispatch.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      inputs.mode == 'deploy'
+      (inputs.mode == 'deploy' || inputs.mode == 'baseline-reconcile')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -169,8 +201,11 @@ jobs:
       contents: read
     env:
       TARGET_SHA: ${{ github.sha }}
+      DEPLOY_MODE: ${{ inputs.mode }}
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
     steps:
       - name: Resolve immutable default-branch classifier source
         id: trusted_classifier_default
@@ -218,6 +253,189 @@ jobs:
           path: trusted-classifier
           fetch-depth: 1
           persist-credentials: false
+      - name: Authenticate automatic reconciliation caller
+        if: ${{ inputs.mode == 'baseline-reconcile' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$AUTODEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$AUTODEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          trusted_root="$GITHUB_WORKSPACE/trusted-classifier"
+          baseline_tool="$trusted_root/platform/tools/platform_deploy_baseline.py"
+          provenance_tool="$trusted_root/platform/tools/platform_workflow_provenance.py"
+          test -f "$baseline_tool" && test ! -L "$baseline_tool"
+          test -f "$provenance_tool" && test ! -L "$provenance_tool"
+          proof_dir="$(mktemp -d "$RUNNER_TEMP/platform-autodeploy-proof.XXXXXX")"
+          trap 'rm -rf -- "$proof_dir"' EXIT
+          workflow_path="$proof_dir/workflow.json"
+          curl --fail-with-body --silent --show-error --location --max-filesize 262144 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-autodeploy.yml" \
+            --output "$workflow_path"
+          chmod 600 "$workflow_path"
+          run_path="$proof_dir/run.json"
+          /usr/bin/python3 - "$trusted_root/platform" "$workflow_path" "$run_path" \
+            "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" "$TARGET_SHA" "$GH_TOKEN" "$GITHUB_API_URL" "$GITHUB_REPOSITORY" <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import time
+          from urllib.request import Request, urlopen
+
+          trusted_platform, workflow_path, run_path, run_id, attempt, target_sha, token, api_url, repository = sys.argv[1:]
+          sys.path.insert(0, trusted_platform)
+          from tools.platform_workflow_provenance import (  # noqa: E402
+              AUTODEPLOY_WORKFLOW_NAME,
+              AUTODEPLOY_WORKFLOW_PATH,
+              ProvenanceError,
+          )
+          from tools.platform_deploy_baseline import wait_for_autodeploy_completion  # noqa: E402
+
+          def read_json(path: str) -> object:
+              def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                  result: dict[str, object] = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError("duplicate JSON key")
+                      result[key] = value
+                  return result
+              return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=unique)
+
+          workflow = read_json(workflow_path)
+          if (
+              not isinstance(workflow, dict)
+              or workflow.get("path") != AUTODEPLOY_WORKFLOW_PATH
+              or workflow.get("name") != AUTODEPLOY_WORKFLOW_NAME
+              or type(workflow.get("id")) is not int
+              or workflow["id"] <= 0
+          ):
+              raise SystemExit("automatic caller workflow identity is not canonical")
+
+          def fetch_attempt() -> dict[str, object]:
+              url = f"{api_url}/repos/{repository}/actions/runs/{run_id}/attempts/{attempt}"
+              request = Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urlopen(request, timeout=10) as response:
+                  raw = response.read(1_048_577)
+              if len(raw) > 1_048_576:
+                  raise ProvenanceError("auto-deploy attempt response exceeds its bound")
+              payload = json.loads(raw, object_pairs_hook=lambda pairs: dict(pairs))
+              if not isinstance(payload, dict):
+                  raise ProvenanceError("auto-deploy attempt response is malformed")
+              return payload
+
+          completed = wait_for_autodeploy_completion(
+              fetch_attempt,
+              expected_workflow_id=workflow["id"],
+              expected_run_id=int(run_id),
+              expected_attempt=int(attempt),
+              expected_target_sha=target_sha,
+              timeout_seconds=120,
+              poll_interval_seconds=5,
+          )
+          descriptor = os.open(run_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+              json.dump(completed, handle, sort_keys=True, separators=(",", ":"))
+              handle.write("\n")
+          PY
+          jobs_dir="$proof_dir/jobs"
+          install -d -m 700 "$jobs_dir"
+          page=1
+          fetched_rows=0
+          expected_total=""
+          while :; do
+            page_path="$jobs_dir/page-${page}.json"
+            curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${AUTODEPLOY_RUN_ID}/attempts/${AUTODEPLOY_RUN_ATTEMPT}/jobs?per_page=100&page=${page}" \
+              --output "$page_path"
+            chmod 600 "$page_path"
+            summary="$(/usr/bin/python3 - "$page_path" "$expected_total" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          rows = payload.get("jobs") if isinstance(payload, dict) else None
+          total = payload.get("total_count") if isinstance(payload, dict) else None
+          if not isinstance(rows, list) or type(total) is not int or total < 0 or len(rows) > 100:
+              raise SystemExit("automatic caller job page is malformed")
+          prior = sys.argv[2]
+          if prior and prior != str(total):
+              raise SystemExit("automatic caller job total changed during pagination")
+          print(f"{len(rows)} {total}")
+          PY
+            )"
+            [[ "$summary" =~ ^([0-9]+)\ ([0-9]+)$ ]]
+            count="${BASH_REMATCH[1]}"
+            total="${BASH_REMATCH[2]}"
+            fetched_rows=$((fetched_rows + count))
+            (( fetched_rows <= 10000 )) || { echo "automatic caller job snapshot exceeds its bound" >&2; exit 1; }
+            (( total <= 10000 )) || { echo "automatic caller job total exceeds its bound" >&2; exit 1; }
+            if [[ -n "$expected_total" ]]; then
+              test "$expected_total" = "$total"
+            else
+              expected_total="$total"
+            fi
+            if (( count < 100 )); then break; fi
+            ((page += 1))
+            (( page <= 100 )) || { echo "automatic caller job pagination exceeded its bound" >&2; exit 1; }
+          done
+          test "$fetched_rows" = "$expected_total" || {
+            echo "automatic caller job pagination is incomplete." >&2
+            exit 1
+          }
+          /usr/bin/python3 - "$trusted_root/platform" "$workflow_path" "$run_path" "$jobs_dir" \
+            "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, sys.argv[1])
+          from tools.platform_workflow_provenance import validate_autodeploy_dispatch  # noqa: E402
+          workflow = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          run = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+          job_dir = Path(sys.argv[4])
+          jobs = []
+          for path in sorted(job_dir.glob("page-*.json")):
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              jobs.extend(payload["jobs"])
+          if len(jobs) > 10000 or len({row.get("id") for row in jobs if isinstance(row, dict)}) != len(jobs):
+              raise SystemExit("automatic caller job pages are ambiguous or too large")
+          validate_autodeploy_dispatch(
+              workflow,
+              run,
+              jobs,
+              expected_run_id=int(sys.argv[5]),
+              expected_attempt=int(sys.argv[6]),
+              expected_target_sha=sys.argv[7],
+          )
+          PY
+          current_sha="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev" \
+            | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["commit"]["sha"])')"
+          [[ "$current_sha" =~ ^[0-9a-f]{40}$ && "$current_sha" == "$TARGET_SHA" ]] || {
+            echo "dev changed while authenticating the automatic caller; refusing reconciliation." >&2
+            exit 1
+          }
+          echo "Authenticated exact automatic deployment caller attempt after bounded completion wait."
       - name: Validate exact classifier artifact before candidate build
         shell: bash
         env:
@@ -294,7 +512,13 @@ jobs:
             "${api_headers[@]}" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
             --output "$route_dir/artifact.zip"
-          /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" --target-sha "$TARGET_SHA"
+          if [[ "$DEPLOY_MODE" == "baseline-reconcile" ]]; then
+            /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" \
+              --target-sha "$TARGET_SHA" --require-recovery-bootstrap
+          else
+            /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" \
+              --target-sha "$TARGET_SHA"
+          fi
       - name: Remove trusted classifier validator
         if: ${{ always() }}
         shell: bash
@@ -314,7 +538,7 @@ jobs:
     if: >-
       needs.validate-dispatch.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      (inputs.mode == 'deploy' || inputs.mode == 'preflight')
+      (inputs.mode == 'deploy' || inputs.mode == 'preflight' || inputs.mode == 'baseline-reconcile')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -525,7 +749,7 @@ jobs:
       needs.validate-dispatch.result == 'success' &&
       needs.build-host-tools.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      (inputs.mode == 'deploy' || inputs.mode == 'preflight')
+      (inputs.mode == 'deploy' || inputs.mode == 'preflight' || inputs.mode == 'baseline-reconcile')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
@@ -546,6 +770,7 @@ jobs:
       host_tools_attestation_run_id: ${{ steps.host-tools-handoff.outputs.attestation_run_id }}
       host_tools_attestation_run_attempt: ${{ steps.host-tools-handoff.outputs.attestation_run_attempt }}
       host_tools_attestation_job_id: ${{ steps.host-tools-handoff.outputs.attestation_job_id }}
+      baseline_identity: ${{ steps.active-baseline.outputs.identity }}
       host_tools_handoff_artifact_id: ${{ steps.publish-host-tools-handoff.outputs.artifact-id }}
       host_tools_handoff_artifact_digest: ${{ steps.publish-host-tools-handoff.outputs.artifact-digest }}
     permissions:
@@ -1144,6 +1369,7 @@ jobs:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
+          umask 077
           test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}"
           [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
           expected_generation="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA"
@@ -1161,7 +1387,7 @@ jobs:
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
           remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
-          expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"
+          expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 python_isolated=1 python_bytecode_disabled=1"
           expected_bytes="$(printf '%s\n' "$expected_output" | wc -c | tr -d '[:space:]')"
           expected_sha256="$(printf '%s\n' "$expected_output" | sha256sum | cut -d' ' -f1)"
           # The file-size limit bounds the remote process, while ``head`` caps
@@ -1210,6 +1436,84 @@ jobs:
             exit 1
           fi
 
+      - name: Read active production baseline for reconciliation
+        id: active-baseline
+        if: ${{ inputs.mode == 'baseline-reconcile' }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}"
+          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          baseline_output="$RUNNER_TEMP/platform-active-release-baseline.json"
+          remote_status=0
+          if (
+            ulimit -f 16
+            exec /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
+              "${remote[@]}" /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-release-baseline
+          ) 2>/dev/null < /dev/null | /usr/bin/head -c 4097 > "$baseline_output"; then
+            :
+          else
+            remote_status="$?"
+          fi
+          test "$remote_status" = 0 || { echo "Immutable host baseline query failed." >&2; exit 1; }
+          test "$(stat -c '%F:%h:%a' -- "$baseline_output")" = "regular file:1:600" || {
+            echo "Immutable host baseline output file is unsafe." >&2; exit 1;
+          }
+          /usr/bin/python3 - "$baseline_output" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          source, output = map(Path, sys.argv[1:])
+          raw = source.read_bytes()
+          keys = {
+              "schema", "source_sha", "release_slug", "release_json_sha256",
+              "current_link_dev", "current_link_ino", "release_dev", "release_ino",
+              "pending_operation",
+          }
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate key")
+                  result[key] = value
+              return result
+          if len(raw) > 4096 or not raw.endswith(b"\n"):
+              raise SystemExit("immutable host baseline response is oversized or malformed")
+          try:
+              value = json.loads(raw.decode("ascii"), object_pairs_hook=unique_object)
+          except (UnicodeError, json.JSONDecodeError, ValueError):
+              raise SystemExit("immutable host baseline response is malformed") from None
+          if (
+              not isinstance(value, dict) or set(value) != keys
+              or type(value.get("schema")) is not int or value["schema"] != 1
+              or not isinstance(value.get("source_sha"), str)
+              or re.fullmatch(r"[0-9a-f]{40}", value["source_sha"]) is None
+              or not isinstance(value.get("release_slug"), str)
+              or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", value["release_slug"]) is None
+              or not isinstance(value.get("release_json_sha256"), str)
+              or re.fullmatch(r"[0-9a-f]{64}", value["release_json_sha256"]) is None
+              or any(type(value.get(field)) is not int or value[field] < 0 for field in (
+                  "current_link_dev", "release_dev"
+              ))
+              or any(type(value.get(field)) is not int or value[field] <= 0 for field in (
+                  "current_link_ino", "release_ino"
+              ))
+              or value.get("pending_operation") is not False
+          ):
+              raise SystemExit("immutable host baseline response does not match the closed contract")
+          compact = json.dumps(value, sort_keys=True, separators=(",", ":"))
+          with output.open("a", encoding="utf-8") as stream:
+              stream.write(f"identity={compact}\n")
+          source.unlink()
+          PY
+
       - name: Remove host capability verifier material
         if: ${{ always() }}
         shell: bash
@@ -1246,7 +1550,7 @@ jobs:
       needs.validate-classifier.result == 'success' &&
       needs.host-capability-preflight.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      inputs.mode == 'deploy'
+      (inputs.mode == 'deploy' || inputs.mode == 'baseline-reconcile')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
