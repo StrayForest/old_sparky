@@ -303,6 +303,7 @@ class MediaSourceStoreTests(unittest.TestCase):
                         *arguments,
                     ],
                     env=environment,
+                    cwd=base,
                     text=True,
                     capture_output=True,
                     check=False,
