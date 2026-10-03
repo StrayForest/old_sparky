@@ -97,13 +97,29 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
           test "$GITHUB_SERVER_URL" = "https://github.com"
-          trusted_ref="$RUNNER_TEMP/platform-trusted-classifier-ref.json"
-          curl --fail-with-body --silent --show-error \
+          trusted_ref="$(mktemp "$RUNNER_TEMP/platform-trusted-classifier-ref.XXXXXX")"
+          trap 'rm -f -- "$trusted_ref"' EXIT
+          if ! curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}" \
-            --output "$trusted_ref"
+            --output "$trusted_ref" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}"; then
+            echo "trusted default branch ref request failed" >&2
+            exit 1
+          fi
+          if ! trusted_ref_bytes="$(wc -c < "$trusted_ref")"; then
+            echo "trusted default branch ref response size is unavailable" >&2
+            exit 1
+          fi
+          case "$trusted_ref_bytes" in
+            ''|*[!0-9]*) echo "trusted default branch ref response size is malformed" >&2; exit 1 ;;
+          esac
+          if (( trusted_ref_bytes > 65536 )); then
+            echo "trusted default branch ref response is oversized" >&2
+            exit 1
+          fi
           /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
           import json
           from pathlib import Path
@@ -121,7 +137,6 @@ jobs:
           with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
               output.write(f"sha={sha}\n")
           PY
-          rm -f -- "$trusted_ref"
 
       - name: Checkout trusted classifier source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -167,13 +182,31 @@ jobs:
         run: |
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
-          curl --fail-with-body --silent --show-error \
+          status_start_response="$(mktemp "$RUNNER_TEMP/platform-security-status-start.XXXXXX")"
+          trap 'rm -f -- "$status_start_response"' EXIT
+          if ! curl --fail-with-body --silent --show-error \
+            --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output "$status_start_response" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
-            --data "{\"state\":\"pending\",\"context\":\"platform-security-build\",\"description\":\"Platform security and build is running\",\"target_url\":\"${run_url}\"}"
+            --data "{\"state\":\"pending\",\"context\":\"platform-security-build\",\"description\":\"Platform security and build is running\",\"target_url\":\"${run_url}\"}"; then
+            echo "platform security pending status request failed" >&2
+            exit 1
+          fi
+          if ! status_start_response_bytes="$(wc -c < "$status_start_response")"; then
+            echo "platform security pending status response size is unavailable" >&2
+            exit 1
+          fi
+          case "$status_start_response_bytes" in
+            ''|*[!0-9]*) echo "platform security pending status response size is malformed" >&2; exit 1 ;;
+          esac
+          if (( status_start_response_bytes > 65536 )); then
+            echo "platform security pending status response is oversized" >&2
+            exit 1
+          fi
 
   backend-static:
     name: Backend DB-free contours
@@ -1270,11 +1303,15 @@ jobs:
           fi
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           if [[ "$EVENT_NAME" == "push" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            curl --fail-with-body --silent --show-error \
+            status_final_response="$(mktemp "$RUNNER_TEMP/platform-security-status-final.XXXXXX")"
+            trap 'rm -f -- "$status_final_response"' EXIT
+            if ! curl --fail-with-body --silent --show-error \
+              --connect-timeout 5 --max-time 15 --retry 0 --max-filesize 65536 \
               --request POST \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
+              --output "$status_final_response" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
               --data "$(/usr/bin/python3 - "$state" "$description" "$run_url" <<'PY'
           import json
@@ -1286,7 +1323,21 @@ jobs:
               "target_url": sys.argv[3],
           }))
           PY
-              )"
+              )"; then
+              echo "platform security final status request failed" >&2
+              exit 1
+            fi
+            if ! status_final_response_bytes="$(wc -c < "$status_final_response")"; then
+              echo "platform security final status response size is unavailable" >&2
+              exit 1
+            fi
+            case "$status_final_response_bytes" in
+              ''|*[!0-9]*) echo "platform security final status response size is malformed" >&2; exit 1 ;;
+            esac
+            if (( status_final_response_bytes > 65536 )); then
+              echo "platform security final status response is oversized" >&2
+              exit 1
+            fi
           fi
           [[ "$state" == "success" ]] || exit 1
 
