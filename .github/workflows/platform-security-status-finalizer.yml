@@ -110,7 +110,6 @@ jobs:
               or not isinstance(run.get("path"), str)
               or not run["path"].startswith(expected_run_path_prefix)
               or not run["path"][len(expected_run_path_prefix):]
-              or run.get("name") != "Platform security and build"
               or not isinstance(display_title, str)
               or event_run_url != expected_base_url
               or run.get("html_url") != expected_base_url
@@ -125,11 +124,11 @@ jobs:
           status_context = None
           is_baseline_candidate = display_title.startswith("platform-baseline-runtime-v1:")
           if event == "workflow_dispatch":
-              if display_title == "platform-security-standard-v1":
+              if display_title == "Platform security and build" and run.get("name") == display_title:
                   status_context = "platform-security-build"
               elif is_baseline_candidate:
                   parsed = baseline_title.fullmatch(display_title)
-                  if parsed is None or parsed.group("target") != target:
+                  if parsed is None or parsed.group("target") != target or run.get("name") != display_title:
                       raise SystemExit("internal baseline run-name marker is malformed or mismatched")
                   run_path_ref = run["path"].rsplit("@", 1)[1]
                   if run.get("event") != "workflow_dispatch" or run.get("head_branch") != "dev" or run.get("head_sha") != parsed.group("target") or branch != "dev" or run_path_ref not in {"dev", "refs/heads/dev"}:
@@ -155,6 +154,8 @@ jobs:
           else:
               # Pushes cannot select workflow_dispatch inputs. Preserve the
               # established canonical context for non-proof workflow events.
+              if run.get("name") != "Platform security and build" or display_title != "Platform security and build":
+                  raise SystemExit("non-dispatch security run-name is not canonical")
               status_context = "platform-security-build"
 
           if status_context == "platform-baseline-runtime" and conclusion == "success":

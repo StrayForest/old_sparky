@@ -337,24 +337,6 @@ def validate_baseline_runtime_proof(
     ]:
         raise ProvenanceError("baseline runtime receipt gate list is not canonical")
 
-    attempt_url = validate_workflow_run(
-        workflow,
-        run,
-        expected_run_id=int(proof_run_id),
-        expected_attempt=int(proof_attempt),
-        expected_target_sha=expected_target_sha,
-        expected_event="workflow_dispatch",
-        expected_branch="dev",
-        expected_path=SECURITY_WORKFLOW_PATH,
-        expected_name=SECURITY_WORKFLOW_NAME,
-    )
-    if run.get("path") not in {
-        f"{SECURITY_WORKFLOW_PATH}@dev",
-        f"{SECURITY_WORKFLOW_PATH}@refs/heads/dev",
-    }:
-        raise ProvenanceError("runtime proof workflow definition is not from trusted dev")
-    title = run.get("display_title")
-    match = BASELINE_RUNTIME_TITLE_RE.fullmatch(title) if isinstance(title, str) else None
     expected_title = {
         "target": expected_target_sha,
         "source_id": expected["source_security_run_id"],
@@ -366,6 +348,33 @@ def validate_baseline_runtime_proof(
         "proof_id": proof_run_id,
         "proof_attempt": proof_attempt,
     }
+    expected_run_name = (
+        f"platform-baseline-runtime-v1:{expected_title['target']}:"
+        f"s{expected_title['source_id']}.{expected_title['source_attempt']}:"
+        f"a{expected_title['auto_id']}.{expected_title['auto_attempt']}:"
+        f"d{expected_title['parent_id']}.{expected_title['parent_attempt']}:"
+        f"r{expected_title['proof_id']}.{expected_title['proof_attempt']}"
+    )
+
+    attempt_url = validate_workflow_run(
+        workflow,
+        run,
+        expected_run_id=int(proof_run_id),
+        expected_attempt=int(proof_attempt),
+        expected_target_sha=expected_target_sha,
+        expected_event="workflow_dispatch",
+        expected_branch="dev",
+        expected_path=SECURITY_WORKFLOW_PATH,
+        expected_name=SECURITY_WORKFLOW_NAME,
+        expected_run_name=expected_run_name,
+    )
+    if run.get("path") not in {
+        f"{SECURITY_WORKFLOW_PATH}@dev",
+        f"{SECURITY_WORKFLOW_PATH}@refs/heads/dev",
+    }:
+        raise ProvenanceError("runtime proof workflow definition is not from trusted dev")
+    title = run.get("display_title")
+    match = BASELINE_RUNTIME_TITLE_RE.fullmatch(title) if isinstance(title, str) else None
     if match is None or match.groupdict() != expected_title:
         raise ProvenanceError("runtime proof title is not bound to its exact source and parent runs")
 

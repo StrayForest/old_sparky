@@ -200,7 +200,7 @@ require(
         ".github/workflows/platform-production-deploy.yml@dev",
         ".github/workflows/platform-production-deploy.yml@refs/heads/dev",
     }
-    and parent.get("name") == "Platform production deploy"
+    and parent.get("name") == parent_title
     and parent.get("event") == "workflow_dispatch"
     and parent.get("head_branch") == "dev"
     and parent.get("head_sha") == target
@@ -278,7 +278,7 @@ while time.monotonic() < deadline:
                 ".github/workflows/platform-security.yml@dev",
                 ".github/workflows/platform-security.yml@refs/heads/dev",
             }
-            and row.get("name") == "Platform security and build"
+            and row.get("name") == row.get("display_title")
             and row.get("event") == "workflow_dispatch"
             and row.get("head_branch") == "dev"
             and row.get("head_sha") == target
@@ -301,6 +301,7 @@ require(
     and child_run.get("status") == "completed"
     and child_run.get("conclusion") == "success"
     and child_run.get("display_title") == row["display_title"]
+    and child_run.get("name") == row["display_title"]
     and child_run.get("id") == int(child_id)
     and child_run.get("run_attempt") == int(child_attempt)
     and child_run.get("workflow_id") == security_workflow["id"]

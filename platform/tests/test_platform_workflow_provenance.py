@@ -126,7 +126,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
         run = {
             "id": run_id,
             "workflow_id": 77,
-            "name": SECURITY_WORKFLOW_NAME,
+            "name": title,
             "path": f"{SECURITY_WORKFLOW_PATH}@refs/heads/dev",
             "display_title": title,
             "run_attempt": attempt,
@@ -359,6 +359,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             (0, "path", ".github/workflows/other.yml"),
             (0, "name", "Other workflow"),
             (1, "event", "push"),
+            (1, "name", SECURITY_WORKFLOW_NAME),
             (1, "path", f"{SECURITY_WORKFLOW_PATH}@refs/heads/feature"),
             (1, "head_branch", "feature/other"),
             (1, "head_sha", "b" * 40),
@@ -773,6 +774,76 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
                 expected_run_url=f"{run['html_url']}/wrong",
+            )
+
+        reconcile_title = (
+            f"Platform production deploy mode=baseline-reconcile target={self.SHA} "
+            "source=567.1 auto=678.2"
+        )
+        reconcile_run = copy.deepcopy(run)
+        reconcile_run["name"] = reconcile_title
+        reconcile_run["display_title"] = reconcile_title
+        validate_deployment_marker(
+            workflow,
+            reconcile_run,
+            jobs,
+            statuses,
+            expected_run_id=1234,
+            expected_attempt=2,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(
+            validate_deployment_event(
+                workflow,
+                reconcile_run,
+                jobs,
+                statuses,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_target_sha=self.SHA,
+            )
+        )
+        for bad_name in (
+            reconcile_title.replace(self.SHA, "b" * 40),
+            reconcile_title + " extra",
+            reconcile_title.replace("source=567.1", "source=0.1"),
+        ):
+            invalid_reconcile = copy.deepcopy(reconcile_run)
+            invalid_reconcile["name"] = bad_name
+            invalid_reconcile["display_title"] = bad_name
+            with self.subTest(run_name=bad_name), self.assertRaises(ProvenanceError):
+                validate_deployment_marker(
+                    workflow,
+                    invalid_reconcile,
+                    jobs,
+                    statuses,
+                    expected_run_id=1234,
+                    expected_attempt=2,
+                    expected_target_sha=self.SHA,
+                )
+        mismatched_run_name = copy.deepcopy(reconcile_run)
+        mismatched_run_name["name"] = "Platform production deploy"
+        with self.assertRaises(ProvenanceError):
+            validate_deployment_marker(
+                workflow,
+                mismatched_run_name,
+                jobs,
+                statuses,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_target_sha=self.SHA,
+            )
+        mismatched_title = copy.deepcopy(reconcile_run)
+        mismatched_title["display_title"] = "Platform production deploy"
+        with self.assertRaises(ProvenanceError):
+            validate_deployment_marker(
+                workflow,
+                mismatched_title,
+                jobs,
+                statuses,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_target_sha=self.SHA,
             )
 
     def test_old_attempt_cannot_authorize_mutation(self) -> None:

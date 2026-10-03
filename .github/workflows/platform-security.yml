@@ -1,7 +1,7 @@
 name: Platform security and build
 
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime' && format('platform-baseline-runtime-v1:{0}:s{1}.{2}:a{3}.{4}:d{5}.{6}:r{7}.{8}', inputs.target_sha, inputs.source_security_run_id, inputs.source_security_run_attempt, inputs.autodeploy_run_id, inputs.autodeploy_run_attempt, inputs.production_deploy_run_id, inputs.production_deploy_run_attempt, github.run_id, github.run_attempt) || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'standard' && 'platform-security-standard-v1') || (github.event_name == 'push' && 'platform-security-push-v1') || 'platform-security-unsupported-event-v1' }}
+  ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime' && format('platform-baseline-runtime-v1:{0}:s{1}.{2}:a{3}.{4}:d{5}.{6}:r{7}.{8}', inputs.target_sha, inputs.source_security_run_id, inputs.source_security_run_attempt, inputs.autodeploy_run_id, inputs.autodeploy_run_attempt, inputs.production_deploy_run_id, inputs.production_deploy_run_attempt, github.run_id, github.run_attempt) || 'Platform security and build' }}
 
 on:
   pull_request:
@@ -329,7 +329,8 @@ jobs:
               path_ref = value["path"].rsplit("@", 1)[1]
               if path_ref not in {"dev", "refs/heads/dev"}:
                   raise SystemExit("baseline proof workflow path ref is not dev")
-          if parent.get("display_title") != f"Platform production deploy mode=baseline-reconcile target={target} source={security_id}.{security_attempt} auto={auto_id}.{auto_attempt}":
+          expected_parent_title = f"Platform production deploy mode=baseline-reconcile target={target} source={security_id}.{security_attempt} auto={auto_id}.{auto_attempt}"
+          if parent.get("name") != expected_parent_title or parent.get("display_title") != expected_parent_title:
               raise SystemExit("baseline proof parent mode marker mismatch")
           if parent.get("actor", {}).get("login") != "github-actions[bot]" or parent.get("status") != "in_progress":
               raise SystemExit("baseline proof parent is not the active trusted dispatcher")
