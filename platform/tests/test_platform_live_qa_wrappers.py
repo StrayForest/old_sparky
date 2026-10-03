@@ -939,7 +939,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "import os,time\n"
             "while True:\n"
             " try: os.write(1, b'x' * 4096)\n"
-            " except BrokenPipeError: time.sleep(30)\n"
+            " except OSError: time.sleep(30)\n"
         )
         children: list[subprocess.Popen[bytes]] = []
         real_popen = platform_workflow_remote_dispatch.subprocess.Popen

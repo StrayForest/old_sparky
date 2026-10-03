@@ -263,8 +263,10 @@ pin-bump lifecycle; it does not silently skip historical ancestry proof.
 The `platform-host-tools-candidate.yml` workflow is a separate trusted
 `workflow_run` contract, not a production gate.  Its validator and bundle
 tests remain owned by the `backend-tool-contract` contour through
-`test_platform_host_tools_bundle`; the executable catalog snapshot must be
-updated whenever those tests change.  The verification-contract gate also
+`test_platform_host_tools_bundle`, except the active-baseline reader test,
+which exercises root-owned release metadata and belongs to
+`backend-privileged`; the executable catalog snapshot must be updated whenever
+those tests change.  The verification-contract gate also
 invokes `host_tools_candidate_workflow_issues()` so a missing default-branch
 guard, broadened permission, unpinned action, direct candidate execution,
 unsafe isolated-Python invocation, missing TOCTOU recheck or production

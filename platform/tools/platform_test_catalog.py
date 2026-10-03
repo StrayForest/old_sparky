@@ -448,7 +448,13 @@ CLASS_CONTOUR_OVERRIDES: Mapping[tuple[str, str], str] = {
     ("test_platform_steam_auth", "SteamOpenIDUnitTests"): "backend-unit",
 }
 
-TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
+TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
+    (
+        "test_platform_host_tools_bundle",
+        "HostToolsBundleTests",
+        "test_active_release_baseline_reader_returns_stable_closed_tuple",
+    ): "backend-privileged",
+}
 
 # Filled after the implementation snapshot is stable.  The contract compares
 # the sorted current IDs to these digests; a new test therefore needs an
@@ -488,8 +494,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 44,
         "module_digest": "693edb2005c56249ac84c9d1d7367b64e2e3291ef18c6bc05e41ea98967ea406",
-        "test_count": 340,
-        "test_id_digest": "6a85b9771ff40feb5dffbe079b559c7fb7762073e903dc61dd5a766e8e69f2d1",
+        "test_count": 339,
+        "test_id_digest": "16c9b48a506f60f55bfad316eaa78c58038acb5cadd48d756a7cdf59c5abb2f8",
     },
     "backend-integration": {
         "module_count": 41,
@@ -498,10 +504,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "046370ce425803de46582d8adf8e7e55c2a15130da7b6f2d23c4ee4f1e917efc",
     },
     "backend-privileged": {
-        "module_count": 23,
-        "module_digest": "2034d1a0a01dffe5b141118aa1b90c060268b28eadc0bf2165954c36c260dc1e",
-        "test_count": 445,
-        "test_id_digest": "3ab2786a3a293119e8548020c350660c37bfa3da28662e603d42c78dfcdd47d9",
+        "module_count": 24,
+        "module_digest": "0fba44da4a9b904869a490ec49fe5926f65a02e3ae5d985908c04cc4675df428",
+        "test_count": 446,
+        "test_id_digest": "5013fcc779f713a78ccbb5322e0116cf0a50eacd46d35e7441a4722e5321ef68",
     },
     "performance-contract": {
         "module_count": 11,
