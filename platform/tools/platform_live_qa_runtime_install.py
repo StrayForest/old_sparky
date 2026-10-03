@@ -40,7 +40,7 @@ DISPATCHER_PATH = TRUSTED_ROOT / "platform_live_user_qa_dispatch.py"
 REMOTE_DISPATCHER_PATH = TRUSTED_ROOT / "platform_workflow_remote_dispatch.py"
 REMOTE_INPUT_GUARD_PATH = TRUSTED_ROOT / "platform_workflow_input_guard.py"
 RELEASE_LOCK_EXEC_PATH = TRUSTED_ROOT / "platform_release_lock_exec.sh"
-RELEASE_LOCK_PATH = TRUSTED_ROOT / "platform_release_lock.sh"
+RELEASE_LOCK_HELPER_PATH = TRUSTED_ROOT / "platform_release_lock.sh"
 MAILBOX_HELPER_PATH = TRUSTED_ROOT / "platform_live_qa_mailbox_helper.py"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
@@ -913,7 +913,7 @@ def _validate_payload(payload: dict[str, object]) -> None:
         (REMOTE_DISPATCHER_PATH, 0o555, "platform/tools/platform_workflow_remote_dispatch.py"),
         (REMOTE_INPUT_GUARD_PATH, 0o555, "platform/tools/platform_workflow_input_guard.py"),
         (RELEASE_LOCK_EXEC_PATH, 0o555, "platform/tools/platform_release_lock_exec.sh"),
-        (RELEASE_LOCK_PATH, 0o444, "platform/tools/platform_release_lock.sh"),
+        (RELEASE_LOCK_HELPER_PATH, 0o444, "platform/tools/platform_release_lock.sh"),
         (MAILBOX_HELPER_PATH, 0o500, "platform/tools/platform_live_qa_mailbox_helper.py"),
     ):
         metadata = _regular(path, mode=mode)
@@ -1156,7 +1156,7 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
             ("platform_workflow_remote_dispatch.py", REMOTE_DISPATCHER_PATH, 0o555),
             ("platform_workflow_input_guard.py", REMOTE_INPUT_GUARD_PATH, 0o555),
             ("platform_release_lock_exec.sh", RELEASE_LOCK_EXEC_PATH, 0o555),
-            ("platform_release_lock.sh", RELEASE_LOCK_PATH, 0o444),
+            ("platform_release_lock.sh", RELEASE_LOCK_HELPER_PATH, 0o444),
             ("platform_live_qa_mailbox_helper.py", MAILBOX_HELPER_PATH, 0o500),
         ):
             source = target / "platform/tools" / source_name

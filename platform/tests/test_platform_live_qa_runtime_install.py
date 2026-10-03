@@ -5,9 +5,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
+from uuid import uuid4
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "platform_live_qa_runtime_install.py"
@@ -67,7 +70,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             "REMOTE_DISPATCHER_PATH": trusted / entrypoints[3],
             "REMOTE_INPUT_GUARD_PATH": trusted / entrypoints[4],
             "RELEASE_LOCK_EXEC_PATH": trusted / entrypoints[5],
-            "RELEASE_LOCK_PATH": trusted / entrypoints[6],
+            "RELEASE_LOCK_HELPER_PATH": trusted / entrypoints[6],
             "MAILBOX_HELPER_PATH": trusted / entrypoints[7],
             "TOOL_FILES": entrypoints,
             "SOURCE_TREES": (),
@@ -87,6 +90,110 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
         del source
         destination.mkdir(mode=0o700, parents=True, exist_ok=False)
         return {}
+
+    @unittest.skipUnless(os.geteuid() == 0, "release lock probe requires root-owned /run/lock")
+    def test_release_lock_identity_is_not_shadowed_by_payload_helper(self) -> None:
+        """The copied helper is payload data, not the canonical mutex path."""
+
+        source = SCRIPT.read_text(encoding="utf-8")
+        canonical = 'Path("/run/lock/oldsparky-platform-release.lock")'
+        self.assertIn(canonical, source)
+        helper_source_path = SCRIPT.with_name("platform_release_lock.sh")
+        helper_source = helper_source_path.read_text(encoding="utf-8")
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            fixture = Path(temporary)
+            trusted = fixture / "liveqa"
+            trusted.mkdir(mode=0o700)
+            lock_path = Path("/run/lock") / f"oldsparky-platform-release-test-{uuid4().hex}.lock"
+            self.assertFalse(lock_path.exists())
+
+            helper_source = helper_source.replace(
+                "/run/lock/oldsparky-platform-release.lock", str(lock_path)
+            ).replace(
+                "/run/lock/oldsparky-retained-load-matrix.lock",
+                "/run/lock/oldsparky-retained-load-test-unused.lock",
+            )
+            helper_path = fixture / "platform_release_lock.sh"
+            helper_path.write_text(helper_source, encoding="utf-8")
+            os.chmod(helper_path, 0o500)
+
+            installer_source = source.replace(
+                canonical, f'Path("{lock_path}")'
+            ).replace(
+                'Path("/root/.oldsparky/liveqa")', f'Path("{trusted}")'
+            )
+            installer_path = fixture / "platform_live_qa_runtime_install.py"
+            installer_path.write_text(installer_source, encoding="utf-8")
+            os.chmod(installer_path, 0o500)
+
+            callback = fixture / "probe.py"
+            callback.write_text(
+                "import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('lock_probe', sys.argv[1])\n"
+                "module = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(module)\n"
+                "module._require_release_lock()\n"
+                "print('LOCK_PROBE_OK')\n",
+                encoding="ascii",
+            )
+            runner = fixture / "probe.sh"
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -Eeuo pipefail\n"
+                f"source {shlex.quote(str(helper_path))}\n"
+                "platform_release_lock_supervise \"$@\"\n"
+                'if [[ "${PLATFORM_RELEASE_LOCK_SUPERVISED:-}" != "1" ]]; then exit 0; fi\n'
+                "platform_release_lock_open\n"
+                "exec /usr/bin/python3 -I -B \"$2\" \"$1\"\n",
+                encoding="ascii",
+            )
+            os.chmod(runner, 0o500)
+
+            def run_probe() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [str(runner), str(installer_path), str(callback)],
+                    env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=15,
+                )
+
+            def assert_probe_passes() -> None:
+                completed = run_probe()
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout, "LOCK_PROBE_OK\n")
+                self.assertEqual(completed.stderr, "")
+
+            try:
+                # The runtime predicate must still reject a caller with no
+                # live pathname-form lock owner.
+                unlocked = subprocess.run(
+                    ["/usr/bin/python3", "-I", "-B", str(callback), str(installer_path)],
+                    env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertNotEqual(unlocked.returncode, 0)
+                self.assertNotIn("LOCK_PROBE_OK", unlocked.stdout)
+
+                # First creation has no copied payload helper yet.
+                assert_probe_passes()
+
+                # After publication, the copied helper is immutable mode 0444;
+                # it must not be mistaken for the active lock file.
+                payload_helper = trusted / "platform_release_lock.sh"
+                payload_helper.write_text("# immutable payload lock helper\n", encoding="ascii")
+                os.chmod(payload_helper, 0o444)
+                assert_probe_passes()
+            finally:
+                if lock_path.exists() and not lock_path.is_symlink():
+                    metadata = lock_path.lstat()
+                    if metadata.st_uid == 0 and metadata.st_nlink == 1:
+                        lock_path.unlink()
 
     def test_install_writes_the_exact_relative_generation_pointer(self) -> None:
         source_sha = "a" * 40
