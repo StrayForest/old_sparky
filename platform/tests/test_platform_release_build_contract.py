@@ -743,6 +743,21 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
         ).read_text()
 
+        security_provenance = workflow_job(workflow, "validate-security-provenance")
+        production = workflow_job(workflow, "production")
+
+        # The ordinary deploy path deliberately skips baseline-reconcile jobs.
+        # Keep those skipped ancestors from triggering GitHub's implicit
+        # success() guard here, while explicitly requiring the two jobs that
+        # authorize this provenance check to have succeeded.
+        self.assertIn("!cancelled()", security_provenance)
+        self.assertIn("needs.validate-dispatch.result == 'success'", security_provenance)
+        self.assertIn("needs.build-release.result == 'success'", security_provenance)
+        self.assertIn("inputs.mode == 'deploy'", security_provenance)
+        self.assertIn("!cancelled()", production)
+        self.assertIn("needs.validate-security-provenance.result == 'success'", production)
+        self.assertIn("needs.build-release.result == 'success'", production)
+
         self.assertIn("Require successful platform security build", workflow)
         self.assertIn("classifier_run_id is required for production deploy", workflow)
         self.assertIn("classifier_run_attempt is required for production deploy", workflow)
