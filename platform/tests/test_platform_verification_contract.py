@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import selectors
+import signal
 import shutil
 import subprocess
 import sys
+import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -145,6 +149,109 @@ def _write_backend_component_fixture(root: Path) -> None:
             + "\n",
             encoding="utf-8",
         )
+
+
+_LOCK_HOLDER_TIMEOUT, _LOCK_HOLDER_DIAGNOSTIC_BYTES = 2.0, 4096
+@contextmanager
+def _lock_holder(command: list[str], *, cwd: Path, env: dict[str, str] | None = None):
+    process = selector = None
+    diagnostics = {"stdout": bytearray(), "stderr": bytearray()}
+    pending = bytearray()
+    state = SimpleNamespace(ready_line=None)
+    def read_ready() -> None:
+        for key, _ in selector.select(0):
+            stream = key.fileobj
+            name = str(key.data)
+            try:
+                chunk = os.read(stream.fileno(), 4096)
+            except (BlockingIOError, InterruptedError):
+                continue
+            if not chunk:
+                selector.unregister(stream)
+                continue
+            buffer = diagnostics[name]
+            buffer.extend(chunk[: max(0, _LOCK_HOLDER_DIAGNOSTIC_BYTES - len(buffer))])
+            if name != "stdout" or state.ready_line is not None:
+                continue
+            pending.extend(chunk)
+            while b"\n" in pending and state.ready_line is None:
+                line, _, remainder = pending.partition(b"\n")
+                pending[:] = remainder
+                line = line.rstrip(b"\r")
+                if line == b"ready" or line.startswith(b"ready:"):
+                    state.ready_line = line
+            if len(pending) > _LOCK_HOLDER_DIAGNOSTIC_BYTES:
+                pending[:] = pending[-_LOCK_HOLDER_DIAGNOSTIC_BYTES:]
+    def cleanup() -> None:
+        if process is None:
+            return
+        try:
+            try:
+                process.stdin.write(b"release\n")
+                process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError, AttributeError):
+                pass
+            finally:
+                process.stdin.close()
+            try:
+                process.wait(timeout=0.15)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=0.15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+            if process.returncode != 0:
+                raise RuntimeError(f"lock-holder exited {process.returncode}")
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        finally:
+            if selector is not None:
+                selector.close()
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+        )
+        selector = selectors.DefaultSelector()
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        deadline = time.monotonic() + _LOCK_HOLDER_TIMEOUT
+        while state.ready_line is None and time.monotonic() < deadline:
+            read_ready()
+            if process.poll() is not None:
+                break
+            remaining = deadline - time.monotonic()
+            selector.select(max(0, min(0.05, remaining)))
+        read_ready()
+        if state.ready_line is None:
+            raise RuntimeError(
+                f"lock-holder did not publish ready: stderr={bytes(diagnostics['stderr'])!r}"
+            )
+        yield state
+    except BaseException as exc:
+        try:
+            cleanup()
+        except BaseException as cleanup_error:
+            exc.add_note(f"lock-holder cleanup failed: {cleanup_error}")
+        raise
+    else:
+        cleanup()
 
 
 class PlatformVerificationContractTests(unittest.TestCase):
@@ -455,16 +562,11 @@ with lock.verification_resource_lock("backend-integration"):
     print("ready", flush=True)
     sys.stdin.readline()
 """
-            holder = subprocess.Popen(
+            with _lock_holder(
                 [sys.executable, "-c", holder_code, str(lock_path)],
                 cwd=Path(__file__).resolve().parents[1],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            self.assertEqual(holder.stdout.readline().strip(), "ready")
-            contender_code = """
+            ):
+                contender_code = """
 from pathlib import Path
 import sys
 import tools.platform_verification_lock as lock
@@ -476,25 +578,29 @@ except lock.VerificationLockError as exc:
     print(exc)
     raise SystemExit(75)
 """
-            contender = subprocess.run(
-                [sys.executable, "-c", contender_code, str(lock_path)],
-                cwd=Path(__file__).resolve().parents[1],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(contender.returncode, 75, contender.stderr)
-            self.assertIn("contention", contender.stdout)
-            assert holder.stdin is not None
-            holder.stdin.write("release\n")
-            holder.stdin.close()
-            holder.wait(timeout=5)
-            stdout = holder.stdout.read()
-            stderr = holder.stderr.read()
-            holder.stdout.close()
-            holder.stderr.close()
-            self.assertEqual(holder.returncode, 0, stderr or stdout)
-            self.assertEqual(lock_path.read_text(encoding="utf-8"), "")
+                contender = subprocess.run(
+                    [sys.executable, "-c", contender_code, str(lock_path)],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(contender.returncode, 75, contender.stderr)
+                self.assertIn("contention", contender.stdout)
+                self.assertEqual(lock_path.read_text(encoding="utf-8"), "")
+            for command, error in (
+                ([str(root / "missing")], FileNotFoundError),
+                ([sys.executable, "-c", "print('rea', flush=True)"], RuntimeError),
+            ):
+                with self.subTest(command=command[0]):
+                    with self.assertRaises(error), _lock_holder(command, cwd=root):
+                        pass
+            ignored_term = "import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); sys.stdin.readline(); time.sleep(60)"
+            with self.assertRaises(AssertionError), _lock_holder(
+                [sys.executable, "-c", ignored_term], cwd=root
+            ):
+                raise AssertionError("body failure")
 
     def test_shared_resource_lock_rejects_wrong_mode_and_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -557,7 +663,7 @@ with lock.verification_resource_lock("backend-integration"):
     print(f"ready:{info.st_dev}:{info.st_ino}", flush=True)
     sys.stdin.readline()
 """
-            holder = subprocess.Popen(
+            with _lock_holder(
                 [
                     shutil.which("runuser") or "/usr/bin/runuser",
                     "-u",
@@ -570,16 +676,11 @@ with lock.verification_resource_lock("backend-integration"):
                 ],
                 cwd=module_dir,
                 env={"PYTHONPATH": str(module_dir), "PATH": os.environ.get("PATH", "")},
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            assert holder.stdout is not None
-            ready = holder.stdout.readline().strip()
-            self.assertTrue(ready.startswith("ready:"), ready)
-            _tag, holder_device, holder_inode = ready.split(":")
-            contender_code = """
+            ) as holder:
+                ready = holder.ready_line.decode("utf-8")
+                self.assertTrue(ready.startswith("ready:"), ready)
+                _tag, holder_device, holder_inode = ready.split(":")
+                contender_code = """
 from pathlib import Path
 import sys
 import tools.platform_verification_lock as lock
@@ -591,32 +692,25 @@ except lock.VerificationLockError as exc:
     print(exc)
     raise SystemExit(75)
 """
-            contender = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    contender_code,
-                    str(lock_path),
-                ],
-                cwd=module_dir,
-                env={"PYTHONPATH": str(module_dir), "PATH": os.environ.get("PATH", "")},
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(contender.returncode, 75, contender.stderr)
-            self.assertIn("contention", contender.stdout)
-            assert holder.stdin is not None
-            holder.stdin.write("release\n")
-            holder.stdin.close()
-            holder.wait(timeout=5)
-            holder_stderr = holder.stderr.read()
-            holder.stdout.close()
-            holder.stderr.close()
-            self.assertEqual(holder.returncode, 0, holder_stderr)
-            current = os.stat(lock_path)
-            self.assertEqual(int(holder_device), current.st_dev)
-            self.assertEqual(int(holder_inode), current.st_ino)
+                contender = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        contender_code,
+                        str(lock_path),
+                    ],
+                    cwd=module_dir,
+                    env={"PYTHONPATH": str(module_dir), "PATH": os.environ.get("PATH", "")},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(contender.returncode, 75, contender.stderr)
+                self.assertIn("contention", contender.stdout)
+                current = os.stat(lock_path)
+                self.assertEqual(int(holder_device), current.st_dev)
+                self.assertEqual(int(holder_inode), current.st_ino)
 
     def test_global_lock_fails_closed_on_missing_or_unsafe_parent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
