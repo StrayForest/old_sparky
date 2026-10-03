@@ -2407,6 +2407,138 @@ cleanup
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(ssh_called.exists())
 
+    def test_production_host_tools_handoff_allows_nonroot_runner_owner(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        handoff = self._workflow_step_run(
+            workflow, "Create closed host-tools handoff after final verification"
+        )
+        owner_check_lines = [
+            line.strip()
+            for line in handoff.splitlines()
+            if line.strip().startswith("expected_owner=")
+            or line.strip().startswith('test "$(stat -c')
+        ]
+        self.assertEqual(
+            owner_check_lines,
+            [
+                'expected_owner="$(id -u)"',
+                'test "$(stat -c \'%F:%u:%h:%a\' -- "$handoff")" = '
+                '"regular file:${expected_owner}:1:600"',
+            ],
+        )
+        owner_check = "\n".join(owner_check_lines)
+
+        with tempfile.TemporaryDirectory(prefix="host-handoff-owner-") as temporary:
+            root = Path(temporary)
+            root.chmod(0o777)
+            handoff_path = root / "handoff.json"
+            drop_privileges = None
+            if os.geteuid() == 0:
+                import pwd
+
+                unprivileged = pwd.getpwnam("nobody")
+
+                def drop_privileges() -> None:
+                    os.setgroups([])
+                    os.setgid(unprivileged.pw_gid)
+                    os.setuid(unprivileged.pw_uid)
+
+                expected_uid = unprivileged.pw_uid
+            else:
+                expected_uid = os.geteuid()
+
+            writer = (
+                "import sys; "
+                f"sys.path.insert(0, {str(REPO_ROOT / 'platform')!r}); "
+                "from tools.platform_workflow_input_guard import main; "
+                "raise SystemExit(main(['host-tools', '--output', sys.argv[1], "
+                "'--target-sha', 'a' * 40, '--host-tools-sha', 'b' * 40, "
+                "'--artifact-id', '123456', '--artifact-name', "
+                "'platform-host-tools-bundle-123456-2', '--artifact-size', '4096', "
+                "'--artifact-digest', 'c' * 64, '--bundle-sha256', 'd' * 64, "
+                "'--manifest-sha256', 'e' * 64, '--capabilities-sha256', 'f' * 64, "
+                "'--files-contract-sha256', '0' * 64, '--modes-contract-sha256', "
+                "'1' * 64, '--signer-workflow', "
+                "'StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml', "
+                "'--source-ref', 'refs/heads/dev', '--source-digest', 'a' * 40, "
+                "'--attestation-run-id', '123456', '--attestation-run-attempt', '2', "
+                "'--attestation-job-id', '654321']))"
+            )
+            write_result = subprocess.run(
+                ["/usr/bin/python3", "-c", writer, str(handoff_path)],
+                capture_output=True,
+                text=True,
+                preexec_fn=drop_privileges,
+                check=False,
+            )
+            self.assertEqual(write_result.returncode, 0, write_result.stderr)
+            metadata = handoff_path.lstat()
+            self.assertEqual(metadata.st_uid, expected_uid)
+            self.assertEqual(metadata.st_mode & 0o777, 0o600)
+            self.assertEqual(metadata.st_nlink, 1)
+
+            roundtrip = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-c",
+                    "import sys; "
+                    f"sys.path.insert(0, {str(REPO_ROOT / 'platform')!r}); "
+                    "from tools.platform_workflow_input_guard import main; "
+                    "raise SystemExit(main(['host-tools', '--input', sys.argv[1]]))",
+                    str(handoff_path),
+                ],
+                capture_output=True,
+                text=True,
+                preexec_fn=drop_privileges,
+                check=False,
+            )
+            self.assertEqual(roundtrip.returncode, 0, roundtrip.stderr)
+
+            def check_handoff(path: Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", "-c", owner_check],
+                    env={**os.environ, "handoff": str(path)},
+                    capture_output=True,
+                    text=True,
+                    preexec_fn=drop_privileges,
+                    check=False,
+                )
+
+            old_root_check = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'test "$(stat -c \'%F:%u:%h:%a\' -- "$handoff")" = '
+                    '"regular file:0:1:600"',
+                ],
+                env={**os.environ, "handoff": str(handoff_path)},
+                capture_output=True,
+                text=True,
+                preexec_fn=drop_privileges,
+                check=False,
+            )
+            self.assertNotEqual(old_root_check.returncode, 0)
+            self.assertEqual(check_handoff(handoff_path).returncode, 0)
+
+            handoff_path.chmod(0o640)
+            self.assertNotEqual(check_handoff(handoff_path).returncode, 0)
+            handoff_path.chmod(0o600)
+            hard_link = root / "handoff-hard-link.json"
+            os.link(handoff_path, hard_link)
+            self.assertNotEqual(check_handoff(handoff_path).returncode, 0)
+            hard_link.unlink()
+            symlink = root / "handoff-symlink.json"
+            symlink.symlink_to(handoff_path)
+            self.assertNotEqual(check_handoff(symlink).returncode, 0)
+
+            if os.geteuid() == 0:
+                root_owned = root / "root-owned.json"
+                root_owned.write_text("{}\n", encoding="ascii")
+                root_owned.chmod(0o600)
+                self.assertNotEqual(check_handoff(root_owned).returncode, 0)
+
     def test_external_load_checked_out_client_has_no_ssh_material_or_persisted_creds(
         self,
     ) -> None:
