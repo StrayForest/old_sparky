@@ -19,8 +19,12 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     _payload_rows,
     deployment_snapshot_digest,
     latest_context_status,
+    parse_status_timestamp,
     validate_deployment_event,
     validate_deployment_marker,
+)
+from tools.platform_deploy_baseline import (  # noqa: E402
+    validate_active_baseline,
 )
 
 
@@ -77,6 +81,198 @@ class WorkflowProvenanceTests(unittest.TestCase):
             }
         ]
         return workflow, run, jobs, statuses
+
+    def _baseline(self, source_sha: str | None = None) -> dict[str, object]:
+        return {
+            "schema": 1,
+            "source_sha": source_sha or self.SHA,
+            "release_slug": "gha-35511236041-1-20260920T123932Z",
+            "release_json_sha256": "b" * 64,
+            "current_link_dev": 253,
+            "current_link_ino": 910001,
+            "release_dev": 253,
+            "release_ino": 910002,
+            "pending_operation": False,
+        }
+
+    def test_active_baseline_accepts_old_exact_deployment_proof(self) -> None:
+        workflow, run, jobs, statuses = self._payload()
+        result = validate_active_baseline(
+            self._baseline(),
+            workflow,
+            run,
+            jobs,
+            statuses,
+            expected_target_sha=self.SHA,
+            current_dev_sha=self.SHA,
+            first_parent_shas=[self.SHA],
+            statuses_complete=True,
+            jobs_complete=True,
+            now=datetime(2026, 10, 20, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            result["deployment_attempt_url"],
+            "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
+        )
+
+    def test_active_baseline_may_be_older_first_parent_ancestor(self) -> None:
+        workflow, run, jobs, statuses = self._payload()
+        target_sha = "c" * 40
+        result = validate_active_baseline(
+            self._baseline(),
+            workflow,
+            run,
+            jobs,
+            statuses,
+            expected_target_sha=target_sha,
+            current_dev_sha=target_sha,
+            first_parent_shas=[target_sha, self.SHA],
+            statuses_complete=True,
+            jobs_complete=True,
+            now=datetime(2026, 10, 20, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result["target_sha"], target_sha)
+
+    def test_active_baseline_requires_current_target_and_first_parent_ancestry(self) -> None:
+        workflow, run, jobs, statuses = self._payload()
+        common = {
+            "expected_target_sha": self.SHA,
+            "current_dev_sha": self.SHA,
+            "statuses_complete": True,
+            "jobs_complete": True,
+        }
+        for baseline, current_dev, parents in (
+            (self._baseline("b" * 40), self.SHA, [self.SHA]),
+            (self._baseline(), "c" * 40, [self.SHA]),
+            (self._baseline(), self.SHA, ["c" * 40, "d" * 40]),
+            (self._baseline(), self.SHA, [self.SHA, self.SHA]),
+            (self._baseline(), self.SHA, []),
+        ):
+            with self.subTest(baseline_sha=baseline["source_sha"], parents=parents):
+                with self.assertRaises(ProvenanceError):
+                    validate_active_baseline(
+                        baseline,
+                        workflow,
+                        run,
+                        jobs,
+                        statuses,
+                        **{
+                            **common,
+                            "current_dev_sha": current_dev,
+                            "first_parent_shas": parents,
+                        },
+                    )
+
+    def test_active_baseline_rejects_pending_or_malformed_host_tuple(self) -> None:
+        workflow, run, jobs, statuses = self._payload()
+        for key, value in (
+            ("pending_operation", True),
+            ("pending_operation", None),
+            ("current_link_ino", True),
+            ("release_dev", -1),
+            ("release_json_sha256", "g" * 64),
+            ("release_slug", "../current"),
+        ):
+            baseline = self._baseline()
+            baseline[key] = value
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(ProvenanceError):
+                    validate_active_baseline(
+                        baseline,
+                        workflow,
+                        run,
+                        jobs,
+                        statuses,
+                        expected_target_sha=self.SHA,
+                        current_dev_sha=self.SHA,
+                        first_parent_shas=[self.SHA],
+                        statuses_complete=True,
+                        jobs_complete=True,
+                    )
+        extra = self._baseline()
+        extra["unexpected"] = "ignored fields must not be accepted"
+        with self.assertRaises(ProvenanceError):
+            validate_active_baseline(
+                extra,
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_target_sha=self.SHA,
+                current_dev_sha=self.SHA,
+                first_parent_shas=[self.SHA],
+                statuses_complete=True,
+                jobs_complete=True,
+            )
+
+    def test_active_baseline_rejects_incomplete_or_ambiguous_status_proof(self) -> None:
+        workflow, run, jobs, statuses = self._payload()
+        common = {
+            "expected_target_sha": self.SHA,
+            "current_dev_sha": self.SHA,
+            "first_parent_shas": [self.SHA],
+            "jobs_complete": True,
+        }
+        for candidate_statuses, complete in (
+            (statuses, False),
+            ([], True),
+            (
+                statuses
+                + [
+                    {
+                        **statuses[0],
+                        "id": 9101,
+                        "target_url": "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/1",
+                    }
+                ],
+                True,
+            ),
+            (
+                statuses
+                + [
+                    {
+                        **statuses[0],
+                        "id": 9101,
+                        "state": "failure",
+                        "description": "Production deployment failed",
+                    }
+                ],
+                True,
+            ),
+        ):
+            with self.subTest(complete=complete, rows=len(candidate_statuses)):
+                with self.assertRaises(ProvenanceError):
+                    validate_active_baseline(
+                        self._baseline(),
+                        workflow,
+                        run,
+                        jobs,
+                        candidate_statuses,
+                        **{**common, "statuses_complete": complete},
+                    )
+
+        with self.assertRaises(ProvenanceError):
+            validate_active_baseline(
+                self._baseline(),
+                workflow,
+                run,
+                jobs,
+                statuses,
+                **{**common, "statuses_complete": True, "jobs_complete": False},
+            )
+
+    def test_no_age_status_timestamp_still_rejects_future_values(self) -> None:
+        now = datetime(2026, 10, 20, tzinfo=timezone.utc)
+        self.assertEqual(
+            parse_status_timestamp(
+                "2026-09-19T10:00:00Z", now=now, max_age=None
+            ),
+            datetime(2026, 9, 19, 10, tzinfo=timezone.utc),
+        )
+        with self.assertRaises(ProvenanceError):
+            parse_status_timestamp(
+                "2026-10-21T10:00:00Z", now=now, max_age=None
+            )
 
     def test_exact_deploy_attempt_is_accepted(self) -> None:
         workflow, run, jobs, statuses = self._payload()
