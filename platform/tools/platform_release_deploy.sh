@@ -385,6 +385,13 @@ wait_for_activation_readiness() {
 }
 
 release_preflight() {
+  local active_revision_flag=()
+  if [[ "${1:-}" == "--defer-active-alembic-revision-check" ]]; then
+    active_revision_flag=(--defer-active-alembic-revision-check)
+  elif [[ -n "${1:-}" ]]; then
+    public_status failed argument >&2
+    return 1
+  fi
   local previous_flag=(--require-previous)
   if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
     previous_flag=(--allow-initial-install)
@@ -407,6 +414,7 @@ release_preflight() {
   fi
   "$TOOLS_DIR/platform_release_preflight.sh" \
     --app-dir "$APP_DIR" \
+    "${active_revision_flag[@]}" \
     "${previous_flag[@]}" \
     --require-verified-backup \
     --require-edge-parity \
@@ -1359,7 +1367,7 @@ abort_quiesce_receipt() {
 acquire_release_lock
 
 run_release_preflight_quiet() {
-  release_preflight
+  release_preflight "$@"
 }
 
 if [[ "$ABORT_RETAINED" -eq 1 ]]; then
@@ -1398,7 +1406,8 @@ if [[ "$RESUME" -eq 0 ]]; then
     public_status failed pending_operation >&2
     exit 3
   fi
-  run_release_preflight_quiet >/dev/null 2>/dev/null
+  run_release_preflight_quiet --defer-active-alembic-revision-check \
+    >/dev/null 2>/dev/null
   quiesce_runtime_writers
   # The candidate installer re-enters through the same pathname-form flock
   # supervisor.  Do not pass a numeric lock FD through the environment: util-
@@ -1487,7 +1496,8 @@ fi
 # Re-run the read-only gate while the release lock is held and writers are
 # quiesced. This closes the preflight -> stage TOCTOU window before migration.
 if [[ "$phase" == "staged" || "$phase" == "migration-pending" || "$phase" == "migration-failed" ]]; then
-  release_preflight >/dev/null 2>/dev/null
+  release_preflight --defer-active-alembic-revision-check \
+    >/dev/null 2>/dev/null
 fi
 
 case "$phase" in

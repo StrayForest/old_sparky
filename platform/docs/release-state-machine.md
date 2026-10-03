@@ -112,6 +112,15 @@ In production the migration wrapper accepts only the exact two-argument
 `upgrade head` command; introspection, downgrade, flags and other Alembic
 argv forms are rejected before any writer quiesce or database access.
 
+During a deploy, operational preflight remains mandatory while active-release
+Alembic current/head equality is deferred until the authenticated candidate is
+staged. With both release locks held and application writers stopped, the
+candidate runtime validates that the single live `platformdb` revision is an
+ancestor or the sole head of the candidate graph before recovery helpers or
+migration writes run. Only a clean first-install transaction may have an
+empty revision registry. Operator preflight and post-activation checks remain
+strict; see the [candidate-bound migration guard ADR](adr/candidate-forward-migration-guard.md).
+
 Before the first service stop, the deploy wrapper captures the state of
 `deadlock-api`, `deadlock-worker`, `deadlock-web` and the
 `deadlock-cloudflare-ips.timer`. It records that snapshot in

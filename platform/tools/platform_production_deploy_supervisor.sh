@@ -383,8 +383,18 @@ fi
 set_lock_failure_context release_open
 platform_release_lock_open || fail "the canonical release lock could not be validated"
 set_lock_failure_context retained_supervise
-platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}" || \
-  fail "the retained-load lock supervisor could not be started"
+if platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}"; then
+  :
+else
+  lock_status=$?
+  if [[ "$lock_status" -eq "$PLATFORM_RELEASE_LOCK_CONFLICT_EXIT_CODE" ]]; then
+    fail "the retained-load lock supervisor could not be started"
+  fi
+  # A successfully acquired flock returns its callback body's status.  Let
+  # ordinary child failures and their already-validated marker reach the
+  # dispatcher without relabeling them as a retained-lock boundary failure.
+  exit "$lock_status"
+fi
 if [[ "${PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED:-}" != "1" ]]; then
   exit 0
 fi
@@ -437,6 +447,10 @@ fi
 
 set_failure_context preflight preflight preflight_failed
 preflight_previous_flag=(--require-previous)
+active_revision_preflight_flag=()
+if [[ "$deploy_mode" == "deploy" ]]; then
+  active_revision_preflight_flag=(--defer-active-alembic-revision-check)
+fi
 if (( initial_install == 1 )); then
   preflight_previous_flag=(--allow-initial-install)
 elif (( current_only_install == 1 )); then
@@ -444,9 +458,11 @@ elif (( current_only_install == 1 )); then
 fi
 "$host_tools_dir/platform_release_preflight.sh" \
   "${preflight_previous_flag[@]}" \
+  "${active_revision_preflight_flag[@]}" \
   --require-verified-backup \
   --require-edge-parity \
-  --backup-max-age-hours 24 >/dev/null 2>/dev/null
+  --backup-max-age-hours 24 >/dev/null 2>/dev/null \
+  || fail "production preflight failed"
 
 if [[ "$deploy_mode" == "preflight" ]]; then
   printf 'RELEASE_DEPLOY schema=1 status=passed class=preflight release_slug=%s source_sha=%s\n' \
@@ -596,9 +612,11 @@ set_failure_context preflight preflight preflight_failed
 "$host_tools_dir/platform_release_preflight.sh" \
   --app-dir "$runtime" \
   "${preflight_previous_flag[@]}" \
+  --defer-active-alembic-revision-check \
   --require-verified-backup \
   --require-edge-parity \
-  --backup-max-age-hours 24 >/dev/null 2>/dev/null
+  --backup-max-age-hours 24 >/dev/null 2>/dev/null \
+  || fail "production preflight failed"
 
 set_failure_context deployment candidate candidate_missing
 candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"

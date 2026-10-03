@@ -18,17 +18,17 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_production_deploy_supervisor.sh",
-      "sha256": "3554235f3dd487592060d8c445bcd7031c01e3728bcbbf6812b0ee301695e091"
+      "sha256": "f045da97ba63f72d4b9d61691e7ecf656042bbe83576cf36415d42955cbde69e"
     },
     {
       "mode": 493,
       "path": "platform/tools/platform_release_lock.sh",
-      "sha256": "19e4d922af1192fe9a92b07762f365af766ed8524fd992ad0dacf457b63336fa"
+      "sha256": "48f214bcb5ecc2ce843ba8290cbf11daa001e6b2265f0b1ffed020af2f1f1307"
     },
     {
       "mode": 493,
       "path": "platform/tools/platform_release_preflight.sh",
-      "sha256": "bd434b2413233b2c7d5d4bfe8a4845386083e01260c743c73b64f320b7603924"
+      "sha256": "5b261403af217cf210a4bab393fa1fc6ef7954d42f6a9830b95ce6a343fbacb4"
     },
     {
       "mode": 493,
@@ -66,7 +66,7 @@
       "sha256": "2fe2c8ebfdea6f24ee6d7c7e1a4539a88fdc70449c66cc50eedf9caab3ae2ebf"
     }
   ],
-  "host_tools_sha": "8dc6e58b6d89830c284a32d26cf755056d4a5997",
+  "host_tools_sha": "7b87e2a996270e818f3b1f0c95c03fe98ab53916",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }

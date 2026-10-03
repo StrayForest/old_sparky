@@ -144,6 +144,7 @@ if (
     print("invalid")
 else:
     print("valid")
+print(record.get("candidate_release") or "")
 '
   )
   if [[ "${transaction_fields[0]:-}" != "install" \
@@ -177,6 +178,11 @@ else:
     echo "Production Alembic release pointers do not match the transaction." >&2
     exit 1
   fi
+  candidate_root="$(readlink -f -- "$PLATFORM_ROOT_DIR" 2>/dev/null || true)"
+  if [[ -z "$candidate_root" || "$candidate_root" != "${transaction_fields[6]:-}" ]]; then
+    echo "Production Alembic candidate does not match the release transaction." >&2
+    exit 1
+  fi
 
   # Repeat the complete release preflight after staging, while the deploy
   # wrapper holds the release lock. This closes the preflight->staging TOCTOU
@@ -192,6 +198,7 @@ else:
   "$TOOLS_DIR/platform_release_preflight.sh" \
     --app-dir "$PLATFORM_APP_DIR" \
     "${migration_preflight_previous_flag[@]}" \
+    --defer-active-alembic-revision-check \
     --require-verified-backup \
     --require-edge-parity \
     --backup-max-age-hours 24
@@ -216,6 +223,29 @@ else:
         exit 1
       fi
     done
+  fi
+
+  # The active release graph may be older than the authenticated candidate.
+  # At this point the candidate runtime is selected, writers are quiesced and
+  # the exact install transaction/pointers were verified above. Validate the
+  # live database revision against that candidate's sole forward graph before
+  # recovery helpers or Alembic can write anything.
+  migration_guard="$PLATFORM_ROOT_DIR/tools/platform_release_migration_guard.py"
+  if [[ ! -f "$migration_guard" || -L "$migration_guard" ]]; then
+    echo "Production candidate migration guard is missing or unsafe." >&2
+    exit 1
+  fi
+  migration_guard_args=(
+    --candidate-dir "$PLATFORM_ROOT_DIR"
+  )
+  if [[ -z "${transaction_fields[3]:-}" && -z "${transaction_fields[4]:-}" ]]; then
+    migration_guard_args+=(--allow-empty-database)
+  fi
+  if ! "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after=5s 30s \
+    "$PLATFORM_PYTHON_BIN" -I -B "$migration_guard" \
+    "${migration_guard_args[@]}"; then
+    echo "Production candidate migration path validation failed." >&2
+    exit 1
   fi
 
   # 0051 commits its table/backfill before concurrent indexes.  Repair only
