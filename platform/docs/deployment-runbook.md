@@ -87,7 +87,7 @@ to `dev`. The chain is:
    `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` generation. It
    requires the configured SSH identity to be root and checks the generation's
    owner, mode, link count, type, capabilities and every digest with fixed
-   absolute tools. The C2 capability contract requires
+   absolute tools. The C3 capability contract requires
    `dispatcher=3`, `supervisor=3`, `release_baseline=1` and
    `python_bytecode_disabled=1`; every immutable dispatcher call uses
    `/usr/bin/python3.12 -I -B`. This is a read-only gate: it never SCPs or executes the
@@ -272,13 +272,13 @@ fail closed after artifact publication. Verify the exact workflow attempt,
 successful builder job, artifact provenance and distinct `TARGET_SHA=P` /
 `HOST_TOOLS_SHA=C` identities before provisioning through the approved
 root-only authority. This run performs no release install or production
-write. Activate the range only through automatic authenticated
-`baseline-reconcile`; never manually dispatch normal `mode=deploy` to repair a
-missing generation. Retain the previous generation, require the exact
-post-copy inventory, and do not use a workflow installer or `current/tools`
-fallback. Application-only SHAs reuse the pinned generation; see the [host-tools
-provisioning ADR](adr/production-host-tools-provisioning.md) for the full C/P
-provenance and receipt fields.
+write. Retain the previous generation and exact post-copy inventory; do not use a workflow installer or `current/tools` fallback.
+If the automatic child stopped only because **C** was absent at the read-only capability gate, do not rerun that child or only failed jobs.
+After provisioning/self-testing **C**, require successful read-only `mode=preflight` at unchanged **P**.
+Only if **P** remains current `dev`, exact source-CI proof is valid, host tuple is unchanged and no operation is pending, rerun all jobs on the exact completed `Platform production auto-deploy` run.
+This preserves source/ref and triggering actor, advances the auto attempt and dispatches a fresh child bound to it; verify both new run IDs/attempts and exact success markers.
+If preconditions changed, follow the automatic chain for current `dev`; never manually dispatch `mode=deploy`/`mode=baseline-reconcile`. Application-only SHAs reuse the pin.
+See the [host-tools provisioning ADR](adr/production-host-tools-provisioning.md) for C/P provenance and receipt fields.
 Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly
 for a normal release. Those commands are implementation details of the
 workflow; direct server execution is limited to an explicitly authorized

@@ -12,11 +12,10 @@ generation.  The immutable path is:
 The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
-is the only source for `HOST_TOOLS_SHA`; it currently pins the reviewed
-generation `e23ac34a4a712104307e573d2ca8f879ddd54185`. This repository pin is
-not evidence that the generation is installed: production remains on its
-previous generation until a root-console provisioning receipt verifies the
-new path. The pin records the
+is the only source for `HOST_TOOLS_SHA`; the reviewed C3 change pins generation
+`8dc6e58b6d89830c284a32d26cf755056d4a5997`. This repository pin is not
+evidence that the generation is installed: production remains on C2 until a
+root-console provisioning receipt verifies the new path. The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
 ancestor of the reviewed application target. There is no `current` or
@@ -298,6 +297,21 @@ never by pinning the commit that carries the pin itself:
    baseline-reconcile path. Its exact full-CI and runtime proofs, current
    deployed-source proof, cumulative classifier result and lock-held host
    recheck remain mandatory.
+
+If that automatic child stopped only because **C** was absent at the
+read-only host-capability gate, do not rerun that child or only its failed
+jobs. After provisioning and self-testing **C**, run a successful read-only
+`mode=preflight` at the unchanged **P**. If **P** is still the current `dev`
+HEAD, its exact successful source-CI proof remains valid, the deployed host
+tuple is unchanged and no operation is pending, rerun **all jobs** on the exact
+completed `Platform production auto-deploy` workflow run that authorized the
+child. This preserves the original source/ref and triggering actor while
+advancing the auto-deploy attempt; its dispatch job must create a fresh
+production child bound to that new auto run ID/attempt. Verify the new auto
+and child run IDs/attempts and their exact success markers before accepting
+the release. If any precondition changed, stop and follow the normal exact-SHA
+automatic chain for the current `dev` HEAD. Never manually dispatch
+`mode=deploy` or rerun only the failed production child as a continuation.
 
 This sequence avoids an impossible self-referential merge-SHA pin while
 ensuring the reviewed generation is built, attested, provisioned and tested
