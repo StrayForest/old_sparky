@@ -411,14 +411,22 @@ def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "web_compression",
     }
     host_tools_key = "host_tools"
+    baseline_key = "baseline_identity"
     if set(payload) == legacy_keys:
         schema_with_host_tools = False
     elif set(payload) == legacy_keys | {host_tools_key}:
         schema_with_host_tools = True
+        schema_with_baseline = False
+    elif set(payload) == legacy_keys | {host_tools_key, baseline_key}:
+        schema_with_host_tools = True
+        schema_with_baseline = True
     else:
         raise _invalid()
+    if set(payload) == legacy_keys:
+        schema_with_baseline = False
     if schema_with_host_tools:
-        if payload.get("schema") not in (2, "2"):
+        expected_schema = (3, "3") if schema_with_baseline else (2, "2")
+        if payload.get("schema") not in expected_schema:
             raise _invalid()
     else:
         _validate_schema(payload.get("schema"))
@@ -461,9 +469,59 @@ def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "web_compression": web_compression,
     }
     if schema_with_host_tools:
-        result["schema"] = "2"
+        result["schema"] = "3" if schema_with_baseline else "2"
         result[host_tools_key] = validate_host_tools_payload(payload.get(host_tools_key))
+    if schema_with_baseline:
+        if mode != "deploy":
+            raise _invalid()
+        result[baseline_key] = validate_release_baseline_payload(payload.get(baseline_key))
     return result
+
+
+def validate_release_baseline_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the exact tuple that the immutable supervisor rechecks."""
+
+    payload = _require_mapping(payload)
+    keys = {
+        "schema",
+        "source_sha",
+        "release_slug",
+        "release_json_sha256",
+        "current_link_dev",
+        "current_link_ino",
+        "release_dev",
+        "release_ino",
+        "pending_operation",
+    }
+    _require_exact_keys(payload, keys)
+    if (
+        type(payload.get("schema")) is not int
+        or payload.get("schema") != 1
+        or payload.get("pending_operation") is not False
+    ):
+        raise _invalid()
+    source_sha = _require_string(payload, "source_sha")
+    release_slug = _require_string(payload, "release_slug")
+    receipt_digest = _require_string(payload, "release_json_sha256")
+    if (
+        SHA_RE.fullmatch(source_sha) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", release_slug) is None
+        or HEX_DIGEST_RE.fullmatch(receipt_digest) is None
+    ):
+        raise _invalid()
+    identity: dict[str, Any] = {
+        "schema": 1,
+        "source_sha": source_sha,
+        "release_slug": release_slug,
+        "release_json_sha256": receipt_digest,
+        "pending_operation": False,
+    }
+    for name in ("current_link_dev", "current_link_ino", "release_dev", "release_ino"):
+        value = payload.get(name)
+        if type(value) is not int or value < 0 or value > 2**63 - 1:
+            raise _invalid()
+        identity[name] = value
+    return identity
 
 
 def validate_host_tools_payload(payload: Mapping[str, Any]) -> dict[str, str]:

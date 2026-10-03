@@ -22,7 +22,7 @@ invalid_input() {
   exit 2
 }
 
-if (( $# != 5 && $# != 8 )); then
+if (( $# != 5 && $# != 8 && $# != 9 )); then
   invalid_input
 fi
 target_sha="$1"
@@ -33,10 +33,16 @@ runtime_profile="$5"
 host_tools_sha=""
 host_manifest_sha=""
 host_capabilities_sha=""
+baseline_identity_b64=""
 if (( $# == 8 )); then
   host_tools_sha="$6"
   host_manifest_sha="$7"
   host_capabilities_sha="$8"
+elif (( $# == 9 )); then
+  host_tools_sha="$6"
+  host_manifest_sha="$7"
+  host_capabilities_sha="$8"
+  baseline_identity_b64="$9"
 fi
 
 runtime=/opt/oldsparky/platform
@@ -431,6 +437,15 @@ if [[ "$deploy_mode" == "preflight" ]]; then
 fi
 
 [[ "$deploy_mode" == "deploy" ]] || fail "unsupported deployment mode"
+if [[ -n "$baseline_identity_b64" ]]; then
+  set_failure_context preflight preflight baseline_changed
+  [[ "$baseline_identity_b64" =~ ^[A-Za-z0-9+/]{1,4096}={0,2}$ ]] \
+    || fail "authenticated release baseline is malformed"
+  /usr/bin/python3.12 -I -B \
+    "$host_tools_dir/platform_workflow_remote_dispatch.py" \
+    host-release-baseline-match "$baseline_identity_b64" >/dev/null 2>&1 \
+    || fail "active release identity changed before deployment"
+fi
 set_failure_context artifact artifact artifact_missing
 if [[ ! -d "$artifact_dir" || -L "$artifact_dir" ]]; then
   fail "CI release artifact directory is missing"

@@ -3115,6 +3115,89 @@ cleanup
         self.assertIn('/usr/bin/chmod -R go-w -- "$STAGING_DIR"', script)
         self.assertIn("! -type l -perm /022 -print -quit", script)
 
+    def test_deployment_handoff_accepts_only_closed_baseline_tuple(self) -> None:
+        from tools.platform_workflow_input_guard import WorkflowInputError
+        from tools.platform_workflow_input_guard import validate_deployment_payload
+
+        target_sha = "a" * 40
+        host_tools = {
+            "schema": "1",
+            "target_sha": target_sha,
+            "host_tools_sha": "b" * 40,
+            "artifact_id": "123456",
+            "artifact_name": "platform-host-tools-bundle-123456-2",
+            "artifact_size": "4096",
+            "artifact_digest": "c" * 64,
+            "bundle_sha256": "d" * 64,
+            "manifest_sha256": "e" * 64,
+            "capabilities_sha256": "f" * 64,
+            "files_contract_sha256": "0" * 64,
+            "modes_contract_sha256": "1" * 64,
+            "signer_workflow": "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml",
+            "source_ref": "refs/heads/dev",
+            "source_digest": target_sha,
+            "attestation_run_id": "123456",
+            "attestation_run_attempt": "2",
+            "attestation_job_id": "123457",
+        }
+        baseline = {
+            "schema": 1,
+            "source_sha": "87547df2abd4aa06a07f4dd4b4f730e9912707e1",
+            "release_slug": "gha-35511236041-1-87547df2abd4",
+            "release_json_sha256": "2" * 64,
+            "current_link_dev": 7,
+            "current_link_ino": 8,
+            "release_dev": 7,
+            "release_ino": 9,
+            "pending_operation": False,
+        }
+        payload = {
+            "schema": 3,
+            "mode": "deploy",
+            "runtime_profile": "baseline",
+            "release_slug": "gha-37120000000-1-aaaaaaaaaaaa",
+            "target_sha": target_sha,
+            "artifact_remote_dir": "/tmp/old-sparky-platform-artifact-37120000000-1",
+            "classifier_run_id": "37120000000",
+            "classifier_run_attempt": "1",
+            "web_compression": "enabled",
+            "host_tools": host_tools,
+            "baseline_identity": baseline,
+        }
+        validated = validate_deployment_payload(payload)
+        self.assertEqual(validated["schema"], "3")
+        self.assertEqual(validated["baseline_identity"], baseline)
+
+        for field, invalid_value in (
+            ("pending_operation", True),
+            ("source_sha", "not-a-source-sha"),
+            ("current_link_ino", True),
+        ):
+            with self.subTest(field=field):
+                invalid = dict(payload)
+                invalid["baseline_identity"] = {**baseline, field: invalid_value}
+                with self.assertRaises(WorkflowInputError):
+                    validate_deployment_payload(invalid)
+        extra = dict(payload)
+        extra["baseline_identity"] = {**baseline, "caller_claim": "ignored"}
+        with self.assertRaises(WorkflowInputError):
+            validate_deployment_payload(extra)
+        preflight = dict(payload)
+        preflight["mode"] = "preflight"
+        with self.assertRaises(WorkflowInputError):
+            validate_deployment_payload(preflight)
+
+    def test_supervisor_rechecks_active_baseline_under_both_release_locks(self) -> None:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        retained_lock = supervisor.index("platform_retained_load_lock_open \\")
+        baseline_query = supervisor.index("host-release-baseline-match")
+        candidate_artifact = supervisor.index('find "$artifact_dir" -maxdepth 1')
+        self.assertLess(retained_lock, baseline_query)
+        self.assertLess(baseline_query, candidate_artifact)
+        self.assertIn("platform_release_lock_open ||", supervisor)
+        self.assertIn("platform_retained_load_lock_open \\\n  || fail", supervisor)
+        self.assertIn("baseline_identity_b64", supervisor)
+
 
 if __name__ == "__main__":
     unittest.main()

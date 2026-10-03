@@ -15,7 +15,8 @@ Use this document for the normal immutable release path. CSP mode changes and pr
    run for the current `dev` HEAD is the normal production release signal and
    is consumed by the automatic deployment workflow; a docs-only,
    out-of-scope or candidate-packaging-only full-route run is a successful
-   non-deployable no-op. Do not substitute a manually run local test.
+   non-deployable no-op. Recovery-bootstrap-only runs remain a no-op until the
+   separately reviewed Phase B capability exists. Do not substitute local tests.
 3. Confirm migration expand/rollback compatibility.
 4. Confirm services are healthy, disk has at least 5 GiB available and is at
    most 85% conservative use, and `current`/`previous` releases are protected.
@@ -39,7 +40,13 @@ to `dev`. The chain is:
 3. The auto-deploy gate downloads the classifier artifact from that exact
    security run, validates its schema, digest, target SHA and non-fallback
    route, then consumes its `deployable` bit: a deployable `full` route
-   proceeds while a valid full CI-only route completes as a no-op. It then
+   proceeds while a valid full CI-only route completes as a no-op. A route
+   classified specifically as recovery-bootstrap-only remains non-deployable
+   until the separately reviewed Phase B baseline-reconcile capability is
+   implemented and provisioned. That future read-only mode cannot authorize
+   normal deployment unless it independently authenticates the active baseline
+   and classifies the complete baseline-to-target range as an ordinary
+   deployable full route. It then
    re-reads the current `dev` HEAD and refuses a stale successful CI result.
    The source run and both status snapshots are
    checked by the shared dependency-free
@@ -51,8 +58,10 @@ to `dev`. The chain is:
    object. It then requires `platform-security-build=success` and skips a SHA that already
    reports `platform-production-deploy=success` only when the matching
    successful deploy attempt has its exact bot-authored marker.
-4. When those checks pass, the auto-deploy workflow dispatches
-   `Platform production deploy` with `mode=deploy` on `dev`.
+4. The current automatic chain dispatches `mode=deploy` only for ordinary
+   deployable full routes. A recovery-bootstrap-only route is a no-op/hold
+   until the Phase B baseline-reconcile capability is separately implemented,
+   reviewed and provisioned.
 5. A secret-free prerequisite independently downloads and validates the exact
    classifier artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
@@ -63,7 +72,7 @@ to `dev`. The chain is:
    Both checks execute one canonical parser from an immutable trusted `dev`
    checkout, never candidate source. Immediately before its first
    production-host write, the workflow re-reads the authoritative `dev` branch
-   head. If `dev` moved from `TARGET_SHA` (the A→B race), the workflow aborts
+   head. If `dev` moved from `TARGET_SHA`, the workflow aborts
    closed; only then does it transfer and install the artifact and run
    production smoke.
 6. Before the expensive release build, `build-host-tools` resolves the
@@ -93,6 +102,18 @@ to `dev`. The chain is:
    `size_in_bytes` to the downloaded archive byte size.
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
+
+### Planned Phase B: recovery-bootstrap baseline reconciliation
+
+This capability is not implemented or available from Phase A. Do not manually
+dispatch or attempt to activate it. If separately reviewed, merged and
+provisioned, it will require exact full CI, an authenticated active-release
+baseline, complete first-parent reclassification and a lock-held host-state
+recheck. Missing, ambiguous or changed state must fail closed; bootstrap-only
+ranges remain a verified no-op. See the
+[baseline-reconcile ADR](adr/recovery-bootstrap-retained-abort.md#authenticated-baseline-reconciliation-for-bootstrap-only-source-ranges)
+and [host-tools provisioning ADR](adr/production-host-tools-provisioning.md)
+for the full contracts and C/P provenance.
 
 ### Non-deployable pull-request host-tools candidate
 
@@ -227,27 +248,26 @@ or when diagnosing the automatic contour. The same exact-SHA
 `platform-security-build=success` and deployable classifier artifact gates still
 apply to `mode=deploy`; provide the originating security `run_id` and
 `run_attempt`. A missing, malformed, fallback or non-deployable manifest blocks
-deployment. `mode=preflight` remains available without that release artifact
-guard and performs no install.
+deployment. `mode=baseline-reconcile` is a planned Phase B mode, not currently
+available and never an operator fallback. `mode=preflight` remains available
+without that release artifact guard and performs no install.
 
 Both `mode=deploy` and the read-only `mode=preflight` require the immutable
-host-tools capability gate. Manual dispatch cannot provision or repair that
-generation: operators must use the approved out-of-band host-image/console
-procedure, retain the previous valid generation, and repeat the reviewed
-`dev` operation only after the exact post-copy inventory passes. There is no
-workflow self-installer, uploaded installer, copied generation or legacy
-`current/tools` fallback for the production dispatcher. Later application
-SHAs reuse the pinned generation. An intentional host-tools bump uses two
-reviewed commits: A changes the closure and is provisioned/self-tested at its
-exact SHA out of band; B is pin-only with respect to host control, points at A
-and records A's exact closure baseline, then merges only after provisioning.
-The resolver rejects the old pin at A and rejects any later closure drift
-without another bump, so the pin never targets B's own merge SHA.
-
-For a read-only production gate without an install, an operator may dispatch
-`mode=preflight` explicitly. A manual fallback must never be used to bypass a
-pending, failed, missing or stale security/build result.
-
+host-tools capability gate. For a bump, first require full exact-SHA CI on the
+merged pin-bearing target **P**, which descends from code commit **C** and pins
+its exact closure. The documented read-only `mode=preflight` then builds and
+attests the generation from **C**; if it is not installed, capability checks
+fail closed after artifact publication. Verify the exact workflow attempt,
+successful builder job, artifact provenance and distinct `TARGET_SHA=P` /
+`HOST_TOOLS_SHA=C` identities before provisioning through the approved
+root-only authority. This run performs no release install or production
+write. Activate the range only through automatic authenticated
+`baseline-reconcile`; never manually dispatch normal `mode=deploy` to repair a
+missing generation. Retain the previous generation, require the exact
+post-copy inventory, and do not use a workflow installer or `current/tools`
+fallback. Application-only SHAs reuse the pinned generation; see the [host-tools
+provisioning ADR](adr/production-host-tools-provisioning.md) for the full C/P
+provenance and receipt fields.
 Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly
 for a normal release. Those commands are implementation details of the
 workflow; direct server execution is limited to an explicitly authorized

@@ -97,7 +97,7 @@ def parse_status_timestamp(
     value: object,
     *,
     now: datetime | None = None,
-    max_age: timedelta = STATUS_MAX_AGE,
+    max_age: timedelta | None = STATUS_MAX_AGE,
     max_future_skew: timedelta = STATUS_MAX_FUTURE_SKEW,
 ) -> datetime:
     """Parse and bound a GitHub status timestamp.
@@ -106,15 +106,17 @@ def parse_status_timestamp(
     They therefore accept only second-precision UTC ``Z`` values.  A caller
     may provide a fixed ``now`` in tests or a workflow snapshot; the default
     is the current UTC clock.  Future and stale timestamps are rejected rather
-    than being silently sorted around.
+    than being silently sorted around. ``max_age=None`` removes only the
+    wall-clock age cutoff for a host-verified active deployment baseline; strict
+    timestamp parsing and future checks still apply.
     """
 
     if (
         not isinstance(value, str)
         or UTC_STATUS_TIMESTAMP_RE.fullmatch(value) is None
-        or not isinstance(max_age, timedelta)
+        or (max_age is not None and not isinstance(max_age, timedelta))
         or not isinstance(max_future_skew, timedelta)
-        or max_age <= timedelta(0)
+        or (max_age is not None and max_age <= timedelta(0))
         or max_future_skew < timedelta(0)
     ):
         raise _fail("status timestamp is malformed")
@@ -134,7 +136,7 @@ def parse_status_timestamp(
     reference = reference.astimezone(timezone.utc)
     if parsed > reference + max_future_skew:
         raise _fail("status timestamp is in the future")
-    if parsed < reference - max_age:
+    if max_age is not None and parsed < reference - max_age:
         raise _fail("status timestamp is outside the accepted window")
     return parsed
 
@@ -264,7 +266,7 @@ def latest_context_status(
     *,
     context: str,
     now: datetime | None = None,
-    max_age: timedelta = STATUS_MAX_AGE,
+    max_age: timedelta | None = STATUS_MAX_AGE,
     max_future_skew: timedelta = STATUS_MAX_FUTURE_SKEW,
 ) -> Mapping[str, Any]:
     """Select one unambiguous latest status; timestamp errors fail closed."""
@@ -299,7 +301,7 @@ def _status_effective_timestamp(
     *,
     context: str,
     now: datetime | None,
-    max_age: timedelta,
+    max_age: timedelta | None,
     max_future_skew: timedelta,
 ) -> datetime:
     """Validate every timestamp and return the row's effective update time."""
@@ -371,7 +373,7 @@ def validate_status_collection(
     *,
     context: str,
     now: datetime | None = None,
-    max_age: timedelta = STATUS_MAX_AGE,
+    max_age: timedelta | None = STATUS_MAX_AGE,
     max_future_skew: timedelta = STATUS_MAX_FUTURE_SKEW,
 ) -> None:
     """Validate a complete status collection without selecting a marker.
@@ -474,7 +476,7 @@ def validate_security_marker(
     expected_run_url: str | None = None,
     server_url: str = GITHUB_SERVER_URL,
     now: datetime | None = None,
-    max_age: timedelta = STATUS_MAX_AGE,
+    max_age: timedelta | None = STATUS_MAX_AGE,
     max_future_skew: timedelta = STATUS_MAX_FUTURE_SKEW,
 ) -> str:
     """Validate the exact security run and its trusted status marker."""
@@ -524,7 +526,7 @@ def validate_deployment_marker(
     expected_run_url: str | None = None,
     server_url: str = GITHUB_SERVER_URL,
     now: datetime | None = None,
-    max_age: timedelta = STATUS_MAX_AGE,
+    max_age: timedelta | None = STATUS_MAX_AGE,
     max_future_skew: timedelta = STATUS_MAX_FUTURE_SKEW,
 ) -> str:
     """Validate a successful deploy run and its exact bot-produced marker."""
@@ -583,7 +585,7 @@ def validate_deployment_event(
     expected_run_url: str | None = None,
     server_url: str = GITHUB_SERVER_URL,
     now: datetime | None = None,
-    max_age: timedelta = STATUS_MAX_AGE,
+    max_age: timedelta | None = STATUS_MAX_AGE,
     max_future_skew: timedelta = STATUS_MAX_FUTURE_SKEW,
 ) -> bool:
     """Validate a deployment workflow event and classify its side-effect state.
@@ -705,7 +707,7 @@ def _status_fingerprint(
     *,
     context: str,
     now: datetime,
-    max_age: timedelta = STATUS_MAX_AGE,
+    max_age: timedelta | None = STATUS_MAX_AGE,
     max_future_skew: timedelta = STATUS_MAX_FUTURE_SKEW,
 ) -> dict[str, Any]:
     """Return only the validated marker fields used by a read-race check."""

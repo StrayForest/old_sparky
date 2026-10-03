@@ -13,7 +13,10 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
 is the only source for `HOST_TOOLS_SHA`; it currently pins the reviewed
-generation `e2400a179c2b9d2dd5d8b256e3e79f08c6309a02`. The pin records the
+generation `e23ac34a4a712104307e573d2ca8f879ddd54185`. This repository pin is
+not evidence that the generation is installed: production remains on its
+previous generation until a root-console provisioning receipt verifies the
+new path. The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
 ancestor of the reviewed application target. There is no `current` or
@@ -70,9 +73,15 @@ to a delimiter-encoded shell string.
 
 The release build is downstream of this gate.  The production consumer invokes
 only the exact immutable dispatcher path with `/usr/bin/python3.12 -I -B`.
-Toolset v2 publishes the explicit `python_bytecode_disabled` capability.  The
-dispatcher also rejects a host-generation invocation that omits `-B` before
-loading its sibling guard, so a failed caller cannot leave a truncated
+Toolset v2 publishes the explicit `python_bytecode_disabled` capability. The
+reviewed baseline-capable generation also publishes `release_baseline=1` and
+provides the fixed `host-release-baseline` command. That query is root-only and
+read-only; it validates the current release receipt with the pinned artifact
+validator, rejects an active release/systemd transaction, and emits only the
+bounded source/release/pointer identity tuple used by the deployment
+supervisor's under-lock recheck. It does not read or execute application code.
+The dispatcher also rejects a host-generation invocation that omits `-B`
+before loading its sibling guard, so a failed caller cannot leave a truncated
 `__pycache__` member in the generation:
 
 `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>/platform_workflow_remote_dispatch.py`
@@ -162,10 +171,15 @@ approved host-image/configuration-management authority must perform the
 following once for a reviewed `HOST_TOOLS_SHA`; the GitHub workflow must not be
 used as the installer:
 
-1. Record the exact GitHub artifact ID, outer artifact digest, application
-   `TARGET_SHA` and pinned `HOST_TOOLS_SHA` from the successful
-   `build-host-tools` job. Download the ZIP through the
-   approved artifact channel and verify its SHA-256 before opening it.
+1. Record the successful exact-`TARGET_SHA` `Platform security and build`
+   run/attempt. From the separately authorized read-only `mode=preflight`
+   workflow run at that same merged `dev` SHA, record the exact successful
+   `build-host-tools` job/attempt, artifact ID/name, outer artifact digest,
+   application `TARGET_SHA` and pinned `HOST_TOOLS_SHA`. Verify that the
+   preflight run performed no release install or production write. Download
+   its ZIP through the approved artifact channel and verify its SHA-256 before
+   opening it. The pull-request candidate artifact is not an acceptable
+   substitute.
 2. Run the offline `platform_host_tools_bundle.py verify` command from the
    pinned reviewed checkout with the expected `HOST_TOOLS_SHA`. Retain the
    generated manifest/capability checksum files with the provisioning record.
@@ -207,45 +221,91 @@ self-test is the fixed installed entrypoint, with no candidate input:
 ```bash
 /usr/bin/python3.12 -I -B \
   /opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA/platform_workflow_remote_dispatch.py \
-  host-capabilities
+host-capabilities
 ```
 
 The self-test must print only the bounded `HOST_TOOLS schema=1 ...` contract,
-including `python_bytecode_disabled=1`, and return zero.  It must not create
+including `release_baseline=1` and `python_bytecode_disabled=1`, and return
+zero. The baseline query is separately exercised only after the capability
+gate confirms this exact generation. It must not create
 `__pycache__` or `.pyc` entries.  A non-zero result, any metadata/digest mismatch or an
 interrupted staging action is a failed provisioning attempt: quarantine/remove
 only that identified incomplete staging/generation through the approved
 authority, retain the previous valid generation, record post-failure hashes and
 do not retry by changing permissions or using `current/tools`.
 
-The first deployment after provisioning is still an ordinary reviewed `dev`
-push/automatic chain.  A missing or mismatched generation blocks before release
-build, attestation, artifact SCP, pending status or production writes.
+The code commit **C** and its pin-bearing target **P** are separate identities.
+The reviewed change places the host-control edits in **C**, followed by a
+pin-only-with-respect-to-host-control commit **P** that names **C** and records
+the exact closure digests. **C** must be an ancestor of **P**; the resolver
+must accept the exact pin and closure at **P**. The pull request and its
+synthetic merge are tested together, and the exact merged **P** must pass the
+full `Platform security and build` workflow. Because a host-control-only
+change is non-deployable, it does not receive an automatic deployment run.
+After full CI succeeds for exact **P**, the documented read-only
+`workflow_dispatch` `mode=preflight` at **P** runs `build-host-tools`: it
+resolves **C** from **P**, checks out **C**, builds and signs the exact bundle,
+and publishes the artifact before the capability check. That downstream
+read-only capability check may fail closed because **C** is not yet
+provisioned. The successful exact `build-host-tools` job and its artifact
+attestation from that preflight run, together with exact-P full-CI evidence,
+are the reviewed provisioning inputs. Do not use the separate pull-request
+candidate artifact as the authoritative provisioning input. The source
+identities remain separate: **P** is the preflight run's application target
+and `HOST_TOOLS_SHA=C` names the bytes installed at the generation path. Never
+require `TARGET_SHA == HOST_TOOLS_SHA`; verify the exact producer run,
+artifact identity, ancestry and closure instead.
+
+Provisioning **C** alone does not authorize an application release. Activation
+requires the separately reviewed Phase B baseline-reconcile capability. That
+capability is not available from the Phase A host-tools change alone; do not
+manually dispatch or assume that `mode=baseline-reconcile` is enabled until
+its workflow, pinned host code, exact tests and full CI have been reviewed and
+published. Phase B must authenticate the current host release against its
+successful deployment proof, reclassify the complete first-parent range and
+repeat the baseline check under both production locks before any write. A
+bootstrap-only range must end as a verified no-op; a mixed range may proceed
+only if the complete range satisfies the ordinary full deployable route,
+including runtime gates when required.
 
 ## Intentional host-tools bump lifecycle
 
 Changes to any member of the host-control closure, its closure declaration or
-the bundle helper must be handled as a two-commit bump, never by pinning the
-merge commit that carries the pin itself:
+the bundle helper must be handled as a reviewed **C → P** source sequence,
+never by pinning the commit that carries the pin itself:
 
-1. Commit **A** changes the host-control closure. Its old pin is expected to
-   fail the closure-baseline gate; this is the useful proof that a closure
-   change cannot silently ship under the installed generation.
-2. Provision and self-test the exact bundle built from A out of band at
-   `/opt/oldsparky/platform/shared/host-tools/<A>/` before merging the pin
-   update. The operator records the full lowercase A SHA, repository and
-   post-copy inventory.
-3. Commit **B** is pin-only with respect to host control: it sets
-   `host_tools_sha` to A and replaces the exact closure baseline with A's
-   paths, modes and digests. B must be a descendant of A, and the resolver
-   must accept B while rejecting any later target that changes the closure
-   without another bump. Application-only commits after B continue to reuse A.
+1. Commit **C** changes the host-control closure. The previously installed pin
+   cannot authorize the modified closure, so ordinary deployment remains
+   blocked.
+2. Commit **P**, descended from **C** in the same reviewed change, updates only
+   the pin with respect to host control: `host_tools_sha` becomes **C** and the
+   exact closure baseline records **C**'s paths, modes and digests. The
+   application target may contain tests or documentation alongside this pin
+   update; the host-control closure itself must match **C** byte for byte.
+3. Require full CI success for exact merged **P**, then use the documented
+   read-only `mode=preflight` run at **P** to produce the signed
+   `build-host-tools` bundle. Verify its exact workflow run/attempt, successful
+   builder job, artifact ID/name/digest, inner manifest and closure. The
+   downstream capability check may stop the preflight run because **C** is
+   not yet installed. The signed bundle is evidence for provisioning, not
+   deployment authority; the pull-request candidate artifact is not the
+   provisioning source.
+4. Provision and self-test `/opt/oldsparky/platform/shared/host-tools/<C>/`
+   through the approved root-only console or host-image authority. Record **P**
+   as `TARGET_SHA` and **C** as `HOST_TOOLS_SHA`; preserve both identities and
+   the artifact provenance in the receipt.
+5. Activate the bootstrap-only range through the authenticated automatic
+   baseline-reconcile path. Its exact full-CI and runtime proofs, current
+   deployed-source proof, cumulative classifier result and lock-held host
+   recheck remain mandatory.
 
-This order avoids an impossible self-referential merge-SHA pin while requiring
-the reviewed exact generation to exist before the pin-bearing change lands. Do
-not point the pin at a mutable branch, copy a generation, upload an installer,
-self-install from CI or manually rerun a release to repair a missing
-generation. Repeat the A/provision/B lifecycle for the next intentional bump.
+This sequence avoids an impossible self-referential merge-SHA pin while
+ensuring the reviewed generation is built, attested, provisioned and tested
+before it gains deployment authority. Do not point the pin at a mutable branch,
+copy a generation, upload an installer, self-install from CI, bypass the
+baseline proof or manually dispatch normal deployment to repair a missing
+generation. Repeat **C → P**, signed provisioning and automatic reconcile for
+the next intentional bump.
 
 ## Consequences
 
