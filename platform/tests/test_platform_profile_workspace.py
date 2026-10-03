@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
+from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
 from sqlalchemy import delete, select
+from sqlalchemy.sql import operators
+from sqlalchemy.sql.visitors import iterate
 
+from apps.platform_api.app.api.routes import profiles
 from apps.platform_api.app.main import create_app
+from apps.platform_api.app.services import profile_workspace as profile_workspace_service
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
@@ -17,12 +22,16 @@ from python_packages.platform_infra.models import (
     User,
 )
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_integration_password import (
+    INTEGRATION_PASSWORD,
+    patch_integration_registration_hash,
+)
 
 
 class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-profile-workspace-{uuid4().hex[:8]}"
-        self.password = "integration-pass-123"
+        self.password = INTEGRATION_PASSWORD
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup()
@@ -69,40 +78,146 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                 base_url="http://testserver",
             )
         )
-        response = await client.post(
-            "/api/v1/auth/register",
-            json={
-                "email": f"{self.prefix}-{label}@example.com",
-                "password": self.password,
-                "display_name": f"test-{label}"[:15],
-            },
-        )
+        with patch_integration_registration_hash():
+            response = await client.post(
+                "/api/v1/auth/register",
+                json={
+                    "email": f"{self.prefix}-{label}@example.com",
+                    "password": self.password,
+                    "display_name": f"test-{label}"[:15],
+                },
+            )
         self.assertEqual(response.status_code, 201, response.text)
         return client
+
+    @staticmethod
+    def _is_user_owner_lock_statement(statement, user_id: str) -> bool:
+        if getattr(statement, "_for_update_arg", None) is None:
+            return False
+        if not any(
+            description.get("entity") is User and description.get("expr") is User
+            for description in getattr(statement, "column_descriptions", ())
+        ):
+            return False
+        whereclause = getattr(statement, "whereclause", None)
+        if whereclause is None:
+            return False
+        for criterion in iterate(whereclause):
+            if getattr(criterion, "operator", None) is not operators.eq:
+                continue
+            for column, value in (
+                (getattr(criterion, "left", None), getattr(criterion, "right", None)),
+                (getattr(criterion, "right", None), getattr(criterion, "left", None)),
+            ):
+                if not hasattr(column, "compare") or not column.compare(User.__table__.c.id):
+                    continue
+                if getattr(value, "value", object()) == user_id:
+                    return True
+        return False
 
     async def _assert_user_lock_serializes_slot_write(
         self,
         owner: httpx.AsyncClient,
         request,
+        *,
+        observe_scalar_lock=False,
     ) -> httpx.Response:
         me = await owner.get("/api/v1/users/me")
         self.assertEqual(me.status_code, 200, me.text)
         user_id = me.json()["id"]
 
-        async with session_factory()() as blocker:
-            await blocker.execute(
-                select(User.id).where(User.id == user_id).with_for_update()
+        lock_attempted = asyncio.Event()
+        lock_acquired = asyncio.Event()
+        if observe_scalar_lock:
+            self.assertTrue(
+                self._is_user_owner_lock_statement(
+                    select(User).where(User.id == user_id).with_for_update(),
+                    user_id,
+                )
             )
-            task = asyncio.create_task(request())
-            await asyncio.sleep(0.15)
-            was_blocked = not task.done()
-            await blocker.rollback()
+            self.assertFalse(
+                self._is_user_owner_lock_statement(
+                    select(User).where(User.id == user_id),
+                    user_id,
+                )
+            )
+            self.assertFalse(
+                self._is_user_owner_lock_statement(
+                    select(User).where(User.email == user_id).with_for_update(),
+                    user_id,
+                )
+            )
+            self.assertFalse(
+                self._is_user_owner_lock_statement(
+                    select(PlayerProfile)
+                    .where(PlayerProfile.user_id == user_id)
+                    .with_for_update(),
+                    user_id,
+                )
+            )
+            self.assertFalse(
+                self._is_user_owner_lock_statement(
+                    select(User)
+                    .where(DeadlockDreamSlot.user_id == user_id)
+                    .with_for_update(),
+                    user_id,
+                )
+            )
+            original_scalar = profile_workspace_service.AsyncSession.scalar
 
-        response = await task
-        self.assertTrue(
-            was_blocked,
-            "replace-all dream-slot writes must wait on the shared User row lock",
-        )
+            async def observe_scalar(db_session, statement, *args, **kwargs):
+                if self._is_user_owner_lock_statement(statement, user_id):
+                    lock_attempted.set()
+                    result = await original_scalar(
+                        db_session, statement, *args, **kwargs
+                    )
+                    lock_acquired.set()
+                    return result
+                return await original_scalar(db_session, statement, *args, **kwargs)
+
+            lock_patch = patch.object(
+                profile_workspace_service.AsyncSession,
+                "scalar",
+                new=observe_scalar,
+            )
+        else:
+            original_lock = profiles.lock_profile_owner
+
+            async def observe_lock(*args, **kwargs):
+                lock_attempted.set()
+                result = await original_lock(*args, **kwargs)
+                lock_acquired.set()
+                return result
+
+            lock_patch = patch.object(
+                profiles,
+                "lock_profile_owner",
+                side_effect=observe_lock,
+            )
+
+        task: asyncio.Task[httpx.Response] | None = None
+        try:
+            async with session_factory()() as blocker:
+                await blocker.execute(
+                    select(User.id).where(User.id == user_id).with_for_update()
+                )
+                try:
+                    with lock_patch:
+                        task = asyncio.create_task(request())
+                        await asyncio.wait_for(lock_attempted.wait(), timeout=5)
+                        self.assertFalse(lock_acquired.is_set())
+                        self.assertFalse(task.done())
+                        await asyncio.wait_for(blocker.rollback(), timeout=5)
+                        response = await asyncio.wait_for(task, timeout=5)
+                        self.assertTrue(lock_acquired.is_set())
+                finally:
+                    if blocker.in_transaction():
+                        await asyncio.wait_for(blocker.rollback(), timeout=5)
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
         return response
 
     async def test_workspace_returns_deadlock_priority_and_complete_dream_slots(self) -> None:
@@ -251,6 +366,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                     ],
                 },
             ),
+            observe_scalar_lock=True,
         )
 
         self.assertEqual(response.status_code, 200, response.text)
