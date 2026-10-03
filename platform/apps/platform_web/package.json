@@ -18,6 +18,7 @@
     "test:hermetic": "../../tools/platform_web_hermetic.sh",
     "test:shutdown-guard": "../../tools/platform_node.sh tests/shutdown-guard-contract.cjs",
     "test:ssr-stream-diagnostics": "../../tools/platform_node.sh tests/ssr-stream-diagnostics-contract.cjs",
+    "test:next-rootdir-glob": "../../tools/platform_node.sh tests/next-rootdir-glob-contract.mjs",
     "test:participant-progressive": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.participant.config.ts",
     "test:live": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-launch.spec.ts",
     "test:live:webkit": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-launch.spec.ts --project=live-webkit-mobile",
@@ -47,6 +48,9 @@
     "typescript-eslint": "^8.61.1"
   },
   "overrides": {
+    "@next/eslint-plugin-next": {
+      "fast-glob": "npm:tinyglobby@0.2.17"
+    },
     "postcss": "$postcss",
     "sharp": "0.35.4"
   }
