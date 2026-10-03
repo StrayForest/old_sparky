@@ -11,6 +11,36 @@ from apps.platform_api.app.services import home_content, patch_detail_security
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
+_REFRESH_OBSERVER_TIMEOUT_SECONDS = 0.5
+
+
+def _capture_refresh_tasks() -> tuple[list[asyncio.Task[None]], asyncio.Event, object]:
+    tasks: list[asyncio.Task[None]] = []
+    registered = asyncio.Event()
+    original = patch_detail_security._track_background_refresh
+
+    def capture(task: asyncio.Task[None]) -> None:
+        tasks.append(task)
+        original(task)
+        registered.set()
+
+    return tasks, registered, patch.object(
+        patch_detail_security, "_track_background_refresh", side_effect=capture
+    )
+
+
+async def _await_refresh_tasks(tasks: list[asyncio.Task[None]]) -> None:
+    if not tasks:
+        return
+    results = await asyncio.wait_for(
+        asyncio.gather(*tasks, return_exceptions=True),
+        timeout=_REFRESH_OBSERVER_TIMEOUT_SECONDS,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+
 class _Pipeline:
     def __init__(self, cache: "_Cache") -> None:
         self.cache = cache
@@ -56,10 +86,26 @@ class _Cache:
 
 
 class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._refresh_baseline = set(patch_detail_security._BACKGROUND_REFRESH_TASKS)
+
     async def asyncTearDown(self) -> None:
-        tasks = list(patch_detail_security._BACKGROUND_REFRESH_TASKS)
+        tasks = list(
+            set(patch_detail_security._BACKGROUND_REFRESH_TASKS)
+            - self._refresh_baseline
+        )
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=_REFRESH_OBSERVER_TIMEOUT_SECONDS,
+            )
+        self.assertEqual(
+            set(patch_detail_security._BACKGROUND_REFRESH_TASKS),
+            self._refresh_baseline,
+        )
 
     async def test_cached_patch_is_returned_without_miss_refresh(self) -> None:
         detail = {"id": "123", "title": "Patch", "sections": []}
@@ -83,6 +129,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
 
     async def test_unknown_patch_sets_negative_cache_and_schedules_background_refresh(self) -> None:
         cache = _Cache()
+        tasks, registered, refresh_patch = _capture_refresh_tasks()
         with (
             patch.object(patch_detail_security, "redis_client", return_value=cache),
             patch.object(
@@ -90,11 +137,14 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 "_refresh_patch_cache_after_miss",
                 AsyncMock(),
             ) as refresh,
+            refresh_patch,
         ):
             result = await patch_detail_security._cached_patch_source("999")
-            await asyncio.sleep(0)
+            await asyncio.wait_for(registered.wait(), timeout=_REFRESH_OBSERVER_TIMEOUT_SECONDS)
+            await _await_refresh_tasks(tasks)
 
         self.assertIsNone(result)
+        self.assertEqual(len(tasks), 1)
         refresh.assert_awaited_once()
         self.assertIn(
             patch_detail_security.PATCH_MISS_NEGATIVE_KEY_PREFIX + "999",
@@ -104,6 +154,7 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
 
     async def test_negative_cache_prevents_repeat_refresh_for_same_patch(self) -> None:
         cache = _Cache()
+        tasks, registered, refresh_patch = _capture_refresh_tasks()
         with (
             patch.object(patch_detail_security, "redis_client", return_value=cache),
             patch.object(
@@ -111,15 +162,19 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 "_refresh_patch_cache_after_miss",
                 AsyncMock(),
             ) as refresh,
+            refresh_patch,
         ):
             await patch_detail_security._cached_patch_source("999")
             await patch_detail_security._cached_patch_source("999")
-            await asyncio.sleep(0)
+            await asyncio.wait_for(registered.wait(), timeout=_REFRESH_OBSERVER_TIMEOUT_SECONDS)
+            await _await_refresh_tasks(tasks)
 
+        self.assertEqual(len(tasks), 1)
         refresh.assert_awaited_once()
 
     async def test_distinct_unknown_ids_share_one_global_refresh_gate(self) -> None:
         cache = _Cache()
+        tasks, registered, refresh_patch = _capture_refresh_tasks()
         with (
             patch.object(patch_detail_security, "redis_client", return_value=cache),
             patch.object(
@@ -127,11 +182,14 @@ class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
                 "_refresh_patch_cache_after_miss",
                 AsyncMock(),
             ) as refresh,
+            refresh_patch,
         ):
             await patch_detail_security._cached_patch_source("901")
             await patch_detail_security._cached_patch_source("902")
-            await asyncio.sleep(0)
+            await asyncio.wait_for(registered.wait(), timeout=_REFRESH_OBSERVER_TIMEOUT_SECONDS)
+            await _await_refresh_tasks(tasks)
 
+        self.assertEqual(len(tasks), 1)
         refresh.assert_awaited_once()
         negative_keys = {
             key
