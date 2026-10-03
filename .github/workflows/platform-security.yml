@@ -1,11 +1,51 @@
 name: Platform security and build
 
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime' && format('platform-baseline-runtime-v1:{0}:s{1}.{2}:a{3}.{4}:d{5}.{6}:r{7}.{8}', inputs.target_sha, inputs.source_security_run_id, inputs.source_security_run_attempt, inputs.autodeploy_run_id, inputs.autodeploy_run_attempt, inputs.production_deploy_run_id, inputs.production_deploy_run_attempt, github.run_id, github.run_attempt) || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'standard' && 'platform-security-standard-v1') || (github.event_name == 'push' && 'platform-security-push-v1') || 'platform-security-unsupported-event-v1' }}
+
 on:
   pull_request:
   push:
     branches: [dev]
   merge_group:
   workflow_dispatch:
+    inputs:
+      proof_mode:
+        description: "Use the ordinary human CI route or the closed internal baseline-runtime proof lane"
+        required: true
+        default: standard
+        type: choice
+        options:
+          - standard
+          - baseline-runtime
+      target_sha:
+        description: "Exact target SHA (baseline-runtime only)"
+        required: false
+        type: string
+      source_security_run_id:
+        description: "Exact successful push security run ID (baseline-runtime only)"
+        required: false
+        type: string
+      source_security_run_attempt:
+        description: "Exact successful push security run attempt (baseline-runtime only)"
+        required: false
+        type: string
+      autodeploy_run_id:
+        description: "Exact successful auto-deploy run ID (baseline-runtime only)"
+        required: false
+        type: string
+      autodeploy_run_attempt:
+        description: "Exact successful auto-deploy run attempt (baseline-runtime only)"
+        required: false
+        type: string
+      production_deploy_run_id:
+        description: "Exact parent production workflow run ID (baseline-runtime only)"
+        required: false
+        type: string
+      production_deploy_run_attempt:
+        description: "Exact parent production workflow run attempt (baseline-runtime only)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -106,6 +146,7 @@ jobs:
             --output "$trusted_ref"
           /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
           import json
+          from datetime import datetime, timezone
           from pathlib import Path
           import re
           import sys
@@ -151,6 +192,259 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  baseline-runtime-guard:
+    name: Authenticate internal baseline runtime proof
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      statuses: read
+    env:
+      TARGET_SHA: ${{ inputs.target_sha }}
+      SOURCE_SECURITY_RUN_ID: ${{ inputs.source_security_run_id }}
+      SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.source_security_run_attempt }}
+      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+      PRODUCTION_DEPLOY_RUN_ID: ${{ inputs.production_deploy_run_id }}
+      PRODUCTION_DEPLOY_RUN_ATTEMPT: ${{ inputs.production_deploy_run_attempt }}
+      PROOF_RUN_ID: ${{ github.run_id }}
+      PROOF_RUN_ATTEMPT: ${{ github.run_attempt }}
+    steps:
+      - name: Validate exact current target and correlated source runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$TARGET_SHA" = "$GITHUB_SHA"
+          for identity in "$SOURCE_SECURITY_RUN_ID" "$SOURCE_SECURITY_RUN_ATTEMPT" \
+              "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" \
+              "$PRODUCTION_DEPLOY_RUN_ID" "$PRODUCTION_DEPLOY_RUN_ATTEMPT" \
+              "$PROOF_RUN_ID" "$PROOF_RUN_ATTEMPT"; do
+            [[ "$identity" =~ ^[1-9][0-9]{0,31}$ ]]
+          done
+          metadata_dir="$(mktemp -d "$RUNNER_TEMP/platform-baseline-proof.XXXXXX")"
+          chmod 700 "$metadata_dir"
+          trap 'rm -rf -- "$metadata_dir"' EXIT
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          fetch() {
+            local url="$1" destination="$2"
+            curl --fail-with-body --silent --show-error \
+              --max-filesize 4194304 "${api_headers[@]}" "$url" --output "$destination"
+            chmod 600 "$destination"
+          }
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev" "$metadata_dir/dev.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-security.yml" "$metadata_dir/security-workflow.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-autodeploy.yml" "$metadata_dir/autodeploy-workflow.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml" "$metadata_dir/deploy-workflow.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_SECURITY_RUN_ID}" "$metadata_dir/security-run.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${AUTODEPLOY_RUN_ID}" "$metadata_dir/autodeploy-run.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCTION_DEPLOY_RUN_ID}" "$metadata_dir/deploy-run.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${PRODUCTION_DEPLOY_RUN_ID}/attempts/${PRODUCTION_DEPLOY_RUN_ATTEMPT}/jobs?per_page=100" "$metadata_dir/deploy-jobs.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_SECURITY_RUN_ID}/attempts/${SOURCE_SECURITY_RUN_ATTEMPT}/jobs?per_page=100" "$metadata_dir/security-jobs.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${AUTODEPLOY_RUN_ID}/attempts/${AUTODEPLOY_RUN_ATTEMPT}/jobs?per_page=100" "$metadata_dir/autodeploy-jobs.json"
+          fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=1" "$metadata_dir/security-statuses.json"
+          /usr/bin/python3 - "$metadata_dir" "$TARGET_SHA" "$SOURCE_SECURITY_RUN_ID" "$SOURCE_SECURITY_RUN_ATTEMPT" "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" "$PRODUCTION_DEPLOY_RUN_ID" "$PRODUCTION_DEPLOY_RUN_ATTEMPT" "$PROOF_RUN_ID" "$PROOF_RUN_ATTEMPT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(sys.argv[1])
+          target, security_id, security_attempt, auto_id, auto_attempt, parent_id, parent_attempt, proof_id, proof_attempt = sys.argv[2:]
+          decimal = re.compile(r"[1-9][0-9]{0,31}\Z")
+          sha_re = re.compile(r"[0-9a-f]{40}\Z")
+          if not sha_re.fullmatch(target) or any(not decimal.fullmatch(value) for value in (security_id, security_attempt, auto_id, auto_attempt, parent_id, parent_attempt, proof_id, proof_attempt)):
+              raise SystemExit("baseline proof identity is malformed")
+
+          def read(name):
+              path = root / name
+              if path.stat().st_size > 4 * 1024 * 1024:
+                  raise SystemExit("baseline proof API response exceeded its bound")
+              try:
+                  value = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeError, json.JSONDecodeError):
+                  raise SystemExit("baseline proof API response is malformed") from None
+              if not isinstance(value, dict):
+                  raise SystemExit("baseline proof API response is malformed")
+              return value
+
+          def workflow(name, path, expected_name):
+              value = read(name)
+              if value.get("path") != path or value.get("name") != expected_name or type(value.get("id")) is not int or value["id"] <= 0:
+                  raise SystemExit("baseline proof workflow identity mismatch")
+              return value["id"]
+
+          def run(name, workflow_id, run_id, attempt, *, event, branch, conclusion, allow_in_progress=False):
+              value = read(name)
+              if (
+                  type(value.get("id")) is not int or str(value["id"]) != run_id
+                  or type(value.get("workflow_id")) is not int or value["workflow_id"] != workflow_id
+                  or value.get("run_attempt") != int(attempt)
+                  or value.get("event") != event
+                  or value.get("head_branch") != branch
+                  or value.get("head_sha") != target
+                  or value.get("path") is None
+                  or not isinstance(value.get("repository"), dict)
+                  or value["repository"].get("full_name") != "StrayForest/old_sparky"
+              ):
+                  raise SystemExit("baseline proof run identity mismatch")
+              if allow_in_progress:
+                  if value.get("status") not in {"queued", "in_progress", "completed"}:
+                      raise SystemExit("baseline proof parent state is invalid")
+                  if value.get("status") == "completed" and value.get("conclusion") != "success":
+                      raise SystemExit("baseline proof parent is not successful")
+              elif value.get("status") != "completed" or value.get("conclusion") != conclusion:
+                  raise SystemExit("baseline proof source run is not completed successfully")
+              return value
+
+          security_workflow_id = workflow("security-workflow.json", ".github/workflows/platform-security.yml", "Platform security and build")
+          auto_workflow_id = workflow("autodeploy-workflow.json", ".github/workflows/platform-production-autodeploy.yml", "Platform production auto-deploy")
+          deploy_workflow_id = workflow("deploy-workflow.json", ".github/workflows/platform-production-deploy.yml", "Platform production deploy")
+          dev = read("dev.json")
+          if (dev.get("name") != "dev" or not isinstance(dev.get("commit"), dict)
+                  or dev["commit"].get("sha") != target):
+              raise SystemExit("baseline proof target is not the exact current dev head")
+          security = run("security-run.json", security_workflow_id, security_id, security_attempt, event="push", branch="dev", conclusion="success")
+          auto = run("autodeploy-run.json", auto_workflow_id, auto_id, auto_attempt, event="workflow_run", branch="dev", conclusion="success")
+          parent = run("deploy-run.json", deploy_workflow_id, parent_id, parent_attempt, event="workflow_dispatch", branch="dev", conclusion="success", allow_in_progress=True)
+          if (
+              not isinstance(security.get("path"), str) or not security["path"].startswith(".github/workflows/platform-security.yml@")
+              or not isinstance(auto.get("path"), str) or not auto["path"].startswith(".github/workflows/platform-production-autodeploy.yml@")
+              or not isinstance(parent.get("path"), str) or not parent["path"].startswith(".github/workflows/platform-production-deploy.yml@")
+          ):
+              raise SystemExit("baseline proof run workflow path mismatch")
+          for value in (security, auto, parent):
+              path_ref = value["path"].rsplit("@", 1)[1]
+              if path_ref not in {"dev", "refs/heads/dev"}:
+                  raise SystemExit("baseline proof workflow path ref is not dev")
+          if parent.get("display_title") != f"Platform production deploy mode=baseline-reconcile target={target} source={security_id}.{security_attempt} auto={auto_id}.{auto_attempt}":
+              raise SystemExit("baseline proof parent mode marker mismatch")
+          if parent.get("actor", {}).get("login") != "github-actions[bot]" or parent.get("status") != "in_progress":
+              raise SystemExit("baseline proof parent is not the active trusted dispatcher")
+
+          def jobs(name):
+              payload = read(name)
+              rows = payload.get("jobs")
+              if not isinstance(rows, list) or len(rows) > 100 or payload.get("total_count") != len(rows):
+                  raise SystemExit("baseline proof job list is incomplete")
+              return rows
+
+          def validate_source_security_status(status_rows, expected_url):
+              if not isinstance(status_rows, list) or len(status_rows) >= 100:
+                  raise SystemExit("baseline source status response is malformed or incomplete")
+              status_ids = [item.get("id") for item in status_rows if isinstance(item, dict)]
+              if (
+                  len(status_ids) != len(status_rows)
+                  or any(type(status_id) is not int or status_id <= 0 for status_id in status_ids)
+                  or len(status_ids) != len(set(status_ids))
+              ):
+                  raise SystemExit("baseline source status identities are malformed or duplicated")
+
+              context_rows = [item for item in status_rows if item.get("context") == "platform-security-build"]
+              if not context_rows:
+                  raise SystemExit("baseline source exact successful status is unavailable")
+              now = datetime.now(timezone.utc)
+              timestamped = []
+              timestamp_re = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+              for item in context_rows:
+                  effective_raw = item.get("updated_at", item.get("created_at"))
+                  if not isinstance(effective_raw, str) or timestamp_re.fullmatch(effective_raw) is None:
+                      raise SystemExit("baseline source context status timestamp is malformed")
+                  try:
+                      effective = datetime.strptime(effective_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                  except ValueError:
+                      raise SystemExit("baseline source context status timestamp is malformed") from None
+                  if effective > now:
+                      raise SystemExit("baseline source context status timestamp is in the future")
+                  if "created_at" in item:
+                      created_raw = item.get("created_at")
+                      if not isinstance(created_raw, str) or timestamp_re.fullmatch(created_raw) is None:
+                          raise SystemExit("baseline source context status timestamp is malformed")
+                      try:
+                          created = datetime.strptime(created_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                      except ValueError:
+                          raise SystemExit("baseline source context status timestamp is malformed") from None
+                      if created > now:
+                          raise SystemExit("baseline source context status timestamp is in the future")
+                  timestamped.append((effective, item))
+              latest_timestamp = max(timestamp for timestamp, _ in timestamped)
+              latest = [item for timestamp, item in timestamped if timestamp == latest_timestamp]
+              if len(latest) != 1:
+                  raise SystemExit("baseline source context status timestamp is ambiguous")
+              selected = latest[0]
+              creator = selected.get("creator")
+              if (
+                  selected.get("state") != "success"
+                  or selected.get("target_url") != expected_url
+                  or not isinstance(creator, dict)
+                  or creator.get("login") != "github-actions[bot]"
+                  or creator.get("type") != "Bot"
+                  or creator.get("id") != 41898282
+              ):
+                  raise SystemExit("baseline source exact successful status is unavailable or superseded")
+
+          parent_jobs = jobs("deploy-jobs.json")
+          dispatch_jobs = [item for item in parent_jobs if isinstance(item, dict) and item.get("name") == "Dispatch exact-target baseline runtime proof"]
+          if len(dispatch_jobs) != 1 or dispatch_jobs[0].get("status") != "completed" or dispatch_jobs[0].get("conclusion") != "success":
+              raise SystemExit("baseline proof parent dispatch job did not succeed exactly once")
+          dispatch_steps = dispatch_jobs[0].get("steps")
+          if not isinstance(dispatch_steps, list):
+              raise SystemExit("baseline proof parent dispatch steps are unavailable")
+          exact_steps = [item for item in dispatch_steps if isinstance(item, dict) and item.get("name") == "Dispatch exact-target baseline runtime proof"]
+          if len(exact_steps) != 1 or exact_steps[0].get("status") != "completed" or exact_steps[0].get("conclusion") != "success":
+              raise SystemExit("baseline proof parent dispatch step did not succeed exactly once")
+
+          auto_jobs = jobs("autodeploy-jobs.json")
+          auto_dispatch = [item for item in auto_jobs if isinstance(item, dict) and item.get("name") == "dispatch"]
+          if len(auto_dispatch) != 1 or auto_dispatch[0].get("status") != "completed" or auto_dispatch[0].get("conclusion") != "success":
+              raise SystemExit("baseline proof auto-deploy dispatch job did not succeed exactly once")
+          auto_steps = auto_dispatch[0].get("steps")
+          auto_dispatch_steps = [item for item in auto_steps if isinstance(item, dict) and item.get("name") == "Dispatch production deployment or baseline reconciliation"] if isinstance(auto_steps, list) else []
+          if len(auto_dispatch_steps) != 1 or auto_dispatch_steps[0].get("status") != "completed" or auto_dispatch_steps[0].get("conclusion") != "success":
+              raise SystemExit("baseline proof auto-deploy dispatch step did not succeed exactly once")
+
+          required_source_jobs = {
+              "Backend DB-free contours", "Backend PostgreSQL and Redis integration",
+              "Backend privileged ephemeral contour", "Backend aggregate", "Python quality",
+              "Security gates", "web-quality", "Web hermetic", "Documentation consistency",
+              "Migration scenarios", "Verification contract", "Conditional release runtime fixture",
+              "Trusted dev immutable release runtime", "status-final",
+          }
+          source_jobs = jobs("security-jobs.json")
+          by_name = {}
+          for item in source_jobs:
+              if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                  raise SystemExit("baseline source job identity is malformed")
+              by_name.setdefault(item["name"], []).append(item)
+          for name in required_source_jobs:
+              matches = by_name.get(name, [])
+              if len(matches) != 1 or matches[0].get("status") != "completed" or matches[0].get("conclusion") != "success":
+                  raise SystemExit("baseline source required job is absent, duplicated, or unsuccessful")
+
+          statuses_path = root / "security-statuses.json"
+          try:
+              if statuses_path.stat().st_size > 4 * 1024 * 1024:
+                  raise SystemExit("baseline source status response exceeded its bound")
+              status_rows = json.loads(statuses_path.read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("baseline source status response is malformed") from None
+          expected_url = f"https://github.com/StrayForest/old_sparky/actions/runs/{security_id}/attempts/{security_attempt}"
+          validate_source_security_status(status_rows, expected_url)
+          print("Authenticated exact current dev target and correlated source, auto-deploy, and parent dispatch attempts.")
+          PY
+
   status-start:
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     permissions:
@@ -164,8 +458,43 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PROOF_MODE: ${{ inputs.proof_mode || 'standard' }}
+          TARGET_SHA_INPUT: ${{ inputs.target_sha }}
+          SOURCE_SECURITY_RUN_ID: ${{ inputs.source_security_run_id }}
+          SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.source_security_run_attempt }}
+          AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+          AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+          PRODUCTION_DEPLOY_RUN_ID: ${{ inputs.production_deploy_run_id }}
+          PRODUCTION_DEPLOY_RUN_ATTEMPT: ${{ inputs.production_deploy_run_attempt }}
         run: |
           set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            case "$PROOF_MODE" in
+              standard) context=platform-security-build ;;
+              baseline-runtime)
+                [[ "$TARGET_SHA_INPUT" =~ ^[0-9a-f]{40}$ ]] \
+                  && test "$TARGET_SHA_INPUT" = "$TESTED_SHA" \
+                  && test "$GITHUB_REF" = "refs/heads/dev" || {
+                    echo "Refusing a baseline pending status without the exact current dev target." >&2
+                    exit 1
+                  }
+                for identity in \
+                    "$SOURCE_SECURITY_RUN_ID" "$SOURCE_SECURITY_RUN_ATTEMPT" \
+                    "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" \
+                    "$PRODUCTION_DEPLOY_RUN_ID" "$PRODUCTION_DEPLOY_RUN_ATTEMPT"; do
+                  [[ "$identity" =~ ^[1-9][0-9]{0,31}$ ]] || {
+                    echo "Refusing a baseline pending status with malformed correlation identity." >&2
+                    exit 1
+                  }
+                done
+                context=platform-baseline-runtime
+                ;;
+              *) echo "Refusing an unsupported workflow-dispatch mode." >&2; exit 1 ;;
+            esac
+          else
+            context=platform-security-build
+          fi
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error \
             --request POST \
@@ -173,12 +502,17 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
-            --data "{\"state\":\"pending\",\"context\":\"platform-security-build\",\"description\":\"Platform security and build is running\",\"target_url\":\"${run_url}\"}"
+            --data "$(/usr/bin/python3 - "$context" "$run_url" <<'PY'
+          import json
+          import sys
+          print(json.dumps({"state": "pending", "context": sys.argv[1], "description": "Platform security and build is running", "target_url": sys.argv[2]}))
+          PY
+            )"
 
   backend-static:
     name: Backend DB-free contours
-    needs: classifier
-    if: ${{ needs.classifier.outputs.class == 'full' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -227,8 +561,8 @@ jobs:
 
   backend-integration:
     name: Backend PostgreSQL and Redis integration
-    needs: classifier
-    if: ${{ needs.classifier.outputs.class == 'full' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -300,8 +634,8 @@ jobs:
 
   backend-privileged:
     name: Backend privileged ephemeral contour
-    needs: classifier
-    if: ${{ needs.classifier.outputs.class == 'full' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -369,8 +703,8 @@ jobs:
 
   backend:
     name: Backend aggregate
-    needs: [classifier, backend-static, backend-integration, backend-privileged]
-    if: ${{ always() && needs.classifier.outputs.class == 'full' }}
+    needs: [classifier, baseline-runtime-guard, backend-static, backend-integration, backend-privileged]
+    if: ${{ always() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -416,8 +750,8 @@ jobs:
 
   python-quality:
     name: Python quality
-    needs: classifier
-    if: ${{ needs.classifier.outputs.class == 'full' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -438,8 +772,8 @@ jobs:
 
   security:
     name: Security gates
-    needs: classifier
-    if: ${{ needs.classifier.outputs.class == 'full' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -459,8 +793,8 @@ jobs:
           .venv_platform/bin/python tools/platform_verify.py security
 
   web-quality:
-    needs: classifier
-    if: ${{ needs.classifier.outputs.class == 'full' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -480,8 +814,8 @@ jobs:
 
   docs:
     name: Documentation consistency
-    needs: classifier
-    if: ${{ needs.classifier.outputs.class == 'full' || needs.classifier.outputs.class == 'docs-only' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || needs.classifier.outputs.class == 'docs-only' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -493,8 +827,8 @@ jobs:
 
   migration:
     name: Migration scenarios
-    needs: classifier
-    if: ${{ needs.classifier.outputs.class == 'full' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     services:
@@ -540,8 +874,8 @@ jobs:
 
   web-hermetic:
     name: Web hermetic
-    needs: classifier
-    if: ${{ needs.classifier.outputs.class == 'full' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.class == 'full' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -575,8 +909,8 @@ jobs:
 
   verification-contract:
     name: Verification contract
-    needs: classifier
-    if: ${{ always() && needs.classifier.result == 'success' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ always() && needs.classifier.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -634,8 +968,8 @@ jobs:
 
   release-runtime:
     name: Conditional release runtime fixture
-    needs: classifier
-    if: ${{ needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true' }}
+    needs: [classifier, baseline-runtime-guard]
+    if: ${{ !cancelled() && needs.classifier.result == 'success' && (needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true' || (github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime')) && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -673,12 +1007,15 @@ jobs:
 
   release-runtime-real:
     name: Trusted dev immutable release runtime
-    needs: classifier
+    needs: [classifier, baseline-runtime-guard]
     if: >-
+      !cancelled() &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/dev' &&
+      (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') &&
       (needs.classifier.outputs.runtime_sensitive == 'true' ||
-      needs.classifier.outputs.fallback == 'true')
+      needs.classifier.outputs.fallback == 'true' ||
+      (inputs.proof_mode == 'baseline-runtime' && needs.baseline-runtime-guard.result == 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -691,6 +1028,28 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Recheck exact current dev SHA immediately before runtime build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch_json="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
+          BRANCH_JSON="$branch_json" /usr/bin/python3 - "$TARGET_SHA" <<'PY'
+          import json
+          import os
+          import sys
+          try:
+              payload = json.loads(os.environ["BRANCH_JSON"])
+          except (KeyError, json.JSONDecodeError):
+              raise SystemExit("current dev ref response is malformed") from None
+          if payload.get("name") != "dev" or not isinstance(payload.get("commit"), dict) or payload["commit"].get("sha") != sys.argv[1]:
+              raise SystemExit("target is no longer the exact current dev head")
+          PY
       - name: Run canonical immutable release builder on trusted dev
         id: real-runtime-build
         timeout-minutes: 40
@@ -1100,7 +1459,7 @@ jobs:
     if: ${{ always() }}
     permissions:
       statuses: write
-    needs: [classifier, status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract, release-runtime, release-runtime-real]
+    needs: [classifier, baseline-runtime-guard, status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract, release-runtime, release-runtime-real]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1110,6 +1469,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TESTED_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
+          PROOF_MODE: ${{ inputs.proof_mode || 'standard' }}
+          BASELINE_GUARD_RESULT: ${{ needs.baseline-runtime-guard.result }}
+          TARGET_SHA_INPUT: ${{ inputs.target_sha }}
+          SOURCE_SECURITY_RUN_ID: ${{ inputs.source_security_run_id }}
+          SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.source_security_run_attempt }}
+          AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+          AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+          PRODUCTION_DEPLOY_RUN_ID: ${{ inputs.production_deploy_run_id }}
+          PRODUCTION_DEPLOY_RUN_ATTEMPT: ${{ inputs.production_deploy_run_attempt }}
+          PROOF_RUN_ID: ${{ github.run_id }}
+          PROOF_RUN_ATTEMPT: ${{ github.run_attempt }}
           CLASSIFIER_RESULT: ${{ needs.classifier.result }}
           ROUTE_CLASS: ${{ needs.classifier.outputs.class }}
           ROUTE_EVENT: ${{ needs.classifier.outputs.event }}
@@ -1156,8 +1526,14 @@ jobs:
           route_class = os.environ.get("ROUTE_CLASS", "")
           route_event = os.environ.get("ROUTE_EVENT", "")
           event_name = os.environ.get("EVENT_NAME", "")
+          proof_mode = os.environ.get("PROOF_MODE", "")
+          baseline_mode = event_name == "workflow_dispatch" and proof_mode == "baseline-runtime"
           raw_runtime_sensitive = os.environ.get("ROUTE_RUNTIME_SENSITIVE", "")
           route_errors = []
+          if event_name == "workflow_dispatch" and proof_mode not in {"standard", "baseline-runtime"}:
+              route_errors.append("workflow-dispatch proof mode is missing or invalid")
+          if baseline_mode and os.environ.get("BASELINE_GUARD_RESULT") != "success":
+              route_errors.append("internal baseline proof authentication did not succeed")
           if raw_runtime_sensitive not in {"true", "false"}:
               route_errors.append("classifier runtime-sensitive output is missing or malformed")
           runtime_sensitive = raw_runtime_sensitive == "true"
@@ -1179,6 +1555,11 @@ jobs:
               route_errors.append("classifier target SHA is missing")
           elif route_target_sha != tested_sha:
               route_errors.append("classifier target SHA does not match the tested SHA")
+          if baseline_mode:
+              if os.environ.get("TARGET_SHA_INPUT", "") != tested_sha:
+                  route_errors.append("internal baseline target does not match the tested SHA")
+              if os.environ.get("WORKFLOW_REF", "") != "refs/heads/dev":
+                  route_errors.append("internal baseline proof is not running on trusted dev")
           route_digest = os.environ.get("ROUTE_DIGEST", "")
           if not re.fullmatch(r"[0-9a-f]{64}", route_digest):
               route_errors.append("classifier digest is missing")
@@ -1202,12 +1583,13 @@ jobs:
               "migration": os.environ.get("MIGRATION_RESULT", "missing"),
               "verification-contract": os.environ.get("VERIFICATION_CONTRACT_RESULT", "missing"),
           }
+          required_expected = expected_by_class["full"] if baseline_mode else expected
           missing_or_failed = [
-              gate for gate in expected if results.get(gate) != "success"
-          ] if isinstance(expected, list) else ["classifier expected gates are malformed"]
+              gate for gate in required_expected if results.get(gate) != "success"
+          ] if isinstance(required_expected, list) else ["classifier expected gates are malformed"]
           release_runtime_result = os.environ.get("RELEASE_RUNTIME_RESULT", "missing")
           real_runtime_result = os.environ.get("RELEASE_RUNTIME_REAL_RESULT", "skipped")
-          requires_release_runtime = runtime_sensitive or raw_fallback == "true"
+          requires_release_runtime = baseline_mode or runtime_sensitive or raw_fallback == "true"
           trusted_real_event = (
               (event_name == "push" and os.environ.get("WORKFLOW_REF") == "refs/heads/dev")
               or (
@@ -1235,13 +1617,17 @@ jobs:
               "schema": 1,
               "tested_sha": os.environ.get("TESTED_SHA", ""),
               "event": os.environ.get("EVENT_NAME", ""),
+              "proof_mode": proof_mode if baseline_mode else "standard",
+              "proof_run_id": os.environ.get("PROOF_RUN_ID", ""),
+              "proof_run_attempt": os.environ.get("PROOF_RUN_ATTEMPT", ""),
+              "baseline_guard_result": os.environ.get("BASELINE_GUARD_RESULT", "missing"),
               "route_event": route_event,
               "class": os.environ.get("ROUTE_CLASS", ""),
               "reason": os.environ.get("ROUTE_REASON", ""),
               "deployable": os.environ.get("ROUTE_DEPLOYABLE", "") == "true",
               "fallback": os.environ.get("ROUTE_FALLBACK", "") == "true",
               "manifest_digest": os.environ.get("ROUTE_DIGEST", ""),
-              "expected_gates": expected,
+              "expected_gates": required_expected,
               "gate_results": results,
               "conditional_gate_results": {
                   "release-runtime": release_runtime_result,
@@ -1271,25 +1657,103 @@ jobs:
           fi
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           if [[ "$EVENT_NAME" == "push" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            curl --fail-with-body --silent --show-error \
-              --request POST \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
-              --data "$(/usr/bin/python3 - "$state" "$description" "$run_url" <<'PY'
+            if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+              case "$PROOF_MODE" in
+                standard) status_context=platform-security-build ;;
+                baseline-runtime) status_context=platform-baseline-runtime ;;
+                *) echo "Refusing to publish an unsupported workflow-dispatch status." >&2; exit 1 ;;
+              esac
+            else
+              status_context=platform-security-build
+            fi
+            if [[ "$EVENT_NAME" != "workflow_dispatch" || "$PROOF_MODE" != "baseline-runtime" ]]; then
+              curl --fail-with-body --silent --show-error \
+                --request POST \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
+                --data "$(/usr/bin/python3 - "$state" "$description" "$run_url" "$status_context" <<'PY'
           import json
           import sys
           print(json.dumps({
               "state": sys.argv[1],
-              "context": "platform-security-build",
+              "context": sys.argv[4],
               "description": sys.argv[2],
               "target_url": sys.argv[3],
           }))
           PY
-              )"
+                )"
+            fi
           fi
           [[ "$state" == "success" ]] || exit 1
+
+      - name: Write exact baseline proof correlation receipt
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime' }}
+        shell: bash
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+          SOURCE_SECURITY_RUN_ID: ${{ inputs.source_security_run_id }}
+          SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.source_security_run_attempt }}
+          AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+          AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+          PRODUCTION_DEPLOY_RUN_ID: ${{ inputs.production_deploy_run_id }}
+          PRODUCTION_DEPLOY_RUN_ATTEMPT: ${{ inputs.production_deploy_run_attempt }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - "$GITHUB_WORKSPACE/platform-baseline-runtime-receipt.json" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          decimal = re.compile(r"[1-9][0-9]{0,31}\Z")
+          sha = os.environ.get("TARGET_SHA", "")
+          if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("baseline proof receipt target is malformed")
+          identities = {
+              key: os.environ.get(key, "")
+              for key in (
+                  "SOURCE_SECURITY_RUN_ID", "SOURCE_SECURITY_RUN_ATTEMPT",
+                  "AUTODEPLOY_RUN_ID", "AUTODEPLOY_RUN_ATTEMPT",
+                  "PRODUCTION_DEPLOY_RUN_ID", "PRODUCTION_DEPLOY_RUN_ATTEMPT",
+              )
+          }
+          if any(decimal.fullmatch(value) is None for value in identities.values()):
+              raise SystemExit("baseline proof receipt correlation is malformed")
+          receipt = {
+              "schema": 1,
+              "proof_mode": "baseline-runtime",
+              "target_sha": sha,
+              "source_security_run_id": identities["SOURCE_SECURITY_RUN_ID"],
+              "source_security_run_attempt": identities["SOURCE_SECURITY_RUN_ATTEMPT"],
+              "autodeploy_run_id": identities["AUTODEPLOY_RUN_ID"],
+              "autodeploy_run_attempt": identities["AUTODEPLOY_RUN_ATTEMPT"],
+              "production_deploy_run_id": identities["PRODUCTION_DEPLOY_RUN_ID"],
+              "production_deploy_run_attempt": identities["PRODUCTION_DEPLOY_RUN_ATTEMPT"],
+              "proof_run_id": os.environ["GITHUB_RUN_ID"],
+              "proof_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "required_gates": [
+                  "backend", "python-quality", "security", "migration", "docs",
+                  "web-quality", "web-hermetic", "verification-contract",
+                  "release-runtime", "release-runtime-real",
+              ],
+          }
+          for key in ("proof_run_id", "proof_run_attempt"):
+              if decimal.fullmatch(receipt[key]) is None:
+                  raise SystemExit("baseline proof receipt identity is malformed")
+          Path(sys.argv[1]).write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload baseline proof correlation receipt
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && inputs.proof_mode == 'baseline-runtime' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-baseline-runtime-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform-baseline-runtime-receipt.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Publish machine-readable CI summary
         if: ${{ always() }}

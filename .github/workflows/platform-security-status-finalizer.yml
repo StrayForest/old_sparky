@@ -5,15 +5,16 @@ on:
     workflows: [Platform security and build]
     types: [completed]
 
-# This workflow has no source checkout, candidate data, or repository secret inputs.
-# It exists outside the cancellable security workflow so a cancelled/skipped
-# run still receives a terminal commit status whenever GitHub starts workflow_run.
+# This workflow has no source checkout or repository secret inputs. It writes
+# the ordinary status for ordinary runs, and a distinct context for the
+# authenticated internal baseline-runtime proof lane.
 jobs:
   finalize-status:
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      actions: read
       statuses: write
     env:
       TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -21,8 +22,12 @@ jobs:
       SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
       SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
       SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+      SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+      SOURCE_REF: ${{ github.event.workflow_run.head_branch }}
+      SOURCE_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
     steps:
-      - name: Publish the exact completed run as a terminal status
+      - name: Resolve exact status context and verify any internal proof
+        id: status
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -31,56 +36,214 @@ jobs:
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
-          attempt_url="$(/usr/bin/python3 - "$SOURCE_RUN_URL" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$GITHUB_REPOSITORY" <<'PY'
+          [[ "$SOURCE_WORKFLOW_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          attempt_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}"
+          metadata_dir="$(mktemp -d "$RUNNER_TEMP/platform-security-finalizer.XXXXXX")"
+          chmod 700 "$metadata_dir"
+          trap 'rm -rf -- "$metadata_dir"' EXIT
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          curl --fail-with-body --silent --show-error --max-filesize 4194304 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}" \
+            --output "$metadata_dir/run.json"
+          chmod 600 "$metadata_dir/run.json"
+          curl --fail-with-body --silent --show-error --max-filesize 4194304 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${SOURCE_WORKFLOW_ID}" \
+            --output "$metadata_dir/workflow.json"
+          chmod 600 "$metadata_dir/workflow.json"
+          /usr/bin/python3 - "$metadata_dir" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
           import re
           import sys
-          from urllib.parse import urlsplit
+          from urllib.request import Request, urlopen
 
-          base, run_id, attempt, repository = sys.argv[1:]
-          expected = f"https://github.com/{repository}/actions/runs/{run_id}"
-          parsed = urlsplit(base)
+          root, output_path = Path(sys.argv[1]), Path(sys.argv[2])
+          sha_re = re.compile(r"[0-9a-f]{40}\Z")
+          decimal = re.compile(r"[1-9][0-9]{0,31}\Z")
+          baseline_title = re.compile(
+              r"platform-baseline-runtime-v1:(?P<target>[0-9a-f]{40}):"
+              r"s(?P<source_id>[1-9][0-9]{0,31})\.(?P<source_attempt>[1-9][0-9]{0,31}):"
+              r"a(?P<auto_id>[1-9][0-9]{0,31})\.(?P<auto_attempt>[1-9][0-9]{0,31}):"
+              r"d(?P<parent_id>[1-9][0-9]{0,31})\.(?P<parent_attempt>[1-9][0-9]{0,31}):"
+              r"r(?P<proof_id>[1-9][0-9]{0,31})\.(?P<proof_attempt>[1-9][0-9]{0,31})\Z"
+          )
+          target = os.environ.get("TARGET_SHA", "")
+          run_id = os.environ.get("SOURCE_RUN_ID", "")
+          attempt = os.environ.get("SOURCE_RUN_ATTEMPT", "")
+          event = os.environ.get("SOURCE_EVENT", "")
+          branch = os.environ.get("SOURCE_REF", "")
+          conclusion = os.environ.get("SOURCE_CONCLUSION", "")
+          workflow_id = int(os.environ.get("SOURCE_WORKFLOW_ID", "0"))
+          event_run_url = os.environ.get("SOURCE_RUN_URL", "")
+          if not sha_re.fullmatch(target) or not decimal.fullmatch(run_id) or not decimal.fullmatch(attempt):
+              raise SystemExit("workflow run identity is malformed")
+
+          def read_json(name):
+              path = root / name
+              if path.stat().st_size > 4 * 1024 * 1024:
+                  raise SystemExit("workflow metadata exceeded its bound")
+              try:
+                  value = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeError, json.JSONDecodeError):
+                  raise SystemExit("workflow metadata is malformed") from None
+              if not isinstance(value, dict):
+                  raise SystemExit("workflow metadata is malformed")
+              return value
+
+          run = read_json("run.json")
+          workflow = read_json("workflow.json")
+          display_title = run.get("display_title", "")
+          expected_base_url = f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{run_id}"
+          expected_run_path_prefix = ".github/workflows/platform-security.yml@"
           if (
-              base != expected
-              or parsed.scheme != "https"
-              or parsed.netloc != "github.com"
-              or parsed.query
-              or parsed.fragment
-              or not re.fullmatch(r"[1-9][0-9]{0,31}", attempt)
+              type(run.get("id")) is not int or run["id"] != int(run_id)
+              or run.get("run_attempt") != int(attempt)
+              or type(run.get("workflow_id")) is not int or run["workflow_id"] != workflow_id
+              or run.get("head_sha") != target
+              or not isinstance(run.get("path"), str)
+              or not run["path"].startswith(expected_run_path_prefix)
+              or not run["path"][len(expected_run_path_prefix):]
+              or run.get("name") != "Platform security and build"
+              or not isinstance(display_title, str)
+              or event_run_url != expected_base_url
+              or run.get("html_url") != expected_base_url
+              or not isinstance(run.get("repository"), dict)
+              or run["repository"].get("full_name") != "StrayForest/old_sparky"
+              or workflow.get("path") != ".github/workflows/platform-security.yml"
+              or workflow.get("name") != "Platform security and build"
+              or type(workflow.get("id")) is not int or workflow["id"] != workflow_id
           ):
-              raise SystemExit("workflow run URL is not canonical")
-          print(f"{expected}/attempts/{attempt}")
+              raise SystemExit("workflow run does not belong to the exact security workflow attempt")
+
+          status_context = None
+          is_baseline_candidate = display_title.startswith("platform-baseline-runtime-v1:")
+          if event == "workflow_dispatch":
+              if display_title == "platform-security-standard-v1":
+                  status_context = "platform-security-build"
+              elif is_baseline_candidate:
+                  parsed = baseline_title.fullmatch(display_title)
+                  if parsed is None or parsed.group("target") != target:
+                      raise SystemExit("internal baseline run-name marker is malformed or mismatched")
+                  run_path_ref = run["path"].rsplit("@", 1)[1]
+                  if run.get("event") != "workflow_dispatch" or run.get("head_branch") != "dev" or run.get("head_sha") != parsed.group("target") or branch != "dev" or run_path_ref not in {"dev", "refs/heads/dev"}:
+                      raise SystemExit("internal baseline run is not bound to exact trusted dev")
+                  terminal_conclusions = {
+                      "success", "failure", "cancelled", "skipped", "timed_out",
+                      "action_required", "neutral", "stale", "startup_failure",
+                  }
+                  if (
+                      run.get("status") != "completed"
+                      or conclusion not in terminal_conclusions
+                      or run.get("conclusion") != conclusion
+                  ):
+                      raise SystemExit("internal baseline run conclusion is unavailable or mismatched")
+                  context = parsed.groupdict()
+                  if context["proof_id"] != run_id or context["proof_attempt"] != attempt:
+                      raise SystemExit("internal baseline run-name is not bound to this exact proof attempt")
+                  status_context = "platform-baseline-runtime"
+              else:
+                  # A missing, truncated, invalid, or legacy display title is
+                  # ambiguous: do not let it overwrite the push CI context.
+                  raise SystemExit("workflow-dispatch run mode is unavailable; no status will be published")
+          else:
+              # Pushes cannot select workflow_dispatch inputs. Preserve the
+              # established canonical context for non-proof workflow events.
+              status_context = "platform-security-build"
+
+          if status_context == "platform-baseline-runtime" and conclusion == "success":
+              if run.get("head_branch") != "dev":
+                  raise SystemExit("internal baseline run ref is not trusted dev")
+              jobs_url = os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + run_id + "/attempts/" + attempt + "/jobs?per_page=100"
+              request = Request(
+                  jobs_url,
+                  headers={
+                      "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urlopen(request, timeout=20) as response:
+                  body = response.read(4 * 1024 * 1024 + 1)
+              if len(body) > 4 * 1024 * 1024:
+                  raise SystemExit("internal baseline job evidence exceeded its bound")
+              try:
+                  job_payload = json.loads(body.decode("utf-8"))
+              except (UnicodeError, json.JSONDecodeError):
+                  raise SystemExit("internal baseline job evidence is malformed") from None
+              rows = job_payload.get("jobs") if isinstance(job_payload, dict) else None
+              if not isinstance(rows, list) or len(rows) >= 100 or job_payload.get("total_count") != len(rows):
+                  raise SystemExit("internal baseline job evidence is incomplete")
+              required = {
+                  "Authenticate internal baseline runtime proof",
+                  "Backend DB-free contours", "Backend PostgreSQL and Redis integration",
+                  "Backend privileged ephemeral contour", "Backend aggregate", "Python quality",
+                  "Security gates", "web-quality", "Web hermetic", "Documentation consistency",
+                  "Migration scenarios", "Verification contract", "Conditional release runtime fixture",
+                  "Trusted dev immutable release runtime", "status-start", "status-final",
+              }
+              grouped = {}
+              for item in rows:
+                  if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                      raise SystemExit("internal baseline job identity is malformed")
+                  grouped.setdefault(item["name"], []).append(item)
+              for name in required:
+                  matches = grouped.get(name, [])
+                  if len(matches) != 1 or matches[0].get("status") != "completed" or matches[0].get("conclusion") != "success":
+                      raise SystemExit("internal baseline required gate is absent, duplicated, or unsuccessful")
+
+          with output_path.open("a", encoding="utf-8") as output:
+              output.write(f"context={status_context}\n")
+              output.write("publish=true\n")
           PY
-          )"
-          case "$SOURCE_CONCLUSION" in
-            success)
-              state=success
-              description="Platform security and build passed"
-              ;;
-            cancelled|failure|skipped|timed_out|action_required|neutral|stale|startup_failure)
-              state=failure
-              description="Platform security or build failed"
-              ;;
-            *)
-              state=failure
-              description="Platform security or build failed"
-              ;;
-          esac
-          payload="$(/usr/bin/python3 - "$state" "$description" "$attempt_url" <<'PY'
+          attempt_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}"
+          state=failure
+          description="Platform security or build failed"
+          if [[ "$SOURCE_CONCLUSION" == "success" ]]; then
+            state=success
+            description="Platform security and build passed"
+          fi
+          /usr/bin/python3 - "$state" "$description" "$attempt_url" "$GITHUB_OUTPUT" <<'PY'
           import json
+          from pathlib import Path
           import sys
 
-          print(json.dumps({
-              "state": sys.argv[1],
-              "context": "platform-security-build",
-              "description": sys.argv[2],
-              "target_url": sys.argv[3],
-          }))
+          state, description, url, output_path = sys.argv[1:]
+          Path(output_path).open("a", encoding="utf-8").write(
+              "payload=" + json.dumps({
+                  "state": state,
+                  "description": description,
+                  "target_url": url,
+              }, separators=(",", ":")) + "\n"
+          )
           PY
-          )"
+
+      - name: Publish exact completed run as terminal status
+        if: ${{ steps.status.outputs.publish == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS_CONTEXT: ${{ steps.status.outputs.context }}
+          STATUS_PAYLOAD: ${{ steps.status.outputs.payload }}
+        run: |
+          set -euo pipefail
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "$payload"
+            --data "$(/usr/bin/python3 - "$STATUS_CONTEXT" "$STATUS_PAYLOAD" <<'PY'
+          import json
+          import sys
+          payload = json.loads(sys.argv[2])
+          payload["context"] = sys.argv[1]
+          print(json.dumps(payload, separators=(",", ":")))
+          PY
+            )"

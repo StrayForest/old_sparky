@@ -636,7 +636,8 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
                 "< /dev/null",
                 ") 2>/dev/null < /dev/null | /usr/bin/head -c 512 > \"$probe_output\"",
                 'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
-                'dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"',
+                'dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 '
+                'python_isolated=1 python_bytecode_disabled=1"',
                 'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
                 "command_rc=",
                 "expected_bytes=",
@@ -1225,10 +1226,16 @@ def _migration_contract_issues(security_text: str) -> list[str]:
     migration = _workflow_job_block(security_text, "migration")
     if not migration:
         return ["platform-security.yml is missing migration job"]
-    if "needs: classifier" not in migration:
+    migration_needs = _workflow_job_needs(migration)
+    if "classifier" not in migration_needs:
         issues.append("migration job must depend on classifier")
-    if "if: ${{ needs.classifier.outputs.class == 'full' }}" not in migration:
+    if "needs.classifier.outputs.class == 'full'" not in migration:
         issues.append("migration job must be full-route gated")
+    if "baseline-runtime-guard" in migration_needs and (
+        "inputs.proof_mode == 'baseline-runtime'" not in migration
+        or "needs.baseline-runtime-guard.result == 'success'" not in migration
+    ):
+        issues.append("migration job must gate the baseline proof lane")
     if "continue-on-error" in migration or re.search(
         r"^\s{4,}retries?\s*:", migration, re.IGNORECASE | re.MULTILINE
     ):
@@ -1343,7 +1350,8 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
         if not block:
             issues.append(f"platform-security.yml is missing backend job {job_id}")
             continue
-        if job_id != "backend" and "needs: classifier" not in block:
+        dependencies = _workflow_job_needs(block)
+        if job_id != "backend" and "classifier" not in dependencies:
             issues.append(f"backend job {job_id} must depend on classifier")
         if "continue-on-error" in block:
             issues.append(f"backend job {job_id} must not continue on error")
@@ -1358,8 +1366,14 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
                 issues.append(
                     f"backend job {job_id} must invoke {contour} exactly once"
                 )
-        if job_id != "backend" and "if: ${{ needs.classifier.outputs.class == 'full' }}" not in block:
-            issues.append(f"backend job {job_id} must be full-route gated")
+        if job_id != "backend":
+            if "needs.classifier.outputs.class == 'full'" not in block:
+                issues.append(f"backend job {job_id} must be full-route gated")
+            if "baseline-runtime-guard" in dependencies and (
+                "inputs.proof_mode == 'baseline-runtime'" not in block
+                or "needs.baseline-runtime-guard.result == 'success'" not in block
+            ):
+                issues.append(f"backend job {job_id} must gate the baseline proof lane")
 
     static = blocks["backend-static"]
     integration = blocks["backend-integration"]
@@ -1495,8 +1509,14 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
 
     if "name: Conditional release runtime fixture" not in fixture:
         issues.append("release-runtime must remain the fixture job")
-    if "needs: classifier" not in fixture:
+    fixture_needs = _workflow_job_needs(fixture)
+    if "classifier" not in fixture_needs:
         issues.append("release-runtime fixture must depend on classifier")
+    if "baseline-runtime-guard" in fixture_needs and (
+        "inputs.proof_mode == 'baseline-runtime'" not in fixture
+        or "needs.baseline-runtime-guard.result == 'success'" not in fixture
+    ):
+        issues.append("release-runtime fixture must gate the baseline proof lane")
     if "timeout-minutes: 15" not in fixture:
         issues.append("release-runtime fixture must retain a 15-minute timeout")
     if "permissions:\n      contents: read" not in fixture:
@@ -1521,7 +1541,8 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
 
     if "name: Trusted dev immutable release runtime" not in real:
         issues.append("release-runtime-real must be named as the trusted-dev builder")
-    if "needs: classifier" not in real:
+    real_needs = _workflow_job_needs(real)
+    if "classifier" not in real_needs:
         issues.append("release-runtime-real must depend on classifier")
     if "timeout-minutes: 45" not in real:
         issues.append("release-runtime-real must retain a 45-minute job timeout")
@@ -1536,6 +1557,11 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
     ):
         if marker not in real:
             issues.append(f"release-runtime-real is missing {message}")
+    if "baseline-runtime-guard" in real_needs and (
+        "inputs.proof_mode == 'baseline-runtime'" not in real
+        or "needs.baseline-runtime-guard.result == 'success'" not in real
+    ):
+        issues.append("release-runtime-real must gate the baseline proof lane")
     real_checkout = next(
         (step for step in _workflow_step_blocks(real) if "actions/checkout@" in step),
         "",
@@ -2101,7 +2127,11 @@ def collect_issues() -> list[str]:
             issues.append(f"exact classifier provenance input is missing: {marker}")
     if "platform_production_classifier_artifact.py" not in production_text:
         issues.append("production deploy must independently invoke the canonical classifier parser")
-    if "manifest \"$route_dir/artifact.zip\" --target-sha \"$TARGET_SHA\"" not in production_text:
+    if (
+        'manifest_args=(--target-sha "$TARGET_SHA"' not in production_text
+        or 'manifest "$route_dir/artifact.zip" "${manifest_args[@]}"' not in production_text
+        or 'manifest_args+=(--require-recovery-bootstrap)' not in production_text
+    ):
         issues.append("production deploy must revalidate the exact classifier manifest before writes")
 
     if not GOVERNANCE_DOC.is_file():

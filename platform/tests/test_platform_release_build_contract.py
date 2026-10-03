@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import importlib.util
@@ -1154,14 +1155,29 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             for runtime_sensitive in (False, True):
                 with self.subTest(runtime_sensitive=runtime_sensitive):
                     payload = manifest_payload(runtime_sensitive)
+                    archive = write_archive(
+                        json.dumps(payload, separators=(",", ":")).encode()
+                    )
                     result = run_tool(
                         "manifest",
-                        str(write_archive(json.dumps(payload, separators=(",", ":")).encode())),
+                        str(archive),
                         "--target-sha",
                         target_sha,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("classifier manifest accepted", result.stdout)
+                    exported = run_tool(
+                        "manifest",
+                        str(archive),
+                        "--target-sha",
+                        target_sha,
+                        "--emit-manifest-base64",
+                    )
+                    self.assertEqual(exported.returncode, 0, exported.stderr)
+                    self.assertEqual(
+                        json.loads(base64.b64decode(exported.stdout.strip())),
+                        payload,
+                    )
 
             classifier_tmp = root / "classifier-tmp"
             classifier_tmp.mkdir(mode=0o700)
@@ -1923,13 +1939,17 @@ fail 'private stderr must not cross the public channel'
             real.index("canonical_builder_rc=$?"),
             real.index("archive_candidates"),
         )
-        sanitizer_match = re.search(
+        sanitizer_scripts = re.findall(
             r"<<'PY'\n(?P<script>.*?)\n\s*PY\n",
             real,
             re.DOTALL,
         )
-        self.assertIsNotNone(sanitizer_match)
-        sanitizer = textwrap.dedent(sanitizer_match.group("script"))
+        sanitizer = next(
+            (script for script in sanitizer_scripts if "RELEASE_BUILD_DIAGNOSTIC" in script),
+            None,
+        )
+        self.assertIsNotNone(sanitizer)
+        sanitizer = textwrap.dedent(sanitizer)
         passed_marker = (
             "RELEASE_BUILD_DIAGNOSTIC schema=1 phase=complete status=passed "
             "reason=ok cleanup=passed "
@@ -2017,13 +2037,19 @@ fail 'private stderr must not cross the public channel'
                 self.assertIn("reject_reason=", parser_rejection.stdout)
                 self.assertNotIn("https://example.invalid", parser_rejection.stdout)
 
-        run_start = real.index("        run: |\n") + len("        run: |\n")
-        run_lines = []
-        for line in real[run_start:].splitlines():
-            if line and not line.startswith("          "):
-                break
-            run_lines.append(line[10:] if line.startswith("          ") else "")
-        run_script = "\n".join(run_lines)
+        run_scripts = []
+        for run_match in re.finditer(r"^        run: \|\n", real, re.MULTILINE):
+            run_lines = []
+            for line in real[run_match.end():].splitlines():
+                if line and not line.startswith("          "):
+                    break
+                run_lines.append(line[10:] if line.startswith("          ") else "")
+            run_scripts.append("\n".join(run_lines))
+        run_script = next(
+            (script for script in run_scripts if "cleanup() {" in script),
+            None,
+        )
+        self.assertIsNotNone(run_script)
         cleanup_start = run_script.index("cleanup() {")
         cleanup_end = run_script.index("\ntrap cleanup EXIT", cleanup_start)
         cleanup_script = run_script[cleanup_start:cleanup_end]
@@ -2550,6 +2576,25 @@ cleanup
                 root_owned.write_text("{}\n", encoding="ascii")
                 root_owned.chmod(0o600)
                 self.assertNotEqual(check_handoff(root_owned).returncode, 0)
+
+    def test_host_capability_probe_matches_pinned_dispatcher_contract(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        dispatcher = (
+            TOOLS_DIR / "platform_workflow_remote_dispatch.py"
+        ).read_text(encoding="utf-8")
+        probe = self._workflow_step_run(
+            workflow, "Probe immutable host dispatcher capabilities"
+        )
+        expected_match = re.search(r'expected_output="([^"]+)"', probe)
+        dispatcher_match = re.search(r'"dispatcher=[^"]+"', dispatcher)
+        self.assertIsNotNone(expected_match)
+        self.assertIsNotNone(dispatcher_match)
+        assert expected_match is not None
+        assert dispatcher_match is not None
+        self.assertIn(dispatcher_match.group(0)[1:-1], expected_match.group(1))
+        self.assertIn("release_baseline=1", expected_match.group(1))
 
     def test_host_tools_handoff_digest_matches_action_and_api_formats(self) -> None:
         workflow = (
@@ -3197,6 +3242,40 @@ cleanup
         self.assertIn("platform_release_lock_open ||", supervisor)
         self.assertIn("platform_retained_load_lock_open \\\n  || fail", supervisor)
         self.assertIn("baseline_identity_b64", supervisor)
+
+    def test_baseline_reconcile_build_and_deploy_require_cumulative_authorization(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        baseline = workflow_job(workflow, "validate-active-baseline")
+        dispatch = workflow_job(workflow, "dispatch-baseline-runtime")
+        proof = workflow_job(workflow, "validate-baseline-runtime-proof")
+        build = workflow_job(workflow, "build-release")
+        production = workflow_job(workflow, "production")
+
+        self.assertIn("name: Dispatch exact-target baseline runtime proof", dispatch)
+        self.assertIn("actions: write", dispatch)
+        self.assertIn("needs.validate-active-baseline.outputs.runtime_required == 'true'", dispatch)
+        self.assertIn("platform-security.yml/dispatches", dispatch)
+        self.assertIn("validate_security_marker(", baseline)
+        self.assertIn("validate_autodeploy_dispatch(", baseline)
+        self.assertIn("classify_cumulative_baseline(", baseline)
+        self.assertIn("platform_baseline_runtime_proof.py", proof)
+        self.assertIn("needs.dispatch-baseline-runtime.result == 'success'", proof)
+        self.assertIn("needs.validate-baseline-runtime-proof", build)
+        self.assertIn("needs.validate-active-baseline.result == 'success'", build)
+        self.assertIn("needs.validate-active-baseline.outputs.cumulative_no_op == 'false'", build)
+        self.assertIn("needs.validate-baseline-runtime-proof.result == 'success'", build)
+        self.assertIn("needs.validate-baseline-runtime-proof", production)
+        self.assertIn("needs.validate-active-baseline.result == 'success'", production)
+        self.assertIn("needs.validate-active-baseline.outputs.cumulative_no_op == 'false'", production)
+        self.assertIn("needs.validate-baseline-runtime-proof.result == 'success'", production)
+        self.assertIn("inputs.mode == 'deploy'", production)
+        dispatch_validator = workflow_job(workflow, "validate-dispatch")
+        self.assertIn("DEPLOY_MODE: ${{ inputs.mode }}", dispatch_validator)
+        self.assertIn('[[ "$handoff_mode" != "baseline-reconcile" ]] || handoff_mode=deploy', dispatch_validator)
+        self.assertIn("DEPLOY_MODE: deploy", build)
+        self.assertNotIn("DEPLOY_MODE: ${{ inputs.mode }}", build)
 
 
 if __name__ == "__main__":

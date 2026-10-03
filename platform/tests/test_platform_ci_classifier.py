@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from tools.platform_ci_classifier import (
     DOCS_ONLY_GATE_IDS,
     FULL_GATE_IDS,
     OUT_OF_SCOPE_GATE_IDS,
+    RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
     RUNTIME_SENSITIVE_FILES,
     ClassifierError,
@@ -292,15 +294,21 @@ class PlatformCiClassifierTests(unittest.TestCase):
         route = self._run_auto_deploy_manifest_contract(push_manifest)
         self.assertEqual(route["route_class"], push_manifest["class"])
         self.assertEqual(route["route_deployable"], str(push_manifest["deployable"]).lower())
+        self.assertEqual(route["route_recovery_bootstrap_only"], "false")
         self.assertEqual(route["route_fallback"], str(push_manifest["fallback"]).lower())
         self.assertEqual(route["route_digest"], push_manifest["digest"])
+        auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
-            'if [[ "$ROUTE_DEPLOYABLE" != "true" ]]',
-            AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8"),
+            'if [[ "$ROUTE_DEPLOYABLE" != "true"',
+            auto,
+        )
+        self.assertIn(
+            '"$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true"',
+            auto,
         )
         self.assertIn(
             'echo "deploy=false" >> "$GITHUB_OUTPUT"',
-            AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8"),
+            auto,
         )
 
     def test_deployable_push_matrix_keeps_application_runtime_migration_and_release_paths(self) -> None:
@@ -585,36 +593,28 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("workflows: [Platform security and build]", workflow)
         self.assertIn("types: [completed]", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
-        self.assertIn("permissions:\n      statuses: write", workflow)
+        self.assertNotIn("--location", workflow)
+        self.assertIn("permissions:\n      actions: read\n      statuses: write", workflow)
         self.assertNotIn("actions/checkout", workflow)
         self.assertNotIn("secrets.", workflow)
         self.assertIn("TARGET_SHA: ${{ github.event.workflow_run.head_sha }}", workflow)
         self.assertIn("statuses/${TARGET_SHA}", workflow)
         self.assertIn("attempt_url=", workflow)
         self.assertIn("SOURCE_RUN_URL", workflow)
-        self.assertIn("/attempts/{attempt}", workflow)
+        self.assertIn("/attempts/${SOURCE_RUN_ATTEMPT}", workflow)
         self.assertNotIn("commits/${TARGET_SHA}/statuses?per_page=100", workflow)
         self.assertNotIn("preserve_success", workflow)
         self.assertNotIn("updated_at", workflow)
         self.assertNotIn("status_rows", workflow)
         self.assertNotIn("pagination", workflow)
-        self.assertIn('case "$SOURCE_CONCLUSION" in', workflow)
-        self.assertIn("success)", workflow)
-        for conclusion in (
-            "cancelled",
-            "failure",
-            "skipped",
-            "timed_out",
-            "action_required",
-            "neutral",
-            "stale",
-            "startup_failure",
-        ):
-            self.assertIn(conclusion, workflow)
+        self.assertIn('if [[ "$SOURCE_CONCLUSION" == "success" ]]', workflow)
+        self.assertIn('"state": state', workflow)
         self.assertIn("state=failure", workflow)
         self.assertIn('description="Platform security or build failed"', workflow)
         self.assertIn('description="Platform security and build passed"', workflow)
-        self.assertIn('"context": "platform-security-build"', workflow)
+        self.assertIn('status_context = "platform-security-build"', workflow)
+        self.assertIn('status_context = "platform-baseline-runtime"', workflow)
+        self.assertIn('raise SystemExit("workflow-dispatch run mode is unavailable; no status will be published")', workflow)
         self.assertIn("SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}", workflow)
         self.assertLess(
             workflow.index("name: Platform security status finalizer"),
@@ -626,7 +626,380 @@ class PlatformCiClassifierTests(unittest.TestCase):
         final_at = security.index("  status-final:")
         self.assertLess(pending_at, first_gate_at)
         self.assertLess(first_gate_at, final_at)
-        self.assertIn("needs: [classifier, status-start", security)
+        self.assertIn("needs: [classifier, baseline-runtime-guard, status-start", security)
+
+    def test_internal_baseline_runtime_lane_is_closed_and_uses_a_distinct_status(self) -> None:
+        workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        finalizer = STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8")
+        for input_name in (
+            "proof_mode", "target_sha", "source_security_run_id",
+            "source_security_run_attempt", "autodeploy_run_id",
+            "autodeploy_run_attempt", "production_deploy_run_id",
+            "production_deploy_run_attempt",
+        ):
+            self.assertIn(f"      {input_name}:", workflow)
+        self.assertIn("default: standard", workflow)
+        self.assertIn("          - baseline-runtime", workflow)
+        self.assertIn("platform-baseline-runtime-v1:", workflow)
+        self.assertNotIn("curl --fail-with-body --silent --show-error --location", workflow)
+        self.assertIn("platform-security-standard-v1", workflow)
+        self.assertIn("platform-security-push-v1", workflow)
+        self.assertIn('test "$TARGET_SHA" = "$GITHUB_SHA"', workflow)
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', workflow)
+        self.assertIn('"baseline proof target is not the exact current dev head"', workflow)
+        self.assertIn('"Platform production deploy mode=baseline-reconcile target={target} source={security_id}.{security_attempt} auto={auto_id}.{auto_attempt}"', workflow)
+        self.assertIn('"Dispatch exact-target baseline runtime proof"', workflow)
+        self.assertIn('parent.get("status") != "in_progress"', workflow)
+        self.assertIn('needs.classifier.outputs.class == \'full\' || (github.event_name == \'workflow_dispatch\' && inputs.proof_mode == \'baseline-runtime\')', workflow)
+        self.assertIn('inputs.proof_mode == \'baseline-runtime\' && needs.baseline-runtime-guard.result == \'success\'', workflow)
+        self.assertIn("Recheck exact current dev SHA immediately before runtime build", workflow)
+        self.assertIn('"required_gates": [', workflow)
+        self.assertIn('name: platform-baseline-runtime-receipt-${{ github.run_id }}-${{ github.run_attempt }}', workflow)
+        self.assertIn('name: platform-baseline-runtime', workflow)
+        self.assertIn('context=platform-baseline-runtime', workflow)
+        self.assertIn('baseline-runtime) status_context=platform-baseline-runtime', workflow)
+        self.assertIn('status_context = "platform-baseline-runtime"', finalizer)
+        self.assertIn('display_title == "platform-security-standard-v1"', finalizer)
+        self.assertIn('is_baseline_candidate = display_title.startswith("platform-baseline-runtime-v1:")', finalizer)
+        self.assertIn('raise SystemExit("workflow-dispatch run mode is unavailable; no status will be published")', finalizer)
+        self.assertIn('required = {', finalizer)
+        self.assertIn('"Trusted dev immutable release runtime"', finalizer)
+        self.assertIn('"success", "failure", "cancelled", "skipped", "timed_out"', finalizer)
+        self.assertIn('if status_context == "platform-baseline-runtime" and conclusion == "success":', finalizer)
+        self.assertNotIn('context = "platform-security-build"\n                  if is_baseline_candidate', finalizer)
+
+    def test_baseline_source_status_must_be_latest_for_the_exact_attempt(self) -> None:
+        workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        guard = workflow.split("  baseline-runtime-guard:", 1)[1].split(
+            "  status-start:", 1
+        )[0]
+        script_match = re.search(
+            r"(?ms)^\s+/usr/bin/python3 - .*?<<'PY'\n(?P<script>.*?)^\s+PY$",
+            guard,
+        )
+        self.assertIsNotNone(script_match)
+        assert script_match is not None
+        guard_script = ast.parse(textwrap.dedent(script_match.group("script")))
+        validator = next(
+            node
+            for node in guard_script.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "validate_source_security_status"
+        )
+        test_module = ast.Module(
+            body=[
+                ast.Import(names=[ast.alias(name="re")]),
+                ast.ImportFrom(
+                    module="datetime",
+                    names=[
+                        ast.alias(name="datetime"),
+                        ast.alias(name="timezone"),
+                    ],
+                    level=0,
+                ),
+                validator,
+            ],
+            type_ignores=[],
+        )
+        namespace: dict[str, object] = {}
+        exec(compile(ast.fix_missing_locations(test_module), "baseline-status", "exec"), namespace)
+        validate = namespace["validate_source_security_status"]
+
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        expected_url = "https://github.com/StrayForest/old_sparky/actions/runs/123/attempts/2"
+        creator = {"login": "github-actions[bot]", "type": "Bot", "id": 41898282}
+        source_status = {
+            "id": 1,
+            "context": "platform-security-build",
+            "state": "success",
+            "target_url": expected_url,
+            "creator": creator,
+            "created_at": (now - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "updated_at": (now - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        validate([source_status], expected_url)
+
+        later_dispatch_status = {
+            **source_status,
+            "id": 2,
+            "target_url": "https://github.com/StrayForest/old_sparky/actions/runs/456/attempts/1",
+            "created_at": (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "updated_at": (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        with self.assertRaisesRegex(SystemExit, "superseded"):
+            validate([later_dispatch_status, source_status], expected_url)
+
+    def test_baseline_status_start_rejects_malformed_inputs_before_posting_pending(self) -> None:
+        workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        status_start = workflow.split("  status-start:", 1)[1].split(
+            "  backend-static:", 1
+        )[0]
+        script_match = re.search(
+            r"(?ms)^[ ]{8}run: \|\n(?P<script>.*)$",
+            status_start,
+        )
+        self.assertIsNotNone(script_match)
+        assert script_match is not None
+        script = textwrap.dedent(script_match.group("script"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            marker = temp_path / "status-posted"
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                "#!/bin/sh\nprintf called > \"$STATUS_WRITE_MARKER\"\nexit 0\n",
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            base_environment = os.environ.copy()
+            base_environment.update(
+                {
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "STATUS_WRITE_MARKER": str(marker),
+                    "EVENT_NAME": "workflow_dispatch",
+                    "PROOF_MODE": "baseline-runtime",
+                    "TESTED_SHA": "a" * 40,
+                    "TARGET_SHA_INPUT": "a" * 40,
+                    "GITHUB_REF": "refs/heads/dev",
+                    "SOURCE_SECURITY_RUN_ID": "1001",
+                    "SOURCE_SECURITY_RUN_ATTEMPT": "1",
+                    "AUTODEPLOY_RUN_ID": "1002",
+                    "AUTODEPLOY_RUN_ATTEMPT": "1",
+                    "PRODUCTION_DEPLOY_RUN_ID": "1003",
+                    "PRODUCTION_DEPLOY_RUN_ATTEMPT": "1",
+                    "GITHUB_SERVER_URL": "https://github.com",
+                    "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                    "GITHUB_RUN_ID": "1004",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_API_URL": "https://api.github.com",
+                    "GH_TOKEN": "test-token",
+                }
+            )
+            invalid_cases = (
+                {"TARGET_SHA_INPUT": "b" * 40},
+                {"SOURCE_SECURITY_RUN_ID": "0"},
+                {"AUTODEPLOY_RUN_ATTEMPT": "01"},
+                {"GITHUB_REF": "refs/heads/feature"},
+            )
+            for overrides in invalid_cases:
+                with self.subTest(overrides=overrides):
+                    marker.unlink(missing_ok=True)
+                    environment = {**base_environment, **overrides}
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", script],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                        timeout=5,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(marker.exists(), result.stdout + result.stderr)
+
+    def test_baseline_status_final_requires_full_gates_and_both_runtime_proofs(self) -> None:
+        workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        status_final = workflow.split("  status-final:", 1)[1]
+        script_match = re.search(
+            r"(?ms)^\s+/usr/bin/python3 - <<'PY'\n(?P<script>.*?)^\s+PY$",
+            status_final,
+        )
+        self.assertIsNotNone(script_match)
+        assert script_match is not None
+        status_script = textwrap.dedent(script_match.group("script"))
+        expected_full = list(FULL_GATE_IDS)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CLASSIFIER_RESULT": "success",
+                "EVENT_NAME": "workflow_dispatch",
+                "PROOF_MODE": "baseline-runtime",
+                "BASELINE_GUARD_RESULT": "success",
+                "TARGET_SHA_INPUT": self.TARGET_SHA,
+                "PROOF_RUN_ID": "12345",
+                "PROOF_RUN_ATTEMPT": "1",
+                "ROUTE_EVENT": "workflow_dispatch",
+                "ROUTE_CLASS": "docs-only",
+                "ROUTE_DEPLOYABLE": "false",
+                "ROUTE_FALLBACK": "false",
+                "ROUTE_RUNTIME_SENSITIVE": "false",
+                "ROUTE_TARGET_SHA": self.TARGET_SHA,
+                "ROUTE_DIGEST": "b" * 64,
+                "ROUTE_REASON": "trusted docs route",
+                "EXPECTED_GATES": json.dumps(["docs", "verification-contract"]),
+                "TESTED_SHA": self.TARGET_SHA,
+                "STATUS_START_RESULT": "success",
+                "WORKFLOW_REF": "refs/heads/dev",
+                "BACKEND_RESULT": "success",
+                "PYTHON_QUALITY_RESULT": "success",
+                "SECURITY_RESULT": "success",
+                "WEB_QUALITY_RESULT": "success",
+                "WEB_HERMETIC_RESULT": "success",
+                "DOCS_RESULT": "success",
+                "MIGRATION_RESULT": "success",
+                "VERIFICATION_CONTRACT_RESULT": "success",
+                "RELEASE_RUNTIME_RESULT": "success",
+                "RELEASE_RUNTIME_REAL_RESULT": "success",
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "summary.json"
+            environment["SUMMARY_PATH"] = str(summary_path)
+            completed = subprocess.run(
+                ["/usr/bin/python3"],
+                input=status_script,
+                text=True,
+                capture_output=True,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "true")
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["expected_gates"], expected_full)
+            self.assertTrue(summary["requires_release_runtime"])
+            self.assertTrue(summary["requires_real_release_runtime"])
+
+            for missing_gate, gate in (
+                ("release-runtime", "fixture"),
+                ("release-runtime-real", "immutable"),
+            ):
+                with self.subTest(missing_gate=missing_gate):
+                    failed_environment = dict(environment)
+                    failed_environment[
+                        "RELEASE_RUNTIME_RESULT"
+                        if gate == "fixture"
+                        else "RELEASE_RUNTIME_REAL_RESULT"
+                    ] = "skipped"
+                    failed_environment["SUMMARY_PATH"] = str(
+                        Path(directory) / f"missing-{gate}.json"
+                    )
+                    failed = subprocess.run(
+                        ["/usr/bin/python3"],
+                        input=status_script,
+                        text=True,
+                        capture_output=True,
+                        env=failed_environment,
+                        check=False,
+                    )
+                    self.assertEqual(failed.returncode, 0, failed.stderr)
+                    self.assertEqual(failed.stdout.strip(), "false")
+
+            invalid_environment = dict(environment)
+            invalid_environment["PROOF_MODE"] = "unrecognized"
+            invalid_environment["SUMMARY_PATH"] = str(Path(directory) / "invalid.json")
+            invalid = subprocess.run(
+                ["/usr/bin/python3"],
+                input=status_script,
+                text=True,
+                capture_output=True,
+                env=invalid_environment,
+                check=False,
+            )
+            self.assertEqual(invalid.returncode, 0, invalid.stderr)
+            self.assertEqual(invalid.stdout.strip(), "false")
+
+    def test_baseline_status_final_leaves_terminal_write_to_workflow_run_finalizer(self) -> None:
+        workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        status_final = workflow.split("  status-final:", 1)[1]
+        script_match = re.search(
+            r"(?ms)^[ ]{8}run: \|\n(?P<script>.*?)(?=^[ ]{6}- name:|\Z)",
+            status_final,
+        )
+        self.assertIsNotNone(script_match)
+        assert script_match is not None
+        script = textwrap.dedent(script_match.group("script"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            marker = root / "status-posted"
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$STATUS_WRITE_MARKER\"\n",
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            base_environment = os.environ.copy()
+            base_environment.update(
+                {
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "STATUS_WRITE_MARKER": str(marker),
+                    "CLASSIFIER_RESULT": "success",
+                    "EVENT_NAME": "workflow_dispatch",
+                    "PROOF_MODE": "baseline-runtime",
+                    "BASELINE_GUARD_RESULT": "success",
+                    "TARGET_SHA_INPUT": self.TARGET_SHA,
+                    "PROOF_RUN_ID": "12345",
+                    "PROOF_RUN_ATTEMPT": "1",
+                    "ROUTE_EVENT": "workflow_dispatch",
+                    "ROUTE_CLASS": "docs-only",
+                    "ROUTE_DEPLOYABLE": "false",
+                    "ROUTE_FALLBACK": "false",
+                    "ROUTE_RUNTIME_SENSITIVE": "false",
+                    "ROUTE_TARGET_SHA": self.TARGET_SHA,
+                    "ROUTE_DIGEST": "b" * 64,
+                    "ROUTE_REASON": "trusted docs route",
+                    "EXPECTED_GATES": json.dumps(["docs", "verification-contract"]),
+                    "TESTED_SHA": self.TARGET_SHA,
+                    "STATUS_START_RESULT": "success",
+                    "WORKFLOW_REF": "refs/heads/dev",
+                    "BACKEND_RESULT": "success",
+                    "PYTHON_QUALITY_RESULT": "success",
+                    "SECURITY_RESULT": "success",
+                    "WEB_QUALITY_RESULT": "success",
+                    "WEB_HERMETIC_RESULT": "success",
+                    "DOCS_RESULT": "success",
+                    "MIGRATION_RESULT": "success",
+                    "VERIFICATION_CONTRACT_RESULT": "success",
+                    "RELEASE_RUNTIME_RESULT": "success",
+                    "RELEASE_RUNTIME_REAL_RESULT": "success",
+                    "SUMMARY_PATH": str(root / "summary.json"),
+                    "GH_TOKEN": "test-token",
+                    "GITHUB_SERVER_URL": "https://github.com",
+                    "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                    "GITHUB_WORKSPACE": str(root),
+                    "GITHUB_RUN_ID": "12345",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_API_URL": "https://api.github.com",
+                }
+            )
+            baseline = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=base_environment,
+                timeout=10,
+            )
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+            self.assertFalse(marker.exists(), baseline.stdout + baseline.stderr)
+
+            standard_environment = dict(base_environment)
+            standard_environment.update(
+                {
+                    "PROOF_MODE": "standard",
+                    "RELEASE_RUNTIME_RESULT": "skipped",
+                    "RELEASE_RUNTIME_REAL_RESULT": "skipped",
+                    "SUMMARY_PATH": str(root / "standard-summary.json"),
+                }
+            )
+            standard = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=standard_environment,
+                timeout=10,
+            )
+            self.assertEqual(standard.returncode, 0, standard.stderr)
+            self.assertTrue(marker.exists())
+            self.assertEqual(marker.read_text(encoding="utf-8").count("\n"), 1)
+            self.assertIn('"context": "platform-security-build"', marker.read_text(encoding="utf-8"))
 
     def test_successful_reduced_routes_keep_canonical_status_and_noop_autodeploy(self) -> None:
         security = SECURITY_WORKFLOW.read_text(encoding="utf-8")
@@ -700,6 +1073,64 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     expected_target_sha=self.TARGET_SHA,
                     expected_run_url="https://github.com/StrayForest/old_sparky/actions/runs/1234",
                 )
+
+    def test_autodeploy_reconciles_only_the_special_full_nondeployable_route(self) -> None:
+        auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+        allowlist_marker = "          recovery_bootstrap_files = {\n"
+        allowlist_start = auto.index(allowlist_marker) + len(allowlist_marker)
+        allowlist_end = auto.index("          }\n", allowlist_start) + len("          }\n")
+        allowlist_source = textwrap.dedent(
+            "recovery_bootstrap_files = {\n"
+            + auto[allowlist_start:allowlist_end]
+        )
+        auto_allowlist = ast.literal_eval(ast.parse(allowlist_source).body[0].value)
+        self.assertEqual(auto_allowlist, set(RECOVERY_BOOTSTRAP_FILES))
+
+        bootstrap_path = sorted(RECOVERY_BOOTSTRAP_FILES)[0]
+        special_route = classify(
+            [bootstrap_path],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(special_route["class"], "full")
+        self.assertFalse(special_route["deployable"])
+        self.assertFalse(special_route["fallback"])
+        self.assertEqual(special_route["reason"], RECOVERY_BOOTSTRAP_REASON)
+        special_outputs = self._run_auto_deploy_manifest_contract(special_route)
+        self.assertEqual(special_outputs["route_class"], "full")
+        self.assertEqual(special_outputs["route_deployable"], "false")
+        self.assertEqual(special_outputs["route_recovery_bootstrap_only"], "true")
+
+        ordinary_nondeployable = classify(
+            [sorted(CANDIDATE_PACKAGING_FILES)[0]],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertFalse(ordinary_nondeployable["deployable"])
+        self.assertFalse(ordinary_nondeployable["fallback"])
+        ordinary_outputs = self._run_auto_deploy_manifest_contract(
+            ordinary_nondeployable
+        )
+        self.assertEqual(ordinary_outputs["route_recovery_bootstrap_only"], "false")
+
+        self.assertIn("route_recovery_bootstrap_only", auto)
+        self.assertIn(
+            '&& ! ( "$ROUTE_CLASS" == "full" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" )',
+            auto,
+        )
+        self.assertIn("dispatch_mode=baseline-reconcile", auto)
+        self.assertIn('case "$DISPATCH_MODE" in', auto)
+        self.assertIn('mode": sys.argv[3]', auto)
+        self.assertIn('autodeploy_run_id": sys.argv[4]', auto)
+        self.assertIn('autodeploy_run_attempt": sys.argv[5]', auto)
+        self.assertIn('AUTODEPLOY_RUN_ID: ${{ github.run_id }}', auto)
+        self.assertIn('AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}', auto)
+        self.assertIn('"ref": "dev"', auto)
+        self.assertIn('"web_compression": "enabled"', auto)
+        self.assertIn('"runtime_profile": "ready-vote-static-8"', auto)
+        self.assertIn("Refusing stale dispatch", auto)
 
     def test_deploy_consumers_validate_the_exact_classifier_artifact(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
@@ -1023,7 +1454,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             status_final,
         )
         self.assertIn(
-            'requires_release_runtime = runtime_sensitive or raw_fallback == "true"',
+            'requires_release_runtime = baseline_mode or runtime_sensitive or raw_fallback == "true"',
             status_final,
         )
         self.assertIn('release_runtime_result != "success"', status_final)
@@ -1041,6 +1472,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
         status_script = textwrap.dedent(script_match.group("script"))
         base_environment = {
             "CLASSIFIER_RESULT": "success",
+            "PROOF_MODE": "standard",
+            "BASELINE_GUARD_RESULT": "skipped",
             "EVENT_NAME": "pull_request",
             "ROUTE_EVENT": "pull_request",
             "ROUTE_CLASS": "docs-only",

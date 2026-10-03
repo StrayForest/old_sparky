@@ -674,7 +674,7 @@ class HostToolsBundleTests(unittest.TestCase):
             encoding="utf-8"
         )
         preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
-            "  build-release:", 1
+            "  validate-active-baseline:", 1
         )[0]
         handoff_steps = [
             step
@@ -2005,8 +2005,8 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
         self.assertIn("/usr/bin/head -c 512", probe)
         self.assertIn(
             'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA '
-            'generation=$HOST_TOOLS_SHA dispatcher=2 artifact_prepare=2 supervisor=2 '
-            'input_guard=1 python_isolated=1 python_bytecode_disabled=1"',
+            'generation=$HOST_TOOLS_SHA dispatcher=3 artifact_prepare=2 supervisor=3 '
+            'input_guard=1 release_baseline=1 python_isolated=1 python_bytecode_disabled=1"',
             probe,
         )
         self.assertIn('printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"', probe)
@@ -2104,7 +2104,7 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
             encoding="utf-8"
         )
         preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
-            "  build-release:", 1
+            "  validate-active-baseline:", 1
         )[0]
         probe_steps = [
             step
@@ -2154,12 +2154,12 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
 
         expected_line = (
             f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
-            "dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 "
+            "dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 "
             "python_isolated=1 python_bytecode_disabled=1"
         )
         expected_payload = (expected_line + "\n").encode("ascii")
         expected_sha256 = hashlib.sha256(expected_payload).hexdigest()
-        self.assertEqual(len(expected_payload), 228)
+        expected_bytes = len(expected_payload)
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2338,7 +2338,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 }
                 diagnostic_pattern = re.compile(
                     r"immutable host capability probe diagnostics: command_rc=[0-9]+ "
-                    r"expected_bytes=228 actual_bytes=[0-9]+ "
+                    rf"expected_bytes={expected_bytes} actual_bytes=[0-9]+ "
                     r"expected_sha256=[0-9a-f]{64} actual_sha256=[0-9a-f]{64} "
                     r"expected_cr_count=0 actual_cr_count=[0-9]+ "
                     r"expected_lf_count=1 actual_lf_count=[0-9]+ exact_one_line=[01]\n$"

@@ -176,6 +176,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_ci_classifier.py",
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tools/platform_deploy_baseline.py",
+        "platform/tools/platform_baseline_runtime_proof.py",
         "platform/tools/platform_workflow_provenance.py",
         "platform/tools/platform_verify_contract.py",
         "platform/tools/platform_test_catalog.py",

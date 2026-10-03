@@ -332,6 +332,7 @@ jobs:
               "platform/tools/platform_ci_classifier.py",
               "platform/tools/platform_production_classifier_artifact.py",
               "platform/tools/platform_deploy_baseline.py",
+              "platform/tools/platform_baseline_runtime_proof.py",
               "platform/tools/platform_workflow_provenance.py",
               "platform/tools/platform_host_tools_bundle.py",
               "platform/tools/platform_validate_release_artifact.py",
@@ -340,7 +341,10 @@ jobs:
               "platform/tools/platform_test_catalog.py",
               "platform/tools/platform_workflow_input_guard.py",
               "platform/tools/platform_workflow_remote_dispatch.py",
+              "platform/tools/platform_host_tools_bundle.py",
+              "platform/tools/platform_validate_release_artifact.py",
               "platform/tests/test_platform_host_tools_bundle.py",
+              "platform/tests/test_platform_workflow_provenance.py",
               "platform/tests/test_platform_cloudflare_ips.py",
               "platform/python_packages/platform_infra/db.py",
               "platform/tests/test_platform_install_nginx.py",
@@ -372,11 +376,13 @@ jobs:
           if not isinstance(manifest.get("files"), list):
               raise SystemExit("classifier files are malformed")
           files = manifest["files"]
+          if any(not isinstance(path, str) or not path for path in files):
+              raise SystemExit("classifier files contain a malformed path")
           recovery_bootstrap_only = bool(
               any(path in recovery_bootstrap_files for path in files)
               and all(
                   path in recovery_bootstrap_files
-                  or (isinstance(path, str) and path.startswith("platform/docs/"))
+                  or path.startswith("platform/docs/")
                   for path in files
               )
           )
@@ -395,11 +401,16 @@ jobs:
               raise SystemExit("full route may be non-deployable, but its flag must be boolean")
           if recovery_bootstrap_only and manifest["deployable"]:
               raise SystemExit("recovery-bootstrap route cannot be deployable")
+          if recovery_bootstrap_only and route_class != "full":
+              raise SystemExit("recovery-bootstrap route must use full verification")
+          if recovery_bootstrap_only and reason != "retained-release recovery-bootstrap change requires full verification and is non-deployable":
+              raise SystemExit("recovery-bootstrap route reason is inconsistent")
           if route_class != "full" and manifest.get("deployable") is not False:
               raise SystemExit("reduced classifier route must be non-deployable")
           with Path(output_path).open("a", encoding="utf-8") as output:
               output.write(f"route_class={route_class}\n")
               output.write(f"route_deployable={'true' if manifest['deployable'] else 'false'}\n")
+              output.write(f"route_recovery_bootstrap_only={'true' if recovery_bootstrap_only else 'false'}\n")
               output.write(f"route_fallback={'true' if manifest['fallback'] else 'false'}\n")
               output.write(f"route_digest={manifest['digest']}\n")
               output.write(f"route_reason={reason}\n")
@@ -412,6 +423,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
+          ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
         run: |
           set -euo pipefail
 
@@ -436,10 +448,20 @@ jobs:
             exit 0
           fi
 
-          if [[ "$ROUTE_DEPLOYABLE" != "true" ]]; then
+          if [[ "$ROUTE_DEPLOYABLE" != "true" \
+            && ! ( "$ROUTE_CLASS" == "full" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" ) ]]; then
             echo "Classifier route is non-deployable ($ROUTE_CLASS); no production deployment required."
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          dispatch_mode=deploy
+          if [[ "$ROUTE_DEPLOYABLE" == "false" ]]; then
+            [[ "$ROUTE_CLASS" == "full" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" ]] || {
+              echo "Refusing an unrecognized non-deployable route." >&2
+              exit 1
+            }
+            dispatch_mode=baseline-reconcile
           fi
 
           status_dir="$(mktemp -d "$RUNNER_TEMP/platform-autodeploy-status.XXXXXX")"
@@ -766,15 +788,38 @@ jobs:
             fi
           done
 
+          echo "mode=$dispatch_mode" >> "$GITHUB_OUTPUT"
           echo "deploy=true" >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch production deployment
+      - name: Dispatch production deployment or baseline reconciliation
         if: ${{ steps.gate.outputs.deploy == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          DISPATCH_MODE: ${{ steps.gate.outputs.mode }}
+          ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
+          ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
+          ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
+          AUTODEPLOY_RUN_ID: ${{ github.run_id }}
+          AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+
+          case "$DISPATCH_MODE" in
+            deploy)
+              [[ "$ROUTE_DEPLOYABLE" == "true" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ]] \
+                || { echo "Refusing an invalid ordinary deploy route." >&2; exit 1; }
+              ;;
+            baseline-reconcile)
+              [[ "$ROUTE_CLASS" == "full" && "$ROUTE_DEPLOYABLE" == "false" \
+                && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" ]] \
+                || { echo "Refusing an invalid baseline-reconcile route." >&2; exit 1; }
+              ;;
+            *)
+              echo "Refusing an unknown production dispatch mode." >&2
+              exit 1
+              ;;
+          esac
 
           branch_json="$(
             curl --fail-with-body --silent --show-error \
@@ -794,6 +839,11 @@ jobs:
             echo "Refusing stale dispatch: dev moved from $TARGET_SHA to $dev_sha." >&2
             exit 1
           }
+          [[ "$AUTODEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+            && "$AUTODEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || {
+            echo "Refusing malformed auto-deploy run identity." >&2
+            exit 1
+          }
 
           curl --fail-with-body --silent --show-error \
             --request POST \
@@ -801,7 +851,7 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches" \
-            --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" <<'PY'
+            --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$DISPATCH_MODE" "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" <<'PY'
           import json
           import sys
           # Keep the reviewed default profile and compression contract explicit:
@@ -809,11 +859,13 @@ jobs:
           print(json.dumps({
               "ref": "dev",
               "inputs": {
-                  "mode": "deploy",
+                  "mode": sys.argv[3],
                   "runtime_profile": "ready-vote-static-8",
                   "web_compression": "enabled",
                   "classifier_run_id": sys.argv[1],
                   "classifier_run_attempt": sys.argv[2],
+                  "autodeploy_run_id": sys.argv[4],
+                  "autodeploy_run_attempt": sys.argv[5],
               },
           }))
           PY
@@ -827,6 +879,7 @@ jobs:
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_REASON: ${{ steps.route.outputs.route_reason }}
+          DISPATCH_MODE: ${{ steps.gate.outputs.mode }}
         run: |
           {
             echo "### Platform production auto-deploy"
@@ -835,7 +888,11 @@ jobs:
             echo "- Security/build run: $SOURCE_RUN_URL"
             echo "- Classifier route: \`$ROUTE_CLASS\` ($ROUTE_REASON)"
             if [[ "$SHOULD_DEPLOY" == "true" ]]; then
-              echo "- Result: production deployment dispatched"
+              if [[ "$DISPATCH_MODE" == "baseline-reconcile" ]]; then
+                echo "- Result: authenticated baseline reconciliation dispatched"
+              else
+                echo "- Result: production deployment dispatched"
+              fi
             else
               echo "- Result: no deployment required"
             fi

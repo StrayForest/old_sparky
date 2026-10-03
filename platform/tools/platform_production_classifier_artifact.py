@@ -10,6 +10,7 @@ ever evaluated as Python source, and failures expose only a fixed reason.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Mapping, Sequence
 import hashlib
 import importlib.util
@@ -108,6 +109,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_ci_classifier.py",
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tools/platform_deploy_baseline.py",
+        "platform/tools/platform_baseline_runtime_proof.py",
         "platform/tools/platform_workflow_provenance.py",
         "platform/tools/platform_verify_contract.py",
         "platform/tools/platform_test_catalog.py",
@@ -126,6 +128,9 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
     }
 )
 DOCS_PREFIX = "platform/docs/"
+RECOVERY_BOOTSTRAP_REASON = (
+    "retained-release recovery-bootstrap change requires full verification and is non-deployable"
+)
 ALLOWED_REASONS = frozenset(
     {
         "metadata",
@@ -448,7 +453,12 @@ def _is_recovery_bootstrap_only(files: Sequence[object]) -> bool:
     )
 
 
-def validate_manifest(archive: Path, *, target_sha: str) -> None:
+def validate_manifest(
+    archive: Path,
+    *,
+    target_sha: str,
+    require_recovery_bootstrap: bool = False,
+) -> dict[str, Any]:
     if SHA_RE.fullmatch(target_sha) is None:
         raise _fail("provenance")
     with tempfile.TemporaryDirectory(prefix="platform-classifier-") as temporary:
@@ -495,6 +505,15 @@ def validate_manifest(archive: Path, *, target_sha: str) -> None:
     ):
         raise _fail("manifest")
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
+    if type(require_recovery_bootstrap) is not bool:
+        raise _fail("manifest")
+    if require_recovery_bootstrap and (
+        not recovery_bootstrap_only
+        or manifest.get("reason") != RECOVERY_BOOTSTRAP_REASON
+        or manifest.get("class") != "full"
+        or manifest.get("deployable") is not False
+    ):
+        raise _fail("manifest")
     if type(manifest.get("deployable")) is not bool:
         raise _fail("manifest")
     if recovery_bootstrap_only:
@@ -511,6 +530,7 @@ def validate_manifest(archive: Path, *, target_sha: str) -> None:
         raise _fail("manifest")
     if digest != _manifest_digest(manifest):
         raise _fail("manifest")
+    return dict(manifest)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -528,6 +548,8 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("archive", type=Path)
     manifest.add_argument("--target-sha", required=True)
+    manifest.add_argument("--require-recovery-bootstrap", action="store_true")
+    manifest.add_argument("--emit-manifest-base64", action="store_true")
     return parser
 
 
@@ -558,8 +580,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(artifact_id)
         else:
-            validate_manifest(arguments.archive, target_sha=arguments.target_sha)
-            print("classifier manifest accepted")
+            validated_manifest = validate_manifest(
+                arguments.archive,
+                target_sha=arguments.target_sha,
+                require_recovery_bootstrap=arguments.require_recovery_bootstrap,
+            )
+            if arguments.emit_manifest_base64:
+                encoded = base64.b64encode(
+                    json.dumps(
+                        validated_manifest,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).decode("ascii")
+                print(encoded)
+            else:
+                print("classifier manifest accepted")
     except ClassifierArtifactError as exc:
         print(f"classifier validation rejected: {exc.reason}", file=sys.stderr)
         return 1
