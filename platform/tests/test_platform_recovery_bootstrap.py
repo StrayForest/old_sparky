@@ -111,6 +111,7 @@ RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES = frozenset(
         "platform/tools/platform_release_lock.sh",
         "platform/tests/test_platform_workflow_provenance.py",
         "platform/tools/platform_deploy_baseline.py",
+        "platform/tools/platform_baseline_runtime_proof.py",
         "platform/tools/platform_host_tools_bundle.py",
         "platform/tools/platform_validate_release_artifact.py",
         "platform/tools/platform_workflow_provenance.py",
