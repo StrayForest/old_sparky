@@ -119,7 +119,7 @@ BASELINE_RUNTIME_TITLE_RE = re.compile(
     r"s(?P<source_id>[1-9][0-9]{0,31})\.(?P<source_attempt>[1-9][0-9]{0,31}):"
     r"a(?P<auto_id>[1-9][0-9]{0,31})\.(?P<auto_attempt>[1-9][0-9]{0,31}):"
     r"d(?P<parent_id>[1-9][0-9]{0,31})\.(?P<parent_attempt>[1-9][0-9]{0,31}):"
-    r"r(?P<proof_id>[1-9][0-9]{0,31})\.(?P<proof_attempt>[1-9][0-9]{0,31})$"
+    r"r(?P<proof_id>[1-9][0-9]{0,31})\.(?P<proof_attempt>[1-9][0-9]{0,31})\Z"
 )
 
 
@@ -333,6 +333,11 @@ def validate_baseline_runtime_proof(
         expected_path=SECURITY_WORKFLOW_PATH,
         expected_name=SECURITY_WORKFLOW_NAME,
     )
+    if run.get("path") not in {
+        f"{SECURITY_WORKFLOW_PATH}@dev",
+        f"{SECURITY_WORKFLOW_PATH}@refs/heads/dev",
+    }:
+        raise ProvenanceError("runtime proof workflow definition is not from trusted dev")
     title = run.get("display_title")
     match = BASELINE_RUNTIME_TITLE_RE.fullmatch(title) if isinstance(title, str) else None
     expected_title = {
