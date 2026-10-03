@@ -627,9 +627,22 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             process = subprocess.Popen([sys.executable, str(supervisor)])
             try:
                 deadline = time.monotonic() + 5
-                while time.monotonic() < deadline and not (root / 'worker.started').exists():
+                while time.monotonic() < deadline and (
+                    not (root / 'worker.started').exists()
+                    or not (root / 'pdeath.heartbeat').exists()
+                ):
                     time.sleep(0.01)
-                self.assertTrue((root / 'pdeath.heartbeat').exists())
+                if not (root / 'pdeath.heartbeat').exists():
+                    try:
+                        final_report = json.loads((root / 'final.json').read_text())
+                    except (OSError, ValueError):
+                        final_report = {}
+                    self.fail(
+                        "parent-death worker did not start its heartbeat: "
+                        f"worker_started={(root / 'worker.started').exists()}, "
+                        f"supervisor_returncode={process.poll()!r}, "
+                        f"runtime_supervisor={final_report.get('runtime_supervisor')}"
+                    )
                 os.kill(process.pid, signal.SIGKILL)
                 process.wait(timeout=3)
                 time.sleep(0.25)
