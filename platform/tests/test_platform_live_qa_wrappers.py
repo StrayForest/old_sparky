@@ -869,6 +869,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "phase=preflight reason=environment "
             f"release_slug={release_slug} source_sha={source_sha}\n"
         )
+        legacy_lock_failure = (
+            "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+            "phase=preflight reason=lock "
+            f"release_slug={release_slug} source_sha={source_sha}\n"
+        )
 
         def run_child(
             output: bytes,
@@ -922,12 +927,48 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             run_child(preflight.encode(), expected_marker=("preflight", release_slug, source_sha)),
             (0, preflight, ""),
         )
+        self.assertEqual(
+            run_child(legacy_lock_failure.encode(), status=1),
+            (1, legacy_lock_failure, ""),
+        )
+        for stage in (
+            "helper_metadata",
+            "release_supervise",
+            "release_open",
+            "retained_supervise",
+            "retained_open",
+        ):
+            staged_lock_failure = (
+                "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+                f"phase=preflight reason=lock lock_stage={stage} "
+                f"release_slug={release_slug} source_sha={source_sha}\n"
+            )
+            with self.subTest(lock_stage=stage):
+                self.assertEqual(
+                    run_child(staged_lock_failure.encode(), status=1),
+                    (1, staged_lock_failure, ""),
+                )
 
         malformed = (
             passed.replace("class=deployment", "class=preflight").encode(),
             passed.replace(release_slug, "gha-123456-2-bbbbbbbbbbbb").encode(),
             passed.replace(source_sha, "b" * 40).encode(),
             passed.encode() + passed.encode(),
+            legacy_lock_failure.replace(
+                "reason=lock ", "reason=lock lock_stage=unknown "
+            ).encode(),
+            legacy_lock_failure.replace(
+                "reason=lock ", "reason=lock lock_stage=release_open lock_stage=retained_open "
+            ).encode(),
+            failed.replace(
+                "reason=environment ", "reason=environment lock_stage=release_open "
+            ).encode(),
+            legacy_lock_failure.replace(
+                "class=preflight", "class=deployment"
+            ).encode(),
+            legacy_lock_failure.replace(
+                "status=failed", "status=passed"
+            ).encode(),
             b"x" * (platform_workflow_remote_dispatch.RELEASE_MARKER_MAX_BYTES + 4096),
         )
         for output in malformed:
