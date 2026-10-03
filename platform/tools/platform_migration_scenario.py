@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,12 +34,22 @@ from tools.platform_tournament_list_read_model_recovery import (
     repair_indexes_async,
     validate_projection_async,
 )
+from tools.platform_migration_support import (
+    MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
+    MigrationCommandError,
+    assert_single_head_state,
+    run_migration_subprocess,
+    select_reversible_range,
+    source_head,
+    validate_disposable_migration_target,
+)
 from tools.platform_verification_lock import VerificationLockError, verification_resource_lock
 
 
 TARGET_REVISION = "20260821_0039"
 MID_REVISION = "20260901_0050"
-HEAD_REVISION = "20260913_0053"
+IRREVERSIBLE_REVISION = "20260829_0046"
+IRREVERSIBLE_REFUSAL = "intentionally not restorable"
 
 
 PARTIAL_PROJECTION_DDL = """
@@ -90,8 +99,28 @@ CREATE TABLE platform.tournament_list_read_models (
 """
 
 
+CRITICAL_SCHEMA_COLUMNS: dict[str, tuple[str, ...]] = {
+    "users": ("id", "email", "status"),
+    "roles": ("slug",),
+    "tournaments": ("id", "slug", "status", "organizer_user_id"),
+    "tournament_participants": ("tournament_id", "user_id", "status"),
+    "patch_translations": ("patch_id", "source_hash", "status"),
+    "external_identities": ("provider", "subject", "user_id"),
+    "google_auth_flows": ("state_digest", "browser_grant_digest", "expires_at"),
+    "tournament_list_read_models": ("id", "slug", "participant_count"),
+}
+CRITICAL_SCHEMA_INDEXES = (
+    "ix_tournaments_organizer_user_id",
+    "ix_tournament_participants_tournament_id",
+    "ix_external_identities_user_id",
+    "ix_patch_translations_status",
+    "ix_google_auth_flows_cleanup",
+    "ix_tournament_list_public_created_at_id",
+)
+
+
 def _run_alembic(
-    revision: str,
+    revision: str | None,
     *,
     expect_success: bool,
     operation: str = "upgrade",
@@ -100,20 +129,26 @@ def _run_alembic(
     command_env = os.environ.copy()
     if extra_env:
         command_env.update(extra_env)
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", operation, revision],
-        cwd=ROOT,
+    command = [sys.executable, "-m", "alembic", operation]
+    if operation == "current":
+        command.append("--check-heads")
+    elif revision is not None:
+        command.append(revision)
+    result = run_migration_subprocess(
+        command,
+        label=f"alembic {operation}{f' {revision}' if revision else ''}".strip(),
+        timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
         env=command_env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
     )
     if (result.returncode == 0) != expect_success:
-        output = result.stdout[-4000:]
-        raise RuntimeError(
-            f"alembic {operation} {revision!r} returned {result.returncode}; output:\n{output}"
+        raise MigrationCommandError(
+            label=f"alembic {operation} {revision!r}",
+            command=command,
+            returncode=result.returncode,
+            output=result.stdout,
         )
+    if expect_success and operation == "upgrade" and revision == source_head():
+        _run_alembic(None, expect_success=True, operation="current", extra_env=extra_env)
     return result
 
 
@@ -121,23 +156,23 @@ def _run_recovery(*, expect_success: bool, extra_env: dict[str, str] | None = No
     command_env = os.environ.copy()
     if extra_env:
         command_env.update(extra_env)
-    result = subprocess.run(
-        [
-            sys.executable,
-            "tools/platform_tournament_list_read_model_recovery.py",
-            "--recover-partial",
-        ],
-        cwd=ROOT,
+    command = [
+        sys.executable,
+        "tools/platform_tournament_list_read_model_recovery.py",
+        "--recover-partial",
+    ]
+    result = run_migration_subprocess(
+        command,
+        label="tournament catalog recovery",
+        timeout_seconds=MIGRATION_SUBPROCESS_TIMEOUT_SECONDS,
         env=command_env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
     )
     if (result.returncode == 0) != expect_success:
-        output = result.stdout[-4000:]
-        raise RuntimeError(
-            f"tournament catalog recovery returned {result.returncode}; output:\n{output}"
+        raise MigrationCommandError(
+            label="tournament catalog recovery",
+            command=command,
+            returncode=result.returncode,
+            output=result.stdout,
         )
     return result.stdout
 
@@ -244,12 +279,110 @@ async def _reset_disposable_schema() -> None:
     production rollback contract.
     """
 
+    settings = get_settings()
+    validate_platform_settings(settings)
+    validate_disposable_migration_target(
+        settings.platform_database_url,
+        environment=settings.platform_environment,
+        schema=settings.platform_db_schema,
+    )
     async with session_factory()() as db_session:
         await db_session.execute(text("DROP SCHEMA IF EXISTS platform CASCADE"))
         await db_session.execute(text("CREATE SCHEMA platform"))
         await db_session.execute(text("DROP TABLE IF EXISTS public.alembic_version"))
         await db_session.commit()
     await dispose_engine()
+
+
+async def _assert_source_and_database_head(expected_revision: str | None = None) -> None:
+    """Require one current/version row, matching source or a test target."""
+
+    async with engine().connect() as db_connection:
+        expected = None if expected_revision is None else (expected_revision,)
+        await db_connection.run_sync(
+            lambda connection: assert_single_head_state(
+                connection,
+                expected_database=expected,
+            )
+        )
+
+
+async def _assert_critical_schema_invariants() -> None:
+    """Check the compact schema contract through PostgreSQL catalogs."""
+
+    async with engine().connect() as db_connection:
+        table_rows = await db_connection.scalars(
+            text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'platform' AND table_type = 'BASE TABLE'"
+            )
+        )
+        present_tables = {str(value) for value in table_rows}
+        missing_tables = sorted(set(CRITICAL_SCHEMA_COLUMNS) - present_tables)
+        if missing_tables:
+            raise RuntimeError(
+                "critical migration tables are missing: " + ", ".join(missing_tables)
+            )
+
+        for table_name, columns in CRITICAL_SCHEMA_COLUMNS.items():
+            placeholders = ", ".join(
+                f":column_{index}" for index in range(len(columns))
+            )
+            parameters = {f"column_{index}": column for index, column in enumerate(columns)}
+            rows = await db_connection.scalars(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'platform' AND table_name = :table_name "
+                    f"AND column_name IN ({placeholders})"
+                ),
+                {"table_name": table_name, **parameters},
+            )
+            present_columns = {str(value) for value in rows}
+            missing_columns = sorted(set(columns) - present_columns)
+            if missing_columns:
+                raise RuntimeError(
+                    f"critical migration columns missing from {table_name}: "
+                    + ", ".join(missing_columns)
+                )
+
+        index_placeholders = ", ".join(
+            f":index_{index}" for index in range(len(CRITICAL_SCHEMA_INDEXES))
+        )
+        index_parameters = {
+            f"index_{index}": index_name
+            for index, index_name in enumerate(CRITICAL_SCHEMA_INDEXES)
+        }
+        index_rows = (
+            await db_connection.execute(
+                text(
+                    "SELECT c.relname, i.indisvalid, i.indisready, i.indislive "
+                    "FROM pg_catalog.pg_class AS c "
+                    "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+                    "JOIN pg_catalog.pg_index AS i ON i.indexrelid = c.oid "
+                    "WHERE n.nspname = 'platform' AND c.relkind = 'i' "
+                    f"AND c.relname IN ({index_placeholders})"
+                ),
+                index_parameters,
+            )
+        ).mappings()
+        indexes = {str(row["relname"]): row for row in index_rows}
+        missing_indexes = sorted(set(CRITICAL_SCHEMA_INDEXES) - set(indexes))
+        if missing_indexes:
+            raise RuntimeError(
+                "critical migration indexes are missing: " + ", ".join(missing_indexes)
+            )
+        invalid_indexes = sorted(
+            index_name
+            for index_name, row in indexes.items()
+            if row["indisvalid"] is not True
+            or row["indisready"] is not True
+            or row["indislive"] is not True
+        )
+        if invalid_indexes:
+            raise RuntimeError(
+                "critical migration indexes are not valid/ready/live: "
+                + ", ".join(invalid_indexes)
+            )
 
 
 async def _create_partial_projection() -> None:
@@ -697,19 +830,66 @@ async def _assert_repaired_state(tournament_id: str) -> None:
             raise RuntimeError("tournament catalog read-model was not backfilled")
 
 
+async def _run_reversible_range_scenario() -> tuple[str, str]:
+    """Exercise one real disposable upgrade/downgrade edge selected safely."""
+
+    base_revision, head_revision = select_reversible_range()
+    await _reset_disposable_schema()
+    _run_alembic(base_revision, expect_success=True)
+    await _assert_source_and_database_head(base_revision)
+    _run_alembic(head_revision, expect_success=True)
+    await _assert_source_and_database_head(head_revision)
+    await _assert_critical_schema_invariants()
+
+    # The source inspection above excludes explicit refusal/no-op revisions;
+    # PostgreSQL remains the authority for the actual reversible edge.
+    _run_alembic(base_revision, operation="downgrade", expect_success=True)
+    await _assert_source_and_database_head(base_revision)
+    _run_alembic(head_revision, expect_success=True)
+    await _assert_source_and_database_head(head_revision)
+    await _assert_critical_schema_invariants()
+    return base_revision, head_revision
+
+
+async def _run_irreversible_refusal_scenario() -> None:
+    """Prove that revision 0046 refuses downgrade and keeps its head."""
+
+    await _reset_disposable_schema()
+    _run_alembic(IRREVERSIBLE_REVISION, expect_success=True)
+    await _assert_source_and_database_head(IRREVERSIBLE_REVISION)
+    refused = _run_alembic(
+        "20260829_0045",
+        operation="downgrade",
+        expect_success=False,
+    )
+    if IRREVERSIBLE_REFUSAL not in refused.stdout:
+        raise RuntimeError(
+            "revision 0046 downgrade did not return its explicit refusal"
+        )
+    await _assert_source_and_database_head(IRREVERSIBLE_REVISION)
+
+
 async def _migration_body() -> None:
     settings = get_settings()
     validate_platform_settings(settings)
-    database_name = urlsplit(settings.platform_database_url).path.lstrip("/")
-    if settings.platform_environment != "test" or database_name != "platformdb_test":
-        raise RuntimeError("Migration scenario requires PLATFORM_ENVIRONMENT=test and platformdb_test")
+    validate_disposable_migration_target(
+        settings.platform_database_url,
+        environment=settings.platform_environment,
+        schema=settings.platform_db_schema,
+    )
 
     # The runner owns a disposable test database. Reset only its application
     # schema so local reruns and CI both exercise the same populated migration
     # states, including histories with irreversible downgrade revisions.
+    source_revision = source_head()
+    await _run_reversible_range_scenario()
+    await _run_irreversible_refusal_scenario()
+
     await _reset_disposable_schema()
-    _run_alembic(HEAD_REVISION, expect_success=True)
-    _run_alembic(HEAD_REVISION, expect_success=True)
+    _run_alembic(source_revision, expect_success=True)
+    _run_alembic(source_revision, expect_success=True)
+    await _assert_source_and_database_head()
+    await _assert_critical_schema_invariants()
 
     # Exercise the historical populated-data repair path separately from the
     # 0051 retry cases below.
@@ -717,11 +897,13 @@ async def _migration_body() -> None:
     _run_alembic(TARGET_REVISION, expect_success=True)
     tournament_id, _first_round_id, second_round_id = await _seed_legacy_rows()
     try:
-        failed = _run_alembic(HEAD_REVISION, expect_success=False)
+        failed = _run_alembic(source_revision, expect_success=False)
         if "Repair the data before retrying" not in failed.stdout:
             raise RuntimeError("migration did not fail with the expected invariant message")
         await _repair_duplicate(tournament_id, second_round_id)
-        _run_alembic(HEAD_REVISION, expect_success=True)
+        _run_alembic(source_revision, expect_success=True)
+        await _assert_source_and_database_head()
+        await _assert_critical_schema_invariants()
         await _assert_repaired_state(tournament_id)
 
         # Start from 0050 with a committed projection and exercise every
@@ -735,12 +917,15 @@ async def _migration_body() -> None:
         _run_alembic(MID_REVISION, expect_success=True)
         await _run_retry_failure_injection_scenarios(expected_rows=1)
         await _run_wrong_preexisting_object_scenario(expected_rows=1)
-        _run_alembic(HEAD_REVISION, expect_success=True)
-        _run_alembic(HEAD_REVISION, expect_success=True)
+        _run_alembic(source_revision, expect_success=True)
+        _run_alembic(source_revision, expect_success=True)
+        await _assert_source_and_database_head()
+        await _assert_critical_schema_invariants()
         await _assert_repaired_state(retry_tournament_id)
         print(
-            "Migration scenario passed: fresh and repeated upgrades, populated "
-            "legacy repair, and every 0051 concurrent-index retry boundary passed."
+            "Migration scenario passed: dynamic source-head checks, a real "
+            "reversible range, explicit 0046 refusal, populated legacy repair, "
+            "critical schema invariants, and every 0051 retry boundary passed."
         )
     finally:
         await dispose_engine()
@@ -752,12 +937,38 @@ async def _main() -> None:
     # while local/canonical invocations must hold the shared contour lock.
     settings = get_settings()
     validate_platform_settings(settings)
-    database_name = urlsplit(settings.platform_database_url).path.lstrip("/")
-    if settings.platform_environment != "test" or database_name != "platformdb_test":
-        raise RuntimeError("Migration scenario requires PLATFORM_ENVIRONMENT=test and platformdb_test")
+    validate_disposable_migration_target(
+        settings.platform_database_url,
+        environment=settings.platform_environment,
+        schema=settings.platform_db_schema,
+    )
     try:
         with verification_resource_lock("migration"):
-            await _migration_body()
+            primary_error: BaseException | None = None
+            cleanup_error: BaseException | None = None
+            try:
+                await _migration_body()
+            except BaseException as exc:  # preserve the migration failure verbatim
+                primary_error = exc
+            finally:
+                try:
+                    # This helper revalidates the exact test URL/schema before
+                    # opening a connection, so a failed scenario can never
+                    # turn cleanup into a production or platformdb mutation.
+                    await _reset_disposable_schema()
+                except BaseException as exc:
+                    cleanup_error = exc
+
+            if cleanup_error is not None:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        "migration fixture cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                else:
+                    raise cleanup_error
+            if primary_error is not None:
+                raise primary_error
     except VerificationLockError as exc:
         raise SystemExit(f"LOCAL GATE BLOCKED: {exc}") from exc
 

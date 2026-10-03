@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-27
+- Last reviewed: 2026-10-01
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
@@ -185,6 +185,32 @@ skips. The sole intentional strict-contour skip is the exact catalog ID
 `tests.test_platform_live_qa_mailbox_helper.MailboxHelperTests.test_live_shared_env_metadata_matches_reviewed_contour_when_present`,
 with the exact reason `production shared env path is absent`; the catalog
 checks that source declaration and any other skip fails the contour.
+
+### Migration ownership and safety
+
+The `migration` gate is the only owner of populated Alembic verification. Its
+support helper resolves the source graph with Alembic's `ScriptDirectory`,
+checks `alembic current --check-heads`, and compares the official
+`MigrationContext` current head with exactly one `public.alembic_version` row.
+The source head is discovered at runtime; callers must not copy a `HEAD_REVISION`
+constant. Backend integration preflight reuses the same source/database-head
+helper before test discovery.
+
+Every Alembic or migration-owned recovery subprocess has a typed 180-second
+timeout. The migration workflow keeps a five-minute job deadline, retains its
+loopback `platformdb_test` PostgreSQL service, and has no production URL or
+database access. The scenario checks a compact critical schema contract from
+`information_schema` and `pg_catalog`, including `indisvalid`, `indisready` and
+`indislive` for required indexes.
+
+The real disposable-database scenario selects only the latest reversible edge
+after inspecting its downgrade body, upgrades and downgrades that edge, and
+then upgrades again. It separately expects revision `20260829_0046` to refuse
+downgrade because its historical invite-access data cannot be restored. It
+does not infer that an older range such as `0038` to `base` is safe. Fixture
+cleanup revalidates the exact test URL and `platform` schema, removes only that
+schema/version table, and preserves the primary migration exception if cleanup
+also fails.
 
 ## CI route and release authority
 
