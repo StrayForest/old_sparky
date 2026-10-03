@@ -654,6 +654,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
 
             query_boundary = asyncio.Event()
             invite_query_count = 0
+            invite_query_completed = 0
             original_scalar = AsyncSession.scalar
 
             async def observe_invite_query(
@@ -662,12 +663,15 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                 *args: object,
                 **kwargs: object,
             ) -> object:
-                nonlocal invite_query_count
+                nonlocal invite_query_completed, invite_query_count
                 if "tournament_invites" in str(statement):
                     invite_query_count += 1
                     if invite_query_count == 2:
                         query_boundary.set()
-                return await original_scalar(session, statement, *args, **kwargs)
+                result = await original_scalar(session, statement, *args, **kwargs)
+                if "tournament_invites" in str(statement):
+                    invite_query_completed += 1
+                return result
 
             tasks: list[asyncio.Task[httpx.Response]] = []
             responses: tuple[httpx.Response, httpx.Response]
@@ -687,8 +691,8 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                     ]
                     try:
                         await asyncio.wait_for(query_boundary.wait(), timeout=5.0)
-                        await asyncio.sleep(0)
                         self.assertEqual(invite_query_count, 2)
+                        self.assertEqual(invite_query_completed, 0)
                         self.assertTrue(
                             all(not task.done() for task in tasks),
                             "both invite requests must remain blocked before lock release",
@@ -761,8 +765,27 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                 text("LOCK TABLE platform.tournament_participants IN SHARE MODE")
             )
 
+            lock_entered = asyncio.Event()
+            lock_entry_count = 0
+            lock_return_count = 0
+            original_lock = tournament_write_serialization._lock_tournament
+
+            async def observe_lock(*args: Any, **kwargs: Any):
+                nonlocal lock_entry_count, lock_return_count
+                target = kwargs.get("slug") == slug or str(
+                    kwargs.get("tournament_id")
+                ) == str(tournament["id"])
+                if target:
+                    lock_entry_count += 1
+                    if lock_entry_count == 2:
+                        lock_entered.set()
+                result = await original_lock(*args, **kwargs)
+                if target:
+                    lock_return_count += 1
+                return result
+
             tasks = [
-                    asyncio.create_task(self._join(self_joiner, slug, invite["code"])),
+                asyncio.create_task(self._join(self_joiner, slug, invite["code"])),
                 asyncio.create_task(
                     organizer["client"].post(
                         f"/api/v1/tournaments/{slug}/participants/manage",
@@ -775,10 +798,29 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                 ),
             ]
             try:
-                await asyncio.sleep(0.2)
+                with patch.object(
+                    tournament_write_serialization,
+                    "_lock_tournament",
+                    side_effect=observe_lock,
+                ):
+                    # Both requests must enter the real lock helper, but no
+                    # helper may return while the blocker owns the row lock.
+                    await asyncio.wait_for(lock_entered.wait(), timeout=5)
+                    self.assertEqual(lock_entry_count, 2)
+                    self.assertEqual(lock_return_count, 0)
+                    self.assertTrue(all(not task.done() for task in tasks))
+                    await asyncio.wait_for(blocker.commit(), timeout=5)
+                    responses = await asyncio.wait_for(
+                        asyncio.gather(*tasks), timeout=5
+                    )
+                    self.assertEqual(lock_return_count, 2)
             finally:
-                await blocker.commit()
-            responses = await asyncio.gather(*tasks)
+                if blocker.in_transaction():
+                    await asyncio.wait_for(blocker.rollback(), timeout=5)
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         self.assertEqual(
             sorted(response.status_code for response in responses),
