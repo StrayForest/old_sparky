@@ -472,6 +472,67 @@ read_unit_state() {
   esac
 }
 
+# Cloudflare's refresh unit is a oneshot.  A previous failed oneshot can still
+# make `systemctl is-active` return `failed:3` after systemd has removed its
+# cgroup.  Treat that exact, process-free state as quiescent without weakening
+# the generic service-state grammar used by the runtime services and timer.
+cloudflare_failed_oneshot_is_empty() {
+  local properties line key value
+  local -A observed=()
+  if ! properties="$(run_systemctl show deadlock-cloudflare-ips.service \
+    --property=ActiveState,SubState,Type,RemainAfterExit,KillMode,MainPID,ControlPID,ControlGroup \
+    2>/dev/null)"; then
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == *=* ]] || return 1
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      ActiveState|SubState|Type|RemainAfterExit|KillMode|MainPID|ControlPID|ControlGroup) ;;
+      *) return 1 ;;
+    esac
+    [[ ! -v "observed[$key]" ]] || return 1
+    observed["$key"]="$value"
+  done <<<"$properties"
+  [[ "${#observed[@]}" -eq 8 \
+    && "${observed[ActiveState]}" == "failed" \
+    && "${observed[SubState]}" == "failed" \
+    && "${observed[Type]}" == "oneshot" \
+    && "${observed[RemainAfterExit]}" == "no" \
+    && "${observed[KillMode]}" == "control-group" \
+    && -z "${observed[ControlGroup]}" \
+    && "${observed[MainPID]}" == "0" \
+    && "${observed[ControlPID]}" == "0" ]]
+}
+
+read_cloudflare_quiescence_state() {
+  local state status
+  state=""
+  if state="$(run_systemctl is-active deadlock-cloudflare-ips.service 2>/dev/null)"; then
+    status=0
+  else
+    status="$?"
+  fi
+  case "$state:$status" in
+    active:0|inactive:3)
+      printf '%s\n' "$state"
+      ;;
+    failed:3)
+      if cloudflare_failed_oneshot_is_empty; then
+        printf 'inactive\n'
+      else
+        public_status failed service_state >&2
+        return 1
+      fi
+      ;;
+    *)
+      public_status failed service_state >&2
+      return 1
+      ;;
+  esac
+}
+
 read_unit_enabled() {
   local unit="$1"
   local state status
@@ -903,7 +964,7 @@ quiesce_runtime_writers() {
   fi
   run_systemctl stop deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null
   for attempt in {1..60}; do
-    cloudflare_service_state="$(read_unit_state deadlock-cloudflare-ips.service)"
+    cloudflare_service_state="$(read_cloudflare_quiescence_state)"
     if [[ "$cloudflare_service_state" == "inactive" ]]; then
       break
     fi

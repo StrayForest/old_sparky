@@ -153,13 +153,14 @@ their production paths intentionally enforce root ownership, fixed release
 paths or systemd state. Tests must mock subprocess contracts rather than
 requiring a real mount namespace or `CAP_SYS_ADMIN` on the CI runner.
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher`
-is root-only in `backend-privileged` and also an explicit `release-runtime`
-focused fixture. It executes the production runner, marker branch and
-dispatcher with isolated fake candidates, covering capture bounds/metadata,
-status preservation, no-follow setup, cleanup and descendant termination.
-Failed run captures remain root-only for scoped diagnosis, then require
-owner-controlled retention cleanup; successful files are removed only after
-child reap and durable metadata. Raw output never enters workflow logs.
+is a root-only `backend-privileged` and `release-runtime` fixture exercising
+the production runner, marker, dispatcher and isolated fake candidates for
+bounded capture, status, no-follow setup, cleanup and descendant termination.
+Successful captures are removed after reap and durable metadata; failed ones
+stay root-only for scoped owner cleanup, and raw output never enters logs.
+`test_cloudflare_failed_oneshot_is_quiescent_only_with_empty_cgroup_contract`
+is a root-only `backend-privileged`/`release-runtime` fixture accepting only
+failed process-free oneshots with empty `ControlGroup`; all else fails closed.
 Privileged release-lock tests hold a serial test guard and use unique
 root-owned files directly beneath `/run/lock`; cleanup removes only the exact
 test-prefixed regular file and never the production canonical lock.
