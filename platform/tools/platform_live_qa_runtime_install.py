@@ -358,6 +358,80 @@ def _directory(path: Path, *, mode: int | None = None) -> os.stat_result:
     return metadata
 
 
+def _ensure_payload_root() -> os.stat_result:
+    """Create or repair only the exact private-umask payload-root mode.
+
+    The recovery entrypoint runs with umask 077, so ``mkdir(..., 0o755)`` can
+    leave a newly-created root at 0700.  Accept only that safe legacy state
+    (or the intended 0755 state) and set the exact intended mode through a
+    no-follow directory descriptor.  The parent remains root-private.
+    """
+    created = False
+    try:
+        try:
+            os.mkdir(PAYLOAD_ROOT, 0o755)
+            created = True
+        except FileExistsError:
+            pass
+
+        descriptor = os.open(
+            PAYLOAD_ROOT,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            named = _metadata(PAYLOAD_ROOT)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or stat.S_ISLNK(named.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                or opened.st_uid != 0
+                or opened.st_gid != 0
+                or opened.st_nlink < 2
+                or opened.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            ):
+                raise InstallerError("trusted live-QA payload root metadata is unsafe")
+            current_mode = stat.S_IMODE(opened.st_mode)
+            if created:
+                if current_mode & ~0o755:
+                    raise InstallerError("trusted live-QA payload root mode is unsupported")
+            elif current_mode not in {0o700, 0o755}:
+                raise InstallerError("trusted live-QA payload root mode is unsupported")
+            changed = created or current_mode != 0o755
+            if created:
+                os.fchown(descriptor, 0, 0)
+            if current_mode != 0o755:
+                os.fchmod(descriptor, 0o755)
+            if changed:
+                os.fsync(descriptor)
+            final = os.fstat(descriptor)
+            final_name = _metadata(PAYLOAD_ROOT)
+            if (
+                not stat.S_ISDIR(final.st_mode)
+                or stat.S_ISLNK(final_name.st_mode)
+                or not stat.S_ISDIR(final_name.st_mode)
+                or (final.st_dev, final.st_ino)
+                != (final_name.st_dev, final_name.st_ino)
+                or final.st_uid != 0
+                or final.st_gid != 0
+                or final.st_nlink < 2
+                or stat.S_IMODE(final.st_mode) != 0o755
+                or final.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            ):
+                raise InstallerError("trusted live-QA payload root changed while opening")
+        finally:
+            os.close(descriptor)
+        if changed:
+            _fsync_directory(TRUSTED_ROOT)
+    except OSError as exc:
+        raise InstallerError("trusted live-QA payload root is unavailable") from exc
+    return _directory(PAYLOAD_ROOT, mode=0o755)
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(
         path,
@@ -1072,11 +1146,7 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
     else:
         os.mkdir(TRUSTED_ROOT, 0o700)
         os.chown(TRUSTED_ROOT, 0, 0)
-    if os.path.lexists(PAYLOAD_ROOT):
-        _directory(PAYLOAD_ROOT, mode=0o755)
-    else:
-        os.mkdir(PAYLOAD_ROOT, 0o755)
-        os.chown(PAYLOAD_ROOT, 0, 0)
+    _ensure_payload_root()
     _cleanup_temporary_files()
     _cleanup_staging(apply=True)
 

@@ -74,6 +74,23 @@ for the two-pointer systemd contract, while release-specific data-plane
 helpers are accepted only through the systemd manifest bound to the recorded
 release.
 
+For a two-pointer operation-ID `install` whose original release lacks both
+managed-LiveQA inputs, `recover_pending` may fail before filesystem recovery
+because its old helper manifest is incomplete. The authorized recovery-only
+fallback requires the exact immutable generation and receipt, no paired
+systemd receipt, `systemd_state_before: null`, a complete embedded service
+snapshot, and valid pointer/venv identities. Before authorization, compare the
+read-only `platformdb` Alembic revision with the exact pinned release source's
+Alembic head; if the read fails or the values differ, retain the receipt.
+Under the generation's release lock, validate those predicates, run
+`authorize-recovery --confirm MIGRATION_NOT_REVERSED`, `recover --retain`, and
+`verify-original`. Once the receipt durably reaches `recovery-restored`, run
+the generation's `validate-legacy-liveqa-recovery` and self-locking
+`platform_abort_retained_only.sh`; it restores services/readiness and removes
+the operation receipt last. Failed checks retain state. Never use
+`current/tools`, edit receipts, issue service commands directly, or downgrade
+or stamp the database.
+
 For an operation-ID rollback, `platform_recover_pending.sh` owns the complete
 phase matrix inside that generation: pre-runtime phases retain the filesystem
 transaction, runtime-pending phases first record
