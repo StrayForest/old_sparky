@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import stat
@@ -2231,6 +2232,266 @@ fail 'private lock detail must not cross the public channel'
             self.assertFalse(artifact.exists())
             self.assertEqual(sentinel.read_bytes(), b"no release lifecycle work\n")
 
+    def test_bounded_child_forwards_only_valid_marker_or_closed_diagnostic(self) -> None:
+        slug = "gha-123456789-1-aaaaaaaaaaaa"
+        sha = "a" * 40
+        expected = ("deploy", slug, sha)
+        valid = (
+            "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+            f"phase=preflight reason=host_tools_invalid release_slug={slug} "
+            f"source_sha={sha}\n"
+        ).encode("ascii")
+        child_code = (
+            "import os,sys; "
+            "os.write(1, bytes.fromhex(sys.argv[1])); "
+            "os.write(2, b'PRIVATE_CHILD_STDERR_SENTINEL'); "
+            "raise SystemExit(int(sys.argv[2]))"
+        )
+
+        def run_child(stdout: bytes, exit_status: int) -> tuple[int, str]:
+            command = [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                child_code,
+                stdout.hex(),
+                str(exit_status),
+            ]
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                status = platform_workflow_remote_dispatch._run_bounded_child(
+                    command,
+                    timeout_seconds=5,
+                    expected_release_marker=expected,
+                )
+            return status, captured.getvalue()
+
+        status, output = run_child(valid, 1)
+        self.assertEqual(status, 1)
+        self.assertEqual(output, valid.decode("ascii"))
+        self.assertNotIn("PRIVATE", output)
+
+        rejected = (
+            (b"", 7, "missing_marker", 0, 7),
+            (
+                valid.replace(sha.encode("ascii"), ("b" * 40).encode("ascii")),
+                1,
+                "invalid_marker",
+                len(valid),
+                1,
+            ),
+            (b"malformed PRIVATE child output\n", 3, "invalid_marker", 31, 3),
+            (valid + valid, 4, "invalid_marker", len(valid) * 2, 4),
+            (b"x" * 600, 5, "oversized_marker", 513, 5),
+            (
+                valid.replace(sha.encode("ascii"), ("b" * 40).encode("ascii")),
+                0,
+                "invalid_marker",
+                len(valid),
+                2,
+            ),
+        )
+        for data, child_status, reason, observed_bytes, dispatcher_status in rejected:
+            with self.subTest(reason=reason, child_status=child_status):
+                status, output = run_child(data, child_status)
+                self.assertEqual(status, dispatcher_status)
+                self.assertEqual(
+                    output,
+                    "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                    f"reason={reason} child_exit={child_status} "
+                    f"observed_bytes={observed_bytes} "
+                    f"dispatcher_exit={dispatcher_status}\n",
+                )
+                self.assertNotIn("PRIVATE", output)
+                self.assertNotIn("malformed", output)
+
+    def test_deploy_only_artifact_preparation_errors_emit_markers_without_app_writes(
+        self,
+    ) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("immutable supervisor fixture requires root")
+
+        failure_cases = (
+            ("find_count", 17, "artifact_count_invalid"),
+            ("find_path", 19, "artifact_missing"),
+            ("mktemp", 21, "validation_failed"),
+            ("chmod", 23, "validation_failed"),
+        )
+        with tempfile.TemporaryDirectory(prefix="deploy-artifact-errors-") as tmp:
+            fixture_root = Path(tmp)
+            supervisor, release_lock, retained_lock, generation_dir = (
+                self._install_supervisor_fixture(fixture_root)
+            )
+
+            def cleanup_fixture() -> None:
+                for path in (release_lock, retained_lock):
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                if generation_dir.exists() or generation_dir.is_symlink():
+                    shutil.rmtree(generation_dir)
+
+            self.addCleanup(cleanup_fixture)
+            source = supervisor.read_text(encoding="utf-8")
+            source = source.replace(
+                "export PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+                'export PATH="$PLATFORM_TEST_PATH:/usr/sbin:/usr/bin:/sbin:/bin"',
+                1,
+            )
+            source = source.replace(
+                "runtime=/opt/oldsparky/platform\ncurrent=\"$runtime/current\"",
+                'runtime="$PLATFORM_TEST_RUNTIME"\ncurrent="$runtime/current"',
+                1,
+            )
+            self.assertIn('export PATH="$PLATFORM_TEST_PATH:', source)
+            self.assertIn('runtime="$PLATFORM_TEST_RUNTIME"', source)
+            supervisor.chmod(0o700)
+            supervisor.write_text(source, encoding="utf-8")
+            os.chown(supervisor, 0, 0)
+            supervisor.chmod(0o555)
+
+            runtime = fixture_root / "runtime"
+            runtime.mkdir()
+            runtime_sentinel = runtime / "unchanged-sentinel"
+            runtime_sentinel.write_bytes(b"no application lifecycle write\n")
+            preflight = generation_dir / "platform_release_preflight.sh"
+            preflight.chmod(0o700)
+            preflight.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            os.chown(preflight, 0, 0)
+            preflight.chmod(0o555)
+
+            fake_bin = fixture_root / "bin"
+            fake_bin.mkdir()
+            fake_find = fake_bin / "find"
+            fake_find.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'PRIVATE_FIND_STDERR_SENTINEL' >&2\n"
+                "case \"$PLATFORM_TEST_FAILURE:$*\" in\n"
+                "  find_count:*) exit 17 ;;\n"
+                "  find_path:*' -printf '*) printf 'x\\n'; exit 0 ;;\n"
+                "  find_path:*) exit 19 ;;\n"
+                "  *) exec /usr/bin/find \"$@\" ;;\n"
+                "esac\n",
+                encoding="ascii",
+            )
+            fake_mktemp = fake_bin / "mktemp"
+            fake_mktemp.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'PRIVATE_MKTEMP_STDERR_SENTINEL' >&2\n"
+                "if [ \"$PLATFORM_TEST_FAILURE\" = mktemp ]; then exit 21; fi\n"
+                "result=$(/usr/bin/mktemp \"$@\") || exit $?\n"
+                "printf '%s\\n' \"$result\" > \"$PLATFORM_TEST_BOOTSTRAP_RECORD\"\n"
+                "printf '%s\\n' \"$result\"\n",
+                encoding="ascii",
+            )
+            fake_chmod = fake_bin / "chmod"
+            fake_chmod.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'PRIVATE_CHMOD_STDERR_SENTINEL' >&2\n"
+                "if [ \"$PLATFORM_TEST_FAILURE\" = chmod ]; then exit 23; fi\n"
+                "exec /usr/bin/chmod \"$@\"\n",
+                encoding="ascii",
+            )
+            for command in (fake_find, fake_mktemp, fake_chmod):
+                command.chmod(0o755)
+
+            target_sha = "a" * 40
+            run_id = str(os.getpid())
+            artifact_dir = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            while artifact_dir.exists() or artifact_dir.is_symlink():
+                run_id = str(int(run_id) + 1)
+                artifact_dir = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            release_slug = f"gha-{run_id}-1-{target_sha[:12]}"
+
+            def prepare_artifact() -> None:
+                artifact_dir.mkdir(mode=0o700)
+                os.chown(artifact_dir, 0, 0)
+                os.chmod(artifact_dir, 0o700)
+                marker = artifact_dir / ".old-sparky-platform-artifact-owner"
+                marker.write_text(
+                    "platform_prepare_artifact_dir schema=1 "
+                    f"dev={artifact_dir.stat().st_dev} ino={artifact_dir.stat().st_ino}\n",
+                    encoding="ascii",
+                )
+                os.chown(marker, 0, 0)
+                os.chmod(marker, 0o600)
+                artifact = artifact_dir / f"{release_slug}.tar.gz"
+                artifact.write_bytes(b"not extracted before injected failure\n")
+                os.chown(artifact, 0, 0)
+                os.chmod(artifact, 0o600)
+                digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                checksum = artifact_dir / f"{release_slug}.tar.gz.sha256"
+                checksum.write_text(f"{digest}  {artifact.name}\n", encoding="ascii")
+                os.chown(checksum, 0, 0)
+                os.chmod(checksum, 0o600)
+                provenance = artifact_dir / "RELEASE.provenance.json"
+                provenance.write_text("{}\n", encoding="ascii")
+                os.chown(provenance, 0, 0)
+                os.chmod(provenance, 0o600)
+
+            def cleanup_artifact() -> None:
+                if artifact_dir.is_dir() and not artifact_dir.is_symlink():
+                    shutil.rmtree(artifact_dir)
+
+            self.addCleanup(cleanup_artifact)
+            bootstrap_record = fixture_root / "bootstrap-path"
+
+            for failure, child_status, reason in failure_cases:
+                with self.subTest(failure=failure):
+                    prepare_artifact()
+                    bootstrap_record.unlink(missing_ok=True)
+                    command = [
+                        str(supervisor),
+                        target_sha,
+                        release_slug,
+                        "deploy",
+                        str(artifact_dir),
+                        "baseline",
+                    ]
+                    expected_marker = (
+                        "RELEASE_DEPLOY schema=1 status=failed class=artifact "
+                        f"phase=artifact reason={reason} release_slug={release_slug} "
+                        f"source_sha={target_sha}\n"
+                    )
+                    captured = io.StringIO()
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "PLATFORM_TEST_FAILURE": failure,
+                            "PLATFORM_TEST_PATH": str(fake_bin),
+                            "PLATFORM_TEST_RUNTIME": str(runtime),
+                            "PLATFORM_TEST_BOOTSTRAP_RECORD": str(bootstrap_record),
+                        },
+                        clear=True,
+                    ):
+                        with redirect_stdout(captured):
+                            status = platform_workflow_remote_dispatch._run_bounded_child(
+                                command,
+                                timeout_seconds=20,
+                                expected_release_marker=(
+                                    "deploy",
+                                    release_slug,
+                                    target_sha,
+                                ),
+                            )
+                    self.assertEqual(status, child_status)
+                    self.assertEqual(captured.getvalue(), expected_marker)
+                    self.assertNotIn("PRIVATE_", captured.getvalue())
+                    self.assertFalse(artifact_dir.exists())
+                    self.assertEqual(
+                        runtime_sentinel.read_bytes(),
+                        b"no application lifecycle write\n",
+                    )
+                    self.assertEqual(
+                        {p.name for p in runtime.iterdir()},
+                        {runtime_sentinel.name},
+                    )
+                    if failure == "chmod":
+                        bootstrap = Path(bootstrap_record.read_text().strip())
+                        self.assertFalse(bootstrap.exists())
+                    else:
+                        self.assertFalse(bootstrap_record.exists())
+
     def test_retained_lock_supervisor_preserves_callback_failure_marker(self) -> None:
         """Nested flock callbacks preserve valid markers and fail closed."""
 
@@ -2320,12 +2581,18 @@ fail 'private lock detail must not cross the public channel'
                 supervisor.chmod(0o555)
 
             # An unhandled callback exit has no trusted marker. The dispatcher
-            # must suppress all output and preserve the nonzero child status.
+            # must suppress child output while emitting its fixed diagnostic
+            # and preserving the nonzero child status.
             inject_after_both_locks("exit 7")
             with patch.dict(os.environ, environment, clear=True):
                 missing_status, missing_output = dispatch()
             self.assertEqual(missing_status, 7)
-            self.assertEqual(missing_output, "")
+            self.assertEqual(
+                missing_output,
+                "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                "reason=missing_marker child_exit=7 observed_bytes=0 "
+                "dispatcher_exit=7\n",
+            )
 
             # flock's reserved 73 can also be a callback status. The accepted
             # lock_stage identifies only the call boundary, not a proven holder.
@@ -3004,6 +3271,11 @@ cleanup
         activation = self._workflow_step_run(
             workflow, "Run production preflight or deployment"
         )
+        preflight = self._workflow_step_run(workflow, "Run production preflight")
+        self.assertIn("remote_diagnostic_pattern=", activation)
+        self.assertNotIn("remote_diagnostic_pattern=", preflight)
+        self.assertIn('stdout_bytes="$(wc -c < "$remote_log"', preflight)
+        self.assertIn('stderr_bytes="$(wc -c < "$remote_error"', preflight)
         marker_patterns = []
         for step_name in ("Run production preflight", "Run production preflight or deployment"):
             body = self._workflow_step_run(workflow, step_name)
@@ -3120,9 +3392,14 @@ cleanup
             )
             self.assertNotIn("private", fallback.stdout + fallback.stderr)
 
-            def run_outer_consumer(marker: str, *, status: int) -> subprocess.CompletedProcess[str]:
+            def run_outer_consumer(
+                marker: str,
+                *,
+                status: int,
+                remote_stderr: str = "private stderr sentinel\n",
+            ) -> subprocess.CompletedProcess[str]:
                 private_stdout.write_text(marker + "\n", encoding="utf-8")
-                private_stderr.write_text("private stderr sentinel\n", encoding="utf-8")
+                private_stderr.write_text(remote_stderr, encoding="utf-8")
                 run_environment = {
                     **environment,
                     "TEST_REMOTE_STATUS": str(status),
@@ -3179,6 +3456,82 @@ cleanup
                     self.assertEqual(result.stdout, passed_marker + "\n")
                     self.assertNotIn("private", result.stdout + result.stderr)
 
+            diagnostic_cases = (
+                ("missing_marker", 7, 0, 7, 7),
+                ("invalid_marker", 1, 1, 1, 1),
+                ("invalid_marker", 1, 31, 1, 1),
+                ("invalid_marker", 1, 512, 1, 1),
+                ("oversized_marker", 5, 513, 5, 5),
+                ("invalid_marker", 0, 1, 2, 2),
+                ("invalid_marker", -9, 1, 247, 247),
+            )
+            for reason, child_exit, observed_bytes, dispatcher_exit, remote_status in diagnostic_cases:
+                diagnostic = (
+                    "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                    f"reason={reason} child_exit={child_exit} "
+                    f"observed_bytes={observed_bytes} "
+                    f"dispatcher_exit={dispatcher_exit}"
+                )
+                with self.subTest(remote_diagnostic=diagnostic):
+                    result = run_outer_consumer(
+                        diagnostic, status=remote_status, remote_stderr=""
+                    )
+                    self.assertEqual(result.returncode, remote_status, result.stderr)
+                    self.assertEqual(result.stdout, diagnostic + "\n")
+                    self.assertEqual(result.stderr, "")
+
+            rejected_diagnostics = (
+                ("invalid_marker", 1, 0, 1, 1),
+                ("invalid_marker", 1, 513, 1, 1),
+                ("oversized_marker", 5, 512, 5, 5),
+                ("oversized_marker", 5, 514, 5, 5),
+                ("missing_marker", 7, 1, 7, 7),
+                ("unknown_reason", 7, 1, 7, 7),
+                ("invalid_marker", 1, 1, 2, 1),
+                ("invalid_marker", 1, 1, 1, 0),
+            )
+            for reason, child_exit, observed_bytes, dispatcher_exit, remote_status in rejected_diagnostics:
+                diagnostic = (
+                    "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                    f"reason={reason} child_exit={child_exit} "
+                    f"observed_bytes={observed_bytes} "
+                    f"dispatcher_exit={dispatcher_exit}"
+                )
+                with self.subTest(rejected_remote_diagnostic=diagnostic):
+                    result = run_outer_consumer(
+                        diagnostic, status=remote_status, remote_stderr=""
+                    )
+                    self.assertEqual(result.returncode, remote_status or 1)
+                    self.assertIn(
+                        "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport",
+                        result.stdout,
+                    )
+                    self.assertNotIn(diagnostic, result.stdout)
+                    self.assertNotIn("private", result.stdout + result.stderr)
+
+            for malformed_stdout, remote_stderr in (
+                (
+                    "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed reason=missing_marker "
+                    "child_exit=7 observed_bytes=0 dispatcher_exit=7\nextra line",
+                    "",
+                ),
+                (
+                    "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed reason=missing_marker "
+                    "child_exit=7 observed_bytes=0 dispatcher_exit=7",
+                    "private stderr sentinel\n",
+                ),
+            ):
+                with self.subTest(remote_diagnostic_extra=malformed_stdout):
+                    result = run_outer_consumer(
+                        malformed_stdout,
+                        status=7,
+                        remote_stderr=remote_stderr,
+                    )
+                    self.assertEqual(result.returncode, 7)
+                    self.assertIn("class=remote_or_transport", result.stdout)
+                    self.assertNotIn("reason=missing_marker child_exit=7", result.stdout)
+                    self.assertNotIn("private", result.stdout + result.stderr)
+
             malformed_markers = (
                 f"RELEASE_DEPLOY schema=1 status=failed class=artifact phase=preflight reason=baseline_changed release_slug={slug} source_sha={sha}",
                 f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=candidate reason=baseline_changed release_slug={slug} source_sha={sha}",
@@ -3202,6 +3555,56 @@ cleanup
                     )
                     self.assertNotIn(marker, result.stdout)
                     self.assertNotIn("private", result.stdout + result.stderr)
+
+    def test_preflight_remote_empty_output_fallback_keeps_closed_diagnostics(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        preflight = self._workflow_step_run(workflow, "Run production preflight")
+
+        with tempfile.TemporaryDirectory(prefix="preflight-empty-output-") as tmp:
+            root = Path(tmp)
+            runner_temp = root / "runner"
+            fake_bin = root / "bin"
+            deploy_input = runner_temp / "deploy-input"
+            deploy_input.mkdir(parents=True)
+            fake_bin.mkdir()
+            (deploy_input / "platform-production-deploy-input.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            timeout = fake_bin / "timeout"
+            timeout.write_text("#!/bin/sh\nshift 2\nexec \"$@\"\n", encoding="ascii")
+            ssh = fake_bin / "ssh"
+            ssh.write_text("#!/bin/sh\nexit 7\n", encoding="ascii")
+            timeout.chmod(0o755)
+            ssh.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "RUNNER_TEMP": str(runner_temp),
+                "PREFLIGHT_SSH_DIR": str(root / "ssh-config"),
+                "HOST_TOOLS_DISPATCHER": "/unused/host-tools-dispatcher.py",
+                "PROD_SSH_HOST": "production.invalid",
+                "PROD_SSH_USER": "deploy",
+            }
+            result = subprocess.run(
+                ["/bin/bash", "-c", preflight],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport "
+            "release_slug=unavailable source_sha=unavailable\n"
+            "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed reason=empty_output "
+            "remote_exit=7 stdout_bytes=0 stderr_bytes=0\n",
+        )
+        self.assertNotIn("unbound variable", result.stderr)
 
     def test_production_host_tools_handoff_allows_nonroot_runner_owner(self) -> None:
         workflow = (

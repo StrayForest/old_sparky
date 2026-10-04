@@ -502,12 +502,25 @@ if [[ ! -d "$artifact_dir" || -L "$artifact_dir" ]]; then
   fail "CI release artifact directory is missing"
 fi
 
-artifact_count="$(find "$artifact_dir" -maxdepth 1 -type f -name '*.tar.gz' -printf 'x\n' | wc -l)"
+if artifact_count="$(find "$artifact_dir" -maxdepth 1 -type f -name '*.tar.gz' -printf 'x\n' | wc -l)"; then
+  :
+else
+  artifact_command_status=$?
+  set_failure_context artifact artifact artifact_count_invalid
+  fail_with_status "$artifact_command_status"
+fi
 if [[ "$artifact_count" != "1" ]]; then
   set_failure_context artifact artifact artifact_count_invalid
   fail "CI release artifact count is invalid"
 fi
-artifact_path="$(find "$artifact_dir" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+if artifact_path="$(find "$artifact_dir" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"; then
+  :
+else
+  artifact_command_status=$?
+  set_failure_context artifact artifact artifact_missing
+  fail_with_status "$artifact_command_status"
+fi
+[[ -n "$artifact_path" ]] || fail "CI release artifact is missing"
 artifact_checksum="$artifact_path.sha256"
 if [[ ! -f "$artifact_checksum" || -L "$artifact_checksum" ]]; then
   set_failure_context artifact artifact checksum_missing
@@ -527,13 +540,25 @@ if [[ "$artifact_slug" != "$release_slug" ]]; then
   set_failure_context artifact provenance release_slug_mismatch
   fail "CI release artifact slug does not match the deployment slug"
 fi
-(cd "$artifact_dir" && sha256sum -c "$(basename "$artifact_checksum")") \
+(cd "$artifact_dir" && sha256sum -c "$(basename "$artifact_checksum")" >/dev/null) \
   || {
     set_failure_context artifact artifact checksum_mismatch
     fail "CI release artifact digest mismatch"
   }
-bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"
-chmod 0700 "$bootstrap_dir"
+if bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"; then
+  :
+else
+  artifact_command_status=$?
+  set_failure_context artifact artifact validation_failed
+  fail_with_status "$artifact_command_status"
+fi
+if chmod 0700 "$bootstrap_dir"; then
+  :
+else
+  artifact_command_status=$?
+  set_failure_context artifact artifact validation_failed
+  fail_with_status "$artifact_command_status"
+fi
 /usr/bin/python3 -I -B "$host_tools_dir/platform_validate_release_artifact.py" \
   --artifact "$artifact_path" \
   --checksum "$artifact_checksum" \

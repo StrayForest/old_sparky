@@ -988,9 +988,44 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         )
         for output in malformed:
             with self.subTest(output_length=len(output)):
-                self.assertEqual(run_child(output), (2, "", ""))
-        self.assertEqual(run_child(passed.encode(), status=9), (9, "", ""))
-        self.assertEqual(run_child(failed.encode()), (2, "", ""))
+                observed = min(len(output), platform_workflow_remote_dispatch.RELEASE_MARKER_MAX_BYTES + 1)
+                reason = (
+                    "oversized_marker"
+                    if observed > platform_workflow_remote_dispatch.RELEASE_MARKER_MAX_BYTES
+                    else "missing_marker"
+                    if observed == 0
+                    else "invalid_marker"
+                )
+                self.assertEqual(
+                    run_child(output),
+                    (
+                        2,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        f"reason={reason} child_exit=0 observed_bytes={observed} "
+                        "dispatcher_exit=2\n",
+                        "",
+                    ),
+                )
+        self.assertEqual(
+            run_child(passed.encode(), status=9),
+            (
+                9,
+                "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                f"reason=invalid_marker child_exit=9 observed_bytes={len(passed.encode())} "
+                "dispatcher_exit=9\n",
+                "",
+            ),
+        )
+        self.assertEqual(
+            run_child(failed.encode()),
+            (
+                2,
+                "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                f"reason=invalid_marker child_exit=0 observed_bytes={len(failed.encode())} "
+                "dispatcher_exit=2\n",
+                "",
+            ),
+        )
 
     def test_deploy_marker_capture_keeps_bounded_timeout_cleanup(self) -> None:
         expected = ("deploy", "gha-123456-2-aaaaaaaaaaaa", "a" * 40)
