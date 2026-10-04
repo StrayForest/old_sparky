@@ -4,22 +4,41 @@ on:
   workflow_run:
     workflows: [Platform security and build]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      proof_run_id:
+        description: Exact baseline runtime proof run ID
+        required: true
+        type: string
+      proof_run_attempt:
+        description: Exact baseline runtime proof run attempt
+        required: true
+        type: string
 
 # This workflow has no source checkout or repository secret inputs. It writes
 # the ordinary status for ordinary runs, and a distinct context for the
 # authenticated internal baseline-runtime proof lane.
 jobs:
   finalize-status:
-    if: ${{ always() }}
+    if: >-
+      always() &&
+      (github.event_name != 'workflow_run' ||
+      !(github.event.workflow_run.event == 'workflow_dispatch' &&
+      startsWith(github.event.workflow_run.display_title, 'platform-baseline-runtime-v1:')))
+    concurrency:
+      group: platform-status-finalizer-${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.proof_run_id }}-${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || inputs.proof_run_attempt }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       actions: read
       statuses: write
     env:
+      FINALIZER_EVENT_NAME: ${{ github.event_name }}
+      FINALIZER_ACTOR: ${{ github.actor }}
       TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
-      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
-      SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.proof_run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || inputs.proof_run_attempt }}
       SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
       SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
       SOURCE_EVENT: ${{ github.event.workflow_run.event }}
@@ -33,10 +52,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test -n "$GH_TOKEN"
           [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
-          [[ "$SOURCE_WORKFLOW_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           attempt_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}"
           metadata_dir="$(mktemp -d "$RUNNER_TEMP/platform-security-finalizer.XXXXXX")"
           chmod 700 "$metadata_dir"
@@ -46,14 +64,83 @@ jobs:
             --header "Accept: application/vnd.github+json"
             --header "X-GitHub-Api-Version: 2022-11-28"
           )
+          run_url="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}"
+          if [[ "$FINALIZER_EVENT_NAME" == workflow_dispatch ]]; then
+            test "$FINALIZER_ACTOR" = "github-actions[bot]"
+            test "$GITHUB_REF" = "refs/heads/dev"
+            deadline=$((SECONDS + 180))
+            complete=false
+            while (( SECONDS < deadline )); do
+              curl --fail-with-body --silent --show-error --max-time 15 --max-filesize 4194304 \
+                "${api_headers[@]}" "$run_url" --output "$metadata_dir/run.json"
+              chmod 600 "$metadata_dir/run.json"
+              run_state="$(/usr/bin/python3 - "$metadata_dir/run.json" <<'PY'
+          import json
+          import sys
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate JSON key")
+                  result[key] = value
+              return result
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              run = json.load(stream, object_pairs_hook=unique_object)
+          if not isinstance(run, dict):
+              raise SystemExit("proof run metadata is malformed")
+          state = run.get("status")
+          if state == "completed":
+              if run.get("conclusion") != "success":
+                  raise SystemExit("baseline proof attempt did not complete successfully")
+              print("completed")
+          elif state in {"queued", "in_progress", "waiting", "pending", "requested"}:
+              print("pending")
+          else:
+              raise SystemExit("baseline proof attempt state is invalid")
+          PY
+              )"
+              if [[ "$run_state" == completed ]]; then
+                complete=true
+                break
+              fi
+              sleep 5
+            done
+            test "$complete" = true || {
+              echo "Timed out waiting for the exact baseline proof attempt to complete." >&2
+              exit 1
+            }
+            curl --fail-with-body --silent --show-error --max-time 15 --max-filesize 4194304 \
+              "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+              --output "$metadata_dir/current.json"
+            chmod 600 "$metadata_dir/current.json"
+          else
+            test "$FINALIZER_EVENT_NAME" = workflow_run
+            curl --fail-with-body --silent --show-error --max-time 15 --max-filesize 4194304 \
+              "${api_headers[@]}" "$run_url" --output "$metadata_dir/run.json"
+            chmod 600 "$metadata_dir/run.json"
+          fi
+          source_workflow_id="$(/usr/bin/python3 - "$metadata_dir/run.json" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              run = json.load(stream)
+          workflow_id = run.get("workflow_id") if isinstance(run, dict) else None
+          if type(workflow_id) is not int or workflow_id <= 0:
+              raise SystemExit("proof workflow identity is malformed")
+          print(workflow_id)
+          PY
+          )"
+          if [[ "$FINALIZER_EVENT_NAME" == workflow_run ]]; then
+            [[ "$SOURCE_WORKFLOW_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+            test "$source_workflow_id" = "$SOURCE_WORKFLOW_ID"
+          else
+            SOURCE_WORKFLOW_ID="$source_workflow_id"
+            export SOURCE_WORKFLOW_ID
+          fi
           curl --fail-with-body --silent --show-error --max-filesize 4194304 \
             "${api_headers[@]}" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}" \
-            --output "$metadata_dir/run.json"
-          chmod 600 "$metadata_dir/run.json"
-          curl --fail-with-body --silent --show-error --max-filesize 4194304 \
-            "${api_headers[@]}" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${SOURCE_WORKFLOW_ID}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${source_workflow_id}" \
             --output "$metadata_dir/workflow.json"
           chmod 600 "$metadata_dir/workflow.json"
           /usr/bin/python3 - "$metadata_dir" "$GITHUB_OUTPUT" <<'PY'
@@ -62,7 +149,7 @@ jobs:
           from pathlib import Path
           import re
           import sys
-          from urllib.request import Request, urlopen
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
 
           root, output_path = Path(sys.argv[1]), Path(sys.argv[2])
           sha_re = re.compile(r"[0-9a-f]{40}\Z")
@@ -74,15 +161,11 @@ jobs:
               r"d(?P<parent_id>[1-9][0-9]{0,31})\.(?P<parent_attempt>[1-9][0-9]{0,31}):"
               r"r(?P<proof_id>[1-9][0-9]{0,31})\.(?P<proof_attempt>[1-9][0-9]{0,31})\Z"
           )
-          target = os.environ.get("TARGET_SHA", "")
+          trigger_event = os.environ.get("FINALIZER_EVENT_NAME", "")
+          trigger_actor = os.environ.get("FINALIZER_ACTOR", "")
           run_id = os.environ.get("SOURCE_RUN_ID", "")
           attempt = os.environ.get("SOURCE_RUN_ATTEMPT", "")
-          event = os.environ.get("SOURCE_EVENT", "")
-          branch = os.environ.get("SOURCE_REF", "")
-          conclusion = os.environ.get("SOURCE_CONCLUSION", "")
-          workflow_id = int(os.environ.get("SOURCE_WORKFLOW_ID", "0"))
-          event_run_url = os.environ.get("SOURCE_RUN_URL", "")
-          if not sha_re.fullmatch(target) or not decimal.fullmatch(run_id) or not decimal.fullmatch(attempt):
+          if trigger_event not in {"workflow_run", "workflow_dispatch"} or not decimal.fullmatch(run_id) or not decimal.fullmatch(attempt):
               raise SystemExit("workflow run identity is malformed")
 
           def read_json(name):
@@ -90,26 +173,40 @@ jobs:
               if path.stat().st_size > 4 * 1024 * 1024:
                   raise SystemExit("workflow metadata exceeded its bound")
               try:
-                  value = json.loads(path.read_text(encoding="utf-8"))
-              except (OSError, UnicodeError, json.JSONDecodeError):
+                  value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+              except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
                   raise SystemExit("workflow metadata is malformed") from None
               if not isinstance(value, dict):
                   raise SystemExit("workflow metadata is malformed")
               return value
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate JSON key")
+                  result[key] = value
+              return result
 
           run = read_json("run.json")
           workflow = read_json("workflow.json")
           display_title = run.get("display_title", "")
           expected_base_url = f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{run_id}"
           expected_run_path = ".github/workflows/platform-security.yml"
+          target = run.get("head_sha", "")
+          event = run.get("event", "")
+          branch = run.get("head_branch", "")
+          conclusion = run.get("conclusion", "")
+          workflow_id = run.get("workflow_id")
           if (
-              type(run.get("id")) is not int or run["id"] != int(run_id)
+              not sha_re.fullmatch(target)
+              or type(run.get("id")) is not int or run["id"] != int(run_id)
+              or type(run.get("run_attempt")) is not int
               or run.get("run_attempt") != int(attempt)
-              or type(run.get("workflow_id")) is not int or run["workflow_id"] != workflow_id
+              or type(workflow_id) is not int or workflow_id <= 0
               or run.get("head_sha") != target
               or run.get("path") != expected_run_path
               or not isinstance(display_title, str)
-              or event_run_url != expected_base_url
               or run.get("html_url") != expected_base_url
               or not isinstance(run.get("repository"), dict)
               or run["repository"].get("full_name") != "StrayForest/old_sparky"
@@ -118,6 +215,51 @@ jobs:
               or type(workflow.get("id")) is not int or workflow["id"] != workflow_id
           ):
               raise SystemExit("workflow run does not belong to the exact security workflow attempt")
+
+          if type(workflow.get("id")) is not int or workflow["id"] != workflow_id:
+              raise SystemExit("security workflow registry identity is mismatched")
+          if trigger_event == "workflow_run":
+              if (
+                  os.environ.get("SOURCE_RUN_URL", "") != expected_base_url
+                  or os.environ.get("TARGET_SHA", "") != target
+                  or os.environ.get("SOURCE_RUN_ATTEMPT", "") != str(run.get("run_attempt"))
+                  or os.environ.get("SOURCE_EVENT", "") != event
+                  or os.environ.get("SOURCE_REF", "") != branch
+                  or os.environ.get("SOURCE_CONCLUSION", "") != conclusion
+                  or os.environ.get("SOURCE_WORKFLOW_ID", "") != str(workflow_id)
+              ):
+                  raise SystemExit("workflow_run event identity is mismatched")
+              if event == "workflow_dispatch" and display_title.startswith("platform-baseline-runtime-v1:"):
+                  with output_path.open("a", encoding="utf-8") as output:
+                      output.write("publish=false\n")
+                  raise SystemExit(0)
+          else:
+              if trigger_actor != "github-actions[bot]":
+                  raise SystemExit("baseline finalizer dispatch actor is not trusted")
+              current = read_json("current.json")
+              if (
+                  run.get("status") != "completed"
+                  or conclusion != "success"
+                  or event != "workflow_dispatch"
+                  or branch != "dev"
+                  or not isinstance(run.get("actor"), dict)
+                  or run["actor"].get("login") != "github-actions[bot]"
+                  or type(current.get("id")) is not int or current["id"] != int(run_id)
+                  or type(current.get("run_attempt")) is not int or current.get("run_attempt") != int(attempt)
+                  or type(current.get("workflow_id")) is not int or current.get("workflow_id") != workflow_id
+                  or current.get("path") != expected_run_path
+                  or current.get("name") != run.get("name")
+                  or current.get("display_title") != display_title
+                  or current.get("html_url") != expected_base_url
+                  or current.get("event") != event
+                  or current.get("head_branch") != branch
+                  or current.get("head_sha") != target
+                  or current.get("status") != "completed"
+                  or current.get("conclusion") != "success"
+                  or not isinstance(current.get("actor"), dict)
+                  or current["actor"].get("login") != "github-actions[bot]"
+              ):
+                  raise SystemExit("requested baseline proof is not the latest successful exact attempt")
 
           status_context = None
           is_baseline_candidate = display_title.startswith("platform-baseline-runtime-v1:")
@@ -130,6 +272,8 @@ jobs:
                       raise SystemExit("internal baseline run-name marker is malformed or mismatched")
                   if run.get("event") != "workflow_dispatch" or run.get("head_branch") != "dev" or run.get("head_sha") != parsed.group("target") or branch != "dev":
                       raise SystemExit("internal baseline run is not bound to exact trusted dev")
+                  if not isinstance(run.get("actor"), dict) or run["actor"].get("login") != "github-actions[bot]":
+                      raise SystemExit("internal baseline run actor is not trusted")
                   terminal_conclusions = {
                       "success", "failure", "cancelled", "skipped", "timed_out",
                       "action_required", "neutral", "stale", "startup_failure",
@@ -167,13 +311,20 @@ jobs:
                       "X-GitHub-Api-Version": "2022-11-28",
                   },
               )
-              with urlopen(request, timeout=20) as response:
+              class RejectRedirect(HTTPRedirectHandler):
+                  def redirect_request(self, req, fp, code, msg, headers, newurl):
+                      return None
+
+              opener = build_opener(RejectRedirect)
+              with opener.open(request, timeout=20) as response:
+                  if response.geturl() != jobs_url:
+                      raise SystemExit("internal baseline jobs response URL changed")
                   body = response.read(4 * 1024 * 1024 + 1)
               if len(body) > 4 * 1024 * 1024:
                   raise SystemExit("internal baseline job evidence exceeded its bound")
               try:
-                  job_payload = json.loads(body.decode("utf-8"))
-              except (UnicodeError, json.JSONDecodeError):
+                  job_payload = json.loads(body.decode("utf-8"), object_pairs_hook=unique_object)
+              except (UnicodeError, json.JSONDecodeError, ValueError):
                   raise SystemExit("internal baseline job evidence is malformed") from None
               rows = job_payload.get("jobs") if isinstance(job_payload, dict) else None
               if not isinstance(rows, list) or len(rows) >= 100 or job_payload.get("total_count") != len(rows):
@@ -185,6 +336,7 @@ jobs:
                   "Security gates", "web-quality", "Web hermetic", "Documentation consistency",
                   "Migration scenarios", "Verification contract", "Conditional release runtime fixture",
                   "Trusted dev immutable release runtime", "status-start", "status-final",
+                  "Dispatch exact baseline proof finalizer",
               }
               grouped = {}
               for item in rows:
@@ -198,28 +350,15 @@ jobs:
 
           with output_path.open("a", encoding="utf-8") as output:
               output.write(f"context={status_context}\n")
+              output.write(f"target_sha={target}\n")
               output.write("publish=true\n")
-          PY
-          attempt_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}"
-          state=failure
-          description="Platform security or build failed"
-          if [[ "$SOURCE_CONCLUSION" == "success" ]]; then
-            state=success
-            description="Platform security and build passed"
-          fi
-          /usr/bin/python3 - "$state" "$description" "$attempt_url" "$GITHUB_OUTPUT" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          state, description, url, output_path = sys.argv[1:]
-          Path(output_path).open("a", encoding="utf-8").write(
-              "payload=" + json.dumps({
+              state = "success" if conclusion == "success" else "failure"
+              description = "Platform security and build passed" if state == "success" else "Platform security or build failed"
+              output.write("payload=" + json.dumps({
                   "state": state,
                   "description": description,
-                  "target_url": url,
-              }, separators=(",", ":")) + "\n"
-          )
+                  "target_url": expected_base_url + "/attempts/" + attempt,
+              }, separators=(",", ":")) + "\n")
           PY
 
       - name: Publish exact completed run as terminal status
@@ -229,8 +368,66 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           STATUS_CONTEXT: ${{ steps.status.outputs.context }}
           STATUS_PAYLOAD: ${{ steps.status.outputs.payload }}
+          TARGET_SHA: ${{ steps.status.outputs.target_sha }}
+          FINALIZER_EVENT_NAME: ${{ github.event_name }}
+          PROOF_RUN_ID: ${{ inputs.proof_run_id }}
+          PROOF_RUN_ATTEMPT: ${{ inputs.proof_run_attempt }}
+          PROOF_TARGET_SHA: ${{ steps.status.outputs.target_sha }}
         run: |
           set -euo pipefail
+          if [[ "$FINALIZER_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$PROOF_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+            [[ "$PROOF_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+            [[ "$PROOF_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+            latest_json="$(mktemp "$RUNNER_TEMP/platform-baseline-finalizer-latest.XXXXXX")"
+            chmod 600 "$latest_json"
+            trap 'rm -f -- "$latest_json"' EXIT
+            curl --fail-with-body --silent --show-error --max-time 15 --max-filesize 4194304 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${PROOF_RUN_ID}" \
+              --output "$latest_json"
+            /usr/bin/python3 - "$latest_json" "$PROOF_RUN_ID" "$PROOF_RUN_ATTEMPT" "$PROOF_TARGET_SHA" <<'PY'
+          import json
+          import re
+          import sys
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate JSON key")
+                  result[key] = value
+              return result
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              run = json.load(stream, object_pairs_hook=unique_object)
+          run_id, attempt, target = sys.argv[2:]
+          marker = re.compile(
+              rf"platform-baseline-runtime-v1:{re.escape(target)}:"
+              rf"s[1-9][0-9]{{0,31}}\.[1-9][0-9]{{0,31}}:"
+              rf"a[1-9][0-9]{{0,31}}\.[1-9][0-9]{{0,31}}:"
+              rf"d[1-9][0-9]{{0,31}}\.[1-9][0-9]{{0,31}}:"
+              rf"r{re.escape(run_id)}\.{re.escape(attempt)}\Z"
+          )
+          if (
+              not isinstance(run, dict)
+              or type(run.get("id")) is not int or run["id"] != int(run_id)
+              or type(run.get("run_attempt")) is not int or run.get("run_attempt") != int(attempt)
+              or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
+              or run.get("event") != "workflow_dispatch"
+              or run.get("head_branch") != "dev"
+              or run.get("head_sha") != target
+              or run.get("path") != ".github/workflows/platform-security.yml"
+              or not isinstance(run.get("actor"), dict)
+              or run["actor"].get("login") != "github-actions[bot]"
+              or not isinstance(run.get("display_title"), str)
+              or marker.fullmatch(run["display_title"]) is None
+              or run.get("name") != run.get("display_title")
+          ):
+              raise SystemExit("baseline proof is no longer the exact latest successful attempt")
+          PY
+          fi
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
