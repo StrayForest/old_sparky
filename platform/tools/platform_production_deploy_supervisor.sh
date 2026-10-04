@@ -48,7 +48,6 @@ fi
 runtime=/opt/oldsparky/platform
 current="$runtime/current"
 host_tools_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-storage_summary_tool=""
 artifact_path=""
 provenance_path="$artifact_dir/RELEASE.provenance.json"
 bootstrap_dir=""
@@ -202,6 +201,11 @@ cleanup() {
 [[ "$release_slug" =~ ^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]] || invalid_input
 [[ "$release_slug" == *"-${target_sha:0:12}" ]] || invalid_input
 [[ "$artifact_dir" =~ ^/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$ ]] || invalid_input
+artifact_run_id="${artifact_dir##*/old-sparky-platform-artifact-}"
+artifact_run_id="${artifact_run_id%%-*}"
+artifact_attempt="${artifact_dir##*-}"
+[[ "$release_slug" == "gha-${artifact_run_id}-${artifact_attempt}-${target_sha:0:12}" ]] \
+  || invalid_input
 case "$deploy_mode" in
   preflight|deploy) ;;
   *) invalid_input ;;
@@ -273,10 +277,13 @@ for host_helper in \
   platform_render_service_envs.py \
   platform_validate_edge_policy.py \
   platform_update_cloudflare_ips.py \
-  platform_storage_evidence_summary.py \
   platform_configure_shared_env.py; do
   require_host_helper "$host_tools_dir/$host_helper"
 done
+# This shared host-tool member is consumed by the storage, backup and recovery
+# workflows.  Validate it as part of the complete pinned generation even
+# though deployment failures no longer print its host-state summaries.
+require_host_helper "$host_tools_dir/platform_storage_evidence_summary.py"
 
 if (( $# == 8 )); then
   [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]] || invalid_input
@@ -564,6 +571,7 @@ fi
   --checksum "$artifact_checksum" \
   --release-slug "$artifact_slug" \
   --extract-to "$bootstrap_dir" \
+  >/dev/null 2>/dev/null \
   || {
     set_failure_context artifact artifact validation_failed
     fail "CI release artifact provenance is invalid"
@@ -665,55 +673,510 @@ candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh
 if [[ ! -f "$candidate_deploy" || -L "$candidate_deploy" || ! -x "$candidate_deploy" ]]; then
   fail "candidate release deploy tool is missing"
 fi
-storage_summary_tool="$host_tools_dir/platform_storage_evidence_summary.py"
-candidate_status=0
-LC_ALL=C.UTF-8 "$candidate_deploy" \
-  --artifact "$artifact_path" \
-  --app-dir "$runtime" \
-  --edge-origin https://127.0.0.1 \
-  --edge-host old-sparky.com \
-  --expected-csp-mode enforce >/dev/null 2>/dev/null || candidate_status=$?
+if candidate_result="$(
+  /usr/bin/python3.12 -I -B - \
+    "$candidate_deploy" "$artifact_path" "$runtime" "$release_slug" \
+    "$target_sha" "$artifact_run_id" "$artifact_attempt" "$host_tools_sha" \
+    <<'PY'
+import errno
+import json
+import os
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+candidate, artifact, runtime, release_slug, source_sha, run_id, attempt, host_tools_sha = sys.argv[1:]
+capture_limit = 64 * 1024
+capture_timeout_seconds = 840.0
+pipe_eof_grace_seconds = 1.0
+termination_grace_seconds = 2.0
+run_name = f"{run_id}-{attempt}"
+file_names = ("candidate.stdout", "candidate.stderr", "candidate.json")
+opened_files = {}
+created_run = False
+root_fd = run_fd = var_tmp_fd = None
+capture_state = "setup_failed"
+candidate_started = False
+stdout_observed = stderr_observed = 0
+stdout_stored = stderr_stored = 0
+exit_status = None
+metadata_written = False
+write_failed = False
+read_failed = False
+interrupted_signal = None
+child = None
+child_reaped = False
+child_reap_failed = False
+group_reaped = False
+selector = None
+streams = {}
+group_id = None
+
+def signal_handler(signum, _frame):
+    global interrupted_signal
+    interrupted_signal = signum
+
+old_handlers = {}
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    old_handlers[sig] = signal.signal(sig, signal_handler)
+
+class RunnerInterrupted(Exception):
+    pass
+
+def open_dir(parent_fd, name, *, expected_mode):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != expected_mode
+        or info.st_nlink < 2
+    ):
+        os.close(fd)
+        raise OSError(errno.EPERM, "unsafe diagnostic directory")
+    return fd
+
+def write_all(fd, payload):
+    view = memoryview(payload)
+    while view:
+        count = os.write(fd, view)
+        if count <= 0:
+            raise OSError(errno.EIO, "short diagnostic write")
+        view = view[count:]
+
+def group_alive():
+    if group_id is None:
+        return False
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+def signal_group(signum):
+    if group_id is not None:
+        try:
+            os.killpg(group_id, signum)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+
+def drain_once(timeout):
+    global read_failed, write_failed
+    global stdout_observed, stderr_observed, stdout_stored, stderr_stored
+    if selector is None or not selector.get_map():
+        time.sleep(max(0.0, timeout))
+        return
+    for key, _ in selector.select(max(0.0, timeout)):
+        try:
+            chunk = os.read(key.fd, 8192)
+        except BlockingIOError:
+            continue
+        except OSError:
+            read_failed = True
+            try:
+                selector.unregister(key.fd)
+            except Exception:
+                pass
+            try:
+                os.close(key.fd)
+            except OSError:
+                pass
+            continue
+        if not chunk:
+            selector.unregister(key.fd)
+            continue
+        name, channel = streams[key.fd]
+        if channel == "stdout":
+            stdout_observed = min(capture_limit + 1, stdout_observed + len(chunk))
+            stored = stdout_stored
+        else:
+            stderr_observed = min(capture_limit + 1, stderr_observed + len(chunk))
+            stored = stderr_stored
+        accepted = chunk[: max(0, capture_limit - stored)]
+        if accepted and not write_failed:
+            try:
+                write_all(opened_files[name], accepted)
+                stored += len(accepted)
+                if channel == "stdout":
+                    stdout_stored = stored
+                else:
+                    stderr_stored = stored
+            except OSError:
+                write_failed = True
+
+def close_streams():
+    if selector is None:
+        return
+    for key in list(selector.get_map().values()):
+        try:
+            selector.unregister(key.fd)
+        except Exception:
+            pass
+        try:
+            os.close(key.fd)
+        except OSError:
+            pass
+
+def stop_group_and_reap(reason):
+    global exit_status, capture_state, child_reaped, child_reap_failed, group_reaped
+    exited_before_stop = child is not None and child.poll() is not None
+    if exited_before_stop and child.returncode is not None:
+        raw = child.returncode
+        exit_status = raw if raw >= 0 else 128 - raw
+        child_reaped = True
+    signal_group(signal.SIGTERM)
+    stop_deadline = time.monotonic() + termination_grace_seconds
+    while time.monotonic() < stop_deadline:
+        drain_once(min(0.1, stop_deadline - time.monotonic()))
+        if child is not None and child.poll() is not None and not group_alive():
+            break
+    if group_alive():
+        signal_group(signal.SIGKILL)
+    if child is not None:
+        try:
+            child.wait(timeout=termination_grace_seconds)
+            child_reaped = True
+        except subprocess.TimeoutExpired:
+            signal_group(signal.SIGKILL)
+            try:
+                child.wait(timeout=termination_grace_seconds)
+                child_reaped = True
+            except subprocess.TimeoutExpired:
+                # Do not turn the outer dispatcher deadline into an unbounded
+                # wait, or report a status that was never safely reaped.
+                child_reap_failed = True
+                exit_status = None
+                capture_state = "cleanup_unreaped"
+    drain_deadline = time.monotonic() + termination_grace_seconds
+    while group_alive() and time.monotonic() < drain_deadline:
+        drain_once(min(0.1, drain_deadline - time.monotonic()))
+    group_reaped = not group_alive()
+    if not child_reaped or not group_reaped:
+        capture_state = "cleanup_unreaped"
+    if not child_reaped:
+        exit_status = None
+    drain_deadline = time.monotonic() + 1.0
+    while selector is not None and selector.get_map() and time.monotonic() < drain_deadline:
+        drain_once(min(0.1, drain_deadline - time.monotonic()))
+    close_streams()
+
+try:
+    if (
+        re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None
+        or re.fullmatch(r"[1-9][0-9]{0,31}", attempt) is None
+        or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+        or re.fullmatch(r"[0-9a-f]{40}", host_tools_sha) is None
+        or release_slug != f"gha-{run_id}-{attempt}-{source_sha[:12]}"
+    ):
+        raise OSError(errno.EINVAL, "invalid candidate binding")
+    var_tmp_fd = os.open(
+        "/var/tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    var_tmp_info = os.fstat(var_tmp_fd)
+    if (
+        not stat.S_ISDIR(var_tmp_info.st_mode)
+        or var_tmp_info.st_uid != 0
+        or var_tmp_info.st_gid != 0
+        or stat.S_IMODE(var_tmp_info.st_mode) != 0o1777
+    ):
+        raise OSError(errno.EPERM, "unsafe var tmp")
+    try:
+        os.mkdir("oldsparky-release-diagnostics", 0o700, dir_fd=var_tmp_fd)
+        os.fsync(var_tmp_fd)
+    except FileExistsError:
+        pass
+    root_fd = open_dir(
+        var_tmp_fd, "oldsparky-release-diagnostics", expected_mode=0o700
+    )
+    os.mkdir(run_name, 0o700, dir_fd=root_fd)
+    created_run = True
+    os.fsync(root_fd)
+    run_fd = open_dir(root_fd, run_name, expected_mode=0o700)
+    for name in file_names:
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=run_fd,
+        )
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            os.close(fd)
+            raise OSError(errno.EPERM, "unsafe diagnostic file")
+        opened_files[name] = fd
+    os.fsync(run_fd)
+except (OSError, ValueError):
+    for fd in opened_files.values():
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if run_fd is not None:
+        os.close(run_fd)
+    if created_run and root_fd is not None:
+        for name in file_names:
+            try:
+                os.unlink(name, dir_fd=root_fd)
+            except OSError:
+                pass
+        try:
+            os.rmdir(run_name, dir_fd=root_fd)
+        except OSError:
+            pass
+        try:
+            os.fsync(root_fd)
+        except OSError:
+            pass
+    for fd in (root_fd, var_tmp_fd):
+        if fd is not None:
+            os.close(fd)
+    print("candidate_status=none capture_state=setup_failed")
+    raise SystemExit(0)
+
+capture_deadline = time.monotonic() + capture_timeout_seconds
+try:
+    if interrupted_signal is not None:
+        raise RunnerInterrupted()
+    child_env = os.environ.copy()
+    child_env["LC_ALL"] = "C.UTF-8"
+    command = [
+        candidate, "--artifact", artifact, "--app-dir", runtime,
+        "--edge-origin", "https://127.0.0.1", "--edge-host", "old-sparky.com",
+        "--expected-csp-mode", "enforce",
+    ]
+    child = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=child_env,
+        close_fds=True,
+        start_new_session=True,
+    )
+    candidate_started = True
+    group_id = child.pid
+    selector = selectors.DefaultSelector()
+    streams = {
+        child.stdout.fileno(): ("candidate.stdout", "stdout"),
+        child.stderr.fileno(): ("candidate.stderr", "stderr"),
+    }
+    for fd in streams:
+        os.set_blocking(fd, False)
+        selector.register(fd, selectors.EVENT_READ)
+    child_exit_seen_at = None
+    capture_state = "complete"
+    while selector.get_map() or child.poll() is None:
+        if interrupted_signal is not None:
+            capture_state = "interrupted"
+            stop_group_and_reap("interrupted")
+            break
+        now = time.monotonic()
+        if now >= capture_deadline:
+            capture_state = "timeout"
+            stop_group_and_reap("timeout")
+            break
+        if child.poll() is not None and child_exit_seen_at is None:
+            child_exit_seen_at = now
+        if child_exit_seen_at is not None and selector.get_map() and now - child_exit_seen_at >= pipe_eof_grace_seconds:
+            capture_state = "inherited_pipe_open"
+            stop_group_and_reap("inherited_pipe_open")
+            break
+        drain_once(min(0.1, capture_deadline - now))
+        if read_failed:
+            capture_state = "read_failed"
+            stop_group_and_reap("read_failed")
+            break
+        if child.poll() is not None and not selector.get_map() and group_alive():
+            capture_state = "descendant_processes_open"
+            stop_group_and_reap("descendant_processes_open")
+            break
+    if child is not None and child.poll() is None:
+        stop_group_and_reap("unfinished")
+    if child is not None and child.poll() is not None and not child_reap_failed:
+        child_reaped = True
+        group_reaped = not group_alive()
+    if exit_status is None and child is not None and child.returncode is not None and child_reaped:
+        raw_status = child.returncode
+        exit_status = raw_status if raw_status >= 0 else 128 - raw_status
+    if capture_state == "complete":
+        capture_state = "write_failed" if write_failed else "read_failed" if read_failed else (
+            "truncated" if stdout_observed > capture_limit or stderr_observed > capture_limit else "complete"
+        )
+except RunnerInterrupted:
+    capture_state = "interrupted"
+except OSError:
+    if child is None:
+        capture_state = "spawn_failed"
+    else:
+        capture_state = "read_failed"
+        stop_group_and_reap("read_failed")
+finally:
+    if child is not None and child.poll() is None and not child_reap_failed:
+        stop_group_and_reap("finally")
+    elif child is not None and child.poll() is not None and not child_reap_failed:
+        child_reaped = True
+        group_reaped = not group_alive()
+    if selector is not None:
+        try:
+            selector.close()
+        except OSError:
+            pass
+    for sig, handler in old_handlers.items():
+        signal.signal(sig, handler)
+    for name in ("candidate.stdout", "candidate.stderr"):
+        fd = opened_files.get(name)
+        if fd is not None:
+            try:
+                os.fsync(fd)
+            except OSError:
+                write_failed = True
+            try:
+                stored_size = os.fstat(fd).st_size
+                if name == "candidate.stdout":
+                    stdout_stored = stored_size
+                else:
+                    stderr_stored = stored_size
+            except OSError:
+                write_failed = True
+            try:
+                os.close(fd)
+            except OSError:
+                write_failed = True
+    if write_failed and capture_state in ("complete", "truncated"):
+        capture_state = "write_failed"
+    if read_failed and capture_state in ("complete", "truncated"):
+        capture_state = "read_failed"
+    metadata = {
+        "schema": 1,
+        "source_sha": source_sha,
+        "host_tools_sha": host_tools_sha,
+        "release_slug": release_slug,
+        "run_id": run_id,
+        "attempt": attempt,
+        "phase": "candidate",
+        "candidate_started": candidate_started,
+        "candidate_exit_status": exit_status,
+        "candidate_child_reaped": child_reaped,
+        "candidate_child_reap_failed": child_reap_failed,
+        "candidate_group_reaped": group_reaped,
+        "capture_state": capture_state,
+        "stdout_observed_bytes": stdout_observed,
+        "stderr_observed_bytes": stderr_observed,
+        "stdout_stored_bytes": stdout_stored,
+        "stderr_stored_bytes": stderr_stored,
+        "stdout_truncated": stdout_observed > capture_limit,
+        "stderr_truncated": stderr_observed > capture_limit,
+        "capture_limit_bytes_per_stream": capture_limit,
+        "capture_timeout_seconds": capture_timeout_seconds,
+    }
+    try:
+        fd = opened_files["candidate.json"]
+        write_all(fd, (json.dumps(metadata, sort_keys=True) + "\n").encode("ascii"))
+        os.fsync(fd)
+        os.close(fd)
+        opened_files.pop("candidate.json", None)
+        os.fsync(run_fd)
+        metadata_written = True
+    except OSError:
+        capture_state = "metadata_failed"
+    can_cleanup = (
+        candidate_started
+        and exit_status == 0
+        and metadata_written
+        and capture_state in ("complete", "truncated")
+        and child is not None
+        and child.returncode is not None
+        and child_reaped
+        and group_reaped
+    )
+    if can_cleanup:
+        try:
+            for name in file_names:
+                os.unlink(name, dir_fd=run_fd)
+            os.fsync(run_fd)
+            os.close(run_fd)
+            run_fd = None
+            os.rmdir(run_name, dir_fd=root_fd)
+            os.fsync(root_fd)
+        except OSError:
+            capture_state = "cleanup_failed"
+    fd = opened_files.pop("candidate.json", None)
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    for fd in (run_fd, root_fd, var_tmp_fd):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+print(
+    f"candidate_status={exit_status if exit_status is not None else 'none'} "
+    f"capture_state={capture_state}"
+)
+PY
+  2>/dev/null
+)"; then
+  if [[ "$candidate_result" =~ ^candidate_status=(none|0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])\ capture_state=(complete|truncated|write_failed|read_failed|inherited_pipe_open|descendant_processes_open|metadata_failed|cleanup_failed|cleanup_unreaped|spawn_failed|setup_failed|timeout|interrupted)$ ]]; then
+    candidate_status="${BASH_REMATCH[1]}"
+    candidate_capture_state="${BASH_REMATCH[2]}"
+  else
+    set_failure_context preflight preflight internal
+    fail "candidate diagnostic result is invalid"
+  fi
+else
+  set_failure_context preflight preflight internal
+  fail "candidate diagnostic capture could not be started"
+fi
+if [[ "$candidate_capture_state" == setup_failed ]]; then
+  set_failure_context preflight preflight internal
+  fail "candidate diagnostic capture could not be prepared"
+fi
+if [[ "$candidate_capture_state" == spawn_failed ]]; then
+  set_failure_context deployment candidate candidate_missing
+  fail "candidate release process could not be started"
+fi
+if [[ "$candidate_capture_state" == timeout || "$candidate_capture_state" == interrupted || "$candidate_capture_state" == read_failed ]]; then
+  set_failure_context deployment candidate activation_failed
+  fail "candidate execution did not complete with a usable capture"
+fi
+if [[ "$candidate_capture_state" == cleanup_unreaped ]]; then
+  set_failure_context deployment candidate activation_failed
+  fail "candidate process group could not be fully reaped"
+fi
+if [[ "$candidate_status" == none ]]; then
+  set_failure_context preflight preflight internal
+  fail "candidate diagnostic runner did not return a child status"
+fi
+if [[ "$candidate_capture_state" != complete && "$candidate_capture_state" != truncated ]]; then
+  set_failure_context deployment candidate activation_failed
+  if (( candidate_status == 0 )); then
+    fail "candidate completed but its diagnostic capture was incomplete"
+  fi
+  fail_with_status "$candidate_status"
+fi
 if (( candidate_status != 0 )); then
   set_failure_context deployment candidate activation_failed
-  summarize_candidate_failure() {
-    printf '{"schema":1,"kind":"candidate_activation_failure","status":"failed","error_class":"activation","exit_status":%s,"target_sha":"%s"}\n' \
-      "$candidate_status" "$target_sha"
-    printf 'state=held\n' \
-      | /usr/bin/python3 -I -B "$storage_summary_tool" --mode lock
-    emit_candidate_disk() {
-      local category="$1"
-      local path="$2"
-      local disk_output inode_output
-      disk_output="$(df -B1 --output=size,used,avail,pcent -- "$path" 2>/dev/null)" \
-        || return 1
-      printf '%s\n' "$disk_output" \
-        | /usr/bin/python3 -I -B "$storage_summary_tool" --mode df --category "$category" \
-        || return 1
-      inode_output="$(df --output=iused,iavail,ipcent -- "$path" 2>/dev/null)" \
-        || return 1
-      printf '%s\n' "$inode_output" \
-        | /usr/bin/python3 -I -B "$storage_summary_tool" --mode inode --category "$category" \
-        || return 1
-    }
-    emit_candidate_disk root /
-    emit_candidate_disk tmp /tmp
-    emit_candidate_disk var_tmp /var/tmp
-    emit_candidate_disk logs /var/log
-    for service in deadlock-api deadlock-worker deadlock-web; do
-      local service_output
-      service_output="$(run_systemctl show "$service" \
-        --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec \
-        --no-pager 2>/dev/null)" \
-        || return 1
-      printf '%s\n' "$service_output" \
-        | /usr/bin/python3 -I -B "$storage_summary_tool" --mode service --service "$service" \
-        || return 1
-    done
-  }
-  if ! summarize_candidate_failure; then
-    fail "candidate release activation failed; diagnostic summary unavailable"
-  fi
-  fail "candidate release activation failed; diagnostics summarized"
+  fail_with_status "$candidate_status"
 fi
 
 # The candidate deploy process has returned, but the release lock

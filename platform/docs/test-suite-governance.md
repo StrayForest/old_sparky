@@ -152,6 +152,14 @@ the privileged contour even when their fixtures are temporary directories:
 their production paths intentionally enforce root ownership, fixed release
 paths or systemd state. Tests must mock subprocess contracts rather than
 requiring a real mount namespace or `CAP_SYS_ADMIN` on the CI runner.
+`test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher`
+is root-only in `backend-privileged` and also an explicit `release-runtime`
+focused fixture. It executes the production runner, marker branch and
+dispatcher with isolated fake candidates, covering capture bounds/metadata,
+status preservation, no-follow setup, cleanup and descendant termination.
+Failed run captures remain root-only for scoped diagnosis, then require
+owner-controlled retention cleanup; successful files are removed only after
+child reap and durable metadata. Raw output never enters workflow logs.
 Privileged release-lock tests hold a serial test guard and use unique
 root-owned files directly beneath `/run/lock`; cleanup removes only the exact
 test-prefixed regular file and never the production canonical lock.

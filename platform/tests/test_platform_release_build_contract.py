@@ -11,12 +11,14 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
 import tempfile
 import stat
 import textwrap
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -56,6 +58,104 @@ def workflow_job(source: str, name: str) -> str:
 
 
 class PlatformReleaseBuildContractTests(unittest.TestCase):
+    @staticmethod
+    def _candidate_diagnostic_runner_source(supervisor: str) -> str:
+        """Return the production runner heredoc for isolated subprocess tests."""
+
+        invocation = supervisor.index('candidate_result="$(')
+        heredoc_start = supervisor.index("<<'PY'\n", invocation) + len("<<'PY'\n")
+        heredoc_end = supervisor.index("\nPY\n  2>/dev/null\n)", heredoc_start)
+        runner = supervisor[heredoc_start:heredoc_end]
+        if runner.count('"/var/tmp"') != 1:
+            raise AssertionError("runner must have one diagnostic-root test seam")
+        return runner
+
+    @staticmethod
+    def _run_candidate_diagnostic_runner(
+        runner: str,
+        *,
+        candidate: Path,
+        diagnostic_parent: Path,
+        release_slug: str,
+        source_sha: str,
+        run_id: str,
+        attempt: str,
+        host_tools_sha: str,
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute the exact embedded runner with only its root redirected."""
+
+        diagnostic_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(diagnostic_parent, 0, 0)
+        os.chmod(diagnostic_parent, 0o1777)
+        isolated = runner.replace(
+            '"/var/tmp"', json.dumps(str(diagnostic_parent)), 1
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-",
+                str(candidate),
+                "/fixture/release.tar.gz",
+                "/fixture/runtime",
+                release_slug,
+                source_sha,
+                run_id,
+                attempt,
+                host_tools_sha,
+            ],
+            input=isolated,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"},
+            timeout=15,
+            check=False,
+        )
+
+    @staticmethod
+    def _candidate_diagnostic_marker_harness(
+        supervisor: str, *, result: str, release_slug: str, source_sha: str
+    ) -> str:
+        """Compose the production result parser with the production marker code."""
+
+        functions_start = supervisor.index("set_failure_context() {")
+        functions_end = supervisor.index("\nvalidate_systemctl_binary() {", functions_start)
+        functions = supervisor[functions_start:functions_end]
+        parser_start = supervisor.index(
+            'if [[ "$candidate_result" =~ ^candidate_status=',
+            supervisor.index('candidate_result="$('),
+        )
+        outer_else = supervisor.index(
+            '\nelse\n  set_failure_context preflight preflight internal\n'
+            '  fail "candidate diagnostic capture could not be started"\nfi',
+            parser_start,
+        )
+        parser_end = outer_else + len(
+            '\nelse\n  set_failure_context preflight preflight internal\n'
+            '  fail "candidate diagnostic capture could not be started"\nfi'
+        )
+        # Keep the inner result parser and the state/exit handling below the
+        # command-substitution shell branch. The real runner always returns
+        # one line here, so its command-substitution outer failure arm cannot
+        # be reached by this fixture.
+        parser = supervisor[parser_start:outer_else]
+        suffix_start = parser_end
+        parser += supervisor[suffix_start : supervisor.index(
+            "\n# The candidate deploy process has returned", suffix_start
+        )]
+        return "\n".join(
+            (
+                "set -Eeuo pipefail",
+                f"release_slug={shlex.quote(release_slug)}",
+                f"target_sha={shlex.quote(source_sha)}",
+                f"candidate_result={shlex.quote(result)}",
+                functions,
+                parser,
+            )
+        )
+
     @staticmethod
     def _install_supervisor_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
         """Install an exact supervisor copy under the production path shape.
@@ -1575,6 +1675,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
         ).read_text()
         supervisor = DEPLOY_SUPERVISOR.read_text()
+        remote_script = supervisor
         workflow += "\n" + supervisor
         deploy_workflow = (
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
@@ -1647,21 +1748,17 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             'candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"',
             workflow,
         )
-        self.assertIn("candidate_activation_failure", workflow)
-        self.assertIn("storage_summary_tool", workflow)
-        self.assertIn(
-            "df -B1 --output=size,used,avail,pcent -- \"$path\"", workflow
-        )
-        self.assertIn(
-            "df --output=iused,iavail,ipcent -- \"$path\"", workflow
-        )
+        self.assertNotIn("candidate_activation_failure", workflow)
+        self.assertNotIn("storage_summary_tool", workflow)
+        self.assertIn('capture_limit = 64 * 1024', remote_script)
+        self.assertIn('os.O_EXCL | os.O_NOFOLLOW', remote_script)
+        self.assertIn('"candidate.stdout", "candidate.stderr", "candidate.json"', remote_script)
+        self.assertIn('>/dev/null 2>/dev/null', remote_script)
+        self.assertIn('fail_with_status "$candidate_status"', remote_script)
+        self.assertNotIn("summarize_candidate_failure", remote_script)
         self.assertNotIn("df -hT", workflow)
         self.assertNotIn("findmnt", workflow)
         self.assertNotIn("journalctl -u \"$service\"", workflow)
-        self.assertIn('systemctl show "$service"', workflow)
-        self.assertIn('fail "candidate release activation failed; diagnostics summarized"', workflow)
-        self.assertIn('"error_class":"activation"', workflow)
-        remote_script = supervisor
         self.assertNotIn("platform_build_release.sh", remote_script)
         self.assertNotIn("pip install -r platform/requirements-platform.lock.txt", remote_script)
         self.assertIn(
@@ -2018,12 +2115,12 @@ fail 'private lock detail must not cross the public channel'
 
             self.addCleanup(cleanup_fixture)
             target_sha = "a" * 40
-            release_slug = "gha-123456-1-aaaaaaaaaaaa"
             run_id = str(os.getpid())
             artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
             if artifact.exists() or artifact.is_symlink():
                 run_id = str(int(run_id) + 1)
                 artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            release_slug = f"gha-{run_id}-1-{target_sha[:12]}"
             artifact.mkdir(mode=0o700)
             os.chown(artifact, 0, 0)
             os.chmod(artifact, 0o700)
@@ -2305,6 +2402,555 @@ fail 'private lock detail must not cross the public channel'
                 )
                 self.assertNotIn("PRIVATE", output)
                 self.assertNotIn("malformed", output)
+
+    def test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher(
+        self,
+    ) -> None:
+        """The real candidate runner keeps noisy output private and preserves its marker ABI."""
+
+        if os.geteuid() != 0:
+            self.skipTest("candidate diagnostic ownership fixture requires root")
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        runner = self._candidate_diagnostic_runner_source(supervisor)
+        target_sha = "a" * 40
+        host_tools_sha = "b" * 40
+        run_id = str(os.getpid())
+        attempt = "41"
+        release_slug = f"gha-{run_id}-{attempt}-{target_sha[:12]}"
+
+        with tempfile.TemporaryDirectory(prefix="candidate-diagnostics-") as tmp:
+            root = Path(tmp)
+            private_parent = root / "var-tmp"
+            artifact = root / "candidate.tar.gz"
+            artifact.write_bytes(b"isolated fixture\n")
+
+            def cleanup_pid_file(pid_file: Path) -> None:
+                if not pid_file.exists():
+                    return
+                try:
+                    child_pid = int(pid_file.read_text(encoding="ascii"))
+                    os.kill(child_pid, 9)
+                except (OSError, ValueError):
+                    pass
+
+            def assert_pid_stopped(pid_file: Path) -> None:
+                child_pid = int(pid_file.read_text(encoding="ascii"))
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
+                    except (FileNotFoundError, ProcessLookupError):
+                        return
+                    if state == "Z":
+                        return
+                    time.sleep(0.02)
+                self.fail("candidate runner left a descendant process running")
+
+            noisy_candidate = root / "noisy-candidate"
+            noisy_candidate.write_text(
+                "#!/usr/bin/python3\n"
+                "import os\n"
+                "os.write(1, b'PRIVATE_CANDIDATE_STDOUT_SENTINEL' + b'x' * 70000)\n"
+                "os.write(2, b'PRIVATE_CANDIDATE_STDERR_SENTINEL' + b'y' * 70000)\n"
+                "raise SystemExit(23)\n",
+                encoding="ascii",
+            )
+            noisy_candidate.chmod(0o700)
+
+            failed = self._run_candidate_diagnostic_runner(
+                runner,
+                candidate=noisy_candidate,
+                diagnostic_parent=private_parent,
+                release_slug=release_slug,
+                source_sha=target_sha,
+                run_id=run_id,
+                attempt=attempt,
+                host_tools_sha=host_tools_sha,
+            )
+            self.assertEqual(failed.returncode, 0, failed.stderr)
+            self.assertEqual(failed.stderr, "")
+            self.assertRegex(
+                failed.stdout,
+                r"^candidate_status=23 capture_state=truncated\n$",
+            )
+            run_dir = private_parent / "oldsparky-release-diagnostics" / f"{run_id}-{attempt}"
+            self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o700)
+            self.assertEqual(run_dir.stat().st_uid, 0)
+            self.assertEqual({path.name for path in run_dir.iterdir()}, {
+                "candidate.stdout",
+                "candidate.stderr",
+                "candidate.json",
+            })
+            for name in ("candidate.stdout", "candidate.stderr", "candidate.json"):
+                info = (run_dir / name).stat()
+                self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+                self.assertEqual(info.st_uid, 0)
+                self.assertEqual(info.st_nlink, 1)
+            self.assertEqual((run_dir / "candidate.stdout").stat().st_size, 65536)
+            self.assertEqual((run_dir / "candidate.stderr").stat().st_size, 65536)
+            metadata = json.loads((run_dir / "candidate.json").read_text())
+            self.assertEqual(metadata["source_sha"], target_sha)
+            self.assertEqual(metadata["host_tools_sha"], host_tools_sha)
+            self.assertEqual(metadata["release_slug"], release_slug)
+            self.assertEqual(metadata["run_id"], run_id)
+            self.assertEqual(metadata["attempt"], attempt)
+            self.assertEqual(metadata["phase"], "candidate")
+            self.assertEqual(metadata["candidate_started"], True)
+            self.assertEqual(metadata["candidate_exit_status"], 23)
+            self.assertEqual(metadata["capture_state"], "truncated")
+            self.assertEqual(metadata["stdout_observed_bytes"], 65537)
+            self.assertEqual(metadata["stderr_observed_bytes"], 65537)
+            self.assertNotIn("PRIVATE_CANDIDATE", failed.stdout)
+
+            expected_marker = (
+                "RELEASE_DEPLOY schema=1 status=failed class=deployment "
+                "phase=candidate reason=activation_failed "
+                f"release_slug={release_slug} source_sha={target_sha}\n"
+            )
+            marker_harness = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=failed.stdout.rstrip("\n"),
+                release_slug=release_slug,
+                source_sha=target_sha,
+            )
+            direct = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-c", marker_harness],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin"},
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(direct.returncode, 23, direct.stderr)
+            self.assertEqual(direct.stdout, expected_marker)
+            dispatcher_output = io.StringIO()
+            with redirect_stdout(dispatcher_output):
+                status = platform_workflow_remote_dispatch._run_bounded_child(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", marker_harness],
+                    timeout_seconds=5,
+                    expected_release_marker=("deploy", release_slug, target_sha),
+                )
+            self.assertEqual(status, 23, dispatcher_output.getvalue())
+            self.assertEqual(dispatcher_output.getvalue(), expected_marker)
+            self.assertNotIn("PRIVATE_CANDIDATE", dispatcher_output.getvalue())
+
+            # A successful candidate follows the same runner but removes only
+            # its exact completed capture after writing the metadata durably.
+            success_candidate = root / "success-candidate"
+            success_candidate.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            success_candidate.chmod(0o700)
+            success_run_id = str(int(run_id) + 1)
+            success_slug = f"gha-{success_run_id}-{attempt}-{target_sha[:12]}"
+            succeeded = self._run_candidate_diagnostic_runner(
+                runner,
+                candidate=success_candidate,
+                diagnostic_parent=private_parent,
+                release_slug=success_slug,
+                source_sha=target_sha,
+                run_id=success_run_id,
+                attempt=attempt,
+                host_tools_sha=host_tools_sha,
+            )
+            self.assertEqual(succeeded.returncode, 0, succeeded.stderr)
+            self.assertEqual(succeeded.stdout, "candidate_status=0 capture_state=complete\n")
+            self.assertFalse(
+                (private_parent / "oldsparky-release-diagnostics" / f"{success_run_id}-{attempt}").exists()
+            )
+
+            def invoke(
+                candidate: Path,
+                numeric_run_id: int,
+                *,
+                runner_source: str = runner,
+                run_attempt: str = attempt,
+            ) -> tuple[subprocess.CompletedProcess[str], str, Path]:
+                bound_run_id = str(numeric_run_id)
+                bound_slug = f"gha-{bound_run_id}-{run_attempt}-{target_sha[:12]}"
+                completed = self._run_candidate_diagnostic_runner(
+                    runner_source,
+                    candidate=candidate,
+                    diagnostic_parent=private_parent,
+                    release_slug=bound_slug,
+                    source_sha=target_sha,
+                    run_id=bound_run_id,
+                    attempt=run_attempt,
+                    host_tools_sha=host_tools_sha,
+                )
+                return (
+                    completed,
+                    bound_slug,
+                    private_parent
+                    / "oldsparky-release-diagnostics"
+                    / f"{bound_run_id}-{run_attempt}",
+                )
+
+            signal_candidate = root / "signal-candidate"
+            signal_candidate.write_text(
+                "#!/usr/bin/python3\n"
+                "import os, signal\n"
+                "os.kill(os.getpid(), signal.SIGTERM)\n",
+                encoding="ascii",
+            )
+            signal_candidate.chmod(0o700)
+            signal_result, signal_slug, signal_dir = invoke(
+                signal_candidate, int(run_id) + 7
+            )
+            self.assertEqual(
+                signal_result.stdout,
+                "candidate_status=143 capture_state=complete\n",
+            )
+            signal_metadata = json.loads((signal_dir / "candidate.json").read_text())
+            self.assertEqual(signal_metadata["candidate_exit_status"], 143)
+            signal_marker_harness = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=signal_result.stdout.rstrip("\n"),
+                release_slug=signal_slug,
+                source_sha=target_sha,
+            )
+            signal_output = io.StringIO()
+            with redirect_stdout(signal_output):
+                signal_status = platform_workflow_remote_dispatch._run_bounded_child(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", signal_marker_harness],
+                    timeout_seconds=5,
+                    expected_release_marker=("deploy", signal_slug, target_sha),
+                )
+            self.assertEqual(signal_status, 143)
+            self.assertEqual(
+                signal_output.getvalue(),
+                "RELEASE_DEPLOY schema=1 status=failed class=deployment "
+                "phase=candidate reason=activation_failed "
+                f"release_slug={signal_slug} source_sha={target_sha}\n",
+            )
+
+            # Binding or exclusive-directory failure is rejected before the
+            # fake candidate can leave its start sentinel or overwrite an
+            # existing same-run diagnostic directory.
+            start_sentinel = root / "candidate-started"
+            setup_candidate = root / "setup-candidate"
+            setup_candidate.write_text(
+                "#!/bin/sh\nprintf started > "
+                + shlex.quote(str(start_sentinel))
+                + "\n",
+                encoding="ascii",
+            )
+            setup_candidate.chmod(0o700)
+            bad_binding = self._run_candidate_diagnostic_runner(
+                runner,
+                candidate=setup_candidate,
+                diagnostic_parent=private_parent,
+                release_slug="wrong-release-binding",
+                source_sha=target_sha,
+                run_id=str(int(run_id) + 2),
+                attempt=attempt,
+                host_tools_sha=host_tools_sha,
+            )
+            self.assertEqual(
+                bad_binding.stdout,
+                "candidate_status=none capture_state=setup_failed\n",
+            )
+            self.assertFalse(start_sentinel.exists())
+            bad_slug = f"gha-{int(run_id) + 2}-{attempt}-{target_sha[:12]}"
+            setup_marker_harness = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=bad_binding.stdout.rstrip("\n"),
+                release_slug=bad_slug,
+                source_sha=target_sha,
+            )
+            setup_output = io.StringIO()
+            with redirect_stdout(setup_output):
+                setup_status = platform_workflow_remote_dispatch._run_bounded_child(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", setup_marker_harness],
+                    timeout_seconds=5,
+                    expected_release_marker=("deploy", bad_slug, target_sha),
+                )
+            self.assertEqual(setup_status, 1)
+            self.assertEqual(
+                setup_output.getvalue(),
+                "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+                f"phase=preflight reason=internal release_slug={bad_slug} "
+                f"source_sha={target_sha}\n",
+            )
+
+            diagnostics_root = private_parent / "oldsparky-release-diagnostics"
+            collision_run_id = str(int(run_id) + 3)
+            collision_name = f"{collision_run_id}-{attempt}"
+            collision_dir = diagnostics_root / collision_name
+            collision_dir.mkdir(mode=0o700)
+            os.chown(collision_dir, 0, 0)
+            os.chmod(collision_dir, 0o700)
+            collision_sentinel = collision_dir / "owner-sentinel"
+            collision_sentinel.write_bytes(b"must remain untouched\n")
+            os.chown(collision_sentinel, 0, 0)
+            os.chmod(collision_sentinel, 0o600)
+            collided, _, _ = invoke(setup_candidate, int(collision_run_id))
+            self.assertEqual(
+                collided.stdout,
+                "candidate_status=none capture_state=setup_failed\n",
+            )
+            self.assertFalse(start_sentinel.exists())
+            self.assertEqual(collision_sentinel.read_bytes(), b"must remain untouched\n")
+
+            symlink_parent = root / "symlink-parent"
+            symlink_parent.mkdir(mode=0o700)
+            os.chown(symlink_parent, 0, 0)
+            os.chmod(symlink_parent, 0o1777)
+            symlink_target = root / "symlink-target"
+            symlink_target.mkdir(mode=0o700)
+            symlink_sentinel = symlink_target / "must-survive"
+            symlink_sentinel.write_bytes(b"trusted target remains untouched\n")
+            os.chown(symlink_target, 0, 0)
+            os.chmod(symlink_target, 0o700)
+            os.chown(symlink_sentinel, 0, 0)
+            os.chmod(symlink_sentinel, 0o600)
+            (symlink_parent / "oldsparky-release-diagnostics").symlink_to(
+                symlink_target,
+                target_is_directory=True,
+            )
+            symlink_result = self._run_candidate_diagnostic_runner(
+                runner,
+                candidate=setup_candidate,
+                diagnostic_parent=symlink_parent,
+                release_slug=f"gha-{int(run_id) + 8}-{attempt}-{target_sha[:12]}",
+                source_sha=target_sha,
+                run_id=str(int(run_id) + 8),
+                attempt=attempt,
+                host_tools_sha=host_tools_sha,
+            )
+            self.assertEqual(
+                symlink_result.stdout,
+                "candidate_status=none capture_state=setup_failed\n",
+            )
+            self.assertFalse(start_sentinel.exists())
+            self.assertEqual(symlink_sentinel.read_bytes(), b"trusted target remains untouched\n")
+
+            missing_candidate = root / "does-not-exist"
+            spawn_failed, spawn_slug, spawn_dir = invoke(
+                missing_candidate, int(run_id) + 4
+            )
+            self.assertEqual(
+                spawn_failed.stdout,
+                "candidate_status=none capture_state=spawn_failed\n",
+            )
+            self.assertTrue(spawn_dir.is_dir())
+            spawn_metadata = json.loads((spawn_dir / "candidate.json").read_text())
+            self.assertFalse(spawn_metadata["candidate_started"])
+            self.assertIsNone(spawn_metadata["candidate_exit_status"])
+            spawn_marker_harness = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=spawn_failed.stdout.rstrip("\n"),
+                release_slug=spawn_slug,
+                source_sha=target_sha,
+            )
+            spawn_output = io.StringIO()
+            with redirect_stdout(spawn_output):
+                spawn_status = platform_workflow_remote_dispatch._run_bounded_child(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", spawn_marker_harness],
+                    timeout_seconds=5,
+                    expected_release_marker=("deploy", spawn_slug, target_sha),
+                )
+            self.assertEqual(spawn_status, 1)
+            self.assertEqual(
+                spawn_output.getvalue(),
+                "RELEASE_DEPLOY schema=1 status=failed class=deployment "
+                "phase=candidate reason=candidate_missing "
+                f"release_slug={spawn_slug} source_sha={target_sha}\n",
+            )
+
+            timeout_candidate = root / "timeout-candidate"
+            timeout_pid_file = root / "timeout-descendant.pid"
+            self.addCleanup(cleanup_pid_file, timeout_pid_file)
+            timeout_candidate.write_text(
+                "#!/usr/bin/python3\n"
+                "import os, time\n"
+                "pid = os.fork()\n"
+                "if pid == 0:\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                f"open({str(timeout_pid_file)!r}, 'w').write(str(pid))\n"
+                "time.sleep(30)\n",
+                encoding="ascii",
+            )
+            timeout_candidate.chmod(0o700)
+            fast_timeout_runner = runner.replace(
+                "capture_timeout_seconds = 840.0",
+                "capture_timeout_seconds = 0.3",
+                1,
+            ).replace(
+                "termination_grace_seconds = 2.0",
+                "termination_grace_seconds = 0.2",
+                1,
+            )
+            self.assertNotEqual(fast_timeout_runner, runner)
+            timed_out, timeout_slug, timeout_dir = invoke(
+                timeout_candidate,
+                int(run_id) + 5,
+                runner_source=fast_timeout_runner,
+            )
+            self.assertRegex(
+                timed_out.stdout,
+                r"^candidate_status=(1[2-9][0-9]|[2-9][0-9]{2}) capture_state=timeout\n$",
+            )
+            timeout_metadata = json.loads((timeout_dir / "candidate.json").read_text())
+            self.assertEqual(timeout_metadata["capture_state"], "timeout")
+            self.assertTrue(timeout_metadata["candidate_started"])
+            assert_pid_stopped(timeout_pid_file)
+            timeout_marker = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=timed_out.stdout.rstrip("\n"),
+                release_slug=timeout_slug,
+                source_sha=target_sha,
+            )
+            timeout_output = io.StringIO()
+            with redirect_stdout(timeout_output):
+                timeout_status = platform_workflow_remote_dispatch._run_bounded_child(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", timeout_marker],
+                    timeout_seconds=5,
+                    expected_release_marker=("deploy", timeout_slug, target_sha),
+                )
+            self.assertEqual(timeout_status, 1)
+            self.assertEqual(
+                timeout_output.getvalue(),
+                "RELEASE_DEPLOY schema=1 status=failed class=deployment "
+                "phase=candidate reason=activation_failed "
+                f"release_slug={timeout_slug} source_sha={target_sha}\n",
+            )
+
+            stuck_candidate = root / "stuck-candidate"
+            stuck_candidate.write_text(
+                "#!/usr/bin/python3\n"
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "while True: time.sleep(1)\n",
+                encoding="ascii",
+            )
+            stuck_candidate.chmod(0o700)
+            bounded_reap_runner = runner.replace(
+                "capture_timeout_seconds = 840.0",
+                "capture_timeout_seconds = 0.3",
+                1,
+            ).replace(
+                "termination_grace_seconds = 2.0",
+                "termination_grace_seconds = 0.1",
+                1,
+            )
+            killpg_marker = "def signal_group(signum):\n"
+            self.assertIn(killpg_marker, bounded_reap_runner)
+            bounded_reap_runner = bounded_reap_runner.replace(
+                killpg_marker,
+                "real_killpg = os.killpg\n"
+                "kill_seen = False\n"
+                "def injected_killpg(pgid, signum):\n"
+                "    global kill_seen\n"
+                "    if signum == signal.SIGKILL:\n"
+                "        kill_seen = True\n"
+                "    return real_killpg(pgid, signum)\n"
+                "class FaultWaitPopen(subprocess.Popen):\n"
+                "    def wait(self, timeout=None):\n"
+                "        if kill_seen:\n"
+                "            raise subprocess.TimeoutExpired(self.args, timeout)\n"
+                "        return super().wait(timeout=timeout)\n"
+                "subprocess.Popen = FaultWaitPopen\n"
+                "os.killpg = injected_killpg\n"
+                + killpg_marker,
+                1,
+            )
+            unreaped, unreaped_slug, unreaped_dir = invoke(
+                stuck_candidate,
+                int(run_id) + 9,
+                runner_source=bounded_reap_runner,
+            )
+            self.assertEqual(unreaped.returncode, 0, unreaped.stderr)
+            self.assertEqual(
+                unreaped.stdout,
+                "candidate_status=none capture_state=cleanup_unreaped\n",
+            )
+            unreaped_metadata = json.loads((unreaped_dir / "candidate.json").read_text())
+            self.assertTrue(unreaped_metadata["candidate_started"])
+            self.assertIsNone(unreaped_metadata["candidate_exit_status"])
+            self.assertFalse(unreaped_metadata["candidate_child_reaped"])
+            self.assertTrue(unreaped_metadata["candidate_child_reap_failed"])
+            self.assertEqual(unreaped_metadata["capture_state"], "cleanup_unreaped")
+            self.assertTrue((unreaped_dir / "candidate.stdout").exists())
+            self.assertTrue((unreaped_dir / "candidate.stderr").exists())
+            self.assertTrue((unreaped_dir / "candidate.json").exists())
+            unreaped_marker = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=unreaped.stdout.rstrip("\n"),
+                release_slug=unreaped_slug,
+                source_sha=target_sha,
+            )
+            unreaped_output = io.StringIO()
+            with redirect_stdout(unreaped_output):
+                unreaped_status = platform_workflow_remote_dispatch._run_bounded_child(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", unreaped_marker],
+                    timeout_seconds=5,
+                    expected_release_marker=("deploy", unreaped_slug, target_sha),
+                )
+            self.assertEqual(unreaped_status, 1)
+            self.assertNotIn("status=passed", unreaped_output.getvalue())
+            self.assertIn("status=failed", unreaped_output.getvalue())
+
+            inherited_candidate = root / "inherited-pipe-candidate"
+            inherited_pid_file = root / "inherited-descendant.pid"
+            self.addCleanup(cleanup_pid_file, inherited_pid_file)
+            inherited_candidate.write_text(
+                "#!/usr/bin/python3\n"
+                "import os, time\n"
+                "pid = os.fork()\n"
+                "if pid == 0:\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                f"open({str(inherited_pid_file)!r}, 'w').write(str(pid))\n"
+                "os._exit(0)\n",
+                encoding="ascii",
+            )
+            inherited_candidate.chmod(0o700)
+            fast_pipe_runner = runner.replace(
+                "pipe_eof_grace_seconds = 1.0",
+                "pipe_eof_grace_seconds = 0.2",
+                1,
+            ).replace(
+                "capture_timeout_seconds = 840.0",
+                "capture_timeout_seconds = 2.0",
+                1,
+            ).replace(
+                "termination_grace_seconds = 2.0",
+                "termination_grace_seconds = 0.2",
+                1,
+            )
+            inherited, inherited_slug, inherited_dir = invoke(
+                inherited_candidate,
+                int(run_id) + 6,
+                runner_source=fast_pipe_runner,
+            )
+            self.assertEqual(
+                inherited.stdout,
+                "candidate_status=0 capture_state=inherited_pipe_open\n",
+            )
+            inherited_metadata = json.loads((inherited_dir / "candidate.json").read_text())
+            self.assertEqual(inherited_metadata["capture_state"], "inherited_pipe_open")
+            assert_pid_stopped(inherited_pid_file)
+            inherited_marker = self._candidate_diagnostic_marker_harness(
+                supervisor,
+                result=inherited.stdout.rstrip("\n"),
+                release_slug=inherited_slug,
+                source_sha=target_sha,
+            )
+            inherited_output = io.StringIO()
+            with redirect_stdout(inherited_output):
+                inherited_status = platform_workflow_remote_dispatch._run_bounded_child(
+                    ["/bin/bash", "--noprofile", "--norc", "-c", inherited_marker],
+                    timeout_seconds=5,
+                    expected_release_marker=("deploy", inherited_slug, target_sha),
+                )
+            self.assertEqual(inherited_status, 1)
+            self.assertEqual(
+                inherited_output.getvalue(),
+                "RELEASE_DEPLOY schema=1 status=failed class=deployment "
+                "phase=candidate reason=activation_failed "
+                f"release_slug={inherited_slug} source_sha={target_sha}\n",
+            )
 
     def test_deploy_only_artifact_preparation_errors_emit_markers_without_app_writes(
         self,
