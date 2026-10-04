@@ -1649,10 +1649,12 @@ jobs:
           sys.path.insert(0, str(Path.cwd() / "platform"))
           from tools.platform_deploy_baseline import (  # noqa: E402
               DEPLOY_STATUS_CONTEXT,
+              active_deployment_status_identity,
               classify_cumulative_baseline,
               validate_active_baseline,
           )
           from tools.platform_workflow_provenance import (  # noqa: E402
+              ProvenanceError,
               latest_context_status,
               validate_autodeploy_dispatch,
               validate_security_marker,
@@ -1794,14 +1796,17 @@ jobs:
               status_rows, context=DEPLOY_STATUS_CONTEXT, max_age=None
           )
           target_url = deployment_marker.get("target_url")
-          match = re.fullmatch(
-              r"https://github\.com/StrayForest/old_sparky/actions/runs/([1-9][0-9]{0,31})/attempts/([1-9][0-9]{0,31})",
-              target_url if isinstance(target_url, str) else "",
-          )
-          if match is None:
-              raise SystemExit("active deployment status target is not an exact attempt URL")
-          deployment_id, deployment_attempt = match.groups()
+          try:
+              deployment_id, deployment_attempt, _legacy_bare_url = active_deployment_status_identity(
+                  target_url, baseline.get("release_slug")
+              )
+          except ProvenanceError as exc:
+              raise SystemExit("active deployment status target is not authenticated") from exc
           workflow = fetch_json("/actions/workflows/platform-production-deploy.yml")
+          latest_run = (
+              fetch_json(f"/actions/runs/{deployment_id}")
+              if _legacy_bare_url else None
+          )
           run = fetch_json(f"/actions/runs/{deployment_id}/attempts/{deployment_attempt}")
           jobs, jobs_complete = fetch_jobs(deployment_id, deployment_attempt)
           validate_active_baseline(
@@ -1815,6 +1820,7 @@ jobs:
               first_parent_shas=first_parent,
               statuses_complete=statuses_complete,
               jobs_complete=jobs_complete,
+              latest_run=latest_run,
           )
 
           # Authenticate the original exact push CI marker and its successful

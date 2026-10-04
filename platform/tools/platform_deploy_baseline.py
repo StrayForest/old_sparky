@@ -28,6 +28,8 @@ from tools.platform_workflow_provenance import (
     AUTODEPLOY_WORKFLOW_NAME,
     AUTODEPLOY_WORKFLOW_PATH,
     DEPLOY_STATUS_CONTEXT,
+    DEPLOY_WORKFLOW_NAME,
+    DEPLOY_WORKFLOW_PATH,
     GITHUB_SERVER_URL,
     SHA_RE,
     SECURITY_SUCCESS_DESCRIPTION,
@@ -62,6 +64,12 @@ RELEASE_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 ATTEMPT_PATH_RE = re.compile(
     r"^/StrayForest/old_sparky/actions/runs/([1-9][0-9]{0,31})/attempts/([1-9][0-9]{0,31})$"
+)
+LEGACY_RUN_PATH_RE = re.compile(
+    r"^/StrayForest/old_sparky/actions/runs/([1-9][0-9]{0,31})$"
+)
+LEGACY_RELEASE_SLUG_RE = re.compile(
+    r"^gha-([1-9][0-9]{0,31})-1-([0-9]{8}T[0-9]{6}Z)$"
 )
 MAX_FIRST_PARENT_COMMITS = 8192
 MAX_STATUS_ROWS = 10_000
@@ -524,6 +532,51 @@ def _attempt_identity(target_url: object) -> tuple[int, int, str]:
     return run_id, attempt, run_url
 
 
+def active_deployment_status_identity(
+    target_url: object, release_slug: object
+) -> tuple[int, int, bool]:
+    """Resolve the exact active-deploy API identity from its latest status.
+
+    New status rows point to an exact attempt URL. The sole compatibility
+    exception is the historical attempt-1 bare run URL, and only when the
+    root-authenticated release slug uses the old UTC-timestamp form and binds
+    the same run ID. Callers must still authenticate that exact run attempt,
+    job set and status before using this identity.
+    """
+
+    try:
+        run_id, attempt, _run_url = _attempt_identity(target_url)
+        return run_id, attempt, False
+    except ProvenanceError:
+        pass
+
+    if not isinstance(target_url, str) or not isinstance(release_slug, str):
+        raise ProvenanceError("legacy deployment status identity is malformed")
+    parsed = urlsplit(target_url)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ProvenanceError("legacy deployment status URL is not canonical")
+    match = LEGACY_RUN_PATH_RE.fullmatch(parsed.path)
+    slug_match = LEGACY_RELEASE_SLUG_RE.fullmatch(release_slug)
+    if match is None or slug_match is None:
+        raise ProvenanceError("legacy deployment status identity is not supported")
+    run_id = parse_run_id(match.group(1), "legacy deployment run id")
+    slug_run_id = parse_run_id(slug_match.group(1), "legacy release run id")
+    if run_id != slug_run_id:
+        raise ProvenanceError("legacy deployment status and release slug do not match")
+    try:
+        datetime.strptime(slug_match.group(2), "%Y%m%dT%H%M%SZ")
+    except ValueError as exc:
+        raise ProvenanceError("legacy release slug timestamp is invalid") from exc
+    return run_id, 1, True
+
+
 def validate_active_baseline(
     baseline: object,
     workflow: Mapping[str, Any],
@@ -536,6 +589,7 @@ def validate_active_baseline(
     first_parent_shas: Sequence[str],
     statuses_complete: bool,
     jobs_complete: bool,
+    latest_run: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, object]:
     """Authenticate the active release SHA and its ancestry to the target.
@@ -595,12 +649,41 @@ def validate_active_baseline(
         now=now,
         max_age=None,
     )
-    run_id, attempt, run_url = _attempt_identity(marker.get("target_url"))
+    run_id, attempt, is_legacy_bare_url = active_deployment_status_identity(
+        marker.get("target_url"), baseline_row["release_slug"]
+    )
+    if is_legacy_bare_url:
+        if not isinstance(latest_run, Mapping):
+            raise ProvenanceError("legacy deployment latest run metadata is missing")
+        validate_workflow_run(
+            workflow,
+            latest_run,
+            expected_run_id=run_id,
+            expected_attempt=1,
+            expected_target_sha=str(baseline_row["source_sha"]),
+            expected_event="workflow_dispatch",
+            expected_branch="dev",
+            expected_path=DEPLOY_WORKFLOW_PATH,
+            expected_name=DEPLOY_WORKFLOW_NAME,
+            expected_run_name=DEPLOY_WORKFLOW_NAME,
+        )
+    marker_statuses: Sequence[Mapping[str, Any]] = statuses
+    if is_legacy_bare_url:
+        attempt_url = f"{GITHUB_SERVER_URL}/StrayForest/old_sparky/actions/runs/{run_id}/attempts/1"
+        marker_statuses = [
+            ({**status, "target_url": attempt_url} if status is marker else status)
+            for status in statuses
+        ]
+        if sum(status is marker for status in statuses) != 1:
+            raise ProvenanceError("legacy deployment marker identity is ambiguous")
+    else:
+        attempt_url = f"{GITHUB_SERVER_URL}/StrayForest/old_sparky/actions/runs/{run_id}/attempts/{attempt}"
+    run_url = f"{GITHUB_SERVER_URL}/StrayForest/old_sparky/actions/runs/{run_id}"
     attempt_url = validate_deployment_marker(
         workflow,
         run,
         jobs,
-        statuses,
+        marker_statuses,
         expected_run_id=run_id,
         expected_attempt=attempt,
         expected_target_sha=str(baseline_row["source_sha"]),
