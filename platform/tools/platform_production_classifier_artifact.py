@@ -25,6 +25,10 @@ from typing import Any
 
 try:
     from .platform_safe_zip import UnsafeZipError, extract_single_manifest
+    from .platform_ci_classifier import (
+        CANDIDATE_PACKAGING_FILES,
+        CANDIDATE_PACKAGING_REASON,
+    )
 except ImportError:  # Executed directly from platform/tools on a runner.
     _SAFE_ZIP_SPEC = importlib.util.spec_from_file_location(
         "platform_safe_zip", Path(__file__).with_name("platform_safe_zip.py")
@@ -35,6 +39,10 @@ except ImportError:  # Executed directly from platform/tools on a runner.
     _SAFE_ZIP_SPEC.loader.exec_module(_SAFE_ZIP_MODULE)
     UnsafeZipError = _SAFE_ZIP_MODULE.UnsafeZipError
     extract_single_manifest = _SAFE_ZIP_MODULE.extract_single_manifest
+    from platform_ci_classifier import (  # type: ignore[no-redef]
+        CANDIDATE_PACKAGING_FILES,
+        CANDIDATE_PACKAGING_REASON,
+    )
 
 
 MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -452,11 +460,23 @@ def _is_recovery_bootstrap_only(files: Sequence[object]) -> bool:
     )
 
 
+def _is_candidate_packaging_only(files: Sequence[object]) -> bool:
+    return bool(
+        any(path in CANDIDATE_PACKAGING_FILES for path in files)
+        and all(
+            path in CANDIDATE_PACKAGING_FILES
+            or (isinstance(path, str) and path.startswith(DOCS_PREFIX))
+            for path in files
+        )
+    )
+
+
 def validate_manifest(
     archive: Path,
     *,
     target_sha: str,
     require_recovery_bootstrap: bool = False,
+    require_reconcile_source: bool = False,
 ) -> dict[str, Any]:
     if SHA_RE.fullmatch(target_sha) is None:
         raise _fail("provenance")
@@ -504,7 +524,12 @@ def validate_manifest(
     ):
         raise _fail("manifest")
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
+    candidate_packaging_only = _is_candidate_packaging_only(files)
     if type(require_recovery_bootstrap) is not bool:
+        raise _fail("manifest")
+    if type(require_reconcile_source) is not bool or (
+        require_recovery_bootstrap and require_reconcile_source
+    ):
         raise _fail("manifest")
     if require_recovery_bootstrap and (
         not recovery_bootstrap_only
@@ -516,9 +541,22 @@ def validate_manifest(
     if type(manifest.get("deployable")) is not bool:
         raise _fail("manifest")
     if recovery_bootstrap_only:
-        if manifest["deployable"] is not False:
+        if (
+            manifest["deployable"] is not False
+            or manifest.get("reason") != RECOVERY_BOOTSTRAP_REASON
+        ):
+            raise _fail("manifest")
+    elif candidate_packaging_only:
+        if (
+            not require_reconcile_source
+            or manifest["runtime_sensitive"] is not False
+            or manifest["deployable"] is not False
+            or manifest.get("reason") != CANDIDATE_PACKAGING_REASON
+        ):
             raise _fail("manifest")
     elif manifest["deployable"] is not True:
+        raise _fail("manifest")
+    if require_reconcile_source and not (recovery_bootstrap_only or candidate_packaging_only):
         raise _fail("manifest")
     if type(manifest.get("fallback")) is not bool or manifest["fallback"] is not False:
         raise _fail("manifest")
@@ -548,6 +586,7 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("archive", type=Path)
     manifest.add_argument("--target-sha", required=True)
     manifest.add_argument("--require-recovery-bootstrap", action="store_true")
+    manifest.add_argument("--require-reconcile-source", action="store_true")
     manifest.add_argument("--emit-manifest-base64", action="store_true")
     return parser
 
@@ -583,6 +622,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.archive,
                 target_sha=arguments.target_sha,
                 require_recovery_bootstrap=arguments.require_recovery_bootstrap,
+                require_reconcile_source=arguments.require_reconcile_source,
             )
             if arguments.emit_manifest_base64:
                 encoded = base64.b64encode(

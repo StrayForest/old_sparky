@@ -2130,7 +2130,15 @@ def collect_issues() -> list[str]:
     if (
         'manifest_args=(--target-sha "$TARGET_SHA"' not in production_text
         or 'manifest "$route_dir/artifact.zip" "${manifest_args[@]}"' not in production_text
-        or 'manifest_args+=(--require-recovery-bootstrap)' not in production_text
+        or production_text.count(
+            'manifest_args+=(--require-reconcile-source)'
+        ) != 2
+        or production_text.count(
+            'if [[ "$RECONCILE_MODE" == "true" ]]; then'
+        ) != 2
+        or "RECONCILE_MODE: ${{ inputs.mode == 'baseline-reconcile' && 'true' || 'false' }}"
+        not in production_text
+        or "DEPLOY_MODE: deploy" not in production_text
     ):
         issues.append("production deploy must revalidate the exact classifier manifest before writes")
 

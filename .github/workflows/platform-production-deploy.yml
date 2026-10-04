@@ -210,6 +210,7 @@ jobs:
       # baseline-reconcile selects the extra proof gates above, not a new
       # release-builder mode.
       DEPLOY_MODE: deploy
+      RECONCILE_MODE: ${{ inputs.mode == 'baseline-reconcile' && 'true' || 'false' }}
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
       AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
@@ -546,8 +547,8 @@ jobs:
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
             --output "$route_dir/artifact.zip"
           manifest_args=(--target-sha "$TARGET_SHA" --emit-manifest-base64)
-          if [[ "$DEPLOY_MODE" == "baseline-reconcile" ]]; then
-            manifest_args+=(--require-recovery-bootstrap)
+          if [[ "$RECONCILE_MODE" == "true" ]]; then
+            manifest_args+=(--require-reconcile-source)
           fi
           manifest_b64="$(/usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" "${manifest_args[@]}")"
           (( ${#manifest_b64} > 0 && ${#manifest_b64} <= 350000 ))
@@ -2898,7 +2899,7 @@ jobs:
             --output "$route_dir/artifact.zip"
           manifest_args=(--target-sha "$TARGET_SHA")
           if [[ "$RECONCILE_MODE" == "true" ]]; then
-            manifest_args+=(--require-recovery-bootstrap)
+            manifest_args+=(--require-reconcile-source)
           fi
           /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" "${manifest_args[@]}"
 

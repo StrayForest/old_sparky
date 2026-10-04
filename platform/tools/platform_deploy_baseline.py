@@ -17,6 +17,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from tools.platform_ci_classifier import (
+    CANDIDATE_PACKAGING_FILES,
+    CANDIDATE_PACKAGING_REASON,
     FULL_GATE_IDS,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
@@ -191,17 +193,18 @@ def classify_cumulative_baseline(
 ) -> dict[str, object]:
     """Reclassify the complete active-baseline-to-target path set.
 
-    The incremental artifact is accepted only as a valid, non-deployable
-    recovery-bootstrap manifest. The cumulative file list comes from the
-    bounded first-parent diff and is reclassified here with the canonical
-    router, so an incremental ``runtime_sensitive=false`` result cannot hide
-    older runtime-sensitive changes still present in the candidate range.
+    The incremental artifact is accepted only as one of the exact,
+    non-deployable recovery-bootstrap or candidate-packaging manifests. The
+    cumulative file list comes from the bounded first-parent diff and is
+    reclassified here with the canonical router, so an incremental
+    ``runtime_sensitive=false`` result cannot hide older runtime-sensitive
+    changes still present in the candidate range.
 
     The result is a closed wrapper containing the canonical cumulative
-    manifest and an explicit ``no_op`` flag. A pure recovery-bootstrap range
-    is a verified no-op; every other non-deployable or fallback result fails
-    closed. Callers must not build or activate an application release when
-    ``no_op`` is true.
+    manifest and an explicit ``no_op`` flag. A pure recovery-bootstrap or
+    candidate-packaging range is a verified no-op; every other
+    non-deployable or fallback result fails closed. Callers must not build or
+    activate an application release when ``no_op`` is true.
     """
 
     try:
@@ -218,15 +221,29 @@ def classify_cumulative_baseline(
         or incremental_manifest.get("fallback") is not False
         or type(incremental_manifest.get("runtime_sensitive")) is not bool
         or incremental_manifest.get("deployable") is not False
-        or incremental_manifest.get("reason") != RECOVERY_BOOTSTRAP_REASON
         or not isinstance(incremental_files, list)
-        or not any(path in RECOVERY_BOOTSTRAP_FILES for path in incremental_files)
-        or any(
-            path not in RECOVERY_BOOTSTRAP_FILES and not path.startswith("platform/docs/")
+    ):
+        raise ProvenanceError("incremental manifest is not a full non-deployable source route")
+    recovery_bootstrap_only = bool(
+        any(path in RECOVERY_BOOTSTRAP_FILES for path in incremental_files)
+        and all(
+            path in RECOVERY_BOOTSTRAP_FILES or path.startswith("platform/docs/")
             for path in incremental_files
         )
-    ):
-        raise ProvenanceError("incremental manifest is not the expected recovery-bootstrap route")
+        and incremental_manifest.get("reason") == RECOVERY_BOOTSTRAP_REASON
+    )
+    candidate_packaging_only = bool(
+        any(path in CANDIDATE_PACKAGING_FILES for path in incremental_files)
+        and all(
+            path in CANDIDATE_PACKAGING_FILES or path.startswith("platform/docs/")
+            for path in incremental_files
+        )
+        and incremental_manifest.get("reason") == CANDIDATE_PACKAGING_REASON
+    )
+    if recovery_bootstrap_only == candidate_packaging_only:
+        raise ProvenanceError("incremental manifest is not one exact reconcile source family")
+    if candidate_packaging_only and incremental_manifest.get("runtime_sensitive") is not False:
+        raise ProvenanceError("candidate-packaging reconcile source is runtime-sensitive")
     if (
         not isinstance(cumulative_changed_paths, Sequence)
         or isinstance(cumulative_changed_paths, (str, bytes))
@@ -260,11 +277,30 @@ def classify_cumulative_baseline(
         and cumulative.get("expected_gates") == list(FULL_GATE_IDS)
         and cumulative.get("fallback") is False
         and type(cumulative.get("runtime_sensitive")) is bool
-        and cumulative.get("reason") == RECOVERY_BOOTSTRAP_REASON
         and cumulative.get("deployable") is False
     ):
-        return {"manifest": cumulative, "no_op": True}
-    raise ProvenanceError("cumulative classifier route is non-deployable and not a verified bootstrap no-op")
+        cumulative_files = cumulative.get("files")
+        if not isinstance(cumulative_files, list):
+            raise ProvenanceError("cumulative non-deployable file list is malformed")
+        recovery_no_op = bool(
+            cumulative.get("reason") == RECOVERY_BOOTSTRAP_REASON
+            and any(path in RECOVERY_BOOTSTRAP_FILES for path in cumulative_files)
+            and all(
+                path in RECOVERY_BOOTSTRAP_FILES or path.startswith("platform/docs/")
+                for path in cumulative_files
+            )
+        )
+        candidate_no_op = bool(
+            cumulative.get("reason") == CANDIDATE_PACKAGING_REASON
+            and any(path in CANDIDATE_PACKAGING_FILES for path in cumulative_files)
+            and all(
+                path in CANDIDATE_PACKAGING_FILES or path.startswith("platform/docs/")
+                for path in cumulative_files
+            )
+        )
+        if recovery_no_op != candidate_no_op:
+            return {"manifest": cumulative, "no_op": True}
+    raise ProvenanceError("cumulative classifier route is non-deployable and not a verified reconcile no-op")
 
 
 def _expected_run_identity(value: object, field: str) -> str:
