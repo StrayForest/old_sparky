@@ -127,6 +127,7 @@ LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 300.0
 LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0
 CHILD_TERMINATION_GRACE_SECONDS = 5.0
 RELEASE_MARKER_MAX_BYTES = 512
+RELEASE_MARKER_OBSERVED_BYTES_MAX = RELEASE_MARKER_MAX_BYTES + 1
 RELEASE_MARKER_RE = re.compile(
     rb"RELEASE_DEPLOY schema=1 status=(?P<status>passed|failed) "
     rb"class=(?P<class>preflight|artifact|deployment)"
@@ -604,6 +605,7 @@ def _wait_for_release_marker(
         return 2
     output = bytearray()
     oversized = False
+    observed_bytes = 0
     eof = False
     try:
         descriptor = stdout.fileno()
@@ -632,8 +634,7 @@ def _wait_for_release_marker(
                 except BlockingIOError:
                     continue
                 except OSError:
-                    oversized = True
-                    chunk = b""
+                    raise
                 if not chunk:
                     try:
                         selector.unregister(key.fd)
@@ -641,6 +642,10 @@ def _wait_for_release_marker(
                         pass
                     eof = True
                     continue
+                observed_bytes = min(
+                    RELEASE_MARKER_OBSERVED_BYTES_MAX,
+                    observed_bytes + len(chunk),
+                )
                 if not oversized:
                     if len(output) + len(chunk) > RELEASE_MARKER_MAX_BYTES:
                         output.clear()
@@ -655,6 +660,29 @@ def _wait_for_release_marker(
             child_status=child_status,
             expected=expected,
         ):
+            reason = (
+                "oversized_marker"
+                if oversized
+                else "missing_marker"
+                if observed_bytes == 0
+                else "invalid_marker"
+            )
+            dispatcher_status = (
+                child_status
+                if child_status > 0
+                else 256 + child_status
+                if child_status < 0
+                else 2
+            )
+            # Keep the failure boundary observable without exposing child
+            # output.  513 means 513 bytes or more; the collector stops
+            # retaining data once the public marker bound is exceeded.
+            print(
+                "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                f"reason={reason} child_exit={child_status} "
+                f"observed_bytes={observed_bytes} "
+                f"dispatcher_exit={dispatcher_status}"
+            )
             return child_status if child_status != 0 else 2
         sys.stdout.write(output.decode("ascii"))
         sys.stdout.flush()

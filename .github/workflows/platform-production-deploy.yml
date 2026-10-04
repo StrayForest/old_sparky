@@ -2563,10 +2563,10 @@ jobs:
           marker_pattern='^(RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed))? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$|^RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=baseline_changed release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$|^RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=(helper_metadata|release_supervise|release_open|retained_supervise|retained_open) release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$)'
           public_line="$(grep -E "$marker_pattern" "$remote_log" | tail -n 1 || true)"
           if [[ -z "$public_line" ]]; then
-            public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
-            printf '%s\n' "$public_line"
             stdout_bytes="$(wc -c < "$remote_log" | tr -d '[:space:]')"
             stderr_bytes="$(wc -c < "$remote_error" | tr -d '[:space:]')"
+            public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
+            printf '%s\n' "$public_line"
             diagnostic_reason=unclassified
             if [[ "$remote_status" == 124 || "$remote_status" == 137 ]]; then
               diagnostic_reason=timeout
@@ -3626,6 +3626,50 @@ jobs:
           marker_pattern='^(RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed))? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$|^RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=baseline_changed release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$|^RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=(helper_metadata|release_supervise|release_open|retained_supervise|retained_open) release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$)'
           public_line="$(grep -E "$marker_pattern" "$remote_log" | tail -n 1 || true)"
           if [[ -z "$public_line" ]]; then
+            stdout_bytes="$(wc -c < "$remote_log" | tr -d '[:space:]')"
+            stderr_bytes="$(wc -c < "$remote_error" | tr -d '[:space:]')"
+            remote_line_count="$(wc -l < "$remote_log" | tr -d '[:space:]')"
+            remote_diagnostic_pattern='^RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed reason=(missing_marker|invalid_marker|oversized_marker) child_exit=(0|-?[1-9][0-9]{0,2}) observed_bytes=(0|[1-9][0-9]{0,2}) dispatcher_exit=([1-9][0-9]{0,2})$'
+            remote_diagnostic_count="$(grep -Ec "$remote_diagnostic_pattern" "$remote_log" || true)"
+            if [[ "$remote_diagnostic_count" == 1 && "$remote_line_count" == 1 \
+              && "$stderr_bytes" == 0 && "$stdout_bytes" -le 512 \
+              && "$remote_status" =~ ^(0|[1-9][0-9]{0,2})$ ]]; then
+              remote_diagnostic_line="$(< "$remote_log")"
+              if [[ "$remote_diagnostic_line" =~ $remote_diagnostic_pattern ]]; then
+                diagnostic_reason="${BASH_REMATCH[1]}"
+                child_exit="${BASH_REMATCH[2]}"
+                observed_bytes="${BASH_REMATCH[3]}"
+                dispatcher_exit="${BASH_REMATCH[4]}"
+                diagnostic_valid=1
+                child_magnitude="${child_exit#-}"
+                (( child_magnitude <= 255 )) || diagnostic_valid=0
+                (( observed_bytes <= 513 )) || diagnostic_valid=0
+                (( dispatcher_exit <= 255 )) || diagnostic_valid=0
+                (( remote_status <= 255 )) || diagnostic_valid=0
+                case "$diagnostic_reason:$observed_bytes" in
+                  missing_marker:0) ;;
+                  invalid_marker:*)
+                    if (( observed_bytes < 1 || observed_bytes > 512 )); then
+                      diagnostic_valid=0
+                    fi
+                    ;;
+                  oversized_marker:513) ;;
+                  *) diagnostic_valid=0 ;;
+                esac
+                expected_dispatcher_exit=2
+                if (( child_exit > 0 )); then
+                  expected_dispatcher_exit="$child_exit"
+                elif (( child_exit < 0 )); then
+                  expected_dispatcher_exit="$((256 + child_exit))"
+                fi
+                (( dispatcher_exit == expected_dispatcher_exit )) || diagnostic_valid=0
+                (( remote_status == dispatcher_exit && remote_status != 0 )) || diagnostic_valid=0
+                if (( diagnostic_valid == 1 )); then
+                  printf '%s\n' "$remote_diagnostic_line"
+                  exit "$remote_status"
+                fi
+              fi
+            fi
             public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
             printf '%s\n' "$public_line"
             stdout_bytes="$(wc -c < "$remote_log" | tr -d '[:space:]')"
