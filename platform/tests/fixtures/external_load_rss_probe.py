@@ -58,7 +58,8 @@ class _TrackingExecutor(ThreadPoolExecutor):
         with self.lock:
             self.submitted += 1
             self.pending.add(future)
-            self.peak_pending = max(self.peak_pending, len(self.pending))
+            live_pending = sum(not pending_future.done() for pending_future in self.pending)
+            self.peak_pending = max(self.peak_pending, live_pending)
         future.add_done_callback(self._done)
         return future
 
