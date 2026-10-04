@@ -13,17 +13,18 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
 is the only source for `HOST_TOOLS_SHA`; pending pin target
-`b39cc48b6d0ad4e5d399d8c286f0b2cf510adf21` selects generation
-`0af4a88f130a550a86accab13f2930ba9366c118` (C6). The pin resolves to that
-source commit, which is its ancestor, and changes only the supervisor digest
-in the 13-member closure. C6 is not provisioned yet. C5 remains the installed
-generation, built and attested from merged target
-`468b08fef78462bfa605c6c9d43cd5d5e2ca3e49`; its root-owned provisioning
-receipt is
-`/var/tmp/oldsparky-host-tools-provisioning/0d9d80b7a7d4365abaaf7875e88442b5f43ed46f/provisioning-receipt.json`.
-The application release is a separate identity and remains at the release
-documented in [`CURRENT.md`](../CURRENT.md) until an exact successful
-automatic deployment and smoke are recorded there. The pin records the
+`d8fc7f0d348285b37287d708461385c50bd9f5b9` (P7) selects generation
+`619afa5d9085b41574392ee77950c9ce3519b651` (S7). The pin resolves to that
+source commit, which is its ancestor; only the dispatcher and supervisor
+digests change in the 13-member closure. S7 is pending provisioning. C6
+`0af4a88f130a550a86accab13f2930ba9366c118` remains installed, with its
+root-owned receipt at
+`/var/tmp/oldsparky-host-tools-provisioning/0af4a88f130a550a86accab13f2930ba9366c118/provisioning-receipt.json`
+(SHA-256 `a7a1430bb69e400af52d669a69e48e6ab892d549c6fa5f76734923ed65a6a819`);
+C5 is also preserved. The application remains at source
+`87547df2abd4aa06a07f4dd4b4f730e9912707e1`, as documented in [`CURRENT.md`](../CURRENT.md),
+until an exact successful automatic deployment and smoke are recorded there.
+The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
 ancestor of the reviewed application target. There is no `current` or
