@@ -1141,6 +1141,22 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('"runtime_profile": "ready-vote-static-8"', auto)
         self.assertIn("Refusing stale dispatch", auto)
 
+    def test_live_qa_runtime_installer_change_is_deployable_and_runtime_sensitive(self) -> None:
+        installer = "platform/tools/platform_live_qa_runtime_install.py"
+        self.assertNotIn(installer, RECOVERY_BOOTSTRAP_FILES)
+
+        manifest = classify(
+            [installer],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+
+        self.assertEqual(manifest["class"], "full")
+        self.assertTrue(manifest["deployable"])
+        self.assertFalse(manifest["fallback"])
+        self.assertTrue(manifest["runtime_sensitive"])
+
     def test_deploy_consumers_validate_the_exact_classifier_artifact(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
         production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")

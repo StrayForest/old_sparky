@@ -289,6 +289,16 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertTrue(runtime_overlap_no_op["no_op"])
         self.assertTrue(runtime_overlap_no_op["manifest"]["runtime_sensitive"])
 
+        candidate_installer = "platform/tools/platform_live_qa_runtime_install.py"
+        installer_route = classify_cumulative_baseline(
+            incremental,
+            [incremental_path, candidate_installer],
+            expected_target_sha=self.SHA,
+        )
+        self.assertFalse(installer_route["no_op"])
+        self.assertTrue(installer_route["manifest"]["deployable"])
+        self.assertTrue(installer_route["manifest"]["runtime_sensitive"])
+
         for unsafe_paths in (
             [incremental_path, "unowned/private-secret.txt"],
         ):
