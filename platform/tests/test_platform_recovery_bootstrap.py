@@ -24,9 +24,11 @@ TOOLS = PLATFORM_ROOT / "tools"
 SOURCE_SHA = "a" * 40
 
 # This is the complete 62-file changed-file set of the recovery-bootstrap
-# patch at the reviewed merge base.  Keep the real set here so the route test exercises the
-# exact pull-request and trusted-dev-push inputs, including the host-key scan
-# contract that is easy to omit from one of the independent consumers.
+# patch at the reviewed merge base. Keep the real set here so the route test
+# exercises the exact pull-request and trusted-dev-push inputs, including the
+# host-key scan contract that is easy to omit from one of the independent
+# consumers. The patch also touched the candidate-owned live-QA installer;
+# that file now correctly promotes a dev push to an ordinary deployable route.
 # The digest assertion below makes this a static merge-base contract: a
 # missing owner/test path cannot be hidden by changing the fixture's count or
 # by consulting the mutable checkout's git state at test time.
@@ -2218,22 +2220,38 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILE_DIGEST,
         )
         paths = sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)
+        pure_bootstrap_paths = sorted(
+            RECOVERY_BOOTSTRAP_PATCH_FILES
+            - {"platform/tools/platform_live_qa_runtime_install.py"}
+        )
         for event, branch in (
             ("pull_request", "feature/recovery-bootstrap"),
             ("push", "dev"),
         ):
             with self.subTest(event=event):
                 manifest = classifier.classify(
-                    paths,
+                    pure_bootstrap_paths,
                     event=event,
                     target_sha="a" * 40,
                     branch=branch,
                 )
-                self.assertEqual(set(manifest["files"]), RECOVERY_BOOTSTRAP_PATCH_FILES)
+                self.assertEqual(set(manifest["files"]), set(pure_bootstrap_paths))
                 self.assertEqual(manifest["class"], "full")
                 self.assertFalse(manifest["deployable"])
                 self.assertFalse(manifest["fallback"])
                 classifier.validate_manifest(manifest, expected_target_sha="a" * 40)
+
+        candidate_route = classifier.classify(
+            paths,
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        self.assertEqual(candidate_route["class"], "full")
+        self.assertTrue(candidate_route["deployable"])
+        self.assertTrue(candidate_route["runtime_sensitive"])
+        self.assertFalse(candidate_route["fallback"])
+        classifier.validate_manifest(candidate_route, expected_target_sha="a" * 40)
 
         delta_paths = sorted(RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)
         for event, branch in (
@@ -2280,9 +2298,13 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
         ).read_text(encoding="utf-8")
         canonical = frozenset(classifier.RECOVERY_BOOTSTRAP_FILES)
+        # Keep the exact historical fixture intact while recording that this
+        # candidate-owned runtime file now promotes the trusted dev push.
         derived_patch_files = (
             canonical - RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES
-        ) | RECOVERY_BOOTSTRAP_PATCH_DOCS
+        ) | RECOVERY_BOOTSTRAP_PATCH_DOCS | {
+            "platform/tools/platform_live_qa_runtime_install.py"
+        }
         self.assertEqual(derived_patch_files, RECOVERY_BOOTSTRAP_PATCH_FILES)
         classifier_files = self._set_assignment(
             classifier_source, "RECOVERY_BOOTSTRAP_FILES"

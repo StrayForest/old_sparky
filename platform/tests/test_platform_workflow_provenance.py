@@ -39,6 +39,7 @@ from tools.platform_workflow_provenance import (  # noqa: E402
 )
 from tools.platform_deploy_baseline import (  # noqa: E402
     BASELINE_RUNTIME_GATE_NAMES,
+    active_deployment_status_identity,
     classify_cumulative_baseline,
     validate_active_baseline,
     validate_baseline_runtime_proof,
@@ -288,6 +289,16 @@ class WorkflowProvenanceTests(unittest.TestCase):
         )
         self.assertTrue(runtime_overlap_no_op["no_op"])
         self.assertTrue(runtime_overlap_no_op["manifest"]["runtime_sensitive"])
+
+        candidate_installer = "platform/tools/platform_live_qa_runtime_install.py"
+        installer_route = classify_cumulative_baseline(
+            incremental,
+            [incremental_path, candidate_installer],
+            expected_target_sha=self.SHA,
+        )
+        self.assertFalse(installer_route["no_op"])
+        self.assertTrue(installer_route["manifest"]["deployable"])
+        self.assertTrue(installer_route["manifest"]["runtime_sensitive"])
 
         for unsafe_paths in (
             [incremental_path, "unowned/private-secret.txt"],
@@ -740,6 +751,130 @@ class WorkflowProvenanceTests(unittest.TestCase):
             result["deployment_attempt_url"],
             "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
         )
+
+    def test_active_baseline_accepts_root_slug_bound_legacy_attempt_one_url(self) -> None:
+        workflow, run, jobs, statuses = self._payload()
+        run["run_attempt"] = 1
+        statuses[0]["target_url"] = run["html_url"]
+        baseline = self._baseline()
+        baseline["release_slug"] = "gha-1234-1-20260920T123932Z"
+
+        result = validate_active_baseline(
+            baseline,
+            workflow,
+            run,
+            jobs,
+            statuses,
+            expected_target_sha=self.SHA,
+            current_dev_sha=self.SHA,
+            first_parent_shas=[self.SHA],
+            statuses_complete=True,
+            jobs_complete=True,
+            latest_run=run,
+            now=datetime(2026, 10, 20, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            result["deployment_attempt_url"],
+            "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/1",
+        )
+        self.assertEqual(
+            statuses[0]["target_url"],
+            "https://github.com/StrayForest/old_sparky/actions/runs/1234",
+        )
+
+    def test_active_baseline_legacy_url_rejects_run_level_rerun(self) -> None:
+        workflow, attempt_one, jobs, statuses = self._payload()
+        attempt_one["run_attempt"] = 1
+        statuses[0]["target_url"] = attempt_one["html_url"]
+        baseline = self._baseline()
+        baseline["release_slug"] = "gha-1234-1-20260920T123932Z"
+        latest_run = {**attempt_one, "run_attempt": 2}
+
+        with self.assertRaises(ProvenanceError):
+            validate_active_baseline(
+                baseline,
+                workflow,
+                attempt_one,
+                jobs,
+                statuses,
+                expected_target_sha=self.SHA,
+                current_dev_sha=self.SHA,
+                first_parent_shas=[self.SHA],
+                statuses_complete=True,
+                jobs_complete=True,
+                latest_run=latest_run,
+                now=datetime(2026, 10, 20, tzinfo=timezone.utc),
+            )
+
+    def test_active_baseline_legacy_url_rejects_attempt_two_and_identity_mismatch(self) -> None:
+        common = {
+            "expected_target_sha": self.SHA,
+            "current_dev_sha": self.SHA,
+            "first_parent_shas": [self.SHA],
+            "statuses_complete": True,
+            "jobs_complete": True,
+        }
+        cases = []
+
+        workflow, run, jobs, statuses = self._payload()
+        run["run_attempt"] = 2
+        statuses[0]["target_url"] = run["html_url"]
+        baseline = self._baseline()
+        baseline["release_slug"] = "gha-1234-1-20260920T123932Z"
+        cases.append((workflow, run, jobs, statuses, baseline))
+
+        workflow, run, jobs, statuses = self._payload()
+        run["run_attempt"] = 1
+        statuses[0]["target_url"] = run["html_url"]
+        baseline = self._baseline()
+        baseline["release_slug"] = "gha-9999-1-20260920T123932Z"
+        cases.append((workflow, run, jobs, statuses, baseline))
+
+        workflow, run, jobs, statuses = self._payload()
+        run["run_attempt"] = 1
+        statuses[0]["target_url"] = "https://github.com/StrayForest/old_sparky/actions/runs/9999"
+        baseline = self._baseline()
+        baseline["release_slug"] = "gha-9999-1-20260920T123932Z"
+        cases.append((workflow, run, jobs, statuses, baseline))
+
+        for workflow, run, jobs, statuses, baseline in cases:
+            with self.subTest(attempt=run["run_attempt"], slug=baseline["release_slug"]):
+                with self.assertRaises(ProvenanceError):
+                    validate_active_baseline(
+                        baseline,
+                        workflow,
+                        run,
+                        jobs,
+                        statuses,
+                        **common,
+                    )
+
+    def test_legacy_status_identity_is_closed_and_exact_attempt_urls_stay_strict(self) -> None:
+        self.assertEqual(
+            active_deployment_status_identity(
+                "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
+                "gha-35511236041-1-20260920T123932Z",
+            ),
+            (1234, 2, False),
+        )
+        for target_url, release_slug in (
+            (
+                "https://github.com/StrayForest/old_sparky/actions/runs/1234?extra=1",
+                "gha-1234-1-20260920T123932Z",
+            ),
+            (
+                "https://github.com/StrayForest/old_sparky/actions/runs/1234",
+                "gha-1234-1-20260230T123932Z",
+            ),
+            (
+                "https://github.com/StrayForest/old_sparky/actions/runs/1234",
+                "gha-1234-2-20260920T123932Z",
+            ),
+        ):
+            with self.subTest(target_url=target_url, release_slug=release_slug):
+                with self.assertRaises(ProvenanceError):
+                    active_deployment_status_identity(target_url, release_slug)
 
     def test_active_baseline_may_be_older_first_parent_ancestor(self) -> None:
         workflow, run, jobs, statuses = self._payload()
