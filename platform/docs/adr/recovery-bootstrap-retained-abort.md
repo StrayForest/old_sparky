@@ -130,6 +130,13 @@ generic phase and recovery commands cannot synthesize or rewind that proof;
 retries revalidate the snapshot and readiness. This path never reconciles or
 removes shared managed-LiveQA state, and any partial payload fails closed.
 
+Readiness after service restoration shares one 30-second monotonic budget across
+the snapshot-active API and web endpoints. Bounded retries tolerate ordinary
+startup settling without accepting late success; expiry leaves the receipt and
+candidate for retry. Failed immutable children add only a fixed stage, outcome,
+and shell-equivalent exit status to stderr; the existing public failure marker
+stays unchanged and child arguments/output remain suppressed.
+
 The mutable systemd installer follows the same durable-boundary rule for
 retired unit files. Before its first stop/disable it records exact source and
 backup identities, digests, and active/enabled states in an fsynced,

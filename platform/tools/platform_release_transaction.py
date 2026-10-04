@@ -48,6 +48,10 @@ AT_FDCWD = -100
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 OPERATION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SERVICE_UNITS = ("deadlock-api", "deadlock-worker", "deadlock-web")
+LEGACY_READINESS_TIMEOUT_SECONDS = 30.0
+LEGACY_READINESS_ATTEMPT_TIMEOUT_SECONDS = 3.0
+LEGACY_READINESS_CURL_TIMEOUT_SECONDS = 2
+LEGACY_READINESS_RETRY_INTERVAL_SECONDS = 1.0
 SYSTEMD_CALL_TIMEOUT_SECONDS = 30.0
 SYSTEMD_OPERATION_TIMEOUT_SECONDS = 120.0
 PHASES = {
@@ -2468,38 +2472,53 @@ def verify_legacy_services(state: Path, *, systemctl: str) -> None:
 
 def _verify_legacy_readiness(record: dict[str, object]) -> None:
     service_state = cast(dict[str, str], record["service_state_before"])
+    deadline = time.monotonic() + LEGACY_READINESS_TIMEOUT_SECONDS
     checks = (
         (
             "deadlock-api",
             [
                 "/usr/bin/curl", "--fail", "--silent", "--show-error",
-                "--max-time", "10", "http://127.0.0.1:8010/api/v1/health/ready",
+                "--max-time", str(LEGACY_READINESS_CURL_TIMEOUT_SECONDS),
+                "http://127.0.0.1:8010/api/v1/health/ready",
             ],
         ),
         (
             "deadlock-web",
             [
                 "/usr/bin/curl", "--fail", "--silent", "--show-error",
-                "--max-time", "10", "http://127.0.0.1:3000/",
+                "--max-time", str(LEGACY_READINESS_CURL_TIMEOUT_SECONDS),
+                "http://127.0.0.1:3000/",
             ],
         ),
     )
     for unit, command in checks:
         if service_state[unit] != "active":
             continue
-        try:
-            result = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=15,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise TransactionError("legacy recovery readiness check failed") from exc
-        if result.returncode != 0:
-            raise TransactionError("legacy recovery readiness check failed")
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TransactionError("legacy recovery readiness check failed")
+            try:
+                result = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=min(LEGACY_READINESS_ATTEMPT_TIMEOUT_SECONDS, remaining),
+                )
+            except subprocess.TimeoutExpired:
+                result = None
+            except OSError as exc:
+                raise TransactionError("legacy recovery readiness check failed") from exc
+            if result is not None and result.returncode == 0:
+                if time.monotonic() >= deadline:
+                    raise TransactionError("legacy recovery readiness check failed")
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TransactionError("legacy recovery readiness check failed")
+            time.sleep(min(LEGACY_READINESS_RETRY_INTERVAL_SECONDS, remaining))
 
 
 def recover(

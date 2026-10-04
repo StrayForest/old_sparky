@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+from contextlib import ExitStack
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -352,10 +354,105 @@ class RecoveryBootstrapBundleTests(unittest.TestCase):
             mock.patch.object(recovery.subprocess, "Popen", return_value=child) as popen,
             mock.patch.object(recovery.os, "killpg") as killpg,
         ):
-            with self.assertRaises(recovery.RecoveryBootstrapError):
+            with self.assertRaises(recovery.RecoveryChildError) as raised:
                 recovery._run_recovery_child(["helper"])
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         killpg.assert_called_once_with(4321, recovery.signal.SIGTERM)
+        self.assertEqual(raised.exception.stage, "recovery_child")
+        self.assertEqual(raised.exception.outcome, "timeout")
+        self.assertIsNone(raised.exception.child_exit)
+
+    def test_recovery_child_diagnostic_is_closed_and_redacts_child_details(self) -> None:
+        command = [
+            "/usr/bin/python3",
+            "-I",
+            "/private/argv-path/platform_release_transaction.py",
+            "restore-legacy-services",
+            "--state",
+            "/private/receipt-path/.release-operation.json",
+        ]
+        cases: tuple[tuple[str, int | None], ...] = (
+            ("spawn_failed", None),
+            ("timeout", None),
+            ("child_exit", 17),
+        )
+        for outcome, child_exit in cases:
+            with self.subTest(outcome=outcome):
+                child = mock.Mock(pid=7890)
+                if outcome == "spawn_failed":
+                    popen_patch = mock.patch.object(
+                        recovery.subprocess,
+                        "Popen",
+                        side_effect=OSError("PRIVATE_EXCEPTION /private/error-path"),
+                    )
+                elif outcome == "timeout":
+                    child.wait.side_effect = [
+                        subprocess.TimeoutExpired(command, 120),
+                        None,
+                    ]
+                    popen_patch = mock.patch.object(
+                        recovery.subprocess,
+                        "Popen",
+                        return_value=child,
+                    )
+                else:
+                    child.wait.return_value = child_exit
+                    popen_patch = mock.patch.object(
+                        recovery.subprocess,
+                        "Popen",
+                        return_value=child,
+                    )
+
+                with popen_patch, mock.patch.object(recovery.os, "killpg"):
+                    with self.assertRaises(recovery.RecoveryChildError) as raised:
+                        recovery._run_recovery_child(
+                            command,
+                            stage="legacy_restore_services",
+                        )
+
+                error = raised.exception
+                self.assertEqual(error.stage, "legacy_restore_services")
+                self.assertEqual(error.outcome, outcome)
+                self.assertEqual(error.child_exit, child_exit)
+                self.assertEqual(
+                    error.args,
+                    ("retained recovery child did not complete",),
+                )
+                self.assertEqual(
+                    set(error.__dict__),
+                    {"stage", "outcome", "child_exit"},
+                )
+                self.assertNotIn("/private/", str(error))
+                self.assertNotIn("PRIVATE_EXCEPTION", str(error))
+
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(
+                        recovery,
+                        "abort_retained_only",
+                        side_effect=error,
+                    ),
+                    mock.patch("sys.stderr", stderr),
+                ):
+                    status = recovery.main(
+                        [
+                            "abort_retained_only",
+                            "--app-dir",
+                            "/private/app-path",
+                        ]
+                    )
+                self.assertEqual(status, 2)
+                child_status = "none" if child_exit is None else str(child_exit)
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "RECOVERY_BOOTSTRAP_DIAGNOSTIC schema=1 "
+                    f"stage=legacy_restore_services outcome={outcome} "
+                    f"child_exit={child_status}\n"
+                    "RECOVERY_BOOTSTRAP schema=1 status=failed "
+                    "capability=abort_retained_only deployable=false\n",
+                )
+                self.assertNotIn("/private/", stderr.getvalue())
+                self.assertNotIn("PRIVATE_EXCEPTION", stderr.getvalue())
 
 
 class RecoveryBootstrapInstallTests(unittest.TestCase):
@@ -409,6 +506,192 @@ class RecoveryBootstrapInstallTests(unittest.TestCase):
             with self.assertRaises(recovery.RecoveryBootstrapError):
                 recovery.install_bundle(bundle, app_dir=app)
             self.assertFalse(any(path.name.startswith(".") for path in (app / "shared" / ".release-recovery" / "generations").iterdir()))
+
+
+class RecoveryLegacyReadinessTests(unittest.TestCase):
+    @staticmethod
+    def _record() -> dict[str, object]:
+        return {
+            "phase": "recovery-restored",
+            "service_state_before": {
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+            },
+            "service_enabled_before": {
+                "deadlock-api": "enabled",
+                "deadlock-worker": "disabled",
+                "deadlock-web": "enabled",
+            },
+            "timer_active_before": True,
+            "timer_enabled_before": "enabled",
+        }
+
+    def _mark_patches(
+        self,
+        transaction: object,
+        record: dict[str, object],
+        *,
+        time_module: object,
+    ) -> tuple[tuple[object, ...], mock.Mock]:
+        service_state = record["service_state_before"]
+        service_enabled = record["service_enabled_before"]
+        enabled = dict(service_enabled)
+        enabled["deadlock-cloudflare-ips.timer"] = "enabled"
+        states = dict(service_state)
+        states["deadlock-cloudflare-ips.timer"] = "active"
+        write_record = mock.Mock()
+        return (
+            (
+                mock.patch.object(
+                    transaction, "_systemctl_path", side_effect=lambda value: value
+                ),
+                mock.patch.object(transaction, "_load_record", return_value=record),
+                mock.patch.object(transaction, "_validate_legacy_liveqa_recovery"),
+                mock.patch.object(
+                    transaction,
+                    "_read_systemctl_enabled",
+                    side_effect=lambda _path, unit: enabled[unit],
+                ),
+                mock.patch.object(
+                    transaction,
+                    "_read_systemctl_state",
+                    side_effect=lambda _path, unit: states[unit],
+                ),
+                mock.patch.object(
+                    transaction, "_record_for_write", side_effect=lambda value: value
+                ),
+                mock.patch.object(transaction, "_write_record", new=write_record),
+                mock.patch.object(transaction, "time", time_module),
+            ),
+            write_record,
+        )
+
+    def test_transient_readiness_failures_retry_api_then_web(self) -> None:
+        from tools import platform_release_transaction as transaction
+
+        record = self._record()
+        calls: list[tuple[list[str], float]] = []
+        returns = iter((22, 0, 22, 0))
+
+        def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append((command, kwargs["timeout"]))
+            return subprocess.CompletedProcess(command, next(returns))
+
+        clock = mock.Mock(monotonic=mock.Mock(return_value=0.0), sleep=mock.Mock())
+        patches, write_record = self._mark_patches(transaction, record, time_module=clock)
+        with ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            with mock.patch.object(transaction.subprocess, "run", side_effect=run):
+                transaction.mark_legacy_services_restored(
+                    Path("/private/state"), systemctl="/usr/bin/systemctl"
+                )
+
+        self.assertEqual(record["phase"], "legacy-services-restored")
+        write_record.assert_called_once()
+        self.assertEqual(
+            [command[-1] for command, _timeout in calls],
+            [
+                "http://127.0.0.1:8010/api/v1/health/ready",
+                "http://127.0.0.1:8010/api/v1/health/ready",
+                "http://127.0.0.1:3000/",
+                "http://127.0.0.1:3000/",
+            ],
+        )
+        for command, timeout in calls:
+            options = [command[index : index + 2] for index in range(len(command) - 1)]
+            self.assertIn(["--max-time", "2"], options)
+            self.assertLessEqual(timeout, 3.0)
+        self.assertEqual(clock.sleep.call_args_list, [mock.call(1.0), mock.call(1.0)])
+
+    def test_permanent_timeouts_share_one_bounded_budget_without_marking_phase(self) -> None:
+        from tools import platform_release_transaction as transaction
+
+        record = self._record()
+        now = {"value": 0.0}
+        timeouts: list[float] = []
+
+        def monotonic() -> float:
+            return now["value"]
+
+        def sleep(seconds: float) -> None:
+            now["value"] += seconds
+
+        def run(command: list[str], **kwargs: object) -> None:
+            timeout = kwargs["timeout"]
+            timeouts.append(timeout)
+            now["value"] += timeout
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        clock = mock.Mock(monotonic=monotonic, sleep=sleep)
+        patches, write_record = self._mark_patches(transaction, record, time_module=clock)
+        with ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            with mock.patch.object(transaction.subprocess, "run", side_effect=run):
+                with self.assertRaises(transaction.TransactionError):
+                    transaction.mark_legacy_services_restored(
+                        Path("/private/state"), systemctl="/usr/bin/systemctl"
+                    )
+
+        self.assertEqual(record["phase"], "recovery-restored")
+        write_record.assert_not_called()
+        self.assertEqual(now["value"], transaction.LEGACY_READINESS_TIMEOUT_SECONDS)
+        self.assertEqual(timeouts, [3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 2.0])
+
+    def test_readiness_success_at_deadline_is_rejected_without_marking_phase(self) -> None:
+        from tools import platform_release_transaction as transaction
+
+        record = self._record()
+        record["service_state_before"] = {
+            "deadlock-api": "active",
+            "deadlock-worker": "inactive",
+            "deadlock-web": "inactive",
+        }
+        now = iter((0.0, 0.0, transaction.LEGACY_READINESS_TIMEOUT_SECONDS))
+        clock = mock.Mock(monotonic=mock.Mock(side_effect=lambda: next(now)), sleep=mock.Mock())
+        patches, write_record = self._mark_patches(
+            transaction,
+            record,
+            time_module=clock,
+        )
+        with ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            with mock.patch.object(
+                transaction.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["curl"], 0),
+            ):
+                with self.assertRaises(transaction.TransactionError):
+                    transaction.mark_legacy_services_restored(
+                        Path("/private/state"), systemctl="/usr/bin/systemctl"
+                    )
+
+        self.assertEqual(record["phase"], "recovery-restored")
+        write_record.assert_not_called()
+        clock.sleep.assert_not_called()
+
+    def test_inactive_snapshot_skips_readiness_endpoints(self) -> None:
+        from tools import platform_release_transaction as transaction
+
+        clock = mock.Mock(monotonic=mock.Mock(return_value=0.0), sleep=mock.Mock())
+        with (
+            mock.patch.object(transaction, "time", clock),
+            mock.patch.object(transaction.subprocess, "run") as run,
+        ):
+            transaction._verify_legacy_readiness(
+                {
+                    "service_state_before": {
+                        "deadlock-api": "inactive",
+                        "deadlock-worker": "inactive",
+                        "deadlock-web": "inactive",
+                    }
+                }
+            )
+        run.assert_not_called()
+        clock.sleep.assert_not_called()
 
 
 class RecoveryBootstrapContractTests(unittest.TestCase):
@@ -1391,9 +1674,12 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 mock.patch.object(recovery, "_receipt_json", return_value=receipt),
                 mock.patch.object(recovery.subprocess, "Popen", side_effect=fake_popen),
             ):
-                with self.assertRaises(subprocess.CalledProcessError):
+                with self.assertRaises(recovery.RecoveryChildError) as raised:
                     recovery.abort_retained_only(app_dir=app, generation=generation)
 
+            self.assertEqual(raised.exception.stage, "legacy_verify_services")
+            self.assertEqual(raised.exception.outcome, "child_exit")
+            self.assertEqual(raised.exception.child_exit, 1)
             self.assertEqual(calls["ready"], 2)
             self.assertEqual(len(commands), 1)
             self.assertIn("verify-legacy-services", commands[0])
