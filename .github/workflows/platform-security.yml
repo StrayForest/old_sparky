@@ -390,6 +390,35 @@ jobs:
               ):
                   raise SystemExit("baseline source exact successful status is unavailable or superseded")
 
+          def validate_source_security_jobs(source_jobs):
+              required_source_jobs = {
+                  "Backend DB-free contours", "Backend PostgreSQL and Redis integration",
+                  "Backend privileged ephemeral contour", "Backend aggregate", "Python quality",
+                  "Security gates", "web-quality", "Web hermetic", "Documentation consistency",
+                  "Migration scenarios", "Verification contract", "status-final",
+              }
+              conditional_source_runtime_jobs = {
+                  "Conditional release runtime fixture",
+                  "Trusted dev immutable release runtime",
+              }
+              by_name = {}
+              for item in source_jobs:
+                  if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                      raise SystemExit("baseline source job identity is malformed")
+                  by_name.setdefault(item["name"], []).append(item)
+              for name in required_source_jobs:
+                  matches = by_name.get(name, [])
+                  if len(matches) != 1 or matches[0].get("status") != "completed" or matches[0].get("conclusion") != "success":
+                      raise SystemExit("baseline source required job is absent, duplicated, or unsuccessful")
+              runtime_outcomes = []
+              for name in conditional_source_runtime_jobs:
+                  matches = by_name.get(name, [])
+                  if len(matches) != 1 or matches[0].get("status") != "completed":
+                      raise SystemExit("baseline source conditional runtime job identity is invalid")
+                  runtime_outcomes.append(matches[0].get("conclusion"))
+              if tuple(runtime_outcomes) not in {("success", "success"), ("skipped", "skipped")}:
+                  raise SystemExit("baseline source conditional runtime jobs are incomplete or inconsistent")
+
           parent_jobs = jobs("deploy-jobs.json")
           dispatch_jobs = [item for item in parent_jobs if isinstance(item, dict) and item.get("name") == "Dispatch exact-target baseline runtime proof"]
           if len(dispatch_jobs) != 1 or dispatch_jobs[0].get("status") != "completed" or dispatch_jobs[0].get("conclusion") != "success":
@@ -410,23 +439,8 @@ jobs:
           if len(auto_dispatch_steps) != 1 or auto_dispatch_steps[0].get("status") != "completed" or auto_dispatch_steps[0].get("conclusion") != "success":
               raise SystemExit("baseline proof auto-deploy dispatch step did not succeed exactly once")
 
-          required_source_jobs = {
-              "Backend DB-free contours", "Backend PostgreSQL and Redis integration",
-              "Backend privileged ephemeral contour", "Backend aggregate", "Python quality",
-              "Security gates", "web-quality", "Web hermetic", "Documentation consistency",
-              "Migration scenarios", "Verification contract", "Conditional release runtime fixture",
-              "Trusted dev immutable release runtime", "status-final",
-          }
           source_jobs = jobs("security-jobs.json")
-          by_name = {}
-          for item in source_jobs:
-              if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                  raise SystemExit("baseline source job identity is malformed")
-              by_name.setdefault(item["name"], []).append(item)
-          for name in required_source_jobs:
-              matches = by_name.get(name, [])
-              if len(matches) != 1 or matches[0].get("status") != "completed" or matches[0].get("conclusion") != "success":
-                  raise SystemExit("baseline source required job is absent, duplicated, or unsuccessful")
+          validate_source_security_jobs(source_jobs)
 
           statuses_path = root / "security-statuses.json"
           try:

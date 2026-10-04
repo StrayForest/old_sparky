@@ -645,6 +645,32 @@ class WorkflowProvenanceTests(unittest.TestCase):
                     elif isinstance(node, ast.Call):
                         call_nodes.append(node)
 
+        runtime_proof_tree = ast.parse(
+            (TOOLS / "platform_baseline_runtime_proof.py").read_text(encoding="utf-8")
+        )
+        runtime_imports = []
+        for node in ast.walk(runtime_proof_tree):
+            if isinstance(node, ast.ImportFrom) and node.module in module_by_name:
+                module = module_by_name[node.module]
+                for alias in node.names:
+                    with self.subTest(runtime_proof_import=alias.name):
+                        self.assertTrue(hasattr(module, alias.name))
+                runtime_imports.append(node)
+        self.assertTrue(runtime_imports)
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=runtime_imports, type_ignores=[]),
+                "baseline-runtime-imports",
+                "exec",
+            ),
+            namespace,
+        )
+        self.assertIs(
+            namespace["BASELINE_RUNTIME_STATUS_CONTEXT"],
+            module_by_name["tools.platform_deploy_baseline"].BASELINE_RUNTIME_STATUS_CONTEXT,
+        )
+
         self.assertIn("wait_for_autodeploy_completion", imports)
         for node in call_nodes:
             if isinstance(node.func, ast.Name) and node.func.id in imports:
@@ -656,6 +682,79 @@ class WorkflowProvenanceTests(unittest.TestCase):
                     *([object()] * len(node.args)),
                     **{keyword.arg: object() for keyword in node.keywords},
                 )
+
+    def test_baseline_source_conditional_runtime_jobs_match_one_closed_route(self) -> None:
+        workflow = yaml.safe_load(
+            (WORKFLOW_DIR / "platform-security.yml").read_text(encoding="utf-8")
+        )
+        guard = workflow["jobs"]["baseline-runtime-guard"]
+        steps = [
+            step for step in guard.get("steps", [])
+            if isinstance(step, dict)
+            and step.get("name") == "Validate exact current target and correlated source runs"
+        ]
+        self.assertEqual(len(steps), 1)
+        script = steps[0].get("run")
+        self.assertIsInstance(script, str)
+        heredocs = re.findall(
+            r"<<['\"]PY['\"]\s*\n(.*?)^\s*PY\s*$",
+            script,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        tree = ast.parse(textwrap.dedent(heredocs[-1]))
+        validator_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "validate_source_security_jobs"
+        )
+        module = ast.Module(
+            body=[
+                ast.Import(names=[ast.alias(name="sys")]),
+                validator_node,
+            ],
+            type_ignores=[],
+        )
+        namespace: dict[str, object] = {}
+        exec(compile(ast.fix_missing_locations(module), "baseline-source-jobs", "exec"), namespace)
+        validate = namespace["validate_source_security_jobs"]
+
+        def rows(runtime_conclusion: str) -> list[dict[str, object]]:
+            required = (
+                "Backend DB-free contours", "Backend PostgreSQL and Redis integration",
+                "Backend privileged ephemeral contour", "Backend aggregate", "Python quality",
+                "Security gates", "web-quality", "Web hermetic", "Documentation consistency",
+                "Migration scenarios", "Verification contract", "status-final",
+            )
+            result = [
+                {"name": name, "status": "completed", "conclusion": "success"}
+                for name in required
+            ]
+            result.extend(
+                {
+                    "name": name,
+                    "status": "completed",
+                    "conclusion": runtime_conclusion,
+                }
+                for name in (
+                    "Conditional release runtime fixture",
+                    "Trusted dev immutable release runtime",
+                )
+            )
+            return result
+
+        validate(rows("success"))
+        validate(rows("skipped"))
+        mixed = rows("success")
+        next(item for item in mixed if item["name"] == "Trusted dev immutable release runtime")["conclusion"] = "skipped"
+        with self.assertRaises(SystemExit):
+            validate(mixed)
+        failed = rows("success")
+        next(item for item in failed if item["name"] == "Trusted dev immutable release runtime")["conclusion"] = "failure"
+        with self.assertRaises(SystemExit):
+            validate(failed)
+        duplicate = rows("skipped")
+        duplicate.append(dict(next(item for item in duplicate if item["name"] == "Conditional release runtime fixture")))
+        with self.assertRaises(SystemExit):
+            validate(duplicate)
 
     def test_autodeploy_dispatch_requires_exact_run_job_and_step_success(self) -> None:
         for field, value in (

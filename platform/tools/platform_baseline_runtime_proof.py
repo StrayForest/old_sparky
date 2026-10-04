@@ -148,11 +148,11 @@ auto_attempt = identity("AUTODEPLOY_RUN_ATTEMPT")
 
 sys.path.insert(0, str(platform_root))
 from tools.platform_deploy_baseline import (  # noqa: E402
+    BASELINE_RUNTIME_STATUS_CONTEXT,
     BASELINE_RUNTIME_TITLE_RE,
     validate_baseline_runtime_proof,
 )
 from tools.platform_workflow_provenance import (  # noqa: E402
-    BASELINE_RUNTIME_STATUS_CONTEXT,
     SECURITY_SUCCESS_DESCRIPTION,
     latest_context_status,
     validate_actions_bot_status,
