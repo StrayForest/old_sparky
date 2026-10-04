@@ -2572,6 +2572,61 @@ fail 'private lock detail must not cross the public channel'
                     "status=failed reason=service_state\n",
                 )
 
+    def test_liveqa_reconcile_stderr_is_available_only_to_private_candidate_capture(
+        self,
+    ) -> None:
+        """A failed runtime reconcile keeps diagnostics for the candidate runner only."""
+
+        source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        match = re.search(
+            r"(?ms)^run_live_qa_reconcile\(\) \{\n.*?^\}", source
+        )
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_python = root / "shared" / "venv" / "bin" / "python"
+            fake_python.parent.mkdir(parents=True)
+            fake_python.write_text(
+                "#!/bin/sh\n"
+                "printf 'runtime_stdout_sentinel\\n'\n"
+                "printf 'runtime_private_stderr_sentinel\\n' >&2\n"
+                "exit 23\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            harness = "\n".join(
+                (
+                    'run_systemd_bounded() { "$@"; }',
+                    f"SHARED_VENV={shlex.quote(str(root / 'shared' / 'venv'))}",
+                    f"LIVE_QA_RUNTIME_INSTALLER={shlex.quote(str(root / 'installer.py'))}",
+                    f"APP_DIR={shlex.quote(str(root / 'app'))}",
+                    match.group(0),
+                    "run_live_qa_reconcile",
+                    "",
+                )
+            )
+            result = subprocess.run(
+                [
+                    "/usr/bin/env",
+                    "-u",
+                    "BASH_ENV",
+                    "-u",
+                    "ENV",
+                    "/usr/bin/bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    harness,
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "runtime_private_stderr_sentinel\n")
+
     def test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher(
         self,
     ) -> None:

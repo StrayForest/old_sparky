@@ -1934,8 +1934,15 @@ def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Pat
     phase = receipt.get("phase")
     if phase in MIGRATION_OUTCOME_UNCERTAIN_PHASES:
         raise RecoveryBootstrapError("migration outcome is uncertain")
-    if phase != "recovery-restored":
+    if phase not in {"recovery-restored", "legacy-services-restored"}:
         raise RecoveryBootstrapError("release receipt is not recovery-restored")
+    if phase == "legacy-services-restored" and (
+        not isinstance(receipt.get("operation_id"), str)
+        or OPERATION_ID_RE.fullmatch(receipt["operation_id"]) is None
+        or receipt.get("systemd_state_before") is not None
+        or os.path.lexists(app_dir / "shared" / ".release-systemd-state.json")
+    ):
+        raise RecoveryBootstrapError("legacy services phase authority is invalid")
     if receipt.get("app_dir") != str(app_dir):
         raise RecoveryBootstrapError("release receipt application identity is invalid")
     if type(receipt.get("remove_env_on_recovery")) is not bool:
@@ -2025,7 +2032,11 @@ def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Pat
         raise RecoveryBootstrapError("release receipt candidate identity is invalid")
     if os.path.lexists(candidate):
         _validate_receipt_directory(candidate, candidate_identity, label="candidate release")
-    elif receipt["phase"] != "recovery-restored":
+    elif receipt["phase"] != "recovery-restored" and not (
+        receipt["phase"] == "legacy-services-restored"
+        and isinstance(receipt.get("operation_id"), str)
+        and OPERATION_ID_RE.fullmatch(receipt["operation_id"]) is not None
+    ):
         raise RecoveryBootstrapError("release receipt candidate release is unavailable")
     return current
 
@@ -2281,6 +2292,83 @@ def _run_recovery_child(command: list[str]) -> None:
         raise subprocess.CalledProcessError(return_code, command)
 
 
+def _restore_legacy_liveqa_release(
+    *, app_dir: Path, state: Path, release: Path, transaction: Path,
+    runtime: Path, receipt: dict[str, object],
+) -> None:
+    """Restore a pre-managed-LiveQA release without changing shared QA state."""
+
+    if receipt.get("operation_id") is None or receipt.get("systemd_state_before") is not None:
+        raise RecoveryBootstrapError("legacy LiveQA recovery authority is invalid")
+    installer = release / "tools" / "platform_live_qa_runtime_install.py"
+    runtime_tree = release / "liveqa-runtime"
+    if os.path.lexists(installer) or os.path.lexists(runtime_tree):
+        raise RecoveryBootstrapError(
+            "legacy LiveQA recovery requires both original-release inputs to be absent"
+        )
+
+    if receipt.get("phase") == "recovery-restored":
+        candidate = _receipt_release_path(
+            receipt.get("candidate_release"), app_dir=app_dir, label="candidate identity"
+        )
+        if candidate is None or not os.path.lexists(candidate):
+            raise RecoveryBootstrapError(
+                "legacy recovery candidate is unavailable before readiness"
+            )
+        _run_recovery_child(
+            [
+                "/usr/bin/python3", "-I", str(transaction),
+                "validate-legacy-liveqa-recovery", "--state", str(state),
+                "--app-dir", str(app_dir), "--release", str(release),
+            ]
+        )
+        _run_recovery_child(
+            [
+                str(runtime), "--app-dir", str(app_dir), "--release", str(release),
+                "--prepare-only", "--preserve-legacy-live-qa", "--transaction", str(state),
+            ]
+        )
+        _run_recovery_child(
+            [
+                "/usr/bin/python3", "-I", str(transaction), "restore-legacy-services",
+                "--state", str(state), "--systemctl", "/usr/bin/systemctl",
+            ]
+        )
+        if _release_pointer(app_dir, "current") != release:
+            raise RecoveryBootstrapError("current release changed during legacy recovery")
+        if receipt.get("previous_before") is not None and _release_pointer(
+            app_dir, "previous"
+        ) != Path(str(receipt["previous_before"])):
+            raise RecoveryBootstrapError("previous release changed during legacy recovery")
+        _run_recovery_child(
+            [
+                "/usr/bin/python3", "-I", str(transaction),
+                "mark-legacy-services-restored", "--state", str(state),
+                "--systemctl", "/usr/bin/systemctl",
+            ]
+        )
+    elif receipt.get("phase") != "legacy-services-restored":
+        raise RecoveryBootstrapError("legacy recovery phase is invalid")
+    _run_recovery_child(
+        [
+            "/usr/bin/python3", "-I", str(transaction), "verify-legacy-services",
+            "--state", str(state), "--systemctl", "/usr/bin/systemctl",
+        ]
+    )
+    _run_recovery_child(
+        [
+            "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
+            "--state", str(state), "--retain-receipt", "--systemctl", "/usr/bin/systemctl",
+        ]
+    )
+    _run_recovery_child(
+        [
+            "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
+            "--state", str(state), "--systemctl", "/usr/bin/systemctl",
+        ]
+    )
+
+
 def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
     """Restore runtime and complete only an already pointer-restored receipt."""
 
@@ -2403,6 +2491,18 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
             "--systemctl", "/usr/bin/systemctl",
         ])
     else:
+        if (
+            receipt.get("operation_id") is not None
+            and receipt.get("phase") in {
+                "recovery-restored",
+                "legacy-services-restored",
+            }
+        ):
+            _restore_legacy_liveqa_release(
+                app_dir=app_dir, state=state, release=release,
+                transaction=transaction, runtime=runtime, receipt=receipt,
+            )
+            return
         # The first attempt may have retained the operation receipt after
         # completing its filesystem cleanup, then removed the systemd receipt
         # before a process failure.  Do not rerun runtime/systemd side effects;

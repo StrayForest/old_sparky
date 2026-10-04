@@ -13,14 +13,13 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
 is the only source for `HOST_TOOLS_SHA`; pending pin target
-`c606976757dc4b80068d9b2f65ab0e8f9b64276a` (P8) selects generation
-`5b2942feba89d235aa7e659ad5b156c2080d7d7a` (S8). The pin resolves to that
-source commit, which is its ancestor; only the supervisor digest changes in
-the 13-member closure. S8 is pending provisioning. S7
-`619afa5d9085b41574392ee77950c9ce3519b651` remains installed, with its
-root-owned receipt at
-`/var/tmp/oldsparky-host-tools-provisioning/619afa5d9085b41574392ee77950c9ce3519b651/provisioning-receipt.json`;
-C6 and earlier generations are preserved. The application remains at source
+`a6531f0154641c0c266f39c6c00d5269be763d6d` (P9) selects generation
+`7a9fe1286054dbe96221d2b428048c4212270cf5` (S9). The pin resolves to that
+source commit, which is its ancestor. The P9 closure is unchanged from the
+previously verified P8 closure. S9 is pending provisioning. The latest verified
+installed generation is S8
+`5b2942feba89d235aa7e659ad5b156c2080d7d7a`; C6 and earlier generations are
+preserved. The application remains at source
 `87547df2abd4aa06a07f4dd4b4f730e9912707e1`, as documented in [`CURRENT.md`](../CURRENT.md),
 until an exact successful automatic deployment and smoke are recorded there.
 The pin records the

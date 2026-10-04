@@ -472,20 +472,20 @@ artifact digest, the publisher outer artifact name/ID/digest, and the bundle
 member digest. Missing, duplicate, over-100, expired, or mismatched API rows
 fail before SSH or host mutation.
 
-The host installs the verified bundle as one immutable generation and invokes
-only its fixed `platform_abort_retained_only.sh` entrypoint for this workflow.
-The separate operation-aware release-recover workflow requests the explicit
-`recover_pending` capability and invokes only
-`platform_recover_pending.sh`. The abort entrypoint
-accepts only an install receipt in `phase=recovery-restored`; uncertain
-migration phases, missing identities, lock contention and any runtime,
-systemd, pointer or completion failure remain retained. It first keeps the
-operation receipt while cleaning candidate/venv artifacts, then clears the
-systemd receipt, and removes the operation receipt only after both durable
-states are clean. A retry after one of those side effects resumes from the
-remaining receipt and never repeats an unproven runtime transition. This workflow is
-non-deployable recovery authority: it does not run normal deploy, Alembic
-downgrade or a manually selected `systemctl` command.
+The host installs the verified bundle as one immutable generation and invokes only its fixed `platform_abort_retained_only.sh` entrypoint. The separate operation-aware release-recover workflow
+requests `recover_pending` and invokes only `platform_recover_pending.sh`. Abort accepts only an
+install receipt in `phase=recovery-restored`; uncertain migration phases, missing identities, lock
+contention, or runtime/systemd/pointer/completion failures retain the receipt. It cleans candidate
+and venv artifacts, clears the systemd receipt, then removes the operation receipt last. Retry
+resumes from remaining durable state and never repeats an unproven runtime transition. This non-deployable
+recovery authority does not run normal deploy, Alembic downgrade, or manual systemctl.
+
+For an operation-ID v2 `install` receipt from a pre-managed-LiveQA release, recovery requires no paired systemd receipt, exact transaction pointers/identities, and both old-release inputs absent:
+`tools/platform_live_qa_runtime_install.py` and `liveqa-runtime/`. Partial payloads fail closed.
+Immutable recovery prepares old unit/Nginx files without reconcile, restores exact service/timer state and readiness,
+then records `legacy-services-restored`. Generic phase commands cannot create this proof;
+retries recheck state/readiness before cleanup. Shared QA remains untouched. Use the immutable recovery
+bootstrap; never run the old reconcile helper or clear the operation receipt manually.
 
 The normal systemd installer uses the same crash discipline for retired unit
 cleanup: it persists an fsynced, root-owned file/digest/state record before

@@ -118,6 +118,18 @@ performs receipt-owned candidate cleanup only, never synthesizes an ID or
 executes a retained release helper. Missing, mismatched, or present systemd
 state fails closed.
 
+The recovery-bootstrap capability also handles the distinct operation-ID
+`install`/`recovery-restored` case where the original release predates managed
+LiveQA. It requires the paired systemd receipt to be absent, the exact
+transaction pointers and identities to validate, and both legacy release
+inputs (`tools/platform_live_qa_runtime_install.py` and `liveqa-runtime/`) to
+be absent. It restores the original unit/Nginx files in prepare-only mode,
+restores the exact service/timer snapshot, verifies readiness, and then
+persists `legacy-services-restored` as the proof required before cleanup. The
+generic phase and recovery commands cannot synthesize or rewind that proof;
+retries revalidate the snapshot and readiness. This path never reconciles or
+removes shared managed-LiveQA state, and any partial payload fails closed.
+
 The mutable systemd installer follows the same durable-boundary rule for
 retired unit files. Before its first stop/disable it records exact source and
 backup identities, digests, and active/enabled states in an fsynced,
