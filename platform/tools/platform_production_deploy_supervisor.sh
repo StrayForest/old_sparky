@@ -99,10 +99,7 @@ service_is_active() {
   esac
 }
 
-fail() {
-  # Failure detail remains private machine state. The runner only
-  # accepts the fixed, token-only RELEASE_DEPLOY line below.
-  printf '%s\n' 'ERROR: deployment failed' >&2
+emit_failure_marker() {
   if [[ -n "$failure_lock_stage" ]]; then
     printf 'RELEASE_DEPLOY schema=1 status=failed class=%s phase=%s reason=%s lock_stage=%s release_slug=%s source_sha=%s\n' \
       "$failure_class" "$failure_phase" "$failure_reason" "$failure_lock_stage" "$release_slug" "$target_sha"
@@ -110,7 +107,21 @@ fail() {
     printf 'RELEASE_DEPLOY schema=1 status=failed class=%s phase=%s reason=%s release_slug=%s source_sha=%s\n' \
       "$failure_class" "$failure_phase" "$failure_reason" "$release_slug" "$target_sha"
   fi
+}
+
+fail() {
+  # Failure detail remains private machine state. The runner only
+  # accepts the fixed, token-only RELEASE_DEPLOY line below.
+  printf '%s\n' 'ERROR: deployment failed' >&2
+  emit_failure_marker
   exit 1
+}
+
+fail_with_status() {
+  local exit_status="$1"
+  printf '%s\n' 'ERROR: deployment failed' >&2
+  emit_failure_marker
+  exit "$exit_status"
 }
 
 validate_systemctl_binary() {
@@ -272,7 +283,10 @@ if (( $# == 8 )); then
   [[ "$host_manifest_sha" =~ ^[0-9a-f]{64}$ ]] || invalid_input
   [[ "$host_capabilities_sha" =~ ^[0-9a-f]{64}$ ]] || invalid_input
   [[ "$host_tools_dir" == "/opt/oldsparky/platform/shared/host-tools/$host_tools_sha" ]] || invalid_input
-  /usr/bin/python3.12 -I -B - "$host_tools_dir" "$host_tools_sha" "$host_manifest_sha" "$host_capabilities_sha" <<'PY'
+  host_tools_validation_status=0
+  /usr/bin/python3.12 -I -B - \
+    "$host_tools_dir" "$host_tools_sha" "$host_manifest_sha" "$host_capabilities_sha" \
+    >/dev/null 2>&1 <<'PY' || host_tools_validation_status=$?
 import hashlib
 import json
 import os
@@ -355,6 +369,9 @@ for name, record in records.items():
     if hashlib.sha256(data).hexdigest() != record["sha256"]:
         raise SystemExit(1)
 PY
+  if (( host_tools_validation_status != 0 )); then
+    fail_with_status "$host_tools_validation_status"
+  fi
 fi
 
 # Lock order is release -> retained-load.  Both locks use the shared pathname
