@@ -33,6 +33,10 @@ from tools.platform_ci_classifier import (
 )
 from tools.platform_ci_classifier import _write_github_output
 from tools.platform_safe_zip import UnsafeZipError, extract_single_manifest
+from tools.platform_production_classifier_artifact import (
+    ClassifierArtifactError,
+    validate_manifest as validate_production_classifier_manifest,
+)
 from tools.platform_workflow_provenance import ProvenanceError, validate_security_marker
 
 
@@ -113,7 +117,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             return json.loads(output_path.read_text(encoding="utf-8"))
 
     def _run_auto_deploy_manifest_contract(
-        self, manifest: dict[str, object]
+        self, manifest: dict[str, object], *, expect_success: bool = True
     ) -> dict[str, str]:
         """Pass a generated manifest through auto-deploy's no-op boundary."""
 
@@ -143,12 +147,30 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
+            if expect_success:
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            else:
+                self.assertNotEqual(completed.returncode, 0)
+                return {}
             output: dict[str, str] = {}
             for line in output_path.read_text(encoding="utf-8").splitlines():
                 key, value = line.split("=", 1)
                 output[key] = value
             return output
+
+    def _write_production_classifier_archive(
+        self, root: Path, manifest: dict[str, object]
+    ) -> Path:
+        archive_path = root / "classifier.zip"
+        member = zipfile.ZipInfo("classifier-manifest.json")
+        member.create_system = 3
+        member.external_attr = (stat.S_IFREG | 0o600) << 16
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                member,
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            )
+        return archive_path
 
     def test_docs_only_route_is_nondeployable_and_digest_bound(self) -> None:
         manifest = classify(
@@ -1074,7 +1096,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     expected_run_url="https://github.com/StrayForest/old_sparky/actions/runs/1234",
                 )
 
-    def test_autodeploy_reconciles_only_the_special_full_nondeployable_route(self) -> None:
+    def test_autodeploy_reconciles_only_exact_full_nondeployable_families(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
         allowlist_marker = "          recovery_bootstrap_files = {\n"
         allowlist_start = auto.index(allowlist_marker) + len(allowlist_marker)
@@ -1085,6 +1107,18 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         auto_allowlist = ast.literal_eval(ast.parse(allowlist_source).body[0].value)
         self.assertEqual(auto_allowlist, set(RECOVERY_BOOTSTRAP_FILES))
+
+        candidate_marker = "          candidate_packaging_files = {\n"
+        candidate_start = auto.index(candidate_marker) + len(candidate_marker)
+        candidate_end = auto.index("          }\n", candidate_start) + len("          }\n")
+        candidate_source = textwrap.dedent(
+            "candidate_packaging_files = {\n"
+            + auto[candidate_start:candidate_end]
+        )
+        self.assertEqual(
+            ast.literal_eval(ast.parse(candidate_source).body[0].value),
+            set(CANDIDATE_PACKAGING_FILES),
+        )
 
         bootstrap_path = sorted(RECOVERY_BOOTSTRAP_FILES)[0]
         special_route = classify(
@@ -1101,24 +1135,60 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(special_outputs["route_class"], "full")
         self.assertEqual(special_outputs["route_deployable"], "false")
         self.assertEqual(special_outputs["route_recovery_bootstrap_only"], "true")
+        self.assertEqual(special_outputs["route_candidate_packaging_only"], "false")
 
-        ordinary_nondeployable = classify(
-            [sorted(CANDIDATE_PACKAGING_FILES)[0]],
+        overlap_route = classify(
+            [".github/workflows/platform-production-autodeploy.yml"],
             event="push",
             target_sha=self.TARGET_SHA,
             branch="dev",
         )
-        self.assertFalse(ordinary_nondeployable["deployable"])
-        self.assertFalse(ordinary_nondeployable["fallback"])
-        ordinary_outputs = self._run_auto_deploy_manifest_contract(
-            ordinary_nondeployable
+        self.assertEqual(overlap_route["reason"], RECOVERY_BOOTSTRAP_REASON)
+        overlap_outputs = self._run_auto_deploy_manifest_contract(overlap_route)
+        self.assertEqual(overlap_outputs["route_recovery_bootstrap_only"], "true")
+        self.assertEqual(overlap_outputs["route_candidate_packaging_only"], "false")
+
+        candidate_route = classify(
+            sorted(CANDIDATE_PACKAGING_FILES),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
         )
-        self.assertEqual(ordinary_outputs["route_recovery_bootstrap_only"], "false")
+        self.assertEqual(candidate_route["reason"], CANDIDATE_PACKAGING_REASON)
+        self.assertFalse(candidate_route["deployable"])
+        self.assertFalse(candidate_route["runtime_sensitive"])
+        candidate_outputs = self._run_auto_deploy_manifest_contract(candidate_route)
+        self.assertEqual(candidate_outputs["route_recovery_bootstrap_only"], "false")
+        self.assertEqual(candidate_outputs["route_candidate_packaging_only"], "true")
+        malformed_candidate = dict(candidate_route)
+        malformed_candidate["runtime_sensitive"] = True
+        malformed_candidate["digest"] = manifest_digest(malformed_candidate)
+        self._run_auto_deploy_manifest_contract(malformed_candidate, expect_success=False)
+        unknown_non_deployable = dict(candidate_route)
+        unknown_non_deployable["reason"] = "unrecognized non-deployable reason"
+        unknown_non_deployable["digest"] = manifest_digest(unknown_non_deployable)
+        self._run_auto_deploy_manifest_contract(unknown_non_deployable, expect_success=False)
+
+        docs_only = classify(
+            ["platform/docs/deployment-runbook.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        docs_outputs = self._run_auto_deploy_manifest_contract(docs_only)
+        self.assertEqual(docs_outputs["route_recovery_bootstrap_only"], "false")
+        self.assertEqual(docs_outputs["route_candidate_packaging_only"], "false")
 
         self.assertIn("route_recovery_bootstrap_only", auto)
+        self.assertIn("route_candidate_packaging_only", auto)
         self.assertIn(
-            '&& ! ( "$ROUTE_CLASS" == "full" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" )',
+            '"$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true"',
             auto,
+        )
+        production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(
+            production.count("manifest_args+=(--require-reconcile-source)"),
+            2,
         )
         self.assertIn("dispatch_mode=baseline-reconcile", auto)
         self.assertIn('case "$DISPATCH_MODE" in', auto)
@@ -1188,6 +1258,72 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("MAX_PAGES = 100", classifier_tool)
         self.assertIn("duplicate_keys", classifier_tool)
         self.assertIn("len(rows) != expected_total", classifier_tool)
+
+    def test_production_manifest_reconcile_option_accepts_only_trusted_non_deployable_families(self) -> None:
+        candidate = classify(
+            sorted(CANDIDATE_PACKAGING_FILES),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(candidate["reason"], CANDIDATE_PACKAGING_REASON)
+        self.assertFalse(candidate["deployable"])
+        self.assertFalse(candidate["runtime_sensitive"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate_archive = self._write_production_classifier_archive(root, candidate)
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    candidate_archive, target_sha=self.TARGET_SHA
+                )
+            accepted_candidate = validate_production_classifier_manifest(
+                candidate_archive,
+                target_sha=self.TARGET_SHA,
+                require_reconcile_source=True,
+            )
+            self.assertEqual(accepted_candidate["reason"], CANDIDATE_PACKAGING_REASON)
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    candidate_archive,
+                    target_sha=self.TARGET_SHA,
+                    require_recovery_bootstrap=True,
+                )
+
+            recovery_path = sorted(RECOVERY_BOOTSTRAP_FILES)[0]
+            recovery = classify(
+                [recovery_path],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            recovery_archive = self._write_production_classifier_archive(root, recovery)
+            self.assertEqual(
+                validate_production_classifier_manifest(
+                    recovery_archive,
+                    target_sha=self.TARGET_SHA,
+                    require_reconcile_source=True,
+                )["reason"],
+                RECOVERY_BOOTSTRAP_REASON,
+            )
+            validate_production_classifier_manifest(
+                recovery_archive,
+                target_sha=self.TARGET_SHA,
+                require_recovery_bootstrap=True,
+            )
+
+            deployable = classify(
+                ["platform/apps/platform_api/app/main.py"],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            deployable_archive = self._write_production_classifier_archive(root, deployable)
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    deployable_archive,
+                    target_sha=self.TARGET_SHA,
+                    require_reconcile_source=True,
+                )
 
     def test_security_run_provenance_accepts_only_the_exact_completed_run(self) -> None:
         workflow = {

@@ -46,7 +46,12 @@ from tools.platform_deploy_baseline import (  # noqa: E402
     wait_for_autodeploy_completion,
 )
 from tools.platform_ci_classifier import (  # noqa: E402
+    CANDIDATE_PACKAGING_FILES,
+    CANDIDATE_PACKAGING_REASON,
+    RECOVERY_BOOTSTRAP_FILES,
+    RECOVERY_BOOTSTRAP_REASON,
     classify,
+    manifest_digest,
 )
 
 
@@ -327,6 +332,101 @@ class WorkflowProvenanceTests(unittest.TestCase):
             classify_cumulative_baseline(
                 tampered,
                 [incremental_path, "platform/tools/platform_build_release.sh"],
+                expected_target_sha=self.SHA,
+            )
+
+    def test_candidate_packaging_reconcile_source_is_closed_and_cumulative(self) -> None:
+        candidate_path = ".github/workflows/platform-host-tools-candidate.yml"
+        shared_path = ".github/workflows/platform-production-autodeploy.yml"
+        recovery_only_path = "platform/tools/platform_recovery_bootstrap.py"
+        docs_path = "platform/docs/candidate-route.md"
+        app_path = "platform/tools/platform_build_release.sh"
+        self.assertIn(candidate_path, CANDIDATE_PACKAGING_FILES)
+        self.assertIn(shared_path, CANDIDATE_PACKAGING_FILES)
+        self.assertIn(shared_path, RECOVERY_BOOTSTRAP_FILES)
+        self.assertIn(recovery_only_path, RECOVERY_BOOTSTRAP_FILES)
+
+        candidate_paths = [candidate_path, shared_path, docs_path]
+        incremental = classify(
+            candidate_paths,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertEqual(incremental["reason"], CANDIDATE_PACKAGING_REASON)
+        self.assertEqual(incremental["class"], "full")
+        self.assertFalse(incremental["deployable"])
+        self.assertFalse(incremental["runtime_sensitive"])
+
+        pure_candidate = classify_cumulative_baseline(
+            incremental, candidate_paths, expected_target_sha=self.SHA
+        )
+        self.assertTrue(pure_candidate["no_op"])
+        self.assertEqual(
+            pure_candidate["manifest"]["reason"], CANDIDATE_PACKAGING_REASON
+        )
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                incremental, [candidate_path], expected_target_sha=self.SHA
+            )
+
+        mixed_candidate_and_application = classify_cumulative_baseline(
+            incremental,
+            [*candidate_paths, app_path],
+            expected_target_sha=self.SHA,
+        )
+        self.assertFalse(mixed_candidate_and_application["no_op"])
+        self.assertTrue(mixed_candidate_and_application["manifest"]["deployable"])
+        self.assertTrue(
+            mixed_candidate_and_application["manifest"]["runtime_sensitive"]
+        )
+
+        # A path present in both closed source families follows the canonical
+        # recovery reason precedence when it appears alone. Adding a
+        # candidate-exclusive path makes the incremental family unambiguous.
+        shared_only = classify(
+            [shared_path], event="push", branch="dev", target_sha=self.SHA
+        )
+        self.assertEqual(shared_only["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertTrue(
+            classify_cumulative_baseline(
+                shared_only, [shared_path], expected_target_sha=self.SHA
+            )["no_op"]
+        )
+        candidate_and_recovery = classify(
+            [candidate_path, recovery_only_path],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertTrue(candidate_and_recovery["deployable"])
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                candidate_and_recovery,
+                [candidate_path, recovery_only_path],
+                expected_target_sha=self.SHA,
+            )
+
+        bad_candidate_runtime = dict(incremental)
+        bad_candidate_runtime["runtime_sensitive"] = True
+        bad_candidate_runtime["digest"] = manifest_digest(bad_candidate_runtime)
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                bad_candidate_runtime, candidate_paths, expected_target_sha=self.SHA
+            )
+
+        bad_candidate_reason = dict(incremental)
+        bad_candidate_reason["reason"] = RECOVERY_BOOTSTRAP_REASON
+        bad_candidate_reason["digest"] = manifest_digest(bad_candidate_reason)
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                bad_candidate_reason, candidate_paths, expected_target_sha=self.SHA
+            )
+
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                incremental,
+                [candidate_path, shared_path, "unowned/private-secret.txt"],
                 expected_target_sha=self.SHA,
             )
 

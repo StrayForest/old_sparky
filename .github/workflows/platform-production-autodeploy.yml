@@ -351,6 +351,19 @@ jobs:
               "platform/deploy/systemd/deadlock-health-monitor.service",
               "platform/contracts/host_tools_pin.json",
           }
+          candidate_packaging_files = {
+              ".github/workflows/platform-host-tools-candidate.yml",
+              ".github/workflows/platform-production-autodeploy.yml",
+              ".github/workflows/platform-security.yml",
+              "platform/tests/test_platform_ci_classifier.py",
+              "platform/tools/platform_host_tools_candidate.py",
+              "platform/tools/platform_ci_classifier.py",
+              "platform/tests/test_platform_host_tools_bundle.py",
+              "platform/tools/platform_test_catalog.py",
+              "platform/tools/platform_verify_contract.py",
+          }
+          recovery_bootstrap_reason = "retained-release recovery-bootstrap change requires full verification and is non-deployable"
+          candidate_packaging_reason = "trusted candidate-packaging change requires full verification and is non-deployable"
           if manifest.get("schema") != 1 or manifest.get("version") != 1:
               raise SystemExit("classifier manifest schema/version is invalid")
           route_class = manifest.get("class")
@@ -378,9 +391,19 @@ jobs:
           if any(not isinstance(path, str) or not path for path in files):
               raise SystemExit("classifier files contain a malformed path")
           recovery_bootstrap_only = bool(
-              any(path in recovery_bootstrap_files for path in files)
+              reason == recovery_bootstrap_reason
+              and any(path in recovery_bootstrap_files for path in files)
               and all(
                   path in recovery_bootstrap_files
+                  or path.startswith("platform/docs/")
+                  for path in files
+              )
+          )
+          candidate_packaging_only = bool(
+              reason == candidate_packaging_reason
+              and any(path in candidate_packaging_files for path in files)
+              and all(
+                  path in candidate_packaging_files
                   or path.startswith("platform/docs/")
                   for path in files
               )
@@ -398,18 +421,33 @@ jobs:
           # deployable bit, not the route class alone, controls dispatch.
           if type(manifest.get("deployable")) is not bool:
               raise SystemExit("full route may be non-deployable, but its flag must be boolean")
+          if (
+              route_class == "full"
+              and manifest["deployable"] is False
+              and not (recovery_bootstrap_only or candidate_packaging_only)
+          ):
+              raise SystemExit("full non-deployable classifier route is not recognized")
           if recovery_bootstrap_only and manifest["deployable"]:
               raise SystemExit("recovery-bootstrap route cannot be deployable")
           if recovery_bootstrap_only and route_class != "full":
               raise SystemExit("recovery-bootstrap route must use full verification")
-          if recovery_bootstrap_only and reason != "retained-release recovery-bootstrap change requires full verification and is non-deployable":
+          if recovery_bootstrap_only and reason != recovery_bootstrap_reason:
               raise SystemExit("recovery-bootstrap route reason is inconsistent")
+          if candidate_packaging_only and manifest["deployable"]:
+              raise SystemExit("candidate-packaging route cannot be deployable")
+          if candidate_packaging_only and route_class != "full":
+              raise SystemExit("candidate-packaging route must use full verification")
+          if candidate_packaging_only and manifest["runtime_sensitive"] is not False:
+              raise SystemExit("candidate-packaging route runtime sensitivity is inconsistent")
+          if candidate_packaging_only and reason != candidate_packaging_reason:
+              raise SystemExit("candidate-packaging route reason is inconsistent")
           if route_class != "full" and manifest.get("deployable") is not False:
               raise SystemExit("reduced classifier route must be non-deployable")
           with Path(output_path).open("a", encoding="utf-8") as output:
               output.write(f"route_class={route_class}\n")
               output.write(f"route_deployable={'true' if manifest['deployable'] else 'false'}\n")
               output.write(f"route_recovery_bootstrap_only={'true' if recovery_bootstrap_only else 'false'}\n")
+              output.write(f"route_candidate_packaging_only={'true' if candidate_packaging_only else 'false'}\n")
               output.write(f"route_fallback={'true' if manifest['fallback'] else 'false'}\n")
               output.write(f"route_digest={manifest['digest']}\n")
               output.write(f"route_reason={reason}\n")
@@ -423,6 +461,7 @@ jobs:
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
           ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
+          ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ steps.route.outputs.route_candidate_packaging_only }}
         run: |
           set -euo pipefail
 
@@ -448,7 +487,9 @@ jobs:
           fi
 
           if [[ "$ROUTE_DEPLOYABLE" != "true" \
-            && ! ( "$ROUTE_CLASS" == "full" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" ) ]]; then
+            && ! ( "$ROUTE_CLASS" == "full" \
+              && ( "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" \
+                || "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" ) ) ]]; then
             echo "Classifier route is non-deployable ($ROUTE_CLASS); no production deployment required."
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -456,7 +497,9 @@ jobs:
 
           dispatch_mode=deploy
           if [[ "$ROUTE_DEPLOYABLE" == "false" ]]; then
-            [[ "$ROUTE_CLASS" == "full" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" ]] || {
+            [[ "$ROUTE_CLASS" == "full" \
+              && ( ( "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) \
+                || ( "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ) ) ]] || {
               echo "Refusing an unrecognized non-deployable route." >&2
               exit 1
             }
@@ -799,6 +842,7 @@ jobs:
           ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
           ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
           ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
+          ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ steps.route.outputs.route_candidate_packaging_only }}
           AUTODEPLOY_RUN_ID: ${{ github.run_id }}
           AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
@@ -806,12 +850,15 @@ jobs:
 
           case "$DISPATCH_MODE" in
             deploy)
-              [[ "$ROUTE_DEPLOYABLE" == "true" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ]] \
+              [[ "$ROUTE_DEPLOYABLE" == "true" \
+                && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" \
+                && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ]] \
                 || { echo "Refusing an invalid ordinary deploy route." >&2; exit 1; }
               ;;
             baseline-reconcile)
               [[ "$ROUTE_CLASS" == "full" && "$ROUTE_DEPLOYABLE" == "false" \
-                && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" ]] \
+                && ( ( "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "true" && "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "false" ) \
+                  || ( "$ROUTE_CANDIDATE_PACKAGING_ONLY" == "true" && "$ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false" ) ) ]] \
                 || { echo "Refusing an invalid baseline-reconcile route." >&2; exit 1; }
               ;;
             *)

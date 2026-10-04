@@ -27,6 +27,14 @@ from tests.test_platform_validate_release_artifact import (
     VALIDATOR_SCRIPT,
 )
 from tools import platform_workflow_remote_dispatch
+from tools.platform_ci_classifier import (
+    CANDIDATE_PACKAGING_FILES,
+    CANDIDATE_PACKAGING_REASON,
+    RECOVERY_BOOTSTRAP_FILES,
+    RECOVERY_BOOTSTRAP_REASON,
+    classify,
+    manifest_digest,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1253,6 +1261,171 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertNotEqual(malicious_manifest_result.returncode, 0)
             self.assertFalse(manifest_sentinel.exists())
             self.assertNotIn("Traceback", malicious_manifest_result.stderr)
+
+    def test_reconcile_classifier_manifest_is_explicit_and_family_bound(self) -> None:
+        target_sha = "a" * 40
+        candidate_path = ".github/workflows/platform-host-tools-candidate.yml"
+        shared_path = ".github/workflows/platform-production-autodeploy.yml"
+        recovery_only_path = "platform/tools/platform_recovery_bootstrap.py"
+        app_path = "platform/tools/platform_build_release.sh"
+        self.assertIn(candidate_path, CANDIDATE_PACKAGING_FILES)
+        self.assertIn(shared_path, CANDIDATE_PACKAGING_FILES)
+        self.assertIn(shared_path, RECOVERY_BOOTSTRAP_FILES)
+        self.assertIn(recovery_only_path, RECOVERY_BOOTSTRAP_FILES)
+
+        def write_archive(root: Path, manifest: dict[str, object]) -> Path:
+            archive = root / f"manifest-{len(list(root.glob('manifest-*.zip')))}.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr(
+                    "classifier-manifest.json",
+                    json.dumps(manifest, separators=(",", ":")),
+                )
+            os.chmod(archive, 0o600)
+            return archive
+
+        def validate(archive: Path, *flags: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    str(TOOLS_DIR / "platform_production_classifier_artifact.py"),
+                    "manifest",
+                    str(archive),
+                    "--target-sha",
+                    target_sha,
+                    *flags,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = classify(
+                [candidate_path, shared_path, "platform/docs/candidate-route.md"],
+                event="push",
+                branch="dev",
+                target_sha=target_sha,
+            )
+            self.assertEqual(candidate["reason"], CANDIDATE_PACKAGING_REASON)
+            self.assertFalse(candidate["deployable"])
+            self.assertFalse(candidate["runtime_sensitive"])
+            candidate_archive = write_archive(root, candidate)
+            self.assertNotEqual(validate(candidate_archive).returncode, 0)
+            self.assertNotEqual(
+                validate(candidate_archive, "--require-recovery-bootstrap").returncode,
+                0,
+            )
+            accepted_candidate = validate(
+                candidate_archive, "--require-reconcile-source"
+            )
+            self.assertEqual(accepted_candidate.returncode, 0, accepted_candidate.stderr)
+            conflicting_flags = validate(
+                candidate_archive,
+                "--require-reconcile-source",
+                "--require-recovery-bootstrap",
+            )
+            self.assertNotEqual(conflicting_flags.returncode, 0)
+
+            recovery = classify(
+                [shared_path, recovery_only_path],
+                event="push",
+                branch="dev",
+                target_sha=target_sha,
+            )
+            self.assertEqual(recovery["reason"], RECOVERY_BOOTSTRAP_REASON)
+            recovery_archive = write_archive(root, recovery)
+            self.assertEqual(validate(recovery_archive).returncode, 0)
+            self.assertEqual(
+                validate(recovery_archive, "--require-recovery-bootstrap").returncode,
+                0,
+            )
+            self.assertEqual(
+                validate(recovery_archive, "--require-reconcile-source").returncode,
+                0,
+            )
+
+            for label, field_value in (
+                ("runtime-sensitive candidate", True),
+                ("non-boolean candidate runtime flag", "false"),
+            ):
+                malformed = dict(candidate)
+                malformed["runtime_sensitive"] = field_value
+                malformed["digest"] = manifest_digest(malformed)
+                rejected = validate(
+                    write_archive(root, malformed), "--require-reconcile-source"
+                )
+                with self.subTest(label=label):
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertIn("manifest", rejected.stderr)
+
+            wrong_reason = dict(candidate)
+            wrong_reason["reason"] = RECOVERY_BOOTSTRAP_REASON
+            wrong_reason["digest"] = manifest_digest(wrong_reason)
+            self.assertNotEqual(
+                validate(
+                    write_archive(root, wrong_reason),
+                    "--require-reconcile-source",
+                ).returncode,
+                0,
+            )
+
+            mixed = classify(
+                [candidate_path, recovery_only_path],
+                event="push",
+                branch="dev",
+                target_sha=target_sha,
+            )
+            self.assertTrue(mixed["deployable"])
+            self.assertNotEqual(
+                validate(
+                    write_archive(root, mixed), "--require-reconcile-source"
+                ).returncode,
+                0,
+            )
+            application_range = classify(
+                [candidate_path, app_path],
+                event="push",
+                branch="dev",
+                target_sha=target_sha,
+            )
+            self.assertTrue(application_range["deployable"])
+            self.assertTrue(application_range["runtime_sensitive"])
+            self.assertNotEqual(
+                validate(
+                    write_archive(root, application_range),
+                    "--require-reconcile-source",
+                ).returncode,
+                0,
+            )
+
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        reconcile_validation = workflow_job(workflow, "validate-classifier")
+        production = workflow_job(workflow, "production")
+        self.assertIn("DEPLOY_MODE: deploy", reconcile_validation)
+        self.assertIn(
+            "RECONCILE_MODE: ${{ inputs.mode == 'baseline-reconcile' && 'true' || 'false' }}",
+            reconcile_validation,
+        )
+        self.assertIn('if [[ "$RECONCILE_MODE" == "true" ]]', reconcile_validation)
+        self.assertNotIn('if [[ "$DEPLOY_MODE" == "baseline-reconcile" ]]', reconcile_validation)
+        self.assertIn('if [[ "$RECONCILE_MODE" == "true" ]]', production)
+        self.assertEqual(workflow.count("manifest_args+=(--require-reconcile-source)"), 2)
+
+        auto = (
+            REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
+        ).read_text(encoding="utf-8")
+        dispatch = workflow_job(auto, "dispatch")
+        self.assertIn("candidate_packaging_reason =", dispatch)
+        self.assertIn("candidate_packaging_only = bool(", dispatch)
+        self.assertIn('manifest["runtime_sensitive"] is not False', dispatch)
+        self.assertIn('dispatch_mode=baseline-reconcile', dispatch)
+        self.assertIn('ROUTE_CANDIDATE_PACKAGING_ONLY" == "true"', dispatch)
+        self.assertIn('ROUTE_RECOVERY_BOOTSTRAP_ONLY" == "false"', dispatch)
+        self.assertIn('ROUTE_CANDIDATE_PACKAGING_ONLY" == "false"', dispatch)
 
     def test_production_web_compression_is_explicit_and_enabled_by_default(self) -> None:
         workflow = (
