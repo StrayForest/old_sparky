@@ -90,6 +90,7 @@ WEB_PLAYWRIGHT_CONFIG = PLATFORM_ROOT / "apps" / "platform_web" / "playwright.co
 WEB_PARTICIPANT_CONFIG = PLATFORM_ROOT / "apps" / "platform_web" / "playwright.participant.config.ts"
 WEB_SOURCE_CONTRACT_CONFIG = PLATFORM_ROOT / "apps" / "platform_web" / "playwright.source-contract.config.ts"
 WEB_HERMETIC_RUNNER = PLATFORM_ROOT / "tools" / "platform_web_hermetic.sh"
+WEB_HERMETIC_MATRIX = PLATFORM_ROOT / "tools" / "platform_web_hermetic_matrix.py"
 TEST_RUNNER = PLATFORM_ROOT / "tools" / "platform_test_runner.py"
 LEGACY_MANIFEST = PLATFORM_ROOT / "tests" / "test-suite-manifest.json"
 EXTERNAL_LOAD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-external-load.yml"
@@ -2037,19 +2038,36 @@ def collect_issues() -> list[str]:
             "frontend-audit-regressions.spec.ts",
             "live-launch.spec.ts",
             "live-user-journey.spec.ts",
+            "origin-validator-contract.spec.ts",
             "tournament-participant-progressive.spec.ts",
         }
         if ignored_specs != expected_ignored_specs:
             issues.append(
                 "web hermetic config must isolate source, live and participant specialized suites"
             )
+        request_only_match = re.search(
+            r"const requestOnlySpecs = \[(.*?)\]", web_config, re.DOTALL
+        )
+        request_only_specs = (
+            set(re.findall(r'"([^"]+\.spec\.ts)"', request_only_match.group(1)))
+            if request_only_match
+            else set()
+        )
+        if request_only_specs != {"public-discovery-documents.spec.ts"}:
+            issues.append("web hermetic config must isolate request-only discovery documents")
         if re.search(r"retries:\s*process\.env\.CI", web_config):
             issues.append("web hermetic deterministic config must not retry CI failures")
         if "PLATFORM_WEB_HERMETIC_BUILD_DIR" not in web_config:
             issues.append("web hermetic config must support the prepared standalone build")
         if "trace: \"retain-on-failure\"" not in web_config:
             issues.append("web hermetic failures must retain traces with retries disabled")
-        for project_name in ("desktop", "wide-1300", "tablet-820", "mobile-layout"):
+        for project_name in (
+            "desktop",
+            "wide-1300",
+            "tablet-820",
+            "mobile-layout",
+            "request-contract",
+        ):
             if f'name: "{project_name}"' not in web_config:
                 issues.append(f"web hermetic project matrix is missing {project_name}")
         for spec_name in (
@@ -2062,6 +2080,7 @@ def collect_issues() -> list[str]:
             "password-reset-autofill.spec.ts",
             "ready-check-timer.spec.ts",
             "tournament-list-concurrency.spec.ts",
+            "tournament-registration-race.spec.ts",
         ):
             if spec_name not in web_config:
                 issues.append(f"desktop-only web regression is missing from project routing: {spec_name}")
@@ -2082,8 +2101,12 @@ def collect_issues() -> list[str]:
     except (OSError, UnicodeError) as exc:
         issues.append(f"source-contract Playwright config is unreadable: {exc}")
     else:
-        if 'testMatch: "frontend-audit-regressions.spec.ts"' not in source_contract_config:
-            issues.append("source-contract runner must own frontend-audit-regressions.spec.ts")
+        for spec_name in (
+            "frontend-audit-regressions.spec.ts",
+            "origin-validator-contract.spec.ts",
+        ):
+            if spec_name not in source_contract_config:
+                issues.append(f"source-contract runner must own {spec_name}")
         if "webServer" in source_contract_config:
             issues.append("source-contract runner must not boot browser/API servers")
 
@@ -2095,6 +2118,22 @@ def collect_issues() -> list[str]:
             issues.append("web hermetic build must serialize the shared API rewrite destination")
         if "test:source-contract" not in runner_text:
             issues.append("web hermetic runner must execute source-contract assertions once")
+        for marker in (
+            "platform_web_hermetic_timing.py",
+            "platform_web_hermetic_matrix.py",
+            "run_phase",
+            "PLATFORM_WEB_TEST_TIMING_PATH",
+        ):
+            if marker not in runner_text:
+                issues.append(f"web hermetic runner is missing timing marker: {marker}")
+
+    if not WEB_HERMETIC_MATRIX.is_file():
+        issues.append("web hermetic matrix acceptance script is missing")
+    else:
+        matrix_text = WEB_HERMETIC_MATRIX.read_text(encoding="utf-8")
+        for marker in ("--list", "request-contract", "source-contract"):
+            if marker not in matrix_text:
+                issues.append(f"web hermetic matrix acceptance is missing marker: {marker}")
 
     if not CLASSIFIER_TOOL.is_file():
         issues.append("platform_ci_classifier.py is missing")

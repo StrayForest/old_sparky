@@ -389,15 +389,27 @@ immutable build. Smoke and participant runs are separate and sequential; each
 starts fresh API/web processes with `reuseExistingServer: false`, so no
 ambient server, browser or database state is reused.
 
-The responsive smoke project owns `desktop`, `wide-1300`, `tablet-820` and
+The responsive smoke projects own `desktop`, `wide-1300`, `tablet-820` and
 `mobile-layout` viewports. Responsive specs run in that matrix; the explicit
 desktop-only list in the
 [`playwright.config.ts`](../apps/platform_web/playwright.config.ts)
-is owned only by the `desktop` project. The participant-progressive suite has
+is owned only by the `desktop` project. The race-protection journey is in that
+desktop-only list because its assertions cover request ordering and state
+identity, not layout or viewport behavior. Pure origin validation belongs to
+the source-contract runner, and request-only public discovery documents use the
+single `request-contract` project; neither is repeated across responsive
+viewports. The participant-progressive suite has
 its own sequential one-worker contour and explicit desktop/mobile projects in
 [`playwright.participant.config.ts`](../apps/platform_web/playwright.participant.config.ts).
-Do not infer viewport ownership from a test name or silently add an exclusion;
-update the owning config and its contract test when the matrix changes.
+The hermetic runner emits a bounded, title-free phase/project timing JSON
+summary for CI. Playwright reports, traces, videos and raw test results are
+failure-only diagnostics with five-day retention; they contain mocked/local
+fixture data and are not an evidence store for production users. Before the
+browser contour starts, the runner invokes Playwright `--list` and fails if
+responsive route, desktop-only race, request-only discovery, source-only origin
+validation or participant ownership changes unexpectedly. Do not infer viewport
+ownership from a test name or silently add an exclusion; update the owning
+config and its contract test when the matrix changes.
 
 ## Local and GitHub verification
 
