@@ -13,7 +13,7 @@ import argparse
 import base64
 from collections.abc import Mapping, Sequence
 import hashlib
-import importlib.util
+from importlib import import_module
 import json
 import os
 from pathlib import Path
@@ -21,28 +21,33 @@ import re
 import stat
 import sys
 import tempfile
+from types import ModuleType
 from typing import Any
 
-try:
+if __package__:
     from .platform_safe_zip import UnsafeZipError, extract_single_manifest
     from .platform_ci_classifier import (
         CANDIDATE_PACKAGING_FILES,
         CANDIDATE_PACKAGING_REASON,
     )
-except ImportError:  # Executed directly from platform/tools on a runner.
-    _SAFE_ZIP_SPEC = importlib.util.spec_from_file_location(
-        "platform_safe_zip", Path(__file__).with_name("platform_safe_zip.py")
+else:  # Executed as a script under Python isolated mode on a runner.
+    _TRUSTED_TOOLS_PACKAGE = "_oldsparky_trusted_platform_tools"
+    _TRUSTED_TOOLS_DIR = str(Path(__file__).resolve().parent)
+    _TRUSTED_TOOLS_MODULE = ModuleType(_TRUSTED_TOOLS_PACKAGE)
+    _TRUSTED_TOOLS_MODULE.__package__ = _TRUSTED_TOOLS_PACKAGE
+    _TRUSTED_TOOLS_MODULE.__path__ = [_TRUSTED_TOOLS_DIR]
+    sys.modules[_TRUSTED_TOOLS_PACKAGE] = _TRUSTED_TOOLS_MODULE
+
+    _SAFE_ZIP_MODULE = import_module(
+        f"{_TRUSTED_TOOLS_PACKAGE}.platform_safe_zip"
     )
-    if _SAFE_ZIP_SPEC is None or _SAFE_ZIP_SPEC.loader is None:
-        raise ImportError("trusted platform_safe_zip helper is unavailable")
-    _SAFE_ZIP_MODULE = importlib.util.module_from_spec(_SAFE_ZIP_SPEC)
-    _SAFE_ZIP_SPEC.loader.exec_module(_SAFE_ZIP_MODULE)
     UnsafeZipError = _SAFE_ZIP_MODULE.UnsafeZipError
     extract_single_manifest = _SAFE_ZIP_MODULE.extract_single_manifest
-    from platform_ci_classifier import (  # type: ignore[no-redef]
-        CANDIDATE_PACKAGING_FILES,
-        CANDIDATE_PACKAGING_REASON,
+    _CI_CLASSIFIER_MODULE = import_module(
+        f"{_TRUSTED_TOOLS_PACKAGE}.platform_ci_classifier"
     )
+    CANDIDATE_PACKAGING_FILES = _CI_CLASSIFIER_MODULE.CANDIDATE_PACKAGING_FILES
+    CANDIDATE_PACKAGING_REASON = _CI_CLASSIFIER_MODULE.CANDIDATE_PACKAGING_REASON
 
 
 MAX_JSON_BYTES = 4 * 1024 * 1024

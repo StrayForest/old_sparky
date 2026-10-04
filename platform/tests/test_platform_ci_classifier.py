@@ -1297,6 +1297,39 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("classifier_run_attempt", auto)
         self.assertIn("platform_production_classifier_artifact.py", production)
 
+    def test_production_manifest_validator_runs_with_isolated_python(self) -> None:
+        manifest = classify(
+            sorted(RECOVERY_BOOTSTRAP_FILES),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = self._write_production_classifier_archive(
+                Path(temporary), manifest
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(
+                        REPO_ROOT
+                        / "platform/tools/platform_production_classifier_artifact.py"
+                    ),
+                    "manifest",
+                    str(archive),
+                    "--target-sha",
+                    self.TARGET_SHA,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "classifier manifest accepted")
+
     def test_classifier_artifact_enumeration_covers_large_and_mutating_pages(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
         production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
