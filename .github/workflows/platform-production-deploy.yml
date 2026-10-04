@@ -2559,10 +2559,27 @@ jobs:
             production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
-          public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed)( lock_stage=(helper_metadata|release_supervise|release_open|retained_supervise|retained_open))?)? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
+          marker_pattern='^(RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed))? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$|^RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=baseline_changed release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$|^RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=(helper_metadata|release_supervise|release_open|retained_supervise|retained_open) release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$)'
+          public_line="$(grep -E "$marker_pattern" "$remote_log" | tail -n 1 || true)"
           if [[ -z "$public_line" ]]; then
             public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
             printf '%s\n' "$public_line"
+            stdout_bytes="$(wc -c < "$remote_log" | tr -d '[:space:]')"
+            stderr_bytes="$(wc -c < "$remote_error" | tr -d '[:space:]')"
+            diagnostic_reason=unclassified
+            if [[ "$remote_status" == 124 || "$remote_status" == 137 ]]; then
+              diagnostic_reason=timeout
+            elif [[ "$remote_status" == 255 ]]; then
+              diagnostic_reason=ssh_or_remote_255
+            elif [[ "$stdout_bytes" == 0 && "$stderr_bytes" == 0 ]]; then
+              diagnostic_reason=empty_output
+            elif [[ "$stdout_bytes" != 0 ]]; then
+              diagnostic_reason=unrecognized_stdout
+            elif [[ "$stderr_bytes" != 0 ]]; then
+              diagnostic_reason=stderr_without_marker
+            fi
+            printf 'RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed reason=%s remote_exit=%s stdout_bytes=%s stderr_bytes=%s\n' \
+              "$diagnostic_reason" "$remote_status" "$stdout_bytes" "$stderr_bytes"
             (( remote_status != 0 )) && exit "$remote_status"
             exit 1
           fi
@@ -3605,10 +3622,27 @@ jobs:
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
-          public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed)( lock_stage=(helper_metadata|release_supervise|release_open|retained_supervise|retained_open))?)? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
+          marker_pattern='^(RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed))? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$|^RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=baseline_changed release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$|^RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=(helper_metadata|release_supervise|release_open|retained_supervise|retained_open) release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$)'
+          public_line="$(grep -E "$marker_pattern" "$remote_log" | tail -n 1 || true)"
           if [[ -z "$public_line" ]]; then
             public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
             printf '%s\n' "$public_line"
+            stdout_bytes="$(wc -c < "$remote_log" | tr -d '[:space:]')"
+            stderr_bytes="$(wc -c < "$remote_error" | tr -d '[:space:]')"
+            diagnostic_reason=unclassified
+            if [[ "$remote_status" == 124 || "$remote_status" == 137 ]]; then
+              diagnostic_reason=timeout
+            elif [[ "$remote_status" == 255 ]]; then
+              diagnostic_reason=ssh_or_remote_255
+            elif [[ "$stdout_bytes" == 0 && "$stderr_bytes" == 0 ]]; then
+              diagnostic_reason=empty_output
+            elif [[ "$stdout_bytes" != 0 ]]; then
+              diagnostic_reason=unrecognized_stdout
+            elif [[ "$stderr_bytes" != 0 ]]; then
+              diagnostic_reason=stderr_without_marker
+            fi
+            printf 'RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed reason=%s remote_exit=%s stdout_bytes=%s stderr_bytes=%s\n' \
+              "$diagnostic_reason" "$remote_status" "$stdout_bytes" "$stderr_bytes"
             (( remote_status != 0 )) && exit "$remote_status"
             exit 1
           fi
