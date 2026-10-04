@@ -482,10 +482,10 @@ recovery authority does not run normal deploy, Alembic downgrade, or manual syst
 
 For an operation-ID v2 `install` receipt from a pre-managed-LiveQA release, recovery requires no paired systemd receipt, exact transaction pointers/identities, and both old-release inputs absent:
 `tools/platform_live_qa_runtime_install.py` and `liveqa-runtime/`. Partial payloads fail closed.
-Immutable recovery prepares old unit/Nginx files without reconcile, restores exact service/timer state and readiness,
-then records `legacy-services-restored`. Generic phase commands cannot create this proof;
-retries recheck state/readiness before cleanup. Shared QA remains untouched. Use the immutable recovery
-bootstrap; never run the old reconcile helper or clear the operation receipt manually.
+Immutable recovery prepares old unit/Nginx files without reconcile and restores the recorded service/timer state.
+`legacy-services-restored` is written only after state checks and a bounded 30-second
+API/web readiness wait; retries recheck readiness before cleanup. Shared QA remains untouched.
+Child failures expose only fixed stage/status labels; use the bootstrap, never clear the receipt manually.
 
 The normal systemd installer uses the same crash discipline for retired unit
 cleanup: it persists an fsynced, root-owned file/digest/state record before

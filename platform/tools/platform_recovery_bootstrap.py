@@ -82,6 +82,33 @@ MAX_PROVENANCE_BYTES = 64 * 1024
 MAX_PUBLISH_PAGE_ROWS = 100
 RECOVERY_SUBPROCESS_TIMEOUT_SECONDS = 120.0
 RECOVERY_CHILD_TERMINATION_GRACE_SECONDS = 5.0
+RECOVERY_CHILD_STAGES = frozenset(
+    {
+        "initial_validate_systemd",
+        "initial_restore_systemd",
+        "initial_authorize_recovery",
+        "initial_recover",
+        "initial_verify_systemd",
+        "transaction_cleanup_retained",
+        "transaction_cleanup_final",
+        "legacy_validate_receipt",
+        "legacy_runtime_prepare",
+        "legacy_restore_services",
+        "legacy_mark_services_restored",
+        "legacy_verify_services",
+        "legacy_cleanup_retained",
+        "legacy_cleanup_final",
+        "operationless_cleanup_retained",
+        "operationless_cleanup_final",
+        "systemd_validate",
+        "systemd_runtime_restore",
+        "systemd_verify",
+        "systemd_clear",
+        "retained_runtime_restore",
+        "liveqa_reconcile",
+        "recovery_child",
+    }
+)
 EXECUTABLE_MODE = 0o555
 DATA_MODE = 0o444
 
@@ -102,6 +129,16 @@ RECOVERY_FILES = (
 
 class RecoveryBootstrapError(ValueError):
     """The recovery bootstrap archive or host state is not safe."""
+
+
+class RecoveryChildError(RecoveryBootstrapError):
+    """A recovery child failed with a closed, non-sensitive status tuple."""
+
+    def __init__(self, *, stage: str, outcome: str, child_exit: int | None) -> None:
+        super().__init__("retained recovery child did not complete")
+        self.stage = stage
+        self.outcome = outcome
+        self.child_exit = child_exit
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -2265,8 +2302,68 @@ def _terminate_recovery_child_group(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _run_recovery_child(command: list[str]) -> None:
+def _recovery_child_stage(command: list[str]) -> str:
+    """Map trusted command shapes to a fixed diagnostic stage label."""
+
+    if len(command) >= 4 and command[0] == "/usr/bin/python3" and command[1] == "-I":
+        tool = Path(command[2]).name
+        operation = command[3]
+        if tool == "platform_release_transaction.py":
+            if operation == "validate-initial-systemd":
+                return "initial_validate_systemd"
+            if operation == "restore-initial-systemd":
+                return "initial_restore_systemd"
+            if operation == "authorize-recovery":
+                return "initial_authorize_recovery"
+            if operation == "recover":
+                return "initial_recover"
+            if operation == "verify-initial-systemd":
+                return "initial_verify_systemd"
+            if operation == "complete-recovery":
+                if "--retain-receipt" in command:
+                    return "transaction_cleanup_retained"
+                return "transaction_cleanup_final"
+            if operation == "validate-legacy-liveqa-recovery":
+                return "legacy_validate_receipt"
+            if operation == "restore-legacy-services":
+                return "legacy_restore_services"
+            if operation == "mark-legacy-services-restored":
+                return "legacy_mark_services_restored"
+            if operation == "verify-legacy-services":
+                return "legacy_verify_services"
+        elif tool == "platform_release_systemd_state.py":
+            if operation == "validate":
+                return "systemd_validate"
+            if operation == "verify":
+                return "systemd_verify"
+            if operation == "clear":
+                return "systemd_clear"
+        elif tool == "platform_live_qa_runtime_install.py" and operation == "reconcile":
+            return "liveqa_reconcile"
+    if command:
+        tool = Path(command[0]).name
+        if tool == "platform_release_restore_runtime.sh":
+            if "--prepare-only" in command and "--preserve-legacy-live-qa" in command:
+                return "legacy_runtime_prepare"
+            if "--systemd-state" in command:
+                return "systemd_runtime_restore"
+            return "retained_runtime_restore"
+    return "recovery_child"
+
+
+def _child_exit_status(return_code: int) -> int | None:
+    """Return the shell-equivalent child status without exposing raw output."""
+
+    status = return_code if return_code >= 0 else 128 - return_code
+    return status if 0 <= status <= 255 else None
+
+
+def _run_recovery_child(command: list[str], *, stage: str | None = None) -> None:
     """Run one immutable recovery child with a bounded fail-closed deadline."""
+
+    diagnostic_stage = stage if stage in RECOVERY_CHILD_STAGES else _recovery_child_stage(command)
+    if diagnostic_stage not in RECOVERY_CHILD_STAGES:
+        diagnostic_stage = "recovery_child"
 
     try:
         process = subprocess.Popen(
@@ -2278,18 +2375,22 @@ def _run_recovery_child(command: list[str]) -> None:
             close_fds=True,
         )
     except OSError as exc:
-        raise RecoveryBootstrapError(
-            "retained recovery child could not start; receipts remain for retry"
+        raise RecoveryChildError(
+            stage=diagnostic_stage, outcome="spawn_failed", child_exit=None
         ) from exc
     try:
         return_code = process.wait(timeout=RECOVERY_SUBPROCESS_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as exc:
         _terminate_recovery_child_group(process)
-        raise RecoveryBootstrapError(
-            "retained recovery child timed out; receipts remain for retry"
+        raise RecoveryChildError(
+            stage=diagnostic_stage, outcome="timeout", child_exit=None
         ) from exc
     if return_code != 0:
-        raise subprocess.CalledProcessError(return_code, command)
+        raise RecoveryChildError(
+            stage=diagnostic_stage,
+            outcome="child_exit",
+            child_exit=_child_exit_status(return_code),
+        )
 
 
 def _restore_legacy_liveqa_release(
@@ -2320,19 +2421,22 @@ def _restore_legacy_liveqa_release(
                 "/usr/bin/python3", "-I", str(transaction),
                 "validate-legacy-liveqa-recovery", "--state", str(state),
                 "--app-dir", str(app_dir), "--release", str(release),
-            ]
+            ],
+            stage="legacy_validate_receipt",
         )
         _run_recovery_child(
             [
                 str(runtime), "--app-dir", str(app_dir), "--release", str(release),
                 "--prepare-only", "--preserve-legacy-live-qa", "--transaction", str(state),
-            ]
+            ],
+            stage="legacy_runtime_prepare",
         )
         _run_recovery_child(
             [
                 "/usr/bin/python3", "-I", str(transaction), "restore-legacy-services",
                 "--state", str(state), "--systemctl", "/usr/bin/systemctl",
-            ]
+            ],
+            stage="legacy_restore_services",
         )
         if _release_pointer(app_dir, "current") != release:
             raise RecoveryBootstrapError("current release changed during legacy recovery")
@@ -2345,7 +2449,8 @@ def _restore_legacy_liveqa_release(
                 "/usr/bin/python3", "-I", str(transaction),
                 "mark-legacy-services-restored", "--state", str(state),
                 "--systemctl", "/usr/bin/systemctl",
-            ]
+            ],
+            stage="legacy_mark_services_restored",
         )
     elif receipt.get("phase") != "legacy-services-restored":
         raise RecoveryBootstrapError("legacy recovery phase is invalid")
@@ -2353,19 +2458,22 @@ def _restore_legacy_liveqa_release(
         [
             "/usr/bin/python3", "-I", str(transaction), "verify-legacy-services",
             "--state", str(state), "--systemctl", "/usr/bin/systemctl",
-        ]
+        ],
+        stage="legacy_verify_services",
     )
     _run_recovery_child(
         [
             "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
             "--state", str(state), "--retain-receipt", "--systemctl", "/usr/bin/systemctl",
-        ]
+        ],
+        stage="legacy_cleanup_retained",
     )
     _run_recovery_child(
         [
             "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
             "--state", str(state), "--systemctl", "/usr/bin/systemctl",
-        ]
+        ],
+        stage="legacy_cleanup_final",
     )
 
 
@@ -2427,14 +2535,20 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
         peer = Path(peer_value)
         if os.path.lexists(peer):
             raise RecoveryBootstrapError("legacy release receipt peer is present")
-        _run_recovery_child([
-            "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
-            "--state", str(state), "--retain-receipt",
-        ])
-        _run_recovery_child([
-            "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
-            "--state", str(state),
-        ])
+        _run_recovery_child(
+            [
+                "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
+                "--state", str(state), "--retain-receipt",
+            ],
+            stage="operationless_cleanup_retained",
+        )
+        _run_recovery_child(
+            [
+                "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
+                "--state", str(state),
+            ],
+            stage="operationless_cleanup_final",
+        )
         return
     if systemd_state_present:
         if (
@@ -2848,7 +2962,13 @@ def main(argv: list[str] | None = None) -> int:
             raise RecoveryBootstrapError("unknown recovery command")
         return 0
     except (RecoveryBootstrapError, OSError, subprocess.CalledProcessError) as exc:
-        del exc
+        if isinstance(exc, RecoveryChildError):
+            child_exit = "none" if exc.child_exit is None else str(exc.child_exit)
+            print(
+                "RECOVERY_BOOTSTRAP_DIAGNOSTIC schema=1 "
+                f"stage={exc.stage} outcome={exc.outcome} child_exit={child_exit}",
+                file=sys.stderr,
+            )
         print("RECOVERY_BOOTSTRAP schema=1 status=failed capability=abort_retained_only deployable=false", file=sys.stderr)
         return 2
 

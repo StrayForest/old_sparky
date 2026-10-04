@@ -269,8 +269,8 @@ resolver against the repository and target SHA. The fast DB-free backend
 contour stays shallow and proves the static contract plus the synthetic A/B
 pin-bump lifecycle; it does not silently skip historical ancestry proof.
 
-Operation-bound legacy LiveQA fixtures in `test_platform_recovery_bootstrap` stay in `backend-privileged`; they cover receipt/pointer/venv identity, service/timer snapshot, readiness
-and receipt-last cleanup. `test_liveqa_reconcile_stderr_is_available_only_to_private_candidate_capture`
+Operation-bound legacy LiveQA fixtures in `test_platform_recovery_bootstrap` stay in `backend-privileged`; they cover receipt/pointer/venv identity, service/timer snapshot, bounded readiness retries, fixed child-stage/status diagnostics and receipt-last cleanup.
+`test_liveqa_reconcile_stderr_is_available_only_to_private_candidate_capture`
 checks the helper preserves reconcile stderr. Its companion
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` verifies private
 capture and closed stdout/public markers; the executable catalog snapshot tracks these IDs.
