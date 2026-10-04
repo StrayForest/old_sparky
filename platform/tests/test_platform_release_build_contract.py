@@ -2720,6 +2720,212 @@ cleanup
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(ssh_called.exists())
 
+    def test_remote_deploy_marker_consumer_matches_closed_c4_shapes(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        activation = self._workflow_step_run(
+            workflow, "Run production preflight or deployment"
+        )
+        marker_patterns = []
+        for step_name in ("Run production preflight", "Run production preflight or deployment"):
+            body = self._workflow_step_run(workflow, step_name)
+            patterns = re.findall(r"^\s*marker_pattern='([^']+)'$", body, re.MULTILINE)
+            self.assertEqual(len(patterns), 1, step_name)
+            marker_patterns.append(patterns[0])
+        self.assertEqual(marker_patterns[0], marker_patterns[1])
+        marker_pattern = marker_patterns[0]
+
+        slug = "gha-123456789-1-aaaaaaaaaaaa"
+        sha = "a" * 40
+        accepted = (
+            f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=baseline_changed release_slug={slug} source_sha={sha}",
+            f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=release_open release_slug={slug} source_sha={sha}",
+            f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock release_slug={slug} source_sha={sha}",
+        )
+        rejected = (
+            f"RELEASE_DEPLOY schema=1 status=failed class=artifact phase=preflight reason=baseline_changed release_slug={slug} source_sha={sha}",
+            f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=unknown release_slug={slug} source_sha={sha}",
+            f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=release_open extra=x release_slug={slug} source_sha={sha}",
+            f"RELEASE_DEPLOY schema=1 status=passed class=preflight phase=preflight reason=lock lock_stage=release_open release_slug={slug} source_sha={sha}",
+        )
+        for marker in accepted:
+            with self.subTest(marker=marker):
+                result = subprocess.run(
+                    ["grep", "-E", marker_pattern],
+                    input=marker + "\n",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, marker + "\n")
+        for marker in rejected:
+            with self.subTest(marker=marker):
+                result = subprocess.run(
+                    ["grep", "-E", marker_pattern],
+                    input=marker + "\n",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+
+        # Exercise the real extracted activation shell block. The stubs emit
+        # private sentinels into the same capture files used by SSH; only the
+        # fixed public fallback and bounded metadata may reach stdout.
+        with tempfile.TemporaryDirectory(prefix="release-marker-contract-") as tmp:
+            root = Path(tmp)
+            runner_temp = root / "runner"
+            fake_bin = root / "bin"
+            (runner_temp / "deploy-input").mkdir(parents=True)
+            fake_bin.mkdir()
+            (runner_temp / "deploy-input/platform-production-deploy-input.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            curl = fake_bin / "curl"
+            curl.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '{\"commit\":{\"sha\":\""
+                + sha
+                + "\"}}'\n",
+                encoding="utf-8",
+            )
+            timeout = fake_bin / "timeout"
+            timeout.write_text("#!/bin/sh\nshift 2\nexec \"$@\"\n", encoding="utf-8")
+            ssh = fake_bin / "ssh"
+            ssh.write_text(
+                "#!/bin/sh\ncat \"$TEST_REMOTE_STDOUT\"\n"
+                "cat \"$TEST_REMOTE_STDERR\" >&2\n"
+                "exit \"$TEST_REMOTE_STATUS\"\n",
+                encoding="utf-8",
+            )
+            for script in (curl, timeout, ssh):
+                script.chmod(0o755)
+
+            private_stdout = root / "remote.stdout"
+            private_stderr = root / "remote.stderr"
+            private_stdout.write_text("private stdout payload\n", encoding="utf-8")
+            private_stderr.write_text("private stderr payload\n", encoding="utf-8")
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "RUNNER_TEMP": str(runner_temp),
+                "TARGET_SHA": sha,
+                "GITHUB_API_URL": "https://api.github.com",
+                "GITHUB_REPOSITORY": "example/oldsparky",
+                "GH_TOKEN": "test-token-not-used-by-stub",
+                "SSH_DIR": str(root / "ssh-config"),
+                "HOST_TOOLS_DISPATCHER": "/unused/host-tools-dispatcher.py",
+                "PROD_SSH_HOST": "production.invalid",
+                "PROD_SSH_USER": "deploy",
+                "TEST_REMOTE_STDOUT": str(private_stdout),
+                "TEST_REMOTE_STDERR": str(private_stderr),
+                "TEST_REMOTE_STATUS": "255",
+            }
+            fallback = subprocess.run(
+                ["/bin/bash", "-c", activation],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(fallback.returncode, 255, fallback.stderr)
+            self.assertEqual(
+                fallback.stdout,
+                "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport "
+                "release_slug=unavailable source_sha=unavailable\n"
+                "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                "reason=ssh_or_remote_255 remote_exit=255 stdout_bytes=23 stderr_bytes=23\n",
+            )
+            self.assertNotIn("private", fallback.stdout + fallback.stderr)
+
+            def run_outer_consumer(marker: str, *, status: int) -> subprocess.CompletedProcess[str]:
+                private_stdout.write_text(marker + "\n", encoding="utf-8")
+                private_stderr.write_text("private stderr sentinel\n", encoding="utf-8")
+                run_environment = {
+                    **environment,
+                    "TEST_REMOTE_STATUS": str(status),
+                }
+                return subprocess.run(
+                    ["/bin/bash", "-c", activation],
+                    env=run_environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            # Drive every closed failure shape from the dispatcher's actual
+            # authoritative table through the extracted production shell
+            # consumer, rather than maintaining a test-only reason allowlist.
+            failure_markers = []
+            for (marker_class, phase), reasons in (
+                platform_workflow_remote_dispatch.RELEASE_FAILURE_REASONS.items()
+            ):
+                for reason in sorted(reasons):
+                    failure_markers.append(
+                        "RELEASE_DEPLOY schema=1 status=failed "
+                        f"class={marker_class} phase={phase} reason={reason} "
+                        f"release_slug={slug} source_sha={sha}"
+                    )
+            failure_markers.extend(
+                "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+                f"phase=preflight reason=lock lock_stage={stage} "
+                f"release_slug={slug} source_sha={sha}"
+                for stage in (
+                    "helper_metadata",
+                    "release_supervise",
+                    "release_open",
+                    "retained_supervise",
+                    "retained_open",
+                )
+            )
+            for marker in failure_markers:
+                with self.subTest(marker=marker):
+                    result = run_outer_consumer(marker, status=1)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, marker + "\n")
+                    self.assertNotIn("private", result.stdout + result.stderr)
+
+            for marker_class in ("preflight", "deployment"):
+                passed_marker = (
+                    "RELEASE_DEPLOY schema=1 status=passed "
+                    f"class={marker_class} release_slug={slug} source_sha={sha}"
+                )
+                with self.subTest(marker=passed_marker):
+                    result = run_outer_consumer(passed_marker, status=0)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, passed_marker + "\n")
+                    self.assertNotIn("private", result.stdout + result.stderr)
+
+            malformed_markers = (
+                f"RELEASE_DEPLOY schema=1 status=failed class=artifact phase=preflight reason=baseline_changed release_slug={slug} source_sha={sha}",
+                f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=candidate reason=baseline_changed release_slug={slug} source_sha={sha}",
+                f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=unknown release_slug={slug} source_sha={sha}",
+                f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=release_open lock_stage=retained_open release_slug={slug} source_sha={sha}",
+                f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=release_open extra=x release_slug={slug} source_sha={sha}",
+                f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=release_open release_slug=bad/slug source_sha={sha}",
+                f"RELEASE_DEPLOY schema=1 status=failed class=preflight phase=preflight reason=lock lock_stage=release_open release_slug={slug} source_sha=bad",
+            )
+            for marker in malformed_markers:
+                with self.subTest(malformed_marker=marker):
+                    result = run_outer_consumer(marker, status=1)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(
+                        "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport",
+                        result.stdout,
+                    )
+                    self.assertIn(
+                        "reason=unrecognized_stdout remote_exit=1",
+                        result.stdout,
+                    )
+                    self.assertNotIn(marker, result.stdout)
+                    self.assertNotIn("private", result.stdout + result.stderr)
+
     def test_production_host_tools_handoff_allows_nonroot_runner_owner(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"

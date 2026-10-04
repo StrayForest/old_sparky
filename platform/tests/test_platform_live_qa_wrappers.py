@@ -874,6 +874,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "phase=preflight reason=lock "
             f"release_slug={release_slug} source_sha={source_sha}\n"
         )
+        baseline_changed_failure = (
+            "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+            "phase=preflight reason=baseline_changed "
+            f"release_slug={release_slug} source_sha={source_sha}\n"
+        )
 
         def run_child(
             output: bytes,
@@ -931,6 +936,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             run_child(legacy_lock_failure.encode(), status=1),
             (1, legacy_lock_failure, ""),
         )
+        self.assertEqual(
+            run_child(baseline_changed_failure.encode(), status=1),
+            (1, baseline_changed_failure, ""),
+        )
         for stage in (
             "helper_metadata",
             "release_supervise",
@@ -965,6 +974,12 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             ).encode(),
             legacy_lock_failure.replace(
                 "class=preflight", "class=deployment"
+            ).encode(),
+            baseline_changed_failure.replace(
+                "class=preflight", "class=artifact"
+            ).encode(),
+            baseline_changed_failure.replace(
+                "phase=preflight", "phase=candidate"
             ).encode(),
             legacy_lock_failure.replace(
                 "status=failed", "status=passed"

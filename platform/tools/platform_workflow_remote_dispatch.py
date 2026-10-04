@@ -136,7 +136,7 @@ RELEASE_MARKER_RE = re.compile(
     rb"artifact_count_invalid|checksum_missing|provenance_missing|"
     rb"artifact_name_invalid|release_slug_mismatch|checksum_mismatch|"
     rb"validation_failed|provenance_invalid|candidate_missing|"
-    rb"activation_failed|lock_lost|runtime_profile_failed)"
+    rb"activation_failed|lock_lost|runtime_profile_failed|baseline_changed)"
     rb"(?: lock_stage=(?P<lock_stage>helper_metadata|release_supervise|"
     rb"release_open|retained_supervise|retained_open))?)? "
     rb"release_slug=(?P<release_slug>[A-Za-z0-9][A-Za-z0-9._-]{0,179}) "
@@ -152,6 +152,7 @@ RELEASE_FAILURE_REASONS = {
             "service_state",
             "nginx_config",
             "preflight_failed",
+            "baseline_changed",
         }
     ),
     ("artifact", "artifact"): frozenset(
