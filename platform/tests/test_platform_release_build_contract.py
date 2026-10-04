@@ -43,6 +43,7 @@ from tools.platform_ci_classifier import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD_SCRIPT = REPO_ROOT / "platform/tools/platform_build_release.sh"
 TOOLS_DIR = REPO_ROOT / "platform/tools"
+DEPLOY_SCRIPT = TOOLS_DIR / "platform_release_deploy.sh"
 DEPLOY_SUPERVISOR = TOOLS_DIR / "platform_production_deploy_supervisor.sh"
 
 
@@ -69,6 +70,17 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         if runner.count('"/var/tmp"') != 1:
             raise AssertionError("runner must have one diagnostic-root test seam")
         return runner
+
+    @staticmethod
+    def _deploy_shell_function_source(source: str, name: str) -> str:
+        match = re.search(
+            rf"^{re.escape(name)}\(\) \{{\n(?P<body>.*?)^\}}",
+            source,
+            re.MULTILINE | re.DOTALL,
+        )
+        if match is None:
+            raise AssertionError(f"deploy helper is missing: {name}")
+        return f"{name}() {{\n{match.group('body')}\n}}"
 
     @staticmethod
     def _run_candidate_diagnostic_runner(
@@ -2402,6 +2414,163 @@ fail 'private lock detail must not cross the public channel'
                 )
                 self.assertNotIn("PRIVATE", output)
                 self.assertNotIn("malformed", output)
+
+    def test_cloudflare_failed_oneshot_is_quiescent_only_with_empty_cgroup_contract(
+        self,
+    ) -> None:
+        deploy = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        helpers = "\n\n".join(
+            self._deploy_shell_function_source(deploy, name)
+            for name in (
+                "cloudflare_failed_oneshot_is_empty",
+                "read_cloudflare_quiescence_state",
+            )
+        )
+        harness = (
+            "set -uo pipefail\n"
+            + helpers
+            + "\nrun_systemctl() {\n"
+            '  case "$1" in\n'
+            '    is-active) [[ "$2" == "deadlock-cloudflare-ips.service" ]] || '
+            'return 91; printf \'%s\\n\' "$FAKE_ACTIVE_OUTPUT"; '
+            'return "$FAKE_ACTIVE_STATUS" ;;\n'
+            '    show) [[ "$2" == "deadlock-cloudflare-ips.service" && '
+            '"$3" == "--property=ActiveState,SubState,Type,RemainAfterExit,'
+            'KillMode,MainPID,ControlPID,ControlGroup" ]] || return 92; '
+            'printf \'%s\' "$FAKE_SHOW_OUTPUT"; '
+            'printf \'called\\n\' >>"$FAKE_SHOW_CALLS"; '
+            'return "$FAKE_SHOW_STATUS" ;;\n'
+            '    *) return 90 ;;\n'
+            '  esac\n'
+            "}\n"
+            "public_status() { printf 'status=%s reason=%s\\n' \"$1\" \"$2\" >&2; }\n"
+            'state=""\n'
+            'if state="$(read_cloudflare_quiescence_state)"; then status=0; '
+            'else status="$?"; fi\n'
+            'printf \'status=%s\\nstate=%s\\n\' "$status" "$state"\n'
+        )
+        keys = (
+            "ActiveState",
+            "SubState",
+            "Type",
+            "RemainAfterExit",
+            "KillMode",
+            "MainPID",
+            "ControlPID",
+            "ControlGroup",
+        )
+        valid_properties = {
+            "ActiveState": "failed",
+            "SubState": "failed",
+            "Type": "oneshot",
+            "RemainAfterExit": "no",
+            "KillMode": "control-group",
+            "MainPID": "0",
+            "ControlPID": "0",
+            "ControlGroup": "",
+        }
+
+        def run_reader(
+            *,
+            active_output: str,
+            active_status: int,
+            properties: list[tuple[str, str]],
+            show_status: int = 0,
+        ) -> tuple[subprocess.CompletedProcess[str], bool]:
+            with tempfile.TemporaryDirectory(prefix="cloudflare-quiescence-") as tmp:
+                root = Path(tmp)
+                script = root / "reader.sh"
+                script.write_text(harness, encoding="utf-8")
+                calls = root / "show-calls"
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "FAKE_ACTIVE_OUTPUT": active_output,
+                        "FAKE_ACTIVE_STATUS": str(active_status),
+                        "FAKE_SHOW_OUTPUT": "".join(
+                            f"{key}={value}\n" for key, value in properties
+                        ),
+                        "FAKE_SHOW_STATUS": str(show_status),
+                        "FAKE_SHOW_CALLS": str(calls),
+                    }
+                )
+                env.pop("BASH_ENV", None)
+                env.pop("ENV", None)
+                result = subprocess.run(
+                    ["/usr/bin/bash", "--noprofile", "--norc", str(script)],
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                return result, calls.exists()
+
+        valid_lines = list(valid_properties.items())
+        accepted = run_reader(
+            active_output="failed",
+            active_status=3,
+            properties=valid_lines,
+        )
+        self.assertEqual(accepted[0].returncode, 0, accepted[0].stderr)
+        self.assertEqual(accepted[0].stdout, "status=0\nstate=inactive\n")
+        self.assertEqual(accepted[0].stderr, "")
+        self.assertTrue(accepted[1])
+
+        for output, status, expected in (
+            ("active", 0, "active"),
+            ("inactive", 3, "inactive"),
+        ):
+            with self.subTest(state=output):
+                result, show_calls = run_reader(
+                    active_output=output,
+                    active_status=status,
+                    properties=[],
+                    show_status=1,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"status=0\nstate={expected}\n")
+                self.assertFalse(show_calls)
+
+        invalid_cases: list[tuple[str, int, list[tuple[str, str]], int]] = []
+        for key, invalid_value in (
+            ("ActiveState", "active"),
+            ("SubState", "dead"),
+            ("Type", "simple"),
+            ("RemainAfterExit", "yes"),
+            ("KillMode", "process"),
+            ("MainPID", "12"),
+            ("ControlPID", "8"),
+            ("ControlGroup", "/system.slice/deadlock-cloudflare-ips.service"),
+        ):
+            altered = list(valid_lines)
+            altered[keys.index(key)] = (key, invalid_value)
+            invalid_cases.append(("failed", 3, altered, 0))
+        invalid_cases.extend(
+            (
+                ("failed", 3, valid_lines + [("MainPID", "0")], 0),
+                ("failed", 3, valid_lines + [("Unexpected", "value")], 0),
+                ("failed", 3, valid_lines[:-1], 0),
+                ("failed", 3, valid_lines, 1),
+                ("failed", 4, valid_lines, 0),
+                ("failed", 0, valid_lines, 0),
+            )
+        )
+        for active_output, active_status, properties, show_status in invalid_cases:
+            with self.subTest(properties=properties, show_status=show_status):
+                result, _show_calls = run_reader(
+                    active_output=active_output,
+                    active_status=active_status,
+                    properties=properties,
+                    show_status=show_status,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "status=1\nstate=\n")
+                self.assertEqual(
+                    result.stderr,
+                    "status=failed reason=service_state\n",
+                )
 
     def test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher(
         self,
