@@ -14,6 +14,8 @@ import unittest
 import warnings
 import zipfile
 
+import yaml
+
 from tools.platform_ci_classifier import (
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
@@ -611,16 +613,24 @@ class PlatformCiClassifierTests(unittest.TestCase):
     def test_cancel_safe_status_finalizer_overwrites_every_terminal_conclusion(self) -> None:
         workflow = STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8")
         security = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        finalizer = yaml.safe_load(workflow)
+        finalize_job = finalizer["jobs"]["finalize-status"]
         self.assertIn("workflow_run:", workflow)
         self.assertIn("workflows: [Platform security and build]", workflow)
         self.assertIn("types: [completed]", workflow)
-        self.assertIn("if: ${{ always() }}", workflow)
+        self.assertIn("always() &&", finalize_job["if"])
+        self.assertIn("github.event_name != 'workflow_run'", finalize_job["if"])
+        self.assertIn("cancel-in-progress: false", workflow)
         self.assertNotIn("--location", workflow)
         self.assertIn("permissions:\n      actions: read\n      statuses: write", workflow)
         self.assertNotIn("actions/checkout", workflow)
         self.assertNotIn("secrets.", workflow)
         self.assertIn("TARGET_SHA: ${{ github.event.workflow_run.head_sha }}", workflow)
-        self.assertIn("statuses/${TARGET_SHA}", workflow)
+        self.assertEqual(
+            finalize_job["steps"][1]["env"]["TARGET_SHA"],
+            "${{ steps.status.outputs.target_sha }}",
+        )
+        self.assertIn("statuses/${TARGET_SHA}", finalize_job["steps"][1]["run"])
         self.assertIn("attempt_url=", workflow)
         self.assertIn("SOURCE_RUN_URL", workflow)
         self.assertIn("/attempts/${SOURCE_RUN_ATTEMPT}", workflow)
@@ -629,11 +639,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertNotIn("updated_at", workflow)
         self.assertNotIn("status_rows", workflow)
         self.assertNotIn("pagination", workflow)
-        self.assertIn('if [[ "$SOURCE_CONCLUSION" == "success" ]]', workflow)
+        self.assertIn('state = "success" if conclusion == "success" else "failure"', workflow)
         self.assertIn('"state": state', workflow)
-        self.assertIn("state=failure", workflow)
-        self.assertIn('description="Platform security or build failed"', workflow)
-        self.assertIn('description="Platform security and build passed"', workflow)
+        self.assertIn('"target_url": expected_base_url + "/attempts/" + attempt', workflow)
         self.assertIn('status_context = "platform-security-build"', workflow)
         self.assertIn('status_context = "platform-baseline-runtime"', workflow)
         self.assertIn('raise SystemExit("workflow-dispatch run mode is unavailable; no status will be published")', workflow)
@@ -697,6 +705,58 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('"success", "failure", "cancelled", "skipped", "timed_out"', finalizer)
         self.assertIn('if status_context == "platform-baseline-runtime" and conclusion == "success":', finalizer)
         self.assertNotIn('context = "platform-security-build"\n                  if is_baseline_candidate', finalizer)
+
+    def test_baseline_proof_terminal_writer_is_success_only_and_separate_from_workflow_run(self) -> None:
+        security = yaml.safe_load(SECURITY_WORKFLOW.read_text(encoding="utf-8"))
+        finalizer = yaml.safe_load(STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8"))
+        security_jobs = security["jobs"]
+        dispatch = security_jobs["dispatch-baseline-runtime-finalizer"]
+        self.assertEqual(dispatch["permissions"], {"actions": "write"})
+        self.assertEqual(dispatch["needs"], ["status-final"])
+        self.assertIn("github.event_name == 'workflow_dispatch'", dispatch["if"])
+        self.assertIn("inputs.proof_mode == 'baseline-runtime'", dispatch["if"])
+        self.assertIn("needs.status-final.result == 'success'", dispatch["if"])
+        dispatch_step = dispatch["steps"][0]
+        self.assertEqual(dispatch_step["name"], "Dispatch the exact completed proof attempt to the terminal status finalizer")
+        self.assertEqual(dispatch_step["env"]["PROOF_MODE"], "${{ inputs.proof_mode }}")
+        self.assertEqual(dispatch_step["env"]["PROOF_RUN_ID"], "${{ github.run_id }}")
+        self.assertEqual(dispatch_step["env"]["PROOF_RUN_ATTEMPT"], "${{ github.run_attempt }}")
+        self.assertIn("test \"$GITHUB_REF\" = refs/heads/dev", dispatch_step["run"])
+        self.assertIn("platform-security-status-finalizer.yml/dispatches", dispatch_step["run"])
+        self.assertIn('"proof_run_id": run_id', dispatch_step["run"])
+        self.assertIn('"proof_run_attempt": attempt', dispatch_step["run"])
+        self.assertIn('"ref": "dev"', dispatch_step["run"])
+
+        events = finalizer.get("on", finalizer.get(True, {}))
+        self.assertEqual(events["workflow_run"]["types"], ["completed"])
+        self.assertEqual(
+            set(events["workflow_dispatch"]["inputs"]),
+            {"proof_run_id", "proof_run_attempt"},
+        )
+        for input_spec in events["workflow_dispatch"]["inputs"].values():
+            self.assertIs(input_spec["required"], True)
+            self.assertEqual(input_spec["type"], "string")
+        finalize_job = finalizer["jobs"]["finalize-status"]
+        self.assertIn("startsWith(github.event.workflow_run.display_title, 'platform-baseline-runtime-v1:')", finalize_job["if"])
+        self.assertIn("github.event.workflow_run.event == 'workflow_dispatch'", finalize_job["if"])
+        self.assertEqual(
+            finalize_job["concurrency"]["group"],
+            "platform-status-finalizer-${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.proof_run_id }}-${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || inputs.proof_run_attempt }}",
+        )
+        self.assertEqual(finalize_job["permissions"], {"actions": "read", "statuses": "write"})
+        validate_step = finalize_job["steps"][0]["run"]
+        self.assertIn("deadline=$((SECONDS + 180))", validate_step)
+        self.assertIn("while (( SECONDS < deadline ))", validate_step)
+        self.assertIn('attempts/${SOURCE_RUN_ATTEMPT}', validate_step)
+        self.assertIn('"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"', validate_step)
+        self.assertIn('current.get("run_attempt") != int(attempt)', validate_step)
+        self.assertIn('run.get("conclusion") != "success"', validate_step)
+        publish_step = finalize_job["steps"][1]
+        self.assertEqual(
+            publish_step["env"]["TARGET_SHA"],
+            "${{ steps.status.outputs.target_sha }}",
+        )
+        self.assertIn("${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}", publish_step["run"])
 
     def test_baseline_source_status_must_be_latest_for_the_exact_attempt(self) -> None:
         workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")

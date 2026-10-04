@@ -5,8 +5,12 @@ import ast
 from datetime import datetime, timezone
 import importlib
 import inspect
+import json
+import os
 import re
 import sys
+import subprocess
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -17,6 +21,7 @@ import yaml
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 WORKFLOW_DIR = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+STATUS_FINALIZER_WORKFLOW = WORKFLOW_DIR / "platform-security-status-finalizer.yml"
 sys.path.insert(0, str(TOOLS))
 
 from tools.platform_workflow_provenance import (  # noqa: E402
@@ -57,6 +62,364 @@ from tools.platform_ci_classifier import (  # noqa: E402
 
 class WorkflowProvenanceTests(unittest.TestCase):
     SHA = "a" * 40
+
+    def _run_finalizer_dispatch_wait(
+        self,
+        *,
+        attempt_state: str,
+        latest_attempt: int = 1,
+        timeout_probe: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], list[str], str]:
+        workflow = yaml.safe_load(STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8"))
+        shell = workflow["jobs"]["finalize-status"]["steps"][0]["run"]
+        finalizer_shell = shell
+        if timeout_probe:
+            finalizer_shell = finalizer_shell.replace("SECONDS + 180", "SECONDS + 1")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/python3
+                    import json
+                    import os
+                    from pathlib import Path
+                    import sys
+
+                    args = sys.argv[1:]
+                    output = Path(args[args.index("--output") + 1])
+                    url = next(value for value in args if value.startswith("https://"))
+                    with open(os.environ["REQUEST_LOG"], "a", encoding="utf-8") as log:
+                        log.write(url + "\\n")
+                    if "/attempts/" in url:
+                        counter = Path(os.environ["ATTEMPT_COUNTER"])
+                        calls = int(counter.read_text() or "0") if counter.exists() else 0
+                        counter.write_text(str(calls + 1), encoding="ascii")
+                        if os.environ["ATTEMPT_STATE"] == "timeout":
+                            result = {"status": "in_progress", "conclusion": None}
+                        elif os.environ["ATTEMPT_STATE"] == "failed":
+                            result = dict(json.loads(Path(os.environ["ATTEMPT_RUN"]).read_text()))
+                            result.update({"status": "completed", "conclusion": "failure"})
+                        elif calls == 0:
+                            result = {"status": "in_progress", "conclusion": None}
+                        else:
+                            result = dict(json.loads(Path(os.environ["ATTEMPT_RUN"]).read_text()))
+                    elif url.endswith("/actions/runs/12345"):
+                        result = json.loads(Path(os.environ["LATEST_RUN"]).read_text())
+                    elif url.endswith("/actions/workflows/77"):
+                        result = {
+                            "id": 77,
+                            "path": ".github/workflows/platform-security.yml",
+                            "name": "Platform security and build",
+                        }
+                    else:
+                        raise SystemExit("unexpected API endpoint")
+                    output.write_text(json.dumps(result), encoding="utf-8")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            fake_sleep = fake_bin / "sleep"
+            fake_sleep.write_text("#!/bin/sh\n/bin/sleep 0.05\n", encoding="utf-8")
+            fake_sleep.chmod(0o755)
+            marker = f"platform-baseline-runtime-v1:{self.SHA}:s111.1:a222.1:d333.1:r12345.1"
+            attempt_metadata = {
+                "id": 12345,
+                "workflow_id": 77,
+                "name": marker,
+                "display_title": marker,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": self.SHA,
+                "head_branch": "dev",
+                "event": "workflow_dispatch",
+                "path": ".github/workflows/platform-security.yml",
+                "html_url": "https://github.com/StrayForest/old_sparky/actions/runs/12345",
+                "repository": {"full_name": "StrayForest/old_sparky"},
+                "actor": {"login": "github-actions[bot]"},
+            }
+            attempt_path = root / "attempt.json"
+            attempt_path.write_text(json.dumps(attempt_metadata), encoding="utf-8")
+            latest_path = root / "latest.json"
+            latest_run = dict(attempt_metadata)
+            latest_run["run_attempt"] = latest_attempt
+            latest_path.write_text(json.dumps(latest_run), encoding="utf-8")
+            log_path = root / "requests.txt"
+            counter_path = root / "attempt-count.txt"
+            runner_temp = root / "runner"
+            runner_temp.mkdir()
+            output_path = root / "github-output"
+            output_path.touch()
+            required_jobs = [
+                "Authenticate internal baseline runtime proof",
+                "Backend DB-free contours",
+                "Backend PostgreSQL and Redis integration",
+                "Backend privileged ephemeral contour",
+                "Backend aggregate",
+                "Python quality",
+                "Security gates",
+                "web-quality",
+                "Web hermetic",
+                "Documentation consistency",
+                "Migration scenarios",
+                "Verification contract",
+                "Conditional release runtime fixture",
+                "Trusted dev immutable release runtime",
+                "status-start",
+                "status-final",
+                "Dispatch exact baseline proof finalizer",
+            ]
+            jobs_path = root / "jobs.json"
+            jobs_path.write_text(
+                json.dumps(
+                    {
+                        "total_count": len(required_jobs),
+                        "jobs": [
+                            {"name": name, "status": "completed", "conclusion": "success"}
+                            for name in required_jobs
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "sitecustomize.py").write_text(
+                textwrap.dedent(
+                    """\
+                    import os
+                    from pathlib import Path
+                    import urllib.request
+
+                    class Response:
+                        def __init__(self, url, body):
+                            self.url = url
+                            self.body = body
+                        def __enter__(self):
+                            return self
+                        def __exit__(self, *args):
+                            return False
+                        def read(self, size=-1):
+                            return self.body if size < 0 else self.body[:size]
+                        def geturl(self):
+                            return self.url
+
+                    class Opener:
+                        def open(self, request, timeout=20):
+                            url = request.full_url
+                            if not url.endswith("/jobs?per_page=100"):
+                                raise RuntimeError("unexpected API endpoint")
+                            return Response(url, Path(os.environ["JOBS_PAYLOAD"]).read_bytes())
+
+                    urllib.request.build_opener = lambda *args: Opener()
+                    """
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_OUTPUT": str(output_path),
+                    "GITHUB_SERVER_URL": "https://github.com",
+                    "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                    "GITHUB_API_URL": "https://api.github.com",
+                    "GITHUB_REF": "refs/heads/dev",
+                    "GH_TOKEN": "test-token",
+                    "FINALIZER_EVENT_NAME": "workflow_dispatch",
+                    "FINALIZER_ACTOR": "github-actions[bot]",
+                    "SOURCE_RUN_ID": "12345",
+                    "SOURCE_RUN_ATTEMPT": "1",
+                    "SOURCE_WORKFLOW_ID": "",
+                    "ATTEMPT_STATE": attempt_state,
+                    "ATTEMPT_COUNTER": str(counter_path),
+                    "ATTEMPT_RUN": str(attempt_path),
+                    "LATEST_RUN": str(latest_path),
+                    "REQUEST_LOG": str(log_path),
+                    "JOBS_PAYLOAD": str(jobs_path),
+                    "PYTHONPATH": str(root),
+                }
+            )
+            environment.pop("BASH_ENV", None)
+            environment.pop("ENV", None)
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", finalizer_shell],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=5,
+            )
+            requests = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
+            return result, requests, output_path.read_text(encoding="utf-8")
+
+    def test_baseline_finalizer_waits_for_exact_attempt_and_rejects_failure_drift_or_timeout(self) -> None:
+        succeeded, requests, output = self._run_finalizer_dispatch_wait(
+            attempt_state="pending-then-success",
+        )
+        self.assertEqual(succeeded.returncode, 0, succeeded.stderr)
+        self.assertEqual(
+            requests,
+            [
+                "https://api.github.com/repos/StrayForest/old_sparky/actions/runs/12345/attempts/1",
+                "https://api.github.com/repos/StrayForest/old_sparky/actions/runs/12345/attempts/1",
+                "https://api.github.com/repos/StrayForest/old_sparky/actions/runs/12345",
+                "https://api.github.com/repos/StrayForest/old_sparky/actions/workflows/77",
+            ],
+        )
+        self.assertIn("context=platform-baseline-runtime", output)
+        self.assertIn(f"target_sha={self.SHA}", output)
+        self.assertIn("publish=true", output)
+        self.assertIn("https://github.com/StrayForest/old_sparky/actions/runs/12345/attempts/1", output)
+
+        failed, failure_requests, _ = self._run_finalizer_dispatch_wait(
+            attempt_state="failed",
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("did not complete successfully", failed.stderr)
+        self.assertEqual(len(failure_requests), 1)
+
+        drifted, drift_requests, _ = self._run_finalizer_dispatch_wait(
+            attempt_state="pending-then-success",
+            latest_attempt=2,
+        )
+        self.assertNotEqual(drifted.returncode, 0)
+        self.assertIn("not the latest successful exact attempt", drifted.stderr)
+        self.assertEqual(
+            drift_requests,
+            [
+                "https://api.github.com/repos/StrayForest/old_sparky/actions/runs/12345/attempts/1",
+                "https://api.github.com/repos/StrayForest/old_sparky/actions/runs/12345/attempts/1",
+                "https://api.github.com/repos/StrayForest/old_sparky/actions/runs/12345",
+                "https://api.github.com/repos/StrayForest/old_sparky/actions/workflows/77",
+            ],
+        )
+        timeout, timeout_requests, _ = self._run_finalizer_dispatch_wait(
+            attempt_state="timeout",
+            timeout_probe=True,
+        )
+        self.assertNotEqual(timeout.returncode, 0)
+        self.assertIn("Timed out waiting for the exact baseline proof attempt", timeout.stderr)
+        self.assertGreaterEqual(len(timeout_requests), 1)
+        self.assertTrue(all("/attempts/1" in request for request in timeout_requests))
+
+    def _run_finalizer_terminal_post(self, *, latest_attempt: int) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        workflow = yaml.safe_load(STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8"))
+        shell = workflow["jobs"]["finalize-status"]["steps"][1]["run"]
+        marker = f"platform-baseline-runtime-v1:{self.SHA}:s111.1:a222.1:d333.1:r12345.1"
+        latest_run = {
+            "id": 12345,
+            "run_attempt": latest_attempt,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+            "head_branch": "dev",
+            "head_sha": self.SHA,
+            "path": ".github/workflows/platform-security.yml",
+            "actor": {"login": "github-actions[bot]"},
+            "display_title": marker,
+            "name": marker,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            request_log = root / "requests.txt"
+            latest_path = root / "latest.json"
+            latest_path.write_text(json.dumps(latest_run), encoding="utf-8")
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/python3
+                    import json
+                    import os
+                    from pathlib import Path
+                    import sys
+
+                    args = sys.argv[1:]
+                    url = next(value for value in args if value.startswith("https://"))
+                    method = args[args.index("--request") + 1] if "--request" in args else "GET"
+                    with open(os.environ["REQUEST_LOG"], "a", encoding="utf-8") as log:
+                        log.write(method + " " + url + "\\n")
+                    if url.endswith("/actions/runs/12345") and "--output" in args:
+                        Path(args[args.index("--output") + 1]).write_text(
+                            Path(os.environ["LATEST_RUN"]).read_text(), encoding="utf-8"
+                        )
+                    elif method == "POST" and "/statuses/" in url:
+                        print("{}")
+                    else:
+                        raise SystemExit("unexpected endpoint or method")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            runner_temp = root / "runner"
+            runner_temp.mkdir()
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_API_URL": "https://api.github.com",
+                    "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                    "GH_TOKEN": "test-token",
+                    "FINALIZER_EVENT_NAME": "workflow_dispatch",
+                    "PROOF_RUN_ID": "12345",
+                    "PROOF_RUN_ATTEMPT": "1",
+                    "PROOF_TARGET_SHA": self.SHA,
+                    "TARGET_SHA": self.SHA,
+                    "STATUS_CONTEXT": "platform-baseline-runtime",
+                    "STATUS_PAYLOAD": json.dumps(
+                        {
+                            "state": "success",
+                            "description": "Platform security and build passed",
+                            "target_url": (
+                                "https://github.com/StrayForest/old_sparky/actions/runs/"
+                                "12345/attempts/1"
+                            ),
+                        }
+                    ),
+                    "LATEST_RUN": str(latest_path),
+                    "REQUEST_LOG": str(request_log),
+                }
+            )
+            environment.pop("BASH_ENV", None)
+            environment.pop("ENV", None)
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", shell],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=5,
+            )
+            requests = request_log.read_text(encoding="utf-8").splitlines() if request_log.exists() else []
+            return result, requests
+
+    def test_baseline_finalizer_late_recheck_blocks_post_when_attempt_changes(self) -> None:
+        success, success_requests = self._run_finalizer_terminal_post(latest_attempt=1)
+        self.assertEqual(success.returncode, 0, success.stderr)
+        self.assertEqual(
+            success_requests,
+            [
+                "GET https://api.github.com/repos/StrayForest/old_sparky/actions/runs/12345",
+                f"POST https://api.github.com/repos/StrayForest/old_sparky/statuses/{self.SHA}",
+            ],
+        )
+
+        changed, changed_requests = self._run_finalizer_terminal_post(latest_attempt=2)
+        self.assertNotEqual(changed.returncode, 0)
+        self.assertIn("no longer the exact latest successful attempt", changed.stderr)
+        self.assertEqual(
+            changed_requests,
+            ["GET https://api.github.com/repos/StrayForest/old_sparky/actions/runs/12345"],
+        )
 
     def _payload(self) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
         run_id = 1234
