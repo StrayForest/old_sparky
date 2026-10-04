@@ -257,6 +257,7 @@ jobs:
           fetch "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=1" "$metadata_dir/security-statuses.json"
           /usr/bin/python3 - "$metadata_dir" "$TARGET_SHA" "$SOURCE_SECURITY_RUN_ID" "$SOURCE_SECURITY_RUN_ATTEMPT" "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" "$PRODUCTION_DEPLOY_RUN_ID" "$PRODUCTION_DEPLOY_RUN_ATTEMPT" "$PROOF_RUN_ID" "$PROOF_RUN_ATTEMPT" <<'PY'
           import json
+          from datetime import datetime, timezone
           from pathlib import Path
           import re
           import sys
