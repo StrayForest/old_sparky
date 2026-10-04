@@ -13,9 +13,12 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
 is the only source for `HOST_TOOLS_SHA`; the reviewed C4 change pins generation
-`7b87e2a996270e818f3b1f0c95c03fe98ab53916`. This repository pin is not
-evidence that the generation is installed: production remains on C3 until a
-root-console provisioning receipt verifies the new path. The pin records the
+`7b87e2a996270e818f3b1f0c95c03fe98ab53916`. The pending C5 pin candidate
+selects generation `0d9d80b7a7d4365abaaf7875e88442b5f43ed46f`; production still
+has C4 installed until a C5 provisioning receipt verifies the new inventory.
+The application release is a separate identity and remains at the release
+documented in [`CURRENT.md`](../CURRENT.md) until an exact successful
+automatic deployment and smoke are recorded there. The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
 ancestor of the reviewed application target. There is no `current` or
@@ -166,17 +169,23 @@ separate classifier and release contract.
 ## One-time operator provisioning (out of band)
 
 This repository change prepares and verifies the handoff only. An operator or
-approved host-image/configuration-management authority must perform the
-following once for a reviewed `HOST_TOOLS_SHA`; the GitHub workflow must not be
-used as the installer:
+approved host-image/configuration-management authority performs provisioning
+for a reviewed `HOST_TOOLS_SHA`; the GitHub workflow must not be used as the
+installer:
 
 1. Record the successful exact-`TARGET_SHA` `Platform security and build`
-   run/attempt. From the separately authorized read-only `mode=preflight`
-   workflow run at that same merged `dev` SHA, record the exact successful
-   `build-host-tools` job/attempt, artifact ID/name, outer artifact digest,
-   application `TARGET_SHA` and pinned `HOST_TOOLS_SHA`. Verify that the
-   preflight run performed no release install or production write. Download
-   its ZIP through the approved artifact channel and verify its SHA-256 before
+   run/attempt. Use a successful `build-host-tools` job and its attested bundle
+   from either a read-only `mode=preflight` run at that same merged `dev` SHA,
+   or the exact normal automatic production run for that SHA when the
+   host-capability gate failed solely because this pinned generation was
+   missing. For the automatic run, also verify the successful automatic
+   dispatch, its exact production child attempt, all preceding provenance and
+   host-contract checks, and that the child did not begin the release build,
+   create pending release state or perform a production write. Any other
+   failure is not provisioning evidence. Bind the successful builder job and
+   artifact ID/name/outer digest, application `TARGET_SHA`, pinned
+   `HOST_TOOLS_SHA`, and attestation to their exact run/attempts. Download the
+   ZIP through the approved artifact channel and verify its SHA-256 before
    opening it. The pull-request candidate artifact is not an acceptable
    substitute.
 2. Run the offline `platform_host_tools_bundle.py verify` command from the
@@ -239,33 +248,30 @@ pin-only-with-respect-to-host-control commit **P** that names **C** and records
 the exact closure digests. **C** must be an ancestor of **P**; the resolver
 must accept the exact pin and closure at **P**. The pull request and its
 synthetic merge are tested together, and the exact merged **P** must pass the
-full `Platform security and build` workflow. Because a host-control-only
-change is non-deployable, it does not receive an automatic deployment run.
-After full CI succeeds for exact **P**, the documented read-only
-`workflow_dispatch` `mode=preflight` at **P** runs `build-host-tools`: it
-resolves **C** from **P**, checks out **C**, builds and signs the exact bundle,
-and publishes the artifact before the capability check. That downstream
-read-only capability check may fail closed because **C** is not yet
-provisioned. The successful exact `build-host-tools` job and its artifact
-attestation from that preflight run, together with exact-P full-CI evidence,
-are the reviewed provisioning inputs. Do not use the separate pull-request
-candidate artifact as the authoritative provisioning input. The source
-identities remain separate: **P** is the preflight run's application target
-and `HOST_TOOLS_SHA=C` names the bytes installed at the generation path. Never
-require `TARGET_SHA == HOST_TOOLS_SHA`; verify the exact producer run,
-artifact identity, ancestry and closure instead.
-
-Provisioning **C** alone does not authorize an application release. Activation
-requires the separately reviewed Phase B baseline-reconcile capability. That
-capability is not available from the Phase A host-tools change alone; do not
-manually dispatch or assume that `mode=baseline-reconcile` is enabled until
-its workflow, pinned host code, exact tests and full CI have been reviewed and
-published. Phase B must authenticate the current host release against its
-successful deployment proof, reclassify the complete first-parent range and
-repeat the baseline check under both production locks before any write. A
-bootstrap-only range must end as a verified no-op; a mixed range may proceed
-only if the complete range satisfies the ordinary full deployable route,
-including runtime gates when required.
+full `Platform security and build` workflow. A host-control-only cumulative
+range is non-deployable by itself. The active automatic chain may route that
+exact recovery-bootstrap-only range through `mode=baseline-reconcile`; do not
+dispatch this mode manually. The production workflow authenticates the exact
+source-CI and automatic caller attempts, reads the installed host baseline
+through the pinned generation, verifies successful deployment proof for the
+baseline source using its unique latest bot-authored deploy marker, canonical
+attempt URL and successful exact `Deploy production` job. One baseline-only
+compatibility adapter accepts the historical root-validated slug
+`gha-<run_id>-1-<UTC build timestamp>` with a bare run URL only when both carry
+the same run ID and the current GitHub run API still reports attempt 1. The
+exact attempt-1 run, source, bot status, workflow and successful job checks
+remain mandatory; unknown slugs, reruns, incomplete pages or ambiguous proof
+fail closed. New status markers use exact attempt URLs. It then checks
+first-parent ancestry to **P** and reclassifies the complete range with the
+trusted classifier. A pure bootstrap range is a verified no-op. A range
+containing application changes proceeds
+only when the cumulative route is full, deployable and non-fallback, with exact-target
+runtime gates when required. Immediately before protected release work, the
+pinned supervisor rereads and compares the complete baseline tuple while
+holding both production locks. **P** remains the application target and
+`HOST_TOOLS_SHA=C` names the bytes at the immutable generation path; never
+require `TARGET_SHA == HOST_TOOLS_SHA` or treat the CI artifact as deployment
+authority.
 
 ## Intentional host-tools bump lifecycle
 

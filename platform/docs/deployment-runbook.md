@@ -61,9 +61,13 @@ to `dev`. The chain is:
 4. The automatic chain dispatches `mode=deploy` for ordinary deployable full
    routes. For a recovery-bootstrap-only route it dispatches
    `mode=baseline-reconcile` only as part of the validated automatic chain; the
-   production workflow authenticates the exact source-CI and caller attempts
-   before it reads the active baseline. Operators must not manually dispatch
-   that mode.
+   production workflow authenticates the source and caller and requires the
+   active baseline's unique latest bot-authored deploy marker, canonical
+   attempt URL and successful exact `Deploy production` job. Legacy support is
+   limited to a root-validated `gha-<run_id>-1-<UTC timestamp>` slug whose run ID matches the
+   latest bot-authored bare URL; GitHub must report attempt 1 and exact checks must pass.
+   Unknown formats, reruns or ambiguity fail closed. New markers use attempt
+   URLs; never dispatch this mode.
 5. A secret-free prerequisite independently downloads and validates the exact
    classifier artifact before the expensive candidate build is allowed to run.
    The production environment then repeats that exact-SHA validation immediately
@@ -87,43 +91,35 @@ to `dev`. The chain is:
    `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` generation. It
    requires the configured SSH identity to be root and checks the generation's
    owner, mode, link count, type, capabilities and every digest with fixed
-   absolute tools. The C4 generation retains the C3 capability contract:
+   absolute tools. The currently installed C4 generation and pending C5 pin
+   candidate retain the same capability contract:
    `dispatcher=3`, `supervisor=3`, `release_baseline=1` and
    `python_bytecode_disabled=1`; every immutable dispatcher call uses
-   `/usr/bin/python3.12 -I -B`. This is a read-only gate: it never SCPs or executes the
-   bundle and fails before release build, attestation, pending status or
-   production artifact transfer when the generation is absent or mismatched.
-   The host-tools manifest/source/generation are bound to `HOST_TOOLS_SHA`;
-   the release artifact, provenance, migration and deployed receipt remain
-   bound to application `TARGET_SHA`. The artifact API binding uses its ID,
-   name, run ID, application source SHA and digest;
-   because nested `workflow_run.run_attempt` may be absent, the secret-free
-   host-tools build gate validates the exact current attempt through the
-   authoritative GitHub attempt endpoint with bounded typed JSON and rejects
-   missing, malformed or mismatched fields. Raw artifact metadata is bounded
-   before parsing by the reviewed canonical verifier, which also matches
-   `size_in_bytes` to the downloaded archive byte size.
+   `/usr/bin/python3.12 -I -B`. A missing or mismatched generation fails before
+   app build/attestation, pending status or transfer. Host bundle/source bind to
+   `HOST_TOOLS_SHA`; app artifact, provenance, migration and receipt bind to
+   `TARGET_SHA`. API artifact ID/name/run/source/digest and downloaded size
+   are cross-checked by bounded canonical verification. Because a nested
+   `workflow_run.run_attempt` may be absent, the secret-free builder resolves
+   the exact attempt through GitHub's authoritative attempt endpoint.
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
 
 ### Recovery-bootstrap baseline reconciliation
 
-This path is automatic-only; never dispatch it manually. It authenticates the
-exact source-CI, caller and parent attempts, then reads the pinned host baseline
-and proves its source SHA with complete bounded status/run/job snapshots and
-first-parent ancestry to the exact `dev` target. The trusted classifier
-recomputes cumulative paths; bootstrap-only is a verified no-op, while a
-deployable full route needs all canonical gates. Runtime-sensitive deploys
-also require exact-target runtime gates and an attempt-bound status/receipt;
-the parent waits for the child finalizer's terminal status. The separate
-context preserves the push `platform-security-build` marker.
+This path is automatic-only; never dispatch it manually. It authenticates exact
+source-CI/caller/parent attempts, the pinned host baseline and its deployment
+proof from complete bounded API snapshots, plus first-parent ancestry to exact
+`dev`. Classification follows event ownership, not bundle membership (the
+bundled live-QA installer stays full/runtime). Bootstrap-only is a verified
+no-op; deployable routes need canonical gates and sensitive routes also need
+exact-target runtime gates/receipt. The finalizer preserves the push context.
 
-Only unique marker-bound temporary ingress and lock files may precede the
-comparison. Under both locks, the immutable supervisor requires an exact tuple
-match, no pending transaction and unchanged `dev` before application artifact
-validation/extraction, candidate execution or protected writes. Cleanup may
-remove only that identity-bound ingress; broad temporary cleanup is forbidden.
-Missing or changed state fails closed. See the [baseline-reconcile ADR](adr/recovery-bootstrap-retained-abort.md#authenticated-baseline-reconciliation-for-bootstrap-only-source-ranges)
+Only marker-bound temporary ingress and lock files may precede comparison.
+Under both locks, the immutable supervisor checks tuple match, no pending
+transaction and unchanged `dev` before app artifact validation/extraction,
+candidate execution or protected writes. Cleanup removes only bound ingress.
+See the [baseline-reconcile ADR](adr/recovery-bootstrap-retained-abort.md#authenticated-baseline-reconciliation-for-bootstrap-only-source-ranges)
 and [host-tools provisioning ADR](adr/production-host-tools-provisioning.md).
 
 ### Non-deployable pull-request host-tools candidate
@@ -263,22 +259,25 @@ deployment. `mode=baseline-reconcile` is accepted only from the validated
 automatic chain and is never an operator fallback. `mode=preflight` remains
 available without that release artifact guard and performs no install.
 
-Both `mode=deploy` and the read-only `mode=preflight` require the immutable
-host-tools capability gate. For a bump, first require full exact-SHA CI on the
-merged pin-bearing target **P**, which descends from code commit **C** and pins
-its exact closure. The documented read-only `mode=preflight` then builds and
-attests the generation from **C**; if it is not installed, capability checks
-fail closed after artifact publication. Verify the exact workflow attempt,
-successful builder job, artifact provenance and distinct `TARGET_SHA=P` /
-`HOST_TOOLS_SHA=C` identities before provisioning through the approved
-root-only authority. This run performs no release install or production
-write. Retain the previous generation and exact post-copy inventory; do not use a workflow installer or `current/tools` fallback.
-If the automatic child stopped only because **C** was absent at the read-only capability gate, do not rerun that child or only failed jobs.
-After provisioning/self-testing **C**, require successful read-only `mode=preflight` at unchanged **P**.
-Only if **P** remains current `dev`, exact source-CI proof is valid, host tuple is unchanged and no operation is pending, rerun all jobs on the exact completed `Platform production auto-deploy` run.
-This preserves source/ref and triggering actor, advances the auto attempt and dispatches a fresh child bound to it; verify both new run IDs/attempts and exact success markers.
-If preconditions changed, follow the automatic chain for current `dev`; never manually dispatch `mode=deploy`/`mode=baseline-reconcile`. Application-only SHAs reuse the pin.
-See the [host-tools provisioning ADR](adr/production-host-tools-provisioning.md) for C/P provenance and receipt fields.
+Deploy and preflight require immutable host-tools; a bump's exact full CI must pass on pin-bearing **P** descended from **C**.
+Normally `mode=preflight` at **P** builds and attests **C**. A natural
+production builder artifact also qualifies if exact source CI, auto caller and
+host contract passed, and capability failed solely because **C** was absent
+before app build/attestation, pending status, transfer or protected writes.
+Bind exact attempts, builder job, artifact, attestation and both SHAs before
+root-only provisioning; retain the prior generation and verify its inventory.
+
+After self-testing **C**, rerun all jobs on the exact auto-deploy run only if
+**P** remains `dev`, source proof and host tuple are unchanged, and no operation
+is pending. This advances the auto attempt and creates a fresh child; verify
+both run IDs/attempts and success markers. Otherwise use the automatic chain; never manually deploy/reconcile or rerun a failed child.
+
+After a verified pre-install preflight failure, one all-jobs rerun of the exact
+auto-deploy run is allowed only if its target is still current `dev` with
+successful source CI, the baseline/pointers are unchanged, no transaction is
+pending, locks are free, and backup/edge/config/readiness/host checks pass.
+This must create a fresh child; never rerun only child/jobs or manually dispatch.
+Stop if the predicate fails again or the failure stage is unclear.
 Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly
 for a normal release. Those commands are implementation details of the
 workflow; direct server execution is limited to an explicitly authorized
@@ -387,21 +386,22 @@ snapshot and then consumes the receipt with `abort-quiesce`; malformed,
 partial, occupied-candidate or other operation-less receipts fail before a
 systemd query. This is not the legacy `recovery-restored` cleanup bridge.
 
-If an operator explicitly chooses code/runtime rollback after reviewing
-database compatibility, use the guarded abort command. It restores the
-recorded pointers and venv and never downgrades Alembic:
+For code/runtime rollback after reviewing database compatibility, the guarded
+abort restores recorded pointers/venv and never downgrades Alembic. Invoke only
+the helper at the validated receipt's immutable `candidate_release` path after
+verifying its recorded digest:
 
 ```bash
-tools/platform_release_deploy.sh \
+/opt/oldsparky/platform/releases/<candidate-slug>/tools/platform_release_deploy.sh \
   --abort-retained \
   --confirm-migration-not-reversed \
   --app-dir /opt/oldsparky/platform
 ```
 
-The command restores and verifies only services recorded active before
-quiesce; intentionally inactive units and timers remain stopped. A restart,
-readiness, pointer or identity failure retains the receipt for another guarded
-attempt.
+It restores only services recorded active before quiesce; failures retain the
+receipt. After pointer rollback never select helpers through `current/tools`
+or the restored release. If the transaction-bound helper cannot be verified,
+leave the receipt retained and use the documented immutable recovery entrypoint.
 
 Rollback has a separate root-owned
 `shared/.release-systemd-state.json` receipt. Before switching pointers it
