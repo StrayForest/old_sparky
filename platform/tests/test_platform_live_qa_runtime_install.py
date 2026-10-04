@@ -416,7 +416,10 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             old = self._make_retention_entry(payload_root, "e" * 40, 1)
             newest = self._make_retention_entry(payload_root, "f" * 40, 2)
 
-            with mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root):
+            with (
+                mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root),
+                mock.patch.object(runtime, "ACTIVE_POINTER", root / "active"),
+            ):
                 self.assertEqual(runtime._retention(root / "app", apply=True), 1)
             self.assertFalse(old.exists())
             self.assertTrue(newest.exists())
@@ -429,7 +432,10 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             old = self._make_retention_entry(payload_root, "1" * 40, 1, hardlink=True)
             self._make_retention_entry(payload_root, "2" * 40, 2)
 
-            with mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root):
+            with (
+                mock.patch.object(runtime, "PAYLOAD_ROOT", payload_root),
+                mock.patch.object(runtime, "ACTIVE_POINTER", root / "active"),
+            ):
                 with self.assertRaisesRegex(
                     runtime.InstallerError,
                     "link count is unsafe",

@@ -269,22 +269,22 @@ resolver against the repository and target SHA. The fast DB-free backend
 contour stays shallow and proves the static contract plus the synthetic A/B
 pin-bump lifecycle; it does not silently skip historical ancestry proof.
 
-The `platform-host-tools-candidate.yml` workflow is a separate trusted
-`workflow_run` contract, not a production gate.  Its validator and bundle
-tests remain owned by the `backend-tool-contract` contour through
-`test_platform_host_tools_bundle`, except the active-baseline reader test,
-which exercises root-owned release metadata and belongs to
-`backend-privileged`; the executable catalog snapshot must be updated whenever
-those tests change.  The verification-contract gate also
-invokes `host_tools_candidate_workflow_issues()` so a missing default-branch
-guard, broadened permission, unpinned action, direct candidate execution,
-unsafe isolated-Python invocation, missing TOCTOU recheck or production
-artifact consumer fails closed.  The workflow first validates whether the
-resolved pin is a novel generation: an existing base-reachable pin completes
-as a successful no-op, while only an eligible novel pin reaches build,
-attestation and upload.  Its successful output is bounded review evidence
-only: it never grants deploy/provision authority and production workflows must
-not consume its artifact prefixes.
+Operation-bound legacy LiveQA fixtures in `test_platform_recovery_bootstrap` stay in `backend-privileged`; they cover receipt/pointer/venv identity, service/timer snapshot, readiness
+and receipt-last cleanup. `test_liveqa_reconcile_stderr_is_available_only_to_private_candidate_capture`
+checks the helper preserves reconcile stderr. Its companion
+`test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` verifies private
+capture and closed stdout/public markers; the executable catalog snapshot tracks these IDs.
+
+The `platform-host-tools-candidate.yml` workflow is a separate trusted `workflow_run` contract, not
+a production gate. Its validator and bundle tests belong to `backend-tool-contract` through
+`test_platform_host_tools_bundle`, except the active-baseline reader test, which exercises
+root-owned release metadata and belongs to `backend-privileged`; catalog snapshots track both.
+The verification-contract gate invokes `host_tools_candidate_workflow_issues()` so default-branch
+guards, narrow permissions, pinned actions, data-only candidate handling, isolated-Python use,
+TOCTOU rechecks and production artifact isolation fail closed. The workflow returns a successful
+no-op for a base-reachable pin; only a novel eligible pin reaches build, attestation and upload.
+That output is review evidence only: it grants no deploy/provision authority, and production
+workflows must not consume its artifact prefixes.
 
 The handoff context keeps the triggering PR source head **E** separate from
 the synthetic merge SHA **M** that the security workflow tested.  The trusted

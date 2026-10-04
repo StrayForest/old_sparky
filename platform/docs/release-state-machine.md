@@ -365,6 +365,17 @@ Alembic. It accepts only an operation-less v2 `install`/`recovery-restored`
 receipt with no systemd receipt and leaves malformed, mismatched, or
 operation-ID receipts retained for the immutable recovery-bootstrap workflow.
 
+The immutable recovery-bootstrap workflow also has a narrow operation-ID
+`install`/`recovery-restored` path for an original release that predates
+managed LiveQA. It is accepted only with no paired systemd receipt, verified
+transaction identities and pointers, and both legacy-release LiveQA inputs
+absent. The recovery generation prepares the old unit/Nginx files without
+running reconcile, restores the recorded service/timer snapshot, verifies
+readiness, and persists `legacy-services-restored` before receipt cleanup.
+Partial LiveQA payloads fail closed. Generic phase changes and generic
+recovery cannot create or rewind that proof, and retries recheck readiness
+before cleanup; the shared managed-LiveQA state is left untouched.
+
 The deploy gate also requires a read-only Cloudflare/Nginx/UFW range-parity
 proof and a direct-origin negative test. The current closure evidence for the
 production source SHA `97db79b681dd90cc8e89dd91f549610c943c16b8` is recorded in

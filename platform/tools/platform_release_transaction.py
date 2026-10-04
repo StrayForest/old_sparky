@@ -35,6 +35,7 @@ except ImportError:  # The immutable recovery generation runs this file directly
 
 
 STATE_NAME = ".release-operation.json"
+SYSTEMD_STATE_NAME = ".release-systemd-state.json"
 QUIESCE_STATE_NAME = ".release-quiesce.json"
 STATE_VERSION = 2
 # Version 1 is the narrow operation-less receipt written before the installer
@@ -75,6 +76,7 @@ PHASES = {
     "filesystem-restored-runtime-pending",
     "filesystem-restored-services-pending",
     "recovery-restored",
+    "legacy-services-restored",
 }
 PHASE_TRANSITIONS = {
     "prepared": {"venv-transitioned"},
@@ -143,6 +145,7 @@ PHASE_TRANSITIONS = {
     "filesystem-restored-runtime-pending": {"recovery-restored"},
     "filesystem-restored-services-pending": {"recovery-restored"},
     "recovery-restored": set(),
+    "legacy-services-restored": set(),
 }
 MIGRATION_OUTCOME_UNCERTAIN_PHASES = {
     "migration-pending",
@@ -684,7 +687,10 @@ def _validate_record(
         record.get("candidate_release"),
         releases,
         label="candidate release",
-        must_exist=not (operation == "install" and phase == "recovery-restored"),
+        must_exist=not (
+            operation == "install"
+            and phase in {"recovery-restored", "legacy-services-restored"}
+        ),
     )
     if candidate is None:
         raise TransactionError("candidate release is missing")
@@ -747,7 +753,7 @@ def _validate_record(
     ):
         raise TransactionError("no-op venv identity is invalid")
 
-    return {
+    validated = {
         **record,
         "app": app,
         "releases": releases,
@@ -759,6 +765,27 @@ def _validate_record(
         "peer_path": peer,
         "snapshot_path": snapshot,
     }
+    if phase == "legacy-services-restored":
+        # This phase is writable only through mark_legacy_services_restored,
+        # after service and readiness checks. Revalidate its full authority
+        # whenever loaded before allowing receipt-bound cleanup.
+        if (
+            operation != "install"
+            or current_before is None
+            or validated.get("systemd_state_before") is not None
+            or not isinstance(validated.get("operation_id"), str)
+            or OPERATION_ID_PATTERN.fullmatch(cast(str, validated["operation_id"])) is None
+            or _lexists(shared / SYSTEMD_STATE_NAME)
+        ):
+            raise TransactionError("legacy services phase authority is invalid")
+        _verify_original_pointers(validated)
+        _verify_restored_venv(validated)
+        legacy_release = cast(Path, current_before)
+        if _lexists(legacy_release / "tools/platform_live_qa_runtime_install.py") or _lexists(
+            legacy_release / "liveqa-runtime"
+        ):
+            raise TransactionError("legacy services phase has managed LiveQA inputs")
+    return validated
 
 
 def _validate_quiesce_record(
@@ -1954,6 +1981,7 @@ def _verify_recovery_pointers(record: dict[str, object]) -> None:
             "systemd-activated": ((candidate, desired_previous),),
             "activation-committed": ((candidate, desired_previous),),
             "recovery-restored": ((None, None),),
+            "legacy-services-restored": ((None, None),),
         }
         allowed = (original, *phase_pairs.get(phase, ()))
     else:
@@ -1996,7 +2024,7 @@ def _restore_venv(record: dict[str, object]) -> None:
         locations = _identity_locations(_unique_paths(shared, peer), (peer_before,))
         new_location = locations.get((peer_before["dev"], peer_before["ino"]))
         if new_location is None:
-            if record["phase"] != "recovery-restored":
+            if record["phase"] not in {"recovery-restored", "legacy-services-restored"}:
                 raise TransactionError("created venv identity is missing")
             return
         if new_location == shared:
@@ -2273,6 +2301,207 @@ def restore_services(state: Path, *, systemctl: str) -> None:
         raise TransactionError("pre-migration timer state was not restored")
 
 
+def _validate_legacy_liveqa_recovery(
+    state: Path, record: dict[str, object]
+) -> Path:
+    """Authorize only the pre-managed-LiveQA release recovery shape.
+
+    This compatibility path is limited to an operation-correlated install
+    receipt whose original active release predates managed LiveQA entirely.
+    Both inputs must be absent; a partial or present payload remains an error.
+    """
+
+    if (
+        record["operation"] != "install"
+        or record["phase"] != "recovery-restored"
+        or not isinstance(record.get("operation_id"), str)
+        or OPERATION_ID_PATTERN.fullmatch(cast(str, record["operation_id"])) is None
+        or record["current_before_path"] is None
+        or record["systemd_state_before"] is not None
+        or _lexists(cast(Path, record["shared"]) / SYSTEMD_STATE_NAME)
+    ):
+        raise TransactionError("transaction is not a legacy LiveQA recovery")
+    validate_service_snapshot(state, require="present")
+    _verify_original_pointers(record)
+    _verify_restored_venv(record)
+    release = cast(Path, record["current_before_path"])
+    installer = release / "tools" / "platform_live_qa_runtime_install.py"
+    runtime_tree = release / "liveqa-runtime"
+    if _lexists(installer) or _lexists(runtime_tree):
+        raise TransactionError("original release has partial or managed LiveQA payload")
+    return release
+
+
+def _verify_restored_venv(record: dict[str, object]) -> None:
+    """Read-only validation that the transaction already restored its venv."""
+
+    transition = record["transition"]
+    shared = cast(Path, record["shared_venv_path"])
+    peer = cast(Path, record["peer_path"])
+    snapshot = cast(Path, record["snapshot_path"])
+    if transition == "none":
+        shared_before = record["shared_before"]
+        if shared_before is None:
+            if _lexists(shared):
+                raise TransactionError("shared venv changed during legacy recovery")
+        elif not _matches(shared, cast(dict[str, int], shared_before)):
+            raise TransactionError("original shared venv was not restored")
+        return
+    if transition == "create":
+        peer_before = cast(dict[str, int], record["peer_before"])
+        peer_restored = _matches(peer, peer_before)
+        cleanup_removed_peer = (
+            record["phase"] == "legacy-services-restored" and not _lexists(peer)
+        )
+        if _lexists(shared) or not (peer_restored or cleanup_removed_peer):
+            raise TransactionError("created venv recovery state is incomplete")
+        return
+    if transition != "exchange":
+        raise TransactionError("legacy recovery venv transition is invalid")
+    shared_before = cast(dict[str, int], record["shared_before"])
+    peer_before = cast(dict[str, int], record["peer_before"])
+    if not _matches(shared, shared_before):
+        raise TransactionError("original shared venv was not restored")
+    locations = _identity_locations(
+        (shared, peer, snapshot), (shared_before, peer_before)
+    )
+    original_location = locations.get((shared_before["dev"], shared_before["ino"]))
+    new_location = locations.get((peer_before["dev"], peer_before["ino"]))
+    if original_location != shared:
+        raise TransactionError("original shared venv recovery state is ambiguous")
+    cleanup_removed_peer = record["phase"] == "legacy-services-restored" and new_location is None
+    if new_location not in {peer, snapshot} and not cleanup_removed_peer:
+        raise TransactionError("replacement shared venv recovery state is incomplete")
+
+
+def validate_legacy_liveqa_recovery(
+    state: Path, *, app_dir: Path, release: Path
+) -> None:
+    """Read-only preflight for the narrowly scoped legacy restore mode."""
+
+    record = _load_record(state)
+    if record["app"] != app_dir:
+        raise TransactionError("transaction application identity changed")
+    if _validate_legacy_liveqa_recovery(state, record) != release:
+        raise TransactionError("legacy recovery release does not match transaction")
+
+
+def restore_legacy_services(state: Path, *, systemctl: str) -> None:
+    """Restore the transaction snapshot after legacy unit files are prepared."""
+
+    systemctl = _systemctl_path(systemctl)
+    record = _load_record(state)
+    _validate_legacy_liveqa_recovery(state, record)
+    service_state = cast(dict[str, str], record["service_state_before"])
+    service_enabled = cast(dict[str, str], record["service_enabled_before"])
+    for unit in SERVICE_UNITS:
+        enabled_expected = service_enabled[unit]
+        _run_systemctl(systemctl, "enable" if enabled_expected == "enabled" else "disable", unit)
+        if _read_systemctl_enabled(systemctl, unit) != enabled_expected:
+            raise TransactionError("legacy service enabled state was not restored")
+        expected = service_state[unit]
+        _run_systemctl(systemctl, "restart" if expected == "active" else "stop", unit)
+        if _read_systemctl_state(systemctl, unit) != expected:
+            raise TransactionError("legacy service state was not restored")
+    timer_expected = "active" if record["timer_active_before"] else "inactive"
+    timer_enabled_expected = cast(str, record["timer_enabled_before"])
+    _run_systemctl(
+        systemctl,
+        "enable" if timer_enabled_expected == "enabled" else "disable",
+        "deadlock-cloudflare-ips.timer",
+    )
+    if _read_systemctl_enabled(systemctl, "deadlock-cloudflare-ips.timer") != timer_enabled_expected:
+        raise TransactionError("legacy timer enabled state was not restored")
+    _run_systemctl(
+        systemctl,
+        "start" if timer_expected == "active" else "stop",
+        "deadlock-cloudflare-ips.timer",
+    )
+    if _read_systemctl_state(systemctl, "deadlock-cloudflare-ips.timer") != timer_expected:
+        raise TransactionError("legacy timer state was not restored")
+
+
+def mark_legacy_services_restored(state: Path, *, systemctl: str) -> None:
+    """Persist the readiness boundary before receipt-bound cleanup begins."""
+
+    systemctl = _systemctl_path(systemctl)
+    record = _load_record(state)
+    _validate_legacy_liveqa_recovery(state, record)
+    service_state = cast(dict[str, str], record["service_state_before"])
+    service_enabled = cast(dict[str, str], record["service_enabled_before"])
+    for unit in SERVICE_UNITS:
+        if _read_systemctl_enabled(systemctl, unit) != service_enabled[unit]:
+            raise TransactionError("legacy service enabled state is not restored")
+        if _read_systemctl_state(systemctl, unit) != service_state[unit]:
+            raise TransactionError("legacy service state is not restored")
+    timer_expected = "active" if record["timer_active_before"] else "inactive"
+    if _read_systemctl_enabled(systemctl, "deadlock-cloudflare-ips.timer") != record["timer_enabled_before"]:
+        raise TransactionError("legacy timer enabled state is not restored")
+    if _read_systemctl_state(systemctl, "deadlock-cloudflare-ips.timer") != timer_expected:
+        raise TransactionError("legacy timer state is not restored")
+    _verify_legacy_readiness(record)
+    record["phase"] = "legacy-services-restored"
+    _write_record(state, _record_for_write(record), creating=False)
+
+
+def verify_legacy_services(state: Path, *, systemctl: str) -> None:
+    """Read-only retry guard for a durably marked legacy recovery."""
+
+    systemctl = _systemctl_path(systemctl)
+    record = _load_record(state)
+    if record["phase"] != "legacy-services-restored":
+        raise TransactionError("legacy services recovery marker is missing")
+    service_state = cast(dict[str, str], record["service_state_before"])
+    service_enabled = cast(dict[str, str], record["service_enabled_before"])
+    for unit in SERVICE_UNITS:
+        if _read_systemctl_enabled(systemctl, unit) != service_enabled[unit]:
+            raise TransactionError("legacy service enabled state changed")
+        if _read_systemctl_state(systemctl, unit) != service_state[unit]:
+            raise TransactionError("legacy service state changed")
+    timer_expected = "active" if record["timer_active_before"] else "inactive"
+    if _read_systemctl_enabled(systemctl, "deadlock-cloudflare-ips.timer") != record["timer_enabled_before"]:
+        raise TransactionError("legacy timer enabled state changed")
+    if _read_systemctl_state(systemctl, "deadlock-cloudflare-ips.timer") != timer_expected:
+        raise TransactionError("legacy timer state changed")
+    _verify_legacy_readiness(record)
+
+
+def _verify_legacy_readiness(record: dict[str, object]) -> None:
+    service_state = cast(dict[str, str], record["service_state_before"])
+    checks = (
+        (
+            "deadlock-api",
+            [
+                "/usr/bin/curl", "--fail", "--silent", "--show-error",
+                "--max-time", "10", "http://127.0.0.1:8010/api/v1/health/ready",
+            ],
+        ),
+        (
+            "deadlock-web",
+            [
+                "/usr/bin/curl", "--fail", "--silent", "--show-error",
+                "--max-time", "10", "http://127.0.0.1:3000/",
+            ],
+        ),
+    )
+    for unit, command in checks:
+        if service_state[unit] != "active":
+            continue
+        try:
+            result = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise TransactionError("legacy recovery readiness check failed") from exc
+        if result.returncode != 0:
+            raise TransactionError("legacy recovery readiness check failed")
+
+
 def recover(
     state: Path,
     *,
@@ -2281,6 +2510,10 @@ def recover(
     service_pending: bool = False,
 ) -> None:
     record = _load_record(state)
+    if record["phase"] == "legacy-services-restored":
+        raise TransactionError(
+            "legacy recovery phase can only resume through complete-recovery"
+        )
     if runtime_pending and service_pending:
         raise TransactionError("recovery subphases are mutually exclusive")
     if runtime_pending and (
@@ -2342,10 +2575,16 @@ def recover(
         _fsync_directory(state.parent)
 
 
-def complete_recovery(state: Path, *, retain_receipt: bool = False) -> None:
+def complete_recovery(
+    state: Path, *, retain_receipt: bool = False, systemctl: str | None = None
+) -> None:
     record = _load_record(state)
-    if record["phase"] != "recovery-restored":
+    if record["phase"] not in {"recovery-restored", "legacy-services-restored"}:
         raise TransactionError("release operation recovery is not durably restored")
+    if record["phase"] == "legacy-services-restored":
+        if systemctl is None:
+            raise TransactionError("legacy recovery cleanup requires fresh readiness proof")
+        verify_legacy_services(state, systemctl=systemctl)
     _verify_original_pointers(record)
     _restore_venv(record)
     if record["operation"] == "install":
@@ -2530,6 +2769,21 @@ def _build_parser() -> argparse.ArgumentParser:
     restore_services_parser = commands.add_parser("restore-services")
     restore_services_parser.add_argument("--state", required=True, type=Path)
     restore_services_parser.add_argument("--systemctl", required=True)
+    validate_legacy_liveqa_parser = commands.add_parser(
+        "validate-legacy-liveqa-recovery"
+    )
+    validate_legacy_liveqa_parser.add_argument("--state", required=True, type=Path)
+    validate_legacy_liveqa_parser.add_argument("--app-dir", required=True, type=Path)
+    validate_legacy_liveqa_parser.add_argument("--release", required=True, type=Path)
+    restore_legacy_services_parser = commands.add_parser("restore-legacy-services")
+    restore_legacy_services_parser.add_argument("--state", required=True, type=Path)
+    restore_legacy_services_parser.add_argument("--systemctl", required=True)
+    mark_legacy_services_parser = commands.add_parser("mark-legacy-services-restored")
+    mark_legacy_services_parser.add_argument("--state", required=True, type=Path)
+    mark_legacy_services_parser.add_argument("--systemctl", required=True)
+    verify_legacy_services_parser = commands.add_parser("verify-legacy-services")
+    verify_legacy_services_parser.add_argument("--state", required=True, type=Path)
+    verify_legacy_services_parser.add_argument("--systemctl", required=True)
     for name in (
         "capture-initial-systemd",
         "restore-initial-systemd",
@@ -2575,6 +2829,7 @@ def _build_parser() -> argparse.ArgumentParser:
     complete_recovery_parser = commands.add_parser("complete-recovery")
     complete_recovery_parser.add_argument("--state", required=True, type=Path)
     complete_recovery_parser.add_argument("--retain-receipt", action="store_true")
+    complete_recovery_parser.add_argument("--systemctl")
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--state", required=True, type=Path)
     status_parser.add_argument("--json", action="store_true", dest="as_json")
@@ -2645,6 +2900,16 @@ def main() -> int:
             validate_service_snapshot(args.state, require=args.require)
         elif args.command == "restore-services":
             restore_services(args.state, systemctl=args.systemctl)
+        elif args.command == "validate-legacy-liveqa-recovery":
+            validate_legacy_liveqa_recovery(
+                args.state, app_dir=args.app_dir, release=args.release
+            )
+        elif args.command == "restore-legacy-services":
+            restore_legacy_services(args.state, systemctl=args.systemctl)
+        elif args.command == "mark-legacy-services-restored":
+            mark_legacy_services_restored(args.state, systemctl=args.systemctl)
+        elif args.command == "verify-legacy-services":
+            verify_legacy_services(args.state, systemctl=args.systemctl)
         elif args.command == "capture-initial-systemd":
             capture_initial_systemd(args.state, systemctl=args.systemctl)
         elif args.command == "restore-initial-systemd":
@@ -2702,7 +2967,11 @@ def main() -> int:
         elif args.command == "complete":
             complete(args.state, retain_receipt=args.retain_receipt)
         elif args.command == "complete-recovery":
-            complete_recovery(args.state, retain_receipt=args.retain_receipt)
+            complete_recovery(
+                args.state,
+                retain_receipt=args.retain_receipt,
+                systemctl=args.systemctl,
+            )
         elif args.command == "status":
             try:
                 record = _load_record(args.state)

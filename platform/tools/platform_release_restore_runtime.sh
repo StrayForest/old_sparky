@@ -10,6 +10,7 @@ RESTART_AFTER=1
 RUN_SMOKE=1
 PREPARE_RUNTIME=1
 RUN_RESTART=1
+PREPARE_ONLY_MODE=0
 EXPECTED_CSP_MODE="enforce"
 EDGE_ORIGIN="https://127.0.0.1"
 EDGE_HOST="old-sparky.com"
@@ -22,6 +23,7 @@ NGINX_BIN="/usr/sbin/nginx"
 NGINX_TIMEOUT_BIN="/usr/bin/timeout"
 NGINX_CONFIG_TIMEOUT_SECONDS=30
 LIVE_QA_RUNTIME_INSTALLER=""
+PRESERVE_LEGACY_LIVE_QA=0
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
 
@@ -54,6 +56,7 @@ while [[ $# -gt 0 ]]; do
       RESTART_AFTER=0
       RUN_SMOKE=0
       RUN_RESTART=0
+      PREPARE_ONLY_MODE=1
       shift
       ;;
     --restart-only)
@@ -106,6 +109,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       LIVE_QA_RUNTIME_INSTALLER="$2"
       shift 2
+      ;;
+    --preserve-legacy-live-qa)
+      PRESERVE_LEGACY_LIVE_QA=1
+      shift
       ;;
     --skip-smoke)
       RUN_SMOKE=0
@@ -240,13 +247,27 @@ if [[ "$RUN_SMOKE" -eq 1 && ! -f "$SMOKE_TOOL" ]]; then
   public_status failed tooling >&2
   exit 1
 fi
-if [[ -z "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
-  LIVE_QA_RUNTIME_INSTALLER="$RELEASE/tools/platform_live_qa_runtime_install.py"
-fi
-if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" \
-  || "$LIVE_QA_RUNTIME_INSTALLER" != /* ]]; then
-  public_status failed liveqa_runtime >&2
-  exit 1
+if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 1 ]]; then
+  if [[ "$TRANSACTION_STATE" != "$APP_DIR/shared/.release-operation.json" \
+    || ! -f "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" \
+    || -n "$SYSTEMD_STATE" || "$PREPARE_ONLY_MODE" -ne 1 \
+    || "$RUN_RESTART" -ne 0 || "$RUN_SMOKE" -ne 0 \
+    || -n "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
+    public_status failed legacy_liveqa_authority >&2
+    exit 1
+  fi
+  "$SHARED_VENV/bin/python" -I "$TOOLS_DIR/platform_release_transaction.py" \
+    validate-legacy-liveqa-recovery --state "$TRANSACTION_STATE" \
+    --app-dir "$APP_DIR" --release "$RELEASE" >/dev/null 2>/dev/null
+else
+  if [[ -z "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
+    LIVE_QA_RUNTIME_INSTALLER="$RELEASE/tools/platform_live_qa_runtime_install.py"
+  fi
+  if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" \
+    || "$LIVE_QA_RUNTIME_INSTALLER" != /* ]]; then
+    public_status failed liveqa_runtime >&2
+    exit 1
+  fi
 fi
 if [[ -n "$SYSTEMD_STATE" ]]; then
   # Correlate the durable systemd receipt, transaction operation and helper
@@ -259,11 +280,13 @@ if [[ -n "$SYSTEMD_STATE" ]]; then
     --systemctl "$SYSTEMCTL_BIN" \
     >/dev/null 2>/dev/null
 fi
-# Rollback/recovery uses this same path, so reconcile the digest-bound
-# generation before units, Nginx, readiness or smoke can observe the restored
-# release. The canonical release lock remains held by this script.
-"$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-  reconcile --app-dir "$APP_DIR" >/dev/null 2>/dev/null
+if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 0 ]]; then
+  # Rollback/recovery uses this same path, so reconcile the digest-bound
+  # generation before units, Nginx, readiness or smoke can observe the restored
+  # release. The canonical release lock remains held by this script.
+  "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+    reconcile --app-dir "$APP_DIR" >/dev/null 2>/dev/null
+fi
 
 prepare_runtime_private() {
   # Restoring unit files is a data-plane operation.  The installer defaults

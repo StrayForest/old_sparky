@@ -365,7 +365,7 @@ run_initial_systemd_candidate() {
 
 run_live_qa_reconcile() {
   run_systemd_bounded "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-    reconcile --app-dir "$APP_DIR" >/dev/null 2>/dev/null
+    reconcile --app-dir "$APP_DIR" >/dev/null
 }
 
 wait_for_activation_readiness() {

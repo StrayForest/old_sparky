@@ -1075,6 +1075,480 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 self.assertTrue(candidate.exists())
                 popen.assert_not_called()
 
+    def test_operation_bound_legacy_liveqa_recovery_preserves_shared_state(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("legacy recovery bridge contract requires root")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "app"
+            releases = app / "releases"
+            shared = app / "shared"
+            current = releases / "current-release"
+            previous = releases / "previous-release"
+            candidate = releases / "candidate-release"
+            for path in (current, previous, candidate, shared):
+                path.mkdir(parents=True, exist_ok=True)
+            app.mkdir(exist_ok=True)
+            (app / "current").symlink_to(current)
+            (app / "previous").symlink_to(previous)
+            # The authenticated original is intentionally an older release:
+            # it has its legacy restore helper but neither managed-LiveQA input.
+            (current / "tools").mkdir()
+            old_helper = current / "tools/platform_release_restore_runtime.sh"
+            old_helper.write_text("legacy immutable helper\n", encoding="ascii")
+            shared_venv = shared / "venv"
+            shared_venv.mkdir()
+            snapshot = candidate / ".rollback/shared-venv-before-install"
+            snapshot.mkdir(parents=True)
+            candidate_peer = shared / ".venv-install-candidate-release.none"
+            state = shared / ".release-operation.json"
+            state.write_text("transaction receipt fixture\n", encoding="ascii")
+            state.chmod(0o600)
+            managed_qa = shared / "liveqa-managed-state"
+            managed_qa.write_bytes(b"preserve this managed QA state\n")
+            managed_before = hashlib.sha256(managed_qa.read_bytes()).hexdigest()
+
+            def identity(path: Path) -> dict[str, int]:
+                metadata = path.lstat()
+                return {"dev": metadata.st_dev, "ino": metadata.st_ino}
+
+            receipt: dict[str, object] = {
+                "version": 2,
+                "operation": "install",
+                "operation_id": "a" * 32,
+                "phase": "recovery-restored",
+                "app_dir": str(app),
+                "current_before": str(current),
+                "previous_before": str(previous),
+                "candidate_release": str(candidate),
+                "shared_venv": str(shared_venv),
+                "peer": str(candidate_peer),
+                "snapshot": str(snapshot),
+                "transition": "exchange",
+                "shared_before": identity(shared_venv),
+                "peer_before": identity(snapshot),
+                "current_before_identity": identity(current),
+                "previous_before_identity": identity(previous),
+                "candidate_identity": identity(candidate),
+                "remove_env_on_recovery": False,
+                "service_state_before": {
+                    "deadlock-api": "active",
+                    "deadlock-worker": "inactive",
+                    "deadlock-web": "active",
+                },
+                "service_enabled_before": {
+                    "deadlock-api": "enabled",
+                    "deadlock-worker": "disabled",
+                    "deadlock-web": "enabled",
+                },
+                "quiesced_services": [
+                    "deadlock-api", "deadlock-worker", "deadlock-web",
+                ],
+                "timer_active_before": True,
+                "timer_enabled_before": "enabled",
+                "systemd_state_before": None,
+            }
+            from tools import platform_release_transaction as release_transaction
+
+            # The bound M10 operation used the exchange branch: the original
+            # shared venv is restored, while peer_before is retained in the
+            # rollback snapshot until receipt-bound cleanup.
+            candidate_source_sha = "c" * 40
+            candidate_release_metadata = {
+                "source_git_commit": candidate_source_sha,
+                "release_slug": candidate.name,
+            }
+            candidate_release_json = candidate / "RELEASE.json"
+            candidate_release_json.write_text(
+                json.dumps(candidate_release_metadata, sort_keys=True) + "\n",
+                encoding="ascii",
+            )
+            candidate_release_json.chmod(0o444)
+            bundle_source = root / "recovery-source"
+            bundle_tools = bundle_source / "platform" / "tools"
+            bundle_tools.mkdir(parents=True)
+            for name in recovery.RECOVERY_FILES:
+                shutil.copy2(TOOLS / name, bundle_tools / name)
+            recovery_bundle = root / "recovery-bundle.zip"
+            generation_record = recovery.build_bundle(
+                bundle_source,
+                source_sha=SOURCE_SHA,
+                provenance=provenance(),
+                output=recovery_bundle,
+            )
+            generation_manifest = generation_record["manifest"]
+            self.assertIsInstance(generation_manifest, dict)
+            self.assertNotEqual(
+                generation_manifest["source_sha"],
+                candidate_release_metadata["source_git_commit"],
+            )
+            generation = root / str(generation_record["bundle_sha256"])
+            self.assertEqual(generation.name, generation_record["bundle_sha256"])
+            exchange_record: dict[str, object] = {
+                "transition": "exchange",
+                "shared_venv_path": shared_venv,
+                "peer_path": candidate_peer,
+                "snapshot_path": snapshot,
+                "shared_before": receipt["shared_before"],
+                "peer_before": receipt["peer_before"],
+                "phase": "recovery-restored",
+            }
+            release_transaction._verify_restored_venv(exchange_record)
+            wrong_original = dict(exchange_record)
+            wrong_original["shared_before"] = {"dev": -1, "ino": -1}
+            with self.assertRaises(release_transaction.TransactionError):
+                release_transaction._verify_restored_venv(wrong_original)
+            missing_peer = dict(exchange_record)
+            missing_peer["peer_before"] = {"dev": -2, "ino": -2}
+            with self.assertRaises(release_transaction.TransactionError):
+                release_transaction._verify_restored_venv(missing_peer)
+            child_commands: list[list[str]] = []
+            readiness_commands: list[list[str]] = []
+            recovery_runtime = generation / "platform_release_restore_runtime.sh"
+
+            def fake_popen(command: list[str], **_kwargs: object) -> object:
+                class Child:
+                    pid = 9123
+
+                    def wait(self, **_wait_kwargs: object) -> int:
+                        child_commands.append(command)
+                        command_name = next(
+                            (part for part in command if part in {
+                                "mark-legacy-services-restored",
+                                "verify-legacy-services",
+                                "complete-recovery",
+                            }),
+                            None,
+                        )
+                        # Model the transaction CLI's bounded API/web checks;
+                        # those run in the child process, not the bootstrap.
+                        if command_name in {
+                            "mark-legacy-services-restored",
+                            "verify-legacy-services",
+                            "complete-recovery",
+                        }:
+                            readiness_commands.extend([
+                                ["/usr/bin/curl", "http://127.0.0.1:8010/api/v1/health/ready"],
+                                ["/usr/bin/curl", "http://127.0.0.1:3000/"],
+                            ])
+                        if "mark-legacy-services-restored" in command:
+                            receipt["phase"] = "legacy-services-restored"
+                        elif "complete-recovery" in command and "--retain-receipt" in command:
+                            shutil.rmtree(candidate)
+                        elif "complete-recovery" in command:
+                            state.unlink()
+                        return 0
+
+                return Child()
+
+            def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                readiness_commands.append(command)
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                mock.patch.object(recovery.os, "geteuid", return_value=0),
+                mock.patch.object(recovery, "_validate_generation_tree"),
+                mock.patch.object(recovery, "_safe_receipt"),
+                mock.patch.object(recovery, "_receipt_json", return_value=receipt),
+                mock.patch.object(recovery.subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(recovery.subprocess, "run", side_effect=fake_run),
+            ):
+                recovery.abort_retained_only(app_dir=app, generation=generation)
+
+            self.assertEqual(len(readiness_commands), 8)
+            child_names = [
+                next((part for part in command if part in {
+                    "validate-legacy-liveqa-recovery", "restore-legacy-services",
+                    "mark-legacy-services-restored", "verify-legacy-services",
+                    "complete-recovery",
+                }), "runtime-prepare" if command[0] == str(recovery_runtime) else "unknown")
+                for command in child_commands
+            ]
+            self.assertEqual(
+                child_names,
+                [
+                    "validate-legacy-liveqa-recovery", "runtime-prepare",
+                    "restore-legacy-services", "mark-legacy-services-restored",
+                    "verify-legacy-services",
+                    "complete-recovery", "complete-recovery",
+                ],
+            )
+            completion_commands = [
+                command for command in child_commands if "complete-recovery" in command
+            ]
+            self.assertEqual(len(completion_commands), 2)
+            for command in completion_commands:
+                self.assertIn("--systemctl", command)
+                self.assertEqual(
+                    command[command.index("--systemctl") + 1],
+                    "/usr/bin/systemctl",
+                )
+            runtime_command = child_commands[1]
+            self.assertIn("--prepare-only", runtime_command)
+            self.assertIn("--preserve-legacy-live-qa", runtime_command)
+            self.assertIn("--transaction", runtime_command)
+            self.assertEqual(runtime_command[runtime_command.index("--release") + 1], str(current))
+            self.assertNotEqual(runtime_command[0], str(old_helper))
+            self.assertFalse((current / "tools/platform_live_qa_runtime_install.py").exists())
+            self.assertFalse((current / "liveqa-runtime").exists())
+            self.assertTrue(old_helper.is_file())
+            self.assertEqual(hashlib.sha256(managed_qa.read_bytes()).hexdigest(), managed_before)
+            self.assertFalse(state.exists())
+            self.assertFalse(candidate.exists())
+
+    def test_legacy_liveqa_retry_rechecks_snapshot_and_readiness_before_cleanup(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("legacy recovery bridge contract requires root")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "app"
+            releases = app / "releases"
+            shared = app / "shared"
+            current = releases / "current-release"
+            previous = releases / "previous-release"
+            candidate = releases / "candidate-release"
+            for path in (current, previous, candidate, shared):
+                path.mkdir(parents=True, exist_ok=True)
+            app.mkdir(exist_ok=True)
+            (app / "current").symlink_to(current)
+            (app / "previous").symlink_to(previous)
+            (current / "tools").mkdir()
+            (current / "tools/platform_release_restore_runtime.sh").write_text(
+                "legacy helper\n", encoding="ascii"
+            )
+            (shared / "venv").mkdir()
+            state = shared / ".release-operation.json"
+            state.write_text("receipt\n", encoding="ascii")
+            state.chmod(0o600)
+            managed_qa = shared / "liveqa-managed-state"
+            managed_qa.write_bytes(b"must survive failed retry\n")
+            managed_before = managed_qa.read_bytes()
+            receipt: dict[str, object] = {
+                "version": 2,
+                "operation": "install",
+                "operation_id": "c" * 32,
+                "phase": "legacy-services-restored",
+                "app_dir": str(app),
+                "current_before": str(current),
+                "previous_before": str(previous),
+                "candidate_release": str(candidate),
+                "shared_venv": str(shared / "venv"),
+                "peer": str(shared / ".venv-install-candidate-release.none"),
+                "snapshot": str(candidate / ".rollback/shared-venv-before-install"),
+                "transition": "none",
+                "shared_before": {
+                    "dev": (shared / "venv").stat().st_dev,
+                    "ino": (shared / "venv").stat().st_ino,
+                },
+                "peer_before": None,
+                "current_before_identity": {"dev": current.stat().st_dev, "ino": current.stat().st_ino},
+                "previous_before_identity": {"dev": previous.stat().st_dev, "ino": previous.stat().st_ino},
+                "candidate_identity": {"dev": candidate.stat().st_dev, "ino": candidate.stat().st_ino},
+                "remove_env_on_recovery": False,
+                "service_state_before": {
+                    "deadlock-api": "active", "deadlock-worker": "inactive", "deadlock-web": "active",
+                },
+                "service_enabled_before": {
+                    "deadlock-api": "enabled", "deadlock-worker": "disabled", "deadlock-web": "enabled",
+                },
+                "quiesced_services": [
+                    "deadlock-api", "deadlock-worker", "deadlock-web",
+                ],
+                "timer_active_before": True,
+                "timer_enabled_before": "enabled",
+                "systemd_state_before": None,
+            }
+            commands: list[list[str]] = []
+            calls = {"ready": 0}
+
+            def fake_popen(command: list[str], **_kwargs: object) -> object:
+                class Child:
+                    pid = 9124
+
+                    def wait(self, **_wait_kwargs: object) -> int:
+                        commands.append(command)
+                        if "verify-legacy-services" in command:
+                            # Retry validation proves both service snapshot and
+                            # readiness before either cleanup command can run.
+                            api = failed_readiness(["/usr/bin/curl", "api"])
+                            web = failed_readiness(["/usr/bin/curl", "web"])
+                            return 1 if api.returncode or web.returncode else 0
+                        return 0
+
+                return Child()
+
+            def failed_readiness(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                calls["ready"] += 1
+                return subprocess.CompletedProcess(command, 0 if calls["ready"] == 1 else 22)
+
+            generation = root / ("d" * 64)
+            with (
+                mock.patch.object(recovery.os, "geteuid", return_value=0),
+                mock.patch.object(recovery, "_validate_generation_tree"),
+                mock.patch.object(recovery, "_safe_receipt"),
+                mock.patch.object(recovery, "_receipt_json", return_value=receipt),
+                mock.patch.object(recovery.subprocess, "Popen", side_effect=fake_popen),
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    recovery.abort_retained_only(app_dir=app, generation=generation)
+
+            self.assertEqual(calls["ready"], 2)
+            self.assertEqual(len(commands), 1)
+            self.assertIn("verify-legacy-services", commands[0])
+            self.assertTrue(state.exists())
+            self.assertTrue(candidate.exists())
+            self.assertEqual(managed_qa.read_bytes(), managed_before)
+
+    def test_operation_bound_legacy_path_rejects_nonlegacy_inputs_before_children(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("legacy recovery bridge contract requires root")
+
+        for invalid in ("installer", "runtime-tree", "both", "bad-operation-id", "bad-phase", "pointer"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                app = root / "app"
+                releases = app / "releases"
+                shared = app / "shared"
+                current = releases / "current-release"
+                previous = releases / "previous-release"
+                candidate = releases / "candidate-release"
+                for path in (current, previous, candidate, shared):
+                    path.mkdir(parents=True, exist_ok=True)
+                app.mkdir(exist_ok=True)
+                (app / "current").symlink_to(current)
+                (app / "previous").symlink_to(previous)
+                (current / "tools").mkdir()
+                (current / "tools/platform_release_restore_runtime.sh").write_text(
+                    "legacy helper\n", encoding="ascii"
+                )
+                (shared / "venv").mkdir()
+                state = shared / ".release-operation.json"
+                state.write_text("receipt\n", encoding="ascii")
+                state.chmod(0o600)
+                managed_qa = shared / "liveqa-managed-state"
+                managed_qa.write_bytes(b"must remain untouched\n")
+                managed_before = managed_qa.read_bytes()
+
+                def identity(path: Path) -> dict[str, int]:
+                    metadata = path.lstat()
+                    return {"dev": metadata.st_dev, "ino": metadata.st_ino}
+
+                receipt: dict[str, object] = {
+                    "version": 2,
+                    "operation": "install",
+                    "operation_id": "e" * 32,
+                    "phase": "recovery-restored",
+                    "app_dir": str(app),
+                    "current_before": str(current),
+                    "previous_before": str(previous),
+                    "candidate_release": str(candidate),
+                    "shared_venv": str(shared / "venv"),
+                    "peer": str(shared / ".venv-install-candidate-release.none"),
+                    "snapshot": str(candidate / ".rollback/shared-venv-before-install"),
+                    "transition": "none",
+                    "shared_before": identity(shared / "venv"),
+                    "peer_before": None,
+                    "current_before_identity": identity(current),
+                    "previous_before_identity": identity(previous),
+                    "candidate_identity": identity(candidate),
+                    "remove_env_on_recovery": False,
+                    "service_state_before": {
+                        "deadlock-api": "active", "deadlock-worker": "inactive", "deadlock-web": "active",
+                    },
+                    "service_enabled_before": {
+                        "deadlock-api": "enabled", "deadlock-worker": "disabled", "deadlock-web": "enabled",
+                    },
+                    "quiesced_services": [
+                        "deadlock-api", "deadlock-worker", "deadlock-web",
+                    ],
+                    "timer_active_before": True,
+                    "timer_enabled_before": "enabled",
+                    "systemd_state_before": None,
+                }
+                if invalid == "installer":
+                    (current / "tools").mkdir(exist_ok=True)
+                    (current / "tools/platform_live_qa_runtime_install.py").write_text(
+                        "partial managed QA input\n", encoding="ascii"
+                    )
+                elif invalid == "runtime-tree":
+                    (current / "liveqa-runtime").mkdir()
+                elif invalid == "both":
+                    (current / "tools").mkdir(exist_ok=True)
+                    (current / "tools/platform_live_qa_runtime_install.py").write_text(
+                        "managed QA installer\n", encoding="ascii"
+                    )
+                    (current / "liveqa-runtime").mkdir()
+                elif invalid == "bad-operation-id":
+                    receipt["operation_id"] = "not-an-operation-id"
+                elif invalid == "bad-phase":
+                    receipt["phase"] = "prepared"
+                elif invalid == "pointer":
+                    (app / "current").unlink()
+                    (app / "current").symlink_to(candidate)
+
+                with (
+                    mock.patch.object(recovery.os, "geteuid", return_value=0),
+                    mock.patch.object(recovery, "_validate_generation_tree"),
+                    mock.patch.object(recovery, "_safe_receipt"),
+                    mock.patch.object(recovery, "_receipt_json", return_value=receipt),
+                    mock.patch.object(recovery.subprocess, "Popen") as popen,
+                ):
+                    with self.assertRaises(recovery.RecoveryBootstrapError):
+                        recovery.abort_retained_only(
+                            app_dir=app,
+                            generation=root / ("f" * 64),
+                        )
+                popen.assert_not_called()
+                self.assertTrue(state.exists())
+                self.assertTrue(candidate.exists())
+                self.assertEqual(managed_qa.read_bytes(), managed_before)
+
+    def test_generic_phase_cannot_mark_legacy_services_restored(self) -> None:
+        from tools import platform_release_transaction as transaction
+
+        record: dict[str, object] = {"phase": "recovery-restored"}
+        with (
+            mock.patch.object(transaction, "_load_record", return_value=record),
+            mock.patch.object(transaction, "_write_record") as write_record,
+        ):
+            with self.assertRaises(transaction.TransactionError):
+                transaction.set_phase(
+                    Path("/unused-state"),
+                    expected="recovery-restored",
+                    phase="legacy-services-restored",
+                )
+        write_record.assert_not_called()
+
+    def test_generic_recover_cannot_rewind_legacy_marker_or_skip_readiness(self) -> None:
+        from tools import platform_release_transaction as transaction
+
+        record: dict[str, object] = {
+            "phase": "legacy-services-restored",
+            "operation": "install",
+        }
+        with (
+            mock.patch.object(transaction, "_load_record", return_value=record),
+            mock.patch.object(transaction, "_write_record") as write_record,
+            mock.patch.object(transaction, "_cleanup_recovered_install") as cleanup,
+            mock.patch.object(transaction, "_restore_pointers") as restore_pointers,
+            mock.patch.object(transaction, "_restore_venv") as restore_venv,
+            mock.patch.object(transaction, "_verify_recovery_pointers") as verify_recovery,
+            mock.patch.object(transaction, "_verify_original_pointers") as verify_original,
+        ):
+            with self.assertRaises(transaction.TransactionError):
+                transaction.recover(Path("/unused-state"))
+            with self.assertRaises(transaction.TransactionError):
+                transaction.complete_recovery(Path("/unused-state"))
+        self.assertEqual(record["phase"], "legacy-services-restored")
+        write_record.assert_not_called()
+        cleanup.assert_not_called()
+        restore_pointers.assert_not_called()
+        restore_venv.assert_not_called()
+        verify_recovery.assert_not_called()
+        verify_original.assert_not_called()
+
     def test_attestation_policy_rejects_source_run_attempt_job_and_digest_drift(self) -> None:
         workflow = (
             REPO_ROOT
