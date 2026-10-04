@@ -15,8 +15,8 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 is the only source for `HOST_TOOLS_SHA`; pending pin target
 `a6531f0154641c0c266f39c6c00d5269be763d6d` (P9) selects generation
 `7a9fe1286054dbe96221d2b428048c4212270cf5` (S9). The pin resolves to that
-source commit, which is its ancestor; only the supervisor digest changes in
-the 13-member closure. S9 is pending provisioning. The latest verified
+source commit, which is its ancestor. The P9 closure is unchanged from the
+previously verified P8 closure. S9 is pending provisioning. The latest verified
 installed generation is S8
 `5b2942feba89d235aa7e659ad5b156c2080d7d7a`; C6 and earlier generations are
 preserved. The application remains at source
