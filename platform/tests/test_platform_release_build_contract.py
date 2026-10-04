@@ -2127,6 +2127,110 @@ fail 'private lock detail must not cross the public channel'
             self.assertFalse(artifact.exists())
             self.assertFalse(artifact.is_symlink())
 
+    def test_host_tools_contract_failure_emits_marker_before_locks(self) -> None:
+        """A silent closure-validator failure reaches the closed marker path."""
+
+        if os.geteuid() != 0:
+            self.skipTest("immutable supervisor fixture requires root")
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            supervisor, release_lock, retained_lock, generation_dir = (
+                self._install_supervisor_fixture(fixture_root)
+            )
+
+            def cleanup_fixture() -> None:
+                for path in (release_lock, retained_lock):
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                if generation_dir.exists() or generation_dir.is_symlink():
+                    shutil.rmtree(generation_dir)
+
+            self.addCleanup(cleanup_fixture)
+            target_sha = "a" * 40
+            run_id = str(os.getpid())
+            artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            while artifact.exists() or artifact.is_symlink():
+                run_id = str(int(run_id) + 1)
+                artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            release_slug = f"gha-{run_id}-1-{target_sha[:12]}"
+            runtime = fixture_root / "runtime"
+            runtime.mkdir()
+            sentinel = runtime / "unchanged"
+            sentinel.write_bytes(b"no release lifecycle work\n")
+            environment = {"PLATFORM_TEST_RUNTIME": str(runtime)}
+            command = [
+                str(supervisor),
+                target_sha,
+                release_slug,
+                "preflight",
+                str(artifact),
+                "baseline",
+                generation_dir.name,
+                "b" * 64,
+                "c" * 64,
+            ]
+            output = io.StringIO()
+            with patch.dict(os.environ, environment, clear=True):
+                with redirect_stdout(output):
+                    status = platform_workflow_remote_dispatch._run_bounded_child(
+                        command,
+                        timeout_seconds=20,
+                        expected_release_marker=(
+                            "preflight",
+                            release_slug,
+                            target_sha,
+                        ),
+                    )
+
+            self.assertEqual(status, 1)
+            self.assertEqual(
+                output.getvalue(),
+                "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+                "phase=preflight reason=host_tools_invalid "
+                f"release_slug={release_slug} source_sha={target_sha}\n",
+            )
+            self.assertFalse(release_lock.exists())
+            self.assertFalse(retained_lock.exists())
+            self.assertFalse(artifact.exists())
+            self.assertEqual(sentinel.read_bytes(), b"no release lifecycle work\n")
+
+            # A malformed but correctly digest-bound manifest takes the JSON
+            # parser's unexpected-exception path. Its traceback must remain
+            # private while the supervisor emits only its fixed failure line.
+            malformed_manifest = b"{"
+            capabilities = b"python_bytecode_disabled\n"
+            manifest_path = generation_dir / "manifest.json"
+            manifest_path.write_bytes(malformed_manifest)
+            os.chown(manifest_path, 0, 0)
+            os.chmod(manifest_path, 0o444)
+            capabilities_path = generation_dir / "capabilities.txt"
+            capabilities_path.write_bytes(capabilities)
+            os.chown(capabilities_path, 0, 0)
+            os.chmod(capabilities_path, 0o444)
+            command[-2] = hashlib.sha256(malformed_manifest).hexdigest()
+            command[-1] = hashlib.sha256(capabilities).hexdigest()
+            result = subprocess.run(
+                command,
+                check=False,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(
+                result.stdout,
+                "RELEASE_DEPLOY schema=1 status=failed class=preflight "
+                "phase=preflight reason=host_tools_invalid "
+                f"release_slug={release_slug} source_sha={target_sha}\n",
+            )
+            self.assertEqual(result.stderr, "ERROR: deployment failed\n")
+            self.assertFalse(release_lock.exists())
+            self.assertFalse(retained_lock.exists())
+            self.assertFalse(artifact.exists())
+            self.assertEqual(sentinel.read_bytes(), b"no release lifecycle work\n")
+
     def test_retained_lock_supervisor_preserves_callback_failure_marker(self) -> None:
         """Nested flock callbacks preserve valid markers and fail closed."""
 

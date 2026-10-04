@@ -229,6 +229,7 @@ DETERMINISTIC_GATE_IDS = tuple(gate.id for gate in GATES if gate.deterministic)
 CI_GATE_IDS = tuple(gate.id for gate in GATES if gate.ci_required)
 
 RELEASE_RUNTIME_TEST_IDS: tuple[str, ...] = (
+    "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_host_tools_contract_failure_emits_marker_before_locks",
     "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_staged_live_qa_build_materializes_validated_browser_links",
     "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_staged_live_qa_builder_output_passes_standalone_artifact_validator",
     "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_staged_live_qa_build_fails_closed_for_browser_link_inputs",
