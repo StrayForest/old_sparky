@@ -694,21 +694,12 @@ class PlatformCiClassifierTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
             and node.name == "validate_source_security_status"
         )
-        test_module = ast.Module(
-            body=[
-                ast.Import(names=[ast.alias(name="re")]),
-                ast.ImportFrom(
-                    module="datetime",
-                    names=[
-                        ast.alias(name="datetime"),
-                        ast.alias(name="timezone"),
-                    ],
-                    level=0,
-                ),
-                validator,
-            ],
-            type_ignores=[],
-        )
+        imports = [
+            node
+            for node in guard_script.body
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+        ]
+        test_module = ast.Module(body=[*imports, validator], type_ignores=[])
         namespace: dict[str, object] = {}
         exec(compile(ast.fix_missing_locations(test_module), "baseline-status", "exec"), namespace)
         validate = namespace["validate_source_security_status"]
