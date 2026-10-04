@@ -12,10 +12,15 @@ generation.  The immutable path is:
 The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
-is the only source for `HOST_TOOLS_SHA`; the reviewed C4 change pins generation
-`7b87e2a996270e818f3b1f0c95c03fe98ab53916`. The pending C5 pin candidate
-selects generation `0d9d80b7a7d4365abaaf7875e88442b5f43ed46f`; production still
-has C4 installed until a C5 provisioning receipt verifies the new inventory.
+is the only source for `HOST_TOOLS_SHA`; pending pin target
+`b39cc48b6d0ad4e5d399d8c286f0b2cf510adf21` selects generation
+`0af4a88f130a550a86accab13f2930ba9366c118` (C6). The pin resolves to that
+source commit, which is its ancestor, and changes only the supervisor digest
+in the 13-member closure. C6 is not provisioned yet. C5 remains the installed
+generation, built and attested from merged target
+`468b08fef78462bfa605c6c9d43cd5d5e2ca3e49`; its root-owned provisioning
+receipt is
+`/var/tmp/oldsparky-host-tools-provisioning/0d9d80b7a7d4365abaaf7875e88442b5f43ed46f/provisioning-receipt.json`.
 The application release is a separate identity and remains at the release
 documented in [`CURRENT.md`](../CURRENT.md) until an exact successful
 automatic deployment and smoke are recorded there. The pin records the
