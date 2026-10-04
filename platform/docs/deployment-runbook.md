@@ -472,13 +472,12 @@ artifact digest, the publisher outer artifact name/ID/digest, and the bundle
 member digest. Missing, duplicate, over-100, expired, or mismatched API rows
 fail before SSH or host mutation.
 
-The host installs the verified bundle as one immutable generation and invokes only its fixed `platform_abort_retained_only.sh` entrypoint. The separate operation-aware release-recover workflow
-requests `recover_pending` and invokes only `platform_recover_pending.sh`. Abort accepts only an
-install receipt in `phase=recovery-restored`; uncertain migration phases, missing identities, lock
-contention, or runtime/systemd/pointer/completion failures retain the receipt. It cleans candidate
-and venv artifacts, clears the systemd receipt, then removes the operation receipt last. Retry
-resumes from remaining durable state and never repeats an unproven runtime transition. This non-deployable
-recovery authority does not run normal deploy, Alembic downgrade, or manual systemctl.
+The host installs verified bundles as immutable generations. The normal
+release-recover flow invokes `platform_recover_pending.sh`; abort bootstrap
+invokes `platform_abort_retained_only.sh`. For a pre-managed-LiveQA target
+missing old helper files, use the guarded two-phase fallback in the
+[recovery ADR](adr/recovery-bootstrap-retained-abort.md). Both flows retain
+unsafe receipts and never downgrade or run `systemctl` manually.
 
 For an operation-ID v2 `install` receipt from a pre-managed-LiveQA release, recovery requires no paired systemd receipt, exact transaction pointers/identities, and both old-release inputs absent:
 `tools/platform_live_qa_runtime_install.py` and `liveqa-runtime/`. Partial payloads fail closed.

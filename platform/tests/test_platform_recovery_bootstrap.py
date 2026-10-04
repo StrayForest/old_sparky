@@ -6,7 +6,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
+import shlex
 import shutil
 import stat
 import subprocess
@@ -15,6 +15,7 @@ import tempfile
 import textwrap
 import unittest
 import zipfile
+from pathlib import Path
 from unittest import mock
 
 from tools import platform_recovery_bootstrap as recovery
@@ -1222,6 +1223,53 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     self.assertFalse(state.exists())
                     self.assertFalse(systemd_state.exists())
                     self.assertGreaterEqual(len(calls), 4)
+
+    def test_recovery_attestation_resolves_workflow_sha_in_shell_scope(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
+        ).read_text(encoding="utf-8")
+        recovery_step = workflow.split(
+            "- name: Validate exact security and recovery provenance before SSH", 1
+        )[1].split("- name: Validate production SSH inputs", 1)[0]
+        run_lines = recovery_step.split("run: |", 1)[1].splitlines()
+        assignment = next(
+            line.strip()
+            for line in run_lines
+            if line.strip().startswith("recovery_workflow_sha=")
+        )
+        digest_guard = next(
+            line.strip()
+            for line in run_lines
+            if line.strip().startswith('[[ "$recovery_workflow_sha" =~')
+        )
+        attestation = 'gh attestation verify "$bundle_path"'
+        self.assertLess(recovery_step.index(assignment), recovery_step.index(attestation))
+        self.assertLess(recovery_step.index(digest_guard), recovery_step.index(attestation))
+        self.assertIn('--source-digest "$recovery_workflow_sha"', recovery_step)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "GITHUB_OUTPUT"
+            for candidate, expected_status in (("a" * 40, 0), ("not-a-sha", 1)):
+                output.write_text(f"recovery_workflow_sha={candidate}\n", encoding="ascii")
+                command = "\n".join(
+                    (
+                        "set -euo pipefail",
+                        f"GITHUB_OUTPUT={shlex.quote(str(output))}",
+                        assignment,
+                        digest_guard,
+                        'printf \'%s\\n\' "$recovery_workflow_sha"',
+                    )
+                )
+                result = subprocess.run(
+                    ["bash", "-c", command],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                self.assertEqual(result.returncode, expected_status)
+                if expected_status == 0:
+                    self.assertEqual(result.stdout.strip(), candidate)
 
     def test_legacy_v2_bridge_cleans_only_with_exact_no_systemd_state(self) -> None:
         if os.geteuid() != 0:

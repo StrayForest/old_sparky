@@ -29,6 +29,15 @@ mailbox helper are digest-bound to the same manifest. A partial switch fails
 closed, and retention removes only inactive generations after exact
 active/current/previous identity checks.
 
+The trusted parent `/root/.oldsparky/liveqa` remains root-private at mode
+`0700`; its `releases` payload root is root-owned mode `0755` to satisfy the
+canonical generation metadata validator while preserving the parent access
+boundary. Installation creates that root at the exact mode even when the
+caller's umask is restrictive. For compatibility, only an existing root-owned
+`0700` payload root is normalized to `0755`; other unexpected metadata fails
+closed. This adjustment does not change existing payload bytes or recursively
+change generation permissions.
+
 The only set-id file permitted anywhere in this contour is the root-owned
 Chromium sandbox at its exact reviewed path, mode `04755` and pinned SHA-256.
 The guard, safe environment and dispatcher accept only the active manifest's

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -199,11 +200,68 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
         source_sha = "a" * 40
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             with self.runtime_tree(Path(temporary), source_sha) as (app_dir, release, trusted, payload_root):
-                manifest = runtime.install(app_dir, release)
+                previous_umask = os.umask(0o077)
+                try:
+                    manifest = runtime.install(app_dir, release)
+                finally:
+                    os.umask(previous_umask)
                 self.assertEqual(manifest["source_sha"], source_sha)
                 self.assertEqual(os.readlink(trusted / "active"), f"releases/{source_sha}")
                 self.assertEqual((trusted / "active").resolve(), payload_root / source_sha)
+                self.assertEqual(stat.S_IMODE(payload_root.stat().st_mode), 0o755)
+                self.assertEqual(stat.S_IMODE(trusted.stat().st_mode), 0o700)
                 runtime._validate_active_pointer(source_sha)
+
+    def test_install_repairs_only_legacy_private_payload_root_mode(self) -> None:
+        source_sha = "b" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.runtime_tree(Path(temporary), source_sha) as (app_dir, release, trusted, payload_root):
+                trusted.mkdir(mode=0o700)
+                payload_root.mkdir(mode=0o700)
+                previous_umask = os.umask(0o077)
+                try:
+                    runtime.install(app_dir, release)
+                finally:
+                    os.umask(previous_umask)
+                self.assertEqual(stat.S_IMODE(payload_root.stat().st_mode), 0o755)
+                self.assertEqual(stat.S_IMODE(trusted.stat().st_mode), 0o700)
+
+    def test_install_preserves_canonical_payload_root_mode(self) -> None:
+        source_sha = "d" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.runtime_tree(Path(temporary), source_sha) as (app_dir, release, trusted, payload_root):
+                trusted.mkdir(mode=0o700)
+                payload_root.mkdir(mode=0o755)
+                runtime.install(app_dir, release)
+                self.assertEqual(stat.S_IMODE(payload_root.stat().st_mode), 0o755)
+                self.assertEqual(stat.S_IMODE(trusted.stat().st_mode), 0o700)
+
+    def test_install_rejects_unsupported_payload_root_metadata_before_cleanup(self) -> None:
+        source_sha = "c" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.runtime_tree(Path(temporary), source_sha) as (app_dir, release, _trusted, payload_root):
+                _trusted.mkdir(mode=0o700)
+                payload_root.mkdir(mode=0o750)
+                with mock.patch.object(runtime, "_cleanup_temporary_files") as cleanup, self.assertRaisesRegex(
+                    runtime.InstallerError,
+                    "payload root mode is unsupported",
+                ):
+                    runtime.install(app_dir, release)
+                cleanup.assert_not_called()
+                self.assertEqual(stat.S_IMODE(payload_root.stat().st_mode), 0o750)
+
+                payload_root.rmdir()
+                target = Path(temporary) / "outside-releases"
+                target.mkdir(mode=0o755)
+                payload_root.symlink_to(target)
+                with self.assertRaisesRegex(runtime.InstallerError, "payload root is unavailable"):
+                    runtime.install(app_dir, release)
+                payload_root.unlink()
+
+                payload_root.mkdir(mode=0o755)
+                os.chown(payload_root, 65534, 65534)
+                with self.assertRaisesRegex(runtime.InstallerError, "payload root metadata is unsafe"):
+                    runtime.install(app_dir, release)
 
     def test_verify_rejects_a_crash_left_noncanonical_pointer(self) -> None:
         source_sha = "b" * 40

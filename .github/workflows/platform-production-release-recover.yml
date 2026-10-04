@@ -395,16 +395,18 @@ jobs:
           PY
           bundle_path="$(awk -F= '$1 == "bundle_path" {print $2}' "$GITHUB_OUTPUT")"
           bundle_sha="$(awk -F= '$1 == "bundle_sha" {print $2}' "$GITHUB_OUTPUT")"
+          recovery_workflow_sha="$(awk -F= '$1 == "recovery_workflow_sha" {print $2}' "$GITHUB_OUTPUT")"
+          [[ "$recovery_workflow_sha" =~ ^[0-9a-f]{40,64}$ ]] || { echo "Exact recovery workflow SHA is missing or invalid" >&2; exit 1; }
           bundle_stat_before="$(stat -c '%d:%i:%h:%s:%u:%g:%a' "$bundle_path")"
           bundle_digest_before="$(sha256sum "$bundle_path" | awk '{print $1}')"
           test "$bundle_digest_before" = "$bundle_sha"
           attestation_json="$artifact_dir/attestation.json"
-          GH_TOKEN="${GH_TOKEN:?}" gh attestation verify "$bundle_path" --repo "$REPOSITORY" --signer-workflow StrayForest/old_sparky/.github/workflows/platform-production-recovery-bootstrap-build.yml --source-ref refs/heads/dev --source-digest "$RECOVERY_WORKFLOW_SHA" --format json >"$attestation_json"
+          GH_TOKEN="${GH_TOKEN:?}" gh attestation verify "$bundle_path" --repo "$REPOSITORY" --signer-workflow StrayForest/old_sparky/.github/workflows/platform-production-recovery-bootstrap-build.yml --source-ref refs/heads/dev --source-digest "$recovery_workflow_sha" --format json >"$attestation_json"
           bundle_stat_after="$(stat -c '%d:%i:%h:%s:%u:%g:%a' "$bundle_path")"
           bundle_digest_after="$(sha256sum "$bundle_path" | awk '{print $1}')"
           test "$bundle_stat_before" = "$bundle_stat_after"
           test "$bundle_digest_before" = "$bundle_digest_after"
-          RECOVERY_WORKFLOW_SHA="$RECOVERY_WORKFLOW_SHA" /usr/bin/python3 -I -B - "$attestation_json" "$bundle_digest_after" "$recovery_run_id" "$recovery_run_attempt" <<'PY'
+          RECOVERY_WORKFLOW_SHA="$recovery_workflow_sha" /usr/bin/python3 -I -B - "$attestation_json" "$bundle_digest_after" "$recovery_run_id" "$recovery_run_attempt" <<'PY'
           import json
           import os
           from pathlib import Path
