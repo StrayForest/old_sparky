@@ -15,9 +15,10 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 is the only source for `HOST_TOOLS_SHA`. This change follows the A/B pin
 lifecycle: source commit A updates the host supervisor and dispatcher timeout
 contract, and the immediately following pin commit B selects A as generation
-S10 with its exact closure. S10 remains pending provisioning until a canonical
-artifact, attestation, installed receipt and isolated host-capability check
-are recorded. The latest verified installed generation is S9
+S10 with its exact closure. S10 source A is
+`03e1aed83017779f25df20b43f2ba37e6efacdbc`. S10 remains pending provisioning
+until a canonical artifact, attestation, installed receipt and isolated
+host-capability check are recorded. The latest verified installed generation is S9
 `7a9fe1286054dbe96221d2b428048c4212270cf5`; C6 and earlier generations are
 preserved. The application remains at source
 `87547df2abd4aa06a07f4dd4b4f730e9912707e1`, as documented in [`CURRENT.md`](../CURRENT.md),
