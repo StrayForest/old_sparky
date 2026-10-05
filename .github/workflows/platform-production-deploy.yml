@@ -2642,7 +2642,7 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 65
     environment: production
     permissions:
       actions: read
@@ -3619,7 +3619,7 @@ jobs:
           remote_error="$RUNNER_TEMP/platform-production-deploy-remote-error.log"
           umask 077; : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
           set +e
-          timeout --foreground 900s ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+          timeout --foreground 2100s ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e

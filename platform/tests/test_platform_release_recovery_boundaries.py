@@ -3238,38 +3238,47 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         deploy = self.copy_deploy_script_with_fault(
             "deploy-first-install-liveqa-reconcile.sh", None, None, systemctl
         )
-        deploy.write_text(
-            deploy.read_text(encoding="utf-8").replace(
-                "SYSTEMD_OPERATION_TIMEOUT_SECONDS=120",
-                "SYSTEMD_OPERATION_TIMEOUT_SECONDS=2",
-                1,
-            ),
-            encoding="utf-8",
-        )
-        deploy.chmod(0o755)
-
         started = time.monotonic()
+        test_env = self.runtime_env(label="first-install-liveqa-reconcile")
+        test_env["PLATFORM_CANDIDATE_DEADLINE_MONOTONIC_NS"] = str(
+            time.monotonic_ns() + 630 * 1_000_000_000
+        )
         result = self.run_script(
             deploy,
             "--resume",
             "--app-dir",
             str(self.app_dir),
-            env=self.runtime_env(label="first-install-liveqa-reconcile"),
+            env=test_env,
             check=False,
         )
         elapsed = time.monotonic() - started
 
         self.assertNotEqual(result.returncode, 0, result.stderr)
-        self.assertLess(elapsed, 12.0, result.stderr)
+        self.assertLess(elapsed, 35.0, result.stderr)
         self.assertEqual(self.state_phase(), "activation-pending")
         self.assertTrue((self.shared / STATE_NAME).exists())
         self.assertTrue(candidate.exists())
         self.assertIn("reconcile\n", log_path.read_text(encoding="ascii"))
+        self.assertRegex(
+            result.stderr,
+            r"outcome=timeout budget_seconds=(?:[1-9]|1[0-9]|2[0-5]) child_exit=124",
+        )
+        payload_path = log_path.with_suffix(".payload")
+        self.assertEqual(payload_path.read_text(encoding="ascii"), "published\n")
 
-        mode_path.write_text("ok\n", encoding="ascii")
+        mode_path.write_text("slow\n", encoding="ascii")
         retry = self.copy_deploy_script_with_fault(
             "deploy-first-install-liveqa-reconcile-retry.sh", None, None, systemctl
         )
+        retry.write_text(
+            retry.read_text(encoding="utf-8").replace(
+                "SYSTEMD_OPERATION_TIMEOUT_SECONDS=120",
+                "SYSTEMD_OPERATION_TIMEOUT_SECONDS=10",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        retry.chmod(0o755)
         result = self.run_script(
             retry,
             "--resume",
@@ -3281,6 +3290,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.shared / STATE_NAME).exists())
         self.assertEqual((self.app_dir / "current").resolve(), candidate)
+        self.assertEqual(payload_path.read_text(encoding="ascii"), "published\n")
+        self.assertEqual(log_path.read_text(encoding="ascii").splitlines(), ["reconcile", "reconcile"])
 
     def test_initial_activation_readiness_budget_retains_receipt_and_retries(self) -> None:
         """Both activation readiness phases enforce the same aggregate budget."""
@@ -4063,6 +4074,9 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
     def runtime_env(self, *, label: str) -> dict[str, str]:
         return {
+            "PLATFORM_CANDIDATE_DEADLINE_MONOTONIC_NS": str(
+                time.monotonic_ns() + 1800 * 1_000_000_000
+            ),
             "PLATFORM_TEST_UNITS_STATE": str(self.root / "units.state"),
             "PLATFORM_TEST_UNITS_LABEL": label,
             "PLATFORM_TEST_NGINX_STATE": str(self.root / "nginx.state"),
@@ -4597,11 +4611,15 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "import time\n"
             f"mode_path = Path({str(mode_path)!r})\n"
             f"log_path = Path({str(log_path)!r})\n"
+            f"payload_path = Path({str(log_path.with_suffix('.payload'))!r})\n"
             "if len(sys.argv) > 1 and sys.argv[1] == 'reconcile':\n"
             "    with log_path.open('a', encoding='ascii') as stream:\n"
             "        stream.write('reconcile\\n')\n"
+            "    payload_path.write_text('published\\n', encoding='ascii')\n"
             "    if mode_path.read_text(encoding='ascii').strip() == 'hang':\n"
-            "        time.sleep(60)\n",
+            "        time.sleep(60)\n"
+            "    if mode_path.read_text(encoding='ascii').strip() == 'slow':\n"
+            "        time.sleep(8)\n",
             encoding="utf-8",
         )
         python = self.shared / "venv/bin/python"

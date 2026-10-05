@@ -691,7 +691,7 @@ import time
 
 candidate, artifact, runtime, release_slug, source_sha, run_id, attempt, host_tools_sha = sys.argv[1:]
 capture_limit = 64 * 1024
-capture_timeout_seconds = 840.0
+capture_timeout_seconds = 1800.0
 pipe_eof_grace_seconds = 1.0
 termination_grace_seconds = 2.0
 run_name = f"{run_id}-{attempt}"
@@ -955,6 +955,9 @@ try:
         raise RunnerInterrupted()
     child_env = os.environ.copy()
     child_env["LC_ALL"] = "C.UTF-8"
+    child_env["PLATFORM_CANDIDATE_DEADLINE_MONOTONIC_NS"] = str(
+        int(capture_deadline * 1_000_000_000)
+    )
     command = [
         candidate, "--artifact", artifact, "--app-dir", runtime,
         "--edge-origin", "https://127.0.0.1", "--edge-host", "old-sparky.com",
