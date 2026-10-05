@@ -89,6 +89,8 @@ jobs:
           artifacts = json.loads((root / "producer-artifacts.json").read_text(encoding="utf-8"))
           producer_id = int(env["PRODUCER_RUN_ID"])
           producer_attempt = int(env["PRODUCER_RUN_ATTEMPT"])
+          repository = run.get("repository") if isinstance(run, dict) else None
+          repository_id = repository.get("id") if isinstance(repository, dict) else None
           if any((
               run.get("id") != producer_id,
               run.get("run_attempt") != producer_attempt,
@@ -99,6 +101,7 @@ jobs:
               run.get("name") != env["PRODUCER_WORKFLOW"],
               run.get("path") != env["PRODUCER_WORKFLOW_PATH"],
               (run.get("repository") or {}).get("full_name") != env["REPOSITORY"],
+              type(repository_id) is not int or repository_id <= 0,
               not re.fullmatch(r"[0-9a-f]{40}", str(run.get("head_sha", ""))),
           )):
               raise SystemExit("producer run provenance is not exact")
@@ -144,7 +147,8 @@ jobs:
                   or not isinstance(workflow_run, dict) or workflow_run.get("id") != producer_id
                   or workflow_run.get("head_sha") != run["head_sha"]
                   or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != producer_attempt)
-                  or (workflow_run.get("repository") or {}).get("full_name") != env["REPOSITORY"]
+                  or workflow_run.get("repository_id") != repository_id
+                  or workflow_run.get("head_repository_id") != repository_id
                   or not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None):
                   raise SystemExit("storage receipt provenance is not exact")
               with output.open("a", encoding="ascii") as stream:
@@ -262,7 +266,9 @@ jobs:
           run = json.loads((root / "storage-security-run.json").read_text(encoding="utf-8"))
           jobs = json.loads((root / "storage-security-jobs.json").read_text(encoding="utf-8"))
           artifacts = json.loads((root / "storage-security-artifacts.json").read_text(encoding="utf-8"))
-          if any((run.get("id") != int(run_id), run.get("run_attempt") != int(attempt), run.get("head_sha") != source_sha, run.get("head_branch") != "dev", run.get("event") != "push", run.get("status") != "completed", run.get("conclusion") != "success", run.get("name") != "Platform security and build", run.get("path") != ".github/workflows/platform-security.yml", (run.get("repository") or {}).get("full_name") != repository)):
+          repository_metadata = run.get("repository") if isinstance(run, dict) else None
+          repository_id = repository_metadata.get("id") if isinstance(repository_metadata, dict) else None
+          if any((run.get("id") != int(run_id), run.get("run_attempt") != int(attempt), run.get("head_sha") != source_sha, run.get("head_branch") != "dev", run.get("event") != "push", run.get("status") != "completed", run.get("conclusion") != "success", run.get("name") != "Platform security and build", run.get("path") != ".github/workflows/platform-security.yml", (run.get("repository") or {}).get("full_name") != repository, type(repository_id) is not int or repository_id <= 0)):
               raise SystemExit("parent security run provenance is not exact")
           job_rows = jobs.get("jobs") if isinstance(jobs, dict) else None
           if not isinstance(job_rows, list) or type(jobs.get("total_count")) is not int or jobs["total_count"] != len(job_rows) or len(job_rows) > 100:
@@ -278,7 +284,7 @@ jobs:
           if len(matches) != 1:
               raise SystemExit("parent classifier artifact is not exact")
           workflow_run = matches[0].get("workflow_run")
-          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != source_sha or workflow_run.get("run_attempt") != int(attempt) or (workflow_run.get("repository") or {}).get("full_name") != repository:
+          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != source_sha or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(attempt)) or workflow_run.get("repository_id") != repository_id or workflow_run.get("head_repository_id") != repository_id:
               raise SystemExit("parent classifier artifact provenance is invalid")
           with output.open("a", encoding="ascii") as stream:
               stream.write(f"route_artifact_id={matches[0]['id']}\nroute_artifact_sha256={matches[0]['digest'][len('sha256:') :]}\n")
