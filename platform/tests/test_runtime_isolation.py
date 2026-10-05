@@ -63,6 +63,7 @@ class RuntimeIsolationTests(unittest.TestCase):
             unit = (PLATFORM_ROOT / "deploy" / "systemd" / filename).read_text()
             self.assertIn(f"User={identity}\n", unit)
             self.assertIn(f"Group={identity}\n", unit)
+            self.assertIn("KillMode=control-group\n", unit)
             self.assertIn(
                 f"Environment=PLATFORM_ENV_FILE=/opt/oldsparky/platform/shared/env/{service}.env",
                 unit,

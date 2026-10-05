@@ -7,6 +7,7 @@ Wants=network-online.target redis-server.service
 Type=simple
 User=oldsparky-api
 Group=oldsparky-api
+KillMode=control-group
 SupplementaryGroups=oldsparky-media
 WorkingDirectory=/opt/oldsparky/platform/current
 Environment=PLATFORM_RUNTIME_SERVICE=api

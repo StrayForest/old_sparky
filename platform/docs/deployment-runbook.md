@@ -370,6 +370,14 @@ health, Cloudflare and maintenance timer enablement, and installs the
 off-site-backup unit/timer without silently enabling off-site backup before its
 manual restore-drill gate.
 
+New shared virtual environments and pip-installed code use a local `umask 022`
+subshell so API/worker identities can traverse and read them; the installer's
+outer `umask 077` still protects receipts, temporary files and service envs.
+Candidate cache cleanup permits service-owned entries only after
+`legacy-services-restored`, fresh readiness and loaded web
+`KillMode=control-group`; dirfd/no-follow checks apply only to that exact cache
+subtree. Other candidate entries remain root-owned; unsafe state retains receipt.
+
 If candidate activation fails, the workflow records read-only filesystem,
 inode, mount and API sandbox facts, plus a sanitized systemd snapshot and the
 last three minutes of API, worker and web journals before retaining the receipt

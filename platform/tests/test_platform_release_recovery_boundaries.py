@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import shlex
 import shutil
 import stat
@@ -11,6 +12,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from typing import cast
 from unittest import mock
 
 from tests import platform_test_lock_support as lock_support
@@ -917,6 +919,185 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                     self.assertTrue((tree / "linked.txt").is_symlink())
                 else:
                     self.assertTrue((tree / "special").exists())
+
+    def test_recursive_candidate_cleanup_allows_only_service_owned_web_cache(self) -> None:
+        with mock.patch.object(
+            transaction, "_run_systemctl", return_value="control-group"
+        ) as read_kill_mode:
+            transaction._require_web_unit_control_group("/usr/bin/systemctl")
+        read_kill_mode.assert_called_once_with(
+            "/usr/bin/systemctl",
+            "show",
+            "--property=KillMode",
+            "--value",
+            "deadlock-web.service",
+        )
+        with mock.patch.object(transaction, "_run_systemctl", return_value="process"):
+            with self.assertRaisesRegex(
+                transaction.TransactionError, "process containment is unsafe"
+            ):
+                transaction._require_web_unit_control_group("/usr/bin/systemctl")
+
+        if os.geteuid() == 0:
+            service_account = pwd.getpwnam("nobody")
+            service_uid = service_account.pw_uid
+            service_gid = service_account.pw_gid
+        else:
+            service_uid = os.geteuid()
+            service_gid = os.getegid()
+        self.assertGreater(service_uid, 0)
+        self.assertGreater(service_gid, 0)
+
+        def make_tree(label: str) -> tuple[Path, Path, Path]:
+            tree = self.root / f"candidate-cache-{label}"
+            tree.mkdir(mode=0o700)
+            cache = tree / transaction.WEB_CACHE_RELATIVE_PATH
+            cache.mkdir(parents=True, mode=0o750)
+            nested = cache / "nested"
+            nested.mkdir(mode=0o750)
+            file = nested / "generated.txt"
+            file.write_text("generated cache data\n", encoding="ascii")
+            cache.chmod(0o750)
+            nested.chmod(0o750)
+            file.chmod(0o640)
+            if os.geteuid() == 0:
+                for path in (cache, nested, file):
+                    os.chown(path, service_uid, service_gid)
+            return tree, cache, file
+
+        tree, cache, generated = make_tree("positive")
+        with self.assertRaisesRegex(
+            transaction.TransactionError,
+            "requires verified legacy restoration",
+        ):
+            transaction._cleanup_recovered_install(
+                self.root / "operation.json",
+                {
+                    "shared": self.root / "shared",
+                    "peer_path": self.root / "peer",
+                    "candidate_path": tree,
+                    "peer_before": None,
+                    "phase": "recovery-restored",
+                    "operation": "install",
+                },
+            )
+        self.assertTrue(tree.exists())
+        real_rmtree = transaction.shutil.rmtree
+
+        def remove_after_mode_check(path: str | bytes | os.PathLike[str], *args, **kwargs) -> None:
+            quarantine_cache = Path(path) / transaction.WEB_CACHE_RELATIVE_PATH
+            self.assertEqual(stat.S_IMODE(quarantine_cache.stat().st_mode), 0o750)
+            self.assertEqual(
+                stat.S_IMODE((quarantine_cache / "nested").stat().st_mode),
+                0o750,
+            )
+            self.assertEqual(
+                stat.S_IMODE((quarantine_cache / "nested/generated.txt").stat().st_mode),
+                0o640,
+            )
+            real_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(
+            transaction.shutil, "rmtree", side_effect=remove_after_mode_check
+        ):
+            transaction._remove_tree(
+                tree,
+                service_owned_cache=(cache, service_uid, service_gid),
+            )
+        self.assertFalse(tree.exists())
+        self.assertFalse(generated.exists())
+
+        for mutation in (
+            "wrong-owner",
+            "nonroot-sibling",
+            "symlink",
+            "hardlink",
+            "group-writable",
+            "special-file",
+        ):
+            with self.subTest(mutation=mutation):
+                tree, cache, generated = make_tree(mutation)
+                expected_owner = (service_uid, service_gid)
+                if mutation == "wrong-owner":
+                    expected_owner = (service_uid + 1, service_gid + 1)
+                elif mutation == "nonroot-sibling":
+                    sibling = tree / "outside-cache" / "generated.txt"
+                    sibling.parent.mkdir(mode=0o755)
+                    sibling.write_text("outside cache\n", encoding="ascii")
+                    if os.geteuid() == 0:
+                        os.chown(sibling, service_uid, service_gid)
+                elif mutation == "symlink":
+                    target = self.root / "external-cache-target"
+                    target.mkdir(exist_ok=True)
+                    link = cache / "link"
+                    link.symlink_to(target, target_is_directory=True)
+                    if os.geteuid() == 0:
+                        os.chown(link, service_uid, service_gid, follow_symlinks=False)
+                elif mutation == "hardlink":
+                    os.link(generated, cache / "duplicate.txt")
+                elif mutation == "group-writable":
+                    generated.chmod(0o660)
+                else:
+                    fifo = cache / "special"
+                    os.mkfifo(fifo, 0o640)
+                    if os.geteuid() == 0:
+                        os.chown(fifo, service_uid, service_gid)
+
+                with self.assertRaises(transaction.TransactionError):
+                    transaction._remove_tree(
+                        tree,
+                        service_owned_cache=(cache, *expected_owner),
+                    )
+                self.assertTrue(tree.exists())
+                self.assertTrue(generated.exists())
+
+    def test_legacy_restore_marker_requires_loaded_control_group_for_cache(self) -> None:
+        _current, _previous, candidate = self.prepare_install_state()
+        cache = candidate / transaction.WEB_CACHE_RELATIVE_PATH
+        cache.mkdir(parents=True, mode=0o750)
+        record = transaction._load_record(self.shared / STATE_NAME)
+        record["phase"] = "recovery-restored"
+        transaction._write_record(
+            self.shared / STATE_NAME,
+            transaction._record_for_write(record),
+            creating=False,
+        )
+        receipt_before = (self.shared / STATE_NAME).read_bytes()
+        enabled = cast(dict[str, str], record["service_enabled_before"])
+        service_state = cast(dict[str, str], record["service_state_before"])
+
+        with (
+            mock.patch.object(transaction, "_validate_legacy_liveqa_recovery"),
+            mock.patch.object(transaction, "_verify_legacy_readiness"),
+            mock.patch.object(
+                transaction,
+                "_read_systemctl_enabled",
+                side_effect=lambda _systemctl, unit: (
+                    cast(str, record["timer_enabled_before"])
+                    if unit == "deadlock-cloudflare-ips.timer"
+                    else enabled[unit]
+                ),
+            ),
+            mock.patch.object(
+                transaction,
+                "_read_systemctl_state",
+                side_effect=lambda _systemctl, unit: (
+                    "active" if unit.endswith(".timer") else service_state[unit]
+                ),
+            ),
+            mock.patch.object(transaction, "_run_systemctl", return_value="process"),
+        ):
+            with self.assertRaisesRegex(
+                transaction.TransactionError, "process containment is unsafe"
+            ):
+                transaction.mark_legacy_services_restored(
+                    self.shared / STATE_NAME,
+                    systemctl="/usr/bin/systemctl",
+                )
+
+        self.assertEqual((self.shared / STATE_NAME).read_bytes(), receipt_before)
+        self.assertEqual(self.state_phase(), "recovery-restored")
+        self.assertTrue(cache.is_dir())
 
     def test_recursive_release_cleanup_unlinks_allowed_symlink_without_chmod_target(self) -> None:
         tree = self.root / "cleanup-venv-symlink"

@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import grp
 import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import runpy
 import shutil
@@ -54,6 +56,9 @@ LEGACY_READINESS_CURL_TIMEOUT_SECONDS = 2
 LEGACY_READINESS_RETRY_INTERVAL_SECONDS = 1.0
 SYSTEMD_CALL_TIMEOUT_SECONDS = 30.0
 SYSTEMD_OPERATION_TIMEOUT_SECONDS = 120.0
+WEB_CACHE_RELATIVE_PATH = Path(
+    "apps/platform_web/.next/standalone/.next/cache"
+)
 PHASES = {
     "prepared",
     "venv-transitioned",
@@ -2065,6 +2070,7 @@ def _remove_tree(
     *,
     expected_identity: dict[str, int] | None = None,
     allowed_symlink_roots: tuple[Path, ...] = (),
+    service_owned_cache: tuple[Path, int, int] | None = None,
 ) -> None:
     metadata = _safe_directory(path, label=f"cleanup path {path.name}")
     if expected_identity is not None and _identity(metadata) != expected_identity:
@@ -2076,60 +2082,99 @@ def _remove_tree(
     # hardlinks, special files and group/world-writable content are retained
     # with the receipt instead of becoming recursive cleanup authority.
     device = metadata.st_dev
-    pending = [path]
-    while pending:
-        root = pending.pop()
-        try:
-            entries = list(os.scandir(root))
-        except OSError as exc:
-            raise TransactionError("release cleanup tree cannot be inspected") from exc
-        for entry in entries:
+    service_cache_root: Path | None = None
+    service_cache_uid = 0
+    service_cache_gid = 0
+    if service_owned_cache is not None:
+        service_cache_root, service_cache_uid, service_cache_gid = service_owned_cache
+        if (
+            service_cache_root != path / WEB_CACHE_RELATIVE_PATH
+            or service_cache_uid <= 0
+            or service_cache_gid <= 0
+        ):
+            raise TransactionError("release cleanup service cache binding is invalid")
+        if _lexists(service_cache_root):
             try:
-                child_metadata = entry.stat(follow_symlinks=False)
+                service_cache_metadata = service_cache_root.lstat()
             except OSError as exc:
-                raise TransactionError("release cleanup entry cannot be inspected") from exc
-            mode = child_metadata.st_mode
-            child = Path(entry.path)
-            is_symlink = stat.S_ISLNK(mode)
-            symlink_root_allowed = any(
-                child == allowed_root or allowed_root in child.parents
-                for allowed_root in allowed_symlink_roots
-            )
+                raise TransactionError("release cleanup service cache is unavailable") from exc
             if (
-                child_metadata.st_dev != device
-                or child_metadata.st_uid != 0
-                or child_metadata.st_gid != 0
-                or (
-                    not is_symlink
-                    and stat.S_IMODE(mode) & 0o022
-                )
-                or (
-                    is_symlink
-                    and (
-                        not symlink_root_allowed
-                        or child_metadata.st_nlink != 1
-                    )
-                )
+                not stat.S_ISDIR(service_cache_metadata.st_mode)
+                or stat.S_ISLNK(service_cache_metadata.st_mode)
+                or service_cache_metadata.st_dev != device
+                or service_cache_metadata.st_uid != service_cache_uid
+                or service_cache_metadata.st_gid != service_cache_gid
             ):
-                raise TransactionError("release cleanup entry metadata is unsafe")
-            if is_symlink:
-                # A staged Python virtualenv normally contains interpreter
-                # symlinks (bin/python*, lib64).  They are safe to unlink
-                # after the exact receipt-bound venv root has been moved into
-                # quarantine: shutil.rmtree never follows symlinks.  Keep the
-                # default strict for release trees and arbitrary cleanup
-                # callers; only exact receipt-bound venv roots opt into this
-                # narrow compatibility path.
-                continue
-            if stat.S_ISDIR(mode):
-                if child_metadata.st_nlink < 2:
-                    raise TransactionError("release cleanup directory identity is invalid")
-                pending.append(child)
-            elif stat.S_ISREG(mode):
-                if child_metadata.st_nlink != 1:
-                    raise TransactionError("release cleanup hardlink is unsafe")
-            else:
-                raise TransactionError("release cleanup entry type is unsafe")
+                raise TransactionError("release cleanup service cache metadata is unsafe")
+    # Walk from open directory descriptors. A service-owned cache is only
+    # eligible after its service cgroup has been stopped and the restored
+    # legacy services have passed readiness; dirfd-relative no-follow stats
+    # also ensure cleanup never follows a cache entry if the tree changes.
+    try:
+        for root, directories, files, directory_fd in os.fwalk(
+            path, topdown=True, follow_symlinks=False
+        ):
+            root_path = Path(root)
+            for name in (*directories, *files):
+                try:
+                    child_metadata = os.stat(
+                        name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                except OSError as exc:
+                    raise TransactionError(
+                        "release cleanup entry cannot be inspected"
+                    ) from exc
+                mode = child_metadata.st_mode
+                child = root_path / name
+                is_symlink = stat.S_ISLNK(mode)
+                service_cache_entry = (
+                    service_cache_root is not None
+                    and (child == service_cache_root or service_cache_root in child.parents)
+                )
+                symlink_root_allowed = any(
+                    child == allowed_root or allowed_root in child.parents
+                    for allowed_root in allowed_symlink_roots
+                )
+                if service_cache_entry:
+                    owner_is_unsafe = (
+                        child_metadata.st_uid != service_cache_uid
+                        or child_metadata.st_gid != service_cache_gid
+                    )
+                else:
+                    owner_is_unsafe = (
+                        child_metadata.st_uid != 0 or child_metadata.st_gid != 0
+                    )
+                if (
+                    child_metadata.st_dev != device
+                    or owner_is_unsafe
+                    or (
+                        not is_symlink
+                        and stat.S_IMODE(mode) & 0o022
+                    )
+                    or (
+                        is_symlink
+                        and (
+                            service_cache_entry
+                            or not symlink_root_allowed
+                            or child_metadata.st_nlink != 1
+                        )
+                    )
+                ):
+                    raise TransactionError("release cleanup entry metadata is unsafe")
+                if is_symlink:
+                    continue
+                if stat.S_ISDIR(mode):
+                    if child_metadata.st_nlink < 2:
+                        raise TransactionError(
+                            "release cleanup directory identity is invalid"
+                        )
+                elif stat.S_ISREG(mode):
+                    if child_metadata.st_nlink != 1:
+                        raise TransactionError("release cleanup hardlink is unsafe")
+                else:
+                    raise TransactionError("release cleanup entry type is unsafe")
+    except OSError as exc:
+        raise TransactionError("release cleanup tree cannot be inspected") from exc
     # Move the fully checked tree into a private, same-parent quarantine before
     # deleting it.  The rename closes the pathname replacement window between
     # validation and recursive deletion: cleanup is now rooted at the inode
@@ -2158,6 +2203,7 @@ def _remove_tree(
             raise TransactionError("release cleanup quarantine identity changed")
         if quarantined.st_dev != device:
             raise TransactionError("release cleanup quarantine device changed")
+        quarantined_service_cache = quarantine / WEB_CACHE_RELATIVE_PATH
         for root, directories, _files in os.walk(
             quarantine, topdown=False, followlinks=False
         ):
@@ -2179,7 +2225,11 @@ def _remove_tree(
                     # never follow or chmod them.
                     child.unlink()
             root_path = Path(root)
-            if not stat.S_ISLNK(root_path.lstat().st_mode):
+            in_service_cache = (
+                root_path == quarantined_service_cache
+                or quarantined_service_cache in root_path.parents
+            )
+            if not in_service_cache and not stat.S_ISLNK(root_path.lstat().st_mode):
                 os.chmod(root_path, stat.S_IMODE(root_path.lstat().st_mode) | 0o700)
         shutil.rmtree(quarantine)
     except Exception as exc:
@@ -2197,6 +2247,41 @@ def _remove_tree(
     _fsync_directory(path.parent)
 
 
+def _web_cache_service_identity() -> tuple[int, int]:
+    try:
+        service_account = pwd.getpwnam("oldsparky-web")
+        service_group = grp.getgrnam("oldsparky-web")
+        user_count = sum(
+            entry.pw_uid == service_account.pw_uid for entry in pwd.getpwall()
+        )
+        group_count = sum(
+            entry.gr_gid == service_group.gr_gid for entry in grp.getgrall()
+        )
+    except KeyError as exc:
+        raise TransactionError("web cache service identity is unavailable") from exc
+    if (
+        service_account.pw_uid <= 0
+        or service_group.gr_gid <= 0
+        or service_account.pw_gid != service_group.gr_gid
+        or user_count != 1
+        or group_count != 1
+    ):
+        raise TransactionError("web cache service identity is unsafe")
+    return service_account.pw_uid, service_group.gr_gid
+
+
+def _require_web_unit_control_group(systemctl: str) -> None:
+    kill_mode = _run_systemctl(
+        systemctl,
+        "show",
+        "--property=KillMode",
+        "--value",
+        "deadlock-web.service",
+    )
+    if kill_mode != "control-group":
+        raise TransactionError("web service process containment is unsafe")
+
+
 def _mark_recovery_restored(
     state: Path, record: dict[str, object]
 ) -> dict[str, object]:
@@ -2206,12 +2291,25 @@ def _mark_recovery_restored(
 
 
 def _cleanup_recovered_install(
-    state: Path, record: dict[str, object], *, remove_receipt: bool = True
+    state: Path,
+    record: dict[str, object],
+    *,
+    remove_receipt: bool = True,
+    allow_service_owned_cache: bool = False,
 ) -> None:
     shared = cast(Path, record["shared"])
     peer = cast(Path, record["peer_path"])
     candidate = cast(Path, record["candidate_path"])
     peer_before = record["peer_before"]
+    candidate_cache = candidate / WEB_CACHE_RELATIVE_PATH
+    if _lexists(candidate_cache) and (
+        not allow_service_owned_cache
+        or record.get("phase") != "legacy-services-restored"
+        or record.get("operation") != "install"
+    ):
+        raise TransactionError(
+            "service-owned candidate cache requires verified legacy restoration"
+        )
     if _lexists(peer):
         if not isinstance(peer_before, dict):
             raise TransactionError("install cleanup peer identity is invalid")
@@ -2227,10 +2325,17 @@ def _cleanup_recovered_install(
         ):
             raise TransactionError("candidate release is still active during cleanup")
         candidate_identity = cast(dict[str, int], record["candidate_identity"])
+        service_owned_cache = None
+        if _lexists(candidate_cache):
+            service_owned_cache = (
+                candidate_cache,
+                *_web_cache_service_identity(),
+            )
         _remove_tree(
             candidate,
             expected_identity=candidate_identity,
             allowed_symlink_roots=(candidate / ".rollback/shared-venv-before-install",),
+            service_owned_cache=service_owned_cache,
         )
     if record["remove_env_on_recovery"]:
         env_file = shared / ".env.platform"
@@ -2444,6 +2549,11 @@ def mark_legacy_services_restored(state: Path, *, systemctl: str) -> None:
     if _read_systemctl_state(systemctl, "deadlock-cloudflare-ips.timer") != timer_expected:
         raise TransactionError("legacy timer state is not restored")
     _verify_legacy_readiness(record)
+    if (
+        record["operation"] == "install"
+        and _lexists(cast(Path, record["candidate_path"]) / WEB_CACHE_RELATIVE_PATH)
+    ):
+        _require_web_unit_control_group(systemctl)
     record["phase"] = "legacy-services-restored"
     _write_record(state, _record_for_write(record), creating=False)
 
@@ -2468,6 +2578,11 @@ def verify_legacy_services(state: Path, *, systemctl: str) -> None:
     if _read_systemctl_state(systemctl, "deadlock-cloudflare-ips.timer") != timer_expected:
         raise TransactionError("legacy timer state changed")
     _verify_legacy_readiness(record)
+    if (
+        record["operation"] == "install"
+        and _lexists(cast(Path, record["candidate_path"]) / WEB_CACHE_RELATIVE_PATH)
+    ):
+        _require_web_unit_control_group(systemctl)
 
 
 def _verify_legacy_readiness(record: dict[str, object]) -> None:
@@ -2611,6 +2726,7 @@ def complete_recovery(
             state,
             record,
             remove_receipt=not retain_receipt,
+            allow_service_owned_cache=(record["phase"] == "legacy-services-restored"),
         )
     else:
         if not retain_receipt:

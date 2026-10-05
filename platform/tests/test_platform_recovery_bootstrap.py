@@ -514,6 +514,8 @@ class RecoveryLegacyReadinessTests(unittest.TestCase):
     def _record() -> dict[str, object]:
         return {
             "phase": "recovery-restored",
+            "operation": "install",
+            "candidate_path": Path("/private/nonexistent-candidate"),
             "service_state_before": {
                 "deadlock-api": "active",
                 "deadlock-worker": "inactive",
