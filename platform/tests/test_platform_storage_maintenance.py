@@ -717,6 +717,317 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertNotIn("prune_runtime_cache_release_lock_held", backup_only)
         self.assertNotIn("_plan_and_maybe_apply(", backup_only)
 
+    @unittest.skipUnless(os.geteuid() == 0, "report binding fixture requires root")
+    def test_maintenance_workflow_binds_report_to_new_service_invocation(self) -> None:
+        workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-storage-maintenance.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"owner":"deadlock-maintenance.service"', workflow)
+        self.assertIn('"state":"service_managed"', workflow)
+        self.assertNotIn("state=held", workflow)
+        start_marker = 'report_name="$(/usr/bin/python3 -I - "$report_dir" '
+        start = workflow.index(start_marker)
+        heredoc = workflow.index("<<'PY'\n", start) + len("<<'PY'\n")
+        end = workflow.index("\n          PY\n          )\"", heredoc)
+        binder = textwrap.dedent(workflow[heredoc:end])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report_dir = Path(temporary)
+            completed_at = datetime.now(UTC) + timedelta(seconds=5)
+            started_at = completed_at - timedelta(seconds=10)
+            (report_dir / "platform-maintenance-20261005T120000Z.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "apply",
+                        "ok": False,
+                        "started_at_utc": (
+                            started_at + timedelta(seconds=2)
+                        ).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                        "completed_at_utc": (
+                            started_at + timedelta(seconds=3)
+                        ).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                        "production_releases": {
+                            "protected": ["release-current", "release-previous"]
+                        },
+                        "backup": {"status": "completed", "restore_verified": True},
+                        "private": "/root/private-maintenance-report.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = report_dir / "platform-maintenance-20261005T120000Z.json"
+            report.chmod(0o600)
+            arguments = [
+                str(report_dir),
+                started_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                completed_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "0" * 32,
+                "1" * 32,
+                "release-current",
+                "release-previous",
+            ]
+            bound = subprocess.run(
+                [sys.executable, "-I", "-", *arguments],
+                input=binder,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(bound.returncode, 0, bound.stderr)
+            self.assertEqual(bound.stdout.strip(), report.name)
+            self.assertNotIn("private-maintenance-report", bound.stdout)
+
+            stale_start = completed_at + timedelta(seconds=10)
+            stale_end = stale_start + timedelta(seconds=10)
+            missing = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    str(report_dir),
+                    stale_start.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                    stale_end.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                    "1" * 32,
+                    "2" * 32,
+                    "release-current",
+                    "release-previous",
+                ],
+                input=binder,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 3)
+            self.assertEqual(missing.stdout, "")
+            self.assertNotIn("private-maintenance-report", missing.stderr)
+
+    def test_maintenance_workflow_preserves_unhealthy_report_and_remote_status_after_upload(self) -> None:
+        workflow_path = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-storage-maintenance.yml"
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+        classifier_start = workflow.index(
+            'maintenance_result="$(/usr/bin/python3 -I - '
+        )
+        classifier_heredoc = workflow.index("<<'PY'\n", classifier_start) + len("<<'PY'\n")
+        classifier_end = workflow.index("\n          PY\n          )\"", classifier_heredoc)
+        classifier = textwrap.dedent(workflow[classifier_heredoc:classifier_end])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            summary_path = Path(temporary) / "retention-summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "apply",
+                        "ok": False,
+                        "backup": {"status": "completed", "restore_verified": True},
+                        "disk_after": {"free_bytes": 5_200_000_000, "used_percent": 86.96},
+                        "limits": {
+                            "minimum_free_bytes": 5 * BYTES_PER_GIB,
+                            "maximum_used_percent": 85,
+                        },
+                        "private": "PRIVATE_REPORT_CONTENT",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            unhealthy = subprocess.run(
+                [sys.executable, "-I", "-", str(summary_path), "1"],
+                input=classifier,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(unhealthy.returncode, 0, unhealthy.stderr)
+            result = json.loads(unhealthy.stdout)
+            self.assertEqual(result["status"], "unhealthy")
+            self.assertEqual(result["error_class"], "disk_threshold")
+            self.assertEqual(result["service_exit_code"], 1)
+            self.assertNotIn("PRIVATE_REPORT_CONTENT", unhealthy.stdout)
+
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "apply",
+                        "ok": True,
+                        "backup": {"status": "completed", "restore_verified": True},
+                        "disk_after": {"free_bytes": 5_200_000_000, "used_percent": 86.96},
+                        "limits": {
+                            "minimum_free_bytes": 5 * BYTES_PER_GIB,
+                            "maximum_used_percent": 85,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            inconsistent = subprocess.run(
+                [sys.executable, "-I", "-", str(summary_path), "0"],
+                input=classifier,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(inconsistent.returncode, 0, inconsistent.stderr)
+            inconsistent_result = json.loads(inconsistent.stdout)
+            self.assertEqual(inconsistent_result["status"], "failed")
+            self.assertEqual(inconsistent_result["error_class"], "inconsistent_result")
+
+            inconsistent_service_exit = subprocess.run(
+                [sys.executable, "-I", "-", str(summary_path), "23"],
+                input=classifier,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(inconsistent_service_exit.returncode, 0)
+            self.assertEqual(
+                json.loads(inconsistent_service_exit.stdout)["service_exit_code"], 23
+            )
+
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "apply",
+                        "ok": True,
+                        "backup": {"status": "completed", "restore_verified": True},
+                        "disk_after": {
+                            "free_bytes": 5 * BYTES_PER_GIB,
+                            "used_percent": 85,
+                        },
+                        "limits": {
+                            "minimum_free_bytes": 5 * BYTES_PER_GIB,
+                            "maximum_used_percent": 85,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            exact_boundaries = subprocess.run(
+                [sys.executable, "-I", "-", str(summary_path), "0"],
+                input=classifier,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(exact_boundaries.returncode, 0)
+            boundary_result = json.loads(exact_boundaries.stdout)
+            self.assertEqual(boundary_result["status"], "ok")
+            self.assertEqual(boundary_result["error_class"], "none")
+
+            equal_boundary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            equal_boundary_payload["ok"] = False
+            summary_path.write_text(
+                json.dumps(equal_boundary_payload), encoding="utf-8"
+            )
+            equal_boundary_mismatch = subprocess.run(
+                [sys.executable, "-I", "-", str(summary_path), "1"],
+                input=classifier,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(equal_boundary_mismatch.returncode, 0)
+            equal_mismatch_result = json.loads(equal_boundary_mismatch.stdout)
+            self.assertEqual(equal_mismatch_result["status"], "failed")
+            self.assertEqual(
+                equal_mismatch_result["error_class"], "inconsistent_result"
+            )
+
+            run_start = workflow.index("      - name: Run installed bounded maintenance service\n")
+            run_marker = "        run: |\n"
+            run_start = workflow.index(run_marker, run_start) + len(run_marker)
+            run_end = workflow.index("\n      - name: Remove production SSH material", run_start)
+            run_script = textwrap.dedent(workflow[run_start:run_end])
+            enforce_start = workflow.index("      - name: Enforce maintenance result\n")
+            enforce_start = workflow.index(run_marker, enforce_start) + len(run_marker)
+            enforce_end = workflow.find("\n      - name: ", enforce_start)
+            if enforce_end < 0:
+                enforce_end = len(workflow)
+            enforce_script = textwrap.dedent(workflow[enforce_start:enforce_end])
+
+            fake_bin = Path(temporary) / "bin"
+            fake_bin.mkdir()
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "sys.stdout.write(os.environ['FIXTURE_REMOTE_STDOUT'])\n"
+                "sys.stderr.write(os.environ['FIXTURE_REMOTE_STDERR'])\n"
+                "raise SystemExit(int(os.environ['FIXTURE_SSH_STATUS']))\n",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o700)
+            runner_temp = Path(temporary) / "runner"
+            runner_temp.mkdir()
+            github_output = Path(temporary) / "github-output"
+            github_output.touch()
+            github_env = Path(temporary) / "github-env"
+            github_env.touch()
+            private_stderr = "PRIVATE_SSH_STDERR_SENTINEL"
+            fixture = (
+                '{"schema":1,"kind":"collection_failure",'
+                '"status":"failed","stage":"report_binding",'
+                '"outcome":"report_unavailable","exit_code":23}\n'
+            )
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.defpath}",
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_OUTPUT": str(github_output),
+                "GITHUB_ENV": str(github_env),
+                "SSH_DIR": str(Path(temporary) / "absent-ssh-dir"),
+                "PROD_SSH_HOST": "production.invalid",
+                "PROD_SSH_USER": "operator",
+                "EXPECTED_SHA": "a" * 40,
+                "CONFIRMATION": "APPLY-PRODUCTION-STORAGE-MAINTENANCE",
+                "FIXTURE_REMOTE_STDOUT": fixture,
+                "FIXTURE_REMOTE_STDERR": private_stderr,
+                "FIXTURE_SSH_STATUS": "23",
+            }
+            collected = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", run_script],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(collected.returncode, 0, collected.stderr)
+            artifact = runner_temp / "platform-production-storage-maintenance-artifacts" / "maintenance.log"
+            artifact_text = artifact.read_text(encoding="utf-8")
+            self.assertIn(fixture.strip(), artifact_text)
+            self.assertNotIn(private_stderr, artifact_text)
+            self.assertIn("remote_status=23", github_output.read_text(encoding="utf-8"))
+
+            cleanup_start = workflow.index("      - name: Remove production SSH material\n")
+            cleanup_start = workflow.index(run_marker, cleanup_start) + len(run_marker)
+            cleanup_end = workflow.index("\n      - name: Publish maintenance evidence", cleanup_start)
+            cleanup_script = textwrap.dedent(workflow[cleanup_start:cleanup_end])
+            cleaned = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", cleanup_script],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+            self.assertFalse(artifact.parent.joinpath("ssh-error.log").exists())
+
+            enforcement = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", enforce_script],
+                env={**environment, "REMOTE_STATUS": "23"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(enforcement.returncode, 23)
+            self.assertIn("after evidence upload", enforcement.stderr)
+            self.assertLess(
+                workflow.index("- name: Publish maintenance evidence"),
+                workflow.index("- name: Enforce maintenance result"),
+            )
+
     def test_apply_lock_order_and_live_qa_report_are_rollback_safe(self) -> None:
         app_dir = self.root / "runtime" / "platform"
         (app_dir / "shared").mkdir(parents=True)

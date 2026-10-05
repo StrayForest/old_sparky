@@ -78,6 +78,7 @@ jobs:
           printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Collect read-only storage evidence
+        id: collect_storage
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -87,10 +88,12 @@ jobs:
           umask 077
           remote_report="$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
           ssh_error="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
+          artifact_report="$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
           : >"$remote_report"
           : >"$ssh_error"
           chmod 600 "$remote_report" "$ssh_error"
-          if ! ssh \
+          set +e
+          ssh \
             -F "$SSH_DIR/config" \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -101,6 +104,16 @@ jobs:
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             bash -s -- "$EXPECTED_SHA" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
           set -Eeuo pipefail
+          CURRENT_STAGE=identity
+          trap 'diagnostic_rc=$?; trap - ERR; printf "{\"schema\":1,\"kind\":\"collection_failure\",\"status\":\"failed\",\"stage\":\"%s\",\"outcome\":\"producer_failed\",\"exit_code\":%d}\n" "$CURRENT_STAGE" "$diagnostic_rc"; exit "$diagnostic_rc"' ERR
+          report_failure() {
+            local failed_stage="$1"
+            local outcome="$2"
+            local exit_code="$3"
+            printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"%s","exit_code":%d}\n' \
+              "$failed_stage" "$outcome" "$exit_code"
+            exit "$exit_code"
+          }
 
           expected_sha="$1"
           runtime=/opt/oldsparky/platform
@@ -109,15 +122,15 @@ jobs:
           summary_tool="$current/tools/platform_storage_evidence_summary.py"
           input_guard="$current/tools/platform_workflow_input_guard.py"
 
-          test "$(id -u)" -eq 0 || { echo "Production diagnostics must run as root." >&2; exit 1; }
+          test "$(id -u)" -eq 0 || report_failure identity privilege_required 1
           test -f "$input_guard" && test ! -L "$input_guard" \
-            || { echo "Workflow input guard is missing or unsafe." >&2; exit 1; }
+            || report_failure identity input_guard_unavailable 1
           /usr/bin/python3 -I "$input_guard" sha --value "$expected_sha" >/dev/null \
-            || { echo "expected_sha is invalid." >&2; exit 1; }
-          test -L "$current" || { echo "Current release symlink is missing." >&2; exit 1; }
-          test -x "$python_bin" || { echo "Shared Python runtime is missing." >&2; exit 1; }
+            || report_failure identity input_invalid 1
+          test -L "$current" || report_failure identity current_pointer_unavailable 1
+          test -x "$python_bin" || report_failure identity python_unavailable 1
           test -f "$summary_tool" && test ! -L "$summary_tool" \
-            || { echo "Storage evidence summary helper is missing or unsafe." >&2; exit 1; }
+            || report_failure identity summary_helper_unavailable 1
 
           active_sha="$(/usr/bin/python3 -I - "$current/RELEASE.json" <<'PY'
           import json
@@ -129,38 +142,101 @@ jobs:
           PY
           )"
           test "$active_sha" = "$expected_sha" \
-            || { echo "active release SHA differs from expected_sha." >&2; exit 1; }
+            || report_failure identity source_mismatch 1
 
           current_id="$(basename "$(readlink -f "$current")")"
           [[ "$current_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] \
-            || { echo "active release identifier is invalid." >&2; exit 1; }
+            || report_failure identity release_id_invalid 1
           printf '{"schema":1,"kind":"platform_storage_diagnostics","active_release_id":"%s","active_source_sha":"%s"}\n' \
             "$current_id" "$active_sha"
 
-          echo '=== retained_load_lock ==='
+          CURRENT_STAGE=retained_load_lock
           retained_load_lock=/run/lock/oldsparky-retained-load-matrix.lock
-          exec 9>"$retained_load_lock"
-          if flock -n 9; then
-            lock_state=unlocked
-            flock -u 9
-          else
-            lock_state=held
-          fi
-          exec 9>&-
-          printf 'state=%s\n' "$lock_state" \
+          lock_state="$(/usr/bin/python3 -I - "$retained_load_lock" 2>/dev/null <<'PY'
+          import errno
+          import fcntl
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          lock_path = Path(sys.argv[1])
+          lock_root = Path("/run/lock")
+          if (
+              os.geteuid() != 0
+              or lock_path.parent != lock_root
+              or not hasattr(os, "O_NOFOLLOW")
+          ):
+              raise SystemExit(2)
+          try:
+              root_info = lock_root.lstat()
+              root_resolved = lock_root.resolve(strict=True)
+              named = lock_path.lstat()
+          except OSError:
+              raise SystemExit(2)
+          root_mode = stat.S_IMODE(root_info.st_mode)
+          if (
+              root_resolved != lock_root
+              or stat.S_ISLNK(root_info.st_mode)
+              or not stat.S_ISDIR(root_info.st_mode)
+              or root_info.st_uid != 0
+              or (root_mode & 0o022 and not root_mode & 0o1000)
+              or not stat.S_ISREG(named.st_mode)
+              or named.st_uid != 0
+              or named.st_gid != 0
+              or named.st_nlink != 1
+              or stat.S_IMODE(named.st_mode) != 0o600
+          ):
+              raise SystemExit(2)
+          descriptor = os.open(
+              lock_path,
+              os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+          )
+          try:
+              opened = os.fstat(descriptor)
+              current = lock_path.lstat()
+              if (
+                  not stat.S_ISREG(opened.st_mode)
+                  or opened.st_uid != 0
+                  or opened.st_gid != 0
+                  or opened.st_nlink != 1
+                  or stat.S_IMODE(opened.st_mode) != 0o600
+                  or not stat.S_ISREG(current.st_mode)
+                  or current.st_uid != 0
+                  or current.st_gid != 0
+                  or current.st_nlink != 1
+                  or stat.S_IMODE(current.st_mode) != 0o600
+                  or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+                  or (named.st_dev, named.st_ino) != (current.st_dev, current.st_ino)
+              ):
+                  raise SystemExit(2)
+              try:
+                  fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+              except OSError as exc:
+                  if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                      print("held")
+                      raise SystemExit(0)
+                  raise
+              fcntl.flock(descriptor, fcntl.LOCK_UN)
+              print("unlocked")
+          finally:
+              os.close(descriptor)
+          PY
+          )"
+          printf '%s\n' "$lock_state" \
             | /usr/bin/python3 -I "$summary_tool" --mode lock
 
-          echo '=== filesystem_usage ==='
+          CURRENT_STAGE=filesystem_usage
           emit_disk_usage() {
             local category="$1"
             local path="$2"
             local bytes_output inode_output
             bytes_output="$(df -B1 --output=size,used,avail,pcent -- "$path" 2>/dev/null)" \
-              || { echo "disk usage producer failed." >&2; exit 1; }
+              || { producer_rc=$?; report_failure filesystem_usage disk_producer_failed "$producer_rc"; }
             printf '%s\n' "$bytes_output" \
               | /usr/bin/python3 -I "$summary_tool" --mode df --category "$category"
             inode_output="$(df --output=iused,iavail,ipcent -- "$path" 2>/dev/null)" \
-              || { echo "inode usage producer failed." >&2; exit 1; }
+              || { producer_rc=$?; report_failure filesystem_usage inode_producer_failed "$producer_rc"; }
             printf '%s\n' "$inode_output" \
               | /usr/bin/python3 -I "$summary_tool" --mode inode --category "$category"
           }
@@ -170,30 +246,30 @@ jobs:
           emit_disk_usage platform_runtime /opt/oldsparky/platform
           emit_disk_usage logs /var/log
 
-          echo '=== journal_usage ==='
+          CURRENT_STAGE=journal_usage
           journal_usage="$(journalctl --disk-usage --no-pager 2>/dev/null)" \
-            || { echo "journal usage producer failed." >&2; exit 1; }
+            || { producer_rc=$?; report_failure journal_usage producer_failed "$producer_rc"; }
           printf '%s\n' "$journal_usage" \
             | /usr/bin/python3 -I "$summary_tool" --mode journal
 
-          echo '=== service_sandbox ==='
+          CURRENT_STAGE=service_state
           for service in deadlock-api deadlock-worker deadlock-web; do
             service_output="$(systemctl show "$service" \
               --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec \
               --no-pager 2>/dev/null)" \
-              || { echo "service state producer failed." >&2; exit 1; }
+              || { producer_rc=$?; report_failure service_state producer_failed "$producer_rc"; }
             printf '%s\n' "$service_output" \
               | /usr/bin/python3 -I "$summary_tool" --mode service --service "$service"
           done
 
-          echo '=== known_category_usage ==='
+          CURRENT_STAGE=category_usage
           emit_category_size() {
             local category="$1"
             local path="$2"
             local size_output
             if [[ -e "$path" && ! -L "$path" ]]; then
               size_output="$(timeout 90s du -x -s -B1 -- "$path" 2>/dev/null)" \
-                || { echo "category size producer failed." >&2; exit 1; }
+                || { producer_rc=$?; report_failure category_usage producer_failed "$producer_rc"; }
             else
               size_output='0'
             fi
@@ -206,21 +282,148 @@ jobs:
           emit_category_size live_qa_runtime /var/lib/oldsparky-liveqa
           emit_category_size backups "$runtime/shared/backups"
 
-          echo '=== storage_retention_dry_run ==='
+          CURRENT_STAGE=retention_tempfile
           retention_file="$(mktemp)"
           trap 'rm -f -- "$retention_file"' EXIT
+          CURRENT_STAGE=retention_dry_run
+          set +e
           "$python_bin" "$current/tools/platform_storage_maintenance.py" --json \
-            >"$retention_file" 2>/dev/null \
-            || { echo "storage retention producer failed." >&2; exit 1; }
-          /usr/bin/python3 -I "$summary_tool" --mode retention <"$retention_file" \
-            || { echo "storage retention summary failed." >&2; exit 1; }
-          REMOTE
-          then
-            echo "Production storage diagnostics collection failed." >&2
-            exit 1
+            >"$retention_file" 2>/dev/null
+          retention_rc=$?
+          set -e
+          CURRENT_STAGE=retention_summary
+          set +e
+          retention_summary="$(/usr/bin/python3 -I "$summary_tool" --mode retention \
+            <"$retention_file")"
+          summary_rc=$?
+          set -e
+          if [[ -n "$retention_summary" ]]; then
+            printf '%s\n' "$retention_summary"
           fi
-          cp "$remote_report" "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
-          chmod 600 "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+          if (( summary_rc != 0 )); then
+            CURRENT_STAGE=retention_summary
+            failure_code=$(( retention_rc != 0 ? retention_rc : summary_rc ))
+            printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"summary_contract","exit_code":%d}\n' \
+              "$CURRENT_STAGE" "$failure_code"
+            exit "$failure_code"
+          fi
+          retention_classification="$(/usr/bin/python3 -I - "$retention_file" 2>/dev/null <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          allowed_errors = {"backup", "configuration", "integrity", "lock", "storage"}
+          try:
+              raw = Path(sys.argv[1]).read_bytes()
+              if not raw or len(raw) > 256 * 1024:
+                  raise ValueError
+              payload = json.loads(raw)
+              if not isinstance(payload, dict):
+                  raise ValueError
+              mode = payload.get("mode")
+              error_class = payload.get("error_class")
+              report_ok = payload.get("ok")
+              disk = payload.get("disk_after")
+              limits = payload.get("limits")
+              def number(value, maximum=10**18):
+                  return (
+                      value
+                      if isinstance(value, (int, float))
+                      and not isinstance(value, bool)
+                      and 0 <= value <= maximum
+                      else None
+                  )
+              minimum_free = number(limits.get("minimum_free_bytes"), 10**18) if isinstance(limits, dict) else None
+              maximum_used = number(limits.get("maximum_used_percent"), 100) if isinstance(limits, dict) else None
+              free_bytes = number(disk.get("free_bytes"), 10**18) if isinstance(disk, dict) else None
+              used_percent = number(disk.get("used_percent"), 100) if isinstance(disk, dict) else None
+              has_thresholds = None not in {
+                  minimum_free, maximum_used, free_bytes, used_percent
+              }
+              if mode == "dry-run" and isinstance(report_ok, bool) and has_thresholds:
+                  threshold_failed = (
+                      free_bytes < minimum_free or used_percent > maximum_used
+                  )
+                  if report_ok == threshold_failed:
+                      status = "failed"
+                      error = "inconsistent_result"
+                  elif not report_ok and threshold_failed:
+                      status = "unhealthy"
+                      error = "disk_threshold"
+                  else:
+                      status = "ok"
+                      error = "none"
+              elif (
+                  report_ok is False
+                  and payload.get("status") == "failed"
+                  and isinstance(error_class, str)
+                  and error_class in allowed_errors
+              ):
+                  status = "failed"
+                  error = error_class
+              else:
+                  raise ValueError
+              result = {
+                  "schema": 1,
+                  "kind": "storage_retention_result",
+                  "status": status,
+                  "error_class": error,
+                  "minimum_free_bytes": minimum_free,
+                  "maximum_used_percent": maximum_used,
+                  "free_bytes": free_bytes,
+                  "used_percent": used_percent,
+              }
+              print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+          except Exception:
+              raise SystemExit(2)
+          PY
+          )"
+          printf '%s\n' "$retention_classification"
+          retention_status="$(printf '%s\n' "$retention_classification" \
+            | /usr/bin/python3 -I -c 'import json,sys; value=json.load(sys.stdin); print(value.get("status", "invalid"))')"
+          if [[ "$retention_status" == unhealthy ]]; then
+            CURRENT_STAGE=retention_threshold
+            failure_code=$(( retention_rc != 0 ? retention_rc : 1 ))
+            printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"threshold","exit_code":%d}\n' \
+              "$CURRENT_STAGE" "$failure_code"
+            exit "$failure_code"
+          elif [[ "$retention_status" == failed ]]; then
+            CURRENT_STAGE=retention_tool
+            failure_code=$(( retention_rc != 0 ? retention_rc : 1 ))
+            printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"bounded_error_class","exit_code":%d}\n' \
+              "$CURRENT_STAGE" "$failure_code"
+            exit "$failure_code"
+          elif [[ "$retention_status" != ok || "$retention_rc" != 0 ]]; then
+            CURRENT_STAGE=retention_dry_run
+            failure_code=$(( retention_rc != 0 ? retention_rc : 2 ))
+            printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"inconsistent_result","exit_code":%d}\n' \
+              "$CURRENT_STAGE" "$failure_code"
+            exit "$failure_code"
+          fi
+          printf '{"schema":1,"kind":"collection_status","status":"ok","stage":"complete","exit_code":0}\n'
+          REMOTE
+          remote_exit_code=$?
+          set -e
+          if (( remote_exit_code == 0 )); then
+            printf '{"schema":1,"kind":"collection_transport","status":"ok","stage":"complete","outcome":"none","exit_code":0}\n' \
+              >>"$remote_report"
+          elif (( remote_exit_code == 255 )); then
+            printf '{"schema":1,"kind":"collection_transport","status":"failed","stage":"ssh_transport","outcome":"transport_failed","exit_code":%d}\n' \
+              "$remote_exit_code" >>"$remote_report"
+          else
+            printf '{"schema":1,"kind":"collection_transport","status":"failed","stage":"remote_exit","outcome":"nonzero_exit","exit_code":%d}\n' \
+              "$remote_exit_code" >>"$remote_report"
+          fi
+          chmod 600 "$remote_report"
+          cp -- "$remote_report" "$artifact_report"
+          chmod 600 "$artifact_report"
+          printf 'remote_exit_code=%s\n' "$remote_exit_code" >>"$GITHUB_OUTPUT"
+          printf 'report_ready=true\n' >>"$GITHUB_OUTPUT"
+          if (( remote_exit_code == 255 )); then
+            echo "Remote diagnostics transport failed (exit 255)." >&2
+          elif (( remote_exit_code != 0 )); then
+            echo "Remote diagnostics failed at a bounded stage (exit ${remote_exit_code})." >&2
+          fi
           rm -f -- "$remote_report"
           test ! -e "$remote_report"
 
@@ -262,10 +465,22 @@ jobs:
           test -z "${SSH_DIR:-}"
 
       - name: Upload storage diagnostic evidence
-        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' }}
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.collect_storage.outputs.report_ready == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: platform-production-storage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/platform-production-storage-diagnostics-artifact.txt
           if-no-files-found: error
           retention-days: 14
+
+      - name: Preserve remote collection failure status
+        if: ${{ always() && steps.collect_storage.outputs.remote_exit_code != '' && steps.collect_storage.outputs.remote_exit_code != '0' }}
+        shell: bash
+        env:
+          REMOTE_EXIT_CODE: ${{ steps.collect_storage.outputs.remote_exit_code }}
+        run: |
+          set -euo pipefail
+          [[ "$REMOTE_EXIT_CODE" =~ ^[1-9][0-9]{0,2}$ ]] \
+            || { echo "Remote diagnostic exit status was not a bounded integer." >&2; exit 2; }
+          echo "Remote storage diagnostics returned exit $REMOTE_EXIT_CODE after evidence upload." >&2
+          exit "$REMOTE_EXIT_CODE"

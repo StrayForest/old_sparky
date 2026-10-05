@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from unittest import mock
@@ -1775,6 +1776,280 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertNotIn("--apply", workflow)
         self.assertNotIn("systemctl restart", workflow)
         self.assertNotIn("rm -rf", workflow)
+        self.assertNotIn('exec 9>"$retained_load_lock"', workflow)
+        self.assertIn("os.O_NOFOLLOW", workflow)
+        self.assertIn("os.fstat(descriptor)", workflow)
+        self.assertIn("named = lock_path.lstat()", workflow)
+        self.assertIn("CURRENT_STAGE=retention_dry_run", workflow)
+        self.assertIn('retention_rc=$?', workflow)
+        self.assertIn('outcome":"threshold"', workflow)
+        self.assertIn('outcome":"bounded_error_class"', workflow)
+        self.assertIn("report_ready=true", workflow)
+        self.assertIn("remote_exit_code=$?", workflow)
+        upload = workflow.index("- name: Upload storage diagnostic evidence")
+        preserve_failure = workflow.index("- name: Preserve remote collection failure status")
+        self.assertLess(upload, preserve_failure)
+        self.assertIn("steps.collect_storage.outputs.report_ready == 'true'", workflow)
+        self.assertIn("if-no-files-found: error", workflow)
+        self.assertNotIn('cat "$ssh_error"', workflow)
+
+    def test_storage_diagnostic_retention_classifier_is_closed_and_threshold_aware(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        marker = (
+            'retention_classification="$(/usr/bin/python3 -I - "$retention_file" '
+            '2>/dev/null <<\'PY\'\n'
+        )
+        start = workflow.index(marker) + len(marker)
+        end = workflow.index("\n          PY\n          )\"", start)
+        classifier = textwrap.dedent(workflow[start:end])
+
+        cases = (
+            (
+                {
+                    "ok": False,
+                    "mode": "dry-run",
+                    "disk_after": {"free_bytes": 1024, "used_percent": 99.5},
+                    "limits": {"minimum_free_bytes": 5 * 1024**3, "maximum_used_percent": 85},
+                    "private": "/home/operator/report.json",
+                },
+                "unhealthy",
+                "disk_threshold",
+            ),
+            (
+                {"ok": False, "status": "failed", "error_class": "lock", "private": "token"},
+                "failed",
+                "lock",
+            ),
+            (
+                {
+                    "ok": True,
+                    "mode": "dry-run",
+                    "disk_after": {"free_bytes": 8 * 1024**3, "used_percent": 70},
+                    "limits": {
+                        "minimum_free_bytes": 5 * 1024**3,
+                        "maximum_used_percent": 85,
+                    },
+                },
+                "ok",
+                "none",
+            ),
+            (
+                {
+                    "ok": False,
+                    "mode": "dry-run",
+                    "disk_after": {"free_bytes": 8 * 1024**3, "used_percent": 70},
+                    "limits": {
+                        "minimum_free_bytes": 5 * 1024**3,
+                        "maximum_used_percent": 85,
+                    },
+                },
+                "failed",
+                "inconsistent_result",
+            ),
+            (
+                {
+                    "ok": True,
+                    "mode": "dry-run",
+                    "disk_after": {"free_bytes": 1024, "used_percent": 99.5},
+                    "limits": {
+                        "minimum_free_bytes": 5 * 1024**3,
+                        "maximum_used_percent": 85,
+                    },
+                },
+                "failed",
+                "inconsistent_result",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, (payload, expected_status, expected_error) in enumerate(cases):
+                report = root / f"retention-{index}.json"
+                report.write_text(json.dumps(payload), encoding="utf-8")
+                completed = subprocess.run(
+                    [sys.executable, "-I", "-", str(report)],
+                    input=classifier,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                result = json.loads(completed.stdout)
+                self.assertEqual(result["status"], expected_status)
+                self.assertEqual(result["error_class"], expected_error)
+                self.assertNotIn("private", completed.stdout)
+                self.assertNotIn("token", completed.stdout)
+            invalid = root / "retention-invalid.json"
+            invalid.write_text(
+                json.dumps({"ok": False, "status": "failed", "error_class": "secret-token"}),
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, "-I", "-", str(invalid)],
+                input=classifier,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(rejected.returncode, 2)
+            self.assertEqual(rejected.stdout, "")
+
+    def test_storage_diagnostic_remote_exit_is_preserved_after_upload(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        step_start = workflow.index(
+            "      - name: Preserve remote collection failure status\n"
+        )
+        run_marker = "        run: |\n"
+        run_start = workflow.index(run_marker, step_start) + len(run_marker)
+        next_step = workflow.find("\n      - name: ", run_start)
+        if next_step < 0:
+            next_step = len(workflow)
+        script = textwrap.dedent(workflow[run_start:next_step])
+
+        for remote_exit_code in (1, 23, 255):
+            with self.subTest(remote_exit_code=remote_exit_code):
+                completed = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", script],
+                    env={**os.environ, "REMOTE_EXIT_CODE": str(remote_exit_code)},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, remote_exit_code)
+                self.assertIn("after evidence upload", completed.stderr)
+
+        invalid = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", script],
+            env={**os.environ, "REMOTE_EXIT_CODE": "0"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(invalid.returncode, 2)
+
+    @unittest.skipUnless(os.geteuid() == 0, "lock metadata fixture requires root")
+    def test_storage_diagnostic_lock_probe_is_nofollow_and_nonmutating(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        marker = (
+            'lock_state="$(/usr/bin/python3 -I - "$retained_load_lock" '
+            '2>/dev/null <<\'PY\'\n'
+        )
+        start = workflow.index(marker) + len(marker)
+        end = workflow.index("\n          PY\n          )\"", start)
+        probe = textwrap.dedent(workflow[start:end]).replace(
+            'lock_root = Path("/run/lock")',
+            'lock_root = Path(sys.argv[2])',
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lock_path = root / "oldsparky-retained-load-matrix.lock"
+            lock_path.write_bytes(b"preserve lock bytes")
+            lock_path.chmod(0o600)
+
+            def run_probe(path: Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-I", "-", str(path), str(root)],
+                    input=probe,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            before = lock_path.stat()
+            unlocked = run_probe(lock_path)
+            self.assertEqual(unlocked.returncode, 0, unlocked.stderr)
+            self.assertEqual(unlocked.stdout.strip(), "unlocked")
+            self.assertEqual(lock_path.read_bytes(), b"preserve lock bytes")
+            self.assertEqual((before.st_dev, before.st_ino, before.st_size),
+                             (lock_path.stat().st_dev, lock_path.stat().st_ino, lock_path.stat().st_size))
+
+            descriptor = os.open(lock_path, os.O_RDWR)
+            try:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = run_probe(lock_path)
+                self.assertEqual(held.returncode, 0, held.stderr)
+                self.assertEqual(held.stdout.strip(), "held")
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+            missing = root / "missing.lock"
+            absent = run_probe(missing)
+            self.assertNotEqual(absent.returncode, 0)
+            self.assertFalse(missing.exists())
+
+            victim = root / "victim"
+            victim.write_bytes(b"untouched")
+            victim.chmod(0o600)
+            symlink = root / "symlink.lock"
+            symlink.symlink_to(victim)
+            rejected = run_probe(symlink)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(victim.read_bytes(), b"untouched")
+
+            replacement = root / "replacement"
+            replacement.write_bytes(b"replacement bytes")
+            replacement.chmod(0o600)
+            swap = (
+                "original_open = os.open\n"
+                "def open_then_swap(path, flags):\n"
+                "    descriptor = original_open(path, flags)\n"
+                "    replacement = Path(sys.argv[2]) / 'replacement'\n"
+                "    os.replace(replacement, path)\n"
+                "    return descriptor\n"
+                "os.open = open_then_swap\n"
+            )
+            raced_probe = probe.replace(
+                "descriptor = os.open(\n", swap + "descriptor = os.open(\n", 1
+            )
+            raced = subprocess.run(
+                [sys.executable, "-I", "-", str(lock_path), str(root)],
+                input=raced_probe,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(raced.returncode, 0)
+            self.assertEqual(lock_path.read_bytes(), b"replacement bytes")
+
+            race_lock_path = root / "race.lock"
+            race_lock_path.write_bytes(b"race lock bytes")
+            race_lock_path.chmod(0o600)
+            race_victim = root / "race-victim"
+            race_victim.write_bytes(b"symlink target bytes")
+            race_victim.chmod(0o600)
+            symlink_swap = (
+                "original_open = os.open\n"
+                "def open_after_symlink_swap(path, flags):\n"
+                "    archived = Path(sys.argv[2]) / 'archived-race-lock'\n"
+                "    os.replace(path, archived)\n"
+                "    os.symlink(Path(sys.argv[2]) / 'race-victim', path)\n"
+                "    return original_open(path, flags)\n"
+                "os.open = open_after_symlink_swap\n"
+            )
+            symlink_race_probe = probe.replace(
+                "descriptor = os.open(\n",
+                symlink_swap + "descriptor = os.open(\n",
+                1,
+            )
+            symlink_race = subprocess.run(
+                [sys.executable, "-I", "-", str(race_lock_path), str(root)],
+                input=symlink_race_probe,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(symlink_race.returncode, 0)
+            self.assertTrue(race_lock_path.is_symlink())
+            self.assertEqual(race_victim.read_bytes(), b"symlink target bytes")
 
     def test_as12_proof_is_read_only_and_sha_locked(self) -> None:
         proof = (WORKFLOW_DIR / "platform-production-as12-proof.yml").read_text(

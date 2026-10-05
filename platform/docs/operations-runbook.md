@@ -116,7 +116,7 @@ gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
 
 When a release activation reports a full filesystem or unusable temporary directory, collect bounded read-only evidence before cleanup:
 `gh workflow run platform-production-storage-diagnostics.yml --repo StrayForest/old_sparky --ref dev -f expected_sha=<exact-source-sha-currently-deployed>`
-It reports blocks/inodes, mounts, journald, service sandbox, top-level usage and retention candidates; it does not delete files or apply runtime settings.
+It reports blocks/inodes, mounts, journald, service sandbox, top-level usage and retention candidates; it does not delete files or apply runtime settings. Failure artifacts may contain bounded partial evidence and a closed stage/outcome, never raw host output. Maintenance reports bind to one service invocation; a verified-backup report and nonzero exit may follow actual deletions when thresholds still fail, so workflow failure proves neither no deletion nor successful cleanup.
 
 Preview storage cleanup without backup or deletion:
 
