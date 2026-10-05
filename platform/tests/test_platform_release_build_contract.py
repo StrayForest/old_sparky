@@ -5450,7 +5450,10 @@ cleanup
         self.assertIn("inputs.mode == 'deploy'", production)
         dispatch_validator = workflow_job(workflow, "validate-dispatch")
         self.assertIn("DEPLOY_MODE: ${{ inputs.mode }}", dispatch_validator)
-        self.assertIn('[[ "$handoff_mode" != "baseline-reconcile" ]] || handoff_mode=deploy', dispatch_validator)
+        self.assertIn(
+            '[[ "$handoff_mode" != "baseline-reconcile" && "$handoff_mode" != "recovery-deploy" ]] || handoff_mode=deploy',
+            dispatch_validator,
+        )
         self.assertIn("DEPLOY_MODE: deploy", build)
         self.assertNotIn("DEPLOY_MODE: ${{ inputs.mode }}", build)
 
