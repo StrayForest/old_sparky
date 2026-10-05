@@ -23,6 +23,8 @@ from tools.platform_ci_classifier import (
     FULL_GATE_IDS,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
+    STORAGE_OPERATIONS_FILES,
+    STORAGE_OPERATIONS_TRIGGER_FILES,
     ClassifierError,
     classify,
     validate_manifest,
@@ -308,9 +310,11 @@ def classify_cumulative_baseline(
 
     The result is a closed wrapper containing the canonical cumulative
     manifest and an explicit ``no_op`` flag. A pure recovery-bootstrap or
-    candidate-packaging range is a verified no-op; every other
-    non-deployable or fallback result fails closed. Callers must not build or
-    activate an application release when ``no_op`` is true.
+    candidate-packaging range is a verified no-op. A validated recovery
+    input may also produce a no-op for a storage-triggered cumulative range
+    limited to the closed recovery, storage-operations and docs families.
+    That action decision does not rewrite canonical manifest fields. Callers
+    must not build or activate an application release when ``no_op`` is true.
     """
 
     try:
@@ -374,10 +378,27 @@ def classify_cumulative_baseline(
         validate_manifest(cumulative, expected_target_sha=expected_target_sha)
     except ClassifierError as exc:
         raise ProvenanceError(f"cumulative classifier route is unsafe: {exc}") from exc
+    cumulative_files = cumulative.get("files")
+    storage_recovery_no_op = bool(
+        recovery_bootstrap_only
+        and cumulative.get("class") == "full"
+        and cumulative.get("expected_gates") == list(FULL_GATE_IDS)
+        and cumulative.get("fallback") is False
+        and cumulative.get("runtime_sensitive") is True
+        and type(cumulative.get("deployable")) is bool
+        and isinstance(cumulative_files, list)
+        and any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in cumulative_files)
+        and all(
+            path in STORAGE_OPERATIONS_FILES
+            or path in RECOVERY_BOOTSTRAP_FILES
+            or path.startswith(DOCS_PREFIX)
+            for path in cumulative_files
+        )
+    )
     if cumulative.get("deployable") is True:
         if cumulative.get("fallback") is not False:
             raise ProvenanceError("cumulative deployable route unexpectedly used fallback")
-        return {"manifest": cumulative, "no_op": False}
+        return {"manifest": cumulative, "no_op": storage_recovery_no_op}
     if (
         cumulative.get("class") == "full"
         and cumulative.get("expected_gates") == list(FULL_GATE_IDS)
@@ -404,6 +425,8 @@ def classify_cumulative_baseline(
                 for path in cumulative_files
             )
         )
+        if storage_recovery_no_op:
+            return {"manifest": cumulative, "no_op": True}
         if recovery_no_op != candidate_no_op:
             return {"manifest": cumulative, "no_op": True}
     raise ProvenanceError("cumulative classifier route is non-deployable and not a verified reconcile no-op")

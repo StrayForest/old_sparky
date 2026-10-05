@@ -579,7 +579,8 @@ the exact run ID.
 ## Contract self-test
 
 The privileged contour owns immutable recovery-bootstrap tests
-(`tests.test_platform_recovery_bootstrap`); verification-contract owns failed-report caller tests. They cover deterministic
+(`tests.test_platform_recovery_bootstrap`); backend-tool-contract owns cumulative-baseline
+provenance tests in `tests.test_platform_workflow_provenance`; verification-contract owns failed-report caller tests. Together they cover
 closed bundles, source/archive path and type rejection, exact manifest and
 provenance schemas, content-addressed atomic installation, receipt identity
 and migration-uncertainty guards, missing-candidate and generation-byte
@@ -596,5 +597,4 @@ membership, workflow gate names, classifier route ownership and artifact
 guards, direct command duplication, exclusion bypasses, backend discovery,
 hermetic suite registration, production reachability from `ci`, documentation
 gate IDs, load-profile schema/deduplication, workflow-owned load budgets and
-the external-generator topology. Keep it deterministic and small enough to
-run on every CI change.
+the external-generator topology. Keep it deterministic and small enough to run on every CI change.

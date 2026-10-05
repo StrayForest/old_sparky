@@ -64,6 +64,7 @@ from tools.platform_ci_classifier import (  # noqa: E402
     CANDIDATE_PACKAGING_REASON,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
+    STORAGE_OPERATIONS_REASON,
     classify,
     manifest_digest,
 )
@@ -859,6 +860,152 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 [incremental_path, "platform/tools/platform_build_release.sh"],
                 expected_target_sha=self.SHA,
             )
+
+    def test_cumulative_storage_recovery_family_is_a_separate_noop_decision(self) -> None:
+        historical_storage_paths = [
+            ".agents/skills/platform-storage-retention/SKILL.md",
+            ".github/workflows/platform-production-autodeploy.yml",
+            ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+            ".github/workflows/platform-production-storage-diagnostics.yml",
+            ".github/workflows/platform-production-storage-maintenance.yml",
+            "platform/docs/CURRENT.md",
+            "platform/docs/adr/production-host-tools-provisioning.md",
+            "platform/docs/operations-runbook.md",
+            "platform/docs/test-suite-governance.md",
+            "platform/tests/test_platform_ci_classifier.py",
+            "platform/tests/test_platform_release_audit_hardening.py",
+            "platform/tests/test_platform_storage_maintenance.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_production_classifier_artifact.py",
+            "platform/tools/platform_test_catalog.py",
+        ]
+        historical_incremental = classify(
+            [".github/workflows/platform-production-recovery-bootstrap-publish.yml"],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertEqual(historical_incremental["reason"], RECOVERY_BOOTSTRAP_REASON)
+
+        actual16_manifest = classify(
+            historical_storage_paths,
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertEqual(actual16_manifest["reason"], STORAGE_OPERATIONS_REASON)
+        self.assertTrue(actual16_manifest["runtime_sensitive"])
+        self.assertFalse(actual16_manifest["deployable"])
+        self.assertFalse(actual16_manifest["fallback"])
+        actual16 = classify_cumulative_baseline(
+            historical_incremental,
+            historical_storage_paths,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(actual16["no_op"])
+        self.assertEqual(actual16["manifest"], actual16_manifest)
+
+        source_fix_incremental = classify(
+            [
+                "platform/tests/test_platform_workflow_provenance.py",
+                "platform/tools/platform_deploy_baseline.py",
+            ],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        self.assertEqual(source_fix_incremental["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertFalse(source_fix_incremental["fallback"])
+        self.assertFalse(source_fix_incremental["deployable"])
+        future18_paths = [
+            *historical_storage_paths,
+            "platform/tests/test_platform_workflow_provenance.py",
+            "platform/tools/platform_deploy_baseline.py",
+        ]
+        future19_paths = [*future18_paths, "platform/docs/deployment-runbook.md"]
+        for label, paths in (("future18", future18_paths), ("future19", future19_paths)):
+            with self.subTest(label=label):
+                canonical = classify(
+                    paths,
+                    event="push",
+                    branch="dev",
+                    target_sha=self.SHA,
+                )
+                self.assertEqual(canonical["class"], "full")
+                self.assertTrue(canonical["runtime_sensitive"])
+                self.assertTrue(canonical["deployable"])
+                self.assertFalse(canonical["fallback"])
+                result = classify_cumulative_baseline(
+                    source_fix_incremental,
+                    paths,
+                    expected_target_sha=self.SHA,
+                )
+                self.assertTrue(result["no_op"])
+                self.assertEqual(result["manifest"], canonical)
+                self.assertTrue(result["manifest"]["runtime_sensitive"])
+                self.assertTrue(result["manifest"]["deployable"])
+                self.assertFalse(result["manifest"]["fallback"])
+
+        # Removing every storage trigger leaves a valid historical recovery
+        # no-op. It must retain its recovery manifest identity; the new
+        # storage-specific path is only available for trigger-bearing ranges.
+        triggerless_recovery_paths = [
+            "platform/tools/platform_deploy_baseline.py",
+            "platform/tests/test_platform_workflow_provenance.py",
+            ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+        ]
+        triggerless = classify_cumulative_baseline(
+            source_fix_incremental,
+            triggerless_recovery_paths,
+            expected_target_sha=self.SHA,
+        )
+        self.assertTrue(triggerless["no_op"])
+        self.assertEqual(triggerless["manifest"]["reason"], RECOVERY_BOOTSTRAP_REASON)
+
+        app_mixed = classify_cumulative_baseline(
+            source_fix_incremental,
+            [*future18_paths, "platform/apps/platform_api/app/main.py"],
+            expected_target_sha=self.SHA,
+        )
+        self.assertFalse(app_mixed["no_op"])
+        self.assertTrue(app_mixed["manifest"]["runtime_sensitive"])
+        self.assertTrue(app_mixed["manifest"]["deployable"])
+        self.assertFalse(app_mixed["manifest"]["fallback"])
+
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                source_fix_incremental,
+                [*future18_paths, "unowned/private-source.txt"],
+                expected_target_sha=self.SHA,
+            )
+
+        storage_incremental = classify(
+            [".github/workflows/platform-production-storage-diagnostics.yml"],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        with self.assertRaises(ProvenanceError):
+            classify_cumulative_baseline(
+                storage_incremental,
+                future18_paths,
+                expected_target_sha=self.SHA,
+            )
+
+        candidate_incremental = classify(
+            [".github/workflows/platform-host-tools-candidate.yml"],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        mixed_candidate = classify_cumulative_baseline(
+            candidate_incremental,
+            [*future18_paths, ".github/workflows/platform-host-tools-candidate.yml"],
+            expected_target_sha=self.SHA,
+        )
+        self.assertFalse(mixed_candidate["no_op"])
+        self.assertTrue(mixed_candidate["manifest"]["deployable"])
 
     def test_candidate_packaging_reconcile_source_is_closed_and_cumulative(self) -> None:
         candidate_path = ".github/workflows/platform-host-tools-candidate.yml"
