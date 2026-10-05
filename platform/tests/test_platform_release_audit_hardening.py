@@ -2038,7 +2038,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             before = lock_path.stat()
             unlocked = run_probe(lock_path)
             self.assertEqual(unlocked.returncode, 0, unlocked.stderr)
-            self.assertEqual(unlocked.stdout.strip(), "unlocked")
+            self.assertEqual(unlocked.stdout.strip(), "state=unlocked")
             self.assertEqual(lock_path.read_bytes(), b"preserve lock bytes")
             self.assertEqual((before.st_dev, before.st_ino, before.st_size),
                              (lock_path.stat().st_dev, lock_path.stat().st_ino, lock_path.stat().st_size))
@@ -2050,7 +2050,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 held = run_probe(lock_path)
                 self.assertEqual(held.returncode, 0, held.stderr)
-                self.assertEqual(held.stdout.strip(), "held")
+                self.assertEqual(held.stdout.strip(), "state=held")
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
                 os.close(descriptor)
