@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +27,9 @@ from tools.platform_ci_classifier import (
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
     RUNTIME_SENSITIVE_FILES,
+    STORAGE_OPERATIONS_FILES,
+    STORAGE_OPERATIONS_REASON,
+    STORAGE_OPERATIONS_TRIGGER_FILES,
     ClassifierError,
     SECURITY_WORKFLOW_NAME,
     SECURITY_WORKFLOW_PATH,
@@ -47,6 +52,35 @@ SECURITY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security.yml"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
 STATUS_FINALIZER_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security-status-finalizer.yml"
+RECOVERY_BUILD_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-build.yml"
+RECOVERY_PUBLISH_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-publish.yml"
+
+
+def _workflow_python_blocks(path: Path, step_name: str) -> list[str]:
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    matching = [
+        step
+        for job in workflow.get("jobs", {}).values()
+        for step in job.get("steps", [])
+        if step.get("name") == step_name
+    ]
+    if len(matching) != 1 or not isinstance(matching[0].get("run"), str):
+        raise AssertionError(f"expected one runnable workflow step: {step_name}")
+    blocks = re.findall(r"<<'PY'\n(.*?)\n\s*PY(?:\n|$)", matching[0]["run"], re.DOTALL)
+    return [textwrap.dedent(block) for block in blocks]
+
+
+def _python_set_assignment(source: str, name: str) -> set[str]:
+    tree = ast.parse(source)
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in statement.targets
+        ):
+            value = ast.literal_eval(statement.value)
+            if isinstance(value, set) and all(isinstance(item, str) for item in value):
+                return value
+    raise AssertionError(f"missing exact set assignment: {name}")
 
 # PR117 was merged as a real merge commit.  The push range is the first
 # parent (the branch before the merge) to that merge commit; the PR range is
@@ -2073,6 +2107,557 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 handle.writestr("classifier-manifest.json", b"{}")
             with self.assertRaises(UnsafeZipError):
                 extract_single_manifest(root / "valid.zip", existing)
+
+    def test_storage_operations_classifier_and_artifact_route_are_exact(self) -> None:
+        files = sorted(
+            STORAGE_OPERATIONS_FILES | {"platform/docs/deployment-runbook.md"}
+        )
+        manifest = classify(
+            files,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(manifest["class"], "full")
+        self.assertEqual(tuple(manifest["expected_gates"]), FULL_GATE_IDS)
+        self.assertTrue(manifest["runtime_sensitive"])
+        self.assertFalse(manifest["deployable"])
+        self.assertFalse(manifest["fallback"])
+        self.assertEqual(manifest["reason"], STORAGE_OPERATIONS_REASON)
+        validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+        skill_only = classify(
+            [".agents/skills/platform-storage-retention/SKILL.md"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(skill_only["reason"], STORAGE_OPERATIONS_REASON)
+        self.assertEqual(tuple(skill_only["expected_gates"]), FULL_GATE_IDS)
+        self.assertTrue(skill_only["runtime_sensitive"])
+        self.assertFalse(skill_only["deployable"])
+        self.assertFalse(skill_only["fallback"])
+
+        skill_with_application = classify(
+            [
+                ".agents/skills/platform-storage-retention/SKILL.md",
+                "platform/apps/platform_api/app/main.py",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertNotEqual(skill_with_application["reason"], STORAGE_OPERATIONS_REASON)
+        self.assertTrue(skill_with_application["deployable"])
+        self.assertFalse(skill_with_application["fallback"])
+
+        skill_with_unknown = classify(
+            [
+                ".agents/skills/platform-storage-retention/SKILL.md",
+                "unknown-root-config.toml",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertNotEqual(skill_with_unknown["reason"], STORAGE_OPERATIONS_REASON)
+        self.assertTrue(skill_with_unknown["fallback"])
+        self.assertFalse(skill_with_unknown["deployable"])
+
+        unrelated_mixed = classify(
+            [
+                ".github/workflows/platform-production-storage-diagnostics.yml",
+                "platform/tools/unreviewed_storage_helper.py",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertNotEqual(unrelated_mixed["reason"], STORAGE_OPERATIONS_REASON)
+        self.assertTrue(unrelated_mixed["deployable"])
+        self.assertFalse(unrelated_mixed["fallback"])
+        self.assertTrue(unrelated_mixed["runtime_sensitive"])
+
+        global_mixed = classify(
+            [
+                ".github/workflows/platform-production-storage-diagnostics.yml",
+                "unknown-root-config.toml",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertNotEqual(global_mixed["reason"], STORAGE_OPERATIONS_REASON)
+        self.assertTrue(global_mixed["fallback"])
+        self.assertFalse(global_mixed["deployable"])
+
+        shared_controls_only = classify(
+            [
+                ".github/workflows/platform-production-autodeploy.yml",
+                "platform/tests/test_platform_ci_classifier.py",
+                "platform/tools/platform_ci_classifier.py",
+                "platform/tools/platform_production_classifier_artifact.py",
+                "platform/tools/platform_test_catalog.py",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(shared_controls_only["reason"], RECOVERY_BOOTSTRAP_REASON)
+        self.assertFalse(shared_controls_only["deployable"])
+        self.assertFalse(shared_controls_only["fallback"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = self._write_production_classifier_archive(root, manifest)
+            accepted = validate_production_classifier_manifest(
+                archive, target_sha=self.TARGET_SHA
+            )
+            self.assertEqual(accepted["reason"], STORAGE_OPERATIONS_REASON)
+            with self.assertRaises(ClassifierArtifactError):
+                validate_production_classifier_manifest(
+                    archive,
+                    target_sha=self.TARGET_SHA,
+                    require_reconcile_source=True,
+                )
+
+            inconsistent = dict(manifest)
+            inconsistent["runtime_sensitive"] = False
+            inconsistent["digest"] = manifest_digest(inconsistent)
+            with self.assertRaises(ClassifierError):
+                validate_manifest(inconsistent, expected_target_sha=self.TARGET_SHA)
+
+    def test_storage_operations_autodeploy_validates_then_skips_dispatch(self) -> None:
+        workflow = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+        storage_triggers_marker = "          storage_operations_triggers = {\n"
+        storage_triggers_start = workflow.index(storage_triggers_marker) + len(storage_triggers_marker)
+        storage_triggers_end = workflow.index("          }\n", storage_triggers_start) + len("          }\n")
+        storage_triggers_source = textwrap.dedent(
+            "storage_operations_triggers = {\n" + workflow[storage_triggers_start:storage_triggers_end]
+        )
+        self.assertEqual(
+            ast.literal_eval(ast.parse(storage_triggers_source).body[0].value),
+            set(STORAGE_OPERATIONS_TRIGGER_FILES),
+        )
+        storage_files_marker = "          storage_operations_files = {\n"
+        storage_files_start = workflow.index(storage_files_marker) + len(storage_files_marker)
+        storage_files_end = workflow.index("          }\n", storage_files_start) + len("          }\n")
+        storage_files_source = textwrap.dedent(
+            "storage_operations_files = {\n" + workflow[storage_files_start:storage_files_end]
+        )
+        self.assertEqual(
+            ast.literal_eval(ast.parse(storage_files_source).body[0].value),
+            set(STORAGE_OPERATIONS_FILES),
+        )
+
+        route = classify(
+            sorted(STORAGE_OPERATIONS_FILES),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        outputs = self._run_auto_deploy_manifest_contract(route)
+        self.assertEqual(outputs["route_storage_operations_only"], "true")
+        self.assertEqual(outputs["route_recovery_bootstrap_only"], "false")
+        self.assertEqual(outputs["route_candidate_packaging_only"], "false")
+        self.assertEqual(outputs["route_deployable"], "false")
+
+        step_start = workflow.index(
+            "      - name: Verify tested SHA is current dev head\n"
+        )
+        run_marker = "        run: |\n"
+        run_start = workflow.index(run_marker, step_start) + len(run_marker)
+        run_end = workflow.index("\n      - name: ", run_start)
+        gate_script = textwrap.dedent(workflow[run_start:run_end])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_curl = fake_bin / "curl"
+            fake_curl.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$FAKE_CURL_CALLS\"\n"
+                "case \"$*\" in\n"
+                "  *'/branches/dev'*) printf '{\"commit\":{\"sha\":\"%s\"}}\\n' \"$TARGET_SHA\" ;;\n"
+                "  *) exit 91 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o700)
+            output = root / "github-output"
+            output.touch()
+            curl_calls = root / "curl-calls"
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.defpath}",
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_API_URL": "https://api.github.com",
+                "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                "TARGET_SHA": self.TARGET_SHA,
+                "GH_TOKEN": "fixture-token",
+                "RUNNER_TEMP": str(runner_temp),
+                "FAKE_CURL_CALLS": str(curl_calls),
+                "ROUTE_CLASS": "full",
+                "ROUTE_DEPLOYABLE": "false",
+                "ROUTE_RECOVERY_BOOTSTRAP_ONLY": "false",
+                "ROUTE_CANDIDATE_PACKAGING_ONLY": "false",
+                "ROUTE_STORAGE_OPERATIONS_ONLY": "true",
+            }
+            completed = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", gate_script],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn(
+                "no application deployment or recovery action required",
+                completed.stdout,
+            )
+            self.assertEqual(output.read_text(encoding="utf-8").strip(), "deploy=false")
+            calls = curl_calls.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(calls), 1)
+            self.assertIn("/branches/dev", calls[0])
+            self.assertNotIn("/workflows/platform-production-deploy.yml/dispatches", calls[0])
+
+    def test_recovery_producer_storage_route_emits_bound_receipt_inputs(self) -> None:
+        blocks = _workflow_python_blocks(
+            RECOVERY_BUILD_WORKFLOW,
+            "Download and validate exact security route artifact",
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(
+            _python_set_assignment(blocks[0], "storage_files"),
+            set(STORAGE_OPERATIONS_FILES),
+        )
+        self.assertEqual(
+            _python_set_assignment(blocks[0], "triggers"),
+            set(STORAGE_OPERATIONS_TRIGGER_FILES),
+        )
+        manifest = classify(
+            sorted(STORAGE_OPERATIONS_FILES),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        encoded = base64.b64encode(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).decode("ascii")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            completed = subprocess.run(
+                [sys.executable, "-I", "-", encoded, str(output), self.TARGET_SHA],
+                input=blocks[0],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(values["storage_skip"], "true")
+            self.assertEqual(values["classifier_digest"], manifest["digest"])
+            expected_files_digest = hashlib.sha256(
+                json.dumps(sorted(manifest["files"]), separators=(",", ":")).encode()
+            ).hexdigest()
+            self.assertEqual(values["storage_files_sha256"], expected_files_digest)
+
+            receipt_blocks = _workflow_python_blocks(
+                RECOVERY_BUILD_WORKFLOW, "Write exact storage-operations skip receipt"
+            )
+            self.assertEqual(len(receipt_blocks), 1)
+            receipt_path = Path(temporary) / "receipt.json"
+            receipt_environment = {
+                **os.environ,
+                "SOURCE_SHA": self.TARGET_SHA,
+                "SECURITY_RUN_ID": "77",
+                "SECURITY_RUN_ATTEMPT": "3",
+                "RECOVERY_BUILD_RUN_ID": "401",
+                "RECOVERY_BUILD_RUN_ATTEMPT": "2",
+                "CLASSIFIER_DIGEST": values["classifier_digest"],
+                "STORAGE_FILES_SHA256": values["storage_files_sha256"],
+            }
+            receipt_created = subprocess.run(
+                [sys.executable, "-I", "-", str(receipt_path)],
+                input=receipt_blocks[0], text=True, capture_output=True,
+                check=False, env=receipt_environment,
+            )
+            self.assertEqual(receipt_created.returncode, 0, receipt_created.stderr)
+            emitted_receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+            self.assertEqual(emitted_receipt["kind"], "platform-storage-operations-skip")
+            self.assertEqual(emitted_receipt["family_proof"], "storage-operations-v1")
+            self.assertEqual(emitted_receipt["security_run_id"], "77")
+            self.assertEqual(stat.S_IMODE(receipt_path.stat().st_mode), 0o600)
+
+            changed = dict(manifest)
+            changed["files"] = [*manifest["files"], "platform/tools/unreviewed.py"]
+            changed["digest"] = manifest_digest(changed)
+            encoded_changed = base64.b64encode(
+                json.dumps(changed, sort_keys=True, separators=(",", ":")).encode()
+            ).decode("ascii")
+            rejected = subprocess.run(
+                [sys.executable, "-I", "-", encoded_changed, str(output), self.TARGET_SHA],
+                input=blocks[0],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+
+    def test_recovery_publisher_receipt_selection_is_closed(self) -> None:
+        blocks = _workflow_python_blocks(
+            RECOVERY_PUBLISH_WORKFLOW,
+            "Fetch exact producer and publisher attempt metadata",
+        )
+        self.assertGreaterEqual(len(blocks), 2)
+        selector = blocks[0]
+        producer_id = 401
+        attempt = 2
+        source_sha = self.TARGET_SHA
+        producer_sha = "b" * 40
+        receipt_name = (
+            f"platform-storage-operations-skip-{source_sha}-77-3-"
+            f"{producer_id}-{attempt}.json"
+        )
+        base_run = {
+            "id": producer_id,
+            "run_attempt": attempt,
+            "status": "completed",
+            "conclusion": "success",
+            "event": "workflow_run",
+            "head_branch": "dev",
+            "head_sha": producer_sha,
+            "name": "Platform production recovery bootstrap build",
+            "path": ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            "repository": {"full_name": "StrayForest/old_sparky"},
+        }
+        receipt_row = {
+            "id": 9001,
+            "name": receipt_name,
+            "expired": False,
+            "digest": "sha256:" + "b" * 64,
+            "workflow_run": {
+                "id": producer_id,
+                "run_attempt": attempt,
+                "head_sha": producer_sha,
+                "repository": {"full_name": "StrayForest/old_sparky"},
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.touch()
+            (root / "producer-run.json").write_text(json.dumps(base_run))
+            (root / "producer-jobs.json").write_text(json.dumps({
+                "total_count": 1,
+                "jobs": [{"id": 5, "name": "Build retained-release recovery bootstrap evidence",
+                          "run_id": producer_id, "run_attempt": attempt, "head_sha": producer_sha,
+                          "status": "completed", "conclusion": "success"}],
+            }))
+            def select(rows: list[dict[str, object]]) -> subprocess.CompletedProcess[str]:
+                (root / "producer-artifacts.json").write_text(
+                    json.dumps({"total_count": len(rows), "artifacts": rows})
+                )
+                return subprocess.run(
+                    [sys.executable, "-I", "-", str(root), str(output)],
+                    input=selector,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env={
+                        **os.environ,
+                        "PRODUCER_RUN_ID": str(producer_id),
+                        "PRODUCER_RUN_ATTEMPT": str(attempt),
+                        "PRODUCER_WORKFLOW": "Platform production recovery bootstrap build",
+                        "PRODUCER_WORKFLOW_PATH": ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+                        "REPOSITORY": "StrayForest/old_sparky",
+                    },
+                )
+            selected = select([receipt_row])
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            selected_outputs = output.read_text(encoding="ascii")
+            self.assertIn("storage_skip=true", selected_outputs)
+            self.assertIn("storage_receipt_artifact_id=9001", selected_outputs)
+
+            output.write_text("", encoding="ascii")
+            bundle_row = {
+                "id": 9003,
+                "name": f"platform-recovery-bootstrap-{source_sha}-77-3-{producer_id}-{attempt}.zip",
+                "expired": False,
+                "digest": "sha256:" + "c" * 64,
+                "workflow_run": receipt_row["workflow_run"],
+            }
+            ordinary = select([bundle_row])
+            self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
+            self.assertIn("storage_skip=false", output.read_text(encoding="ascii"))
+
+            stale_receipt = {
+                **receipt_row,
+                "name": f"platform-storage-operations-skip-{source_sha}-76-2-{producer_id}-1.json",
+                "workflow_run": {
+                    "id": producer_id,
+                    "run_attempt": 1,
+                    "head_sha": producer_sha,
+                    "repository": {"full_name": "StrayForest/old_sparky"},
+                },
+            }
+            output.write_text("", encoding="ascii")
+            prior_receipt_with_bundle = select([stale_receipt, bundle_row])
+            self.assertEqual(prior_receipt_with_bundle.returncode, 0, prior_receipt_with_bundle.stderr)
+            self.assertIn("storage_skip=false", output.read_text(encoding="ascii"))
+            output.write_text("", encoding="ascii")
+            prior_and_current_receipt = select([stale_receipt, receipt_row])
+            self.assertEqual(prior_and_current_receipt.returncode, 0, prior_and_current_receipt.stderr)
+            self.assertIn("storage_skip=true", output.read_text(encoding="ascii"))
+
+            for invalid_rows in ([receipt_row, receipt_row], [receipt_row, {
+                "id": 9002,
+                "name": f"platform-recovery-bootstrap-{source_sha}-77-3-{producer_id}-{attempt}.zip",
+            }]):
+                rejected = select(invalid_rows)
+                self.assertNotEqual(rejected.returncode, 0)
+
+            missing = select([])
+            self.assertNotEqual(missing.returncode, 0)
+
+    def test_recovery_publisher_receipt_and_classifier_proof_reject_tampering(self) -> None:
+        blocks = _workflow_python_blocks(
+            RECOVERY_PUBLISH_WORKFLOW,
+            "Authenticate storage skip receipt and parent classifier proof",
+        )
+        self.assertEqual(len(blocks), 3)
+        self.assertEqual(
+            _python_set_assignment(blocks[2], "allowed"),
+            set(STORAGE_OPERATIONS_FILES),
+        )
+        self.assertEqual(
+            _python_set_assignment(blocks[2], "triggers"),
+            set(STORAGE_OPERATIONS_TRIGGER_FILES),
+        )
+        manifest = classify(
+            sorted(STORAGE_OPERATIONS_FILES),
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        receipt = {
+            "schema": 1,
+            "kind": "platform-storage-operations-skip",
+            "source_sha": self.TARGET_SHA,
+            "security_run_id": "77",
+            "security_run_attempt": "3",
+            "producer_run_id": "401",
+            "producer_run_attempt": "2",
+            "classifier_digest": manifest["digest"],
+            "storage_files_sha256": hashlib.sha256(
+                json.dumps(sorted(manifest["files"]), separators=(",", ":")).encode()
+            ).hexdigest(),
+            "family_proof": "storage-operations-v1",
+        }
+        receipt_name = f"platform-storage-operations-skip-{self.TARGET_SHA}-77-3-401-2.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.touch()
+            def receipt_check(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+                zip_path = root / "receipt.zip"
+                info = zipfile.ZipInfo(receipt_name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as archive:
+                    archive.writestr(info, json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+                return subprocess.run(
+                    [sys.executable, "-I", "-", str(zip_path), receipt_name, "401", "2", str(output)],
+                    input=blocks[0], text=True, capture_output=True, check=False,
+                )
+            accepted = receipt_check(receipt)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            tampered_receipt = dict(receipt, family_proof="recovery-bundle")
+            self.assertNotEqual(receipt_check(tampered_receipt).returncode, 0)
+
+            encoded = base64.b64encode(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+            ).decode("ascii")
+            environment = {
+                **os.environ,
+                "CLASSIFIER_DIGEST": str(receipt["classifier_digest"]),
+                "STORAGE_FILES_SHA256": str(receipt["storage_files_sha256"]),
+            }
+            proof = subprocess.run(
+                [sys.executable, "-I", "-", encoded, str(output)],
+                input=blocks[2], text=True, capture_output=True, check=False, env=environment,
+            )
+            self.assertEqual(proof.returncode, 0, proof.stderr)
+            tampered = dict(manifest, runtime_sensitive=False)
+            tampered["digest"] = manifest_digest(tampered)
+            tampered_encoded = base64.b64encode(
+                json.dumps(tampered, sort_keys=True, separators=(",", ":")).encode()
+            ).decode("ascii")
+            rejected = subprocess.run(
+                [sys.executable, "-I", "-", tampered_encoded, str(output)],
+                input=blocks[2], text=True, capture_output=True, check=False, env=environment,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+
+            parent_run = {
+                "id": 77,
+                "run_attempt": 3,
+                "head_sha": self.TARGET_SHA,
+                "head_branch": "dev",
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+                "name": "Platform security and build",
+                "path": ".github/workflows/platform-security.yml",
+                "repository": {"full_name": "StrayForest/old_sparky"},
+            }
+            parent_job = {
+                "id": 900,
+                "name": "Verification contract",
+                "run_id": 77,
+                "run_attempt": 3,
+                "head_sha": self.TARGET_SHA,
+                "status": "completed",
+                "conclusion": "success",
+            }
+            parent_artifact = {
+                "id": 901,
+                "name": "platform-ci-route-77-3",
+                "expired": False,
+                "digest": "sha256:" + "d" * 64,
+                "workflow_run": {
+                    "id": 77,
+                    "run_attempt": 3,
+                    "head_sha": self.TARGET_SHA,
+                    "repository": {"full_name": "StrayForest/old_sparky"},
+                },
+            }
+            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
+            (root / "storage-security-jobs.json").write_text(json.dumps({"total_count": 1, "jobs": [parent_job]}))
+            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            parent_check = subprocess.run(
+                [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
+                input=blocks[1], text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(parent_check.returncode, 0, parent_check.stderr)
+            self.assertIn("route_artifact_id=901", output.read_text(encoding="ascii"))
+            parent_run["conclusion"] = "failure"
+            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
+            parent_rejected = subprocess.run(
+                [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
+                input=blocks[1], text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(parent_rejected.returncode, 0)
+            parent_run["conclusion"] = "success"
+            parent_run["head_sha"] = "c" * 40
+            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
+            misbound = subprocess.run(
+                [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
+                input=blocks[1], text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(misbound.returncode, 0)
 
 
 if __name__ == "__main__":

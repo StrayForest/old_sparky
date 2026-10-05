@@ -29,6 +29,8 @@ if __package__:
     from .platform_ci_classifier import (
         CANDIDATE_PACKAGING_FILES,
         CANDIDATE_PACKAGING_REASON,
+        STORAGE_OPERATIONS_REASON,
+        _is_storage_operations_only,
     )
 else:  # Executed as a script under Python isolated mode on a runner.
     _TRUSTED_TOOLS_PACKAGE = "_oldsparky_trusted_platform_tools"
@@ -48,6 +50,8 @@ else:  # Executed as a script under Python isolated mode on a runner.
     )
     CANDIDATE_PACKAGING_FILES = _CI_CLASSIFIER_MODULE.CANDIDATE_PACKAGING_FILES
     CANDIDATE_PACKAGING_REASON = _CI_CLASSIFIER_MODULE.CANDIDATE_PACKAGING_REASON
+    STORAGE_OPERATIONS_REASON = _CI_CLASSIFIER_MODULE.STORAGE_OPERATIONS_REASON
+    _is_storage_operations_only = _CI_CLASSIFIER_MODULE._is_storage_operations_only
 
 
 MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -532,6 +536,7 @@ def validate_manifest(
         raise _fail("manifest")
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
     candidate_packaging_only = _is_candidate_packaging_only(files)
+    storage_operations_only = _is_storage_operations_only(files)
     if type(require_recovery_bootstrap) is not bool:
         raise _fail("manifest")
     if type(require_reconcile_source) is not bool or (
@@ -565,7 +570,16 @@ def validate_manifest(
             or manifest.get("reason") != CANDIDATE_PACKAGING_REASON
         ):
             raise _fail("manifest")
+    elif storage_operations_only:
+        if (
+            manifest["deployable"] is not False
+            or manifest["runtime_sensitive"] is not True
+            or manifest.get("reason") != STORAGE_OPERATIONS_REASON
+        ):
+            raise _fail("manifest")
     elif manifest["deployable"] is not True:
+        raise _fail("manifest")
+    if manifest.get("reason") == STORAGE_OPERATIONS_REASON and not storage_operations_only:
         raise _fail("manifest")
     if require_reconcile_source and not (recovery_bootstrap_only or candidate_packaging_only):
         raise _fail("manifest")

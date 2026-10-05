@@ -365,6 +365,26 @@ jobs:
           }
           recovery_bootstrap_reason = "retained-release recovery-bootstrap change requires full verification and is non-deployable"
           candidate_packaging_reason = "trusted candidate-packaging change requires full verification and is non-deployable"
+          storage_operations_files = {
+              ".github/workflows/platform-production-storage-diagnostics.yml",
+              ".github/workflows/platform-production-storage-maintenance.yml",
+              ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+              ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+              ".github/workflows/platform-production-autodeploy.yml",
+              ".agents/skills/platform-storage-retention/SKILL.md",
+              "platform/tools/platform_ci_classifier.py",
+              "platform/tools/platform_production_classifier_artifact.py",
+              "platform/tests/test_platform_ci_classifier.py",
+              "platform/tests/test_platform_release_audit_hardening.py",
+              "platform/tests/test_platform_storage_maintenance.py",
+              "platform/tools/platform_test_catalog.py",
+          }
+          storage_operations_triggers = {
+              ".github/workflows/platform-production-storage-diagnostics.yml",
+              ".github/workflows/platform-production-storage-maintenance.yml",
+              ".agents/skills/platform-storage-retention/SKILL.md",
+          }
+          storage_operations_reason = "storage operations change requires full verification and is non-deployable"
           if manifest.get("schema") != 1 or manifest.get("version") != 1:
               raise SystemExit("classifier manifest schema/version is invalid")
           route_class = manifest.get("class")
@@ -409,6 +429,15 @@ jobs:
                   for path in files
               )
           )
+          storage_operations_only = bool(
+              reason == storage_operations_reason
+              and any(path in storage_operations_triggers for path in files)
+              and all(
+                  path in storage_operations_files
+                  or path.startswith("platform/docs/")
+                  for path in files
+              )
+          )
           if not isinstance(manifest.get("runtime_sensitive"), bool):
               raise SystemExit("classifier runtime-sensitive field is malformed")
           payload = {field: manifest[field] for field in fields}
@@ -425,7 +454,11 @@ jobs:
           if (
               route_class == "full"
               and manifest["deployable"] is False
-              and not (recovery_bootstrap_only or candidate_packaging_only)
+              and not (
+                  recovery_bootstrap_only
+                  or candidate_packaging_only
+                  or storage_operations_only
+              )
           ):
               raise SystemExit("full non-deployable classifier route is not recognized")
           if recovery_bootstrap_only and manifest["deployable"]:
@@ -442,6 +475,17 @@ jobs:
               raise SystemExit("candidate-packaging route runtime sensitivity is inconsistent")
           if candidate_packaging_only and reason != candidate_packaging_reason:
               raise SystemExit("candidate-packaging route reason is inconsistent")
+          if storage_operations_only and (
+              route_class != "full"
+              or manifest["deployable"] is not False
+              or manifest["runtime_sensitive"] is not True
+              or manifest["fallback"] is not False
+          ):
+              raise SystemExit("storage-operations route fields are inconsistent")
+          if storage_operations_only and reason != storage_operations_reason:
+              raise SystemExit("storage-operations route reason is inconsistent")
+          if reason == storage_operations_reason and not storage_operations_only:
+              raise SystemExit("storage-operations route does not match its exact file family")
           if route_class != "full" and manifest.get("deployable") is not False:
               raise SystemExit("reduced classifier route must be non-deployable")
           with Path(output_path).open("a", encoding="utf-8") as output:
@@ -449,6 +493,7 @@ jobs:
               output.write(f"route_deployable={'true' if manifest['deployable'] else 'false'}\n")
               output.write(f"route_recovery_bootstrap_only={'true' if recovery_bootstrap_only else 'false'}\n")
               output.write(f"route_candidate_packaging_only={'true' if candidate_packaging_only else 'false'}\n")
+              output.write(f"route_storage_operations_only={'true' if storage_operations_only else 'false'}\n")
               output.write(f"route_fallback={'true' if manifest['fallback'] else 'false'}\n")
               output.write(f"route_digest={manifest['digest']}\n")
               output.write(f"route_reason={reason}\n")
@@ -463,6 +508,7 @@ jobs:
           ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
           ROUTE_RECOVERY_BOOTSTRAP_ONLY: ${{ steps.route.outputs.route_recovery_bootstrap_only }}
           ROUTE_CANDIDATE_PACKAGING_ONLY: ${{ steps.route.outputs.route_candidate_packaging_only }}
+          ROUTE_STORAGE_OPERATIONS_ONLY: ${{ steps.route.outputs.route_storage_operations_only }}
         run: |
           set -euo pipefail
 
@@ -483,6 +529,16 @@ jobs:
 
           if [[ "$dev_sha" != "$TARGET_SHA" ]]; then
             echo "Skipping stale successful CI result for $TARGET_SHA; current dev is $dev_sha."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$ROUTE_STORAGE_OPERATIONS_ONLY" == "true" ]]; then
+            [[ "$ROUTE_CLASS" == "full" && "$ROUTE_DEPLOYABLE" == "false" ]] || {
+              echo "Refusing inconsistent storage-operations route fields." >&2
+              exit 1
+            }
+            echo "Storage-operations route validated; no application deployment or recovery action required."
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

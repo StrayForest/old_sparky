@@ -81,6 +81,9 @@ RUNTIME_SENSITIVE_FILES = frozenset(
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tests/test_platform_workflow_provenance.py",
         "platform/tests/test_platform_recovery_workflow_caller.py",
+        ".github/workflows/platform-production-storage-diagnostics.yml",
+        ".github/workflows/platform-production-storage-maintenance.yml",
+        ".agents/skills/platform-storage-retention/SKILL.md",
     }
 )
 
@@ -205,6 +208,46 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
 )
 RECOVERY_BOOTSTRAP_REASON = (
     "retained-release recovery-bootstrap change requires full verification and is non-deployable"
+)
+
+# Storage operations are production-capable operator workflows, but source
+# updates to those workflows must not authorize either an app deployment or a
+# recovery-baseline action.  Keep the route family closed and require one of
+# the two workflow entrypoints as its trigger; shared classifier/AUTO control
+# files are allowed only when a storage workflow is part of the same range.
+STORAGE_OPERATIONS_WORKFLOW_FILES = frozenset(
+    {
+        ".github/workflows/platform-production-storage-diagnostics.yml",
+        ".github/workflows/platform-production-storage-maintenance.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+    }
+)
+STORAGE_OPERATIONS_SKILL_FILE = ".agents/skills/platform-storage-retention/SKILL.md"
+STORAGE_OPERATIONS_TRIGGER_FILES = frozenset(
+    {
+        ".github/workflows/platform-production-storage-diagnostics.yml",
+        ".github/workflows/platform-production-storage-maintenance.yml",
+        STORAGE_OPERATIONS_SKILL_FILE,
+    }
+)
+STORAGE_OPERATIONS_FILES = frozenset(
+    {
+        *STORAGE_OPERATIONS_WORKFLOW_FILES,
+        ".github/workflows/platform-production-autodeploy.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-publish.yml",
+        STORAGE_OPERATIONS_SKILL_FILE,
+        "platform/tools/platform_ci_classifier.py",
+        "platform/tools/platform_production_classifier_artifact.py",
+        "platform/tests/test_platform_ci_classifier.py",
+        "platform/tests/test_platform_release_audit_hardening.py",
+        "platform/tests/test_platform_storage_maintenance.py",
+        "platform/tools/platform_test_catalog.py",
+    }
+)
+STORAGE_OPERATIONS_REASON = (
+    "storage operations change requires full verification and is non-deployable"
 )
 
 _DIGEST_FIELDS = (
@@ -351,6 +394,18 @@ def _is_recovery_bootstrap_only(files: Sequence[str]) -> bool:
     )
 
 
+def _is_storage_operations_only(files: Sequence[str]) -> bool:
+    """Return whether files are the exact storage-operations route plus docs."""
+
+    return bool(
+        any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in files)
+        and all(
+            path in STORAGE_OPERATIONS_FILES or path.startswith(DOCS_PREFIX)
+            for path in files
+        )
+    )
+
+
 def _route_for_files(files: Sequence[str]) -> tuple[str, tuple[str, ...], str, bool]:
     """Return class, gates, reason and whether the path set is a fallback."""
 
@@ -368,13 +423,16 @@ def _route_for_files(files: Sequence[str]) -> tuple[str, tuple[str, ...], str, b
             "change is outside the active platform application",
             False,
         )
-    if all(path.startswith(FULL_PREFIXES) for path in files):
+    if all(
+        path.startswith(FULL_PREFIXES) or path == STORAGE_OPERATIONS_SKILL_FILE
+        for path in files
+    ):
         return (
-            "full",
-            FULL_GATE_IDS,
-            "platform or workflow change requires the full deterministic suite",
-            False,
-        )
+        "full",
+        FULL_GATE_IDS,
+        "platform or workflow change requires the full deterministic suite",
+        False,
+    )
     return (
         "full",
         FULL_GATE_IDS,
@@ -534,10 +592,17 @@ def classify(
     runtime_sensitive = runtime_sensitive or fallback
     candidate_packaging_only = _is_candidate_packaging_only(normalised)
     recovery_bootstrap_only = _is_recovery_bootstrap_only(normalised)
+    storage_operations_only = _is_storage_operations_only(normalised)
+    if storage_operations_only:
+        route_class = "full"
+        expected_gates = FULL_GATE_IDS
+        fallback = False
     if recovery_bootstrap_only:
         reason = RECOVERY_BOOTSTRAP_REASON
     elif candidate_packaging_only:
         reason = CANDIDATE_PACKAGING_REASON
+    elif storage_operations_only:
+        reason = STORAGE_OPERATIONS_REASON
     return _build_manifest(
         target_sha=target_sha,
         event=event,
@@ -547,8 +612,12 @@ def classify(
         reason=reason,
         route_class=route_class,
         expected_gates=expected_gates,
-        runtime_sensitive=runtime_sensitive,
-        non_deployable=candidate_packaging_only or recovery_bootstrap_only,
+        runtime_sensitive=runtime_sensitive or storage_operations_only,
+        non_deployable=(
+            candidate_packaging_only
+            or recovery_bootstrap_only
+            or storage_operations_only
+        ),
     )
 
 
@@ -599,10 +668,12 @@ def validate_manifest(
     if not isinstance(files, list) or any(not isinstance(path, str) for path in files):
         raise ClassifierError("classifier files must be a list of strings")
     recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
+    storage_operations_only = _is_storage_operations_only(files)
     expected_runtime_sensitive = (
         manifest["fallback"]
         or event not in {"pull_request", "push"}
         or any(path in RUNTIME_SENSITIVE_FILES for path in files)
+        or storage_operations_only
     )
     if runtime_sensitive != expected_runtime_sensitive:
         raise ClassifierError("classifier runtime_sensitive does not match its route")
@@ -618,10 +689,18 @@ def validate_manifest(
     if (
         route_class == "full"
         and not manifest["fallback"]
-        and (_is_candidate_packaging_only(files) or recovery_bootstrap_only)
+        and (
+            _is_candidate_packaging_only(files)
+            or recovery_bootstrap_only
+            or storage_operations_only
+        )
         and manifest["deployable"]
     ):
         raise ClassifierError("review-only packaging route cannot be deployable")
+    if storage_operations_only and manifest.get("reason") != STORAGE_OPERATIONS_REASON:
+        raise ClassifierError("storage-operations route reason is inconsistent")
+    if manifest.get("reason") == STORAGE_OPERATIONS_REASON and not storage_operations_only:
+        raise ClassifierError("storage-operations route does not match its exact file family")
     if expected_target_sha is not None and target_sha != expected_target_sha:
         raise ClassifierError("classifier target_sha does not match the release SHA")
     if require_deployable:

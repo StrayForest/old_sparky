@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ast
+import fcntl
 import io
 import json
 import os
@@ -1793,6 +1794,79 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("if-no-files-found: error", workflow)
         self.assertNotIn('cat "$ssh_error"', workflow)
 
+    @unittest.skipUnless(os.geteuid() == 0, "lock probe fixture requires root")
+    def test_storage_diagnostic_lock_probe_output_reaches_canonical_summary(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        marker = (
+            'lock_state="$(/usr/bin/python3 -I - "$retained_load_lock" '
+            '2>/dev/null <<\'PY\'\n'
+        )
+        start = workflow.index(marker) + len(marker)
+        end = workflow.index("\n          PY\n          )\"", start)
+        probe = textwrap.dedent(workflow[start:end])
+        self.assertEqual(probe.count('lock_root = Path("/run/lock")'), 1)
+        probe = probe.replace(
+            'lock_root = Path("/run/lock")', "lock_root = lock_path.parent"
+        )
+        summary_tool = TOOLS_DIR / "platform_storage_evidence_summary.py"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_root = Path(temporary)
+            lock_root.chmod(0o700)
+            lock_path = lock_root / "oldsparky-retained-load.lock"
+            lock_path.write_bytes(b"retained-load-lock-fixture")
+            lock_path.chmod(0o600)
+            os.chown(lock_path, 0, 0)
+            identity = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+            original_bytes = lock_path.read_bytes()
+
+            def run_probe() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-I", "-", str(lock_path)],
+                    input=probe,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            unlocked = run_probe()
+            self.assertEqual(unlocked.returncode, 0, unlocked.stderr)
+            self.assertEqual(unlocked.stdout.strip(), "state=unlocked")
+            summarized_unlocked = subprocess.run(
+                [sys.executable, "-I", str(summary_tool), "--mode", "lock"],
+                input=unlocked.stdout,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(summarized_unlocked.returncode, 0, summarized_unlocked.stderr)
+            self.assertFalse(json.loads(summarized_unlocked.stdout)["lock_held"])
+
+            descriptor = os.open(lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = run_probe()
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            self.assertEqual(held.returncode, 0, held.stderr)
+            self.assertEqual(held.stdout.strip(), "state=held")
+            summarized_held = subprocess.run(
+                [sys.executable, "-I", str(summary_tool), "--mode", "lock"],
+                input=held.stdout,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(summarized_held.returncode, 0, summarized_held.stderr)
+            self.assertTrue(json.loads(summarized_held.stdout)["lock_held"])
+            self.assertEqual(
+                (lock_path.stat().st_dev, lock_path.stat().st_ino), identity
+            )
+            self.assertEqual(lock_path.read_bytes(), original_bytes)
+
     def test_storage_diagnostic_retention_classifier_is_closed_and_threshold_aware(self) -> None:
         workflow = (
             WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
@@ -1964,7 +2038,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             before = lock_path.stat()
             unlocked = run_probe(lock_path)
             self.assertEqual(unlocked.returncode, 0, unlocked.stderr)
-            self.assertEqual(unlocked.stdout.strip(), "unlocked")
+            self.assertEqual(unlocked.stdout.strip(), "state=unlocked")
             self.assertEqual(lock_path.read_bytes(), b"preserve lock bytes")
             self.assertEqual((before.st_dev, before.st_ino, before.st_size),
                              (lock_path.stat().st_dev, lock_path.stat().st_ino, lock_path.stat().st_size))
@@ -1976,7 +2050,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 held = run_probe(lock_path)
                 self.assertEqual(held.returncode, 0, held.stderr)
-                self.assertEqual(held.stdout.strip(), "held")
+                self.assertEqual(held.stdout.strip(), "state=held")
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
                 os.close(descriptor)

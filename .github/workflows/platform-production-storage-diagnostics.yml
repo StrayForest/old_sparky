@@ -214,11 +214,11 @@ jobs:
                   fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
               except OSError as exc:
                   if exc.errno in {errno.EACCES, errno.EAGAIN}:
-                      print("held")
+                      print("state=held")
                       raise SystemExit(0)
                   raise
               fcntl.flock(descriptor, fcntl.LOCK_UN)
-              print("unlocked")
+              print("state=unlocked")
           finally:
               os.close(descriptor)
           PY
