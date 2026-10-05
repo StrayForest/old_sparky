@@ -2,27 +2,29 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-01
+- Last reviewed: 2026-10-05
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
-## Verified checkpoint — 2026-09-11
+## Verified checkpoint — 2026-10-05
 
-- Production is on the standard `ready-vote-static-8` runtime with compression
-  enabled, the normal `fetch` auth transport and Node `26.3.1`. The latest
-  behavior-bearing restore is
-  [`34550534777`](https://github.com/StrayForest/old_sparky/actions/runs/34550534777)
-  at source SHA `0700b7402ecdd182fe0cfba4feae14f15fb68243`; its launch QA and
-  post-run storage maintenance passed. A later documentation-only publication
-  must preserve this runtime profile.
-- Preventative web-runtime hardening is encoded in the source contract:
-  `deadlock-web` uses bounded automatic restart limits, the standalone cache is
-  created with exact service ownership/mode and its systemd write allowlist,
-  and the release artifact excludes stale cache state while requiring the two
-  fixed-schema diagnostics helpers. The read-only outage workflow fails closed
-  on producer/helper failure and uploads aggregate summaries only; this does
-  not itself change the recovered production runtime until the normal reviewed
-  release path runs.
+- Current app T: source `dcad5d1baf0998bec89edfccac0f8ac7f3de1a61`, slug
+  `gha-37293942804-1-dcad5d1baf09`, RELEASE SHA-256
+  `6269ac96777eb947c9db1cbe1398508b6fcf486e1586c0e46cca2d909df8776f`; installed by
+  normal AUTO [run `37293922013`](https://github.com/StrayForest/old_sparky/actions/runs/37293922013)
+  and [child `37293942804`](https://github.com/StrayForest/old_sparky/actions/runs/37293942804).
+  Previous R source `cf29087ba2313ace344db7f2dd52aa55a0a28fad`, slug
+  `gha-37266469137-1-cf29087ba231`, RELEASE SHA-256
+  `d82005f212401947dd92c0b95acc2c431178f5edc833935d047b90a16fc2dd64`; its failed
+  status remains unchanged. Final receipt `69b5ec3bb3c13ed79d07823c227782307fb1c90d65db20adf7ba7590efea9bb8` verifies clean
+  markers, active health, three HTTP 200s, managed-QA T tree (966 files; SHA
+  `cc797eb6d7603b0aa7c6dc3de0cff5149eb3e5be6e3e498b9296d48462ccddf9`) and DB
+  head `20260913_0053`.
+- Host-tools S11 (`138128c99025069143f5c234f6cb58545ed8ab1c`) is installed;
+  all 15 members, no bytecode and receipt SHA-256 `2f182be1aaf90ee56ed83f7c755e4f38ec860d6f7f20e2ae003084c1a0a7c3f7` passed.
+  S10, S9 and recovery generation
+  `d47ae6a278f76bb8a46cca0bbe9019427584c3d2861880e8a7365d87a627be66` remain
+  preserved separately.
 - The authenticated HTML follow-up compared the unchanged v1 control, the
   HTTP/1.1 keep-alive client, the one-worker native server transport and the
   two-worker native profile. All pressure windows observed web-process
@@ -195,10 +197,8 @@ the OOM/queueing failure mode, but it missed the `<1,000 ms` target by `173.196
 ms`, so it is not the production default. The direct transport is now gated by
 `PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node` and the two-worker profile; ordinary
 baseline/static/diagnostic profiles explicitly use `fetch`. The current
-standard production runtime is the restored `ready-vote-static-8` baseline,
-with compression enabled and Node `26.3.1`, validated by
-[`34550534777`](https://github.com/StrayForest/old_sparky/actions/runs/34550534777)
-from behavior-bearing SHA `0700b7402ecdd182fe0cfba4feae14f15fb68243`.
+current production runtime is recorded in the verified checkpoint above. The
+historical transport runs below did not change it.
 
 The 2026-09-11 authenticated HTML follow-up did not produce a promotion
 candidate. The unchanged v1 control returned `18,077/20,000` HTTP 200 and
