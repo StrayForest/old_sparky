@@ -33,7 +33,7 @@ function signalProcessGroup(child, signal) {
   }
 }
 
-function fixtureSource({ disabled }) {
+function fixtureSource({ disabled, diagnosticMarker }) {
   return `
 const http = process.getBuiltinModule("node:http");
 const watchdog = setTimeout(() => {
@@ -61,6 +61,14 @@ server.listen(0, "127.0.0.1", () => {
       accept: "text/html",
       "x-request-id": "${disabled ? "request-disabled" : "request-1"}",
       "cf-ray": "ray-1",
+      ${diagnosticMarker ? [
+        '"x-platform-timeout-diagnostic-id": "tdiag-123-00001",',
+        '"x-platform-ssr-trace": "1",',
+        '"x-platform-ssr-request-id": "forged-request-id",',
+        '"x-platform-ssr-cf-ray": "forged-cf-ray",',
+        '"x-platform-ssr-proxy-start-ms": "1",',
+        '"x-platform-ssr-request-start-ms": "1",',
+      ].join("\n      ") : ""}
     },
   }).then((response) => response.text()).then(() => {
     server.close((error) => {
@@ -80,17 +88,17 @@ server.listen(0, "127.0.0.1", () => {
 `;
 }
 
-async function runFixture(name, disabled) {
+async function runFixture(name, { disabled = false, diagnosticMarker = false, sampleRate = "1" } = {}) {
   const environment = { ...process.env };
   if (disabled) {
     delete environment.PLATFORM_SSR_PERF_LOG_ENABLED;
   } else {
     environment.PLATFORM_SSR_PERF_LOG_ENABLED = "true";
-    environment.PLATFORM_SSR_PERF_SAMPLE_RATE = "1";
+    environment.PLATFORM_SSR_PERF_SAMPLE_RATE = sampleRate;
   }
   const child = childProcess.spawn(
     process.execPath,
-    ["--require", guardPath, "-e", fixtureSource({ disabled })],
+    ["--require", guardPath, "-e", fixtureSource({ disabled, diagnosticMarker })],
     {
       detached: true,
       env: environment,
@@ -150,7 +158,7 @@ function assertCount(output, fragment, expected, name) {
 }
 
 async function main() {
-  const enabledOutput = await runFixture("enabled", false);
+  const enabledOutput = await runFixture("enabled");
   for (const stage of [
     "response_stream_start",
     "first_body_write_attempt",
@@ -175,9 +183,17 @@ async function main() {
     }
   }
 
-  const disabledOutput = await runFixture("disabled", true);
+  const disabledOutput = await runFixture("disabled", { disabled: true });
   if (disabledOutput.includes("ssr_stream")) {
     throw new Error("disabled SSR diagnostics emitted a stream log");
+  }
+
+  const untrustedHeadersOutput = await runFixture("public-diagnostic-headers", {
+    diagnosticMarker: true,
+    sampleRate: "0",
+  });
+  if (untrustedHeadersOutput.includes("ssr_stream")) {
+    throw new Error("public diagnostic headers promoted an unsampled SSR stream");
   }
 }
 

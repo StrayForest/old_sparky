@@ -57,11 +57,62 @@ jobs:
       input_artifact_digest: ${{ steps.publish-input.outputs.artifact-digest }}
     env:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
-      CONTROL_EMAIL: ${{ inputs.control_email }}
       PROFILE_ID: ${{ inputs.profile_id }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       TARGET_SHA: ${{ github.sha }}
     steps:
+      - name: Mask and stage the control identity from the event file
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          try:
+              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+              inputs = event.get("inputs")
+              email = inputs.get("control_email") if isinstance(inputs, dict) else None
+              if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
+                  raise ValueError
+              local, domain = email.split("@", 1)
+              local_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?$")
+              label_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
+              labels = domain.split(".")
+              if not 1 <= len(local) <= 64 or not 1 <= len(domain) <= 253 or "." not in domain or local_pattern.fullmatch(local) is None or any(label_pattern.fullmatch(label) is None for label in labels):
+                  raise ValueError
+              if any(ord(character) < 0x21 or ord(character) == 0x7F for character in email):
+                  raise ValueError
+              canonical_email = email.lower()
+              if len(canonical_email) > 254:
+                  raise ValueError
+          except (OSError, ValueError, TypeError, json.JSONDecodeError):
+              raise SystemExit("control identity input is invalid")
+
+          # Register both accepted input casing and its canonical form before
+          # persisting the value for any later step.
+          for value in dict.fromkeys((email, canonical_email)):
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              sys.stdout.write(f"::add-mask::{escaped}\n")
+          sys.stdout.flush()
+
+          destination = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+          try:
+              descriptor = os.open(destination, flags, 0o600)
+              with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+                  handle.write(canonical_email + "\n")
+                  handle.flush()
+                  os.fsync(handle.fileno())
+          except OSError:
+              raise SystemExit("control identity handoff could not be created safely")
+          if destination.is_symlink() or destination.stat().st_mode & 0o077:
+              raise SystemExit("control identity handoff permissions are unsafe")
+          PY
+
       - name: Reject invalid external-load dispatch before checkout
         shell: bash
         run: |
@@ -118,7 +169,7 @@ jobs:
           set -euo pipefail
           profile_env="$RUNNER_TEMP/profile.env"
           run_checked_out_client() {
-            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 SOURCE_GIT_SHA="$TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" "$@"
+            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 RUNNER_TEMP="$RUNNER_TEMP" SOURCE_GIT_SHA="$TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" "$@"
           }
           run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py validate --profile "$PROFILE_ID" --dispatchable
           run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py export-env --profile "$PROFILE_ID" > "$profile_env"
@@ -145,18 +196,43 @@ jobs:
               SETUP_CONCURRENCY|TOURNAMENT_COUNT|USERS_PER_TOURNAMENT) export "$key=$value" ;;
             esac
           done < "$profile_env"
-          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py email --value "$CONTROL_EMAIL"
-          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py external \
-            --output "$RUNNER_TEMP/platform-production-external-load-input.json" \
-            --confirmation "$QA_CONFIRMATION" \
-            --target-sha "$TARGET_SHA" \
-            --control-email "$CONTROL_EMAIL" \
-            --setup-concurrency "$SETUP_CONCURRENCY" \
-            --run-id "$GITHUB_RUN_ID" \
-            --profile external-vote \
-            --tournament-count "$TOURNAMENT_COUNT" \
-            --users-per-tournament "$USERS_PER_TOURNAMENT" \
-            --timeout-diagnostics "$TIMEOUT_DIAGNOSTICS"
+          run_checked_out_client /usr/bin/python3 - \
+            "$RUNNER_TEMP/platform-production-external-load-input.json" \
+            "$QA_CONFIRMATION" "$TARGET_SHA" "$SETUP_CONCURRENCY" \
+            "$GITHUB_RUN_ID" "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
+            "$TIMEOUT_DIAGNOSTICS" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+          sys.path.insert(0, str(Path("platform").resolve()))
+          from tools.platform_workflow_input_guard import (
+              _write_private_json,
+              validate_external_payload,
+          )
+
+          output_path, confirmation, target_sha, setup_concurrency, run_id, tournaments, users, timeout_diagnostics = sys.argv[1:]
+          control_email_path = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
+          metadata = control_email_path.lstat()
+          if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_mode & 0o077:
+              raise SystemExit("control identity handoff permissions are unsafe")
+          control_email = control_email_path.read_text(encoding="ascii")
+          if not control_email.endswith("\n") or control_email.count("\n") != 1:
+              raise SystemExit("control identity handoff is malformed")
+          payload = {
+              "schema": 1,
+              "confirmation": confirmation,
+              "target_sha": target_sha,
+              "control_email": control_email[:-1],
+              "setup_concurrency": setup_concurrency,
+              "run_id": run_id,
+              "profile": "external-vote",
+              "tournament_count": tournaments,
+              "users_per_tournament": users,
+              "timeout_diagnostics": timeout_diagnostics,
+          }
+          _write_private_json(Path(output_path), validate_external_payload(payload))
+          PY
           test "$(stat -c '%a' "$RUNNER_TEMP/platform-production-external-load-input.json")" = 600
 
       - name: Publish closed external-load handoff
@@ -173,7 +249,11 @@ jobs:
         if: ${{ always() }}
         shell: bash
         run: |
-          rm -f -- "$RUNNER_TEMP/platform-production-external-load-input.json" "$RUNNER_TEMP/profile.env"
+          rm -f -- \
+            "$RUNNER_TEMP/platform-production-external-load-input.json" \
+            "$RUNNER_TEMP/profile.env" \
+            "$RUNNER_TEMP/platform-production-control-email"
+          test ! -e "$RUNNER_TEMP/platform-production-control-email" && test ! -L "$RUNNER_TEMP/platform-production-control-email"
 
   # This job owns SSH only for trusted fixture setup.  It does not checkout or
   # execute candidate code and publishes the manifest as data for a fresh
@@ -200,6 +280,40 @@ jobs:
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
       INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
     steps:
+      - name: Mask the control identity before reading the handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          try:
+              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+              inputs = event.get("inputs")
+              email = inputs.get("control_email") if isinstance(inputs, dict) else None
+              if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
+                  raise ValueError
+              local, domain = email.split("@", 1)
+              local_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?$")
+              label_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
+              labels = domain.split(".")
+              if not 1 <= len(local) <= 64 or not 1 <= len(domain) <= 253 or "." not in domain or local_pattern.fullmatch(local) is None or any(label_pattern.fullmatch(label) is None for label in labels):
+                  raise ValueError
+              if any(ord(character) < 0x21 or ord(character) == 0x7F for character in email):
+                  raise ValueError
+              canonical_email = email.lower()
+          except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("control identity input is invalid")
+          for value in dict.fromkeys((email, canonical_email)):
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              sys.stdout.write(f"::add-mask::{escaped}\n")
+          sys.stdout.flush()
+          PY
+
       - name: Download closed external-load handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
@@ -460,6 +574,40 @@ jobs:
       MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
       MANIFEST_ARTIFACT_DIGEST: ${{ needs.fixture-setup.outputs.manifest_artifact_digest }}
     steps:
+      - name: Mask the control identity before reading the handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          try:
+              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+              inputs = event.get("inputs")
+              email = inputs.get("control_email") if isinstance(inputs, dict) else None
+              if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
+                  raise ValueError
+              local, domain = email.split("@", 1)
+              local_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?$")
+              label_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
+              labels = domain.split(".")
+              if not 1 <= len(local) <= 64 or not 1 <= len(domain) <= 253 or "." not in domain or local_pattern.fullmatch(local) is None or any(label_pattern.fullmatch(label) is None for label in labels):
+                  raise ValueError
+              if any(ord(character) < 0x21 or ord(character) == 0x7F for character in email):
+                  raise ValueError
+              canonical_email = email.lower()
+          except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("control identity input is invalid")
+          for value in dict.fromkeys((email, canonical_email)):
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              sys.stdout.write(f"::add-mask::{escaped}\n")
+          sys.stdout.flush()
+          PY
+
       - name: Download external-load handoffs
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
@@ -801,13 +949,61 @@ jobs:
       origin_artifact_digest: ${{ steps.publish-origin.outputs.artifact-digest }}
     env:
       TARGET_SHA: ${{ github.sha }}
-      CONTROL_EMAIL: ${{ inputs.control_email }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
       INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
       CANDIDATE_ARTIFACT_ID: ${{ needs.load-client.outputs.candidate_artifact_id }}
       CANDIDATE_ARTIFACT_DIGEST: ${{ needs.load-client.outputs.candidate_artifact_digest }}
     steps:
+      - name: Mask and stage the control identity from the event file
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          try:
+              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+              inputs = event.get("inputs")
+              email = inputs.get("control_email") if isinstance(inputs, dict) else None
+              if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
+                  raise ValueError
+              local, domain = email.split("@", 1)
+              local_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?$")
+              label_pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
+              labels = domain.split(".")
+              if not 1 <= len(local) <= 64 or not 1 <= len(domain) <= 253 or "." not in domain or local_pattern.fullmatch(local) is None or any(label_pattern.fullmatch(label) is None for label in labels):
+                  raise ValueError
+              if any(ord(character) < 0x21 or ord(character) == 0x7F for character in email):
+                  raise ValueError
+              canonical_email = email.lower()
+              if len(canonical_email) > 254:
+                  raise ValueError
+          except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("control identity input is invalid")
+          for value in dict.fromkeys((email, canonical_email)):
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              sys.stdout.write(f"::add-mask::{escaped}\n")
+          sys.stdout.flush()
+
+          destination = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+          try:
+              descriptor = os.open(destination, flags, 0o600)
+              with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+                  handle.write(canonical_email + "\n")
+                  handle.flush()
+                  os.fsync(handle.fileno())
+          except OSError:
+              raise SystemExit("control identity handoff could not be created safely")
+          if destination.is_symlink() or destination.stat().st_mode & 0o077:
+              raise SystemExit("control identity handoff permissions are unsafe")
+          PY
+
       - name: Download exact external-load handoff
         continue-on-error: true
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -839,15 +1035,27 @@ jobs:
           # candidate handoffs.  Setup may already have committed a fixture
           # when a later artifact/handoff check fails, so cleanup must still
           # have a machine-validated run/SHA/control-account document.
-          if /usr/bin/python3 - "$cleanup_input_path" "$TARGET_SHA" "$GITHUB_RUN_ID" "$CONTROL_EMAIL" <<'PY'
+          if /usr/bin/python3 - "$cleanup_input_path" "$TARGET_SHA" "$GITHUB_RUN_ID" <<'PY'
           import json
           import os
           from pathlib import Path
           import re
+          import stat
           import sys
           import tempfile
 
-          destination, target_sha, run_id, control_email = sys.argv[1:]
+          destination, target_sha, run_id = sys.argv[1:]
+          control_email_path = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
+          try:
+              control_metadata = control_email_path.lstat()
+              if not stat.S_ISREG(control_metadata.st_mode) or stat.S_ISLNK(control_metadata.st_mode) or control_metadata.st_mode & 0o077:
+                  raise ValueError
+              control_email = control_email_path.read_text(encoding="ascii")
+          except (OSError, ValueError):
+              raise SystemExit("cleanup control identity is unavailable")
+          if not control_email.endswith("\n") or control_email.count("\n") != 1:
+              raise SystemExit("cleanup control identity is malformed")
+          control_email = control_email[:-1]
           email_local = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._%+\\-]{0,62}[A-Za-z0-9])?$")
           email_label = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?$")
           if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
@@ -1242,6 +1450,7 @@ jobs:
           control_path="/tmp/old-sparky-external-load-ssh-finalize-$GITHUB_RUN_ID"
           input_path="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
           cleanup_input_path="$RUNNER_TEMP/external-input/platform-production-external-load-cleanup.json"
+          control_email_path="$RUNNER_TEMP/platform-production-control-email"
 
           if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
             test -d "$ssh_dir" && test ! -L "$ssh_dir"
@@ -1265,10 +1474,11 @@ jobs:
             rmdir -- "$ssh_dir"
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
-          rm -f -- "$control_path" "$input_path" "$cleanup_input_path"
+          rm -f -- "$control_path" "$input_path" "$cleanup_input_path" "$control_email_path"
           test ! -e "$control_path" && test ! -L "$control_path"
           test ! -e "$input_path" && test ! -L "$input_path"
           test ! -e "$cleanup_input_path" && test ! -L "$cleanup_input_path"
+          test ! -e "$control_email_path" && test ! -L "$control_email_path"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
           test -z "${SSH_DIR:-}"

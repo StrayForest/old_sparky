@@ -13,14 +13,24 @@ from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 from typing import Sequence
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_ROOT = PLATFORM_ROOT / "tools"
 WEB_ROOT = PLATFORM_ROOT / "apps" / "platform_web"
+_PROCESS_GROUP_TERM_GRACE_SECONDS = 1.0
+
+
+class _VerifierTermination(BaseException):
+    """A TERM delivered while the verifier owns a running gate process group."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
 
 
 def _backend_catalog_module():
@@ -265,6 +275,76 @@ def _tool(name: str) -> str:
     return str(TOOLS_ROOT / name)
 
 
+def _terminate_owned_process_group(process: subprocess.Popen[bytes]) -> bool:
+    """Stop only the session/process group created for one verifier command.
+
+    The direct child is intentionally left unreaped until after both signals;
+    its PID therefore cannot be reused as another process group's ID during
+    cleanup. This covers ordinary descendants that stay in the command's
+    group. A descendant that creates a new session must own its own cleanup.
+    """
+
+    if process.returncode is not None:
+        return False
+
+    process_group_id = process.pid
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return True
+    except OSError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait()
+        return False
+
+    cleanup_complete = True
+    try:
+        time.sleep(_PROCESS_GROUP_TERM_GRACE_SECONDS)
+    finally:
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            cleanup_complete = False
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        process.wait()
+    return cleanup_complete
+
+
+def _wait_for_owned_process_exit(
+    process: subprocess.Popen[bytes],
+    timeout_seconds: float | None,
+) -> None:
+    """Observe direct-child exit without reaping its PID/process-group ID."""
+
+    deadline = (
+        time.monotonic() + timeout_seconds
+        if timeout_seconds is not None
+        else None
+    )
+    wait_options = os.WEXITED | os.WNOWAIT
+    if deadline is not None:
+        wait_options |= os.WNOHANG
+    while True:
+        result = os.waitid(os.P_PID, process.pid, wait_options)
+        if result is not None and result.si_pid == process.pid:
+            return
+        if deadline is None:
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+        time.sleep(min(0.01, remaining))
+
+
 def _run(
     label: str,
     command: Sequence[str],
@@ -274,30 +354,97 @@ def _run(
     timeout_seconds: float | None = None,
 ) -> int:
     print(f"[GATE START] {label}", flush=True)
+    previous_term_handler = signal.getsignal(signal.SIGTERM)
+    process: subprocess.Popen[bytes] | None = None
+    pending_term: int | None = None
+    cleaning_up = False
+    term_handler_installed = False
+
+    def handle_term(signum: int, _frame: object) -> None:
+        nonlocal pending_term
+        if process is None:
+            pending_term = signum
+            return
+        if cleaning_up:
+            return
+        raise _VerifierTermination(signum)
+
+    signal.signal(signal.SIGTERM, handle_term)
+    term_handler_installed = True
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=cwd,
             env=env,
-            check=False,
-            timeout=timeout_seconds,
+            close_fds=True,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        timeout_label = (
-            f"{timeout_seconds:g}s" if timeout_seconds is not None else "the configured timeout"
-        )
-        print(
-            f"[GATE TIMEOUT] {label} exceeded {timeout_label}",
-            file=sys.stderr,
-        )
-        return 124
+        if pending_term is not None:
+            cleaning_up = True
+            cleanup_complete = _terminate_owned_process_group(process)
+            if not cleanup_complete:
+                print(
+                    f"[GATE INTERRUPTION CLEANUP INCOMPLETE] {label}",
+                    file=sys.stderr,
+                )
+            return 128 + pending_term
+        try:
+            _wait_for_owned_process_exit(process, timeout_seconds)
+        except subprocess.TimeoutExpired:
+            cleaning_up = True
+            cleanup_complete = _terminate_owned_process_group(process)
+            if not cleanup_complete:
+                print(
+                    f"[GATE TIMEOUT CLEANUP INCOMPLETE] {label}",
+                    file=sys.stderr,
+                )
+            timeout_label = (
+                f"{timeout_seconds:g}s" if timeout_seconds is not None else "the configured timeout"
+            )
+            print(
+                f"[GATE TIMEOUT] {label} exceeded {timeout_label}",
+                file=sys.stderr,
+            )
+            return 124
+        except _VerifierTermination as interrupted:
+            cleaning_up = True
+            cleanup_complete = _terminate_owned_process_group(process)
+            if not cleanup_complete:
+                print(
+                    f"[GATE INTERRUPTION CLEANUP INCOMPLETE] {label}",
+                    file=sys.stderr,
+                )
+            return 128 + interrupted.signum
+        except BaseException:
+            cleaning_up = True
+            _terminate_owned_process_group(process)
+            raise
+        # Once the command exits, stop intercepting cancellation before reap.
+        # Until this point WNOWAIT keeps the PGID pinned to the owned session.
+        signal.signal(signal.SIGTERM, previous_term_handler)
+        term_handler_installed = False
+        returncode = process.wait()
+    except _VerifierTermination as interrupted:
+        if process is None:
+            return 128 + interrupted.signum
+        cleaning_up = True
+        cleanup_complete = _terminate_owned_process_group(process)
+        if not cleanup_complete:
+            print(
+                f"[GATE INTERRUPTION CLEANUP INCOMPLETE] {label}",
+                file=sys.stderr,
+            )
+        return 128 + interrupted.signum
     except FileNotFoundError as exc:
         raise VerificationError(
             f"LOCAL GATE BLOCKED: required executable is unavailable: {exc.filename}"
         ) from exc
-    if result.returncode:
-        print(f"[GATE FAIL] {label} (exit {result.returncode})", file=sys.stderr)
-        return result.returncode
+    finally:
+        if term_handler_installed:
+            signal.signal(signal.SIGTERM, previous_term_handler)
+    if returncode:
+        print(f"[GATE FAIL] {label} (exit {returncode})", file=sys.stderr)
+        return returncode
     print(f"[GATE PASS] {label}", flush=True)
     return 0
 

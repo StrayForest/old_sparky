@@ -335,7 +335,7 @@ first stop or stage side effect it atomically writes
 `shared/.release-operation.json` in `phase=quiesce-pending` with the original
 API/worker/web/timer state, pointer identities and candidate path. After
 staging, that same receipt is promoted to the operation schema before
-migration. Never print service environments or secrets.
+migration. Never print service environments or secrets. With `--apply`, pass reviewed candidate slugs; under lock, set drift aborts before deletion. Current/previous and 14-day backup protections remain.
 
 The production deploy workflow acquires the release lock before the retained
 load lock (`/run/lock/oldsparky-retained-load-matrix.lock`) and keeps both

@@ -81,6 +81,7 @@ class SsrObservabilityTests(unittest.TestCase):
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=auth_bootstrap_fetch duration_ms=12.000 outcome=ok",
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=tournament_workspace duration_ms=80.000 outcome=ok",
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=tournament_detail_data_ready duration_ms=90.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=page_component duration_ms=110.000 outcome=ok",
             "ssr_event_loop p50_ms=1.000 p95_ms=4.000 max_ms=8.000 mean_ms=2.000",
             "ssr_event_loop p50_ms=1.000 p95_ms=4.000 p99_ms=6.000 max_ms=8.000 "
             "mean_ms=2.000 elu=0.910000 cpu_pct=87.500 gc_count=2 gc_duration_ms=3.250",
@@ -114,6 +115,7 @@ class SsrObservabilityTests(unittest.TestCase):
             correlated["stage_ms"]["tournament_workspace"]["p50_ms"],
             80.0,
         )
+        self.assertEqual(correlated["stage_ms"]["page_component"]["p50_ms"], 110.0)
         self.assertEqual(
             correlated["unattributed_upstream_after_data_ms"]["p50_ms"],
             20.0,
@@ -288,11 +290,11 @@ class SsrObservabilityTests(unittest.TestCase):
             "auth_bootstrap",
         )
 
-    def test_ssr_summary_joins_diagnostic_identity_to_nginx_and_api(self) -> None:
+    def test_ssr_summary_keeps_nginx_request_id_canonical_with_diagnostic_metadata(self) -> None:
         diagnostic_id = "tdiag-123-00001"
         summary = summarize_ssr_observability(
             [
-                f"ssr_perf request_id={diagnostic_id} cf_ray=ray-1 "
+                "ssr_perf request_id=nginx-owned-id cf_ray=ray-1 "
                 "stage=root_layout duration_ms=4.000 outcome=ok",
             ],
             [
@@ -309,7 +311,7 @@ class SsrObservabilityTests(unittest.TestCase):
                 }
             ],
             [
-                "request_perf request_id=tdiag-123-00001 method=GET "
+                "request_perf request_id=nginx-owned-id method=GET "
                 "path=/api/v1/auth/bootstrap route=/api/v1/auth/bootstrap "
                 "status=200 total_ms=18.5 sql_ms=2.5",
             ],
@@ -317,10 +319,10 @@ class SsrObservabilityTests(unittest.TestCase):
 
         correlated = summary["correlated_html"]
         self.assertEqual(correlated["requests"], 1)
-        self.assertEqual(correlated["api_request_perf_join"]["matched_by_diagnostic_id"], 1)
-        self.assertEqual(correlated["api_request_perf_join"]["matched_by_request_id"], 0)
+        self.assertEqual(correlated["api_request_perf_join"]["matched_by_diagnostic_id"], 0)
+        self.assertEqual(correlated["api_request_perf_join"]["matched_by_request_id"], 1)
         self.assertNotIn("diagnostic_id", correlated["timeline"][0])
-        self.assertEqual(correlated["timeline"][0]["api_request_perf_correlation"], "diagnostic_id")
+        self.assertEqual(correlated["timeline"][0]["api_request_perf_correlation"], "request_id")
         self.assertNotIn(diagnostic_id, json.dumps(summary))
 
     def test_ssr_summary_marks_close_without_finish_as_response_integrity_failure(self) -> None:

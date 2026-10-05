@@ -8,8 +8,13 @@ instead of relying on GitHub's implicit job conclusion propagation.
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 
 
@@ -58,6 +63,25 @@ def _pass_truth_table(state: dict[str, object]) -> bool:
             state["sanitizer_status"] == "0",
         )
     )
+
+
+def _step_script(job: str, name: str) -> str:
+    marker = f"      - name: {name}\n"
+    start = job.index(marker)
+    rest = job[start + len(marker) :]
+    end = rest.find("\n      - name: ")
+    block = rest if end < 0 else rest[:end]
+    lines = block.splitlines()
+    run_line = lines.index("        run: |")
+    body: list[str] = []
+    for line in lines[run_line + 1 :]:
+        if line.startswith("          "):
+            body.append(line[10:])
+        elif line == "":
+            body.append("")
+        else:
+            break
+    return textwrap.dedent("\n".join(body))
 
 
 class ExternalLoadWorkflowContractTests(unittest.TestCase):
@@ -211,6 +235,121 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertIn(artifact, self.source)
         self.assertIn("test -n \"$artifact_id\" && test -n \"$artifact_digest\"", self.source)
         self.assertIn("if-no-files-found: error", self.source)
+
+    def test_control_identity_is_masked_before_consuming_steps_and_never_becomes_env_or_argv(self) -> None:
+        self.assertNotIn("${{ inputs.control_email }}", self.source)
+        self.assertNotIn("CONTROL_EMAIL:", self.source)
+        self.assertNotIn("$CONTROL_EMAIL", self.source)
+        self.assertNotIn("--control-email", self.source)
+        validator = self.jobs["validate-external-inputs"]
+        self.assertIn("validate_external_payload(payload)", validator)
+        self.assertIn("_write_private_json(Path(output_path)", validator)
+        self.assertIn('control_email_path.read_text(encoding="ascii")', validator)
+
+        mask_steps = {
+            "validate-external-inputs": "Mask and stage the control identity from the event file",
+            "fixture-setup": "Mask the control identity before reading the handoff",
+            "load-client": "Mask the control identity before reading the handoff",
+            "fixture-finalize": "Mask and stage the control identity from the event file",
+        }
+        for job_name, step_name in mask_steps.items():
+            with self.subTest(job=job_name):
+                job = self.jobs[job_name]
+                step_names = re.findall(r"^      - name: (.+)$", job, re.MULTILINE)
+                self.assertTrue(step_names)
+                self.assertEqual(step_names[0], step_name)
+                script = _step_script(job, step_name)
+                self.assertLess(script.index("GITHUB_EVENT_PATH"), script.index("::add-mask::"))
+                if "os.open(" in script:
+                    self.assertLess(script.index("sys.stdout.flush()"), script.index("os.open("))
+
+        # The two jobs that need a private local cleanup value stage it only
+        # after the runner has received the masking command.
+        for job_name, step_name in (
+            ("validate-external-inputs", mask_steps["validate-external-inputs"]),
+            ("fixture-finalize", mask_steps["fixture-finalize"]),
+        ):
+            script = _step_script(self.jobs[job_name], step_name)
+            self.assertLess(script.index("::add-mask::"), script.index("os.open("))
+
+        finalizer = self.jobs["fixture-finalize"]
+        self.assertIn('"$cleanup_input_path" "$TARGET_SHA" "$GITHUB_RUN_ID"', finalizer)
+        self.assertIn('control_email_path.read_text(encoding="ascii")', finalizer)
+        self.assertNotRegex(finalizer, r'python3\s+-[^\n]*\$\{?CONTROL_EMAIL')
+        self.assertIn('"$RUNNER_TEMP/platform-production-control-email"', self.jobs["validate-external-inputs"])
+        self.assertIn('"$RUNNER_TEMP/platform-production-control-email"', finalizer)
+        for job_name, step_name in (
+            ("validate-external-inputs", "Remove external-load validator handoff"),
+            ("fixture-finalize", "Remove finalizer SSH material"),
+        ):
+            with self.subTest(cleanup_job=job_name):
+                cleanup = self.jobs[job_name].split(f"- name: {step_name}", 1)[1]
+                self.assertIn("if: ${{ always() }}", cleanup)
+                self.assertIn('"$RUNNER_TEMP/platform-production-control-email"', cleanup)
+                self.assertIn("test ! -e", cleanup)
+
+        valid_event = {"inputs": {"control_email": "Control%qa@example.invalid"}}
+        invalid_event = {
+            "inputs": {"control_email": "private@example.invalid\r\n::warning::injected"}
+        }
+        for job_name, step_name in (
+            ("validate-external-inputs", mask_steps["validate-external-inputs"]),
+            ("fixture-setup", mask_steps["fixture-setup"]),
+            ("load-client", mask_steps["load-client"]),
+            ("fixture-finalize", mask_steps["fixture-finalize"]),
+        ):
+            script = _step_script(self.jobs[job_name], step_name)
+            with self.subTest(job=job_name, event="valid"):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    event_path = root / "event.json"
+                    event_path.write_text(json.dumps(valid_event), encoding="utf-8")
+                    result = subprocess.run(
+                        ["/bin/bash", "-euo", "pipefail", "-c", script],
+                        env={
+                            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            "GITHUB_EVENT_PATH": str(event_path),
+                            "RUNNER_TEMP": str(root),
+                        },
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("::warning::", result.stdout)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(
+                        result.stdout.splitlines(),
+                        [
+                            "::add-mask::Control%25qa@example.invalid",
+                            "::add-mask::control%25qa@example.invalid",
+                        ],
+                    )
+                    if "stage" in step_name:
+                        email_file = root / "platform-production-control-email"
+                        self.assertEqual(email_file.read_text(encoding="ascii"), "control%qa@example.invalid\n")
+                        self.assertEqual(email_file.stat().st_mode & 0o777, 0o600)
+            with self.subTest(job=job_name, event="malicious-crlf"):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    event_path = root / "event.json"
+                    event_path.write_text(json.dumps(invalid_event), encoding="utf-8")
+                    result = subprocess.run(
+                        ["/bin/bash", "-euo", "pipefail", "-c", script],
+                        env={
+                            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            "GITHUB_EVENT_PATH": str(event_path),
+                            "RUNNER_TEMP": str(root),
+                        },
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertNotIn("private@example.invalid", result.stderr)
+                    self.assertNotIn("::warning::", result.stderr)
+                    self.assertFalse((root / "platform-production-control-email").exists())
 
     def test_load_runner_is_pinned_and_has_containment_probe_margin(self) -> None:
         self.assertNotIn("runs-on: ubuntu-latest", self.source)

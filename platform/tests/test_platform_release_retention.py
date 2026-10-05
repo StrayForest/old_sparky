@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -115,7 +117,7 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
             min_age_days=7,
             now=self.now,
         )
-        apply_plan(plan)
+        apply_plan(plan, expected_candidates=(candidate.name,))
 
         self.assertFalse(candidate.exists())
         self.assertTrue(current.exists())
@@ -124,6 +126,123 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
         self.assertTrue(young.exists())
         self.assertEqual((self.app_dir / "current").resolve(), current)
         self.assertEqual((self.app_dir / "previous").resolve(), previous)
+
+    def test_apply_refuses_incomplete_candidate_allowlist_before_deleting(self) -> None:
+        current = self.add_release("release-current", age_days=30)
+        previous = self.add_release("release-previous", age_days=29)
+        candidate_one = self.add_release("release-old-one", age_days=20)
+        candidate_two = self.add_release("release-old-two", age_days=19)
+        self.link("current", current)
+        self.link("previous", previous)
+        plan = build_retention_plan(
+            self.app_dir,
+            keep=0,
+            min_age_days=0,
+            now=self.now,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "expected candidates"):
+            apply_plan(
+                plan,
+                app_dir=self.app_dir,
+                expected_candidates=(candidate_one.name,),
+            )
+
+        self.assertTrue(candidate_one.is_dir())
+        self.assertTrue(candidate_two.is_dir())
+        self.assertTrue(current.is_dir())
+        self.assertTrue(previous.is_dir())
+
+    def test_apply_refuses_stale_candidate_allowlist(self) -> None:
+        current = self.add_release("release-current", age_days=30)
+        previous = self.add_release("release-previous", age_days=29)
+        candidate = self.add_release("release-old", age_days=20)
+        self.link("current", current)
+        self.link("previous", previous)
+        plan = build_retention_plan(
+            self.app_dir,
+            keep=0,
+            min_age_days=0,
+            now=self.now,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "expected candidates"):
+            apply_plan(
+                plan,
+                app_dir=self.app_dir,
+                expected_candidates=("release-no-longer-planned",),
+            )
+
+        self.assertTrue(candidate.is_dir())
+
+    def test_expected_candidate_cli_values_must_be_unique_safe_slugs(self) -> None:
+        with mock.patch.object(
+            retention.sys,
+            "argv",
+            [
+                "platform_release_retention.py",
+                "--apply",
+                "--expected-candidate",
+                "release-old",
+            ],
+        ):
+            args = retention.parse_args()
+        self.assertEqual(args.expected_candidate, ["release-old"])
+
+        with mock.patch.object(
+            retention.sys,
+            "argv",
+            ["platform_release_retention.py", "--expected-candidate", "release-old"],
+        ):
+            with self.assertRaises(SystemExit):
+                retention.parse_args()
+
+        for values in (
+            ("release-old", "release-old"),
+            ("../outside",),
+        ):
+            argv = ["platform_release_retention.py", "--apply"]
+            for value in values:
+                argv.extend(("--expected-candidate", value))
+            with mock.patch.object(retention.sys, "argv", argv):
+                with self.assertRaises(SystemExit):
+                    retention.parse_args()
+
+    def test_apply_cli_replans_under_release_lock_and_fails_before_deletion(self) -> None:
+        current = self.add_release("release-current", age_days=30)
+        previous = self.add_release("release-previous", age_days=29)
+        candidate_one = self.add_release("release-old-one", age_days=20)
+        candidate_two = self.add_release("release-old-two", age_days=19)
+        self.link("current", current)
+        self.link("previous", previous)
+        argv = [
+            "platform_release_retention.py",
+            "--app-dir",
+            str(self.app_dir),
+            "--keep",
+            "0",
+            "--min-age-days",
+            "0",
+            "--apply",
+            "--expected-candidate",
+            candidate_one.name,
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(retention.sys, "argv", argv),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            result = retention.main()
+
+        self.assertEqual(result, 1)
+        self.assertIn("Release retention failed", stderr.getvalue())
+        self.assertTrue(candidate_one.is_dir())
+        self.assertTrue(candidate_two.is_dir())
+        self.assertTrue(current.is_dir())
+        self.assertTrue(previous.is_dir())
 
     def test_zero_retention_keeps_only_current_and_previous(self) -> None:
         current = self.add_release("release-current", age_days=0)

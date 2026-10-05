@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -102,6 +103,50 @@ class PlatformInstallNginxTests(unittest.TestCase):
         self.assertIn('"upstream_connect_time":"$upstream_connect_time"', vhost)
         self.assertIn('"upstream_header_time":"$upstream_header_time"', vhost)
         self.assertIn('"upstream_time":"$upstream_response_time"', vhost)
+
+    def test_public_api_clears_internal_diagnostic_authority(self) -> None:
+        vhost = MODULE.DEFAULT_SOURCE.read_text(encoding="utf-8")
+        diagnostic_headers = (
+            "X-Platform-SSR-Trace",
+            "X-Platform-SSR-Request-Id",
+            "X-Platform-SSR-CF-Ray",
+            "X-Platform-SSR-Proxy-Start-Ms",
+            "X-Platform-SSR-Request-Start-Ms",
+            "X-Platform-Timeout-Diagnostic-ID",
+        )
+        api_locations = []
+        for match in re.finditer(r"proxy_pass http://platform_api;", vhost):
+            location_start = vhost.rfind("\n    location ", 0, match.start())
+            opening_brace = vhost.index("{", location_start)
+            depth = 0
+            location_end = opening_brace
+            for location_end in range(opening_brace, len(vhost)):
+                if vhost[location_end] == "{":
+                    depth += 1
+                elif vhost[location_end] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            api_locations.append(vhost[location_start:location_end + 1])
+
+        self.assertGreater(len(api_locations), 0)
+        for index, api_location in enumerate(api_locations):
+            with self.subTest(location=index):
+                self.assertIn("proxy_set_header X-Request-ID $request_id;", api_location)
+                for header in diagnostic_headers:
+                    self.assertIn(f'proxy_set_header {header} "";', api_location)
+
+        self.assertIn("proxy_set_header CF-Ray $http_cf_ray;", api_locations[-1])
+
+        self.assertIn(
+            '"~^tdiag-[0-9]{1,32}-[0-9]{5}$" $http_x_platform_timeout_diagnostic_id;',
+            vhost,
+        )
+        self.assertIn('"timeout_diagnostic_id":"$platform_timeout_diagnostic_id"', vhost)
+        self.assertNotIn(
+            '"timeout_diagnostic_id":"$http_x_platform_timeout_diagnostic_id"',
+            vhost,
+        )
 
     def test_main_config_is_valid(self) -> None:
         MODULE.validate_main_config(MODULE.DEFAULT_MAIN_SOURCE)

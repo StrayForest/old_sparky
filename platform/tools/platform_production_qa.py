@@ -2665,10 +2665,9 @@ def _nginx_api_records(records: list[dict[str, Any]]) -> list[tuple[str, str, in
 def _nginx_request_correlation_keys(record: dict[str, Any]) -> tuple[str, ...]:
     """Return safe identities that can join one Nginx record to app logs.
 
-    Nginx owns ``request_id`` while the diagnostic hop deliberately promotes
-    the bounded diagnostic ID to the Next.js/API request identity. Keep both
-    identities available: the diagnostic ID is the primary key for marked
-    requests, and the Nginx request ID preserves the normal sampled contour.
+    Nginx owns ``request_id`` and it remains the application trace identity.
+    The bounded timeout ID remains separate edge-observation metadata and is
+    retained first for compatibility with older diagnostic artifacts.
     """
 
     keys: list[str] = []
