@@ -74,6 +74,14 @@ set_lock_failure_context() {
   failure_lock_stage="$1"
 }
 
+apply_shared_env_profile() {
+  # The remote dispatcher accepts only the fixed RELEASE_DEPLOY marker on
+  # stdout. Keep the helper's human-readable summary off that protocol stream;
+  # preserve stderr and its exit status for failure handling.
+  "$runtime/shared/venv/bin/python" -B \
+    "$host_tools_dir/platform_configure_shared_env.py" "$@" >/dev/null
+}
+
 run_nginx_config_test() {
   "$NGINX_TIMEOUT_BIN" --foreground --signal=TERM --kill-after=5s \
     "${NGINX_CONFIG_TIMEOUT_SECONDS}s" "$NGINX_BIN" -t
@@ -1194,7 +1202,7 @@ platform_release_lock_supervisor_holds \
 set_failure_context deployment readiness runtime_profile_failed
 case "$runtime_profile" in
   baseline)
-    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+    apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile baseline \
@@ -1256,7 +1264,7 @@ case "$runtime_profile" in
         --only PLATFORM_PERF_LOG_MUTATIONS
       )
     fi
-    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+    apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -1299,7 +1307,7 @@ case "$runtime_profile" in
           --only PLATFORM_PERF_LOG_MUTATIONS
         )
       fi
-      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+      apply_shared_env_profile \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -1321,7 +1329,7 @@ case "$runtime_profile" in
     fi
     ;;
   ready-vote-adaptive-v2)
-    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+    apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -1352,7 +1360,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+      apply_shared_env_profile \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile ready-vote-static-8 \
@@ -1392,7 +1400,7 @@ case "$runtime_profile" in
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
       --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
     )
-    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+    apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -1405,7 +1413,7 @@ case "$runtime_profile" in
     grep -qx 'PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=true' "$api_env" \
       || fail "web SSR diagnostic API auth bootstrap log gate is not enabled"
     if ! restart_api_and_wait; then
-      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+      apply_shared_env_profile \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -1426,7 +1434,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$web_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+      apply_shared_env_profile \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -1450,7 +1458,7 @@ case "$runtime_profile" in
     fi
     ;;
   web-ssr-native-transport)
-    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+    apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -1458,7 +1466,7 @@ case "$runtime_profile" in
     restart_web_and_wait
     ;;
   web-ssr-workers-2)
-    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+    apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -1489,7 +1497,7 @@ case "$runtime_profile" in
       --only PLATFORM_SSR_PERF_SAMPLE_RATE
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
     )
-    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+    apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -1506,7 +1514,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+      apply_shared_env_profile \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -1528,7 +1536,7 @@ case "$runtime_profile" in
     fi
     ;;
   api-3x16)
-    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+    apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile api-3x16 \
@@ -1551,7 +1559,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+      apply_shared_env_profile \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -1579,7 +1587,7 @@ case "$runtime_profile" in
     fi
     ;;
   api-1x48)
-    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+    apply_shared_env_profile \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile api-1x48 \
@@ -1602,7 +1610,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
+      apply_shared_env_profile \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \

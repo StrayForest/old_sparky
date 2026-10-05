@@ -2084,6 +2084,96 @@ fail 'private lock detail must not cross the public channel'
                     supervisor.index(operation),
                 )
 
+    def test_runtime_config_summary_cannot_pollute_deployment_success_marker(self) -> None:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        match = re.search(
+            r"(?ms)^apply_shared_env_profile\(\) \{.*?^\}",
+            supervisor,
+        )
+        self.assertIsNotNone(match, "runtime profile helper wrapper is missing")
+        self.assertEqual(
+            supervisor.count("apply_shared_env_profile " + chr(92)),
+            16,
+        )
+        self.assertNotIn(
+            '"$runtime/shared/venv/bin/python" -B '
+            '"$host_tools_dir/platform_configure_shared_env.py" ' + chr(92),
+            supervisor,
+        )
+
+        marker = (
+            "RELEASE_DEPLOY schema=1 status=passed class=deployment "
+            "release_slug=gha-37266469137-1-cf29087ba231 "
+            "source_sha=cf29087ba2313ace344db7f2dd52aa55a0a28fad\n"
+        )
+        helper_summary = (
+            "Shared env baseline: mode=apply; changed=1; "
+            "credentials_preserved=true.\n"
+        )
+        self.assertEqual(len(helper_summary.encode()) + len(marker.encode()), 223)
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            fake_python = runtime / "shared/venv/bin/python"
+            fake_python.parent.mkdir(parents=True)
+            fake_python.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'Shared env baseline: mode=apply; changed=1; "
+                "credentials_preserved=true.'\n"
+                "if [ \"${PLATFORM_TEST_HELPER_FAIL:-0}\" = 1 ]; then\n"
+                "  printf '%s\\n' 'safe helper failure' >&2\n"
+                "  exit 23\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+
+            fixture = (
+                "set -eu\n"
+                f"runtime={str(runtime)!r}\n"
+                "host_tools_dir=/fixed/host-tools\n"
+                f"{match.group(0)}\n"
+                "apply_shared_env_profile --apply --profile ready-vote-static-8\n"
+                f"printf '%s\\n' {marker.rstrip()!r}\n"
+            )
+            success = subprocess.run(
+                ["/bin/bash"],
+                input=fixture,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(success.returncode, 0, success.stderr)
+            self.assertEqual(success.stdout, marker)
+            self.assertEqual(success.stderr, "")
+
+            forwarded = io.StringIO()
+            with redirect_stdout(forwarded):
+                dispatched = platform_workflow_remote_dispatch._run_bounded_child(
+                    ["/bin/bash", "-c", fixture],
+                    timeout_seconds=5,
+                    expected_release_marker=(
+                        "deploy",
+                        "gha-37266469137-1-cf29087ba231",
+                        "cf29087ba2313ace344db7f2dd52aa55a0a28fad",
+                    ),
+                )
+            self.assertEqual(dispatched, 0)
+            self.assertEqual(forwarded.getvalue(), marker)
+
+            failed = subprocess.run(
+                ["/bin/bash"],
+                input=fixture,
+                env={**os.environ, "PLATFORM_TEST_HELPER_FAIL": "1"},
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(failed.returncode, 23)
+            self.assertEqual(failed.stdout, "")
+            self.assertEqual(failed.stderr, "safe helper failure\n")
+
     def test_supervisor_cleanup_covers_upload_failures_and_closes_locks(self) -> None:
         supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
         cleanup_start = supervisor.index("cleanup() {")
