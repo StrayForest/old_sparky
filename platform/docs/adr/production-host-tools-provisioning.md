@@ -13,16 +13,16 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
 is the only source for `HOST_TOOLS_SHA`. This change follows the A/B pin
-lifecycle: source commit A updates the host supervisor and dispatcher timeout
-contract, and the immediately following pin commit B selects A as generation
-S10 with its exact closure. S10 source A is
-`03e1aed83017779f25df20b43f2ba37e6efacdbc`. S10 remains pending provisioning
-until a canonical artifact, attestation, installed receipt and isolated
-host-capability check are recorded. The latest verified installed generation is S9
-`7a9fe1286054dbe96221d2b428048c4212270cf5`; C6 and earlier generations are
-preserved. The application remains at source
-`87547df2abd4aa06a07f4dd4b4f730e9912707e1`, as documented in [`CURRENT.md`](../CURRENT.md),
-until an exact successful automatic deployment and smoke are recorded there.
+lifecycle: source commit A updates the runtime-profile output boundary and its
+regression, and pin commit B selects A as generation S11 with its exact
+closure. S11 source A is `138128c99025069143f5c234f6cb58545ed8ab1c` and
+remains pending canonical provisioning. The latest verified installed
+generation is S10 `03e1aed83017779f25df20b43f2ba37e6efacdbc`, with
+provisioning receipt SHA-256
+`b0ff2f0483c281538699b1a0104e071b9b319d89b2cf8512c4951f307d394ec7`; S9
+`7a9fe1286054dbe96221d2b428048c4212270cf5` and earlier generations are
+preserved. The active application release and production health are owned by
+[`CURRENT.md`](../CURRENT.md); this ADR does not duplicate those changing facts.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
