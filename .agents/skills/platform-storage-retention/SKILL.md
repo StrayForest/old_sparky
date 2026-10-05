@@ -66,7 +66,10 @@ calling the task complete.
    ```
 
    The workflow verifies the active release and starts
-   `deadlock-maintenance.service`; the service holds the canonical release and retained-load locks while applying the sweep and publishing bounded evidence.
+   `deadlock-maintenance.service`; the installed service holds the canonical
+   release then retained-load locks while applying the sweep and publishing
+   bounded evidence. Diagnostics only sample retained-lock state at one point
+   in time; they do not hold that lock during collection.
 
    Its report is bound to that service invocation. If a valid report confirms
    a restore-verified backup but maintenance exits nonzero because disk

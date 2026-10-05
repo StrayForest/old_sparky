@@ -114,7 +114,7 @@ gh workflow run platform-production-storage-maintenance.yml --repo StrayForest/o
 gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-When a release activation reports a full filesystem or unusable temporary directory, collect bounded read-only evidence before cleanup:
+Storage diagnostics/maintenance workflow or exact storage-retention skill changes use the closed storage-operations route: full, runtime-sensitive verification but no application or baseline action. AUTO takes its no-deploy branch. The recovery producer uploads a bound skip receipt with a provenance attestation; the publisher checks its fields against exact producer and parent CI/classifier evidence, but does not verify the attestation cryptographically or publish a host bundle/production marker. When an activation reports a full filesystem or unusable temporary directory, collect bounded read-only evidence before cleanup:
 `gh workflow run platform-production-storage-diagnostics.yml --repo StrayForest/old_sparky --ref dev -f expected_sha=<exact-source-sha-currently-deployed>`
 It reports blocks/inodes, mounts, journald, service sandbox, top-level usage and retention candidates; it does not delete files or apply runtime settings. Failure artifacts may contain bounded partial evidence and a closed stage/outcome, never raw host output. Maintenance reports bind to one service invocation; a verified-backup report and nonzero exit may follow actual deletions when thresholds still fail, so workflow failure proves neither no deletion nor successful cleanup.
 

@@ -244,14 +244,13 @@ trusted-push authority. The exact candidate allowlist is owned by the
 | known `docs-only` | `docs`, `verification-contract` | `false` | never deployable; auto-deploy is a successful no-op |
 | known `out-of-scope` | `verification-contract` | `false` | never deployable; auto-deploy is a successful no-op |
 | known full candidate-packaging-only path set (candidate workflow/helper, contract test/catalog/verification updates and platform docs) | all first eight gates | `false` | never deployable; trusted pushes are successful CI-only no-ops |
+| exact storage-operations family (diagnostics/maintenance workflow or exact storage-retention skill, plus only its closed classifier/AUTO/recovery-workflow/tests/catalog set and docs) | all first eight gates plus runtime-sensitive gates | `false` | full verification, non-deployable; AUTO takes no-deploy; producer uploads an attested skip receipt; publisher checks exact producer/parent CI evidence and performs no host-bundle or marker action |
 | known `full` application/runtime/migration/release path | all first eight gates | `false` | deployable only for a non-fallback push to current `dev` |
 | unknown or malformed full fallback | all first eight gates | `true` | never deployable; fail-closed verification only |
 
-Host-tools lifecycle files are full-route platform/workflow paths, never a
-docs-only or reduced route. The trusted candidate-packaging-only set remains a
-full route for test coverage but has `deployable=false` on both pull-request
-and trusted push events. A mixed candidate-packaging/application change is
-classified by its application path and remains deployable on a trusted push.
+Host-tools lifecycle files use full-route verification. Candidate-packaging-
+only changes remain non-deployable; a mixed application change follows its
+application path and may deploy on a trusted push.
 `platform/contracts/host_tools_pin.json` is the
 single bounded pin contract: application-only changes keep the reviewed
 `HOST_TOOLS_SHA`, while a host-control closure edit must update the pin and its
@@ -312,17 +311,18 @@ trusted `dev` and invoked with `python -I -B`.
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route
 with `fallback=true` and `deployable=false`; these routes also run the
-conditional `release-runtime` fixture gate; a sensitive/fallback push to the
-canonical `dev` branch also runs the separate `release-runtime-real` builder.
-Known `.github/**` and
-`platform/**` dependency, configuration, migration, workflow and registry
-paths are recognized full routes with `fallback=false`; they are not fallback
-cases merely because they require the full gate set. The explicit candidate
-packaging-only allowlist is the exception to production authority: it remains
-full verification but sets `deployable=false`. A known full path with valid
-exact-SHA provenance is the distinct `fallback=false` case. A successful
-`platform-security-build` status
-therefore remains the exact-SHA CI result, not permission to deploy by itself:
+conditional `release-runtime` fixture gate, and a sensitive/fallback push to
+`dev` runs `release-runtime-real`. Recognized platform paths use
+`fallback=false`; full verification alone does not imply production authority.
+The candidate-packaging and exact storage-operations families are separately
+closed, full-coverage, non-deployable routes. The storage family requires
+runtime-sensitive gates. AUTO takes its no-deploy branch before baseline or
+production. The producer uploads a provenance-attested skip receipt; the
+publisher binds its artifact and payload to exact producer and parent
+CI/classifier evidence, without cryptographically verifying the attestation or
+publishing a recovery bundle. Tests stay in the existing `verification-contract`
+classifier module and `backend-privileged` storage diagnostics module. A known deployable full path with valid exact-SHA provenance
+is distinct from both review-only families. A successful `platform-security-build` status therefore remains the exact-SHA CI result, not permission to deploy by itself:
 auto-deploy must download and validate the matching classifier artifact, and
 production repeats that guard before any artifact build or server-side effect.
 This preserves the release authority while preventing a documentation or

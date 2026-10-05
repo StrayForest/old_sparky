@@ -75,7 +75,94 @@ jobs:
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$PRODUCER_RUN_ID/attempts/$PRODUCER_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/producer-jobs.json"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$PRODUCER_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/producer-artifacts.json"
           curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$PUBLISHER_RUN_ID/attempts/$PUBLISHER_RUN_ATTEMPT/jobs?per_page=100&page=1" --output "$metadata/publisher-jobs.json"
-          /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publisher-select --metadata "$metadata" --github-output "$GITHUB_OUTPUT" --repository "$REPOSITORY" --producer-run-id "$PRODUCER_RUN_ID" --producer-run-attempt "$PRODUCER_RUN_ATTEMPT" --producer-workflow "$PRODUCER_WORKFLOW" --producer-workflow-path "$PRODUCER_WORKFLOW_PATH"
+          /usr/bin/python3 -I -B - "$metadata" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(sys.argv[1])
+          env = os.environ
+          run = json.loads((root / "producer-run.json").read_text(encoding="utf-8"))
+          jobs = json.loads((root / "producer-jobs.json").read_text(encoding="utf-8"))
+          artifacts = json.loads((root / "producer-artifacts.json").read_text(encoding="utf-8"))
+          producer_id = int(env["PRODUCER_RUN_ID"])
+          producer_attempt = int(env["PRODUCER_RUN_ATTEMPT"])
+          if any((
+              run.get("id") != producer_id,
+              run.get("run_attempt") != producer_attempt,
+              run.get("status") != "completed",
+              run.get("conclusion") != "success",
+              run.get("event") != "workflow_run",
+              run.get("head_branch") != "dev",
+              run.get("name") != env["PRODUCER_WORKFLOW"],
+              run.get("path") != env["PRODUCER_WORKFLOW_PATH"],
+              (run.get("repository") or {}).get("full_name") != env["REPOSITORY"],
+              not re.fullmatch(r"[0-9a-f]{40}", str(run.get("head_sha", ""))),
+          )):
+              raise SystemExit("producer run provenance is not exact")
+          job_rows = jobs.get("jobs") if isinstance(jobs, dict) else None
+          if (not isinstance(job_rows, list) or type(jobs.get("total_count")) is not int
+              or not 0 <= jobs["total_count"] <= 100 or jobs["total_count"] != len(job_rows)):
+              raise SystemExit("producer job inventory is incomplete")
+          producer_jobs = [row for row in job_rows if isinstance(row, dict)
+                           and row.get("name") == "Build retained-release recovery bootstrap evidence"
+                           and row.get("run_id") == producer_id and row.get("run_attempt") == producer_attempt
+                           and row.get("head_sha") == run["head_sha"] and row.get("status") == "completed"
+                           and row.get("conclusion") == "success" and type(row.get("id")) is int and row["id"] > 0]
+          if len(producer_jobs) != 1:
+              raise SystemExit("exact successful producer job is missing")
+          rows = artifacts.get("artifacts") if isinstance(artifacts, dict) else None
+          if (not isinstance(rows, list) or type(artifacts.get("total_count")) is not int
+              or not 0 <= artifacts["total_count"] <= 100 or artifacts["total_count"] != len(rows)):
+              raise SystemExit("producer artifact inventory is incomplete")
+          receipt_prefix = "platform-storage-operations-skip-"
+          receipt_pattern = re.compile(r"^platform-storage-operations-skip-[0-9a-f]{40}-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-([1-9][0-9]{0,31})-([1-9][0-9]{0,31})\.json$")
+          receipt_rows = []
+          for row in rows:
+              if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].startswith(receipt_prefix):
+                  continue
+              parsed_receipt = receipt_pattern.fullmatch(row["name"])
+              if parsed_receipt is None:
+                  raise SystemExit("storage receipt artifact name is invalid")
+              if parsed_receipt.groups() == (str(producer_id), str(producer_attempt)):
+                  receipt_rows.append(row)
+          bundle_pattern = re.compile(rf"^platform-recovery-bootstrap-[0-9a-f]{{40}}-[1-9][0-9]{{0,31}}-[1-9][0-9]{{0,31}}-{producer_id}-{producer_attempt}\.zip$")
+          bundles = [row for row in rows if isinstance(row, dict) and bundle_pattern.fullmatch(str(row.get("name", "")))]
+          output = Path(sys.argv[2])
+          if receipt_rows:
+              if len(receipt_rows) != 1 or bundles:
+                  raise SystemExit("storage skip receipt inventory is ambiguous")
+              row = receipt_rows[0]
+              pattern = re.compile(rf"^platform-storage-operations-skip-([0-9a-f]{{40}})-([1-9][0-9]{{0,31}})-([1-9][0-9]{{0,31}})-{producer_id}-{producer_attempt}\.json$")
+              match = pattern.fullmatch(row.get("name", ""))
+              workflow_run = row.get("workflow_run")
+              digest = row.get("digest")
+              if (row.get("expired") is not False or type(row.get("id")) is not int or row["id"] <= 0
+                  or match is None
+                  or not isinstance(workflow_run, dict) or workflow_run.get("id") != producer_id
+                  or workflow_run.get("head_sha") != run["head_sha"]
+                  or ("run_attempt" in workflow_run and workflow_run.get("run_attempt") != producer_attempt)
+                  or (workflow_run.get("repository") or {}).get("full_name") != env["REPOSITORY"]
+                  or not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None):
+                  raise SystemExit("storage receipt provenance is not exact")
+              with output.open("a", encoding="ascii") as stream:
+                  stream.write("storage_skip=true\n")
+                  stream.write(f"storage_receipt_artifact_id={row['id']}\n")
+                  stream.write(f"storage_receipt_artifact_sha256={digest.removeprefix('sha256:')}\n")
+                  stream.write(f"storage_receipt_name={row['name']}\n")
+                  stream.write(f"producer_workflow_sha={run['head_sha']}\n")
+          else:
+              if bundles:
+                  with output.open("a", encoding="ascii") as stream:
+                      stream.write("storage_skip=false\n")
+              else:
+                  raise SystemExit("exact producer bundle or storage receipt is missing")
+          PY
+          if ! grep -q '^storage_skip=true$' "$GITHUB_OUTPUT"; then
+            /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publisher-select --metadata "$metadata" --github-output "$GITHUB_OUTPUT" --repository "$REPOSITORY" --producer-run-id "$PRODUCER_RUN_ID" --producer-run-attempt "$PRODUCER_RUN_ATTEMPT" --producer-workflow "$PRODUCER_WORKFLOW" --producer-workflow-path "$PRODUCER_WORKFLOW_PATH"
+          fi
           /usr/bin/python3 -I -B - "$metadata/publisher-jobs.json" "$GITHUB_OUTPUT" <<'PY'
           import json
           import os
@@ -93,8 +180,148 @@ jobs:
               stream.write(f"publisher_job_id={matches[0]['id']}\n")
           PY
 
+      - name: Authenticate storage skip receipt and parent classifier proof
+        id: storage_skip
+        if: steps.select.outputs.storage_skip == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECEIPT_ARTIFACT_ID: ${{ steps.select.outputs.storage_receipt_artifact_id }}
+          RECEIPT_ARTIFACT_SHA256: ${{ steps.select.outputs.storage_receipt_artifact_sha256 }}
+          RECEIPT_NAME: ${{ steps.select.outputs.storage_receipt_name }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/platform-recovery-publisher"
+          artifact_dir="$RUNNER_TEMP/platform-storage-skip-receipt"
+          install -d -m 700 "$artifact_dir"
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          gh_header=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/artifacts/$RECEIPT_ARTIFACT_ID/zip" --output "$artifact_dir/receipt.zip"
+          test "$(sha256sum "$artifact_dir/receipt.zip" | awk '{print $1}')" = "$RECEIPT_ARTIFACT_SHA256"
+          /usr/bin/python3 -I -B - "$artifact_dir/receipt.zip" "$RECEIPT_NAME" "$PRODUCER_RUN_ID" "$PRODUCER_RUN_ATTEMPT" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import re
+          import stat
+          import sys
+          import zipfile
+          from pathlib import Path
+          archive_path, expected_name, producer_id, attempt, output_path = sys.argv[1:]
+          with zipfile.ZipFile(archive_path) as archive:
+              entries = archive.infolist()
+              if len(entries) != 1 or entries[0].filename != expected_name:
+                  raise SystemExit("storage receipt archive is not exact")
+              entry = entries[0]
+              mode = (entry.external_attr >> 16) & 0o177777
+              if entry.create_system != 3 or entry.is_dir() or not stat.S_ISREG(mode) or entry.file_size > 8192:
+                  raise SystemExit("storage receipt member is unsafe")
+              raw = archive.read(entry)
+              if len(raw) != entry.file_size:
+                  raise SystemExit("storage receipt is truncated")
+          receipt = json.loads(raw.decode("ascii"))
+          expected = {"schema", "kind", "source_sha", "security_run_id", "security_run_attempt", "producer_run_id", "producer_run_attempt", "classifier_digest", "storage_files_sha256", "family_proof"}
+          if not isinstance(receipt, dict) or set(receipt) != expected:
+              raise SystemExit("storage receipt schema is invalid")
+          if (receipt["schema"] != 1 or receipt["kind"] != "platform-storage-operations-skip" or receipt["family_proof"] != "storage-operations-v1"
+              or receipt["producer_run_id"] != producer_id or receipt["producer_run_attempt"] != attempt):
+              raise SystemExit("storage receipt identity is invalid")
+          if re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("source_sha", ""))) is None:
+              raise SystemExit("storage receipt source SHA is invalid")
+          if expected_name != f"platform-storage-operations-skip-{receipt['source_sha']}-{receipt['security_run_id']}-{receipt['security_run_attempt']}-{producer_id}-{attempt}.json":
+              raise SystemExit("storage receipt name is invalid")
+          for key in ("source_sha",):
+              if re.fullmatch(r"[0-9a-f]{40}", receipt[key]) is None:
+                  raise SystemExit("storage receipt SHA is invalid")
+          for key in ("security_run_id", "security_run_attempt", "producer_run_id", "producer_run_attempt"):
+              if re.fullmatch(r"[1-9][0-9]{0,31}", receipt[key]) is None:
+                  raise SystemExit("storage receipt run identity is invalid")
+          for key in ("classifier_digest", "storage_files_sha256"):
+              if re.fullmatch(r"[0-9a-f]{64}", receipt[key]) is None:
+                  raise SystemExit("storage receipt digest is invalid")
+          with Path(output_path).open("a", encoding="ascii") as stream:
+              stream.write(f"security_run_id={receipt['security_run_id']}\nsecurity_run_attempt={receipt['security_run_attempt']}\n")
+              stream.write(f"classifier_digest={receipt['classifier_digest']}\nstorage_files_sha256={receipt['storage_files_sha256']}\n")
+              stream.write(f"source_sha={receipt['source_sha']}\n")
+          PY
+          security_run_id="$(sed -n 's/^security_run_id=//p' "$GITHUB_OUTPUT" | tail -n 1)"
+          security_attempt="$(sed -n 's/^security_run_attempt=//p' "$GITHUB_OUTPUT" | tail -n 1)"
+          SOURCE_SHA="$(sed -n 's/^source_sha=//p' "$GITHUB_OUTPUT" | tail -n 1)"
+          export SOURCE_SHA
+          CLASSIFIER_DIGEST="$(sed -n 's/^classifier_digest=//p' "$GITHUB_OUTPUT" | tail -n 1)"
+          export CLASSIFIER_DIGEST
+          STORAGE_FILES_SHA256="$(sed -n 's/^storage_files_sha256=//p' "$GITHUB_OUTPUT" | tail -n 1)"
+          export STORAGE_FILES_SHA256
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$security_run_id/attempts/$security_attempt" --output "$metadata/storage-security-run.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$security_run_id/attempts/$security_attempt/jobs?per_page=100&page=1" --output "$metadata/storage-security-jobs.json"
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/runs/$security_run_id/artifacts?per_page=100&page=1" --output "$metadata/storage-security-artifacts.json"
+          /usr/bin/python3 -I -B - "$metadata" "$GITHUB_OUTPUT" "$REPOSITORY" "$security_run_id" "$security_attempt" "$SOURCE_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          root = Path(sys.argv[1]); output = Path(sys.argv[2]); repository, run_id, attempt, source_sha = sys.argv[3:]
+          run = json.loads((root / "storage-security-run.json").read_text(encoding="utf-8"))
+          jobs = json.loads((root / "storage-security-jobs.json").read_text(encoding="utf-8"))
+          artifacts = json.loads((root / "storage-security-artifacts.json").read_text(encoding="utf-8"))
+          if any((run.get("id") != int(run_id), run.get("run_attempt") != int(attempt), run.get("head_sha") != source_sha, run.get("head_branch") != "dev", run.get("event") != "push", run.get("status") != "completed", run.get("conclusion") != "success", run.get("name") != "Platform security and build", run.get("path") != ".github/workflows/platform-security.yml", (run.get("repository") or {}).get("full_name") != repository)):
+              raise SystemExit("parent security run provenance is not exact")
+          job_rows = jobs.get("jobs") if isinstance(jobs, dict) else None
+          if not isinstance(job_rows, list) or type(jobs.get("total_count")) is not int or jobs["total_count"] != len(job_rows) or len(job_rows) > 100:
+              raise SystemExit("parent security jobs are incomplete")
+          matched_jobs = [row for row in job_rows if isinstance(row, dict) and row.get("name") == "Verification contract" and row.get("run_id") == int(run_id) and row.get("run_attempt") == int(attempt) and row.get("head_sha") == source_sha and row.get("status") == "completed" and row.get("conclusion") == "success" and type(row.get("id")) is int and row["id"] > 0]
+          if len(matched_jobs) != 1:
+              raise SystemExit("parent full-gate job is not exact")
+          rows = artifacts.get("artifacts") if isinstance(artifacts, dict) else None
+          if not isinstance(rows, list) or type(artifacts.get("total_count")) is not int or artifacts["total_count"] != len(rows) or len(rows) > 100:
+              raise SystemExit("parent security artifacts are incomplete")
+          name = f"platform-ci-route-{run_id}-{attempt}"
+          matches = [row for row in rows if isinstance(row, dict) and row.get("name") == name and row.get("expired") is False and type(row.get("id")) is int and row["id"] > 0 and isinstance(row.get("digest"), str) and re.fullmatch(r"sha256:[0-9a-f]{64}", row["digest"])]
+          if len(matches) != 1:
+              raise SystemExit("parent classifier artifact is not exact")
+          workflow_run = matches[0].get("workflow_run")
+          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != source_sha or workflow_run.get("run_attempt") != int(attempt) or (workflow_run.get("repository") or {}).get("full_name") != repository:
+              raise SystemExit("parent classifier artifact provenance is invalid")
+          with output.open("a", encoding="ascii") as stream:
+              stream.write(f"route_artifact_id={matches[0]['id']}\nroute_artifact_sha256={matches[0]['digest'][len('sha256:') :]}\n")
+          PY
+          route_id="$(sed -n 's/^route_artifact_id=//p' "$GITHUB_OUTPUT" | tail -n 1)"
+          route_sha="$(sed -n 's/^route_artifact_sha256=//p' "$GITHUB_OUTPUT" | tail -n 1)"
+          curl --fail-with-body --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors "${gh_header[@]}" "$api/actions/artifacts/$route_id/zip" --output "$artifact_dir/security-route.zip"
+          test "$(sha256sum "$artifact_dir/security-route.zip" | awk '{print $1}')" = "$route_sha"
+          route_manifest="$(env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 -I -B trusted-source/platform/tools/platform_production_classifier_artifact.py manifest "$artifact_dir/security-route.zip" --target-sha "$SOURCE_SHA" --emit-manifest-base64)"
+          /usr/bin/python3 -I -B - "$route_manifest" "$GITHUB_OUTPUT" <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          manifest = json.loads(base64.b64decode(sys.argv[1], validate=True))
+          files = manifest.get("files")
+          allowed = {".github/workflows/platform-production-storage-diagnostics.yml", ".github/workflows/platform-production-storage-maintenance.yml", ".github/workflows/platform-production-autodeploy.yml", ".github/workflows/platform-production-recovery-bootstrap-build.yml", ".github/workflows/platform-production-recovery-bootstrap-publish.yml", ".agents/skills/platform-storage-retention/SKILL.md", "platform/tools/platform_ci_classifier.py", "platform/tools/platform_production_classifier_artifact.py", "platform/tests/test_platform_ci_classifier.py", "platform/tests/test_platform_release_audit_hardening.py", "platform/tests/test_platform_storage_maintenance.py", "platform/tools/platform_test_catalog.py"}
+          triggers = {".github/workflows/platform-production-storage-diagnostics.yml", ".github/workflows/platform-production-storage-maintenance.yml", ".agents/skills/platform-storage-retention/SKILL.md"}
+          exact = (manifest.get("reason") == "storage operations change requires full verification and is non-deployable" and manifest.get("class") == "full" and manifest.get("runtime_sensitive") is True and manifest.get("deployable") is False and manifest.get("fallback") is False and isinstance(files, list) and files and len(files) == len(set(files)) and any(path in triggers for path in files) and all(path in allowed or path.startswith("platform/docs/") for path in files) and manifest.get("digest") == os.environ["CLASSIFIER_DIGEST"] and hashlib.sha256(json.dumps(sorted(files), separators=(",", ":")).encode("utf-8")).hexdigest() == os.environ["STORAGE_FILES_SHA256"])
+          if not exact:
+              raise SystemExit("classifier artifact does not prove the exact storage route")
+          with Path(sys.argv[2]).open("a", encoding="ascii") as stream:
+              stream.write("storage_route_authenticated=true\n")
+          PY
+
+      - name: Complete authenticated storage-operations no-op
+        if: steps.select.outputs.storage_skip == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.storage_skip.outputs.storage_route_authenticated }}" = true
+          {
+            echo "### Storage operations route publisher"
+            echo "- Producer run: $PRODUCER_RUN_ID attempt $PRODUCER_RUN_ATTEMPT"
+            echo "- Source security run and classifier artifact were authenticated for the exact storage route."
+            echo "- Recovery bundle selection and publication were skipped; no baseline or production action was requested."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Validate API-derived provenance before bundle use
         id: provenance_pre
+        if: steps.select.outputs.storage_skip != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,6 +340,7 @@ jobs:
 
       - name: Download and validate the exact producer bundle
         id: bundle
+        if: steps.select.outputs.storage_skip != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -168,6 +396,7 @@ jobs:
 
       - name: Validate exact security A and publisher C provenance
         id: provenance
+        if: steps.select.outputs.storage_skip != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -186,6 +415,7 @@ jobs:
 
       - name: Name exact publisher C outer bundle
         id: publisher_bundle_name
+        if: steps.select.outputs.storage_skip != 'true'
         shell: bash
         env:
           SOURCE_SHA: ${{ steps.provenance.outputs.source_sha }}
@@ -199,6 +429,7 @@ jobs:
           printf 'publisher_bundle_name=%s\n' "$publisher_bundle_name" >> "$GITHUB_OUTPUT"
 
       - name: Upload exact C outer bundle
+        if: steps.select.outputs.storage_skip != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ steps.publisher_bundle_name.outputs.publisher_bundle_name }}
@@ -208,6 +439,7 @@ jobs:
 
       - name: Fetch exact C bundle artifact metadata
         id: publisher_bundle
+        if: steps.select.outputs.storage_skip != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -231,6 +463,7 @@ jobs:
 
       - name: Build closed publisher evidence after C upload
         id: evidence
+        if: steps.select.outputs.storage_skip != 'true'
         shell: bash
         env:
           SOURCE_SHA: ${{ steps.provenance.outputs.source_sha }}
@@ -262,6 +495,7 @@ jobs:
             --publisher-bundle-artifact-sha256 "$PUBLISHER_BUNDLE_ARTIFACT_SHA256"
 
       - name: Upload closed recovery evidence
+        if: steps.select.outputs.storage_skip != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ steps.evidence.outputs.evidence_name }}
@@ -270,16 +504,17 @@ jobs:
           retention-days: 14
 
       - name: Write non-deployable publisher summary
+        if: steps.select.outputs.storage_skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
           {
             echo "### Retained-release recovery bootstrap publisher"
-            echo "- Bundle source A: `${{ steps.provenance.outputs.source_sha }}`"
-            echo "- Producer workflow SHA B: `${{ steps.provenance.outputs.producer_workflow_sha }}`"
-            echo "- Publisher workflow SHA C: `$PUBLISHER_WORKFLOW_SHA`"
-            echo "- Producer run: `$PRODUCER_RUN_ID` attempt `$PRODUCER_RUN_ATTEMPT`"
-            echo "- Publisher run: `$PUBLISHER_RUN_ID` attempt `$PUBLISHER_RUN_ATTEMPT`"
-            echo "- Evidence: `${{ steps.evidence.outputs.evidence_name }}`"
-            echo "- deployable: `false` (no provisioning/deployment authority)"
+            echo "- Bundle source A: ${{ steps.provenance.outputs.source_sha }}"
+            echo "- Producer workflow SHA B: ${{ steps.provenance.outputs.producer_workflow_sha }}"
+            echo "- Publisher workflow SHA C: $PUBLISHER_WORKFLOW_SHA"
+            echo "- Producer run: $PRODUCER_RUN_ID attempt $PRODUCER_RUN_ATTEMPT"
+            echo "- Publisher run: $PUBLISHER_RUN_ID attempt $PUBLISHER_RUN_ATTEMPT"
+            echo "- Evidence: ${{ steps.evidence.outputs.evidence_name }}"
+            echo "- deployable: false (no provisioning/deployment authority)"
           } >> "$GITHUB_STEP_SUMMARY"
