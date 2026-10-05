@@ -889,6 +889,7 @@ class LiveQaGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             root = Path(temporary) / "cache"
             root.mkdir(mode=0o755)
+            root.chmod(0o755)
             caches = {
                 "a": self.make_runtime_cache(
                     root, commits["a"], modified_at_ns=now_ns - 90 * day_ns
@@ -950,6 +951,7 @@ class LiveQaGuardTests(unittest.TestCase):
             base = Path(temporary)
             root = base / "cache"
             root.mkdir(mode=0o755)
+            root.chmod(0o755)
             outside = base / "outside"
             outside.mkdir()
             candidate = root / f"runtime-{'a' * 40}"
@@ -972,6 +974,7 @@ class LiveQaGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             root = Path(temporary) / "cache"
             root.mkdir(mode=0o755)
+            root.chmod(0o755)
             valid = self.make_runtime_cache(
                 root, "a" * 40, modified_at_ns=now_ns - 30 * day_ns
             )
@@ -1010,6 +1013,7 @@ class LiveQaGuardTests(unittest.TestCase):
             base = Path(temporary)
             root = base / "cache"
             root.mkdir(mode=0o755)
+            root.chmod(0o755)
             newest = self.make_runtime_cache(
                 root, "c" * 40, modified_at_ns=now_ns - 20 * day_ns
             )
@@ -1070,6 +1074,7 @@ class LiveQaGuardTests(unittest.TestCase):
             base = Path(temporary)
             root = base / "cache"
             root.mkdir(mode=0o755)
+            root.chmod(0o755)
             machine_lock = lock_support.create_test_lock(
                 "liveqa-machine", root=base
             )
@@ -1176,6 +1181,7 @@ class LiveQaGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
             root = Path(temporary) / "cache"
             root.mkdir(mode=0o755)
+            root.chmod(0o755)
             newest = self.make_runtime_cache(root, "a" * 40, modified_at_ns=20)
             candidate = self.make_runtime_cache(root, "b" * 40, modified_at_ns=10)
             plan = guard.build_runtime_cache_retention_plan(

@@ -22,6 +22,7 @@ from tools.platform_test_catalog import (
     CONTOUR_METADATA,
     CONTOUR_TIMEOUT_SECONDS,
     EXPECTED_SNAPSHOT,
+    TestCase as CatalogTestCase,
     VERIFICATION_CONTOUR,
     cases_for_contour,
     discover_test_cases,
@@ -53,7 +54,9 @@ from tools.platform_verify import (
     registry_payload,
 )
 from tools.platform_test_runner import (
+    TimingRunner,
     TestResourceConfigurationError,
+    _summary,
     _integration_preflight_error,
     _require_integration_resources_ready,
     main as test_runner_main,
@@ -264,6 +267,72 @@ def _lock_holder(command: list[str], *, cwd: Path, env: dict[str, str] | None = 
 
 
 class PlatformVerificationContractTests(unittest.TestCase):
+    def test_failed_subtests_record_one_parent_execution_without_hiding_failures(self) -> None:
+        class FailingSubtests(unittest.TestCase):
+            def test_two_subtests(self) -> None:
+                for exit_code in (4, 124):
+                    with self.subTest(exit_code=exit_code):
+                        self.assertEqual(exit_code, 0)
+
+        class MixedSubtestOutcomes(unittest.TestCase):
+            def test_failure_and_error(self) -> None:
+                with self.subTest(kind="failure"):
+                    self.fail("subtest failure remains visible")
+                with self.subTest(kind="error"):
+                    raise RuntimeError("subtest error remains visible")
+
+        class LateParentError(unittest.TestCase):
+            def test_late_parent_error(self) -> None:
+                raise RuntimeError("late parent error remains visible")
+
+        def run_case(
+            test_case_type: type[unittest.TestCase], method_name: str
+        ) -> tuple[unittest.TestResult, dict[str, object], str]:
+            suite = unittest.defaultTestLoader.loadTestsFromTestCase(test_case_type)
+            runner = TimingRunner(stream=io.StringIO(), verbosity=0)
+            result = runner.run(suite)
+            parent_id = test_case_type(method_name).id()
+            case = CatalogTestCase(
+                test_id=parent_id,
+                module="tests.synthetic_subtests",
+                class_name=test_case_type.__name__,
+                method_name=method_name,
+                line=0,
+                is_async=False,
+                contour=VERIFICATION_CONTOUR,
+            )
+            summary = _summary(
+                contour=VERIFICATION_CONTOUR,
+                cases=(case,),
+                result=result,
+                elapsed_ms=1.0,
+                status="failed",
+            )
+            return result, summary, parent_id
+
+        scenarios = (
+            (FailingSubtests, "test_two_subtests", 2, 0, "failed"),
+            (MixedSubtestOutcomes, "test_failure_and_error", 1, 1, "error"),
+            (LateParentError, "test_late_parent_error", 0, 1, "error"),
+        )
+        for test_case_type, method_name, failure_count, error_count, outcome in scenarios:
+            with self.subTest(scenario=test_case_type.__name__):
+                result, summary, parent_id = run_case(test_case_type, method_name)
+                self.assertEqual(result.testsRun, 1)
+                self.assertEqual(len(result.failures), failure_count)
+                self.assertEqual(len(result.errors), error_count)
+                self.assertFalse(result.wasSuccessful())
+                self.assertEqual(summary["executed_ids"], [parent_id])
+                self.assertEqual(summary["missing_ids"], [])
+                self.assertEqual(summary["duplicate_ids"], [])
+                self.assertTrue(summary["execution_complete"])
+                self.assertEqual(summary["failures"], failure_count)
+                self.assertEqual(summary["errors"], error_count)
+                timings = summary["timings"]
+                self.assertEqual(len(timings), 1)
+                self.assertEqual(timings[0]["test_id"], parent_id)
+                self.assertEqual(timings[0]["outcome"], outcome)
+
     @staticmethod
     def _test_settings(**overrides: object) -> SimpleNamespace:
         values: dict[str, object] = {
@@ -698,6 +767,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
 
             marker_dir = root / "markers"
             marker_dir.mkdir(mode=0o733)
+            marker_dir.chmod(0o733)
             marker = marker_dir / "imported"
             probe = root / "probe.py"
             runner = synthetic_tools / "platform_test_runner.py"
@@ -719,6 +789,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 "runpy.run_path(str(sys.argv[0]), run_name='__main__')\n",
                 encoding="utf-8",
             )
+            probe.chmod(0o644)
 
             environment = {
                 **os.environ,
@@ -864,6 +935,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             root.chmod(0o755)
             lock_path = root / "platformdb-test.lock"
             lock_path.touch(mode=LOCK_FILE_MODE)
+            lock_path.chmod(LOCK_FILE_MODE)
             if os.geteuid() != 0:
                 # A non-root test process cannot manufacture the root-owned
                 # production identity.  Prove the validator fails on owner
@@ -952,6 +1024,7 @@ except lock.VerificationLockError as exc:
             root.chmod(0o755)
             lock_path = root / "platformdb-test.lock"
             lock_path.touch(mode=LOCK_FILE_MODE)
+            lock_path.chmod(LOCK_FILE_MODE)
             if os.geteuid() != 0:
                 with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
                     with self.assertRaisesRegex(VerificationLockError, "wrong owner"):
@@ -965,14 +1038,20 @@ except lock.VerificationLockError as exc:
                 return
             module_dir = root / "module"
             module_dir.mkdir(mode=0o755)
+            module_dir.chmod(0o755)
             package_dir = module_dir / "tools"
             package_dir.mkdir(mode=0o755)
-            (package_dir / "__init__.py").write_text("", encoding="utf-8")
-            (package_dir / "platform_verification_lock.py").write_bytes(
+            package_dir.chmod(0o755)
+            init_file = package_dir / "__init__.py"
+            init_file.write_text("", encoding="utf-8")
+            init_file.chmod(0o644)
+            lock_module = package_dir / "platform_verification_lock.py"
+            lock_module.write_bytes(
                 Path(__file__).resolve().parents[1].joinpath(
                     "tools/platform_verification_lock.py"
                 ).read_bytes()
             )
+            lock_module.chmod(0o644)
             holder_code = """
 from pathlib import Path
 import sys
@@ -1040,8 +1119,10 @@ except lock.VerificationLockError as exc:
             if os.geteuid() != 0:
                 parent = root / "non-root-parent"
                 parent.mkdir(mode=0o755)
+                parent.chmod(0o755)
                 lock_path = parent / "platformdb-test.lock"
                 lock_path.touch(mode=LOCK_FILE_MODE)
+                lock_path.chmod(LOCK_FILE_MODE)
                 with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
                     with self.assertRaisesRegex(VerificationLockError, "wrong owner"):
                         with verification_resource_lock("migration"):
@@ -1054,8 +1135,10 @@ except lock.VerificationLockError as exc:
 
             parent = root / "secure-parent"
             parent.mkdir(mode=0o755)
+            parent.chmod(0o755)
             lock_path = parent / "platformdb-test.lock"
             lock_path.touch(mode=LOCK_FILE_MODE)
+            lock_path.chmod(LOCK_FILE_MODE)
             parent.chmod(0o775)
             with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
                 with self.assertRaisesRegex(VerificationLockError, "writable"):
@@ -1081,8 +1164,10 @@ except lock.VerificationLockError as exc:
             # security failure even when the leaf itself still looks valid.
             stable = root / "stable"
             stable.mkdir(mode=0o755)
+            stable.chmod(0o755)
             stable_lock = stable / "platformdb-test.lock"
             stable_lock.touch(mode=LOCK_FILE_MODE)
+            stable_lock.chmod(LOCK_FILE_MODE)
             with (
                 patch("tools.platform_verification_lock.LOCK_PATH", stable_lock),
                 patch(

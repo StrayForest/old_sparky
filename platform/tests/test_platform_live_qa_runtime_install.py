@@ -261,6 +261,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             with self.runtime_tree(Path(temporary), source_sha) as (app_dir, release, trusted, payload_root):
                 trusted.mkdir(mode=0o700)
                 payload_root.mkdir(mode=0o755)
+                payload_root.chmod(0o755)
                 runtime.install(app_dir, release)
                 self.assertEqual(stat.S_IMODE(payload_root.stat().st_mode), 0o755)
                 self.assertEqual(stat.S_IMODE(trusted.stat().st_mode), 0o700)
@@ -271,6 +272,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             with self.runtime_tree(Path(temporary), source_sha) as (app_dir, release, _trusted, payload_root):
                 _trusted.mkdir(mode=0o700)
                 payload_root.mkdir(mode=0o750)
+                payload_root.chmod(0o750)
                 with mock.patch.object(runtime, "_cleanup_temporary_files") as cleanup, self.assertRaisesRegex(
                     runtime.InstallerError,
                     "payload root mode is unsupported",
@@ -288,6 +290,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 payload_root.unlink()
 
                 payload_root.mkdir(mode=0o755)
+                payload_root.chmod(0o755)
                 os.chown(payload_root, 65534, 65534)
                 with self.assertRaisesRegex(runtime.InstallerError, "payload root metadata is unsafe"):
                     runtime.install(app_dir, release)

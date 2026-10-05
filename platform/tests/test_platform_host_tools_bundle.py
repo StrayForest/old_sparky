@@ -563,6 +563,21 @@ class HostToolsBundleTests(unittest.TestCase):
             payload = json.loads(
                 (REPO_ROOT / pin.PIN_RELATIVE_PATH).read_text(encoding="utf-8")
             )
+            closure_paths = tuple(
+                str(record["path"]) for record in payload["closure"]
+            )
+            indexed_modes: dict[str, int] = {}
+            for line in git("ls-files", "--stage", "--", *closure_paths).splitlines():
+                metadata, tracked_path = line.split("\t", 1)
+                mode, _object_id, stage = metadata.split()
+                self.assertEqual(stage, "0")
+                indexed_modes[tracked_path] = {
+                    "100644": 0o644,
+                    "100755": 0o755,
+                }[mode]
+            self.assertEqual(set(indexed_modes), set(closure_paths))
+            for relative_path, expected_mode in indexed_modes.items():
+                (fixture / relative_path).chmod(expected_mode)
             payload["host_tools_sha"] = generation_base
             contract_path.write_text(
                 json.dumps(payload, indent=2, sort_keys=True) + "\n",
