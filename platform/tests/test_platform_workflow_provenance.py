@@ -15,7 +15,6 @@ import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-import zipfile
 
 import yaml
 

@@ -27,7 +27,6 @@ import stat
 import sys
 from typing import Any
 from urllib.parse import urlsplit
-import zipfile
 
 
 REPOSITORY_OWNER = "StrayForest"
