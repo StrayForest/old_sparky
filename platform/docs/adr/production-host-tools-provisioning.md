@@ -15,12 +15,16 @@ The application release SHA (`TARGET_SHA`) and host-control generation SHA
 is the only source for `HOST_TOOLS_SHA`. This change follows the A/B pin
 lifecycle: source commit A updates the runtime-profile output boundary and its
 regression, and pin commit B selects A as generation S11 with its exact
-closure. S11 source A is `138128c99025069143f5c234f6cb58545ed8ab1c` and
-remains pending canonical provisioning. The latest verified installed
-generation is S10 `03e1aed83017779f25df20b43f2ba37e6efacdbc`, with
-provisioning receipt SHA-256
-`b0ff2f0483c281538699b1a0104e071b9b319d89b2cf8512c4951f307d394ec7`; S9
-`7a9fe1286054dbe96221d2b428048c4212270cf5` and earlier generations are
+closure. S11 source A is `138128c99025069143f5c234f6cb58545ed8ab1c` and is
+installed with provisioning receipt SHA-256
+`2f182be1aaf90ee56ed83f7c755e4f38ec860d6f7f20e2ae003084c1a0a7c3f7`. Its
+exact-target preflight run `37276328155` passed; independent checkpoint
+`69b5ec3bb3c13ed79d07823c227782307fb1c90d65db20adf7ba7590efea9bb8` verified
+all 15 members, the isolated self-test and no bytecode. S10
+`03e1aed83017779f25df20b43f2ba37e6efacdbc` with receipt
+`b0ff2f0483c281538699b1a0104e071b9b319d89b2cf8512c4951f307d394ec7`, S9
+`7a9fe1286054dbe96221d2b428048c4212270cf5`, and recovery generation
+`d47ae6a278f76bb8a46cca0bbe9019427584c3d2861880e8a7365d87a627be66` remain
 preserved. The active application release and production health are owned by
 [`CURRENT.md`](../CURRENT.md); this ADR does not duplicate those changing facts.
 The pin records the
