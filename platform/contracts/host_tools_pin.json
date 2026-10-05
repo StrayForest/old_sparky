@@ -3,7 +3,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_workflow_remote_dispatch.py",
-      "sha256": "7a84505d12fdb8318f34d0418e18b333dd1266ee382087ea9e142483bba60c07"
+      "sha256": "9c502606ec5470666503c7129f9a1a60d65dbb58308354664f6d409b781937f9"
     },
     {
       "mode": 493,
@@ -18,7 +18,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_production_deploy_supervisor.sh",
-      "sha256": "5c2943c446cf87b20eac387f0fca378ca4a44ce9181fa6e39d7e8a9909166c8d"
+      "sha256": "7cbdf62be4850c74edcf169905d0df4f1c1e2f1f739fe91009a0e61f3dc048a8"
     },
     {
       "mode": 493,
@@ -66,7 +66,7 @@
       "sha256": "2fe2c8ebfdea6f24ee6d7c7e1a4539a88fdc70449c66cc50eedf9caab3ae2ebf"
     }
   ],
-  "host_tools_sha": "7a9fe1286054dbe96221d2b428048c4212270cf5",
+  "host_tools_sha": "03e1aed83017779f25df20b43f2ba37e6efacdbc",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }

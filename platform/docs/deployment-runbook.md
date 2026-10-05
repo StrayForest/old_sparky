@@ -357,9 +357,15 @@ and disabled state of the seven application/service timers. The initial
 activation boundary then prepares unit files with enablement disabled, and only
 after smoke restores that baseline, enables the intended units, verifies all
 seven enabled/active states, reconciles the live-QA runtime, and reruns
-readiness. This boundary has one aggregate 120-second budget and 30-second
-per-call caps; a timeout retains the
-candidate and receipt for retry. The normal activation path owns the reviewed
+readiness. Live-QA runtime reconciliation uses a separate 600-second maximum,
+clamped against the exact candidate-supervisor deadline with a 600-second
+post-reconcile reserve and timeout-reaping grace. The supervisor, remote
+dispatcher and workflow SSH bounds are 1800, 1950 and 2100 seconds; the
+production job has a 65-minute deadline covering artifact preparation and
+transfer as well. The initial-install systemd sequence keeps its 120-second
+aggregate and 30-second per-call caps, starting only after reconciliation
+succeeds. A reconciliation timeout retains the candidate and receipt for
+retry. The normal activation path owns the reviewed
 health, Cloudflare and maintenance timer enablement, and installs the
 off-site-backup unit/timer without silently enabling off-site backup before its
 manual restore-drill gate.
@@ -461,23 +467,9 @@ workflow therefore binds the numeric producer and publisher job IDs selected
 from their exact attempt jobs APIs into the closed evidence artifact and
 rejects any evidence/API pairing drift before accepting the attestation.
 
-The complete recovery handoff is the six exact operator inputs
-`security_run_id/security_run_attempt`, `recovery_run_id/recovery_run_attempt`,
-and `publisher_run_id/publisher_run_attempt`. The corresponding security,
-producer, and publisher job IDs are not operator-supplied: each is selected
-exactly once from that run's attempt jobs API and carried into the closed
-evidence. The handoff therefore binds source **A**, producer workflow/run/job
-**B/P**, publisher workflow/run/job **C**, the route digest, the producer
-artifact digest, the publisher outer artifact name/ID/digest, and the bundle
-member digest. Missing, duplicate, over-100, expired, or mismatched API rows
-fail before SSH or host mutation.
+The complete recovery handoff is the six exact operator inputs `security_run_id/security_run_attempt`, `recovery_run_id/recovery_run_attempt`, and `publisher_run_id/publisher_run_attempt`. Corresponding security, producer and publisher job IDs are selected exactly once from each attempt-jobs API and carried into the closed evidence. The handoff binds source **A**, producer workflow/run/job **B/P**, publisher workflow/run/job **C**, route and producer-artifact digests, publisher outer artifact name/ID/digest, and bundle-member digest. Missing, duplicate, over-100, expired or mismatched API rows fail before SSH or host mutation.
 
-The host installs verified bundles as immutable generations. The normal
-release-recover flow invokes `platform_recover_pending.sh`; abort bootstrap
-invokes `platform_abort_retained_only.sh`. For a pre-managed-LiveQA target
-missing old helper files, use the guarded two-phase fallback in the
-[recovery ADR](adr/recovery-bootstrap-retained-abort.md). Both flows retain
-unsafe receipts and never downgrade or run `systemctl` manually.
+The host installs verified bundles as immutable generations. Normal release recovery invokes `platform_recover_pending.sh`; abort bootstrap invokes `platform_abort_retained_only.sh`. For pre-managed-LiveQA targets missing old helper files, use the guarded two-phase fallback in the [recovery ADR](adr/recovery-bootstrap-retained-abort.md). Both flows retain unsafe receipts and never downgrade or run `systemctl` manually.
 
 For an operation-ID v2 `install` receipt from a pre-managed-LiveQA release, recovery requires no paired systemd receipt, exact transaction pointers/identities, and both old-release inputs absent:
 `tools/platform_live_qa_runtime_install.py` and `liveqa-runtime/`. Partial payloads fail closed.

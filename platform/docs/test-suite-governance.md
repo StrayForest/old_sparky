@@ -270,6 +270,7 @@ contour stays shallow and proves the static contract plus the synthetic A/B
 pin-bump lifecycle; it does not silently skip historical ancestry proof.
 
 Operation-bound legacy LiveQA fixtures in `test_platform_recovery_bootstrap` stay in `backend-privileged`; they cover receipt/pointer/venv identity, service/timer snapshot, bounded readiness retries, fixed child-stage/status diagnostics and receipt-last cleanup.
+`test_platform_release_recovery_boundaries` covers the candidate-deadline-clamped reconcile timeout, retained receipt, and idempotent retry after a simulated partial payload publish. `test_platform_live_qa_runtime_install` covers fixed stage diagnostics for a post-promotion retention failure. These remain in `backend-privileged` because they exercise release-state transitions and privileged payload ownership.
 `test_liveqa_reconcile_stderr_is_available_only_to_private_candidate_capture`
 checks the helper preserves reconcile stderr. Its companion
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` verifies private
@@ -583,12 +584,7 @@ workflow's secret/SSH ordering. `tests.test_platform_release_systemd_state`
 adds real subprocess coverage for operation-ID/path/inode mismatch,
 helper-manifest tamper-before-systemd, and rollback-target retry binding;
 `tests.test_platform_release_recovery_boundaries` covers rollback/recovery
-subprocess fault boundaries. The recovery-bootstrap contract also executes the
-attestation policy fixture with wrong source/ref/run-attempt/job/subject
-variants, including a recovery-job/evidence/API pairing mutation, and covers
-the exact legacy-v2 no-systemd cleanup bridge. The
-workflow is evidence-only and non-deployable; live execution remains an
-explicit operator recovery action.
+subprocess fault boundaries. The recovery-bootstrap contract also executes the attestation policy fixture with wrong source/ref/run-attempt/job/subject variants, including a recovery-job/evidence/API pairing mutation, and covers the exact legacy-v2 no-systemd cleanup bridge. The workflow is evidence-only and non-deployable; live execution remains an explicit operator recovery action.
 
 The `docs` gate checks document shape, repository-local links and project skill
 frontmatter/interface metadata. `verification-contract` checks registry/CI

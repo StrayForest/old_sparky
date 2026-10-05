@@ -2594,9 +2594,19 @@ fail 'private lock detail must not cross the public channel'
                 encoding="utf-8",
             )
             fake_python.chmod(0o755)
+            deadline_assignment = (
+                'PLATFORM_CANDIDATE_DEADLINE_MONOTONIC_NS=$(/usr/bin/python3 '
+                '-I -B -c "import time; print(time.monotonic_ns() + '
+                '1800000000000)")'
+            )
             harness = "\n".join(
                 (
                     'run_systemd_bounded() { "$@"; }',
+                    'SYSTEMCTL_TIMEOUT_BIN=/usr/bin/timeout',
+                    'LIVE_QA_RECONCILE_TIMEOUT_SECONDS=600',
+                    'LIVE_QA_POST_RECONCILE_RESERVE_SECONDS=600',
+                    'LIVE_QA_TIMEOUT_KILL_GRACE_SECONDS=5',
+                    deadline_assignment,
                     f"SHARED_VENV={shlex.quote(str(root / 'shared' / 'venv'))}",
                     f"LIVE_QA_RUNTIME_INSTALLER={shlex.quote(str(root / 'installer.py'))}",
                     f"APP_DIR={shlex.quote(str(root / 'app'))}",
@@ -2625,7 +2635,38 @@ fail 'private lock detail must not cross the public channel'
             )
         self.assertEqual(result.returncode, 23)
         self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "runtime_private_stderr_sentinel\n")
+        self.assertEqual(
+            result.stderr,
+            "runtime_private_stderr_sentinel\n"
+            "LIVE_QA_RECONCILE status=failed outcome=child_exit "
+            "budget_seconds=600 child_exit=23\n",
+        )
+
+        missing_deadline_harness = harness.replace(deadline_assignment + "\n", "")
+        missing_deadline = subprocess.run(
+            [
+                "/usr/bin/env",
+                "-u",
+                "BASH_ENV",
+                "-u",
+                "ENV",
+                "/usr/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                missing_deadline_harness,
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(missing_deadline.returncode, 1)
+        self.assertEqual(missing_deadline.stdout, "")
+        self.assertEqual(
+            missing_deadline.stderr,
+            "LIVE_QA_RECONCILE status=failed outcome=deadline_unavailable\n",
+        )
 
     def test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher(
         self,
@@ -2674,6 +2715,7 @@ fail 'private lock detail must not cross the public channel'
             noisy_candidate.write_text(
                 "#!/usr/bin/python3\n"
                 "import os\n"
+                "os.write(1, ('CANDIDATE_DEADLINE=' + os.environ.get('PLATFORM_CANDIDATE_DEADLINE_MONOTONIC_NS', '') + '\\n').encode())\n"
                 "os.write(1, b'PRIVATE_CANDIDATE_STDOUT_SENTINEL' + b'x' * 70000)\n"
                 "os.write(2, b'PRIVATE_CANDIDATE_STDERR_SENTINEL' + b'y' * 70000)\n"
                 "raise SystemExit(23)\n",
@@ -2712,6 +2754,8 @@ fail 'private lock detail must not cross the public channel'
                 self.assertEqual(info.st_nlink, 1)
             self.assertEqual((run_dir / "candidate.stdout").stat().st_size, 65536)
             self.assertEqual((run_dir / "candidate.stderr").stat().st_size, 65536)
+            captured_stdout = (run_dir / "candidate.stdout").read_text(encoding="ascii")
+            self.assertRegex(captured_stdout, r"CANDIDATE_DEADLINE=[0-9]{1,20}\n")
             metadata = json.loads((run_dir / "candidate.json").read_text())
             self.assertEqual(metadata["source_sha"], target_sha)
             self.assertEqual(metadata["host_tools_sha"], host_tools_sha)
@@ -2997,7 +3041,7 @@ fail 'private lock detail must not cross the public channel'
             )
             timeout_candidate.chmod(0o700)
             fast_timeout_runner = runner.replace(
-                "capture_timeout_seconds = 840.0",
+                "capture_timeout_seconds = 1800.0",
                 "capture_timeout_seconds = 0.3",
                 1,
             ).replace(
@@ -3050,7 +3094,7 @@ fail 'private lock detail must not cross the public channel'
             )
             stuck_candidate.chmod(0o700)
             bounded_reap_runner = runner.replace(
-                "capture_timeout_seconds = 840.0",
+                "capture_timeout_seconds = 1800.0",
                 "capture_timeout_seconds = 0.3",
                 1,
             ).replace(
@@ -3135,7 +3179,7 @@ fail 'private lock detail must not cross the public channel'
                 "pipe_eof_grace_seconds = 0.2",
                 1,
             ).replace(
-                "capture_timeout_seconds = 840.0",
+                "capture_timeout_seconds = 1800.0",
                 "capture_timeout_seconds = 2.0",
                 1,
             ).replace(

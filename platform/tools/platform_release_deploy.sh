@@ -22,6 +22,9 @@ SYSTEMCTL_TIMEOUT_BIN="/usr/bin/timeout"
 SYSTEMD_CALL_TIMEOUT_SECONDS=30
 SYSTEMD_OPERATION_TIMEOUT_SECONDS=120
 SYSTEMD_OPERATION_DEADLINE_NS=""
+LIVE_QA_RECONCILE_TIMEOUT_SECONDS=600
+LIVE_QA_POST_RECONCILE_RESERVE_SECONDS=600
+LIVE_QA_TIMEOUT_KILL_GRACE_SECONDS=5
 ORIGINAL_ARGS=("$@")
 
 public_status() {
@@ -364,8 +367,55 @@ run_initial_systemd_candidate() {
 }
 
 run_live_qa_reconcile() {
-  run_systemd_bounded "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-    reconcile --app-dir "$APP_DIR" >/dev/null
+  local supervisor_deadline_ns now_ns remaining_ns reserve_ns budget_seconds child_status
+  local started_ns finished_ns elapsed_ns
+  supervisor_deadline_ns="${PLATFORM_CANDIDATE_DEADLINE_MONOTONIC_NS:-}"
+  if [[ ! "$supervisor_deadline_ns" =~ ^[0-9]{1,20}$ ]]; then
+    printf 'LIVE_QA_RECONCILE status=failed outcome=deadline_unavailable\n' >&2
+    return 1
+  fi
+  now_ns="$(/usr/bin/python3 -I -B -c 'import time; print(time.monotonic_ns())' 2>/dev/null)" || {
+    printf 'LIVE_QA_RECONCILE status=failed outcome=clock_unavailable\n' >&2
+    return 1
+  }
+  [[ "$now_ns" =~ ^[0-9]{1,20}$ ]] || {
+    printf 'LIVE_QA_RECONCILE status=failed outcome=clock_unavailable\n' >&2
+    return 1
+  }
+  remaining_ns=$((supervisor_deadline_ns - now_ns))
+  reserve_ns=$(((LIVE_QA_POST_RECONCILE_RESERVE_SECONDS + LIVE_QA_TIMEOUT_KILL_GRACE_SECONDS) * 1000000000))
+  if (( remaining_ns <= reserve_ns )); then
+    printf 'LIVE_QA_RECONCILE status=failed outcome=budget_unavailable\n' >&2
+    return 1
+  fi
+  budget_seconds=$(((remaining_ns - reserve_ns) / 1000000000))
+  (( budget_seconds > LIVE_QA_RECONCILE_TIMEOUT_SECONDS )) && budget_seconds="$LIVE_QA_RECONCILE_TIMEOUT_SECONDS"
+  if (( budget_seconds < 1 )); then
+    printf 'LIVE_QA_RECONCILE status=failed outcome=budget_unavailable\n' >&2
+    return 1
+  fi
+  started_ns="$now_ns"
+  if "$SYSTEMCTL_TIMEOUT_BIN" --signal=TERM --kill-after="${LIVE_QA_TIMEOUT_KILL_GRACE_SECONDS}s" \
+    "${budget_seconds}s" "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+    reconcile --app-dir "$APP_DIR" >/dev/null; then
+    printf 'LIVE_QA_RECONCILE status=passed budget_seconds=%s\n' "$budget_seconds" >&2
+    return 0
+  else
+    child_status=$?
+  fi
+  finished_ns="$(/usr/bin/python3 -I -B -c 'import time; print(time.monotonic_ns())' 2>/dev/null)" || finished_ns="$started_ns"
+  if [[ ! "$finished_ns" =~ ^[0-9]{1,20}$ ]]; then
+    finished_ns="$started_ns"
+  fi
+  elapsed_ns=$((finished_ns - started_ns))
+  if (( elapsed_ns >= budget_seconds * 1000000000 )); then
+    printf 'LIVE_QA_RECONCILE status=failed outcome=timeout budget_seconds=%s child_exit=%s\n' \
+      "$budget_seconds" "$child_status" >&2
+  else
+    printf 'LIVE_QA_RECONCILE status=failed outcome=child_exit budget_seconds=%s child_exit=%s\n' \
+      "$budget_seconds" "$child_status" >&2
+  fi
+  return "$child_status"
 }
 
 wait_for_activation_readiness() {
@@ -1636,12 +1686,6 @@ if [[ "$phase" == "activation-pending" ]]; then
   # The trusted live-QA payload is part of activation identity. Reconcile it
   # while the canonical release lock is still held, before any post-activation
   # readiness or smoke work can observe the new current release.
-  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
-    systemd_operation_reset || {
-      public_status failed systemd >&2
-      exit 1
-    }
-  fi
   LIVE_QA_RUNTIME_INSTALLER="$CANDIDATE/tools/platform_live_qa_runtime_install.py"
   if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
     public_status failed liveqa_runtime >&2
@@ -1651,6 +1695,14 @@ if [[ "$phase" == "activation-pending" ]]; then
     public_status failed liveqa_runtime >&2
     exit 1
   }
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    # Live-QA publication has its own supervisor-clamped budget. Start the
+    # original 120-second initial systemd window only after it succeeds.
+    systemd_operation_reset || {
+      public_status failed systemd >&2
+      exit 1
+    }
+  fi
   # Unit files are prepared without mutating enablement or activation. A
   # clean first install performs its persistent activation only after smoke
   # has passed and the durable systemd-activation-pending phase is recorded.

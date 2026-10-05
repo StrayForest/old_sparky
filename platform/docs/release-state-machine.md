@@ -78,10 +78,16 @@ installer with `PLATFORM_ENABLE_SYSTEMD_UNITS=1`. It then verifies all seven
 units are enabled, the three services and four timers are active, and both
 readiness endpoints pass before recording `systemd-activated`.
 
-Every restore/installer/live-QA-reconcile/enable/restart/readiness/verify
-sequence is bounded by one 120-second operation deadline, with each
-individual systemctl/installer/reconcile call capped at 30 seconds. A timeout or non-zero result leaves the candidate
-and receipt retained. Failures after `systemd-activated` or
+The live-QA payload reconciliation is a separate, bounded candidate step.
+The production supervisor supplies its monotonic candidate deadline; the
+reconcile timeout is capped at 600 seconds and clamped to leave 600 seconds
+plus timeout-reaping grace for activation, readiness, smoke and durable
+receipt work. The candidate supervisor allows 1800 seconds, the remote
+dispatcher 1950 seconds, and the workflow SSH call 2100 seconds. A reconcile
+timeout or non-zero result leaves the candidate and receipt retained. For a
+clean initial install, the existing 120-second systemd-operation deadline
+starts only after reconciliation succeeds; individual systemd calls remain
+capped at 30 seconds. Failures after `systemd-activated` or
 `activation-committed` first restore and verify the captured baseline, then
 rewind to `systemd-activation-pending` so the next resume does not require
 units that recovery has already stopped. A stale or incomplete legacy

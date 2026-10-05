@@ -546,7 +546,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("os.killpg", recovery)
         dispatcher = self.read_tool("platform_workflow_remote_dispatch.py")
         for value in (
-            "DEPLOY_OPERATION_TIMEOUT_SECONDS = 900.0",
+            "DEPLOY_OPERATION_TIMEOUT_SECONDS = 1950.0",
             "CLEANUP_OPERATION_TIMEOUT_SECONDS = 300.0",
             "ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS = 120.0",
             "LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 300.0",
@@ -567,7 +567,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         )
         self.assertIn("timeout --foreground 300s ssh", workflow)
         self.assertIn("timeout --foreground 300s scp", workflow)
-        self.assertIn("timeout --foreground 900s ssh", workflow)
+        self.assertIn("timeout --foreground 2100s ssh", workflow)
         self.assertIn("ServerAliveInterval=15", workflow)
         self.assertIn("ServerAliveCountMax=3", workflow)
         self.assertIn("/usr/bin/timeout --foreground --signal=TERM --kill-after=5s 60s", workflow)

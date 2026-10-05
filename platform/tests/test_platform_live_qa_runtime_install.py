@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -211,6 +212,34 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(payload_root.stat().st_mode), 0o755)
                 self.assertEqual(stat.S_IMODE(trusted.stat().st_mode), 0o700)
                 runtime._validate_active_pointer(source_sha)
+
+    def test_postpromotion_retention_failure_reports_closed_stage_and_keeps_pointer(self) -> None:
+        source_sha = "e" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                payload_root,
+            ):
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    runtime,
+                    "_retention",
+                    side_effect=runtime.InstallerError("private diagnostic detail"),
+                ), redirect_stderr(stderr), self.assertRaises(runtime.InstallerError):
+                    runtime.install(app_dir, release)
+
+                diagnostic = stderr.getvalue()
+                self.assertIn(
+                    "LIVE_QA_INSTALL_STAGE stage=retention status=failed ",
+                    diagnostic,
+                )
+                self.assertNotIn("private diagnostic detail", diagnostic)
+                self.assertEqual(os.readlink(trusted / "active"), f"releases/{source_sha}")
+                manifest = json.loads((trusted / "active-manifest.json").read_text(encoding="ascii"))
+                self.assertEqual(manifest["source_sha"], source_sha)
+                self.assertTrue((payload_root / source_sha).is_dir())
 
     def test_install_repairs_only_legacy_private_payload_root_mode(self) -> None:
         source_sha = "b" * 40

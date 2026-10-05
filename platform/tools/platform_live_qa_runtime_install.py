@@ -17,6 +17,7 @@ deployment; there is no host-image or source-checkout fallback.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ import re
 import shutil
 import stat
 import sys
+import time
 from uuid import uuid4
 
 
@@ -58,6 +60,18 @@ MAX_FILE_BYTES = 768 * 1024 * 1024
 MAX_RUNTIME_BYTES = 2 * 1024 * 1024 * 1024
 MAX_FILES = 200_000
 MAX_ADDITIONAL_PAYLOADS = 1
+INSTALL_DIAGNOSTIC_STAGES = frozenset(
+    {
+        "trusted_layout",
+        "prewrite_cleanup",
+        "source_validation",
+        "payload_stage_build",
+        "payload_publish",
+        "retention",
+        "staging_cleanup",
+        "final_payload_validation",
+    }
+)
 CHROMIUM_SANDBOX_RELATIVE = PurePosixPath(
     "runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
 )
@@ -133,6 +147,34 @@ SECRET_NAME_PATTERN = re.compile(
 
 class InstallerError(RuntimeError):
     """A trusted live-QA install cannot be proven safe."""
+
+
+def _install_stage_start(stage: str) -> int:
+    if stage not in INSTALL_DIAGNOSTIC_STAGES:
+        raise InstallerError("trusted live-QA diagnostic stage is invalid")
+    started_ns = time.monotonic_ns()
+    print(f"LIVE_QA_INSTALL_STAGE stage={stage} status=started", file=sys.stderr, flush=True)
+    return started_ns
+
+
+def _install_stage_finish(stage: str, started_ns: int, status: str) -> None:
+    elapsed_ms = max(0, (time.monotonic_ns() - started_ns) // 1_000_000)
+    print(
+        f"LIVE_QA_INSTALL_STAGE stage={stage} status={status} elapsed_ms={elapsed_ms}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _run_install_stage(stage: str, operation: Callable[[], object]) -> object:
+    started_ns = _install_stage_start(stage)
+    try:
+        result = operation()
+    except BaseException:
+        _install_stage_finish(stage, started_ns, "failed")
+        raise
+    _install_stage_finish(stage, started_ns, "passed")
+    return result
 
 
 def _release_lock_supervisor_pid() -> int | None:
@@ -1134,37 +1176,47 @@ def _retention(app_dir: Path, *, apply: bool) -> int:
 def install(app_dir: Path, release: Path) -> dict[str, object]:
     _require_release_lock()
     resolved_release, source_sha, release_slug = _safe_release(app_dir, release)
-    _trusted_chain(Path("/root"))
-    trusted_parent = TRUSTED_ROOT.parent
-    if os.path.lexists(trusted_parent):
-        _directory(trusted_parent, mode=0o700)
-    else:
-        os.mkdir(trusted_parent, 0o700)
-        os.chown(trusted_parent, 0, 0)
-    if os.path.lexists(TRUSTED_ROOT):
-        _directory(TRUSTED_ROOT, mode=0o700)
-    else:
-        os.mkdir(TRUSTED_ROOT, 0o700)
-        os.chown(TRUSTED_ROOT, 0, 0)
-    _ensure_payload_root()
-    _cleanup_temporary_files()
-    _cleanup_staging(apply=True)
-
     source_platform = resolved_release
     runtime_source = source_platform / "liveqa-runtime"
-    _validate_runtime_source(runtime_source)
-    for relative in TOOL_FILES:
-        source = source_platform / "tools" / relative
-        _regular(source)
-    for relative in SOURCE_TREES:
-        _validate_source_tree(source_platform, relative)
-    for relative in SOURCE_FILES:
-        _regular(source_platform / relative)
-
     stage = PAYLOAD_ROOT / f".{source_sha}.install-{uuid4().hex}"
-    stage.mkdir(mode=0o700)
     temporary_paths: list[Path] = []
+
+    def prepare_trusted_layout() -> None:
+        _trusted_chain(Path("/root"))
+        trusted_parent = TRUSTED_ROOT.parent
+        if os.path.lexists(trusted_parent):
+            _directory(trusted_parent, mode=0o700)
+        else:
+            os.mkdir(trusted_parent, 0o700)
+            os.chown(trusted_parent, 0, 0)
+        if os.path.lexists(TRUSTED_ROOT):
+            _directory(TRUSTED_ROOT, mode=0o700)
+        else:
+            os.mkdir(TRUSTED_ROOT, 0o700)
+            os.chown(TRUSTED_ROOT, 0, 0)
+        _ensure_payload_root()
+
+    def clear_interrupted_state() -> None:
+        _cleanup_temporary_files()
+        _cleanup_staging(apply=True)
+
+    def validate_sources() -> None:
+        _validate_runtime_source(runtime_source)
+        for relative in TOOL_FILES:
+            _regular(source_platform / "tools" / relative)
+        for relative in SOURCE_TREES:
+            _validate_source_tree(source_platform, relative)
+        for relative in SOURCE_FILES:
+            _regular(source_platform / relative)
+
+    _run_install_stage("trusted_layout", prepare_trusted_layout)
+    _run_install_stage("prewrite_cleanup", clear_interrupted_state)
+    _run_install_stage("source_validation", validate_sources)
+
+    active_stage = "payload_stage_build"
+    stage_started_ns = _install_stage_start(active_stage)
     try:
+        stage.mkdir(mode=0o700)
         platform = stage / "platform"
         (platform / "tools").mkdir(mode=0o700, parents=True)
         files: dict[str, str] = {}
@@ -1195,6 +1247,9 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
         tree_digest, actual_files = _tree_digest(stage)
         if actual_files != files:
             raise InstallerError("trusted live-QA staged digest bookkeeping drifted")
+        _install_stage_finish(active_stage, stage_started_ns, "passed")
+        active_stage = "payload_publish"
+        stage_started_ns = _install_stage_start(active_stage)
         target = PAYLOAD_ROOT / source_sha
         if os.path.lexists(target):
             _directory(target, mode=0o555)
@@ -1244,11 +1299,22 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
         # manifest/entrypoints, which every verifier rejects closed; a crash
         # after it leaves the new generation fully addressable.
         _write_active_pointer(target)
+        _install_stage_finish(active_stage, stage_started_ns, "passed")
+        active_stage = "retention"
+        stage_started_ns = _install_stage_start(active_stage)
         _retention(app_dir, apply=True)
+        _install_stage_finish(active_stage, stage_started_ns, "passed")
+        active_stage = "staging_cleanup"
+        stage_started_ns = _install_stage_start(active_stage)
         _cleanup_staging(apply=True)
+        _install_stage_finish(active_stage, stage_started_ns, "passed")
+        active_stage = "final_payload_validation"
+        stage_started_ns = _install_stage_start(active_stage)
         _validate_payload(manifest)
+        _install_stage_finish(active_stage, stage_started_ns, "passed")
         return manifest
     except BaseException:
+        _install_stage_finish(active_stage, stage_started_ns, "failed")
         for temporary in temporary_paths:
             try:
                 if os.path.lexists(temporary):
