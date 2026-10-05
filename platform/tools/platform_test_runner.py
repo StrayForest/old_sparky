@@ -474,6 +474,7 @@ class TimingResult(unittest.TextTestResult):
         self.timed_out = False
         self.timeout_message: str | None = None
         self._started_at: float | None = None
+        self._subtest_outcomes: dict[str, set[str]] = {}
 
     @staticmethod
     def _test_id(test: unittest.case.TestCase) -> str:
@@ -481,7 +482,35 @@ class TimingResult(unittest.TextTestResult):
 
     def startTest(self, test: unittest.case.TestCase) -> None:
         self._started_at = time.perf_counter()
+        self._subtest_outcomes[self._test_id(test)] = set()
         super().startTest(test)
+
+    def addSubTest(
+        self,
+        test: unittest.case.TestCase,
+        subtest: unittest.case.TestCase,
+        err: tuple[type[BaseException], BaseException, object] | None,
+    ) -> None:
+        outcomes = self._subtest_outcomes.setdefault(self._test_id(test), set())
+        if err is None:
+            outcomes.add("passed")
+        elif issubclass(err[0], test.failureException):
+            outcomes.add("failed")
+        else:
+            outcomes.add("error")
+        super().addSubTest(test, subtest, err)
+
+    def stopTest(self, test: unittest.case.TestCase) -> None:
+        outcomes = self._subtest_outcomes.pop(self._test_id(test), set())
+        if outcomes and self._started_at is not None:
+            if "error" in outcomes:
+                outcome = "error"
+            elif "failed" in outcomes:
+                outcome = "failed"
+            else:
+                outcome = "passed"
+            self._record(test, outcome)
+        super().stopTest(test)
 
     def addSuccess(self, test: unittest.case.TestCase) -> None:
         self._record(test, "passed")

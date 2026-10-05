@@ -268,7 +268,15 @@ class MediaSourceStoreTests(unittest.TestCase):
             code_root = base / "runtime"
             media_package = code_root / "python_packages" / "platform_infra" / "media"
             media_package.mkdir(parents=True, mode=0o755)
-            os.chmod(code_root, 0o755)
+            import_path_directories = (
+                code_root,
+                code_root / "python_packages",
+                code_root / "python_packages" / "platform_infra",
+                media_package,
+            )
+            for path in import_path_directories:
+                os.chmod(path, 0o755)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
             shutil.copyfile(
                 Path(__file__).parents[1]
                 / "python_packages/platform_infra/media/source_store.py",

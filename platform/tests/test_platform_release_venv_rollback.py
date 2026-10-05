@@ -63,8 +63,12 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             self.app_dir = self.root / "platform-app"
             self.releases_dir = self.app_dir / "releases"
             self.shared_dir = self.app_dir / "shared"
-            self.releases_dir.mkdir(parents=True)
-            self.shared_dir.mkdir()
+            self.app_dir.mkdir(mode=0o755)
+            self.app_dir.chmod(0o755)
+            self.releases_dir.mkdir(mode=0o755)
+            self.releases_dir.chmod(0o755)
+            self.shared_dir.mkdir(mode=0o755)
+            self.shared_dir.chmod(0o755)
             (self.shared_dir / ".env.platform").write_text("PLATFORM_TESTING=1\n")
             (self.shared_dir / ".env.platform").chmod(0o600)
             self.fake_systemctl = self.root / "systemctl"

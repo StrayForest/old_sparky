@@ -188,9 +188,13 @@ The privileged preflight is fail-closed: normal aggregate execution and
 `backend-privileged` require the root test user; aggregate component-manifest
 verification is the DB-free exception. Media-processor cases also
 require Pillow, `/usr/bin/runuser`, `/usr/bin/test` and the `oldsparky-media`
-group. Wrapper cases additionally require `/usr/bin/setpriv`. Missing
-prerequisites are blocked before tests start and must not be converted into
-skips. The sole intentional strict-contour skip is the exact catalog ID
+group. Mode-sensitive fixtures chmod directories to their exact expected
+modes after creation so checks remain valid under private umask `0077`,
+including each synthetic media import-path directory needed by service users.
+Git clones restore indexed modes before pinned checks; checkout keeps umask modes.
+Wrapper cases additionally require `/usr/bin/setpriv`. Missing prerequisites
+are blocked before tests start and must not be converted into skips. The sole
+intentional strict-contour skip is the exact catalog ID
 `tests.test_platform_live_qa_mailbox_helper.MailboxHelperTests.test_live_shared_env_metadata_matches_reviewed_contour_when_present`,
 with the exact reason `production shared env path is absent`; the catalog
 checks that source declaration and any other skip fails the contour.
@@ -579,16 +583,13 @@ the exact run ID.
 
 The privileged contour owns immutable recovery-bootstrap tests
 (`tests.test_platform_recovery_bootstrap`); backend-tool-contract owns cumulative-baseline
-provenance tests in `tests.test_platform_workflow_provenance`; verification-contract owns failed-report caller tests. Together they cover
-closed bundles, source/archive path and type rejection, exact manifest and
-provenance schemas, content-addressed atomic installation, receipt identity
-and migration-uncertainty guards, missing-candidate and generation-byte
-provenance boundaries, two-phase receipt cleanup retries, and the manual
-workflow's secret/SSH ordering. `tests.test_platform_release_systemd_state`
-adds real subprocess coverage for operation-ID/path/inode mismatch,
-helper-manifest tamper-before-systemd, and rollback-target retry binding;
-`tests.test_platform_release_recovery_boundaries` covers rollback/recovery
-subprocess fault boundaries. The recovery-bootstrap contract also executes the attestation policy fixture with wrong source/ref/run-attempt/job/subject variants, including a recovery-job/evidence/API pairing mutation, and covers the exact legacy-v2 no-systemd cleanup bridge. The workflow is evidence-only and non-deployable; live execution remains an explicit operator recovery action.
+provenance tests in `tests.test_platform_workflow_provenance`. The
+verification-contract contour owns failed-report caller tests and the synthetic `unittest.subTest` accounting regression: multiple failures/errors count as one executed parent ID while native failure/error rows remain in the summary.
+Together the contract tests cover closed bundles, exact manifest/provenance schemas, content-addressed installation, receipt identity, migration-uncertainty guards, and secret/SSH ordering. `tests.test_platform_release_systemd_state`
+adds subprocess coverage for operation-ID/path/inode mismatch, helper-manifest
+tampering and rollback-target retry binding; `tests.test_platform_release_recovery_boundaries`
+covers rollback/recovery subprocess faults. Recovery-bootstrap tests retain
+attestation variants and the legacy-v2 no-systemd cleanup bridge; live execution remains an explicit operator recovery action.
 
 The `docs` gate checks document shape, repository-local links and project skill
 frontmatter/interface metadata. `verification-contract` checks registry/CI

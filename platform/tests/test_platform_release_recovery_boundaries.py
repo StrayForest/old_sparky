@@ -45,8 +45,12 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             self.app_dir = self.root / "platform-app"
             self.releases = self.app_dir / "releases"
             self.shared = self.app_dir / "shared"
-            self.releases.mkdir(parents=True)
-            self.shared.mkdir()
+            self.app_dir.mkdir(mode=0o755)
+            self.app_dir.chmod(0o755)
+            self.releases.mkdir(mode=0o755)
+            self.releases.chmod(0o755)
+            self.shared.mkdir(mode=0o755)
+            self.shared.chmod(0o755)
             (self.shared / ".env.platform").write_text("PLATFORM_TESTING=1\n")
             (self.shared / ".env.platform").chmod(0o600)
         except BaseException:
@@ -4845,7 +4849,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
     def add_release(self, name: str) -> Path:
         release = self.releases / name
-        release.mkdir()
+        release.mkdir(mode=0o755)
+        release.chmod(0o755)
         return release
 
     def add_fake_venv(self, venv: Path, *, marker: str) -> None:
