@@ -120,8 +120,54 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
         self.assertIn("tournament_deadlock_ready_rounds", sql)
         self.assertIn("tournament_deadlock_ready_vote_count_shards", sql)
         self.assertIn("tournament_deadlock_ready_votes", sql)
+        self.assertIn("json_typeof", sql)
+        self.assertIn("json_array_length", sql)
+        self.assertIn("workspace_ready_round_legacy_eligible_user_ids", sql)
+        self.assertNotIn("workspace_ready_round_eligible_user_ids", sql)
         self.assertIn("workspace_base_user_id", statement.compile().params)
         self.assertIn("workspace_base_slug", statement.compile().params)
+
+    def test_ready_check_count_projection_preserves_legacy_json_semantics(self) -> None:
+        count = tournament_routes._workspace_eligible_participant_count
+
+        self.assertEqual(count(0, None), 0)
+        self.assertEqual(count(14, None), 14)
+        self.assertEqual(count(None, None), 0)  # SQL NULL or JSON null
+        self.assertEqual(count(None, []), 0)
+        self.assertEqual(count(None, False), 0)
+        self.assertEqual(count(None, 0), 0)
+        self.assertEqual(count(None, {}), 0)
+        self.assertEqual(count(None, {"duplicate": 1, "kept": 2}), 2)
+        self.assertEqual(count(None, ""), 0)
+        self.assertEqual(count(None, "legacy"), 6)
+        with self.assertRaises(TypeError):
+            count(None, True)
+        with self.assertRaises(TypeError):
+            count(None, 1)
+
+    def test_ready_check_projection_exposes_only_eligible_participant_count(self) -> None:
+        response = tournament_routes._ready_check_state_response_from_preflight(
+            tournament_routes.WorkspaceReadyCheckPreflight(
+                round=tournament_routes.WorkspaceReadyRoundSnapshot(
+                    id=11,
+                    tournament_id="tournament-1",
+                    status="active",
+                    eligible_participant_count=37,
+                    initiated_by_user_id="organizer-1",
+                    created_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+                    closed_at=None,
+                ),
+                ready_count=12,
+                declined_count=4,
+                current_user_choice="yes",
+            )
+        )
+
+        self.assertEqual(response.active_round.eligible_participant_count, 37)
+        self.assertEqual(response.latest_round.eligible_participant_count, 37)
+        self.assertEqual(response.active_round.ready_count, 12)
+        self.assertEqual(response.active_round.declined_count, 4)
+        self.assertEqual(response.active_round.current_user_choice, "yes")
 
     async def test_authenticated_workspace_reuses_base_preflight_access(self) -> None:
         created_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
@@ -259,7 +305,7 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
             id=11,
             tournament_id="tournament-1",
             status="active",
-            eligible_user_ids=["user-1"],
+            eligible_participant_count=1,
             initiated_by_user_id="organizer-1",
             created_at=created_at,
             closed_at=None,
@@ -372,6 +418,10 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(workspace_response.ready_check.active_round.declined_count, 4)
         self.assertEqual(workspace_response.ready_check.active_round.current_user_choice, "yes")
         self.assertEqual(workspace_response.ready_check.latest_round.id, 11)
+        self.assertEqual(
+            workspace_response.ready_check.latest_round.eligible_participant_count,
+            1,
+        )
 
     async def test_conditional_detail_returns_304_from_one_preflight_query(self) -> None:
         updated_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
