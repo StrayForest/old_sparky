@@ -77,11 +77,12 @@ to `dev`. The chain is:
    immutable artifact consumption. The classifier artifact is treated as
    bounded mode-0600 JSON data, never executed as Python; malformed, oversized,
    stale or non-deployable data aborts closed without printing the payload.
-   Both checks use the canonical parser from an immutable trusted `dev`
-   checkout. Before host writes, it rechecks exact `dev` HEAD and aborts if it
-   moved from `TARGET_SHA`. The supervisor validates all archive contents and
-   digests before extracting only candidate `tools/`; the installer
-   independently validates and extracts the complete artifact before smoke.
+   Both checks execute one canonical parser from an immutable trusted `dev`
+   checkout, never candidate source. Immediately before its first
+   production-host write, the workflow re-reads the authoritative `dev` branch
+   head. If `dev` moved from `TARGET_SHA`, the workflow aborts
+   closed; only then does it transfer and install the artifact and run
+   production smoke.
 6. Before the expensive release build, `build-host-tools` resolves the
    repository-owned `platform/contracts/host_tools_pin.json` from the exact
    target source, validates its repository/commit ancestry and closure
@@ -334,8 +335,7 @@ first stop or stage side effect it atomically writes
 `shared/.release-operation.json` in `phase=quiesce-pending` with the original
 API/worker/web/timer state, pointer identities and candidate path. After
 staging, that same receipt is promoted to the operation schema before
-migration. Never print service environments or secrets. For approved cleanup,
-pass every exact dry-run slug via repeated `--expected-candidate` with `--apply`; under lock it aborts before deletion if the set changes. Current/previous and 14-day backup protections remain, and the approved list must not be broadened.
+migration. Never print service environments or secrets. With `--apply`, pass reviewed candidate slugs; under lock, set drift aborts before deletion. Current/previous and 14-day backup protections remain.
 
 The production deploy workflow acquires the release lock before the retained
 load lock (`/run/lock/oldsparky-retained-load-matrix.lock`) and keeps both

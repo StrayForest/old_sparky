@@ -20,7 +20,7 @@ Read this file for the current production baseline and next engineering priority
   markers, active health, three HTTP 200s, managed-QA T tree (966 files; SHA
   `cc797eb6d7603b0aa7c6dc3de0cff5149eb3e5be6e3e498b9296d48462ccddf9`) and DB
   head `20260913_0053`.
-- Read-only storage run [`37359027285`](https://github.com/StrayForest/old_sparky/actions/runs/37359027285) reports healthy services/locks and 6,824,091,648 free bytes (83%) after cache-only cleanup; no release or backup was deleted.
+- Storage diagnostic [`37359027285`](https://github.com/StrayForest/old_sparky/actions/runs/37359027285): healthy services/locks; 6,824,091,648 B free (83%) after cache-only cleanup; no release or backup was deleted.
 - Host-tools S11 (`138128c99025069143f5c234f6cb58545ed8ab1c`) is installed;
   all 15 members, no bytecode and receipt SHA-256 `2f182be1aaf90ee56ed83f7c755e4f38ec860d6f7f20e2ae003084c1a0a7c3f7` passed.
   S10, S9 and recovery generation
@@ -122,7 +122,8 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-Current next step: finish exact-SHA gates and rerun the unchanged authenticated-page load; the follow-up candidate is not deployed or load-tested. The historical production performance stage completed on 2026-09-07 against deployed SHA `bba3fb278e348906a6942aee8462b758c3d616ef`. The measurement
+Current next step: finish exact-SHA gates, then rerun the unchanged authenticated-page load; the follow-up candidate is not deployed or load-tested.
+The historical production performance stage completed on 2026-09-07 against deployed SHA `bba3fb278e348906a6942aee8462b758c3d616ef`. The measurement
 boundary and retained-load runtime contour were corrected, then the exact
 13-profile matrix was rerun with the original contracts, thresholds and
 dataset sizes; lifecycle profiles were not run on production. The complete

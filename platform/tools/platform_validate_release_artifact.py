@@ -725,7 +725,6 @@ def _extract_validated_archive(
     *,
     release_slug: str,
     extract_to: Path,
-    bootstrap_tools_only: bool = False,
 ) -> None:
     destination_root = _safe_root_directory(
         extract_to, label="release extraction directory", writable=True
@@ -733,28 +732,6 @@ def _extract_validated_archive(
     release_root = destination_root / release_slug
     if os.path.lexists(release_root):
         raise ArtifactError("release extraction target already exists")
-
-    if bootstrap_tools_only:
-        tools_root = f"{release_slug}/tools"
-        selected = [
-            member
-            for member in members
-            if member.name == release_slug
-            or member.name == tools_root
-            or member.name.startswith(f"{tools_root}/")
-        ]
-        if not any(member.name == tools_root and member.isdir() for member in selected):
-            raise ArtifactError("release archive is missing its bootstrap tools tree")
-        selected_names = {member.name for member in selected}
-        for member in selected:
-            if not member.issym():
-                continue
-            target = _contained_link_target(member, release_slug=release_slug)
-            if str(target) not in selected_names:
-                raise ArtifactError(
-                    "bootstrap tools symlink target is outside its subtree"
-                )
-        members = selected
 
     directories = sorted(
         (member for member in members if member.isdir()),
@@ -793,12 +770,9 @@ def validate_archive(
     *,
     release_slug: str,
     extract_to: Path | None = None,
-    extract_bootstrap_tools_to: Path | None = None,
 ) -> dict[str, object]:
     if SLUG_PATTERN.fullmatch(release_slug) is None:
         raise ArtifactError("release slug is invalid")
-    if extract_to is not None and extract_bootstrap_tools_to is not None:
-        raise ArtifactError("release extraction modes are mutually exclusive")
     try:
         with tarfile.open(artifact, mode="r:gz") as archive:
             members: list[tarfile.TarInfo] = []
@@ -834,14 +808,6 @@ def validate_archive(
                     release_slug=release_slug,
                     extract_to=extract_to,
                 )
-            elif extract_bootstrap_tools_to is not None:
-                _extract_validated_archive(
-                    archive,
-                    members,
-                    release_slug=release_slug,
-                    extract_to=extract_bootstrap_tools_to,
-                    bootstrap_tools_only=True,
-                )
             return release_payload
     except ArtifactError:
         raise
@@ -857,9 +823,7 @@ def main() -> int:
     parser.add_argument("--checksum", type=Path, required=True)
     parser.add_argument("--release-slug", required=True)
     parser.add_argument("--expected-source-commit")
-    extraction = parser.add_mutually_exclusive_group()
-    extraction.add_argument("--extract-to", type=Path)
-    extraction.add_argument("--extract-bootstrap-tools-to", type=Path)
+    parser.add_argument("--extract-to", type=Path)
     args = parser.parse_args()
     try:
         if os.geteuid() != 0:
@@ -869,19 +833,13 @@ def main() -> int:
             args.artifact,
             release_slug=args.release_slug,
             extract_to=args.extract_to,
-            extract_bootstrap_tools_to=args.extract_bootstrap_tools_to,
         )
         if args.expected_source_commit is not None:
             if not COMMIT_PATTERN.fullmatch(args.expected_source_commit):
                 raise ArtifactError("expected source commit is invalid")
             if release_payload.get("source_git_commit") != args.expected_source_commit:
                 raise ArtifactError("release source commit does not match expected commit")
-        if args.extract_to is not None:
-            action = "extracted"
-        elif args.extract_bootstrap_tools_to is not None:
-            action = "bootstrap tools extracted"
-        else:
-            action = "validated"
+        action = "extracted" if args.extract_to is not None else "validated"
         print(
             f"Release artifact checksum, layout, and metadata are valid; {action} safely."
         )

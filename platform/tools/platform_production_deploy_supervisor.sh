@@ -578,7 +578,7 @@ fi
   --artifact "$artifact_path" \
   --checksum "$artifact_checksum" \
   --release-slug "$artifact_slug" \
-  --extract-bootstrap-tools-to "$bootstrap_dir" \
+  --extract-to "$bootstrap_dir" \
   >/dev/null 2>/dev/null \
   || {
     set_failure_context artifact artifact validation_failed

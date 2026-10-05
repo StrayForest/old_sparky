@@ -275,9 +275,8 @@ The privileged release tests also prove promoted venv dependencies remain
 readable by service identities, candidate cache cleanup stays receipt-,
 readiness- and loaded-cgroup-bound, and runtime-config summaries cannot
 pollute the strict deployment marker stream.
-Release artifact tests own full-validation-before-tools-only extraction; the deployment
-contract test traps the bootstrap entrypoint at a layout boundary; retention
-tests own locked candidate-set rechecks. All belong to `backend-privileged`.
+Release retention tests own locked candidate-set rechecks and belong to
+`backend-privileged`.
 
 The `platform-host-tools-candidate.yml` workflow is a separate trusted `workflow_run` contract, not
 a production gate. Its validator and bundle tests belong to `backend-tool-contract` through
