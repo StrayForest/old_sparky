@@ -189,7 +189,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         cleanup_source = workflow_modes[2][0]
         deploy_source = workflow_modes[3][0]
         self.assertLess(
-            external_source.index("platform_workflow_input_guard.py external"),
+            external_source.index("validate_external_payload(payload)"),
             external_source.index('printf \'%s\\n\' "$PROD_SSH_KEY"'),
         )
         self.assertLess(
