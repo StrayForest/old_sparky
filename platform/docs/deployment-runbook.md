@@ -248,40 +248,39 @@ is a failed health result, never a successful readiness signal.
 
 ### Manual workflow fallback
 
-`Platform production deploy` keeps `workflow_dispatch` as an operator fallback,
-not as the normal release path. Use manual dispatch only when an operator has an
-explicit reason to repeat preflight/deploy for the current reviewed `dev` HEAD
-or when diagnosing the automatic contour. The same exact-SHA
-`platform-security-build=success` and deployable classifier artifact gates still
-apply to `mode=deploy`; provide the originating security `run_id` and
-`run_attempt`. A missing, malformed, fallback or non-deployable manifest blocks
-deployment. `mode=baseline-reconcile` is accepted only from the validated
-automatic chain and is never an operator fallback. `mode=preflight` remains
-available without that release artifact guard and performs no install.
+`Platform production deploy` keeps `workflow_dispatch` for diagnosis or a reviewed current `dev` HEAD; it is not the normal release path.
+`mode=deploy` requires exact-SHA security success and a deployable classifier; provide its
+source `run_id`/`run_attempt`. `mode=baseline-reconcile` is automatic-only;
+`mode=preflight` performs no install.
 
-Deploy and preflight require immutable host-tools; a bump's exact full CI must pass on pin-bearing **P** descended from **C**.
-Normally `mode=preflight` at **P** builds and attests **C**. A natural
-production builder artifact also qualifies if exact source CI, auto caller and
-host contract passed, and capability failed solely because **C** was absent
-before app build/attestation, pending status, transfer or protected writes.
-Bind exact attempts, builder job, artifact, attestation and both SHAs before
-root-only provisioning; retain the prior generation and verify its inventory.
+`mode=recovery-deploy` is a separate operator exception for exact failed
+attempt **R.A** proven by its bounded private plain-text job log to be the report-only invalid-marker case. Dispatch
+against current reviewed **T** with exact failed and successful source-security
+run/attempt pairs and `report_only_confirmation=RECOVERY_DEPLOY_REPORT_ONLY_INVALID_MARKER`.
+All full security jobs, both real runtime jobs, the closed bootstrap classifier,
+cumulative no-op check, **S11** baseline and lock-held tuple recheck are required.
+It performs a fresh ordinary **T** build/install; only new **T** success is green and **R** remains
+failed. Never rerun **R** or invoke an installer.
+See the [recovery-bootstrap ADR](adr/recovery-bootstrap-retained-abort.md#operator-recovery-deployment-for-a-report-only-invalid-marker)
+for the exact evidence and tuple contract.
 
-After self-testing **C**, rerun all jobs on the exact auto-deploy run only if
-**P** remains `dev`, source proof and host tuple are unchanged, and no operation
-is pending. This advances the auto attempt and creates a fresh child; verify
-both run IDs/attempts and success markers. Otherwise use the automatic chain; never manually deploy/reconcile or rerun a failed child.
+Deploy/preflight require immutable host-tools and exact full CI on pin-bearing **P** descended from **C**.
+Normally preflight at **P** builds and attests **C**. A natural artifact qualifies only if source CI,
+auto caller and host contract passed, and capability failed solely because **C** was absent before
+app build/attestation, pending status, transfer or protected writes. Bind attempts, builder job,
+artifact, attestation and SHAs before root-only provisioning; retain and verify the prior generation.
 
-After a verified pre-install preflight failure, one all-jobs rerun of the exact
-auto-deploy run is allowed only if its target is still current `dev` with
-successful source CI, the baseline/pointers are unchanged, no transaction is
-pending, locks are free, and backup/edge/config/readiness/host checks pass.
-This must create a fresh child; never rerun only child/jobs or manually dispatch.
-Stop if the predicate fails again or the failure stage is unclear.
-Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly
-for a normal release. Those commands are implementation details of the
-workflow; direct server execution is limited to an explicitly authorized
-recovery or rollback.
+After self-testing **C**, rerun all jobs on its exact auto-deploy run only while **P** remains `dev`,
+source proof and host tuple are unchanged, and no operation is pending. This creates a fresh child;
+verify its run IDs/attempts and success markers. Otherwise use the automatic chain; never manually
+deploy/reconcile or rerun a failed child.
+
+After a verified pre-install failure, allow one all-jobs rerun only if the exact auto target remains
+current `dev`, source CI succeeds, baseline is unchanged, no transaction is pending, locks are free,
+and backup/edge/config/readiness/host checks pass. Require a fresh child; never rerun child/jobs or
+manually dispatch. Stop if it fails again or the stage is unclear.
+Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly for a normal release.
+They are workflow implementation details; direct server execution is limited to explicitly authorized recovery or rollback.
 
 ### Service preflight recovery
 

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run production preflight only or perform the full immutable deployment"
+        description: "Run preflight, a normal deployment, baseline reconciliation, or report-only recovery deployment"
         required: true
         default: preflight
         type: choice
@@ -15,6 +15,7 @@ on:
           - preflight
           - deploy
           - baseline-reconcile
+          - recovery-deploy
       runtime_profile:
         description: "Reviewed runtime capacity profile to apply after deployment"
         required: true
@@ -72,6 +73,21 @@ on:
         required: false
         default: ""
         type: string
+      failed_deploy_run_id:
+        description: "Exact failed production deployment run to reconcile (recovery-deploy only)"
+        required: false
+        default: ""
+        type: string
+      failed_deploy_run_attempt:
+        description: "Exact failed production deployment attempt (recovery-deploy only)"
+        required: false
+        default: ""
+        type: string
+      report_only_confirmation:
+        description: "Typed confirmation after verifying the exact report-only invalid-marker diagnostic"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -102,6 +118,9 @@ jobs:
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
       AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
       AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+      FAILED_DEPLOY_RUN_ID: ${{ inputs.failed_deploy_run_id }}
+      FAILED_DEPLOY_RUN_ATTEMPT: ${{ inputs.failed_deploy_run_attempt }}
+      REPORT_ONLY_CONFIRMATION: ${{ inputs.report_only_confirmation }}
       RELEASE_SLUG_BASE: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -110,7 +129,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$DEPLOY_MODE" in
-            preflight|deploy|baseline-reconcile) ;;
+            preflight|deploy|baseline-reconcile|recovery-deploy) ;;
             *) echo "Unsupported deployment mode; refusing a green no-op." >&2; exit 1 ;;
           esac
           if [[ "$DEPLOY_MODE" == "baseline-reconcile" ]]; then
@@ -128,6 +147,32 @@ jobs:
               echo "Baseline reconciliation requires the exact automatic caller attempt." >&2
               exit 1
             }
+          fi
+          if [[ "$DEPLOY_MODE" == "recovery-deploy" ]]; then
+            [[ "$DISPATCH_ACTOR" != "github-actions[bot]" ]] || {
+              echo "Report-only recovery requires an authorized operator dispatch." >&2
+              exit 1
+            }
+            [[ "$FAILED_DEPLOY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+              && "$FAILED_DEPLOY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
+              && "$FAILED_DEPLOY_RUN_ID" != "$GITHUB_RUN_ID" ]] || {
+              echo "Recovery requires the exact prior failed deployment attempt." >&2
+              exit 1
+            }
+            [[ "$CLASSIFIER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ \
+              && "$CLASSIFIER_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ \
+              && "$CLASSIFIER_RUN_ID" != "$GITHUB_RUN_ID" \
+              && -z "$AUTODEPLOY_RUN_ID" && -z "$AUTODEPLOY_RUN_ATTEMPT" ]] || {
+              echo "Recovery requires a distinct exact security run and no automatic caller." >&2
+              exit 1
+            }
+            [[ "$REPORT_ONLY_CONFIRMATION" == "RECOVERY_DEPLOY_REPORT_ONLY_INVALID_MARKER" ]] || {
+              echo "Recovery confirmation does not match the closed report-only case." >&2
+              exit 1
+            }
+          elif [[ -n "$FAILED_DEPLOY_RUN_ID" || -n "$FAILED_DEPLOY_RUN_ATTEMPT" || -n "$REPORT_ONLY_CONFIRMATION" ]]; then
+            echo "Report-only recovery inputs are only valid for recovery-deploy." >&2
+            exit 1
           fi
           case "$RUNTIME_PROFILE" in
             baseline|ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-cprofile|ready-vote-static-12|ready-vote-static-16|ready-vote-adaptive-v2|api-3x16|api-1x48|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|web-ssr-diagnostics|web-ssr-native-transport|web-ssr-workers-2|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24) ;;
@@ -158,7 +203,7 @@ jobs:
           # The candidate parser is used only on this secret-free runner.  All
           # secret-bearing consumers independently validate the JSON schema.
           handoff_mode="$DEPLOY_MODE"
-          [[ "$handoff_mode" != "baseline-reconcile" ]] || handoff_mode=deploy
+          [[ "$handoff_mode" != "baseline-reconcile" && "$handoff_mode" != "recovery-deploy" ]] || handoff_mode=deploy
           /usr/bin/python3 platform/tools/platform_workflow_input_guard.py deployment \
             --output "$RUNNER_TEMP/platform-production-deploy-input.json" \
             --mode "$handoff_mode" \
@@ -194,11 +239,12 @@ jobs:
     name: Validate exact classifier artifact before build
     outputs:
       incremental_manifest_b64: ${{ steps.validate_manifest.outputs.manifest_b64 }}
+      trusted_classifier_sha: ${{ steps.trusted_classifier_default.outputs.sha }}
     needs: validate-dispatch
     if: >-
       needs.validate-dispatch.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      (inputs.mode == 'deploy' || inputs.mode == 'baseline-reconcile')
+      (inputs.mode == 'deploy' || inputs.mode == 'baseline-reconcile' || inputs.mode == 'recovery-deploy')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -211,6 +257,7 @@ jobs:
       # release-builder mode.
       DEPLOY_MODE: deploy
       RECONCILE_MODE: ${{ inputs.mode == 'baseline-reconcile' && 'true' || 'false' }}
+      RECOVERY_DEPLOY_MODE: ${{ inputs.mode == 'recovery-deploy' && 'true' || 'false' }}
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
       AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
@@ -550,6 +597,9 @@ jobs:
           if [[ "$RECONCILE_MODE" == "true" ]]; then
             manifest_args+=(--require-reconcile-source)
           fi
+          if [[ "$RECOVERY_DEPLOY_MODE" == "true" ]]; then
+            manifest_args+=(--require-recovery-bootstrap --require-runtime-sensitive)
+          fi
           manifest_b64="$(/usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" "${manifest_args[@]}")"
           (( ${#manifest_b64} > 0 && ${#manifest_b64} <= 350000 ))
           [[ "$manifest_b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
@@ -573,7 +623,7 @@ jobs:
     if: >-
       needs.validate-dispatch.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      (inputs.mode == 'deploy' || inputs.mode == 'preflight' || inputs.mode == 'baseline-reconcile')
+      (inputs.mode == 'deploy' || inputs.mode == 'preflight' || inputs.mode == 'baseline-reconcile' || inputs.mode == 'recovery-deploy')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -784,7 +834,7 @@ jobs:
       needs.validate-dispatch.result == 'success' &&
       needs.build-host-tools.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      (inputs.mode == 'deploy' || inputs.mode == 'preflight' || inputs.mode == 'baseline-reconcile')
+      (inputs.mode == 'deploy' || inputs.mode == 'preflight' || inputs.mode == 'baseline-reconcile' || inputs.mode == 'recovery-deploy')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
@@ -1473,7 +1523,7 @@ jobs:
 
       - name: Read active production baseline for reconciliation
         id: active-baseline
-        if: ${{ inputs.mode == 'baseline-reconcile' }}
+        if: ${{ inputs.mode == 'baseline-reconcile' || inputs.mode == 'recovery-deploy' }}
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -1876,6 +1926,8 @@ jobs:
           cumulative_no_op = cumulative_result["no_op"]
           if not isinstance(cumulative, dict) or type(cumulative_no_op) is not bool:
               raise SystemExit("cumulative classifier result is malformed")
+          if cumulative_no_op is not True or cumulative.get("runtime_sensitive") is not True:
+              raise SystemExit("recovery target is not a runtime-sensitive cumulative no-op route")
           manifest_bytes = json.dumps(
               cumulative, sort_keys=True, separators=(",", ":")
           ).encode("utf-8")
@@ -1896,6 +1948,518 @@ jobs:
           target_source="$GITHUB_WORKSPACE"
           test "$(git -C "$target_source" rev-parse HEAD)" = "$TARGET_SHA"
           git -C "$target_source" status --porcelain=v1 --untracked-files=all -- platform
+
+  validate-recovery-baseline:
+    name: Authenticate exact report-only failed release and active baseline
+    needs:
+      - validate-dispatch
+      - validate-classifier
+      - host-capability-preflight
+    if: >-
+      !cancelled() &&
+      needs.validate-dispatch.result == 'success' &&
+      needs.validate-classifier.result == 'success' &&
+      needs.host-capability-preflight.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'recovery-deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+      statuses: read
+    outputs:
+      active_baseline_sha: ${{ steps.verify_recovery.outputs.active_baseline_sha }}
+      failed_release_json_sha256: ${{ steps.verify_recovery.outputs.failed_release_json_sha256 }}
+      cumulative_manifest_sha256: ${{ steps.verify_recovery.outputs.cumulative_manifest_sha256 }}
+      cumulative_no_op: ${{ steps.verify_recovery.outputs.cumulative_no_op }}
+      runtime_required: ${{ steps.verify_recovery.outputs.runtime_required }}
+      source_security_attempt_url: ${{ steps.verify_recovery.outputs.source_security_attempt_url }}
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      FAILED_RUN_ID: ${{ inputs.failed_deploy_run_id }}
+      FAILED_RUN_ATTEMPT: ${{ inputs.failed_deploy_run_attempt }}
+      CONFIRMATION: ${{ inputs.report_only_confirmation }}
+      ACTIVE_BASELINE_JSON: ${{ needs.host-capability-preflight.outputs.baseline_identity }}
+      INCREMENTAL_MANIFEST_B64: ${{ needs.validate-classifier.outputs.incremental_manifest_b64 }}
+    steps:
+      - name: Checkout exact reviewed recovery target
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Collect bounded exact failed-attempt API evidence
+        id: failed_attempt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SECURITY_RUN_ID: ${{ inputs.classifier_run_id }}
+          SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          /usr/bin/python3 - "$RUNNER_TEMP/recovery-proof" "$GH_TOKEN" "$GITHUB_API_URL" "$GITHUB_REPOSITORY" "$FAILED_RUN_ID" "$FAILED_RUN_ATTEMPT" "$TARGET_SHA" "$SOURCE_SECURITY_RUN_ID" "$SOURCE_SECURITY_RUN_ATTEMPT" <<'PY'
+          from __future__ import annotations
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          output, token, api, repo, run_id, attempt, target, security_id, security_attempt = sys.argv[1:]
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_workflow_provenance import collect_github_api_pages
+          if (api != "https://api.github.com" or repo != "StrayForest/old_sparky"
+              or re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None
+              or re.fullmatch(r"[1-9][0-9]{0,31}", attempt) is None
+              or re.fullmatch(r"[0-9a-f]{40}", target) is None
+              or re.fullmatch(r"[1-9][0-9]{0,31}", security_id) is None
+              or re.fullmatch(r"[1-9][0-9]{0,31}", security_attempt) is None or not token):
+              raise SystemExit("recovery evidence identity is malformed")
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, new_url):
+                  raise URLError("redirect rejected")
+          opener = build_opener(NoRedirect())
+          root = Path(output)
+          root.mkdir(mode=0o700)
+          def fetch(path: str, limit: int = 8 * 1024 * 1024) -> dict:
+              if not path.startswith("/") or ".." in path.split("/"):
+                  raise SystemExit("recovery API path is invalid")
+              request = Request(api + "/repos/" + repo + path, headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              try:
+                  with opener.open(request, timeout=20) as response:
+                      if response.geturl() != request.full_url:
+                          raise SystemExit("recovery API URL changed")
+                      raw = response.read(limit + 1)
+              except (HTTPError, URLError, TimeoutError, OSError):
+                  raise SystemExit("recovery API request failed") from None
+              if len(raw) > limit:
+                  raise SystemExit("recovery API response exceeded its bound")
+              try:
+                  value = json.loads(raw)
+              except (UnicodeError, json.JSONDecodeError):
+                  raise SystemExit("recovery API response is malformed") from None
+              if not isinstance(value, dict):
+                  raise SystemExit("recovery API object is malformed")
+              return value
+          def pages(path: str, key: str, *, rows_limit: int = 10000) -> list[dict]:
+              def fetch_page(page: int):
+                  separator = "&" if "?" in path else "?"
+                  return fetch_raw(f"{path}{separator}per_page=100&page={page}")
+              try:
+                  return list(collect_github_api_pages(
+                      fetch_page, collection_key=key, rows_limit=rows_limit,
+                  ))
+              except ValueError as exc:
+                  raise SystemExit("recovery API pagination failed closed") from exc
+          def fetch_raw(path: str, limit: int = 8 * 1024 * 1024):
+              if not path.startswith("/") or ".." in path.split("/"):
+                  raise SystemExit("recovery API path is invalid")
+              request = Request(api + "/repos/" + repo + path, headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              try:
+                  with opener.open(request, timeout=20) as response:
+                      if response.geturl() != request.full_url:
+                          raise SystemExit("recovery API URL changed")
+                      raw = response.read(limit + 1)
+              except (HTTPError, URLError, TimeoutError, OSError):
+                  raise SystemExit("recovery API request failed") from None
+              if len(raw) > limit:
+                  raise SystemExit("recovery API response exceeded its bound")
+              try:
+                  return json.loads(raw)
+              except (UnicodeError, json.JSONDecodeError):
+                  raise SystemExit("recovery API response is malformed") from None
+          workflow = fetch("/actions/workflows/platform-production-deploy.yml")
+          run = fetch(f"/actions/runs/{run_id}/attempts/{attempt}")
+          jobs = pages(f"/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+          source = run.get("head_sha")
+          if not isinstance(source, str) or re.fullmatch(r"[0-9a-f]{40}", source) is None:
+              raise SystemExit("failed deployment source is malformed")
+          statuses = pages(f"/commits/{source}/statuses", "statuses")
+          security_workflow = fetch("/actions/workflows/platform-security.yml")
+          security_run = fetch(f"/actions/runs/{security_id}/attempts/{security_attempt}")
+          security_source = security_run.get("head_sha")
+          if not isinstance(security_source, str):
+              raise SystemExit("source security target is malformed")
+          security_jobs = pages(f"/actions/runs/{security_id}/attempts/{security_attempt}/jobs", "jobs")
+          security_statuses = pages(f"/commits/{security_source}/statuses", "statuses")
+          current_dev = fetch("/git/ref/heads/dev")
+          artifacts = pages(f"/actions/runs/{run_id}/artifacts", "artifacts")
+          expected_name = f"platform-release-artifact-{run_id}-{attempt}"
+          matches = [row for row in artifacts if isinstance(row, dict) and row.get("name") == expected_name]
+          if len(matches) != 1:
+              raise SystemExit("failed deployment release artifact is missing or ambiguous")
+          artifact = matches[0]
+          artifact_run = artifact.get("workflow_run")
+          artifact_list_id = artifact.get("id")
+          artifact_list_digest = artifact.get("digest")
+          artifact_list_size = artifact.get("size_in_bytes")
+          if (not isinstance(artifact_run, dict)
+              or type(artifact_list_id) is not int or artifact_list_id <= 0
+              or not isinstance(artifact_list_digest, str)
+              or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_list_digest) is None
+              or type(artifact_list_size) is not int or not 0 < artifact_list_size <= 2 * 1024 * 1024 * 1024
+              or ("run_attempt" in artifact_run and artifact_run.get("run_attempt") != int(attempt))):
+              raise SystemExit("failed deployment artifact run binding is malformed")
+          if (artifact.get("expired") is not False or artifact_run.get("id") != int(run_id)
+              or artifact_run.get("head_sha") != source):
+              raise SystemExit("failed deployment release artifact is not run-bound")
+          metadata = fetch(f"/actions/artifacts/{artifact.get('id')}")
+          artifact_id = metadata.get("id")
+          artifact_digest = metadata.get("digest")
+          artifact_size = metadata.get("size_in_bytes")
+          if (type(artifact_id) is not int or artifact_id <= 0 or artifact_id > 10**32 - 1
+              or not isinstance(artifact_digest, str)
+              or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_digest) is None
+              or type(artifact_size) is not int or not 0 < artifact_size <= 2 * 1024 * 1024 * 1024):
+              raise SystemExit("failed deployment artifact output fields are malformed")
+          if (metadata.get("id") != artifact.get("id") or metadata.get("name") != expected_name
+              or metadata.get("expired") is not False or metadata.get("digest") != artifact.get("digest")
+              or ("run_attempt" in metadata.get("workflow_run", {})
+                  and metadata["workflow_run"].get("run_attempt") != int(attempt))
+              or metadata.get("workflow_run", {}).get("id") != int(run_id)
+              or metadata.get("workflow_run", {}).get("head_sha") != source
+              or metadata.get("size_in_bytes") != artifact.get("size_in_bytes")):
+              raise SystemExit("failed deployment artifact metadata changed")
+          for name, value in (("workflow.json", workflow), ("run.json", run),
+                              ("jobs.json", {"jobs": jobs}), ("statuses.json", {"statuses": statuses}),
+                              ("artifact.json", metadata), ("security-workflow.json", security_workflow),
+                              ("security-run.json", security_run), ("security-jobs.json", {"jobs": security_jobs}),
+                              ("security-statuses.json", {"statuses": security_statuses}),
+                              ("dev-ref.json", current_dev)):
+              path = root / name
+              path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+              os.chmod(path, 0o600)
+          job_matches = [job for job in jobs if isinstance(job, dict) and job.get("name") == "Deploy production"]
+          if len(job_matches) != 1:
+            raise SystemExit("failed production job identity is missing or ambiguous")
+          failed_job = job_matches[0]
+          if (type(failed_job.get("id")) is not int or failed_job["id"] <= 0
+              or type(failed_job.get("run_id")) is not int or failed_job["run_id"] != int(run_id)
+              or failed_job.get("head_sha") != source
+              or ("run_attempt" in failed_job
+                  and (type(failed_job.get("run_attempt")) is not int
+                       or failed_job.get("run_attempt") != int(attempt)))):
+              raise SystemExit("failed production job is not bound to the exact failed attempt")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="ascii") as stream:
+              stream.write(f"source_sha={source}\n")
+              stream.write(f"artifact_id={artifact_id}\n")
+              stream.write(f"artifact_digest={artifact_digest}\n")
+              stream.write(f"artifact_size={artifact_size}\n")
+              stream.write(f"deploy_job_id={failed_job['id']}\n")
+          PY
+
+      - name: Download authenticated failed-job and release evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "${{ steps.failed_attempt.outputs.artifact_id }}" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "${{ steps.failed_attempt.outputs.artifact_size }}" =~ ^[1-9][0-9]{0,15}$ ]]
+          [[ "${{ steps.failed_attempt.outputs.deploy_job_id }}" =~ ^[1-9][0-9]{0,31}$ ]]
+          curl --fail-with-body --silent --show-error --location --max-filesize 16777216 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/jobs/${{ steps.failed_attempt.outputs.deploy_job_id }}/logs" \
+            --output "$RUNNER_TEMP/recovery-proof/failed-job-logs.txt"
+          curl --fail-with-body --silent --show-error --location --max-filesize 2147483648 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${{ steps.failed_attempt.outputs.artifact_id }}/zip" \
+            --output "$RUNNER_TEMP/recovery-proof/release-artifact.zip"
+
+      - name: Validate failed marker, report-only diagnostic, signed release, and live baseline
+        id: verify_recovery
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED_SOURCE_SHA: ${{ steps.failed_attempt.outputs.source_sha }}
+          FAILED_ARTIFACT_ID: ${{ steps.failed_attempt.outputs.artifact_id }}
+          FAILED_ARTIFACT_DIGEST: ${{ steps.failed_attempt.outputs.artifact_digest }}
+          FAILED_ARTIFACT_SIZE: ${{ steps.failed_attempt.outputs.artifact_size }}
+          SOURCE_SECURITY_RUN_ID: ${{ inputs.classifier_run_id }}
+          SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          proof="$RUNNER_TEMP/recovery-proof"
+          /usr/bin/python3 platform/tools/platform_workflow_provenance.py failed-deployment \
+            --workflow "$proof/workflow.json" --run "$proof/run.json" \
+            --status "$proof/statuses.json" --jobs "$proof/jobs.json" \
+            --expected-run-id "$FAILED_RUN_ID" --expected-attempt "$FAILED_RUN_ATTEMPT" \
+            --expected-target-sha "$FAILED_SOURCE_SHA" \
+            --remote-log-text "$proof/failed-job-logs.txt" >/dev/null
+          failed_slug="gha-${FAILED_RUN_ID}-${FAILED_RUN_ATTEMPT}-${FAILED_SOURCE_SHA:0:12}"
+          outer="$proof/release-artifact.zip"
+          artifact_meta="$proof/artifact.json"
+          /usr/bin/python3 - "$outer" "$artifact_meta" "$FAILED_ARTIFACT_DIGEST" "$FAILED_ARTIFACT_SIZE" "$failed_slug" "$FAILED_SOURCE_SHA" "$proof" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+          import zipfile
+
+          outer, metadata_path, digest, size, slug, source, destination = sys.argv[1:]
+          outer_path = Path(outer)
+          before = outer_path.lstat()
+          metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          expected = str(metadata.get("digest", ""))
+          if not expected.startswith("sha256:") or digest != expected or re.fullmatch(r"sha256:[0-9a-f]{64}", expected) is None:
+              raise SystemExit("failed artifact digest metadata is invalid")
+          if type(metadata.get("size_in_bytes")) is not int or str(metadata["size_in_bytes"]) != size or before.st_size != metadata["size_in_bytes"]:
+              raise SystemExit("failed artifact size does not match GitHub metadata")
+          if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_nlink != 1:
+              raise SystemExit("failed artifact archive metadata is unsafe")
+          outer_digest = hashlib.sha256()
+          with outer_path.open("rb") as outer_stream:
+              for chunk in iter(lambda: outer_stream.read(1024 * 1024), b""):
+                  outer_digest.update(chunk)
+          if outer_digest.hexdigest() != expected.removeprefix("sha256:"):
+              raise SystemExit("failed artifact archive digest mismatch")
+          expected_names = {f"{slug}.tar.gz", f"{slug}.tar.gz.sha256", "RELEASE.provenance.json"}
+          try:
+              with zipfile.ZipFile(outer_path, "r", allowZip64=False) as archive:
+                  infos = archive.infolist()
+                  if {item.filename for item in infos} != expected_names or len(infos) != 3:
+                      raise SystemExit("failed release artifact inventory is not exact")
+                  members = {}
+                  for info in infos:
+                      kind = (info.external_attr >> 16) & 0o170000
+                      if info.is_dir() or kind not in {0, stat.S_IFREG} or info.file_size > 2 * 1024 * 1024 * 1024:
+                          raise SystemExit("failed release artifact member is unsafe")
+                      if info.filename != f"{slug}.tar.gz":
+                          members[info.filename] = archive.read(info)
+                      else:
+                          tar_path = Path(destination) / info.filename
+                          fd = os.open(tar_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                          member_digest = hashlib.sha256()
+                          written = 0
+                          try:
+                              with archive.open(info, "r") as member_stream:
+                                  while True:
+                                      chunk = member_stream.read(1024 * 1024)
+                                      if not chunk:
+                                          break
+                                      written += len(chunk)
+                                      if written > info.file_size:
+                                          raise SystemExit("failed release artifact member exceeded its size")
+                                      member_digest.update(chunk)
+                                      view = memoryview(chunk)
+                                      while view:
+                                          count = os.write(fd, view)
+                                          if count <= 0:
+                                              raise SystemExit("failed release artifact staging failed")
+                                          view = view[count:]
+                              if written != info.file_size:
+                                  raise SystemExit("failed release artifact member was truncated")
+                              os.fsync(fd)
+                          finally:
+                              os.close(fd)
+                          members[info.filename] = (member_digest.hexdigest(), written)
+          except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+              raise SystemExit("failed release artifact archive is invalid") from None
+          tar_name = f"{slug}.tar.gz"
+          tar_sha, tar_size = members[tar_name]
+          if members[f"{tar_name}.sha256"].decode("ascii", "strict") != f"{tar_sha}  {tar_name}\n":
+              raise SystemExit("failed release artifact checksum contract is invalid")
+          provenance = json.loads(members["RELEASE.provenance.json"])
+          if set(provenance) != {"schema", "artifact_file", "artifact_sha256", "source_git_commit"} or provenance.get("schema") != 1 or provenance.get("artifact_file") != tar_name or provenance.get("artifact_sha256") != tar_sha or provenance.get("source_git_commit") != source:
+              raise SystemExit("failed release provenance does not bind the exact run")
+          tar_path = Path(destination) / tar_name
+          if not tar_path.is_file() or tar_path.is_symlink() or tar_path.stat().st_size != tar_size:
+              raise SystemExit("failed release artifact tar staging is unsafe")
+          checksum_path = Path(destination) / f"{tar_name}.sha256"
+          checksum_path.write_bytes(members[f"{tar_name}.sha256"])
+          os.chmod(checksum_path, 0o600)
+          print(f"release_archive={tar_path}")
+          PY
+          release_archive="$proof/$failed_slug.tar.gz"
+          FAILED_RELEASE_JSON_SHA256="$(/usr/bin/python3 - "$release_archive" "$failed_slug" "$FAILED_SOURCE_SHA" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import tarfile
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_validate_release_artifact import validate_archive
+          archive_path, slug, source = sys.argv[1:]
+          release = validate_archive(Path(archive_path), release_slug=slug)
+          if release.get("source_git_commit") != source:
+              raise SystemExit("signed failed release archive source mismatch")
+          with tarfile.open(archive_path, "r:gz") as archive:
+              member = archive.getmember(f"{slug}/RELEASE.json")
+              if not member.isfile() or member.size > 1048576:
+                  raise SystemExit("failed release identity member is invalid")
+              stream = archive.extractfile(member)
+              if stream is None:
+                  raise SystemExit("failed release identity member is unavailable")
+              raw = stream.read(1048577)
+              if len(raw) != member.size or len(raw) > 1048576:
+                  raise SystemExit("failed release identity member is malformed")
+          print(hashlib.sha256(raw).hexdigest())
+          PY
+          )"
+          [[ "$FAILED_RELEASE_JSON_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          export FAILED_RELEASE_JSON_SHA256
+          /usr/bin/gh attestation verify "$release_archive" --repo "$GITHUB_REPOSITORY" \
+            --cert-identity "https://github.com/StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml@refs/heads/dev" \
+            --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --source-ref refs/heads/dev --source-digest "$FAILED_SOURCE_SHA" --format json \
+            > "$proof/attestation-certificate.json"
+          /usr/bin/gh attestation verify "$release_archive" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml \
+            --source-ref refs/heads/dev --source-digest "$FAILED_SOURCE_SHA" --format json \
+            > "$proof/attestation-signer.json"
+          /usr/bin/python3 - "$proof/attestation-certificate.json" "$proof/attestation-signer.json" "$FAILED_RUN_ID" "$FAILED_RUN_ATTEMPT" "$FAILED_SOURCE_SHA" "$release_archive" "$GITHUB_REPOSITORY" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          cert_path, signer_path, run_id, attempt, source, archive_path, repo = sys.argv[1:]
+          bundle_hash = hashlib.sha256()
+          with Path(archive_path).open("rb") as bundle_stream:
+              for chunk in iter(lambda: bundle_stream.read(1024 * 1024), b""):
+                  bundle_hash.update(chunk)
+          bundle_sha = bundle_hash.hexdigest()
+          build = f"https://github.com/{repo}/.github/workflows/platform-production-deploy.yml@refs/heads/dev"
+          repo_uri = f"https://github.com/{repo}"
+          invocation = f"https://github.com/{repo}/actions/runs/{run_id}/attempts/{attempt}"
+          def count(path, certificate_policy):
+              values = json.loads(Path(path).read_text(encoding="utf-8"))
+              if not isinstance(values, list) or not values:
+                  raise SystemExit("failed release attestation output is malformed")
+              matches = 0
+              for item in values:
+                  result = item.get("verificationResult") if isinstance(item, dict) else None
+                  signature = result.get("signature") if isinstance(result, dict) else None
+                  certificate = signature.get("certificate") if isinstance(signature, dict) else None
+                  claims = certificate.get("extensions", certificate) if isinstance(certificate, dict) else None
+                  statement = result.get("statement") if isinstance(result, dict) else None
+                  if not isinstance(claims, dict) or not isinstance(statement, dict):
+                      continue
+                  base_match = (claims.get("issuer") == "https://token.actions.githubusercontent.com"
+                      and claims.get("sourceRepositoryURI") == repo_uri
+                      and claims.get("sourceRepositoryRef") == "refs/heads/dev"
+                      and claims.get("sourceRepositoryDigest") == source
+                      and claims.get("buildConfigURI") == build
+                      and claims.get("buildSignerURI") == build
+                      and claims.get("runInvocationURI") == invocation)
+                  # The corresponding gh invocation independently enforced
+                  # either exact certificate identity or signer workflow.
+                  subjects = statement.get("subject")
+                  digest = subjects[0].get("digest") if isinstance(subjects, list) and len(subjects) == 1 and isinstance(subjects[0], dict) else None
+                  if base_match and isinstance(digest, dict) and set(digest) == {"sha256"} and digest.get("sha256") == bundle_sha:
+                      matches += 1
+              return matches
+          if count(cert_path, True) != 1 or count(signer_path, False) != 1:
+              raise SystemExit("failed release attestation did not uniquely bind the exact attempt")
+          PY
+          /usr/bin/python3 - "$ACTIVE_BASELINE_JSON" "$INCREMENTAL_MANIFEST_B64" "$FAILED_SOURCE_SHA" "$TARGET_SHA" "$FAILED_RUN_ID" "$FAILED_RUN_ATTEMPT" "$REPORT_ONLY_CONFIRMATION" "$GITHUB_OUTPUT" "$SOURCE_SECURITY_RUN_ID" "$SOURCE_SECURITY_RUN_ATTEMPT" "$proof" <<'PY'
+          from __future__ import annotations
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_deploy_baseline import (
+              REPORT_ONLY_RECOVERY_CONFIRMATION,
+              classify_cumulative_baseline,
+              validate_report_only_recovery_baseline,
+          )
+          from tools.platform_workflow_provenance import validate_recovery_source_security_gates
+          baseline_raw, manifest_b64, source, target, run_id, attempt, confirmation, output, security_id, security_attempt, proof = sys.argv[1:]
+          baseline = json.loads(baseline_raw)
+          if not isinstance(baseline, dict):
+              raise SystemExit("active baseline identity is malformed")
+          try:
+              incremental = json.loads(base64.b64decode(manifest_b64, validate=True))
+          except (ValueError, json.JSONDecodeError):
+              raise SystemExit("recovery classifier manifest is malformed") from None
+          dev_ref = json.loads((Path(proof) / "dev-ref.json").read_text(encoding="utf-8"))
+          dev_object = dev_ref.get("object") if isinstance(dev_ref, dict) else None
+          current_sha = dev_object.get("sha") if isinstance(dev_object, dict) else None
+          if (dev_ref.get("ref") != "refs/heads/dev" or not isinstance(current_sha, str)
+              or re.fullmatch(r"[0-9a-f]{40}", current_sha) is None):
+              raise SystemExit("current dev reference is unavailable")
+          if subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip() != target:
+              raise SystemExit("recovery checkout does not match the exact target")
+          first_parent_raw = subprocess.run(
+              ["git", "rev-list", "--first-parent", target], check=True, capture_output=True, timeout=20,
+          ).stdout.splitlines()
+          if len(first_parent_raw) > 8192:
+              raise SystemExit("recovery first-parent history exceeds its bound")
+          parents = [value.decode("ascii", "strict") for value in first_parent_raw]
+          if source not in parents:
+              raise SystemExit("failed release is not a first-parent ancestor of the target")
+          changed_raw = subprocess.run(
+              ["git", "diff", "--name-only", "-z", "--no-renames", source, target],
+              check=True, capture_output=True, timeout=20,
+          ).stdout.split(b"\0")
+          changed = [value.decode("utf-8", "strict") for value in changed_raw if value]
+          cumulative = classify_cumulative_baseline(
+              incremental, changed, expected_target_sha=target
+          )
+          result = validate_report_only_recovery_baseline(
+              baseline,
+              cumulative["manifest"],
+              failed_run_id=int(run_id),
+              failed_run_attempt=int(attempt),
+              failed_source_sha=source,
+              failed_release_json_sha256=os.environ["FAILED_RELEASE_JSON_SHA256"],
+              target_sha=target,
+              current_dev_sha=current_sha,
+              first_parent_shas=parents,
+              confirmation=confirmation,
+          )
+          security_workflow = json.loads((Path(proof) / "security-workflow.json").read_text(encoding="utf-8"))
+          security_run = json.loads((Path(proof) / "security-run.json").read_text(encoding="utf-8"))
+          security_jobs = json.loads((Path(proof) / "security-jobs.json").read_text(encoding="utf-8")).get("jobs")
+          security_statuses = json.loads((Path(proof) / "security-statuses.json").read_text(encoding="utf-8")).get("statuses")
+          source_security_attempt_url = validate_recovery_source_security_gates(
+              security_workflow, security_run, security_jobs, security_statuses,
+              expected_run_id=int(security_id), expected_attempt=int(security_attempt),
+              expected_target_sha=target,
+          )
+          digest = hashlib.sha256(json.dumps(cumulative["manifest"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+          with Path(output).open("a", encoding="ascii") as stream:
+              stream.write(f"active_baseline_sha={result['failed_source_sha']}\n")
+              stream.write(f"failed_release_json_sha256={os.environ['FAILED_RELEASE_JSON_SHA256']}\n")
+              stream.write(f"cumulative_manifest_sha256={digest}\n")
+              stream.write("cumulative_no_op=true\n")
+              stream.write("runtime_required=true\n")
+              stream.write(f"source_security_attempt_url={source_security_attempt_url}\n")
+          print("Exact failed deployment, report-only diagnostic, signed artifact, and locked baseline identity accepted.")
+          PY
+      - name: Remove failed recovery proof material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- "$RUNNER_TEMP/recovery-proof"
 
   dispatch-baseline-runtime:
     name: Dispatch exact-target baseline runtime proof
@@ -2046,6 +2610,7 @@ jobs:
       - host-capability-preflight
       - validate-active-baseline
       - validate-baseline-runtime-proof
+      - validate-recovery-baseline
     if: >-
       !cancelled() &&
       needs.validate-dispatch.result == 'success' &&
@@ -2054,6 +2619,12 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       (
         inputs.mode == 'deploy' ||
+        (
+          inputs.mode == 'recovery-deploy' &&
+          needs.validate-recovery-baseline.result == 'success' &&
+          needs.validate-recovery-baseline.outputs.cumulative_no_op == 'true' &&
+          needs.validate-recovery-baseline.outputs.runtime_required == 'true'
+        ) ||
         (
           inputs.mode == 'baseline-reconcile' &&
           needs.validate-active-baseline.result == 'success' &&
@@ -2262,7 +2833,7 @@ jobs:
       needs.validate-dispatch.result == 'success' &&
       needs.build-release.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
-      inputs.mode == 'deploy'
+      (inputs.mode == 'deploy' || inputs.mode == 'recovery-deploy')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -2616,6 +3187,7 @@ jobs:
       - host-capability-preflight
       - validate-active-baseline
       - validate-baseline-runtime-proof
+      - validate-recovery-baseline
     if: >-
       !cancelled() &&
       needs.validate-dispatch.result == 'success' &&
@@ -2626,6 +3198,13 @@ jobs:
       (
         (
           inputs.mode == 'deploy' &&
+          needs.validate-security-provenance.result == 'success'
+        ) ||
+        (
+          inputs.mode == 'recovery-deploy' &&
+          needs.validate-recovery-baseline.result == 'success' &&
+          needs.validate-recovery-baseline.outputs.cumulative_no_op == 'true' &&
+          needs.validate-recovery-baseline.outputs.runtime_required == 'true' &&
           needs.validate-security-provenance.result == 'success'
         ) ||
         (
@@ -2651,6 +3230,7 @@ jobs:
       statuses: write
     env:
       TARGET_SHA: ${{ github.sha }}
+      WORKFLOW_MODE: ${{ inputs.mode }}
       DEPLOY_MODE: deploy
       RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
       PLATFORM_WEB_NEXT_COMPRESSION: ${{ inputs.web_compression == 'disabled' && 'false' || 'true' }}
@@ -2681,13 +3261,14 @@ jobs:
       HOST_TOOLS_HANDOFF_ARTIFACT_ID: ${{ needs.host-capability-preflight.outputs.host_tools_handoff_artifact_id }}
       HOST_TOOLS_HANDOFF_ARTIFACT_DIGEST: ${{ needs.host-capability-preflight.outputs.host_tools_handoff_artifact_digest }}
       ACTIVE_BASELINE_JSON: ${{ needs.host-capability-preflight.outputs.baseline_identity }}
-      ACTIVE_BASELINE_SHA: ${{ needs.validate-active-baseline.outputs.active_baseline_sha }}
-      RECONCILE_MODE: ${{ inputs.mode == 'baseline-reconcile' && 'true' || 'false' }}
-      BASELINE_RUNTIME_REQUIRED: ${{ needs.validate-active-baseline.outputs.runtime_required }}
-      CUMULATIVE_MANIFEST_SHA256: ${{ needs.validate-active-baseline.outputs.cumulative_manifest_sha256 }}
+      ACTIVE_BASELINE_SHA: ${{ inputs.mode == 'recovery-deploy' && needs.validate-recovery-baseline.outputs.active_baseline_sha || needs.validate-active-baseline.outputs.active_baseline_sha }}
+      RECONCILE_MODE: ${{ (inputs.mode == 'baseline-reconcile' || inputs.mode == 'recovery-deploy') && 'true' || 'false' }}
+      BASELINE_RUNTIME_REQUIRED: ${{ inputs.mode == 'recovery-deploy' && needs.validate-recovery-baseline.outputs.runtime_required || needs.validate-active-baseline.outputs.runtime_required }}
+      CUMULATIVE_MANIFEST_SHA256: ${{ inputs.mode == 'recovery-deploy' && needs.validate-recovery-baseline.outputs.cumulative_manifest_sha256 || needs.validate-active-baseline.outputs.cumulative_manifest_sha256 }}
       BASELINE_RUNTIME_PROOF_RUN_ID: ${{ needs.validate-baseline-runtime-proof.outputs.proof_run_id }}
       BASELINE_RUNTIME_PROOF_RUN_ATTEMPT: ${{ needs.validate-baseline-runtime-proof.outputs.proof_run_attempt }}
       BASELINE_RUNTIME_PROOF_RECEIPT_DIGEST: ${{ needs.validate-baseline-runtime-proof.outputs.proof_receipt_digest }}
+      RECOVERY_SOURCE_SECURITY_ATTEMPT_URL: ${{ needs.validate-recovery-baseline.outputs.source_security_attempt_url }}
     steps:
       - name: Download closed deployment handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -2738,7 +3319,7 @@ jobs:
           PY
 
       - name: Require successful platform security build (shared provenance validator)
-        if: ${{ inputs.mode == 'deploy' }}
+        if: ${{ inputs.mode == 'deploy' || inputs.mode == 'recovery-deploy' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2752,22 +3333,37 @@ jobs:
           echo "exact platform security provenance accepted: snapshot=$security_digest"
 
       - name: Require cumulative baseline and exact runtime proof when applicable
-        if: ${{ inputs.mode == 'baseline-reconcile' }}
+        if: ${{ inputs.mode == 'baseline-reconcile' || inputs.mode == 'recovery-deploy' }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$ACTIVE_BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$CUMULATIVE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          case "$BASELINE_RUNTIME_REQUIRED" in
-            true)
-              [[ "$BASELINE_RUNTIME_PROOF_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
-              [[ "$BASELINE_RUNTIME_PROOF_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
-              [[ "$BASELINE_RUNTIME_PROOF_RECEIPT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-              ;;
-            false) ;;
-            *) echo "cumulative runtime requirement is missing or malformed" >&2; exit 1 ;;
-          esac
+          if [[ "$WORKFLOW_MODE" == "baseline-reconcile" ]]; then
+            case "$BASELINE_RUNTIME_REQUIRED" in
+              true)
+                [[ "$BASELINE_RUNTIME_PROOF_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+                [[ "$BASELINE_RUNTIME_PROOF_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+                [[ "$BASELINE_RUNTIME_PROOF_RECEIPT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+                ;;
+              false) ;;
+              *) echo "cumulative runtime requirement is missing or malformed" >&2; exit 1 ;;
+            esac
+          elif [[ "$WORKFLOW_MODE" == "recovery-deploy" ]]; then
+            [[ "$BASELINE_RUNTIME_REQUIRED" == "true" ]]
+            [[ "$CLASSIFIER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+            [[ "$CLASSIFIER_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+            test "$RECOVERY_SOURCE_SECURITY_ATTEMPT_URL" = "https://github.com/StrayForest/old_sparky/actions/runs/$CLASSIFIER_RUN_ID/attempts/$CLASSIFIER_RUN_ATTEMPT"
+            test "${{ needs.validate-recovery-baseline.result }}" = "success"
+            test "${{ needs.validate-recovery-baseline.outputs.cumulative_no_op }}" = "true"
+            test "${{ needs.validate-recovery-baseline.outputs.runtime_required }}" = "true"
+            test "${{ needs.validate-security-provenance.outputs.security_ready }}" = "true"
+            [[ "${{ needs.validate-security-provenance.outputs.security_digest }}" =~ ^[0-9a-f]{64}$ ]]
+          else
+            echo "cumulative deployment branch is invalid" >&2
+            exit 1
+          fi
           echo "authenticated baseline=$ACTIVE_BASELINE_SHA cumulative route=$CUMULATIVE_MANIFEST_SHA256 runtime_required=$BASELINE_RUNTIME_REQUIRED"
 
       - name: Resolve immutable default-branch classifier source

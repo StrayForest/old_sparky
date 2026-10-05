@@ -26,7 +26,7 @@ REPO_ROOT = PLATFORM_ROOT.parent
 TOOLS = PLATFORM_ROOT / "tools"
 SOURCE_SHA = "a" * 40
 
-# This is the complete 62-file changed-file set of the recovery-bootstrap
+# This is the complete changed-file set of the recovery-bootstrap
 # patch at the reviewed merge base. Keep the real set here so the route test
 # exercises the exact pull-request and trusted-dev-push inputs, including the
 # host-key scan contract that is easy to omit from one of the independent
@@ -60,6 +60,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tests/test_platform_host_tools_bundle.py",
         "platform/tests/test_platform_db.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
+        "platform/tests/test_platform_recovery_workflow_caller.py",
         "platform/tests/test_platform_release_audit_hardening.py",
         "platform/tests/test_platform_release_build_contract.py",
         "platform/tests/test_platform_release_build_diagnostics.py",
@@ -101,9 +102,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/python_packages/platform_infra/db.py",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 62
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 63
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "6d5ae25eb5321a99bd872c64d793f7b754214962abe08bd35538a625769a063d"
+    "d542d27ef613aae1c67ae9778bae97f4f68340d05a3e87fe9eb2c7704cd65bfb"
 )
 
 # These paths are deliberately present in the recovery route allowlist but are

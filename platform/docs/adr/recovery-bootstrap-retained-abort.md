@@ -299,3 +299,51 @@ full CI, signed `mode=preflight` artifact verification and atomic root-only
 provisioning before the workflow can use that new generation. A failed
 capability preflight is never readiness, and the reconcile mode remains
 unavailable to manual dispatch.
+
+### Operator recovery deployment for a report-only invalid marker
+
+Status: implemented as a narrow operator-dispatch exception to the
+automatic-only bootstrap route above. It uses the ordinary production
+deployment job and its `production` environment; it adds no installer or
+host-side recovery authority.
+
+The exception accepts only an exact prior `Platform production deploy`
+`workflow_dispatch` run/attempt **R.A**, one failed `Deploy production` job
+bound to **R.A** and its source SHA, and the latest bot-authored
+`platform-production-deploy` status still failing for that attempt. The
+bounded plain-text body from the exact job-logs endpoint (following its
+redirect) must contain exactly one matching candidate-failure diagnostic:
+`reason=invalid_marker child_exit=0 observed_bytes=1..512 dispatcher_exit=2`.
+Read it as strict UTF-8 from the private runner temporary file; do not upload
+or print raw job logs.
+The old release artifact and its attestation must bind **R.A**, the source SHA
+and derived release slug; its `RELEASE.json` digest must match the active
+host tuple. The required typed confirmation is an additional operator
+acknowledgment; it cannot replace any of these proofs.
+
+Target **T** must be the current `dev` head and a first-parent descendant of
+the failed source. Its exact successful `Platform security and build` run
+must publish the current bot-authored success status and complete successfully
+for every required job, including the two real runtime jobs; skipped or
+partial job inventories fail closed. The incremental manifest must be the
+non-fallback, non-deployable, runtime-sensitive closed recovery-bootstrap
+route. Reclassification of the complete failed-source-to-**T** range must
+produce the same closed bootstrap no-op family with
+`runtime_sensitive=true`; the workflow also requires its explicit
+`cumulative_no_op=true` result.
+
+The initial **S11** host-baseline capture is read-only and does not acquire
+release locks. It proves the active source SHA, derived **R** slug,
+`RELEASE.json` digest, pointer identities and absence of a pending
+transaction. The deployment supervisor then acquires the release lock followed
+by the retained-load lock, repeats the host query and compares that exact tuple
+and the current **T** head before consuming the new candidate on the host or
+making protected writes. Any changed identity, pending transaction, failed
+read, stale source proof or incomplete API page retains the existing release
+and stops.
+
+An accepted exception runs the ordinary fresh **T** build, attestation,
+security checks, install and health path. Only a real successful deployment of
+**T** publishes a green deployment status; **R** remains failed. Never rerun
+the failed child, manually run an installer, weaken a fallback check or use
+this exception for a normal deployment.

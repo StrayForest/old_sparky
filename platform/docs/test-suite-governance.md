@@ -578,8 +578,8 @@ the exact run ID.
 
 ## Contract self-test
 
-The immutable recovery-bootstrap contract is owned by the privileged contour
-(`tests.test_platform_recovery_bootstrap`). Its tests cover deterministic
+The privileged contour owns immutable recovery-bootstrap tests
+(`tests.test_platform_recovery_bootstrap`); verification-contract owns failed-report caller tests. They cover deterministic
 closed bundles, source/archive path and type rejection, exact manifest and
 provenance schemas, content-addressed atomic installation, receipt identity
 and migration-uncertainty guards, missing-candidate and generation-byte
