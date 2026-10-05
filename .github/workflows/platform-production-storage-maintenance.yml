@@ -216,10 +216,11 @@ jobs:
           fi
           invocation_started_at="$(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')" \
             || fail "Maintenance invocation start time producer failed."
-          set +e
-          systemctl start deadlock-maintenance.service
-          service_status=$?
-          set -e
+          if systemctl start deadlock-maintenance.service; then
+            service_status=0
+          else
+            service_status=$?
+          fi
           invocation_completed_at="$(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')" \
             || fail "Maintenance invocation completion time producer failed."
           if ! service_invocation_after="$(systemctl show deadlock-maintenance.service \

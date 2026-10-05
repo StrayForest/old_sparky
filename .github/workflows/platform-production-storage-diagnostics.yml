@@ -286,11 +286,12 @@ jobs:
           retention_file="$(mktemp)"
           trap 'rm -f -- "$retention_file"' EXIT
           CURRENT_STAGE=retention_dry_run
-          set +e
-          "$python_bin" "$current/tools/platform_storage_maintenance.py" --json \
-            >"$retention_file" 2>/dev/null
-          retention_rc=$?
-          set -e
+          if "$python_bin" "$current/tools/platform_storage_maintenance.py" --json \
+            >"$retention_file" 2>/dev/null; then
+            retention_rc=0
+          else
+            retention_rc=$?
+          fi
           CURRENT_STAGE=retention_summary
           set +e
           retention_summary="$(/usr/bin/python3 -I "$summary_tool" --mode retention \

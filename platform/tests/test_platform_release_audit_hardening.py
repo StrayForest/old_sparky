@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import shutil
 import subprocess
@@ -1969,6 +1970,108 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             self.assertEqual(rejected.returncode, 2)
             self.assertEqual(rejected.stdout, "")
 
+    def test_storage_diagnostic_expected_unhealthy_exit_is_summarized_before_failure(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        remote_start = workflow.index(
+            "          set -Eeuo pipefail\n          CURRENT_STAGE=identity\n"
+        )
+        remote_end = workflow.index("\n          REMOTE\n", remote_start)
+        remote_script = textwrap.dedent(workflow[remote_start:remote_end])
+        trap_line = next(
+            line for line in remote_script.splitlines() if line.startswith("trap ")
+        )
+        caller_start = workflow.index("          CURRENT_STAGE=retention_tempfile\n")
+        caller_end = workflow.index(
+            "          printf '{\"schema\":1,\"kind\":\"collection_status\"",
+            caller_start,
+        )
+        caller = textwrap.dedent(workflow[caller_start:caller_end])
+        summary_tool = TOOLS_DIR / "platform_storage_evidence_summary.py"
+        unhealthy_report = {
+            "schema": 1,
+            "ok": False,
+            "mode": "dry-run",
+            "disk_after": {"free_bytes": 1024, "used_percent": 99.5},
+            "limits": {
+                "minimum_free_bytes": 5 * 1024**3,
+                "maximum_used_percent": 85,
+            },
+            "private": "must-not-appear-in-evidence",
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / "tools"
+            tools.mkdir()
+            producer = tools / "platform_storage_maintenance.py"
+
+            def run_caller(output: str) -> subprocess.CompletedProcess[str]:
+                producer.write_text(
+                    "import sys\n"
+                    f"print({output!r})\n"
+                    "sys.exit(1)\n",
+                    encoding="utf-8",
+                )
+                prefix = "\n".join(
+                    (
+                        "set -Eeuo pipefail",
+                        "CURRENT_STAGE=identity",
+                        trap_line,
+                        f"python_bin={shlex.quote(sys.executable)}",
+                        f"current={shlex.quote(str(root))}",
+                        f"summary_tool={shlex.quote(str(summary_tool))}",
+                        "",
+                    )
+                )
+                return subprocess.run(
+                    ["bash", "-c", prefix + caller],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            unhealthy = run_caller(json.dumps(unhealthy_report))
+            self.assertEqual(unhealthy.returncode, 1, unhealthy.stderr)
+            records = [json.loads(line) for line in unhealthy.stdout.splitlines()]
+            summary = next(
+                item for item in records if item.get("kind") == "storage_retention"
+            )
+            result = next(
+                item
+                for item in records
+                if item.get("kind") == "storage_retention_result"
+            )
+            failure = next(
+                item for item in records if item.get("kind") == "collection_failure"
+            )
+            self.assertEqual(summary["status"], "ok")
+            self.assertFalse(summary["ok"])
+            self.assertEqual(summary["mode"], "dry-run")
+            self.assertEqual(result["status"], "unhealthy")
+            self.assertEqual(result["error_class"], "disk_threshold")
+            self.assertEqual(failure["stage"], "retention_threshold")
+            self.assertEqual(failure["exit_code"], 1)
+            self.assertNotIn("must-not-appear-in-evidence", unhealthy.stdout)
+
+            malformed = run_caller("not-json")
+            self.assertNotEqual(malformed.returncode, 0, malformed.stderr)
+            malformed_records = [
+                json.loads(line) for line in malformed.stdout.splitlines()
+            ]
+            malformed_failure = next(
+                item
+                for item in malformed_records
+                if item.get("kind") == "collection_failure"
+            )
+            self.assertEqual(malformed_failure["status"], "failed")
+            self.assertEqual(malformed_failure["stage"], "retention_summary")
+            self.assertNotIn(
+                "storage_retention_result",
+                {item.get("kind") for item in malformed_records},
+            )
+
     def test_storage_diagnostic_remote_exit_is_preserved_after_upload(self) -> None:
         workflow = (
             WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
@@ -2003,6 +2106,108 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(invalid.returncode, 2)
+
+    def test_storage_maintenance_expected_service_exit_reaches_report_binding(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-maintenance.yml"
+        ).read_text(encoding="utf-8")
+        remote_start = workflow.index(
+            "          set -Eeuo pipefail\n          CURRENT_STAGE=identity\n"
+        )
+        remote_end = workflow.index("\n          REMOTE\n", remote_start)
+        remote_script = textwrap.dedent(workflow[remote_start:remote_end])
+        trap_line = next(
+            line for line in remote_script.splitlines() if line.startswith("trap ")
+        )
+        helper_start = workflow.index("          fail() {\n", remote_start)
+        helper_end = workflow.index(
+            '\n          test "$(id -u)"', helper_start
+        )
+        failure_helpers = textwrap.dedent(workflow[helper_start:helper_end])
+        service_start = workflow.index(
+            "          CURRENT_STAGE=service_invocation\n", remote_start
+        )
+        service_end = workflow.index(
+            "\n          CURRENT_STAGE=postchecks\n", service_start
+        )
+        service_caller = textwrap.dedent(workflow[service_start:service_end])
+        report_failure_start = workflow.index(
+            "          if (( report_binding_status != 0 )); then", service_end
+        )
+        report_failure_end = workflow.index(
+            '\n          [[ "$report_name" =~', report_failure_start
+        )
+        report_failure = textwrap.dedent(
+            workflow[report_failure_start:report_failure_end]
+        )
+        summary_tool = TOOLS_DIR / "platform_storage_evidence_summary.py"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mock_bin = root / "bin"
+            mock_bin.mkdir()
+            calls = root / "invocation-count"
+            started = root / "service-started"
+            systemctl = mock_bin / "systemctl"
+            systemctl.write_text(
+                "#!/usr/bin/python3\n"
+                "import os, pathlib, sys\n"
+                "args = sys.argv[1:]\n"
+                "prop = next((item.split('=', 1)[1] for item in args "
+                "if item.startswith('--property=')), '')\n"
+                "if args[:1] == ['start']:\n"
+                f"    pathlib.Path({str(started)!r}).write_text('called')\n"
+                "    raise SystemExit(1)\n"
+                "if prop == 'ActiveState':\n"
+                "    print('inactive')\n"
+                "elif prop == 'InvocationID':\n"
+                f"    counter = pathlib.Path({str(calls)!r})\n"
+                "    value = int(counter.read_text()) if counter.exists() else 0\n"
+                "    counter.write_text(str(value + 1))\n"
+                "    print(('1' if value == 0 else '2') * 32)\n"
+                "elif prop == 'ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec':\n"
+                "    print('ActiveState=failed\\nSubState=dead\\nResult=exit-code\\nExecMainCode=exited\\nExecMainStatus=1\\nNRestarts=0\\nMemoryCurrent=0\\nMemoryPeak=0\\nMemoryMax=0\\nTasksCurrent=0\\nTasksMax=0\\nCPUUsageNSec=0')\n"
+                "else:\n"
+                "    raise SystemExit(2)\n",
+                encoding="utf-8",
+            )
+            systemctl.chmod(0o755)
+            prefix = "\n".join(
+                (
+                    "set -Eeuo pipefail",
+                    "CURRENT_STAGE=identity",
+                    trap_line,
+                    failure_helpers,
+                    f"summary_tool={shlex.quote(str(summary_tool))}",
+                    "",
+                )
+            )
+            trailer = (
+                "\nCURRENT_STAGE=report_binding\n"
+                "report_binding_status=2\n"
+                f"{report_failure}\n"
+            )
+            completed = subprocess.run(
+                ["bash", "-c", prefix + service_caller + trailer],
+                env={**os.environ, "PATH": f"{mock_bin}:/usr/bin:/bin"},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            self.assertTrue(started.is_file())
+            records = [json.loads(line) for line in completed.stdout.splitlines()]
+            service_summary = next(
+                item for item in records if item.get("kind") == "service_state"
+            )
+            failure = next(
+                item for item in records if item.get("kind") == "collection_failure"
+            )
+            self.assertEqual(service_summary["service"], "maintenance")
+            self.assertEqual(service_summary["status"], "ok")
+            self.assertEqual(failure["stage"], "report_binding")
+            self.assertEqual(failure["outcome"], "report_unavailable")
+            self.assertEqual(failure["exit_code"], 1)
 
     @unittest.skipUnless(os.geteuid() == 0, "lock metadata fixture requires root")
     def test_storage_diagnostic_lock_probe_is_nofollow_and_nonmutating(self) -> None:
