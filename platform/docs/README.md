@@ -24,6 +24,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Release transaction and recovery | [Release state machine](release-state-machine.md) |
 | Candidate-bound forward migration safety | [Candidate forward migration guard ADR](adr/candidate-forward-migration-guard.md) |
 | Immutable retained-release recovery bootstrap | [Recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md), [first-install systemd ADR](adr/first-install-systemd-activation.md) and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap) |
+| Report-only failed-deployment recovery | [Recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md#operator-recovery-deployment-for-a-report-only-invalid-marker) and [deployment runbook](deployment-runbook.md#manual-workflow-fallback) |
 | Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |

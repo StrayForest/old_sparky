@@ -1404,6 +1404,24 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 require_recovery_bootstrap=True,
             )
 
+            recovery_caller = "platform/tests/test_platform_recovery_workflow_caller.py"
+            caller_route = classify(
+                [recovery_caller],
+                event="push",
+                target_sha=self.TARGET_SHA,
+                branch="dev",
+            )
+            self.assertFalse(caller_route["deployable"])
+            self.assertTrue(caller_route["runtime_sensitive"])
+            caller_archive = self._write_production_classifier_archive(root, caller_route)
+            caller_authority = validate_production_classifier_manifest(
+                caller_archive,
+                target_sha=self.TARGET_SHA,
+                require_reconcile_source=True,
+                require_runtime_sensitive=True,
+            )
+            self.assertEqual(caller_authority["files"], [recovery_caller])
+
             deployable = classify(
                 ["platform/apps/platform_api/app/main.py"],
                 event="push",

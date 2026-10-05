@@ -16,15 +16,18 @@ attempt URL.  A status row cannot promote a preflight or another repository.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any
 from urllib.parse import urlsplit
+import zipfile
 
 
 REPOSITORY_OWNER = "StrayForest"
@@ -49,6 +52,25 @@ PREFLIGHT_JOB_NAME = "Production preflight"
 SECURITY_STATUS_CONTEXT = "platform-security-build"
 DEPLOY_STATUS_CONTEXT = "platform-production-deploy"
 DEPLOY_SUCCESS_DESCRIPTION = "Production deployment and live smoke passed"
+DEPLOY_FAILURE_DESCRIPTION = "Production deployment failed"
+RECOVERY_REQUIRED_SECURITY_JOBS = frozenset(
+    {
+        "Backend DB-free contours",
+        "Backend PostgreSQL and Redis integration",
+        "Backend privileged ephemeral contour",
+        "Backend aggregate",
+        "Python quality",
+        "Security gates",
+        "web-quality",
+        "Web hermetic",
+        "Documentation consistency",
+        "Migration scenarios",
+        "Verification contract",
+        "Conditional release runtime fixture",
+        "Trusted dev immutable release runtime",
+        "status-final",
+    }
+)
 SECURITY_SUCCESS_DESCRIPTION = "Platform security and build passed"
 ACTIONS_BOT_LOGIN = "github-actions[bot]"
 ACTIONS_BOT_TYPE = "Bot"
@@ -68,6 +90,85 @@ STATUS_MAX_FUTURE_SKEW = timedelta(0)
 
 class ProvenanceError(ValueError):
     """Raised when an API payload is incomplete, mismatched, or spoofed."""
+
+
+def collect_github_api_pages(
+    fetch_page: Callable[[int], object],
+    *,
+    collection_key: str,
+    rows_limit: int = 10_000,
+    page_limit: int = 100,
+    page_size: int = 100,
+) -> list[Mapping[str, Any]]:
+    """Collect bounded GitHub list responses without accepting partial object pages.
+
+    Most REST list endpoints return an object containing ``total_count`` and a
+    named list. Commit statuses instead return a top-level array. The object
+    form must report a stable total and end at exactly that total; the array
+    form ends only on a short page. Both forms are bounded and type checked.
+    """
+
+    if (
+        not isinstance(collection_key, str)
+        or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", collection_key)
+        or isinstance(rows_limit, bool)
+        or not isinstance(rows_limit, int)
+        or rows_limit <= 0
+        or isinstance(page_limit, bool)
+        or not isinstance(page_limit, int)
+        or not 1 <= page_limit <= 100
+        or isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not 1 <= page_size <= 100
+    ):
+        raise _fail("GitHub pagination bounds are invalid")
+
+    collected: list[Mapping[str, Any]] = []
+    expected_total: int | None = None
+    response_shape: str | None = None
+    for page_number in range(1, page_limit + 1):
+        payload = fetch_page(page_number)
+        if isinstance(payload, list):
+            shape = "array"
+            rows = payload
+            total = None
+        elif isinstance(payload, Mapping):
+            shape = "object"
+            rows = payload.get(collection_key)
+            total = payload.get("total_count")
+            if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+                raise _fail("GitHub object page has no valid total_count")
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise _fail("GitHub object page total_count changed")
+        else:
+            raise _fail("GitHub page has an unsupported response shape")
+
+        if response_shape is None:
+            response_shape = shape
+        elif shape != response_shape:
+            raise _fail("GitHub pagination response shape changed")
+        if not isinstance(rows, list) or len(rows) > page_size:
+            raise _fail("GitHub page rows are malformed")
+        if any(not isinstance(row, Mapping) for row in rows):
+            raise _fail("GitHub page contains a malformed row")
+        collected.extend(rows)
+        if len(collected) > rows_limit:
+            raise _fail("GitHub page count exceeds its bound")
+
+        if shape == "object":
+            assert expected_total is not None
+            if len(collected) > expected_total:
+                raise _fail("GitHub object page count exceeds total_count")
+            if len(collected) == expected_total:
+                return collected
+            if len(rows) < page_size:
+                raise _fail("GitHub object pagination ended before total_count")
+        elif len(rows) < page_size:
+            return collected
+
+    raise _fail("GitHub pagination exceeded its bound")
 
 
 def _fail(message: str) -> ProvenanceError:
@@ -662,6 +763,255 @@ def validate_deployment_marker(
     return attempt_url
 
 
+def validate_failed_report_deployment(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    expected_run_url: str | None = None,
+    server_url: str = GITHUB_SERVER_URL,
+    now: datetime | None = None,
+) -> str:
+    """Authenticate one exact failed production attempt for report repair.
+
+    This deliberately does not relax :func:`validate_deployment_marker`.
+    Callers must separately require a typed operator attestation that the
+    failure was the report-only case and bind the active host tuple to the
+    signed artifact for this exact run before dispatching a new deployment.
+    """
+
+    _validate_job_rows(jobs)
+    _validate_status_rows(statuses)
+    workflow_id = _positive_int(workflow.get("id"), "workflow id")
+    if workflow.get("path") != DEPLOY_WORKFLOW_PATH or workflow.get("name") != DEPLOY_WORKFLOW_NAME:
+        raise _fail("failed deployment workflow identity is not canonical")
+    if run.get("path") != DEPLOY_WORKFLOW_PATH:
+        raise _fail("failed deployment run workflow path is not canonical")
+    validate_repository_identity(run)
+    if _positive_int(run.get("workflow_id"), "run workflow id") != workflow_id:
+        raise _fail("failed deployment run belongs to a different workflow")
+    if run.get("name") != DEPLOY_WORKFLOW_NAME or run.get("display_title") not in (
+        None,
+        DEPLOY_WORKFLOW_NAME,
+    ):
+        raise _fail("failed deployment run name is not canonical")
+    if _run_id(run.get("id"), "run id") != _run_id(expected_run_id, "expected run id"):
+        raise _fail("failed deployment run id does not match")
+    if _run_id(run.get("run_attempt"), "run attempt") != _run_id(
+        expected_attempt, "expected run attempt"
+    ):
+        raise _fail("failed deployment run attempt does not match")
+    if not isinstance(expected_target_sha, str) or SHA_RE.fullmatch(expected_target_sha) is None:
+        raise _fail("failed deployment source SHA is malformed")
+    if (
+        run.get("head_sha") != expected_target_sha
+        or run.get("head_branch") != "dev"
+        or run.get("event") != "workflow_dispatch"
+        or run.get("status") != "completed"
+        or run.get("conclusion") != "failure"
+    ):
+        raise _fail("failed deployment run is not the expected completed dev attempt")
+    attempt_url = canonical_attempt_url(
+        run,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        server_url=server_url,
+    )
+    if expected_run_url is not None and run.get("html_url") != expected_run_url:
+        raise _fail("failed deployment workflow run URL does not match")
+
+    matching_jobs = [job for job in jobs if job.get("name") == DEPLOY_JOB_NAME]
+    if len(matching_jobs) != 1:
+        raise _fail("failed Deploy production job is missing or ambiguous")
+    job = matching_jobs[0]
+    if not isinstance(job, Mapping):
+        raise _fail("Deploy production job metadata is malformed")
+    if (
+        _positive_int(job.get("run_id"), "failed job run id")
+        != _run_id(expected_run_id, "expected run id")
+        or not isinstance(job.get("head_sha"), str)
+        or SHA_RE.fullmatch(job["head_sha"]) is None
+        or job.get("head_sha") != expected_target_sha
+    ):
+        raise _fail("Deploy production job is not bound to the exact failed run")
+    # GitHub's jobs endpoint normally includes run_attempt. Some compatible
+    # API responses omit it; when present, it must be a valid exact binding.
+    if "run_attempt" in job and _run_id(
+        job.get("run_attempt"), "failed job run attempt"
+    ) != _run_id(expected_attempt, "expected run attempt"):
+        raise _fail("Deploy production job attempt does not match")
+    if not isinstance(job, Mapping) or job.get("status") != "completed" or job.get("conclusion") != "failure":
+        raise _fail("Deploy production job did not fail on the exact attempt")
+    marker = latest_context_status(
+        statuses,
+        context=DEPLOY_STATUS_CONTEXT,
+        now=now,
+        max_age=None,
+    )
+    validate_actions_bot_status(
+        marker,
+        expected_context=DEPLOY_STATUS_CONTEXT,
+        expected_state="failure",
+        expected_target_url=attempt_url,
+        expected_description=DEPLOY_FAILURE_DESCRIPTION,
+    )
+    return attempt_url
+
+
+def validate_report_only_remote_diagnostic(log_text: Path) -> dict[str, int | str]:
+    """Accept only the exact closed diagnostic in the job-logs text response.
+
+    GitHub's job-specific logs endpoint redirects to plain text. The bounded
+    response remains private and is never emitted; its exact closed marker is
+    parsed from a no-follow, identity-stable file. This is separate from the
+    failed-run API validator so callers must prove both independent records.
+    """
+
+    before = log_text.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_nlink != 1
+        or not 1 <= before.st_size <= 16 * 1024 * 1024
+    ):
+        raise _fail("failed deployment log text metadata is unsafe")
+    pattern = re.compile(
+        r"^RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+        r"reason=invalid_marker child_exit=0 observed_bytes=(?P<bytes>[1-9][0-9]{0,2}) "
+        r"dispatcher_exit=2$"
+    )
+    timestamp_prefix = re.compile(
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{1,9})?Z (RELEASE_REMOTE_DIAGNOSTIC .+)$"
+    )
+    matching: list[dict[str, int | str]] = []
+    marker_count = 0
+    descriptor = os.open(log_text, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    stream = None
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ):
+            raise _fail("failed deployment log text changed before read")
+        stream = os.fdopen(descriptor, "rb", closefd=False)
+        raw = stream.read(16 * 1024 * 1024 + 1)
+        if len(raw) != before.st_size or len(raw) > 16 * 1024 * 1024:
+            raise _fail("failed deployment log text is truncated or oversized")
+        try:
+            lines = raw.decode("utf-8", errors="strict").splitlines()
+        except UnicodeError as exc:
+            raise _fail("failed deployment log text is not UTF-8") from exc
+        for line in lines:
+            if "RELEASE_REMOTE_DIAGNOSTIC" in line:
+                marker_count += 1
+                marker_line = line
+                if not marker_line.startswith("RELEASE_REMOTE_DIAGNOSTIC"):
+                    prefixed = timestamp_prefix.fullmatch(marker_line)
+                    if prefixed is None:
+                        raise _fail("failed deployment diagnostic line prefix is invalid")
+                    marker_line = prefixed.group(1)
+                found = pattern.fullmatch(marker_line)
+                if found is None:
+                    raise _fail("failed deployment diagnostic is not the report-only case")
+                observed = int(found.group("bytes"))
+                if not 1 <= observed <= 512:
+                    raise _fail("failed deployment diagnostic byte count is invalid")
+                matching.append(
+                    {
+                        "reason": "invalid_marker",
+                        "child_exit": 0,
+                        "observed_bytes": observed,
+                        "dispatcher_exit": 2,
+                    }
+                )
+        opened_after = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) != (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_size,
+            opened_after.st_mtime_ns,
+            opened_after.st_ctime_ns,
+        ):
+            raise _fail("failed deployment log text changed during read")
+    except (OSError, UnicodeError) as exc:
+        raise _fail("failed deployment log text is unreadable") from exc
+    finally:
+        if stream is not None:
+            stream.close()
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    after = log_text.lstat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise _fail("failed deployment log text changed during validation")
+    if marker_count != 1 or len(matching) != 1:
+        raise _fail("failed deployment log does not contain one report-only diagnostic")
+    return matching[0]
+
+
+def validate_recovery_source_security_gates(
+    workflow: Mapping[str, Any],
+    run: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    expected_run_id: int,
+    expected_attempt: int,
+    expected_target_sha: str,
+    now: datetime | None = None,
+) -> str:
+    """Require exact successful full CI and both real runtime jobs for T."""
+
+    attempt_url = validate_security_marker(
+        workflow,
+        run,
+        statuses,
+        expected_run_id=expected_run_id,
+        expected_attempt=expected_attempt,
+        expected_target_sha=expected_target_sha,
+        expected_run_url=f"{GITHUB_SERVER_URL}/{REPOSITORY_FULL_NAME}/actions/runs/{expected_run_id}",
+        now=now,
+    )
+    _validate_job_rows(jobs)
+    for name in RECOVERY_REQUIRED_SECURITY_JOBS:
+        matching = [job for job in jobs if job.get("name") == name]
+        if len(matching) != 1:
+            raise _fail("recovery source security gate is missing or ambiguous")
+        job = matching[0]
+        if (
+            job.get("status") != "completed"
+            or job.get("conclusion") != "success"
+            or job.get("run_id") != expected_run_id
+            or ("run_attempt" in job and (
+                type(job.get("run_attempt")) is not int
+                or job.get("run_attempt") != expected_attempt
+            ))
+            or job.get("head_sha") != expected_target_sha
+        ):
+            raise _fail("recovery source security gate did not pass for the exact attempt")
+    return attempt_url
+
+
 def validate_deployment_event(
     workflow: Mapping[str, Any],
     run: Mapping[str, Any],
@@ -847,6 +1197,16 @@ def _build_cli_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="accept an exact successful preflight as a non-mutating no-op",
             )
+    failed = subparsers.add_parser("failed-deployment")
+    failed.add_argument("--workflow", type=Path, required=True)
+    failed.add_argument("--run", type=Path, required=True)
+    failed.add_argument("--status", type=Path, required=True)
+    failed.add_argument("--jobs", type=Path, required=True)
+    failed.add_argument("--expected-run-id", required=True)
+    failed.add_argument("--expected-attempt", required=True)
+    failed.add_argument("--expected-target-sha", required=True)
+    failed.add_argument("--expected-run-url")
+    failed.add_argument("--remote-log-text", type=Path, required=True)
     return parser
 
 
@@ -888,9 +1248,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             statuses = _payload_rows(
                 status_payload,
                 "statuses",
-                "deployment status",
+                "deployment status" if args.command == "deployment" else "failed deployment status",
             )
-            if args.allow_preflight_noop:
+            if args.command == "failed-deployment":
+                attempt_url = validate_failed_report_deployment(
+                    workflow,
+                    run,
+                    jobs,
+                    statuses,
+                    expected_run_id=expected_run_id,
+                    expected_attempt=expected_attempt,
+                    expected_target_sha=args.expected_target_sha,
+                    expected_run_url=args.expected_run_url,
+                    now=now,
+                )
+                diagnostic = validate_report_only_remote_diagnostic(args.remote_log_text)
+                deploy_ready = False
+            elif args.allow_preflight_noop:
                 deploy_ready = validate_deployment_event(
                     workflow,
                     run,
@@ -921,21 +1295,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     now=now,
                 )
             context = DEPLOY_STATUS_CONTEXT
-        snapshot_jobs = jobs if args.command == "deployment" else []
+        snapshot_jobs = jobs if args.command in {"deployment", "failed-deployment"} else []
         marker = (
             _status_fingerprint(
                 statuses,
                 context=context,
                 now=now,
+                max_age=None if args.command == "failed-deployment" else STATUS_MAX_AGE,
             )
-            if args.command == "security" or deploy_ready
+            if args.command == "security" or deploy_ready or args.command == "failed-deployment"
             else None
         )
         print(
             json.dumps(
                 {
                     "attempt_url": attempt_url,
-                    "deploy_ready": deploy_ready if args.command == "deployment" else True,
+                    "deploy_ready": deploy_ready if args.command in {"deployment", "failed-deployment"} else True,
+                    "report_only_diagnostic": diagnostic if args.command == "failed-deployment" else None,
                     "snapshot_digest": deployment_snapshot_digest(
                         workflow,
                         run,

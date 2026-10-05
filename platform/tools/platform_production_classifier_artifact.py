@@ -131,6 +131,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_validate_release_artifact.py",
         "platform/tests/test_platform_host_tools_bundle.py",
         "platform/tests/test_platform_workflow_provenance.py",
+        "platform/tests/test_platform_recovery_workflow_caller.py",
         "platform/tests/test_platform_cloudflare_ips.py",
         "platform/python_packages/platform_infra/db.py",
         "platform/tests/test_platform_install_nginx.py",
@@ -482,6 +483,7 @@ def validate_manifest(
     target_sha: str,
     require_recovery_bootstrap: bool = False,
     require_reconcile_source: bool = False,
+    require_runtime_sensitive: bool = False,
 ) -> dict[str, Any]:
     if SHA_RE.fullmatch(target_sha) is None:
         raise _fail("provenance")
@@ -535,6 +537,10 @@ def validate_manifest(
     if type(require_reconcile_source) is not bool or (
         require_recovery_bootstrap and require_reconcile_source
     ):
+        raise _fail("manifest")
+    if type(require_runtime_sensitive) is not bool:
+        raise _fail("manifest")
+    if require_runtime_sensitive and manifest.get("runtime_sensitive") is not True:
         raise _fail("manifest")
     if require_recovery_bootstrap and (
         not recovery_bootstrap_only
@@ -592,6 +598,7 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--target-sha", required=True)
     manifest.add_argument("--require-recovery-bootstrap", action="store_true")
     manifest.add_argument("--require-reconcile-source", action="store_true")
+    manifest.add_argument("--require-runtime-sensitive", action="store_true")
     manifest.add_argument("--emit-manifest-base64", action="store_true")
     return parser
 
@@ -628,6 +635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target_sha=arguments.target_sha,
                 require_recovery_bootstrap=arguments.require_recovery_bootstrap,
                 require_reconcile_source=arguments.require_reconcile_source,
+                require_runtime_sensitive=arguments.require_runtime_sensitive,
             )
             if arguments.emit_manifest_base64:
                 encoded = base64.b64encode(

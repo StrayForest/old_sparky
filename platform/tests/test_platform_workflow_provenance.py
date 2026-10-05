@@ -15,6 +15,7 @@ import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import zipfile
 
 import yaml
 
@@ -31,23 +32,32 @@ from tools.platform_workflow_provenance import (  # noqa: E402
     DEPLOY_WORKFLOW_NAME,
     DEPLOY_WORKFLOW_PATH,
     DEPLOY_STATUS_CONTEXT,
+    SECURITY_STATUS_CONTEXT,
+    SECURITY_SUCCESS_DESCRIPTION,
+    RECOVERY_REQUIRED_SECURITY_JOBS,
     ProvenanceError,
     _payload_rows,
     deployment_snapshot_digest,
     latest_context_status,
     parse_status_timestamp,
     validate_deployment_event,
+    collect_github_api_pages,
     validate_deployment_marker,
+    validate_failed_report_deployment,
+    validate_report_only_remote_diagnostic,
+    validate_recovery_source_security_gates,
     validate_autodeploy_dispatch,
     SECURITY_WORKFLOW_NAME,
     SECURITY_WORKFLOW_PATH,
 )
 from tools.platform_deploy_baseline import (  # noqa: E402
     BASELINE_RUNTIME_GATE_NAMES,
+    REPORT_ONLY_RECOVERY_CONFIRMATION,
     active_deployment_status_identity,
     classify_cumulative_baseline,
     validate_active_baseline,
     validate_baseline_runtime_proof,
+    validate_report_only_recovery_baseline,
     wait_for_autodeploy_completion,
 )
 from tools.platform_ci_classifier import (  # noqa: E402
@@ -61,6 +71,55 @@ from tools.platform_ci_classifier import (  # noqa: E402
 
 
 class WorkflowProvenanceTests(unittest.TestCase):
+    def test_bounded_github_pagination_accepts_arrays_and_complete_objects_only(self) -> None:
+        statuses = [{"id": 1}, {"id": 2}]
+        self.assertEqual(
+            collect_github_api_pages(
+                lambda page: statuses if page == 1 else [],
+                collection_key="statuses",
+            ),
+            statuses,
+        )
+
+        jobs = [{"id": index} for index in range(100)]
+        self.assertEqual(
+            collect_github_api_pages(
+                lambda page: {"total_count": 101, "jobs": jobs}
+                if page == 1
+                else {"total_count": 101, "jobs": [{"id": 100}]},
+                collection_key="jobs",
+            ),
+            jobs + [{"id": 100}],
+        )
+        artifacts = [{"id": 7}]
+        self.assertEqual(
+            collect_github_api_pages(
+                lambda _page: {"total_count": 1, "artifacts": artifacts},
+                collection_key="artifacts",
+            ),
+            artifacts,
+        )
+
+        invalid_pages = (
+            lambda page: {"total_count": 2, "jobs": [{"id": 1}]} if page == 1 else {"total_count": 2, "jobs": []},
+            lambda page: {"total_count": 101, "jobs": jobs}
+            if page == 1
+            else {"total_count": 102, "jobs": [{"id": 100}]},
+            lambda _page: {"jobs": []},
+            lambda _page: {"total_count": 1, "jobs": [None]},
+            lambda _page: {"total_count": 1, "jobs": []},
+        )
+        for fetch_page in invalid_pages:
+            with self.subTest(fetch_page=fetch_page), self.assertRaises(ProvenanceError):
+                collect_github_api_pages(fetch_page, collection_key="jobs")
+
+        with self.assertRaises(ProvenanceError):
+            collect_github_api_pages(
+                lambda _page: {"total_count": 0, "jobs": []},
+                collection_key="jobs",
+                page_limit=0,
+            )
+
     SHA = "a" * 40
 
     def _run_finalizer_dispatch_wait(
@@ -602,7 +661,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             branch="dev",
             target_sha=self.SHA,
         )
-        self.assertFalse(incremental["runtime_sensitive"])
+        self.assertTrue(incremental["runtime_sensitive"])
         self.assertFalse(incremental["deployable"])
 
         cumulative = classify_cumulative_baseline(
@@ -619,6 +678,110 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertTrue(manifest["deployable"])
         self.assertEqual(manifest["class"], "full")
         self.assertFalse(manifest["fallback"])
+
+    def test_report_only_recovery_baseline_binds_exact_failed_release_and_closed_route(self) -> None:
+        failed_sha = "a" * 40
+        target_sha = "b" * 40
+        baseline = {
+            "schema": 1,
+            "source_sha": failed_sha,
+            "release_slug": f"gha-1234-2-{failed_sha[:12]}",
+            "release_json_sha256": "c" * 64,
+            "current_link_dev": 253,
+            "current_link_ino": 910001,
+            "release_dev": 253,
+            "release_ino": 910002,
+            "pending_operation": False,
+        }
+        changed_paths = [
+            ".github/workflows/platform-production-deploy.yml",
+            "platform/tools/platform_deploy_baseline.py",
+            "platform/tools/platform_workflow_provenance.py",
+            "platform/docs/deployment-runbook.md",
+        ]
+        incremental = classify(
+            changed_paths,
+            event="push",
+            branch="dev",
+            target_sha=target_sha,
+        )
+        manifest = classify_cumulative_baseline(
+            incremental,
+            changed_paths,
+            expected_target_sha=target_sha,
+        )["manifest"]
+        self.assertEqual(manifest["class"], "full")
+        self.assertTrue(manifest["runtime_sensitive"])
+        self.assertFalse(manifest["deployable"])
+        args = {
+            "failed_run_id": 1234,
+            "failed_run_attempt": 2,
+            "failed_source_sha": failed_sha,
+            "failed_release_json_sha256": "c" * 64,
+            "target_sha": target_sha,
+            "current_dev_sha": target_sha,
+            "first_parent_shas": [target_sha, failed_sha],
+            "confirmation": REPORT_ONLY_RECOVERY_CONFIRMATION,
+        }
+        result = validate_report_only_recovery_baseline(baseline, manifest, **args)
+        self.assertEqual(result["failed_run_id"], 1234)
+
+        invalid_baselines = (
+            {**baseline, "source_sha": "d" * 40},
+            {**baseline, "release_slug": "gha-1234-2-dddddddddddd"},
+            {**baseline, "release_json_sha256": "d" * 64},
+            {**baseline, "pending_operation": True},
+        )
+        for invalid in invalid_baselines:
+            with self.subTest(baseline=invalid), self.assertRaises(ProvenanceError):
+                validate_report_only_recovery_baseline(invalid, manifest, **args)
+
+        bad_cases = (
+            {**args, "confirmation": "operator says so"},
+            {**args, "current_dev_sha": "e" * 40},
+            {**args, "target_sha": failed_sha, "current_dev_sha": failed_sha},
+            {**args, "first_parent_shas": [target_sha, "d" * 40]},
+            {**args, "first_parent_shas": [target_sha, failed_sha, failed_sha]},
+        )
+        for invalid in bad_cases:
+            with self.subTest(arguments=invalid), self.assertRaises(ProvenanceError):
+                validate_report_only_recovery_baseline(baseline, manifest, **invalid)
+
+        for field, value in (
+            ("schema", 99),
+            ("target_sha", "d" * 40),
+            ("runtime_sensitive", False),
+            ("deployable", True),
+            ("fallback", True),
+            ("class", "docs-only"),
+            ("reason", "another route"),
+        ):
+            invalid_manifest = {**manifest, field: value}
+            with self.subTest(manifest_field=field), self.assertRaises(ProvenanceError):
+                validate_report_only_recovery_baseline(baseline, invalid_manifest, **args)
+        invalid_manifest = {
+            **manifest,
+            "files": manifest["files"] + ["platform/apps/platform_api/main.py"],
+        }
+        with self.assertRaises(ProvenanceError):
+            validate_report_only_recovery_baseline(baseline, invalid_manifest, **args)
+
+        hidden_app_incremental = classify(
+            [".github/workflows/platform-production-deploy.yml"],
+            event="push",
+            branch="dev",
+            target_sha=target_sha,
+        )
+        hidden_app_route = classify_cumulative_baseline(
+            hidden_app_incremental,
+            [
+                ".github/workflows/platform-production-deploy.yml",
+                "platform/apps/platform_api/main.py",
+            ],
+            expected_target_sha=target_sha,
+        )["manifest"]
+        with self.assertRaises(ProvenanceError):
+            validate_report_only_recovery_baseline(baseline, hidden_app_route, **args)
 
     def test_cumulative_baseline_rejects_incomplete_or_non_deployable_paths(self) -> None:
         incremental_path = ".github/workflows/platform-production-deploy.yml"
@@ -640,7 +803,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
         )
         self.assertTrue(bootstrap_no_op["no_op"])
         self.assertFalse(bootstrap_no_op["manifest"]["deployable"])
-        self.assertFalse(bootstrap_no_op["manifest"]["runtime_sensitive"])
+        self.assertTrue(bootstrap_no_op["manifest"]["runtime_sensitive"])
 
         runtime_overlap_path = "platform/tools/platform_live_qa_guard.py"
         runtime_overlap_incremental = classify(
@@ -690,7 +853,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
             )
 
         tampered = dict(incremental)
-        tampered["runtime_sensitive"] = True
+        tampered["runtime_sensitive"] = False
         with self.assertRaises(ProvenanceError):
             classify_cumulative_baseline(
                 tampered,
@@ -1624,6 +1787,281 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_run_url=f"{run['html_url']}/wrong",
             )
 
+    def test_exact_failed_report_deployment_requires_failed_run_job_and_bot_marker(self) -> None:
+        workflow, run, jobs, statuses = self._payload()
+        run["conclusion"] = "failure"
+        jobs[0]["conclusion"] = "failure"
+        jobs[0].update(run_id=1234, run_attempt=2, head_sha=self.SHA)
+        statuses[0].update(
+            state="failure",
+            description="Production deployment failed",
+        )
+        expected_url = f"{run['html_url']}/attempts/{run['run_attempt']}"
+        self.assertEqual(
+            validate_failed_report_deployment(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_target_sha=self.SHA,
+                expected_run_url=run["html_url"],
+            ),
+            expected_url,
+        )
+        documented_job_shape = [
+            {key: value for key, value in job.items() if key != "run_attempt"}
+            for job in jobs
+        ]
+        self.assertEqual(
+            validate_failed_report_deployment(
+                workflow,
+                run,
+                documented_job_shape,
+                statuses,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_target_sha=self.SHA,
+                expected_run_url=run["html_url"],
+            ),
+            expected_url,
+        )
+
+        for field, value in (
+            ("id", 1235),
+            ("run_attempt", 3),
+            ("head_sha", "b" * 40),
+            ("head_branch", "topic"),
+            ("event", "push"),
+            ("status", "in_progress"),
+            ("conclusion", "success"),
+            ("path", ".github/workflows/other.yml"),
+        ):
+            candidate = copy.deepcopy((workflow, run, jobs, statuses))
+            candidate[1][field] = value
+            with self.subTest(run_field=field), self.assertRaises(ProvenanceError):
+                validate_failed_report_deployment(
+                    *candidate,
+                    expected_run_id=1234,
+                    expected_attempt=2,
+                    expected_target_sha=self.SHA,
+                )
+        for field, value in (
+            ("run_id", 1235),
+            ("run_attempt", 3),
+            ("head_sha", "b" * 40),
+        ):
+            candidate = copy.deepcopy((workflow, run, jobs, statuses))
+            candidate[2][0][field] = value
+            with self.subTest(job_field=field), self.assertRaises(ProvenanceError):
+                validate_failed_report_deployment(
+                    *candidate,
+                    expected_run_id=1234,
+                    expected_attempt=2,
+                    expected_target_sha=self.SHA,
+                )
+
+    def test_recovery_security_requires_all_full_gates_and_both_real_runtime_jobs(self) -> None:
+        run_id, attempt = 808, 3
+        base = f"https://github.com/StrayForest/old_sparky/actions/runs/{run_id}"
+        workflow = {
+            "id": 91,
+            "path": SECURITY_WORKFLOW_PATH,
+            "name": SECURITY_WORKFLOW_NAME,
+        }
+        run = {
+            "id": run_id,
+            "workflow_id": 91,
+            "path": SECURITY_WORKFLOW_PATH,
+            "name": SECURITY_WORKFLOW_NAME,
+            "display_title": SECURITY_WORKFLOW_NAME,
+            "run_attempt": attempt,
+            "event": "push",
+            "head_branch": "dev",
+            "head_sha": self.SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": base,
+            "repository": {
+                "full_name": "StrayForest/old_sparky",
+                "name": "old_sparky",
+                "owner": {"login": "StrayForest"},
+            },
+        }
+        jobs = [
+            {
+                "id": index,
+                "name": name,
+                "status": "completed",
+                "conclusion": "success",
+                "run_id": run_id,
+                "run_attempt": attempt,
+                "head_sha": self.SHA,
+            }
+            for index, name in enumerate(sorted(RECOVERY_REQUIRED_SECURITY_JOBS), 1)
+        ]
+        statuses = [
+            {
+                "id": 999,
+                "context": SECURITY_STATUS_CONTEXT,
+                "state": "success",
+                "description": SECURITY_SUCCESS_DESCRIPTION,
+                "target_url": f"{base}/attempts/{attempt}",
+                "updated_at": "2026-10-05T10:00:00Z",
+                "creator": {"login": "github-actions[bot]", "type": "Bot", "id": 41898282},
+            }
+        ]
+        self.assertEqual(
+            validate_recovery_source_security_gates(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=run_id,
+                expected_attempt=attempt,
+                expected_target_sha=self.SHA,
+                now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+            ),
+            f"{base}/attempts/{attempt}",
+        )
+        documented_job_shape = [
+            {key: value for key, value in job.items() if key != "run_attempt"}
+            for job in jobs
+        ]
+        self.assertEqual(
+            validate_recovery_source_security_gates(
+                workflow,
+                run,
+                documented_job_shape,
+                statuses,
+                expected_run_id=run_id,
+                expected_attempt=attempt,
+                expected_target_sha=self.SHA,
+                now=datetime(2026, 10, 5, 12, tzinfo=timezone.utc),
+            ),
+            f"{base}/attempts/{attempt}",
+        )
+        for rejected in (
+            [{**job, "conclusion": "skipped"} if job["name"] == "Trusted dev immutable release runtime" else job for job in jobs],
+            [job for job in jobs if job["name"] != "Conditional release runtime fixture"],
+            [{**job, "run_attempt": 2} if job["name"] == "Backend aggregate" else job for job in jobs],
+            [{**job, "head_sha": "b" * 40} if job["name"] == "Python quality" else job for job in jobs],
+        ):
+            with self.subTest(jobs=rejected), self.assertRaises(ProvenanceError):
+                validate_recovery_source_security_gates(
+                    workflow,
+                    run,
+                    rejected,
+                    statuses,
+                    expected_run_id=run_id,
+                    expected_attempt=attempt,
+                    expected_target_sha=self.SHA,
+                )
+
+        for changed_jobs, changed_statuses in (
+            ([], statuses),
+            ([{**jobs[0], "conclusion": "success"}], statuses),
+            (jobs + [dict(jobs[0])], statuses),
+            (jobs, [{**statuses[0], "state": "success"}]),
+            (jobs, [{**statuses[0], "target_url": "https://github.com/StrayForest/old_sparky/actions/runs/1234"}]),
+            (jobs, [{**statuses[0], "creator": {"login": "operator", "type": "User", "id": 1}}]),
+            (jobs, [{**statuses[0], "description": "another failure"}]),
+        ):
+            with self.subTest(jobs=changed_jobs, statuses=changed_statuses), self.assertRaises(ProvenanceError):
+                validate_failed_report_deployment(
+                    workflow,
+                    run,
+                    changed_jobs,
+                    changed_statuses,
+                    expected_run_id=1234,
+                    expected_attempt=2,
+                    expected_target_sha=self.SHA,
+                )
+
+    def test_report_only_remote_diagnostic_accepts_only_closed_plain_text_marker(self) -> None:
+        valid = (
+            "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+            "reason=invalid_marker child_exit=0 observed_bytes=223 dispatcher_exit=2\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "job-logs.txt"
+
+            def write_log(body: str | bytes, *, symlink: bool = False) -> None:
+                log_path.write_bytes(body.encode("utf-8") if isinstance(body, str) else body)
+                if symlink:
+                    log_path.unlink()
+                    log_path.symlink_to(Path(__file__))
+
+            write_log(valid)
+            self.assertEqual(
+                validate_report_only_remote_diagnostic(log_path),
+                {
+                    "reason": "invalid_marker",
+                    "child_exit": 0,
+                    "observed_bytes": 223,
+                    "dispatcher_exit": 2,
+                },
+            )
+            write_log("2026-10-05T12:34:56.1234567Z " + valid.rstrip("\n") + "\n")
+            self.assertEqual(
+                validate_report_only_remote_diagnostic(log_path)["observed_bytes"],
+                223,
+            )
+
+            invalid_markers = (
+                valid.replace("child_exit=0", "child_exit=1"),
+                valid.replace("dispatcher_exit=2", "dispatcher_exit=0"),
+                valid.replace("reason=invalid_marker", "reason=ssh_failure"),
+                valid.replace("observed_bytes=223", "observed_bytes=0"),
+                valid.replace("observed_bytes=223", "observed_bytes=513"),
+                valid.replace("observed_bytes=223", "observed_bytes=not-a-number"),
+                valid + "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed reason=other\n",
+                valid + valid,
+            )
+            for body in invalid_markers:
+                write_log(body)
+                with self.subTest(body=body), self.assertRaises(ProvenanceError):
+                    validate_report_only_remote_diagnostic(log_path)
+
+            write_log("ordinary output\n" + valid)
+            self.assertEqual(
+                validate_report_only_remote_diagnostic(log_path)["dispatcher_exit"],
+                2,
+            )
+            write_log(b"ordinary output\n\xff")
+            with self.assertRaises(ProvenanceError):
+                validate_report_only_remote_diagnostic(log_path)
+            write_log(valid, symlink=True)
+            with self.assertRaises(ProvenanceError):
+                validate_report_only_remote_diagnostic(log_path)
+
+        # A failed report proof never changes the strict successful marker
+        # contract used by normal baseline reconciliation.
+        workflow, run, jobs, statuses = self._payload()
+        run["conclusion"] = "failure"
+        jobs[0]["conclusion"] = "failure"
+        statuses[0].update(
+            state="failure",
+            description="Production deployment failed",
+        )
+        with self.assertRaises(ProvenanceError):
+            validate_deployment_marker(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_target_sha=self.SHA,
+            )
+
+        run["conclusion"] = "success"
+        jobs[0]["conclusion"] = "success"
+        statuses[0].update(
+            state="success",
+            description="Production deployment and live smoke passed",
+        )
         reconcile_title = (
             f"Platform production deploy mode=baseline-reconcile target={self.SHA} "
             "source=567.1 auto=678.2"

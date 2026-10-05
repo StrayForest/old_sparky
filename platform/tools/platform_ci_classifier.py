@@ -72,6 +72,15 @@ RUNTIME_SENSITIVE_FILES = frozenset(
         "platform/tests/test_platform_live_qa_guard.py",
         "platform/tests/test_platform_live_qa_runtime_install.py",
         "platform/tests/test_platform_validate_release_artifact.py",
+        # Recovery-deploy authenticates the failed report marker and opens a
+        # narrowly scoped production mode. It must receive the trusted
+        # runtime fixture gate on the new target before that mode can deploy.
+        ".github/workflows/platform-production-deploy.yml",
+        "platform/tools/platform_workflow_provenance.py",
+        "platform/tools/platform_deploy_baseline.py",
+        "platform/tools/platform_production_classifier_artifact.py",
+        "platform/tests/test_platform_workflow_provenance.py",
+        "platform/tests/test_platform_recovery_workflow_caller.py",
     }
 )
 
@@ -185,6 +194,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_validate_release_artifact.py",
         "platform/tests/test_platform_host_tools_bundle.py",
         "platform/tests/test_platform_workflow_provenance.py",
+        "platform/tests/test_platform_recovery_workflow_caller.py",
         "platform/tests/test_platform_cloudflare_ips.py",
         "platform/python_packages/platform_infra/db.py",
         "platform/tests/test_platform_install_nginx.py",

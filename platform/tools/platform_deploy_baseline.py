@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from tools.platform_ci_classifier import (
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
+    DOCS_PREFIX,
     FULL_GATE_IDS,
     RECOVERY_BOOTSTRAP_FILES,
     RECOVERY_BOOTSTRAP_REASON,
@@ -135,6 +136,111 @@ BASELINE_RUNTIME_TITLE_RE = re.compile(
     r"d(?P<parent_id>[1-9][0-9]{0,31})\.(?P<parent_attempt>[1-9][0-9]{0,31}):"
     r"r(?P<proof_id>[1-9][0-9]{0,31})\.(?P<proof_attempt>[1-9][0-9]{0,31})\Z"
 )
+REPORT_ONLY_RECOVERY_CONFIRMATION = "RECOVERY_DEPLOY_REPORT_ONLY_INVALID_MARKER"
+
+
+def validate_report_only_recovery_baseline(
+    baseline: object,
+    classifier_manifest: object,
+    *,
+    failed_run_id: int,
+    failed_run_attempt: int,
+    failed_source_sha: str,
+    failed_release_json_sha256: str,
+    target_sha: str,
+    current_dev_sha: str,
+    first_parent_shas: Sequence[str],
+    confirmation: str,
+) -> dict[str, object]:
+    """Bind a typed recovery dispatch to the exact failed release and target.
+
+    This exception authorizes only a new ordinary deployment after the
+    operator attests that the exact previous failure was report-only.  The
+    failed run/status and signed artifact are validated separately; their
+    derived SHA, slug, and RELEASE.json digest must then equal the live host
+    tuple captured by the pinned capability.  The deployment supervisor
+    repeats that complete tuple comparison under both write locks.
+    """
+
+    baseline_row = _validate_baseline(baseline)
+    if confirmation != REPORT_ONLY_RECOVERY_CONFIRMATION:
+        raise ProvenanceError("recovery deployment confirmation is invalid")
+    for value, field in (
+        (failed_run_id, "failed run id"),
+        (failed_run_attempt, "failed run attempt"),
+    ):
+        _positive_bounded_integer(value, field)
+    if not isinstance(failed_source_sha, str) or SHA_RE.fullmatch(failed_source_sha) is None:
+        raise ProvenanceError("failed release source SHA is invalid")
+    if not isinstance(failed_release_json_sha256, str) or HEX_DIGEST_RE.fullmatch(
+        failed_release_json_sha256
+    ) is None:
+        raise ProvenanceError("failed release identity digest is invalid")
+    expected_slug = (
+        f"gha-{failed_run_id}-{failed_run_attempt}-{failed_source_sha[:12]}"
+    )
+    if (
+        baseline_row["source_sha"] != failed_source_sha
+        or baseline_row["release_slug"] != expected_slug
+        or baseline_row["release_json_sha256"] != failed_release_json_sha256
+        or baseline_row["pending_operation"] is not False
+    ):
+        raise ProvenanceError("active release does not match the exact failed run artifact")
+
+    if not isinstance(target_sha, str) or SHA_RE.fullmatch(target_sha) is None:
+        raise ProvenanceError("recovery deployment target SHA is invalid")
+    if not isinstance(current_dev_sha, str) or current_dev_sha != target_sha:
+        raise ProvenanceError("recovery deployment target is not the current dev head")
+    if failed_source_sha == target_sha:
+        raise ProvenanceError("recovery deployment must target a new source SHA")
+    if (
+        not isinstance(first_parent_shas, Sequence)
+        or isinstance(first_parent_shas, (str, bytes))
+        or not first_parent_shas
+        or first_parent_shas[0] != target_sha
+        or failed_source_sha not in first_parent_shas
+        or len(first_parent_shas) > MAX_FIRST_PARENT_COMMITS
+        or any(not isinstance(sha, str) or SHA_RE.fullmatch(sha) is None for sha in first_parent_shas)
+        or len(set(first_parent_shas)) != len(first_parent_shas)
+    ):
+        raise ProvenanceError("failed release is not an unambiguous first-parent ancestor")
+
+    if not isinstance(classifier_manifest, Mapping):
+        raise ProvenanceError("recovery classifier manifest is malformed")
+    try:
+        validate_manifest(classifier_manifest, expected_target_sha=target_sha)
+    except ClassifierError as exc:
+        raise ProvenanceError(f"recovery classifier manifest is invalid: {exc}") from exc
+    manifest = classifier_manifest
+    files = manifest.get("files")
+    if (
+        manifest.get("target_sha") != target_sha
+        or manifest.get("event") != "push"
+        or manifest.get("class") != "full"
+        or manifest.get("expected_gates") != list(FULL_GATE_IDS)
+        or manifest.get("runtime_sensitive") is not True
+        or manifest.get("deployable") is not False
+        or manifest.get("fallback") is not False
+        or manifest.get("reason") != RECOVERY_BOOTSTRAP_REASON
+        or not isinstance(files, list)
+        or not files
+        or any(not isinstance(path, str) for path in files)
+        or len(set(files)) != len(files)
+        or not any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
+        or any(
+            path not in RECOVERY_BOOTSTRAP_FILES and not path.startswith(DOCS_PREFIX)
+            for path in files
+        )
+    ):
+        raise ProvenanceError("classifier manifest is not the exact recovery-only route")
+    return {
+        "baseline": dict(baseline_row),
+        "failed_run_id": failed_run_id,
+        "failed_run_attempt": failed_run_attempt,
+        "failed_source_sha": failed_source_sha,
+        "target_sha": target_sha,
+        "confirmation": confirmation,
+    }
 
 
 def _positive_bounded_integer(value: object, field: str) -> int:
