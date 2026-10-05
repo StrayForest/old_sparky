@@ -65,8 +65,19 @@ calling the task complete.
    gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
    ```
 
-   The workflow holds the retained-load barrier, verifies the active release,
-   starts `deadlock-maintenance.service`, and publishes bounded evidence.
+   The workflow verifies the active release and starts
+   `deadlock-maintenance.service`; the service holds the canonical release and retained-load locks while applying the sweep and publishing bounded evidence.
+
+   Its report is bound to that service invocation. If a valid report confirms
+   a restore-verified backup but maintenance exits nonzero because disk
+   thresholds still fail, the workflow publishes the bounded result and keeps
+   the failure status. Do not infer that no deletion occurred or call cleanup
+   successful from an artifact upload alone.
+
+   Read-only diagnostics may upload a bounded partial inventory plus a closed
+   stage/outcome when collection fails. Use those fields to distinguish
+   transport or producer failure from a disk-threshold result; raw host report
+   content and command output remain private.
 
    The service keeps five newest production releases plus `current` and
    `previous`; it retains one live-QA runtime cache and applies age/pattern

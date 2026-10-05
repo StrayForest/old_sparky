@@ -109,8 +109,10 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$EXPECTED_SHA" "$CONFIRMATION" > "$remote_log" 2> "$ssh_error" <<'REMOTE'
+          bash -s -- "$EXPECTED_SHA" "$CONFIRMATION" > "$remote_log" 2> "$ssh_error" <<'REMOTE'
           set -Eeuo pipefail
+          CURRENT_STAGE=identity
+          trap 'diagnostic_rc=$?; trap - ERR; if [[ "${service_status:-0}" =~ ^[1-9][0-9]{0,2}$ ]] && (( service_status <= 255 )); then diagnostic_rc=$service_status; fi; printf "{\"schema\":1,\"kind\":\"collection_failure\",\"status\":\"failed\",\"stage\":\"%s\",\"outcome\":\"producer_failed\",\"exit_code\":%d}\n" "$CURRENT_STAGE" "$diagnostic_rc"; exit "$diagnostic_rc"' ERR
 
           expected_sha="$1"
           confirmation="$2"
@@ -122,8 +124,31 @@ jobs:
           input_guard="$current/tools/platform_workflow_input_guard.py"
 
           fail() {
-            printf 'ERROR: %s\n' "$*" >&2
-            exit 1
+            local failure_code=1
+            if [[ "${service_status:-0}" =~ ^[1-9][0-9]{0,2}$ ]] \
+              && (( service_status <= 255 )); then
+              failure_code="$service_status"
+            fi
+            printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"producer_failed","exit_code":%d}\n' \
+              "$CURRENT_STAGE" "$failure_code"
+            exit "$failure_code"
+          }
+          fail_with_status() {
+            local outcome="$1"
+            local failure_code="$2"
+            printf '{"schema":1,"kind":"collection_failure","status":"failed","stage":"%s","outcome":"%s","exit_code":%d}\n' \
+              "$CURRENT_STAGE" "$outcome" "$failure_code"
+            exit "$failure_code"
+          }
+          fail_for_service_status() {
+            local outcome="$1"
+            local fallback_code="$2"
+            local failure_code="$fallback_code"
+            if [[ "${service_status:-0}" =~ ^[1-9][0-9]{0,2}$ ]] \
+              && (( service_status <= 255 )); then
+              failure_code="$service_status"
+            fi
+            fail_with_status "$outcome" "$failure_code"
           }
 
           test "$(id -u)" -eq 0 || fail "Production maintenance must run as root."
@@ -174,50 +199,264 @@ jobs:
           # reverse load -> release edge against production deploy.
           printf '{"schema":1,"kind":"storage_maintenance","active_release_id":"%s","previous_release_id":"%s","active_source_sha":"%s"}\n' \
             "$current_id" "$previous_id" "$active_sha"
-          printf 'state=held\n' \
-            | /usr/bin/python3 -I "$summary_tool" --mode lock
+          printf '{"schema":1,"kind":"storage_lock_lifecycle","owner":"deadlock-maintenance.service","state":"service_managed"}\n'
 
+          CURRENT_STAGE=service_invocation
+          service_state_before="$(systemctl show deadlock-maintenance.service \
+            --property=ActiveState --value --no-pager 2>/dev/null)" \
+            || fail "Maintenance service state producer failed."
+          [[ "$service_state_before" == inactive || "$service_state_before" == failed ]] \
+            || fail "Maintenance service already has an active invocation."
+          service_invocation_before="$(systemctl show deadlock-maintenance.service \
+            --property=InvocationID --value --no-pager 2>/dev/null)" \
+            || fail "Maintenance invocation identity producer failed."
+          if [[ -n "$service_invocation_before" \
+            && ! "$service_invocation_before" =~ ^[0-9a-f]{32}$ ]]; then
+            fail "Previous maintenance invocation identity is invalid."
+          fi
+          invocation_started_at="$(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')" \
+            || fail "Maintenance invocation start time producer failed."
           set +e
           systemctl start deadlock-maintenance.service
           service_status=$?
           set -e
+          invocation_completed_at="$(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')" \
+            || fail "Maintenance invocation completion time producer failed."
+          if ! service_invocation_after="$(systemctl show deadlock-maintenance.service \
+            --property=InvocationID --value --no-pager 2>/dev/null)"; then
+            fail_for_service_status invocation_unavailable 2
+          fi
+          if [[ ! "$service_invocation_after" =~ ^[0-9a-f]{32}$ \
+            || "$service_invocation_after" == "$service_invocation_before" ]]; then
+            fail_for_service_status invocation_unavailable 2
+          fi
           service_output="$(systemctl show deadlock-maintenance.service \
             --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec \
             --no-pager 2>/dev/null)" \
-            || fail "Maintenance service state producer failed."
+            || fail_for_service_status service_state_unavailable 2
           printf '%s\n' "$service_output" \
             | /usr/bin/python3 -I "$summary_tool" --mode service --service maintenance \
-            || fail "Maintenance service state summary failed."
-          test "$service_status" -eq 0 || fail "deadlock-maintenance.service failed."
+            || fail_for_service_status service_summary_unavailable 2
 
+          CURRENT_STAGE=postchecks
           test "$(readlink -f "$current")" = "$current_before" \
             || fail "Current release target changed during maintenance."
           test "$(readlink -f "$runtime/previous")" = "$previous_before" \
             || fail "Previous release target changed during maintenance."
+          current_id_after="$(basename "$(readlink -f "$current")")"
+          previous_id_after="$(basename "$(readlink -f "$runtime/previous")")"
+          [[ "$current_id_after" == "$current_id" \
+            && "$previous_id_after" == "$previous_id" ]] \
+            || fail "Protected release identifiers changed during maintenance."
+          active_sha_after="$(/usr/bin/python3 -I - "$current/RELEASE.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("source_git_commit") or "")
+          PY
+          )"
+          test "$active_sha_after" = "$active_sha" \
+            || fail "Active release source SHA changed during maintenance."
           test ! -e "$shared/.release-operation.json" \
             || fail "A release transaction remains after maintenance."
 
-          latest_report="$(find "$report_dir" -maxdepth 1 -type f -name 'platform-maintenance-*.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
-          test -n "$latest_report" && test ! -L "$latest_report" || fail "Maintenance report is missing or unsafe."
+          CURRENT_STAGE=report_binding
+          set +e
+          report_name="$(/usr/bin/python3 -I - "$report_dir" \
+            "$invocation_started_at" "$invocation_completed_at" \
+            "$service_invocation_before" "$service_invocation_after" \
+            "$current_id" "$previous_id" 2>/dev/null <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          report_dir = Path(sys.argv[1])
+          pattern = re.compile(r"^platform-maintenance-[0-9]{8}T[0-9]{6}Z\.json$")
+          try:
+              started_at = datetime.fromisoformat(sys.argv[2].replace("Z", "+00:00"))
+              completed_at = datetime.fromisoformat(sys.argv[3].replace("Z", "+00:00"))
+              before_id, after_id = sys.argv[4], sys.argv[5]
+              current_id, previous_id = sys.argv[6], sys.argv[7]
+              if (
+                  started_at.tzinfo != timezone.utc
+                  or completed_at.tzinfo != timezone.utc
+                  or completed_at < started_at
+                  or (before_id and not re.fullmatch(r"[0-9a-f]{32}", before_id))
+                  or not re.fullmatch(r"[0-9a-f]{32}", after_id)
+                  or before_id == after_id
+              ):
+                  raise ValueError
+              directory = report_dir.lstat()
+              if (
+                  not stat.S_ISDIR(directory.st_mode)
+                  or stat.S_ISLNK(directory.st_mode)
+                  or directory.st_uid != 0
+                  or directory.st_gid != 0
+                  or (stat.S_IMODE(directory.st_mode) & 0o022)
+              ):
+                  raise ValueError
+              start_ns = int(started_at.timestamp() * 1_000_000_000)
+              finish_ns = int(completed_at.timestamp() * 1_000_000_000)
+              matches = []
+              for path in report_dir.iterdir():
+                  if not pattern.fullmatch(path.name):
+                      continue
+                  named = path.lstat()
+                  if not start_ns <= named.st_mtime_ns <= finish_ns:
+                      continue
+                  if (
+                      not stat.S_ISREG(named.st_mode)
+                      or stat.S_ISLNK(named.st_mode)
+                      or named.st_uid != 0
+                      or named.st_gid != 0
+                      or named.st_nlink != 1
+                      or stat.S_IMODE(named.st_mode) != 0o600
+                  ):
+                      raise ValueError
+                  descriptor = os.open(
+                      path,
+                      os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+                  )
+                  try:
+                      opened = os.fstat(descriptor)
+                      current = path.lstat()
+                      if (
+                          (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+                          or (named.st_dev, named.st_ino) != (current.st_dev, current.st_ino)
+                          or not stat.S_ISREG(opened.st_mode)
+                          or opened.st_uid != 0
+                          or opened.st_gid != 0
+                          or opened.st_nlink != 1
+                          or stat.S_IMODE(opened.st_mode) != 0o600
+                          or opened.st_size > 256 * 1024
+                      ):
+                          raise ValueError
+                      payload_bytes = os.read(descriptor, 256 * 1024 + 1)
+                      if len(payload_bytes) > 256 * 1024:
+                          raise ValueError
+                  finally:
+                      os.close(descriptor)
+                  payload = json.loads(payload_bytes)
+                  if not isinstance(payload, dict) or payload.get("mode") != "apply":
+                      continue
+                  production = payload.get("production_releases")
+                  protected = production.get("protected") if isinstance(production, dict) else None
+                  backup = payload.get("backup")
+                  if (
+                      not isinstance(protected, list)
+                      or current_id not in protected
+                      or previous_id not in protected
+                      or not isinstance(backup, dict)
+                      or backup.get("status") != "completed"
+                      or backup.get("restore_verified") is not True
+                  ):
+                      continue
+                  report_started = datetime.fromisoformat(
+                      str(payload.get("started_at_utc", "")).replace("Z", "+00:00")
+                  )
+                  report_completed = datetime.fromisoformat(
+                      str(payload.get("completed_at_utc", "")).replace("Z", "+00:00")
+                  )
+                  if (
+                      report_started.tzinfo == timezone.utc
+                      and report_completed.tzinfo == timezone.utc
+                      and started_at <= report_started <= report_completed <= completed_at
+                      and isinstance(payload.get("ok"), bool)
+                  ):
+                      matches.append(path.name)
+              if len(matches) != 1:
+                  raise LookupError
+              print(matches[0])
+          except LookupError:
+              raise SystemExit(3)
+          except Exception:
+              raise SystemExit(2)
+          PY
+          )"
+          report_binding_status=$?
+          set -e
+          if (( report_binding_status != 0 )); then
+            if (( service_status != 0 )); then
+              fail_with_status report_unavailable "$service_status"
+            fi
+            failure_code=$(( report_binding_status == 3 ? 3 : 2 ))
+            fail_with_status report_unavailable "$failure_code"
+          fi
+          [[ "$report_name" =~ ^platform-maintenance-[0-9]{8}T[0-9]{6}Z\.json$ ]] \
+            || fail "Bound maintenance report name is invalid."
+          latest_report="$report_dir/$report_name"
+          CURRENT_STAGE=retention_summary
           retention_summary_file="$(mktemp)"
           trap 'rm -f -- "$retention_summary_file"' EXIT
           /usr/bin/python3 -I "$summary_tool" --mode retention <"$latest_report" \
             >"$retention_summary_file" \
             || fail "Maintenance report summary failed."
-          /usr/bin/python3 -I - "$retention_summary_file" <<'PY'
+          maintenance_result="$(/usr/bin/python3 -I - \
+            "$retention_summary_file" "$service_status" <<'PY'
           import json
           from pathlib import Path
           import sys
 
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           backup = report.get("backup") or {}
-          if report.get("mode") != "apply" or report.get("ok") is not True:
-              raise SystemExit("maintenance report summary is not successful")
+          disk = report.get("disk_after") or {}
+          limits = report.get("limits") or {}
+          ok = report.get("ok")
+          if report.get("mode") != "apply" or not isinstance(ok, bool):
+              raise SystemExit(2)
           if backup.get("status") != "completed" or backup.get("restore_verified") is not True:
-              raise SystemExit("maintenance backup was not restore-verified")
+              raise SystemExit(2)
+          free_bytes = disk.get("free_bytes")
+          used_percent = disk.get("used_percent")
+          minimum_free = limits.get("minimum_free_bytes")
+          maximum_used = limits.get("maximum_used_percent")
+          def numeric(value):
+              return isinstance(value, (int, float)) and not isinstance(value, bool)
+          if not all(numeric(value) for value in (free_bytes, used_percent, minimum_free, maximum_used)):
+              raise SystemExit(2)
+          threshold_failed = free_bytes < minimum_free or used_percent > maximum_used
+          service_status = int(sys.argv[2])
+          if ok == threshold_failed:
+              status, error_class = "failed", "inconsistent_result"
+          elif not ok and threshold_failed:
+              status, error_class = "unhealthy", "disk_threshold"
+          elif ok and service_status == 0:
+              status, error_class = "ok", "none"
+          else:
+              status, error_class = "failed", "service_exit"
+          print(json.dumps({
+              "schema": 1,
+              "kind": "storage_maintenance_result",
+              "status": status,
+              "error_class": error_class,
+              "service_exit_code": service_status,
+              "minimum_free_bytes": minimum_free,
+              "maximum_used_percent": maximum_used,
+              "free_bytes": free_bytes,
+              "used_percent": used_percent,
+          }, sort_keys=True, separators=(",", ":")))
           PY
+          )" || fail "Maintenance report result summary failed."
+          printf '%s\n' "$maintenance_result"
           cat "$retention_summary_file"
+          maintenance_result_status="$(printf '%s\n' "$maintenance_result" \
+            | /usr/bin/python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("status", "invalid"))')"
+          if [[ "$maintenance_result_status" == unhealthy ]]; then
+            CURRENT_STAGE=service_result
+            failure_code=$(( service_status != 0 ? service_status : 1 ))
+            fail_with_status disk_threshold "$failure_code"
+          elif [[ "$maintenance_result_status" == failed || "$maintenance_result_status" != ok ]]; then
+            CURRENT_STAGE=service_result
+            failure_code=$(( service_status != 0 ? service_status : 2 ))
+            fail_with_status maintenance_service_failed "$failure_code"
+          fi
 
+          CURRENT_STAGE=postchecks
           for service in deadlock-api deadlock-worker deadlock-web nginx; do
             systemctl is-active --quiet "$service" || fail "$service is not active after maintenance."
           done
@@ -238,9 +477,14 @@ jobs:
           REMOTE
           remote_status=$?
           if (( remote_status != 0 )); then
-            printf '%s\n' \
-              '{"schema":1,"kind":"storage_maintenance","status":"failed","error_class":"remote_or_transport"}' \
-              > "$remote_log"
+            if (( remote_status == 255 )); then
+              printf '%s\n' \
+                '{"schema":1,"kind":"collection_transport","status":"failed","stage":"ssh_transport","outcome":"transport_failed","exit_code":255}' \
+                >> "$remote_log"
+            else
+              printf '{"schema":1,"kind":"collection_transport","status":"failed","stage":"remote_exit","outcome":"nonzero_exit","exit_code":%d}\n' \
+                "$remote_status" >> "$remote_log"
+            fi
           fi
           set -e
           echo "remote_status=$remote_status" >> "$GITHUB_OUTPUT"
@@ -293,7 +537,15 @@ jobs:
       - name: Enforce maintenance result
         if: ${{ always() }}
         shell: bash
+        env:
+          REMOTE_STATUS: ${{ steps.maintenance.outputs.remote_status }}
         run: |
           set -euo pipefail
-          test "${{ steps.maintenance.outputs.remote_status }}" = "0" \
-            || { echo "Production storage maintenance failed." >&2; exit 1; }
+          [[ "$REMOTE_STATUS" =~ ^(0|[1-9][0-9]{0,2})$ ]] \
+            || { echo "Maintenance remote status was not a bounded integer." >&2; exit 2; }
+          (( REMOTE_STATUS <= 255 )) \
+            || { echo "Maintenance remote status exceeded the SSH exit range." >&2; exit 2; }
+          if (( REMOTE_STATUS != 0 )); then
+            echo "Production storage maintenance failed after evidence upload (exit $REMOTE_STATUS)." >&2
+          fi
+          exit "$REMOTE_STATUS"
