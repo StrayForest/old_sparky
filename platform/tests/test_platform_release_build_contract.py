@@ -30,6 +30,7 @@ from tests.test_platform_validate_release_artifact import (
     VALIDATOR_SCRIPT,
 )
 from tools import platform_workflow_remote_dispatch
+from tools import platform_validate_release_artifact as release_artifact_validator
 from tools.platform_ci_classifier import (
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
@@ -1755,7 +1756,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             'bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"',
             workflow,
         )
-        self.assertIn('--extract-to "$bootstrap_dir"', workflow)
+        self.assertIn('--extract-bootstrap-tools-to "$bootstrap_dir"', workflow)
         self.assertIn(
             'candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"',
             workflow,
@@ -2326,6 +2327,190 @@ fail 'private lock detail must not cross the public channel'
             self.assertNotEqual(cleaned.returncode, 0)
             self.assertFalse(artifact.exists())
             self.assertFalse(artifact.is_symlink())
+
+    def test_bootstrap_deploy_entrypoint_uses_only_extracted_tools_and_isolated_lock(
+        self,
+    ) -> None:
+        """Run the real bootstrap deploy entrypoint up to a safe layout rejection."""
+
+        if os.geteuid() != 0:
+            self.skipTest("isolated root-owned release lock fixture requires root")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "bootstrap-execution.tar.gz"
+            fixture = ReleaseArtifactFixtureBuilder(artifact)
+            tools_prefix = f"{RELEASE_SLUG}/tools"
+            fixture.entries = [
+                (member, content)
+                for member, content in fixture.entries
+                if member.name != tools_prefix
+                and not member.name.startswith(f"{tools_prefix}/")
+            ]
+            fixture.add_directory(tools_prefix)
+
+            lock_suffix = hashlib.sha256(
+                f"{os.getpid()}:{root}".encode("utf-8")
+            ).hexdigest()[:16]
+            release_lock = Path(
+                f"/run/lock/oldsparky-bootstrap-{os.getpid()}-{lock_suffix}.lock"
+            )
+            retained_lock = Path(
+                f"/run/lock/oldsparky-bootstrap-retained-{os.getpid()}-{lock_suffix}.lock"
+            )
+            self.assertFalse(release_lock.exists() or release_lock.is_symlink())
+            self.assertFalse(retained_lock.exists() or retained_lock.is_symlink())
+
+            lock_source = (TOOLS_DIR / "platform_release_lock.sh").read_text(
+                encoding="utf-8"
+            )
+            release_path = (
+                'PLATFORM_RELEASE_LOCK_CANONICAL_PATH="/run/lock/'
+                'oldsparky-platform-release.lock"'
+            )
+            retained_path = (
+                'PLATFORM_RETAINED_LOAD_LOCK_CANONICAL_PATH='
+                '"/run/lock/oldsparky-retained-load-matrix.lock"'
+            )
+            self.assertEqual(lock_source.count(release_path), 1)
+            self.assertEqual(lock_source.count(retained_path), 1)
+            lock_source = lock_source.replace(
+                release_path,
+                f'PLATFORM_RELEASE_LOCK_CANONICAL_PATH="{release_lock}"',
+                1,
+            ).replace(
+                retained_path,
+                f'PLATFORM_RETAINED_LOAD_LOCK_CANONICAL_PATH="{retained_lock}"',
+                1,
+            )
+            self.assertNotIn(release_path, lock_source)
+            self.assertNotIn(retained_path, lock_source)
+            self.assertEqual(lock_source.count(str(release_lock)), 1)
+            self.assertEqual(lock_source.count(str(retained_lock)), 1)
+
+            for relative in (
+                "platform_release_deploy.sh",
+                "platform_release_lock.sh",
+                "platform_nginx_error_summary.py",
+                "platform_web_runtime_diagnostics_summary.py",
+                "platform_storage_evidence_summary.py",
+                "platform_media_migration_diagnostics_summary.py",
+            ):
+                source = TOOLS_DIR / relative
+                content = (
+                    lock_source.encode("utf-8")
+                    if relative == "platform_release_lock.sh"
+                    else source.read_bytes()
+                )
+                fixture.add_file(
+                    f"{tools_prefix}/{relative}", content, mode=0o755
+                )
+            fixture.write()
+
+            checksum = Path(f"{artifact}.sha256")
+            checksum.write_text(
+                f"{hashlib.sha256(artifact.read_bytes()).hexdigest()}  "
+                f"{artifact.name}\n",
+                encoding="ascii",
+            )
+            bootstrap_root = root / "bootstrap"
+            bootstrap_root.mkdir()
+            release_artifact_validator.validate_archive(
+                artifact,
+                release_slug=RELEASE_SLUG,
+                extract_bootstrap_tools_to=bootstrap_root,
+            )
+
+            app_dir = root / "empty-app"
+            app_dir.mkdir()
+            deploy_entrypoint = (
+                bootstrap_root / RELEASE_SLUG / "tools/platform_release_deploy.sh"
+            )
+            self.assertEqual(
+                deploy_entrypoint.read_bytes(),
+                (TOOLS_DIR / "platform_release_deploy.sh").read_bytes(),
+            )
+            trap_bin = root / "host-command-traps"
+            trap_bin.mkdir(mode=0o700)
+            unexpected_calls = root / "unexpected-host-command-calls"
+            for command_name in (
+                "systemctl",
+                "timeout",
+                "sudo",
+                "psql",
+                "redis-cli",
+                "nginx",
+                "curl",
+                "alembic",
+                "npm",
+            ):
+                trap = trap_bin / command_name
+                trap.write_text(
+                    "#!/bin/sh\n"
+                    'printf "%s\\n" "$0" >> "$PLATFORM_TEST_HOST_CALLS"\n'
+                    "exit 99\n",
+                    encoding="ascii",
+                )
+                trap.chmod(0o700)
+
+            # Keep the archived entrypoint byte-for-byte equal to production,
+            # then redirect only its command lookup paths in the disposable
+            # execution fixture.  Any unexpected host action fails closed.
+            deploy_source = deploy_entrypoint.read_text(encoding="utf-8")
+            production_path = "export PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+            self.assertEqual(deploy_source.count(production_path), 1)
+            deploy_source = deploy_source.replace(
+                production_path,
+                f'export PATH={trap_bin}:/usr/sbin:/usr/bin:/sbin:/bin',
+                1,
+            )
+            for variable, command_name in (
+                ("SYSTEMCTL_BIN", "systemctl"),
+                ("SYSTEMCTL_TIMEOUT_BIN", "timeout"),
+            ):
+                assignment = f'{variable}="/usr/bin/{command_name}"'
+                self.assertEqual(deploy_source.count(assignment), 1)
+                deploy_source = deploy_source.replace(
+                    assignment,
+                    f'{variable}="{trap_bin / command_name}"',
+                    1,
+                )
+            deploy_entrypoint.write_text(deploy_source, encoding="utf-8")
+            deploy_entrypoint.chmod(0o755)
+            try:
+                result = subprocess.run(
+                    [
+                        str(deploy_entrypoint),
+                        "--app-dir",
+                        str(app_dir),
+                        "--artifact",
+                        str(artifact),
+                    ],
+                    env={
+                        "PATH": f"{trap_bin}:/usr/sbin:/usr/bin:/sbin:/bin",
+                        "LC_ALL": "C",
+                        "PLATFORM_TEST_HOST_CALLS": str(unexpected_calls),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=20,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(
+                    result.stderr,
+                    "RELEASE_DEPLOY schema=1 status=failed class=layout "
+                    "release_slug=unavailable source_sha=unavailable\n",
+                )
+                self.assertFalse(
+                    (bootstrap_root / RELEASE_SLUG / "RELEASE.json").exists()
+                )
+                self.assertTrue(release_lock.is_file())
+                self.assertFalse(unexpected_calls.exists())
+            finally:
+                for path in (release_lock, retained_lock):
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
 
     def test_host_tools_contract_failure_emits_marker_before_locks(self) -> None:
         """A silent closure-validator failure reaches the closed marker path."""

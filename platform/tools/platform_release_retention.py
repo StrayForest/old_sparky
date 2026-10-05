@@ -77,11 +77,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete planned candidates. Without this flag the command is read-only.",
     )
+    parser.add_argument(
+        "--expected-candidate",
+        action="append",
+        default=None,
+        metavar="SLUG",
+        help=(
+            "Require this release slug to be in the complete deletion plan. "
+            "Repeat once for every approved candidate; any plan mismatch fails closed."
+        ),
+    )
     args = parser.parse_args()
     if args.keep < 0 or args.keep > 200:
         parser.error("--keep must be between 0 and 200")
     if args.min_age_days < 0 or args.min_age_days > 3650:
         parser.error("--min-age-days must be between 0 and 3650")
+    if args.expected_candidate is not None:
+        if not args.apply:
+            parser.error("--expected-candidate requires --apply")
+        if len(args.expected_candidate) != len(set(args.expected_candidate)):
+            parser.error("--expected-candidate values must be unique")
+        if any(
+            SAFE_RELEASE_ID_RE.fullmatch(slug) is None
+            for slug in args.expected_candidate
+        ):
+            parser.error("--expected-candidate must be a valid release slug")
     return args
 
 
@@ -449,7 +469,16 @@ def _validate_candidate(
         raise RuntimeError("Release deletion target changed after planning")
 
 
-def apply_plan(plan: RetentionPlan, *, app_dir: Path | None = None) -> None:
+def apply_plan(
+    plan: RetentionPlan,
+    *,
+    app_dir: Path | None = None,
+    expected_candidates: tuple[str, ...] | None = None,
+) -> None:
+    if expected_candidates is not None:
+        planned_candidates = {entry.path.name for entry in plan.candidates}
+        if planned_candidates != set(expected_candidates):
+            raise RuntimeError("Planned releases do not match expected candidates")
     resolved_app_dir = _plan_app_dir(plan, app_dir)
     releases_dir = (resolved_app_dir / "releases").resolve(strict=True)
     for entry in plan.candidates:
@@ -506,7 +535,15 @@ def main() -> int:
                 min_age_days=args.min_age_days,
                 apply=True,
             )
-            apply_plan(plan, app_dir=resolved_app_dir)
+            apply_plan(
+                plan,
+                app_dir=resolved_app_dir,
+                expected_candidates=(
+                    tuple(args.expected_candidate)
+                    if args.expected_candidate is not None
+                    else None
+                ),
+            )
             print(f"Deleted {len(plan.candidates)} release(s).")
             return 0
     except Exception as exc:

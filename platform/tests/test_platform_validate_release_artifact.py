@@ -446,6 +446,84 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         )
         self.assertEqual((release / "server-link").read_text(), "console.log('ok');\n")
 
+    def test_bootstrap_extraction_materializes_only_validated_tools_subtree(self) -> None:
+        artifact = self.root / f"{RELEASE_SLUG}-bootstrap.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        builder.add_symlink(
+            f"{RELEASE_SLUG}/tools/summary-alias",
+            "platform_storage_evidence_summary.py",
+        )
+        builder.write()
+        extraction_root = self.root / "bootstrap"
+        extraction_root.mkdir()
+
+        validator.validate_archive(
+            artifact,
+            release_slug=RELEASE_SLUG,
+            extract_bootstrap_tools_to=extraction_root,
+        )
+
+        release = extraction_root / RELEASE_SLUG
+        self.assertTrue(
+            (release / "tools/platform_storage_evidence_summary.py").is_file()
+        )
+        self.assertEqual(
+            (release / "tools/summary-alias").read_text(),
+            "#!/usr/bin/env python3\nprint('storage summary')\n",
+        )
+        for absent in (
+            "RELEASE.json",
+            ".env.platform.example",
+            "apps",
+            "wheelhouse",
+            "liveqa-runtime",
+        ):
+            self.assertFalse((release / absent).exists(), absent)
+
+    def test_bootstrap_validation_rejects_bad_unextracted_runtime(self) -> None:
+        original = ArchiveBuilder(self.root / "valid.tar.gz").write()
+        tampered = self.root / "tampered-runtime.tar.gz"
+        self._rewrite_archive(
+            original,
+            tampered,
+            {
+                f"{RELEASE_SLUG}/liveqa-runtime/node/bin/node": b"tampered\n",
+            },
+        )
+        extraction_root = self.root / "bootstrap"
+        extraction_root.mkdir()
+
+        with self.assertRaisesRegex(validator.ArtifactError, "content digest"):
+            validator.validate_archive(
+                tampered,
+                release_slug=RELEASE_SLUG,
+                extract_bootstrap_tools_to=extraction_root,
+            )
+
+        self.assertFalse((extraction_root / RELEASE_SLUG).exists())
+
+    def test_bootstrap_extraction_rejects_symlink_outside_tools_subtree(self) -> None:
+        artifact = self.root / f"{RELEASE_SLUG}-outside-link.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        builder.add_symlink(
+            f"{RELEASE_SLUG}/tools/server-alias",
+            "../apps/platform_web/.next/standalone/server.js",
+        )
+        builder.write()
+        extraction_root = self.root / "bootstrap"
+        extraction_root.mkdir()
+
+        with self.assertRaisesRegex(
+            validator.ArtifactError, "symlink target is outside its subtree"
+        ):
+            validator.validate_archive(
+                artifact,
+                release_slug=RELEASE_SLUG,
+                extract_bootstrap_tools_to=extraction_root,
+            )
+
+        self.assertFalse((extraction_root / RELEASE_SLUG).exists())
+
     def test_runtime_manifest_may_exceed_release_json_bound_within_runtime_bound(
         self,
     ) -> None:
