@@ -30,14 +30,18 @@ not hidden by stale startup configuration. For the same sampled requests, Next.j
 correlation headers to `GET /api/v1/auth/bootstrap`; the API uses those headers
 only for the marked diagnostic hop. The API then emits its existing bounded
 `request_perf` record even when the request is faster than the normal slow
-request threshold. In the separate timeout-path mode below, only the bounded
-timeout observation population is promoted from the sampled trace to full
-SSR/API lifecycle evidence when this profile is active; identifiers remain
-transient and the load shape remains unchanged. Applying the profile restarts both
+request threshold. The public timeout diagnostic marker is bounded, passive
+metadata in the Nginx edge access record only; it never enters SSR/API tracing,
+changes SSR sampling or forces an API request log. The separately named timeout-path window keeps
+SSR/event-loop diagnostics and API request logging off; its required evidence
+is the bounded client-timeout to Nginx route/status/upstream-timing join.
+Applying the profile restarts both
 `deadlock-api` and `deadlock-web` with readiness checks because the API gate is read at process
 startup; restoring `ready-vote-static-8` returns both services to baseline.
-The marker is not accepted as a standalone production switch: the API gate is
-disabled in the baseline and the route/method check is mandatory.
+The API only accepts internal SSR diagnostic headers from the loopback SSR
+hop; every public API proxy location clears those headers. The API auth/bootstrap gate
+also requires the expected route, method, internal trace marker and startup
+profile flag.
 
 The production observer may use request-local correlation internally while it
 is reducing the journal window, but it never persists the request ID or
@@ -78,10 +82,12 @@ client timeout population is joined to Nginx's allowlisted route class,
 upstream status/timings and numeric system/CPU/PostgreSQL aggregates. The
 first, low-overhead contour intentionally leaves SSR/event-loop and API
 request logging off; an absent SSR/API row therefore means “not instrumented”,
-not “not called”. The optional full diagnostic profile promotes marked
-requests to SSR/API lifecycle evidence and event-loop samples, but must be
-treated as a diagnostic-pressure window if it creates restarts or unexpected
-statuses. Reports retain only `observation_index`, route class, status, error
+not “not called”. The optional full diagnostic profile enables the normal
+bounded request sample for SSR/API lifecycle evidence and event-loop samples,
+but must be treated as a diagnostic-pressure window if it creates restarts or
+unexpected statuses. A caller-provided timeout marker cannot enter or promote
+an SSR/API trace; normal trace selection uses the Nginx request ID or
+Cloudflare ray. Reports retain only `observation_index`, route class, status, error
 class, completion booleans, bounded stage counts and timings; unknown routes
 map to `other`.
 

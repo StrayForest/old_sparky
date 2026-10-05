@@ -16,8 +16,6 @@ const ssrStreamState = Symbol.for("old-sparky.ssr-stream-state");
 const ssrStreamInstallState = Symbol.for("old-sparky.ssr-stream-installed");
 const ssrRequestStart = Symbol.for("old-sparky.ssr-request-start");
 const ssrRequestStartHeader = "x-platform-ssr-request-start-ms";
-const timeoutDiagnosticIdHeader = "x-platform-timeout-diagnostic-id";
-const timeoutDiagnosticIdPattern = /^tdiag-[0-9]{1,32}-[0-9]{5}$/;
 const maxStreamWrites = 100_000;
 const maxStreamBytes = 100_000_000;
 
@@ -47,15 +45,7 @@ function requestFor(response) {
 }
 
 function requestCorrelationId(request) {
-  const diagnosticId = request
-    && request.headers
-    && request.headers[timeoutDiagnosticIdHeader];
-  return safeToken(
-    timeoutDiagnosticIdPattern.test(typeof diagnosticId === "string" ? diagnosticId.trim() : "")
-      ? diagnosticId
-      : "",
-    safeToken(request && request.headers && request.headers["x-request-id"], "unknown")
-  );
+  return safeToken(request && request.headers && request.headers["x-request-id"], "unknown");
 }
 
 function shouldTrace(response) {
@@ -63,11 +53,6 @@ function shouldTrace(response) {
     return false;
   }
   const request = requestFor(response);
-  const diagnosticId = request
-    && request.headers
-    && request.headers[timeoutDiagnosticIdHeader];
-  const validDiagnosticId = typeof diagnosticId === "string"
-    && timeoutDiagnosticIdPattern.test(diagnosticId.trim());
   const sampleKey = request && (
     request.headers["x-request-id"]
     || request.headers["cf-ray"]
@@ -76,7 +61,7 @@ function shouldTrace(response) {
   if (
     !request
     || request.method !== "GET"
-    || (!validDiagnosticId && !sampleRequest(sampleKey, sampleRate()))
+    || !sampleRequest(sampleKey, sampleRate())
   ) {
     return false;
   }

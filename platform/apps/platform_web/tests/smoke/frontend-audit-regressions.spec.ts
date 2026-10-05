@@ -1,10 +1,76 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
+import { NextRequest } from "next/server";
+import { proxy } from "../../proxy";
 
 function source(relativePath: string): string {
   return readFileSync(resolve(process.cwd(), relativePath), "utf8");
 }
+
+test("public timeout metadata cannot promote SSR trace sampling", () => {
+  const priorEnabled = process.env.PLATFORM_SSR_PERF_LOG_ENABLED;
+  const priorRate = process.env.PLATFORM_SSR_PERF_SAMPLE_RATE;
+  process.env.PLATFORM_SSR_PERF_LOG_ENABLED = "true";
+  process.env.PLATFORM_SSR_PERF_SAMPLE_RATE = "0.05";
+  try {
+    const requestHeaders = {
+      "x-request-id": "nginx-request-id",
+      "cf-ray": "trusted-edge-ray",
+      "x-platform-ssr-trace": "1",
+      "x-platform-ssr-request-id": "forged-request-id",
+      "x-platform-ssr-cf-ray": "forged-cf-ray",
+      "x-platform-timeout-diagnostic-id": "tdiag-123-00001",
+    };
+    const response = proxy(new NextRequest("https://old-sparky.com/tournaments/fixture", {
+      headers: requestHeaders,
+    }));
+    expect(response.headers.get("x-middleware-request-x-platform-ssr-trace")).toBe("0");
+    expect(response.headers.get("x-middleware-request-x-request-id")).toBe("nginx-request-id");
+    expect(response.headers.get("x-middleware-request-x-platform-ssr-request-id")).toBeNull();
+    expect(response.headers.get("x-middleware-request-x-platform-ssr-cf-ray")).toBeNull();
+    expect(response.headers.get("x-middleware-request-x-platform-timeout-diagnostic-id"))
+      .toBeNull();
+
+    const cfFallback = proxy(new NextRequest("https://old-sparky.com/tournaments/fixture", {
+      headers: {
+        "cf-ray": "trusted-edge-ray",
+        "x-platform-timeout-diagnostic-id": "tdiag-999999-00001",
+      },
+    }));
+    expect(cfFallback.headers.get("x-middleware-request-x-platform-ssr-trace")).toBe("0");
+    expect(cfFallback.headers.get("x-middleware-request-cf-ray")).toBe("trusted-edge-ray");
+    expect(cfFallback.headers.get("x-middleware-request-x-platform-timeout-diagnostic-id"))
+      .toBeNull();
+  } finally {
+    if (priorEnabled === undefined) delete process.env.PLATFORM_SSR_PERF_LOG_ENABLED;
+    else process.env.PLATFORM_SSR_PERF_LOG_ENABLED = priorEnabled;
+    if (priorRate === undefined) delete process.env.PLATFORM_SSR_PERF_SAMPLE_RATE;
+    else process.env.PLATFORM_SSR_PERF_SAMPLE_RATE = priorRate;
+  }
+});
+
+test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
+  const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
+  const workspaceCalls = detailPage.match(/\bgetTournamentWorkspace\s*\(/gu) ?? [];
+
+  // The true/false branches each contain one source call, but only one branch
+  // executes. The disabled path does not allocate a measurement callback.
+  expect(workspaceCalls).toHaveLength(2);
+  expect(detailPage).toContain("const diagnosticsEnabled = isSsrDiagnosticsEnabled();");
+  expect(detailPage).toContain(
+    "const ssrTraceSampled = diagnosticsEnabled ? await isSsrTraceSampled() : false;",
+  );
+  expect(detailPage).toContain('? measureSsrStage("tournament_workspace", () =>');
+  expect(detailPage).toContain("const workspace = await (ssrTraceSampled");
+  expect(detailPage).toContain(': getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));');
+  expect(detailPage).toContain('recordSsrPoint("tournament_detail_data_ready")');
+  expect(detailPage.indexOf('recordSsrPoint("tournament_detail_data_ready")'))
+    .toBeGreaterThan(detailPage.indexOf("initialTournament = workspace.tournament"));
+  expect(detailPage).toContain("const workspace = await (ssrTraceSampled");
+  expect(detailPage).toContain("? measureSsrStage(");
+  expect(detailPage).toContain(": getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));");
+});
 
 test("invite-only pages convert missing workspace proof into invite-code flow", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");

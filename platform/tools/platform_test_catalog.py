@@ -464,12 +464,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 161,
     "module_digest": "e5636bddcca3f60e082b92cf2dc7c3d2035c3c2592a19fc3e870ab61740db190",
-    "test_count": 1644,
-    "test_id_digest": "ef23ffde70ec166cb88b4f90d5e06d5c3c0925b741e426c9c4d29a34c8450c15",
-    "backend_test_count": 1576,
-    "backend_test_id_digest": "684a47e41caad39a0a84f2e5fcdca05ae3386a1d1e198e6b980283864e99a70a",
-    "verification_test_count": 68,
-    "verification_test_id_digest": "24f3f6b73f2e305d6f073b2865879220466375ea5759131ce5928b2c90ee14c4",
+    "test_count": 1650,
+    "test_id_digest": "6f1d5a60f5e7f83cc824f3327eab0f4db7d49dc9f9fcc97e86cf8fc3ba75ea04",
+    "backend_test_count": 1579,
+    "backend_test_id_digest": "3b8fd2f4d73f0dbbabf74a86ebb4c7297428320178444ef47be93337b7423988",
+    "verification_test_count": 71,
+    "verification_test_id_digest": "2479e34784934e5a032edd4b1690a800a58d911e1d1d51c90c74d0c8c6e4afb3",
     "verification_classifier_test_count": 38,
     "verification_classifier_test_id_digest": "3071e068f59bbb5fa0d26d6b9128bf5469d7def96bd163238df356a89ae08c34",
 }
@@ -496,8 +496,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 44,
         "module_digest": "693edb2005c56249ac84c9d1d7367b64e2e3291ef18c6bc05e41ea98967ea406",
-        "test_count": 366,
-        "test_id_digest": "1098734d5fd3e53c7fef12545b28aa94371873c66404f462f895a02b8a15d287",
+        "test_count": 367,
+        "test_id_digest": "7a6aded6e363d7dbc8d136543b7907bfebf6e59ec4eaad94a29ae5e6c1b44c64",
     },
     "backend-integration": {
         "module_count": 41,
@@ -514,14 +514,14 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "performance-contract": {
         "module_count": 11,
         "module_digest": "ac879f1b292f00df28f399af5e34ed8995b39878e1961386b8eb055bb1d025e0",
-        "test_count": 164,
-        "test_id_digest": "0a3971ea208b63c8d2e1871859a0ff3e2f4da80b949baeb4f4518361f1f6526b",
+        "test_count": 166,
+        "test_id_digest": "38015c476a7c75b1bdf6825de83d9edd1be52439cc14d4d9bba149b2a0ac1480",
     },
     VERIFICATION_CONTOUR: {
         "module_count": 3,
         "module_digest": "bc3b5eb1bc4e61842407a5e9edd6ab07f4bb21581ac2663b4754f6dcdaf5c02c",
-        "test_count": 68,
-        "test_id_digest": "24f3f6b73f2e305d6f073b2865879220466375ea5759131ce5928b2c90ee14c4",
+        "test_count": 71,
+        "test_id_digest": "2479e34784934e5a032edd4b1690a800a58d911e1d1d51c90c74d0c8c6e4afb3",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])

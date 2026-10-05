@@ -4,6 +4,9 @@ import { notFound } from "next/navigation";
 import { TournamentDetailClientPage } from "@/components/tournaments/tournament-detail-client-page";
 import {
   isSsrDiagnosticsEnabled,
+  isSsrTraceSampled,
+  measureSsrStage,
+  recordSsrPoint,
   recordSsrStage
 } from "@/lib/server-ssr-observability";
 import {
@@ -34,6 +37,8 @@ export default async function TournamentDetailPage({
   const startedAt = performance.now();
   const { slug } = await params;
   const resolvedSearchParams = await searchParams;
+  const diagnosticsEnabled = isSsrDiagnosticsEnabled();
+  const ssrTraceSampled = diagnosticsEnabled ? await isSsrTraceSampled() : false;
   const inviteCode = normalizeTournamentInviteCode(resolvedSearchParams?.invite_code);
   const cookieHeader = (await cookies()).toString();
   let initialTournament: TournamentDetail | undefined;
@@ -44,20 +49,27 @@ export default async function TournamentDetailPage({
   // tournaments intentionally remain client-owned when the server receives
   // 401/403, preserving the invite gate and its loading behavior.
   try {
-    const workspace = await getTournamentWorkspace(
-      slug,
-      cookieHeader ? { cookie: cookieHeader } : {},
-      {
-        participantsLimit: 0,
-        workspaceView: "detail",
-        includeCurrentUser: false,
-        inviteCode
-      }
-    );
+    const workspaceHeaders: Record<string, string> = cookieHeader
+      ? { cookie: cookieHeader }
+      : {};
+    const workspaceOptions = {
+      participantsLimit: 0,
+      workspaceView: "detail" as const,
+      includeCurrentUser: false,
+      inviteCode
+    };
+    const workspace = await (ssrTraceSampled
+      ? measureSsrStage("tournament_workspace", () =>
+        getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions)
+      )
+      : getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));
     if (!workspace) {
       notFound();
     }
     initialTournament = workspace.tournament;
+    if (ssrTraceSampled) {
+      await recordSsrPoint("tournament_detail_data_ready");
+    }
   } catch (error) {
     if (!(error instanceof PlatformApiError && (error.status === 401 || error.status === 403))) {
       throw error;
@@ -71,7 +83,7 @@ export default async function TournamentDetailPage({
       initialTournament={initialTournament}
     />
   );
-  if (isSsrDiagnosticsEnabled()) {
+  if (ssrTraceSampled) {
     await recordSsrStage("page_component", performance.now() - startedAt);
   }
   return rendered;

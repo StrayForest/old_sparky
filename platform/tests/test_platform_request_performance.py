@@ -1,3 +1,4 @@
+import asyncio
 from time import perf_counter
 from types import SimpleNamespace
 import unittest
@@ -232,7 +233,98 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
 
         log_info.assert_called_once()
 
-    def test_sampled_ssr_identity_prefers_explicit_diagnostic_headers(self) -> None:
+    def test_timeout_marker_and_forged_trace_do_not_bypass_api_log_gate(self) -> None:
+        async def run_request(headers: list[tuple[bytes, bytes]]) -> None:
+            async def app(_scope: dict, _receive: object, send: object) -> None:
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+            async def receive() -> dict[str, object]:
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(_message: dict[str, object]) -> None:
+                return None
+
+            middleware = performance.RequestPerformanceMiddleware(app)
+            scope = {
+                "type": "http",
+                "method": "GET",
+                "path": "/api/v1/auth/bootstrap",
+                "headers": headers,
+                "route": SimpleNamespace(path="/auth/bootstrap"),
+                "client": None,
+            }
+            await middleware(scope, receive, send)
+
+        timeout_marker = (b"x-platform-timeout-diagnostic-id", b"tdiag-123-00001")
+        trace_marker = (b"x-platform-ssr-trace", b"1")
+        with (
+            patch.object(
+                performance,
+                "get_settings",
+                return_value=SimpleNamespace(
+                    platform_perf_log_enabled=True,
+                    platform_perf_log_mutations=False,
+                    platform_perf_slow_request_ms=1000,
+                    platform_perf_slow_db_ms=500,
+                    platform_perf_sql_count_threshold=25,
+                    platform_perf_auth_bootstrap_log_enabled=False,
+                ),
+            ),
+            patch.object(performance.logger, "info") as log_info,
+            patch.object(performance.logger, "warning") as log_warning,
+        ):
+            asyncio.run(run_request([timeout_marker, trace_marker]))
+            log_info.assert_not_called()
+            log_warning.assert_not_called()
+
+        with (
+            patch.object(
+                performance,
+                "get_settings",
+                return_value=SimpleNamespace(
+                    platform_perf_log_enabled=True,
+                    platform_perf_log_mutations=False,
+                    platform_perf_slow_request_ms=1000,
+                    platform_perf_slow_db_ms=500,
+                    platform_perf_sql_count_threshold=25,
+                    platform_perf_auth_bootstrap_log_enabled=True,
+                ),
+            ),
+            patch.object(performance.logger, "info") as log_info,
+            patch.object(performance.logger, "warning") as log_warning,
+        ):
+            asyncio.run(run_request([timeout_marker]))
+            log_info.assert_not_called()
+            log_warning.assert_not_called()
+
+    def test_slow_request_still_logs_without_timeout_marker_identity(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        metrics = self.metrics(method="GET")
+        metrics.started_at = perf_counter() - 2.0
+        diagnostic_id = "tdiag-123-00001"
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings()),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            middleware._log_if_slow(
+                {
+                    "headers": [
+                        (b"x-platform-timeout-diagnostic-id", diagnostic_id.encode("ascii")),
+                    ],
+                    "route": SimpleNamespace(path="/tournaments/{slug}"),
+                },
+                metrics,
+                200,
+            )
+
+        log_info.assert_called_once()
+        rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+        self.assertIn("request_perf request_id=request", rendered)
+        self.assertNotIn("diagnostic_id=", rendered)
+        self.assertNotIn(diagnostic_id, rendered)
+
+    def test_sampled_ssr_identity_preserves_proxy_request_id_and_cf_ray(self) -> None:
         scope = {
             "headers": [
                 (b"x-request-id", b"proxy-request"),

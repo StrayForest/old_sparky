@@ -205,12 +205,9 @@ The source head is discovered at runtime; callers must not copy a `HEAD_REVISION
 constant. Backend integration preflight reuses the same source/database-head
 helper before test discovery.
 
-Every Alembic or migration-owned recovery subprocess has a typed 180-second
-timeout. The migration workflow keeps a five-minute job deadline, retains its
-loopback `platformdb_test` PostgreSQL service, and has no production URL or
-database access. The scenario checks a compact critical schema contract from
-`information_schema` and `pg_catalog`, including `indisvalid`, `indisready` and
-`indislive` for required indexes.
+Every Alembic or migration-owned recovery subprocess has a typed 180-second timeout. The migration workflow keeps a five-minute job deadline, retains its loopback `platformdb_test` PostgreSQL service, and has no production URL or database access. The scenario checks a compact critical schema contract from `information_schema` and `pg_catalog`, including `indisvalid`, `indisready` and `indislive` for required indexes.
+
+The verifier starts each gate command in its own POSIX session and observes child exit without reaping until the TERM cleanup window closes. During supervision, timeout or cancellation sends `SIGTERM` to that command's group, waits one second, sends `SIGKILL` if needed, and then reaps the direct child; only ordinary descendants in the group are covered, so children creating a new session must own their cleanup. It never matches or signals unrelated processes. Timeout remains a failed gate with status `124`; cleanup cannot turn it into a pass or skip checks.
 
 The real disposable-database scenario selects only the latest reversible edge
 after inspecting its downgrade body, upgrades and downgrades that edge, and

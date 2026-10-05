@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import re
 import selectors
@@ -10,7 +11,7 @@ import subprocess
 import sys
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -46,6 +47,7 @@ from tools.platform_verify import (
     DETERMINISTIC_GATE_IDS,
     GATES_BY_ID,
     VerificationError,
+    _run,
     _verification_contract_commands,
     dispatch,
     registry_payload,
@@ -358,6 +360,266 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 timeout_seconds=0.01,
             )
         self.assertEqual(timeout.exception.timeout_seconds, 0.01)
+
+    def test_verifier_timeout_reaps_only_its_owned_process_group(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="platform-verifier-timeout-") as temp_dir:
+            temp_root = Path(temp_dir)
+            marker = f"verifier-timeout-{os.getpid()}-{time.monotonic_ns()}"
+            child_pid_path = temp_root / "grandchild.pid"
+            child_code = (
+                "import signal,sys,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(60)"
+            )
+            parent_code = "\n".join(
+                (
+                    "import pathlib,subprocess,sys,time",
+                    "child=subprocess.Popen([sys.executable, '-c', "
+                    f"{child_code!r}, {marker!r}])",
+                    f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))",
+                    "time.sleep(60)",
+                )
+            )
+            sentinel = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                close_fds=True,
+                start_new_session=True,
+            )
+            child_pid: int | None = None
+
+            def child_identity(pid: int) -> tuple[str, bytes] | None:
+                proc_root = Path("/proc") / str(pid)
+                try:
+                    state = proc_root.joinpath("stat").read_text().split()[2]
+                    command_line = proc_root.joinpath("cmdline").read_bytes()
+                except (OSError, IndexError):
+                    return None
+                return state, command_line
+
+            try:
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = _run(
+                        "timeout process group contract",
+                        [sys.executable, "-c", parent_code],
+                        timeout_seconds=0.2,
+                    )
+                self.assertEqual(status, 124)
+                self.assertIn("[GATE START] timeout process group contract", stdout.getvalue())
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "[GATE TIMEOUT] timeout process group contract exceeded 0.2s\n",
+                )
+                self.assertIsNone(sentinel.poll(), "an unrelated session was signalled")
+                self.assertTrue(child_pid_path.is_file(), "timed-out parent did not start child")
+                child_pid = int(child_pid_path.read_text(encoding="ascii"))
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    identity = child_identity(child_pid)
+                    if identity is None or identity[0] == "Z":
+                        break
+                    time.sleep(0.02)
+                identity = child_identity(child_pid)
+                self.assertTrue(
+                    identity is None or identity[0] == "Z",
+                    "ordinary grandchild survived verifier process-group timeout cleanup",
+                )
+                success_stdout = io.StringIO()
+                with redirect_stdout(success_stdout):
+                    success_status = _run(
+                        "success status contract",
+                        [sys.executable, "-c", "pass"],
+                        timeout_seconds=2,
+                    )
+                self.assertEqual(success_status, 0)
+                self.assertIn("[GATE PASS] success status contract", success_stdout.getvalue())
+            finally:
+                if child_pid is not None:
+                    identity = child_identity(child_pid)
+                    if identity is not None and marker.encode() in identity[1] and identity[0] != "Z":
+                        os.kill(child_pid, signal.SIGKILL)
+                sentinel.kill()
+                sentinel.wait()
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = _run(
+                "nonzero status contract",
+                [sys.executable, "-c", "raise SystemExit(7)"],
+                timeout_seconds=2,
+            )
+        self.assertEqual(status, 7)
+        self.assertIn("[GATE FAIL] nonzero status contract (exit 7)", stderr.getvalue())
+
+    def test_verifier_term_cleans_owned_group_and_preserves_signal_status(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="platform-verifier-term-") as temp_dir:
+            temp_root = Path(temp_dir)
+            marker = f"verifier-term-{os.getpid()}-{time.monotonic_ns()}"
+            child_pid_path = temp_root / "grandchild.pid"
+            child_code = (
+                "import signal,sys,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(60)"
+            )
+            command_code = "\n".join(
+                (
+                    "import pathlib,subprocess,sys,time",
+                    "child=subprocess.Popen([sys.executable, '-c', "
+                    f"{child_code!r}, {marker!r}])",
+                    f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))",
+                    "time.sleep(60)",
+                )
+            )
+            verifier_code = (
+                "import sys; from tools.platform_verify import _run; "
+                "sys.exit(_run('parent SIGTERM contract', "
+                f"[sys.executable, '-c', {command_code!r}], timeout_seconds=30))"
+            )
+            verifier = subprocess.Popen(
+                [sys.executable, "-c", verifier_code],
+                cwd=Path.cwd(),
+                close_fds=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            sentinel = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                close_fds=True,
+                start_new_session=True,
+            )
+            child_pid: int | None = None
+
+            def child_identity(pid: int) -> tuple[str, bytes] | None:
+                proc_root = Path("/proc") / str(pid)
+                try:
+                    state = proc_root.joinpath("stat").read_text().split()[2]
+                    command_line = proc_root.joinpath("cmdline").read_bytes()
+                except (OSError, IndexError):
+                    return None
+                return state, command_line
+
+            try:
+                deadline = time.monotonic() + 3.0
+                while not child_pid_path.exists() and time.monotonic() < deadline:
+                    if verifier.poll() is not None:
+                        self.fail("verifier exited before the nested child started")
+                    time.sleep(0.02)
+                self.assertTrue(child_pid_path.is_file(), "verifier did not start nested child")
+                child_pid = int(child_pid_path.read_text(encoding="ascii"))
+                identity = child_identity(child_pid)
+                self.assertIsNotNone(identity, "nested child disappeared before cancellation")
+                assert identity is not None
+                self.assertIn(marker.encode(), identity[1])
+
+                os.kill(verifier.pid, signal.SIGTERM)
+                self.assertEqual(verifier.wait(timeout=5), 128 + signal.SIGTERM)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    identity = child_identity(child_pid)
+                    if identity is None or identity[0] == "Z":
+                        break
+                    time.sleep(0.02)
+                identity = child_identity(child_pid)
+                self.assertTrue(
+                    identity is None or identity[0] == "Z",
+                    "nested child survived parent SIGTERM cleanup",
+                )
+                self.assertIsNone(sentinel.poll(), "an unrelated session was signalled")
+            finally:
+                if verifier.poll() is None:
+                    verifier.kill()
+                    verifier.wait()
+                if child_pid is not None:
+                    identity = child_identity(child_pid)
+                    if identity is not None and marker.encode() in identity[1] and identity[0] != "Z":
+                        os.kill(child_pid, signal.SIGKILL)
+                sentinel.kill()
+                sentinel.wait()
+
+    def test_verifier_term_after_child_exit_cleans_before_reap(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="platform-verifier-late-term-") as temp_dir:
+            temp_root = Path(temp_dir)
+            marker = f"verifier-late-term-{os.getpid()}-{time.monotonic_ns()}"
+            child_pid_path = temp_root / "grandchild.pid"
+            child_code = (
+                "import signal,sys,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(60)"
+            )
+            command_code = "\n".join(
+                (
+                    "import pathlib,subprocess,sys",
+                    "child=subprocess.Popen([sys.executable, '-c', "
+                    f"{child_code!r}, {marker!r}])",
+                    f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))",
+                )
+            )
+            verifier_code = "\n".join(
+                (
+                    "import os,signal,sys",
+                    "import tools.platform_verify as verifier_module",
+                    "wait_for_exit=verifier_module._wait_for_owned_process_exit",
+                    "def inject_term_before_reap(process, timeout):",
+                    "    wait_for_exit(process, timeout)",
+                    "    os.kill(os.getpid(), signal.SIGTERM)",
+                    "verifier_module._wait_for_owned_process_exit=inject_term_before_reap",
+                    "sys.exit(verifier_module._run('late parent SIGTERM contract', "
+                    f"[sys.executable, '-c', {command_code!r}], timeout_seconds=5))",
+                )
+            )
+            verifier = subprocess.Popen(
+                [sys.executable, "-c", verifier_code],
+                cwd=Path.cwd(),
+                close_fds=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            sentinel = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                close_fds=True,
+                start_new_session=True,
+            )
+            child_pid: int | None = None
+
+            def child_identity(pid: int) -> tuple[str, bytes] | None:
+                proc_root = Path("/proc") / str(pid)
+                try:
+                    state = proc_root.joinpath("stat").read_text().split()[2]
+                    command_line = proc_root.joinpath("cmdline").read_bytes()
+                except (OSError, IndexError):
+                    return None
+                return state, command_line
+
+            try:
+                self.assertEqual(verifier.wait(timeout=5), 128 + signal.SIGTERM)
+                self.assertTrue(child_pid_path.is_file(), "gate child did not start its descendant")
+                child_pid = int(child_pid_path.read_text(encoding="ascii"))
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    identity = child_identity(child_pid)
+                    if identity is None or identity[0] == "Z":
+                        break
+                    time.sleep(0.02)
+                identity = child_identity(child_pid)
+                self.assertTrue(
+                    identity is None or identity[0] == "Z",
+                    "descendant survived cancellation after direct-child exit",
+                )
+                self.assertIsNone(sentinel.poll(), "an unrelated session was signalled")
+            finally:
+                if verifier.poll() is None:
+                    verifier.kill()
+                    verifier.wait()
+                if child_pid is not None:
+                    identity = child_identity(child_pid)
+                    if identity is not None and marker.encode() in identity[1] and identity[0] != "Z":
+                        os.kill(child_pid, signal.SIGKILL)
+                sentinel.kill()
+                sentinel.wait()
         self.assertEqual(MIGRATION_SUBPROCESS_TIMEOUT_SECONDS, 180.0)
 
     def test_invalid_resource_config_fails_before_client_imports(self) -> None:

@@ -138,6 +138,7 @@ SAFE_STAGE_NAMES = frozenset(
         "ready_check",
         "ready_vote",
         "assignment",
+        "page_component",
         "response_stream_start",
         "first_body_write_attempt",
         "response_finish",
