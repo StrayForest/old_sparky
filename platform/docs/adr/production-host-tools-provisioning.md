@@ -272,8 +272,12 @@ exact attempt-1 run, source, bot status, workflow and successful job checks
 remain mandatory; unknown slugs, reruns, incomplete pages or ambiguous proof
 fail closed. New status markers use exact attempt URLs. It then checks
 first-parent ancestry to **P** and reclassifies the complete range with the
-trusted classifier. A pure bootstrap range is a verified no-op. A range
-containing application changes proceeds
+trusted classifier. A pure bootstrap range is a verified no-op. The
+authenticated baseline helper may also report operational no-action when the
+incoming route is recovery-bootstrap-only and the storage-triggered cumulative
+range stays within the exact recovery, storage and docs sets. It preserves the
+manifest and baseline; no app build, activation or marker occurs.
+A range containing application changes proceeds
 only when the cumulative route is full, deployable and non-fallback, with exact-target
 runtime gates when required. Immediately before protected release work, the
 pinned supervisor rereads and compares the complete baseline tuple while

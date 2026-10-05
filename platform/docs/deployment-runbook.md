@@ -42,11 +42,13 @@ to `dev`. The chain is:
    security run, validates its schema, digest, target SHA and non-fallback
    route, then consumes its `deployable` bit: a deployable `full` route
    proceeds while a valid full CI-only route completes as a no-op. A route
-   classified specifically as recovery-bootstrap-only stays
-   `deployable=false`; the automatic chain may send it to the separate
-   `baseline-reconcile` path, which must independently authenticate the active
-   baseline and classify the complete baseline-to-target range before it can
-   authorize an application release. It then re-reads the current `dev` HEAD
+   classified as recovery-bootstrap-only stays `deployable=false`; the
+   automatic chain may send it to `baseline-reconcile`, which authenticates
+   the active baseline and complete baseline-to-target range. A separately
+   reported operational no-op is allowed only for an authenticated recovery
+   input plus a storage-triggered range wholly in the closed recovery, storage
+   and docs sets; it does not change classifier fields or authorize app work.
+   Other ranges need normal release checks. The gate re-reads current `dev` HEAD
    and refuses a stale successful CI result.
    The source run and both status snapshots are
    checked by the shared dependency-free
