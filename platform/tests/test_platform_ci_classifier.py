@@ -2417,6 +2417,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         attempt = 2
         source_sha = self.TARGET_SHA
         producer_sha = "b" * 40
+        repository_id = 11223344
         receipt_name = (
             f"platform-storage-operations-skip-{source_sha}-77-3-"
             f"{producer_id}-{attempt}.json"
@@ -2431,7 +2432,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "head_sha": producer_sha,
             "name": "Platform production recovery bootstrap build",
             "path": ".github/workflows/platform-production-recovery-bootstrap-build.yml",
-            "repository": {"full_name": "StrayForest/old_sparky"},
+            "repository": {"id": repository_id, "full_name": "StrayForest/old_sparky"},
         }
         receipt_row = {
             "id": 9001,
@@ -2440,9 +2441,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "digest": "sha256:" + "b" * 64,
             "workflow_run": {
                 "id": producer_id,
-                "run_attempt": attempt,
                 "head_sha": producer_sha,
-                "repository": {"full_name": "StrayForest/old_sparky"},
+                "repository_id": repository_id,
+                "head_repository_id": repository_id,
             },
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -2480,6 +2481,14 @@ class PlatformCiClassifierTests(unittest.TestCase):
             selected_outputs = output.read_text(encoding="ascii")
             self.assertIn("storage_skip=true", selected_outputs)
             self.assertIn("storage_receipt_artifact_id=9001", selected_outputs)
+            wrong_attempt_name = json.loads(json.dumps(receipt_row))
+            wrong_attempt_name["name"] = wrong_attempt_name["name"].rsplit("-", 1)[0] + "-3.json"
+            self.assertNotEqual(select([wrong_attempt_name]).returncode, 0)
+            base_run["run_attempt"] = attempt + 1
+            (root / "producer-run.json").write_text(json.dumps(base_run))
+            self.assertNotEqual(select([receipt_row]).returncode, 0)
+            base_run["run_attempt"] = attempt
+            (root / "producer-run.json").write_text(json.dumps(base_run))
 
             output.write_text("", encoding="ascii")
             bundle_row = {
@@ -2496,11 +2505,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
             stale_receipt = {
                 **receipt_row,
                 "name": f"platform-storage-operations-skip-{source_sha}-76-2-{producer_id}-1.json",
-                "workflow_run": {
-                    "id": producer_id,
-                    "run_attempt": 1,
-                    "head_sha": producer_sha,
-                    "repository": {"full_name": "StrayForest/old_sparky"},
+            "workflow_run": {
+                "id": producer_id,
+                "head_sha": producer_sha,
+                "repository_id": repository_id,
+                "head_repository_id": repository_id,
                 },
             }
             output.write_text("", encoding="ascii")
@@ -2518,6 +2527,21 @@ class PlatformCiClassifierTests(unittest.TestCase):
             }]):
                 rejected = select(invalid_rows)
                 self.assertNotEqual(rejected.returncode, 0)
+
+            for misbound_field, misbound_value in (
+                ("repository_id", repository_id + 1),
+                ("head_repository_id", repository_id + 1),
+                ("run_attempt", attempt + 1),
+            ):
+                bad_receipt = json.loads(json.dumps(receipt_row))
+                bad_receipt["workflow_run"][misbound_field] = misbound_value
+                self.assertNotEqual(select([bad_receipt]).returncode, 0)
+            missing_repository = json.loads(json.dumps(receipt_row))
+            del missing_repository["workflow_run"]["repository_id"]
+            self.assertNotEqual(select([missing_repository]).returncode, 0)
+            missing_head_repository = json.loads(json.dumps(receipt_row))
+            del missing_head_repository["workflow_run"]["head_repository_id"]
+            self.assertNotEqual(select([missing_head_repository]).returncode, 0)
 
             missing = select([])
             self.assertNotEqual(missing.returncode, 0)
@@ -2611,7 +2635,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 "conclusion": "success",
                 "name": "Platform security and build",
                 "path": ".github/workflows/platform-security.yml",
-                "repository": {"full_name": "StrayForest/old_sparky"},
+                "repository": {"id": 11223344, "full_name": "StrayForest/old_sparky"},
             }
             parent_job = {
                 "id": 900,
@@ -2629,9 +2653,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 "digest": "sha256:" + "d" * 64,
                 "workflow_run": {
                     "id": 77,
-                    "run_attempt": 3,
                     "head_sha": self.TARGET_SHA,
-                    "repository": {"full_name": "StrayForest/old_sparky"},
+                    "repository_id": 11223344,
+                    "head_repository_id": 11223344,
                 },
             }
             (root / "storage-security-run.json").write_text(json.dumps(parent_run))
@@ -2643,6 +2667,42 @@ class PlatformCiClassifierTests(unittest.TestCase):
             )
             self.assertEqual(parent_check.returncode, 0, parent_check.stderr)
             self.assertIn("route_artifact_id=901", output.read_text(encoding="ascii"))
+            parent_artifact["name"] = "platform-ci-route-77-4"
+            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            parent_name_rejected = subprocess.run(
+                [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
+                input=blocks[1], text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(parent_name_rejected.returncode, 0)
+            parent_artifact["name"] = "platform-ci-route-77-3"
+            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            parent_run["run_attempt"] = 4
+            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
+            parent_api_attempt_rejected = subprocess.run(
+                [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
+                input=blocks[1], text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(parent_api_attempt_rejected.returncode, 0)
+            parent_run["run_attempt"] = 3
+            (root / "storage-security-run.json").write_text(json.dumps(parent_run))
+            parent_artifact["workflow_run"]["repository_id"] = 11223345
+            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            parent_repo_rejected = subprocess.run(
+                [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
+                input=blocks[1], text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(parent_repo_rejected.returncode, 0)
+            parent_artifact["workflow_run"]["repository_id"] = 11223344
+            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            parent_artifact["workflow_run"]["run_attempt"] = 4
+            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
+            parent_attempt_rejected = subprocess.run(
+                [sys.executable, "-I", "-", str(root), str(output), "StrayForest/old_sparky", "77", "3", self.TARGET_SHA],
+                input=blocks[1], text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(parent_attempt_rejected.returncode, 0)
+            del parent_artifact["workflow_run"]["run_attempt"]
+            (root / "storage-security-artifacts.json").write_text(json.dumps({"total_count": 1, "artifacts": [parent_artifact]}))
             parent_run["conclusion"] = "failure"
             (root / "storage-security-run.json").write_text(json.dumps(parent_run))
             parent_rejected = subprocess.run(
