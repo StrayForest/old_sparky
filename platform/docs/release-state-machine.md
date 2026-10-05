@@ -256,6 +256,10 @@ compatibility handoff needed for the normal cross-release boundary.
   `recovery-restored` proves the exact baseline before completing filesystem
   cleanup. If that proof, its timeout budget, or the receipt pair fails, no
   candidate or receipt is removed.
+  A service-owned web cache inside an inactive candidate is the sole ownership
+  exception: cleanup requires the verified `legacy-services-restored` phase,
+  API/web readiness and loaded web-unit `KillMode=control-group`; all other
+  candidate entries remain root-owned.
 - `nginx-pending` is an explicit uncertainty boundary. If the process stops
   after Nginx has been mutated but before `nginx-applied`, abort recovery first
   restores the recorded pointers/venv and then reinstalls the previous

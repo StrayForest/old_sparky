@@ -275,6 +275,9 @@ Operation-bound legacy LiveQA fixtures in `test_platform_recovery_bootstrap` sta
 checks the helper preserves reconcile stderr. Its companion
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` verifies private
 capture and closed stdout/public markers; the executable catalog snapshot tracks these IDs.
+The privileged release tests also prove that promoted venv dependencies are
+readable by service identities and candidate cache cleanup remains receipt-,
+readiness- and loaded-cgroup-bound.
 
 The `platform-host-tools-candidate.yml` workflow is a separate trusted `workflow_run` contract, not
 a production gate. Its validator and bundle tests belong to `backend-tool-contract` through

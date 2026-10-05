@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import os
+import pwd
 import shutil
 import stat
 import subprocess
@@ -127,6 +128,51 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         self.assertEqual(
             (self.shared_dir / "venv" / "deps-version").read_text(), "new\n"
         )
+        installed_venv = self.shared_dir / "venv"
+        self.assertEqual(stat.S_IMODE((installed_venv / "bin").stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((installed_venv / "lib").stat().st_mode), 0o755)
+        site_packages = next(installed_venv.glob("lib/python*/site-packages"))
+        permission_probe = site_packages / "release_permission_probe.py"
+        self.assertEqual(stat.S_IMODE(site_packages.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(permission_probe.stat().st_mode), 0o644)
+        self.assertEqual(
+            stat.S_IMODE((self.shared_dir / ".env.platform").stat().st_mode),
+            0o600,
+        )
+        self.assertFalse(any(self.shared_dir.glob(".freeze-check-*")))
+        self.assertEqual(stat.S_IMODE(self.app_dir.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(self.shared_dir.stat().st_mode), 0o755)
+        # The same promoted interpreter and installed package must be usable
+        # by an identity other than root, as the API and worker services do.
+        import_command = [
+            str(installed_venv / "bin" / "python"),
+            "-I",
+            "-c",
+            "import pip, release_permission_probe; "
+            "print(pip.__version__, release_permission_probe.VALUE)",
+        ]
+        if os.geteuid() == 0:
+            runuser = shutil.which("runuser")
+            self.assertIsNotNone(runuser)
+            self.assertNotEqual(pwd.getpwnam("nobody").pw_uid, 0)
+            self.root.chmod(0o755)
+            nonroot_import = subprocess.run(
+                [runuser, "-u", "nobody", "--", *import_command],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        else:
+            nonroot_import = subprocess.run(
+                import_command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        self.assertEqual(nonroot_import.returncode, 0, nonroot_import.stderr)
+        self.assertEqual(nonroot_import.stdout.strip(), "26.1.2 readable dependency")
         console = subprocess.run(
             [str(self.shared_dir / "venv" / "bin" / "fake-pip-cli")],
             text=True,
@@ -1155,6 +1201,12 @@ import sys
 arguments = sys.argv[1:]
 if arguments and arguments[0] == "install":
     Path(sys.prefix, "deps-version").write_text({result!r} + "\\n")
+    import sysconfig
+    site_packages = Path(sysconfig.get_paths()["purelib"])
+    site_packages.mkdir(parents=True, exist_ok=True)
+    (site_packages / "release_permission_probe.py").write_text(
+        "VALUE = 'readable dependency'\\n"
+    )
     raise SystemExit({42 if result == "fail" else 0})
 if arguments and arguments[0] == "check":
     print("No broken requirements found.")

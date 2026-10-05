@@ -494,27 +494,34 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
   verify_venv "$SHARED_VENV_DIR" "$FREEZE_CHECK_FILE"
 else
   NEW_VENV_DIR="$(mktemp -d "$SHARED_DIR/.venv-install-$RELEASE_SLUG.XXXXXX")"
-  /usr/bin/python3 -I -m venv "$NEW_VENV_DIR" >/dev/null 2>/dev/null
-  shopt -s nullglob
-  PIP_WHEELS=("$RELEASE_DIR"/wheelhouse/pip-*.whl)
-  shopt -u nullglob
-  if (( ${#PIP_WHEELS[@]} != 1 )); then
-    echo "RELEASE_INSTALL status=failed class=wheelhouse release_slug=$PUBLIC_RELEASE_SLUG" >&2
-    exit 1
-  fi
-  run_isolated_python "$NEW_VENV_DIR/bin/python" -I -m pip install \
-    --no-index \
-    --no-deps \
-    --force-reinstall \
-    "${PIP_WHEELS[0]}" >/dev/null 2>/dev/null
-  run_isolated_python "$NEW_VENV_DIR/bin/python" -I -m pip install \
-    --no-index \
-    --find-links "$RELEASE_DIR/wheelhouse" \
-    --only-binary=:all: \
-    --upgrade \
-    --force-reinstall \
-    --require-hashes \
-    --requirement "$RELEASE_DIR/requirements-platform.lock.txt" >/dev/null 2>/dev/null
+  # API/worker import this root-owned environment as non-root service users.
+  # The installer itself keeps umask 077 for receipts, temporary files and
+  # secret environment data; apply a readable-code umask only while creating
+  # the new venv and installing its artifact-bound packages.
+  (
+    umask 022
+    /usr/bin/python3 -I -m venv "$NEW_VENV_DIR" >/dev/null 2>/dev/null
+    shopt -s nullglob
+    PIP_WHEELS=("$RELEASE_DIR"/wheelhouse/pip-*.whl)
+    shopt -u nullglob
+    if (( ${#PIP_WHEELS[@]} != 1 )); then
+      echo "RELEASE_INSTALL status=failed class=wheelhouse release_slug=$PUBLIC_RELEASE_SLUG" >&2
+      exit 1
+    fi
+    run_isolated_python "$NEW_VENV_DIR/bin/python" -I -m pip install \
+      --no-index \
+      --no-deps \
+      --force-reinstall \
+      "${PIP_WHEELS[0]}" >/dev/null 2>/dev/null
+    run_isolated_python "$NEW_VENV_DIR/bin/python" -I -m pip install \
+      --no-index \
+      --find-links "$RELEASE_DIR/wheelhouse" \
+      --only-binary=:all: \
+      --upgrade \
+      --force-reinstall \
+      --require-hashes \
+      --requirement "$RELEASE_DIR/requirements-platform.lock.txt" >/dev/null 2>/dev/null
+  )
   relocate_venv_paths "$NEW_VENV_DIR" "$SHARED_VENV_DIR" >/dev/null 2>/dev/null
   verify_venv "$NEW_VENV_DIR" "$FREEZE_CHECK_FILE"
   chmod 0755 "$NEW_VENV_DIR"

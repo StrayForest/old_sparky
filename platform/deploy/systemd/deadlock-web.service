@@ -9,6 +9,7 @@ StartLimitBurst=5
 Type=simple
 User=oldsparky-web
 Group=oldsparky-web
+KillMode=control-group
 WorkingDirectory=/opt/oldsparky/platform/current
 Environment=NODE_ENV=production
 Environment=PLATFORM_RUNTIME_SERVICE=web
