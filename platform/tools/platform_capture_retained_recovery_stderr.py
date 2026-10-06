@@ -263,8 +263,17 @@ def capture_recovery_stderr(
             close_fds=True,
         )
         assert process.stdin is not None and process.stderr is not None
-        process.stdin.write(control_email.encode("ascii") + b"\n")
-        process.stdin.close()
+        try:
+            process.stdin.write(control_email.encode("ascii") + b"\n")
+        except BrokenPipeError:
+            # The fixed child may reject startup before consuming its small
+            # identity line. Still drain its bounded stderr and preserve the
+            # actual child status in the private capture.
+            pass
+        try:
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
         with os.fdopen(descriptor, "wb", closefd=True) as output:
             descriptor = -1
             _write_bounded(process.stderr, output)

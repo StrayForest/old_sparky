@@ -165,6 +165,57 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             )
             self.assertEqual(before.st_mtime_ns, after.st_mtime_ns)
 
+    def test_recovery_capture_drains_child_after_early_stdin_close(self) -> None:
+        class ClosedInput:
+            def write(self, value: bytes) -> int:
+                raise BrokenPipeError
+
+            def close(self) -> None:
+                raise BrokenPipeError
+
+        class EarlyExitProcess:
+            def __init__(self) -> None:
+                self.stdin = ClosedInput()
+                self.stderr = io.BytesIO(b"bounded child startup failure")
+
+            def wait(self) -> int:
+                return 37
+
+            def poll(self) -> int:
+                return 37
+
+        with tempfile.TemporaryDirectory(
+            prefix="retained-recovery-early-exit-", dir="/root"
+        ) as parent:
+            run_root_base = Path(parent) / "production-retained-matrix"
+            run_root = run_root_base / "gha-12345"
+            run_root.mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            with (
+                patch.object(recovery_capture, "RUN_ROOT_BASE", run_root_base),
+                patch.object(
+                    recovery_capture.subprocess,
+                    "Popen",
+                    return_value=EarlyExitProcess(),
+                ) as popen,
+            ):
+                self.assertEqual(
+                    recovery_capture.capture_recovery_stderr(
+                        load_run_id="12345",
+                        cleanup_run_id="67890",
+                        control_email="private@example.invalid",
+                        mode="external-vote",
+                    ),
+                    37,
+                )
+            self.assertNotIn(
+                "private@example.invalid", popen.call_args.args[0]
+            )
+            self.assertEqual(
+                (run_root / "cleanup-recovery-12345-67890.stderr").read_bytes(),
+                b"bounded child startup failure",
+            )
+
     def test_cleanup_recovery_failure_emits_only_fixed_stage_marker(self) -> None:
         script = (
             Path(__file__).resolve().parents[1]
