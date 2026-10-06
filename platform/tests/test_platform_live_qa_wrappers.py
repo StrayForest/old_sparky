@@ -1297,7 +1297,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 external,
                 "      - name: Diagnose origin evidence publication gate",
                 "      - name: Publish origin evidence",
-                ("ORIGIN_PUBLISH_GATE", "eligible=", "ORIGIN_OBSERVER_READY"),
+                ("ORIGIN_PUBLISH_GATE", "explicit_conditions_met=", "ORIGIN_OBSERVER_READY"),
             ),
             (
                 abort,
