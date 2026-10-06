@@ -50,7 +50,17 @@ supervisor's exact manifest inventory and its root-owned helper metadata
 checks, matching the dispatcher and signed bundle. Exact-P provisioning and
 the installed generation self-test are required before this generation is
 used. The
-active application release and production health are owned by
+safe-environment interpreter metadata correction uses **C**
+`b186fbd177ab82330c1ec001d96a2d40474f9552` and pin commit **P**
+`4c954d02494f2f25a9da112bf26e8c02ef6636a2`; P records C's exact 14-member
+closure. The fixed production venv Python path is a root-owned, single-link
+symlink that must resolve to `/usr/bin/python3.12`. The validator checks the
+resolved interpreter as a regular root-owned, single-link file with no
+group/world write or set-id bits; it does not treat Linux symlink mode `0777`
+as target write permission. The exact manifest-bound payload, source,
+approved-tool, script and runtime-ancestry checks remain required. Provisioning
+and the installed-generation self-test are required before this generation is
+used. The active application release and production health are owned by
 [`CURRENT.md`](../CURRENT.md); this ADR does not duplicate those changing facts.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
