@@ -21,7 +21,7 @@ import zipfile
 
 
 SCHEMA = 1
-TOOLSET_VERSION = "production-host-tools-v2"
+TOOLSET_VERSION = "production-host-tools-v3"
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024
@@ -52,10 +52,18 @@ PRODUCTION_DEPLOY_CONTROL_FILES = (
     "platform_update_cloudflare_ips.py",
     "platform_storage_evidence_summary.py",
 )
-HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + PRODUCTION_DEPLOY_CONTROL_FILES
+RETAINED_LOAD_ARTIFACT_FILES = (
+    "platform_retained_load_export_executor.py",
+)
+HOST_TOOL_FILES = (
+    PREPARE_ARTIFACT_FILES
+    + PRODUCTION_DEPLOY_CONTROL_FILES
+    + RETAINED_LOAD_ARTIFACT_FILES
+)
 COMPONENT_FILES = {
     "prepare_artifact": PREPARE_ARTIFACT_FILES,
     "production_deploy_control": PRODUCTION_DEPLOY_CONTROL_FILES,
+    "retained_load_artifact_cleanup": RETAINED_LOAD_ARTIFACT_FILES,
 }
 CAPABILITIES = (
     "artifact_prepare",
@@ -64,6 +72,7 @@ CAPABILITIES = (
     "production_supervisor",
     "production_deploy_control",
     "release_baseline",
+    "retained_load_export_cleanup",
     "python_isolated",
     "python_bytecode_disabled",
 )

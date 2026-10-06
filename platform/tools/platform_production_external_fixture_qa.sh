@@ -52,20 +52,19 @@ platform_retained_load_lock_open || {
   exit 1
 }
 trap platform_retained_load_lock_close EXIT
-if (( $# != 8 && $# != 9 )); then
-  echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path]" >&2
+if (( $# != 7 && $# != 8 )); then
+  echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path]" >&2
   exit 2
 fi
 
 confirmation="$1"
 target_sha="$2"
-control_email="$3"
-concurrency="$4"
-run_id="$5"
-profile="$6"
-external_vote_tournament_count="$7"
-external_vote_users_per_tournament="$8"
-timeout_diagnostics="${9:-false}"
+concurrency="$3"
+run_id="$4"
+profile="$5"
+external_vote_tournament_count="$6"
+external_vote_users_per_tournament="$7"
+timeout_diagnostics="${8:-false}"
 
 [[ "$profile" == "external-vote" ]] || {
   echo "External-load fixture supports only the external-vote profile." >&2
@@ -75,8 +74,13 @@ timeout_diagnostics="${9:-false}"
   echo "Target SHA must be a lowercase 40-character commit SHA." >&2
   exit 1
 }
-"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" email \
-  --value "$control_email" || {
+unset control_email
+control_email="$("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" \
+  control-email-json-stdin)" || {
+  echo "Control email is invalid." >&2
+  exit 1
+}
+[[ -n "$control_email" ]] || {
   echo "Control email is invalid." >&2
   exit 1
 }
@@ -151,16 +155,34 @@ test "$platform_origin" = "$EXPECTED_ORIGIN" || {
 run_root="$OUTPUT_ROOT_BASE/gha-$run_id"
 export_dir="/tmp/old-sparky-production-retained-load-$run_id"
 supervisor_exit_path="$export_dir/supervisor.exit"
+export_created=0
+export_dir_identity=""
 # ShellCheck cannot infer functions invoked through a dynamically registered
 # EXIT trap; this callback is reachable only when that trap fires.
 # shellcheck disable=SC2317
 write_supervisor_exit() {
   local supervisor_status=$?
-  if [[ -d "$export_dir" && ! -L "$export_dir" ]]; then
-    printf '%s\n' "$supervisor_status" > "$supervisor_exit_path"
-    chmod 0600 "$supervisor_exit_path"
-    if [[ "${export_uid:-}" =~ ^[0-9]+$ && "${export_gid:-}" =~ ^[0-9]+$ ]]; then
-      chown "$export_uid:$export_gid" "$supervisor_exit_path"
+  if [[ "$export_created" == "1" && -n "$export_dir_identity" \
+    && -d "$export_dir" && ! -L "$export_dir" \
+    && "$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h' -- "$export_dir" 2>/dev/null || true)" == "$export_dir_identity" ]]; then
+    if [[ ! -e "$supervisor_exit_path" && ! -L "$supervisor_exit_path" ]] \
+      && (umask 077; set -o noclobber; printf '%s\n' "$supervisor_status" > "$supervisor_exit_path") \
+      && chmod 0600 "$supervisor_exit_path" 2>/dev/null \
+      && [[ "${export_uid:-}" =~ ^[0-9]+$ && "${export_gid:-}" =~ ^[0-9]+$ ]] \
+      && chown "$export_uid:$export_gid" "$supervisor_exit_path" 2>/dev/null; then
+      local leaf_metadata
+      local leaf_device leaf_inode leaf_uid leaf_gid leaf_mode leaf_links
+      leaf_metadata="$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h' -- "$supervisor_exit_path" 2>/dev/null || true)"
+      IFS=: read -r leaf_device leaf_inode leaf_uid leaf_gid leaf_mode leaf_links <<< "$leaf_metadata"
+      if [[ "$leaf_device" != "${export_dir_identity%%:*}" \
+        || ! "$leaf_inode" =~ ^[0-9]+$ \
+        || "$leaf_uid" != "$export_uid" || "$leaf_gid" != "$export_gid" \
+        || "$leaf_mode" != "600" || "$leaf_links" != "1" \
+        || ! -f "$supervisor_exit_path" || -L "$supervisor_exit_path" ]]; then
+        supervisor_status=1
+      fi
+    else
+      supervisor_status=1
     fi
   fi
   # This trap replaces the acquisition trap above; close the retained-load
@@ -169,21 +191,49 @@ write_supervisor_exit() {
   exit "$supervisor_status"
 }
 trap write_supervisor_exit EXIT
-export_uid="${SUDO_UID:-0}"
-export_gid="${SUDO_GID:-0}"
-[[ "$export_uid" =~ ^[0-9]+$ && "$export_gid" =~ ^[0-9]+$ ]] || {
-  echo "Unable to determine the SSH caller identity for report export." >&2
+artifact_owner_json="$("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_retained_load_export_executor.py" owner)" || {
+  echo "Dedicated retained-load artifact owner is not available." >&2
   exit 1
 }
+artifact_owner_pair="$("$SYSTEM_PYTHON" -I -B -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if (
+    not isinstance(payload, dict)
+    or set(payload) != {"uid", "gid"}
+    or type(payload.get("uid")) is not int
+    or type(payload.get("gid")) is not int
+    or payload["uid"] <= 0
+    or payload["gid"] <= 0
+):
+    raise SystemExit(1)
+print("{} {}".format(payload["uid"], payload["gid"]))
+' <<< "$artifact_owner_json")" || {
+  echo "Dedicated retained-load artifact owner projection is invalid." >&2
+  exit 1
+}
+read -r export_uid export_gid <<< "$artifact_owner_pair"
 if [[ -e "$run_root" || -L "$run_root" ]]; then
   echo "A production external-load run already exists for this GitHub run id." >&2
+  exit 1
+fi
+if [[ -e "$export_dir" || -L "$export_dir" ]]; then
+  echo "A retained-load artifact export already exists for this GitHub run id." >&2
   exit 1
 fi
 
 install -d -o root -g root -m 0700 "$OUTPUT_ROOT_BASE"
 install -d -o root -g root -m 0700 "$run_root"
-rm -rf -- "$export_dir"
-install -d -o "$export_uid" -g "$export_gid" -m 0700 "$export_dir"
+/usr/bin/mkdir -m 0700 -- "$export_dir"
+/usr/bin/chown "$export_uid:$export_gid" -- "$export_dir"
+/usr/bin/chmod 0700 -- "$export_dir"
+export_dir_identity="$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h' -- "$export_dir")"
+export_created=1
 log_path="$run_root/canonical.log"
 server_observability_log="$run_root/server-observability.json"
 external_vote_root="$run_root/external-vote"
@@ -277,7 +327,7 @@ PY
 
 if [[ "$qa_status" == "0" && -s "$external_vote_manifest" ]]; then
   # The manifest is temporary session credential material. It is exported
-  # only to the SSH caller's private directory and is never in a report or
+  # only to the dedicated artifact export and is never in a report or
   # Actions artifact.
   install -o "$export_uid" -g "$export_gid" -m 0600 \
     "$external_vote_manifest" "$export_dir/manifest.json"
@@ -338,6 +388,8 @@ PY
   }
   if [[ "$qa_status" == "0" ]]; then
     : > "$external_vote_ready"
+    chown "$export_uid:$export_gid" "$external_vote_ready"
+    chmod 0600 "$external_vote_ready"
   fi
   printf 'PRODUCTION_EXTERNAL_LOAD_READY=%s\n' "$export_dir/manifest.json"
   observer_deadline=$(( $(date +%s) + 10800 ))
@@ -357,6 +409,8 @@ PY
   done
   if [[ ! -e "$external_vote_complete" ]]; then
     : > "$external_vote_complete"
+    chown "$export_uid:$export_gid" "$external_vote_complete"
+    chmod 0600 "$external_vote_complete"
   fi
   observer_status=0
   wait "$observer_pid" 2>/dev/null || observer_status="$?"

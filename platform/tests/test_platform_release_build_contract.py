@@ -4030,7 +4030,7 @@ cleanup
         )
         self.assertNotIn('"$QA_PYTHON" "${observer_args[@]}"', supervisor)
         self.assertIn(
-            'platform_workflow_input_guard.py" email',
+            'platform_workflow_input_guard.py" \\\n  control-email-json-stdin)',
             supervisor,
         )
         self.assertIn('EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"', supervisor)
@@ -4079,7 +4079,10 @@ cleanup
             REPO_ROOT
             / "platform/tools/platform_production_retained_load_cleanup_qa.sh"
         ).read_text()
-        self.assertIn('platform_workflow_input_guard.py" email', cleanup_supervisor)
+        self.assertIn(
+            'platform_workflow_input_guard.py" \\\n  control-email-json-stdin)',
+            cleanup_supervisor,
+        )
         self.assertIn('PLATFORM_ROOT="$RUNTIME_ROOT/current"', supervisor)
         self.assertIn('PLATFORM_ROOT="$RUNTIME_ROOT/current"', cleanup_supervisor)
         self.assertIn('QA_PYTHON="$RUNTIME_ROOT/shared/venv/bin/python"', supervisor)

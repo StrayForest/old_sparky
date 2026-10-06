@@ -150,20 +150,55 @@ def _bundle_file_names(source_root: Path) -> tuple[str, ...]:
     # The closure declaration is deliberately simple and bounded.  Importing
     # target source here would make a source-only pin gate depend on arbitrary
     # module imports, so parse only its literal HOST_TOOL_FILES tuple.
-    match = re.search(
-        r"HOST_TOOL_FILES\s*=\s*PREPARE_ARTIFACT_FILES\s*\+\s*PRODUCTION_DEPLOY_CONTROL_FILES",
-        source,
+    declarations = list(
+        re.finditer(
+            r"(?ms)^HOST_TOOL_FILES\s*=\s*(?:\((?P<parenthesized>.*?)\)|(?P<bare>[^\n]+))\s*$",
+            source,
+        )
     )
-    if match is None:
+    if len(declarations) != 1:
         raise HostToolsPinError("host-tools closure declaration is missing")
-    groups = re.findall(
-        r"(?:PREPARE_ARTIFACT_FILES|PRODUCTION_DEPLOY_CONTROL_FILES)\s*=\s*\((.*?)\)",
-        source,
-        flags=re.DOTALL,
-    )
+    expression = declarations[0].group("parenthesized")
+    if expression is None:
+        expression = declarations[0].group("bare") or ""
+    declared_groups = tuple(re.findall(r"[A-Z_]+", expression))
+    residual_expression = re.sub(r"[A-Z_]+", "", expression)
+    allowed_declarations = {
+        ("PREPARE_ARTIFACT_FILES", "PRODUCTION_DEPLOY_CONTROL_FILES"),
+        (
+            "PREPARE_ARTIFACT_FILES",
+            "PRODUCTION_DEPLOY_CONTROL_FILES",
+            "RETAINED_LOAD_ARTIFACT_FILES",
+        ),
+    }
+    if (
+        declared_groups not in allowed_declarations
+        or residual_expression.strip(" +\t\r\n")
+    ):
+        raise HostToolsPinError("host-tools closure declaration is missing")
+    group_pattern = re.compile(r"(?m)^([A-Z_]+)\s*=\s*\((.*?)\)", re.DOTALL)
+    allowed_groups = {
+        "PREPARE_ARTIFACT_FILES",
+        "PRODUCTION_DEPLOY_CONTROL_FILES",
+        "RETAINED_LOAD_ARTIFACT_FILES",
+    }
+    groups_by_name: dict[str, str] = {}
+    for match in group_pattern.finditer(source):
+        name = match.group(1)
+        if name in allowed_groups:
+            if name in groups_by_name:
+                raise HostToolsPinError("host-tools closure declaration is invalid")
+            groups_by_name[name] = match.group(2)
+    if set(groups_by_name) != set(declared_groups):
+        raise HostToolsPinError("host-tools closure declaration is invalid")
     names: list[str] = []
-    for group in groups:
-        names.extend(re.findall(r"\"([^\"]+)\"", group))
+    for name in declared_groups:
+        group = groups_by_name[name]
+        strings = re.findall(r'"([^\"]+)"', group)
+        residual = re.sub(r'"[^\"]+"', "", group)
+        if residual.strip(" ,\t\r\n"):
+            raise HostToolsPinError("host-tools closure declaration is invalid")
+        names.extend(strings)
     if not names or len(names) > MAX_CLOSURE_FILES or len(set(names)) != len(names):
         raise HostToolsPinError("host-tools closure declaration is invalid")
     return tuple(names)

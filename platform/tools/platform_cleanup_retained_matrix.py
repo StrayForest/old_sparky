@@ -42,6 +42,7 @@ from python_packages.platform_infra.models import (
     User,
     UserSession,
 )
+from platform_workflow_input_guard import validate_control_email, WorkflowInputError
 _HELPER_PATH = Path(__file__).resolve().with_name("platform_cleanup_live_user_qa.py")
 _HELPER_SPEC = importlib.util.spec_from_file_location(
     "platform_cleanup_live_user_qa_retained_helpers", _HELPER_PATH
@@ -143,6 +144,45 @@ def _uuid_list(value: object, *, field: str, allow_empty: bool = True) -> list[s
     if len(result) != len(set(result)):
         raise ValueError(f"{field} must not contain duplicate IDs")
     return result
+
+
+MAX_CONTROL_EMAIL_STDIN_BYTES = 255
+
+
+def add_control_email_argument(parser: argparse.ArgumentParser) -> None:
+    """Add mutually exclusive legacy argv and private stdin identity options."""
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--control-email")
+    group.add_argument(
+        "--control-email-stdin",
+        action="store_true",
+        help="read one bounded ASCII control email line from stdin",
+    )
+
+
+def resolve_control_email(args: argparse.Namespace, *, stdin: Any = None) -> str:
+    """Validate and canonicalize control identity before cleanup side effects."""
+
+    if getattr(args, "control_email_stdin", False):
+        stream = stdin if stdin is not None else sys.stdin.buffer
+        raw = stream.read(MAX_CONTROL_EMAIL_STDIN_BYTES + 1)
+        if not isinstance(raw, bytes) or len(raw) > MAX_CONTROL_EMAIL_STDIN_BYTES:
+            raise RuntimeError("control email input is invalid")
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+        if b"\n" in raw or b"\r" in raw:
+            raise RuntimeError("control email input is invalid")
+        try:
+            value = raw.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("control email input is invalid") from exc
+    else:
+        value = getattr(args, "control_email", None)
+    try:
+        return validate_control_email(value)
+    except WorkflowInputError as exc:
+        raise RuntimeError("control email input is invalid") from exc
 
 
 def _is_canonical_matrix_origin(report: dict[str, Any], *, mode: str) -> bool:
@@ -752,20 +792,19 @@ async def async_main() -> int:
     parser = argparse.ArgumentParser(description="Cleanup one exact production retained load matrix.")
     parser.add_argument("--summary", type=Path, required=True)
     parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--control-email", required=True)
+    add_control_email_argument(parser)
     parser.add_argument("--confirm", required=True)
     parser.add_argument("--result-path", type=Path, required=True)
     args = parser.parse_args()
+    control_email = resolve_control_email(args)
     if os.geteuid() != 0:
         raise RuntimeError("retained matrix cleanup must run as root")
     if args.confirm != CONFIRMATION:
         raise RuntimeError(f"cleanup requires --confirm {CONFIRMATION}")
-    if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", args.control_email):
-        raise RuntimeError("control email is invalid")
     manifest = load_matrix_manifest(
         args.summary,
         run_root=args.run_root,
-        expected_control_email=args.control_email,
+        expected_control_email=control_email,
         repair_permissions=True,
     )
     result = await cleanup_manifest(manifest)

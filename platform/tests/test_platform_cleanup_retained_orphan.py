@@ -1,12 +1,37 @@
 from __future__ import annotations
 
+import asyncio
+from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
+import io
 import unittest
 
 from tools import platform_cleanup_retained_orphan as cleanup
 
 
 class RetainedOrphanCleanupTests(unittest.TestCase):
+    def test_invalid_control_stdin_stops_before_database_setup(self) -> None:
+        argv = [
+            "cleanup",
+            "--load-run-id",
+            "12345",
+            "--control-email-stdin",
+            "--confirm",
+            cleanup.CONFIRMATION,
+            "--result-path",
+            "/tmp/result.json",
+        ]
+        stdin = io.TextIOWrapper(io.BytesIO(b"bad identity\n"), encoding="ascii")
+        with (
+            patch.object(cleanup.sys, "argv", argv),
+            patch.object(cleanup.sys, "stdin", stdin),
+            patch.object(cleanup, "get_settings") as get_settings,
+            patch.object(cleanup, "dispose_engine", new=AsyncMock()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "control email input is invalid"):
+                asyncio.run(cleanup._main())
+        get_settings.assert_not_called()
+
     def _run(self, **overrides: object) -> SimpleNamespace:
         marker = "preprod260829000001abcd"
         mode = "read-mix"
