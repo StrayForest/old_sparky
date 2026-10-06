@@ -25,7 +25,12 @@ all 15 members, the isolated self-test and no bytecode. S10
 `b0ff2f0483c281538699b1a0104e071b9b319d89b2cf8512c4951f307d394ec7`, S9
 `7a9fe1286054dbe96221d2b428048c4212270cf5`, and recovery generation
 `d47ae6a278f76bb8a46cca0bbe9019427584c3d2861880e8a7365d87a627be66` remain
-preserved. The active application release and production health are owned by
+preserved. The retained-load export-authority bump uses **C**
+`47551d9c9278da79234314aade6aa1ce55d7f979` and pin commit **P**
+`b806ff4f141b29d2d970ada36b2e3521cd2ce1e9`; the pin records C's exact
+14-member closure. Root provisioning and the exact-P preflight/reconcile remain
+pending the reviewed merge and are required before the capability is used. The
+active application release and production health are owned by
 [`CURRENT.md`](../CURRENT.md); this ADR does not duplicate those changing facts.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
