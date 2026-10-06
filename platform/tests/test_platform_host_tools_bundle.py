@@ -3004,10 +3004,27 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             }
             for index, name in enumerate(sorted(candidate.EXPECTED_JOB_NAMES))
         ]
+        self.assertEqual(
+            candidate.PR_ALWAYS_SKIPPED_JOB_NAMES,
+            {
+                "Authenticate internal baseline runtime proof",
+                "Dispatch exact baseline proof finalizer",
+            },
+        )
+        self.assertTrue(candidate.PR_ALWAYS_SKIPPED_JOB_NAMES.issubset(candidate.EXPECTED_JOB_NAMES))
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "jobs.json"
             path.write_text(json.dumps({"total_count": len(jobs), "jobs": jobs}), encoding="utf-8")
             candidate.verify_jobs(path, context, summary)
+            for name in sorted(candidate.PR_ALWAYS_SKIPPED_JOB_NAMES):
+                changed_jobs = [
+                    {**job, "conclusion": "success"} if job["name"] == name else job
+                    for job in jobs
+                ]
+                path.write_text(json.dumps({"total_count": len(changed_jobs), "jobs": changed_jobs}), encoding="utf-8")
+                with self.subTest(unexpected_pr_job=name):
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.verify_jobs(path, context, summary)
             for label, changed in (
                 ("extra-job", {**jobs[0], "name": "attacker-job"}),
                 ("failed-required", {**jobs[0], "conclusion": "failure"}),
