@@ -406,6 +406,85 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("cleanup_exports_status=", finalizer)
         self.assertIn("cleanup_status\" != 0 || \"$cleanup_exports_status\" != 0", finalizer)
         self.assertIn("cleanup summary projection input is invalid", finalizer)
+        diagnostic = finalizer.split(
+            "- name: Diagnose origin evidence publication gate", 1
+        )[1].split("- name: Publish origin evidence", 1)[0]
+        diagnostic_script = _step_script(
+            finalizer, "Diagnose origin evidence publication gate"
+        )
+        self.assertIn("if: ${{ always() }}", diagnostic)
+        self.assertIn("ORIGIN_PUBLISH_GATE", diagnostic_script)
+        self.assertNotIn("${{", diagnostic_script)
+        self.assertNotIn("secrets.", diagnostic)
+        for category in (
+            '"missing"',
+            '"invalid"',
+            '"cancelled"',
+            '"skipped"',
+            "eligible=",
+        ):
+            with self.subTest(category=category):
+                self.assertIn(category, diagnostic_script)
+        allowed_environment = {
+            "ORIGIN_PRIOR_STEPS_SUCCESS": "true",
+            "ORIGIN_NAMESPACE_CLOSED": "0",
+            "ORIGIN_MANUAL_REQUIRED": "0",
+            "ORIGIN_CLEANUP_SSH_OUTCOME": "success",
+            "ORIGIN_REMOTE_STATUS": "0",
+            "ORIGIN_OBSERVER_READY": "1",
+            "ORIGIN_FINALIZE_STATUS": "0",
+            "ORIGIN_CLEANUP_STATUS": "0",
+            "ORIGIN_CLEANUP_EXPORTS_STATUS": "0",
+            "ORIGIN_SSH_CLEANUP_STATUS": "0",
+            "ORIGIN_CLEANUP_IDENTITY_STATUS": "0",
+        }
+        valid_summary = subprocess.run(
+            ["/bin/bash", "-c", diagnostic_script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=allowed_environment,
+            timeout=10,
+        ).stdout
+        self.assertIn("eligible=yes", valid_summary)
+
+        invalid_environment = dict(allowed_environment)
+        invalid_environment["ORIGIN_REMOTE_STATUS"] = "0\nraw-path-or-secret"
+        invalid_environment["ORIGIN_CLEANUP_SSH_OUTCOME"] = "skipped"
+        invalid_environment.pop("ORIGIN_FINALIZE_STATUS")
+        invalid_summary = subprocess.run(
+            ["/bin/bash", "-c", diagnostic_script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=invalid_environment,
+            timeout=10,
+        ).stdout
+        self.assertIn("remote=invalid", invalid_summary)
+        self.assertIn("ssh_step=skipped", invalid_summary)
+        self.assertIn("finalize=missing", invalid_summary)
+        self.assertIn("eligible=no", invalid_summary)
+        self.assertNotIn("raw-path-or-secret", invalid_summary)
+
+        publish = finalizer.split("- name: Publish origin evidence", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        for gate_input in (
+            "success()",
+            "needs.namespace-containment-barrier.outputs.namespace_closed_status == '0'",
+            "needs.namespace-containment-manual-barrier.outputs.manual_required == '0'",
+            "steps.cleanup_ssh.outcome == 'success'",
+            "steps.external-finalize.outputs.remote_status == '0'",
+            "steps.external-finalize.outputs.observer_ready == '1'",
+            "steps.external-finalize.outputs.finalize_status == '0'",
+            "steps.cleanup.outputs.cleanup_status == '0'",
+            "steps.cleanup.outputs.cleanup_exports_status == '0'",
+            "steps.cleanup_ssh.outputs.ssh_cleanup_status == '0'",
+            "steps.revalidate-finalizer.outputs.cleanup_identity_status == '0'",
+        ):
+            with self.subTest(gate_input=gate_input):
+                self.assertIn(gate_input, publish)
+
         evaluator = self.jobs["evaluate-load"]
         self.assertIn("sanitizer_status=0", evaluator)
         self.assertIn("External evidence projection/sanitizer failed.", evaluator)

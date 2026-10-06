@@ -1483,6 +1483,73 @@ jobs:
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
 
+      - name: Diagnose origin evidence publication gate
+        if: ${{ always() }}
+        shell: bash
+        env:
+          ORIGIN_PRIOR_STEPS_SUCCESS: ${{ success() }}
+          ORIGIN_NAMESPACE_CLOSED: ${{ needs.namespace-containment-barrier.outputs.namespace_closed_status }}
+          ORIGIN_MANUAL_REQUIRED: ${{ needs.namespace-containment-manual-barrier.outputs.manual_required }}
+          ORIGIN_CLEANUP_SSH_OUTCOME: ${{ steps.cleanup_ssh.outcome }}
+          ORIGIN_REMOTE_STATUS: ${{ steps.external-finalize.outputs.remote_status }}
+          ORIGIN_OBSERVER_READY: ${{ steps.external-finalize.outputs.observer_ready }}
+          ORIGIN_FINALIZE_STATUS: ${{ steps.external-finalize.outputs.finalize_status }}
+          ORIGIN_CLEANUP_STATUS: ${{ steps.cleanup.outputs.cleanup_status }}
+          ORIGIN_CLEANUP_EXPORTS_STATUS: ${{ steps.cleanup.outputs.cleanup_exports_status }}
+          ORIGIN_SSH_CLEANUP_STATUS: ${{ steps.cleanup_ssh.outputs.ssh_cleanup_status }}
+          ORIGIN_CLEANUP_IDENTITY_STATUS: ${{ steps.revalidate-finalizer.outputs.cleanup_identity_status }}
+        run: |
+          set +e
+          /usr/bin/python3 - <<'PY'
+          import os
+
+          def classify(name: str, allowed: dict[str, str]) -> str:
+              value = os.environ.get(name)
+              if value is None or value == "":
+                  return "missing"
+              return allowed.get(value, "invalid")
+
+          fields = {
+              "prior": classify("ORIGIN_PRIOR_STEPS_SUCCESS", {"true": "ok", "false": "blocked"}),
+              "namespace": classify("ORIGIN_NAMESPACE_CLOSED", {"0": "closed", "1": "open"}),
+              "manual": classify("ORIGIN_MANUAL_REQUIRED", {"0": "none", "1": "required"}),
+              "ssh_step": classify(
+                  "ORIGIN_CLEANUP_SSH_OUTCOME",
+                  {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"},
+              ),
+              "remote": classify("ORIGIN_REMOTE_STATUS", {"0": "ok", "1": "failed"}),
+              "observer": classify("ORIGIN_OBSERVER_READY", {"0": "not_ready", "1": "ready"}),
+              "finalize": classify("ORIGIN_FINALIZE_STATUS", {"0": "ok", "1": "failed"}),
+              "cleanup": classify("ORIGIN_CLEANUP_STATUS", {"0": "ok", "1": "failed"}),
+              "exports": classify("ORIGIN_CLEANUP_EXPORTS_STATUS", {"0": "ok", "1": "failed"}),
+              "ssh_cleanup": classify("ORIGIN_SSH_CLEANUP_STATUS", {"0": "ok", "1": "failed"}),
+              "identity": classify("ORIGIN_CLEANUP_IDENTITY_STATUS", {"0": "ok", "1": "failed"}),
+          }
+          eligible = all(
+              fields[name] == expected
+              for name, expected in (
+                  ("prior", "ok"),
+                  ("namespace", "closed"),
+                  ("manual", "none"),
+                  ("ssh_step", "ok"),
+                  ("remote", "ok"),
+                  ("observer", "ready"),
+                  ("finalize", "ok"),
+                  ("cleanup", "ok"),
+                  ("exports", "ok"),
+                  ("ssh_cleanup", "ok"),
+                  ("identity", "ok"),
+              )
+          )
+          summary = " ".join(f"{name}={value}" for name, value in fields.items())
+          print(f"ORIGIN_PUBLISH_GATE {summary} eligible={'yes' if eligible else 'no'}")
+          PY
+          diagnostic_status="$?"
+          if [[ "$diagnostic_status" != 0 ]]; then
+            printf '%s\n' 'ORIGIN_PUBLISH_GATE diagnostic=unavailable'
+          fi
+          exit 0
+
       - name: Publish origin evidence
         id: publish-origin
         if: ${{ success() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' && steps.cleanup_ssh.outcome == 'success' && steps.external-finalize.outputs.remote_status == '0' && steps.external-finalize.outputs.observer_ready == '1' && steps.external-finalize.outputs.finalize_status == '0' && steps.cleanup.outputs.cleanup_status == '0' && steps.cleanup.outputs.cleanup_exports_status == '0' && steps.cleanup_ssh.outputs.ssh_cleanup_status == '0' && steps.revalidate-finalizer.outputs.cleanup_identity_status == '0' }}
