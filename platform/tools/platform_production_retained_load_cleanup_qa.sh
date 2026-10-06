@@ -78,16 +78,15 @@ run_external_vote_recovery() {
 {"schema":1,"load_run_id":"$load_run_id","cleanup_run_id":"$cleanup_run_id","control_email":"$control_email","mode":"$recovery_profile"}
 EOF
 }
-if (( $# != 5 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <load-run-id> <control-email> <cleanup-run-id>" >&2
+if (( $# != 4 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <load-run-id> <cleanup-run-id>" >&2
   exit 2
 fi
 
 confirmation="$1"
 target_sha="$2"
 load_run_id="$3"
-control_email="$4"
-cleanup_run_id="$5"
+cleanup_run_id="$4"
 
 [[ "$confirmation" == "$CONFIRMATION" ]]
 [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || {
@@ -98,8 +97,8 @@ cleanup_run_id="$5"
   echo "GitHub run ids must be numeric." >&2
   exit 1
 }
-"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" email \
-  --value "$control_email" || {
+control_email="$("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" \
+  control-email-json-stdin)" || {
   echo "Control email is invalid." >&2
   exit 1
 }
@@ -217,11 +216,11 @@ if [[ ! -e "$run_root" ]]; then
   result_path="$export_dir/cleanup-summary.json"
   CLEANUP_STAGE="orphan_cleanup"
   set +e
-  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+  printf '%s\n' "$control_email" | "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
     --pythonpath "$PLATFORM_ROOT" \
     -- "$QA_PYTHON" "$TOOLS_DIR/platform_cleanup_retained_orphan.py" \
     --load-run-id "$load_run_id" \
-    --control-email "$control_email" \
+    --control-email-stdin \
     --confirm "$CONFIRMATION" \
     --result-path "$result_path" \
     > "$raw_log_path" 2>&1
@@ -367,12 +366,12 @@ raw_log_path="$export_dir/cleanup-raw.log"
 result_path="$export_dir/cleanup-summary.json"
 
 set +e
-"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+printf '%s\n' "$control_email" | "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
   --pythonpath "$PLATFORM_ROOT" \
   -- "$QA_PYTHON" "$TOOLS_DIR/platform_cleanup_retained_matrix.py" \
   --summary "$summary_path" \
   --run-root "$run_root" \
-  --control-email "$control_email" \
+  --control-email-stdin \
   --confirm "$CONFIRMATION" \
   --result-path "$result_path" \
   > "$raw_log_path" 2>&1

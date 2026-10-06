@@ -18,6 +18,29 @@ from tools import platform_capture_retained_recovery_stderr as recovery_capture
 
 
 class RetainedLoadExportExecutorTests(unittest.TestCase):
+    def test_production_shell_handoffs_keep_control_identity_on_stdin(self) -> None:
+        tools = Path(__file__).resolve().parents[1] / "tools"
+        external = (tools / "platform_production_external_fixture_qa.sh").read_text(
+            encoding="utf-8"
+        )
+        cleanup = (tools / "platform_production_retained_load_cleanup_qa.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("control-email-json-stdin", external)
+        self.assertNotIn('--value "$control_email"', external)
+        self.assertIn("<target-sha> <concurrency> <run-id>", external)
+        external_parse = external.index("control-email-json-stdin")
+        external_lock = external.index('PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED:-}')
+        self.assertGreater(external_parse, external_lock)
+
+        self.assertIn("control-email-json-stdin", cleanup)
+        self.assertNotIn('--value "$control_email"', cleanup)
+        self.assertIn("<target-sha> <load-run-id> <cleanup-run-id>", cleanup)
+        self.assertIn("--control-email-stdin", cleanup)
+        self.assertNotIn('--control-email "$control_email"', cleanup)
+        self.assertRegex(cleanup, r'printf .+\\n. \"\$control_email\" \\|')
+
     def test_recovery_capture_accepts_only_closed_stdin_schema(self) -> None:
         valid = recovery_capture.parse_request(
             b'{"schema":1,"load_run_id":"12345","cleanup_run_id":"67890",'

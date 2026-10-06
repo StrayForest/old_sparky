@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,54 @@ SPEC.loader.exec_module(cleanup)
 
 
 class RetainedMatrixManifestTests(unittest.TestCase):
+    def test_invalid_control_stdin_stops_before_manifest_or_database_cleanup(self) -> None:
+        argv = [
+            "cleanup",
+            "--summary",
+            "/tmp/summary.json",
+            "--run-root",
+            "/tmp/run-root",
+            "--control-email-stdin",
+            "--confirm",
+            cleanup.CONFIRMATION,
+            "--result-path",
+            "/tmp/result.json",
+        ]
+        stdin = io.TextIOWrapper(io.BytesIO(b'{"schema":1}\n'), encoding="ascii")
+        with (
+            mock.patch.object(cleanup.sys, "argv", argv),
+            mock.patch.object(cleanup.sys, "stdin", stdin),
+            mock.patch.object(cleanup, "load_matrix_manifest") as load_manifest,
+            mock.patch.object(cleanup, "dispose_engine", new=mock.AsyncMock()),
+            mock.patch.object(cleanup, "dispose_redis_clients", new=mock.AsyncMock()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "control email input is invalid"):
+                asyncio.run(cleanup._main())
+        load_manifest.assert_not_called()
+
+    def test_control_email_stdin_is_bounded_single_ascii_line(self) -> None:
+        args = type("Args", (), {"control_email_stdin": True})()
+        self.assertEqual(
+            cleanup.resolve_control_email(args, stdin=io.BytesIO(b"Control@example.invalid\n")),
+            "control@example.invalid",
+        )
+        for raw in (
+            b"control@example.invalid\nsecond@example.invalid\n",
+            b"control@example.invalid\r\n",
+            b"control@example.invalid\x00\n",
+            b"control@example.invalid " + b"x" * 240,
+            b"control\xff@example.invalid\n",
+        ):
+            with self.subTest(raw_size=len(raw)):
+                with self.assertRaisesRegex(RuntimeError, "control email input is invalid"):
+                    cleanup.resolve_control_email(args, stdin=io.BytesIO(raw))
+
+    def test_legacy_control_email_argument_remains_supported(self) -> None:
+        args = type(
+            "Args", (), {"control_email_stdin": False, "control_email": "Control@example.invalid"}
+        )()
+        self.assertEqual(cleanup.resolve_control_email(args), "control@example.invalid")
+
     def test_read_model_cleanup_is_exact_and_verifies_no_projection_remains(self) -> None:
         class RedisStub:
             def __init__(self, remaining: int = 0):

@@ -52,20 +52,19 @@ platform_retained_load_lock_open || {
   exit 1
 }
 trap platform_retained_load_lock_close EXIT
-if (( $# != 8 && $# != 9 )); then
-  echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path]" >&2
+if (( $# != 7 && $# != 8 )); then
+  echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path]" >&2
   exit 2
 fi
 
 confirmation="$1"
 target_sha="$2"
-control_email="$3"
-concurrency="$4"
-run_id="$5"
-profile="$6"
-external_vote_tournament_count="$7"
-external_vote_users_per_tournament="$8"
-timeout_diagnostics="${9:-false}"
+concurrency="$3"
+run_id="$4"
+profile="$5"
+external_vote_tournament_count="$6"
+external_vote_users_per_tournament="$7"
+timeout_diagnostics="${8:-false}"
 
 [[ "$profile" == "external-vote" ]] || {
   echo "External-load fixture supports only the external-vote profile." >&2
@@ -75,8 +74,8 @@ timeout_diagnostics="${9:-false}"
   echo "Target SHA must be a lowercase 40-character commit SHA." >&2
   exit 1
 }
-"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" email \
-  --value "$control_email" || {
+"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" \
+  control-email-json-stdin >/dev/null || {
   echo "Control email is invalid." >&2
   exit 1
 }

@@ -34,7 +34,9 @@ from platform_cleanup_retained_matrix import (
     EXPECTED_ORIGIN,
     MARKER_PATTERN,
     _uuid_list,
+    add_control_email_argument,
     cleanup_manifest,
+    resolve_control_email,
 )
 
 
@@ -48,10 +50,12 @@ RUN_ID_PATTERN = r"[1-9][0-9]{0,31}"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--load-run-id", required=True)
-    parser.add_argument("--control-email", required=True)
+    add_control_email_argument(parser)
     parser.add_argument("--confirm", required=True)
     parser.add_argument("--result-path", type=Path, required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.control_email = resolve_control_email(args)
+    return args
 
 
 def _canonical_report_path(*, run_id: str, mode: str) -> str:
