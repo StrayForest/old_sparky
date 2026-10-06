@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -18,6 +19,44 @@ from tools import platform_capture_retained_recovery_stderr as recovery_capture
 
 
 class RetainedLoadExportExecutorTests(unittest.TestCase):
+    def _stage_executor_for_setpriv(self, parent: str | Path) -> Path:
+        """Stage the exact helper under a traversable immutable test tree.
+
+        GitHub checkout parents need not be traversable after the real
+        privilege drop. Read the source bytes before setpriv, then import this
+        byte-identical staged copy as the dropped identity.
+        """
+
+        parent_path = Path(parent)
+        os.chmod(parent_path, 0o711)
+        generation = parent_path / "host-tools-generation"
+        generation.mkdir(mode=0o755)
+        os.chmod(generation, 0o755)
+        source = Path(executor.__file__).resolve()
+        source_bytes = source.read_bytes()
+        staged = generation / source.name
+        with staged.open("xb") as handle:
+            handle.write(source_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        staged.chmod(0o444)
+        os.chmod(generation, 0o555)
+        metadata = staged.stat(follow_symlinks=False)
+        self.assertTrue(stat.S_ISREG(metadata.st_mode))
+        self.assertEqual((metadata.st_uid, metadata.st_gid), (0, 0))
+        self.assertEqual((metadata.st_nlink, stat.S_IMODE(metadata.st_mode)), (1, 0o444))
+        self.assertEqual(
+            hashlib.sha256(staged.read_bytes()).digest(),
+            hashlib.sha256(source_bytes).digest(),
+        )
+        generation_metadata = generation.stat(follow_symlinks=False)
+        parent_metadata = parent_path.stat(follow_symlinks=False)
+        self.assertEqual((generation_metadata.st_uid, generation_metadata.st_gid), (0, 0))
+        self.assertEqual((stat.S_IMODE(generation_metadata.st_mode), generation_metadata.st_nlink), (0o555, 2))
+        self.assertEqual((parent_metadata.st_uid, parent_metadata.st_gid), (0, 0))
+        self.assertEqual(stat.S_IMODE(parent_metadata.st_mode), 0o711)
+        return staged
+
     def test_production_shell_handoffs_keep_control_identity_on_stdin(self) -> None:
         tools = Path(__file__).resolve().parents[1] / "tools"
         external = (tools / "platform_production_external_fixture_qa.sh").read_text(
@@ -563,7 +602,7 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             unexpected.write_text("must block all mutation\n", encoding="ascii")
             os.chmod(unexpected, 0o600)
             os.chown(unexpected, user.pw_uid, user.pw_gid)
-            module_path = Path(executor.__file__).resolve()
+            module_path = self._stage_executor_for_setpriv(parent)
             program = "\n".join(
                 (
                     "import importlib.util",
@@ -635,52 +674,53 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             user = pwd.getpwnam("nobody")
         except KeyError:
             self.skipTest("no unprivileged test identity is installed")
-        module_path = Path(executor.__file__).resolve()
-        program = "\n".join(
-            (
-                "import importlib.util",
-                "from pathlib import Path",
-                "import sys",
-                "spec = importlib.util.spec_from_file_location('export_executor', "
-                + repr(str(module_path))
-                + ")",
-                "module = importlib.util.module_from_spec(spec)",
-                "sys.modules[spec.name] = module",
-                "spec.loader.exec_module(module)",
-                f"module._verify_dropped_identity(module.ArtifactIdentity({user.pw_uid}, {user.pw_gid}), {{0, 1, 2}})",
-                "print('DROP_CONTRACT_PASS')",
+        with tempfile.TemporaryDirectory(prefix="load-export-import-") as parent:
+            module_path = self._stage_executor_for_setpriv(parent)
+            program = "\n".join(
+                (
+                    "import importlib.util",
+                    "from pathlib import Path",
+                    "import sys",
+                    "spec = importlib.util.spec_from_file_location('export_executor', "
+                    + repr(str(module_path))
+                    + ")",
+                    "module = importlib.util.module_from_spec(spec)",
+                    "sys.modules[spec.name] = module",
+                    "spec.loader.exec_module(module)",
+                    f"module._verify_dropped_identity(module.ArtifactIdentity({user.pw_uid}, {user.pw_gid}), {{0, 1, 2}})",
+                    "print('DROP_CONTRACT_PASS')",
+                )
             )
-        )
-        command = [
-            "/usr/bin/setpriv",
-            f"--reuid={user.pw_uid}",
-            f"--regid={user.pw_gid}",
-            "--clear-groups",
-            "--no-new-privs",
-            "--bounding-set=-all",
-            "--inh-caps=-all",
-            "--ambient-caps=-all",
-            "/usr/bin/python3.12",
-            "-I",
-            "-B",
-            "-c",
-            program,
-        ]
-        completed = subprocess.run(
-            command,
-            cwd="/",
-            env=executor.FIXED_ENVIRONMENT,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            close_fds=True,
-            timeout=10,
-        )
-        self.assertEqual(
-            completed.returncode, 0, completed.stderr.decode("utf-8", "replace")
-        )
-        self.assertEqual(completed.stdout, b"DROP_CONTRACT_PASS\n")
+            command = [
+                "/usr/bin/setpriv",
+                f"--reuid={user.pw_uid}",
+                f"--regid={user.pw_gid}",
+                "--clear-groups",
+                "--no-new-privs",
+                "--bounding-set=-all",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "/usr/bin/python3.12",
+                "-I",
+                "-B",
+                "-c",
+                program,
+            ]
+            completed = subprocess.run(
+                command,
+                cwd="/",
+                env=executor.FIXED_ENVIRONMENT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                close_fds=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                completed.returncode, 0, completed.stderr.decode("utf-8", "replace")
+            )
+            self.assertEqual(completed.stdout, b"DROP_CONTRACT_PASS\n")
 
     @unittest.skipUnless(
         os.geteuid() == 0 and shutil.which("setpriv"),
@@ -701,7 +741,7 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             root.mkdir(mode=0o700)
             os.chmod(root, 0o700)
             os.chown(root, user.pw_uid, user.pw_gid)
-            module_path = Path(executor.__file__).resolve()
+            module_path = self._stage_executor_for_setpriv(parent)
             program = "\n".join(
                 (
                     "import importlib.util",
@@ -791,7 +831,7 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             os.chown(target, user.pw_uid, user.pw_gid)
             symlink_root = tmp_root / f"{executor.LOAD_PREFIX}987654321"
             symlink_root.symlink_to(target, target_is_directory=True)
-            module_path = Path(executor.__file__).resolve()
+            module_path = self._stage_executor_for_setpriv(parent)
             program = "\n".join(
                 (
                     "import importlib.util",
