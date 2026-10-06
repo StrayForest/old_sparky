@@ -247,7 +247,6 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-          HOST_TOOLS_SHA: ${{ steps.resolve_retained_load_host_tools.outputs.host_tools_sha }}
         run: |
           set -u
           umask 077

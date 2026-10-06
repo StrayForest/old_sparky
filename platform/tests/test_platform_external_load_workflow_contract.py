@@ -414,6 +414,37 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         for mode in ("retained-cleanup", "retained-cleanup-exports"):
             self.assertIn(f"{mode} < \"$input_path\"", workflow)
         cleanup_step = _jobs(workflow)["cleanup"]
+        parsed_workflow = yaml.safe_load(workflow)
+        cleanup_job = parsed_workflow["jobs"]["cleanup"]
+        self.assertIn("resolve-host-tools-pin", cleanup_job["needs"])
+        self.assertEqual(
+            cleanup_job["env"]["HOST_TOOLS_SHA"],
+            "${{ needs.resolve-host-tools-pin.outputs.host_tools_sha }}",
+        )
+        cleanup_dispatch = next(
+            step
+            for step in cleanup_job["steps"]
+            if step.get("name") == "Clean the exact retained load run on production"
+        )
+        self.assertNotIn("HOST_TOOLS_SHA", cleanup_dispatch.get("env", {}))
+        self.assertNotIn("steps.resolve_retained_load_host_tools", workflow)
+        external_workflow = yaml.safe_load(self.source)
+        finalize_job = external_workflow["jobs"]["fixture-finalize"]
+        self.assertIn("resolve-host-tools-pin", finalize_job["needs"])
+        self.assertEqual(
+            finalize_job["env"]["HOST_TOOLS_SHA"],
+            "${{ needs.resolve-host-tools-pin.outputs.host_tools_sha }}",
+        )
+        for step_name in (
+            "Signal fixture completion and collect origin evidence",
+            "Exact cleanup of external fixture",
+        ):
+            step = next(
+                step for step in finalize_job["steps"] if step.get("name") == step_name
+            )
+            with self.subTest(step=step_name):
+                self.assertNotIn("HOST_TOOLS_SHA", step.get("env", {}))
+        self.assertNotIn("steps.resolve_retained_load_host_tools", self.source)
         self.assertNotRegex(
             cleanup_step,
             r"python3\s+-[^\n]*\$\{?inputs\.control_email|"
