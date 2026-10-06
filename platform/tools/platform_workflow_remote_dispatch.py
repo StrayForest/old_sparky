@@ -117,9 +117,20 @@ TRUSTED_LIVE_ROOT = Path("/root/.oldsparky/liveqa")
 TRUSTED_LIVE_LAUNCH = TRUSTED_LIVE_ROOT / "platform_live_launch_trusted.sh"
 DEPLOY_HELPER = ACTIVE_TOOLS_DIR / "platform_production_deploy_supervisor.sh"
 ARTIFACT_DIR_HELPER = ACTIVE_TOOLS_DIR / "platform_prepare_artifact_dir.py"
+RETAINED_LOAD_EXPORT_EXECUTOR = (
+    ACTIVE_TOOLS_DIR / "platform_retained_load_export_executor.py"
+)
 EXTERNAL_EXPORT_PREFIX = "/tmp/old-sparky-production-retained-load-"
 CLEANUP_EXPORT_PREFIX = "/tmp/old-sparky-production-retained-cleanup-"
 SUDO = "/usr/bin/sudo"
+SETPRIV = "/usr/bin/setpriv"
+SYSTEM_PYTHON = "/usr/bin/python3.12"
+EXPORT_EXECUTOR_ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "LC_CTYPE": "C.UTF-8",
+}
 DEPLOY_OPERATION_TIMEOUT_SECONDS = 1950.0
 CLEANUP_OPERATION_TIMEOUT_SECONDS = 300.0
 ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS = 120.0
@@ -128,6 +139,27 @@ LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0
 CHILD_TERMINATION_GRACE_SECONDS = 5.0
 RELEASE_MARKER_MAX_BYTES = 512
 RELEASE_MARKER_OBSERVED_BYTES_MAX = RELEASE_MARKER_MAX_BYTES + 1
+RETAINED_CLEANUP_MARKER_MAX_BYTES = 256
+RETAINED_CLEANUP_STAGES = frozenset(
+    {
+        "lock",
+        "input",
+        "identity",
+        "release_binding",
+        "run_root",
+        "external_vote_recovery",
+        "orphan_cleanup",
+        "matrix_cleanup",
+        "export_cleanup",
+        "complete",
+    }
+)
+RETAINED_CLEANUP_MARKER_RE = re.compile(
+    rb"RETAINED_CLEANUP_STAGE schema=1 stage="
+    rb"(?P<stage>lock|input|identity|release_binding|run_root|"
+    rb"external_vote_recovery|orphan_cleanup|matrix_cleanup|export_cleanup|complete) "
+    rb"exit_code=(?P<exit_code>0|[1-9][0-9]{0,2})"
+)
 RELEASE_MARKER_RE = re.compile(
     rb"RELEASE_DEPLOY schema=1 status=(?P<status>passed|failed) "
     rb"class=(?P<class>preflight|artifact|deployment)"
@@ -180,6 +212,7 @@ HOST_TOOL_FILES = (
     "platform_workflow_remote_dispatch.py",
     "platform_workflow_input_guard.py",
     "platform_prepare_artifact_dir.py",
+    "platform_retained_load_export_executor.py",
     "platform_production_deploy_supervisor.sh",
     "platform_release_lock.sh",
     "platform_release_preflight.sh",
@@ -476,6 +509,128 @@ def _run_sudo(
         timeout_seconds=timeout_seconds,
         expected_release_marker=expected_release_marker,
     )
+
+
+def _run_retained_cleanup_sudo(helper: Path, arguments: list[str]) -> int:
+    """Run exact cleanup while retaining only its fixed stage marker."""
+
+    if not _trusted_helper(helper):
+        print(
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        )
+        return 2
+    command = [SUDO, "-n", "--", str(helper), *arguments]
+    try:
+        process = subprocess.Popen(  # nosec B603 - fixed helper and validated inputs.
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        print(
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        )
+        return 2
+    stream = process.stdout
+    if stream is None:
+        _terminate_process_group(process)
+        print(
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        )
+        return 2
+    try:
+        descriptor = stream.fileno()
+        os.set_blocking(descriptor, False)
+    except (OSError, ValueError):
+        _terminate_process_group(process)
+        stream.close()
+        print(
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        )
+        return 2
+
+    selector: selectors.BaseSelector | None = None
+    pending = bytearray()
+    oversized_line = False
+    marker: tuple[str, int] | None = None
+    marker_invalid = False
+    try:
+        selector = selectors.DefaultSelector()
+        selector.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + CLEANUP_OPERATION_TIMEOUT_SECONDS
+        eof = False
+        while process.poll() is None or not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process_group(process)
+                print(
+                    "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=timeout child_exit=124"
+                )
+                return 124
+            for key, _ in selector.select(min(remaining, 0.1)):
+                try:
+                    chunk = os.read(key.fd, 4096)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    eof = True
+                    continue
+                for byte in chunk:
+                    if byte == 10:
+                        if not oversized_line:
+                            match = RETAINED_CLEANUP_MARKER_RE.fullmatch(pending)
+                            if match is not None:
+                                stage = match.group("stage").decode("ascii")
+                                code = int(match.group("exit_code"))
+                                candidate = (stage, code)
+                                if code > 255 or marker is not None:
+                                    marker_invalid = True
+                                else:
+                                    marker = candidate
+                        pending.clear()
+                        oversized_line = False
+                    elif not oversized_line:
+                        if len(pending) >= RETAINED_CLEANUP_MARKER_MAX_BYTES:
+                            pending.clear()
+                            oversized_line = True
+                        else:
+                            pending.append(byte)
+        child_status = process.returncode
+        if child_status is None:
+            child_status = 2
+        if child_status < 0:
+            child_status = min(255, 128 + abs(child_status))
+        if (
+            marker is None
+            or marker_invalid
+            or marker[1] != child_status
+            or child_status > 255
+        ):
+            print(
+                "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=unknown "
+                f"child_exit={child_status}"
+            )
+            return child_status if child_status != 0 else 2
+        stage, _ = marker
+        print(
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 "
+            f"stage={stage} child_exit={child_status}"
+        )
+        return child_status
+    except (OSError, ValueError):
+        _terminate_process_group(process)
+        print(
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        )
+        return 2
+    finally:
+        if selector is not None:
+            selector.close()
+        stream.close()
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -888,6 +1043,25 @@ def _trusted_host_helper(path: Path) -> bool:
     return stat.S_IMODE(metadata.st_mode) == 0o555
 
 
+def _trusted_export_executor(path: Path) -> bool:
+    """Check the data-mode helper executed only by the fixed Python runtime."""
+
+    if path.parent != ACTIVE_TOOLS_DIR or ACTIVE_TOOLS_DIR.parent != HOST_TOOLS_ROOT:
+        return False
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == 0o555
+        and metadata.st_size <= 512 * 1024
+    )
+
+
 def _trusted_generation() -> bool:
     dispatcher_path = Path(__file__)
     if (
@@ -934,13 +1108,15 @@ def _host_capabilities() -> int:
         )
         or not _trusted_data(ACTIVE_TOOLS_DIR / "manifest.json")
         or not _trusted_data(ACTIVE_TOOLS_DIR / "capabilities.txt")
+        or _retained_load_export_owner() is None
     ):
         return 2
     print(
         "HOST_TOOLS schema=1 "
         f"source_sha={ACTIVE_TOOLS_DIR.name} generation={ACTIVE_TOOLS_DIR.name} "
         "dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 "
-        "release_baseline=1 python_isolated=1 python_bytecode_disabled=1"
+        "release_baseline=1 retained_load_export_cleanup=1 "
+        "python_isolated=1 python_bytecode_disabled=1"
     )
     return 0
 
@@ -964,7 +1140,10 @@ def _host_baseline_generation_ready() -> bool:
                 "capabilities_sha256": hashlib.sha256(capability_bytes).hexdigest(),
             }
         }
-    ) and b"capability=release_baseline" in capability_bytes.splitlines()
+    ) and {
+        b"capability=release_baseline",
+        b"capability=retained_load_export_cleanup",
+    } <= set(capability_bytes.splitlines())
 
 
 def _trusted_live_launch_helper() -> bool:
@@ -1031,163 +1210,232 @@ def _run_id_path(prefix: str, run_id: str, leaf: str) -> Path:
     return Path(f"{prefix}{run_id}") / leaf
 
 
-def _touch_complete(payload: dict[str, str]) -> int:
-    root = _run_id_path(EXTERNAL_EXPORT_PREFIX, payload["run_id"], "complete").parent
-    if root.is_symlink() or not root.is_dir():
-        return 1
-    target = root / "complete"
-    if target.is_symlink() or target.exists() and not target.is_file():
-        return 1
+def _current_pin_matches_host_generation(*, target_sha: str) -> bool:
+    """Bind cleanup authority to the active release's exact C6 pin."""
+
+    if SOURCE_SHA_RE.fullmatch(target_sha) is None or not _host_baseline_generation_ready():
+        return False
     try:
-        descriptor = os.open(
-            target,
-            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW,
-            0o600,
-        )
-    except OSError:
+        baseline = _release_baseline()
+        if baseline.get("source_sha") != target_sha:
+            return False
+        release_slug = baseline.get("release_slug")
+        if not isinstance(release_slug, str) or RELEASE_SLUG_RE.fullmatch(release_slug) is None:
+            return False
+        release = RUNTIME_ROOT / "releases" / release_slug
+        if release.resolve(strict=True) != release:
+            return False
+        release_metadata = release.lstat()
+        contracts = release / "contracts"
+        contracts_metadata = contracts.lstat()
+        pin_path = contracts / "host_tools_pin.json"
+        pin_before = pin_path.lstat()
+        if (
+            not stat.S_ISDIR(release_metadata.st_mode)
+            or release_metadata.st_uid != 0
+            or release_metadata.st_gid != 0
+            or stat.S_IMODE(release_metadata.st_mode) & 0o022
+            or not stat.S_ISDIR(contracts_metadata.st_mode)
+            or contracts_metadata.st_uid != 0
+            or contracts_metadata.st_gid != 0
+            or stat.S_IMODE(contracts_metadata.st_mode) & 0o022
+            or not stat.S_ISREG(pin_before.st_mode)
+            or pin_before.st_uid != 0
+            or pin_before.st_gid != 0
+            or pin_before.st_nlink != 1
+            or stat.S_IMODE(pin_before.st_mode) != 0o644
+            or pin_before.st_size > 16 * 1024
+        ):
+            return False
+        descriptor = os.open(pin_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                != (pin_before.st_dev, pin_before.st_ino, pin_before.st_size, pin_before.st_mtime_ns, pin_before.st_ctime_ns)
+            ):
+                return False
+            chunks: list[bytes] = []
+            remaining = 16 * 1024 + 1
+            while remaining:
+                chunk = os.read(descriptor, min(4096, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            after = os.fstat(descriptor)
+            if (
+                len(raw) > 16 * 1024
+                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                or pin_path.lstat().st_ino != opened.st_ino
+            ):
+                return False
+        finally:
+            os.close(descriptor)
+        pin = _strict_baseline_json(raw)
+        if (
+            not isinstance(pin, dict)
+            or set(pin) != {"schema", "repository", "host_tools_sha", "closure"}
+            or type(pin.get("schema")) is not int
+            or pin.get("schema") != 1
+            or pin.get("repository") != "StrayForest/old_sparky"
+            or pin.get("host_tools_sha") != ACTIVE_TOOLS_DIR.name
+            or not isinstance(pin.get("closure"), list)
+        ):
+            return False
+        manifest_raw = _stable_host_file(ACTIVE_TOOLS_DIR / "manifest.json", mode=0o444)
+        if manifest_raw is None:
+            return False
+        manifest = _strict_baseline_json(manifest_raw)
+        if not isinstance(manifest, dict) or manifest.get("source_sha") != ACTIVE_TOOLS_DIR.name:
+            return False
+        records = manifest.get("files")
+        if not isinstance(records, list):
+            return False
+        by_name: dict[str, dict[str, object]] = {}
+        for record in records:
+            if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
+                return False
+            name = record.get("path")
+            if not isinstance(name, str) or name == "capabilities.txt" or name in by_name:
+                continue
+            by_name[name] = record
+        expected_paths = tuple(f"platform/tools/{name}" for name in HOST_TOOL_FILES)
+        if len(pin["closure"]) != len(expected_paths):
+            return False
+        for path, record in zip(expected_paths, pin["closure"], strict=True):
+            name = path.removeprefix("platform/tools/")
+            expected = by_name.get(name)
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"path", "sha256", "mode"}
+                or record.get("path") != path
+                or expected is None
+                or type(record.get("mode")) is not int
+                or record.get("sha256") != expected.get("sha256")
+                or record.get("mode") != expected.get("mode")
+            ):
+                return False
+        return set(by_name) == set(HOST_TOOL_FILES)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _run_retained_export_executor(operation: str, payload: dict[str, object]) -> int:
+    if (
+        operation not in {"touch-complete", "remove"}
+        or os.geteuid() != 0
+        or not _trusted_generation()
+        or not _trusted_export_executor(RETAINED_LOAD_EXPORT_EXECUTOR)
+    ):
         return 1
-    else:
-        os.close(descriptor)
-    return 0
+    owner = _retained_load_export_owner()
+    if owner is None:
+        return 1
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    if len(raw) > 256:
+        return 1
+    command = [
+        SETPRIV,
+        f"--reuid={owner['uid']}",
+        f"--regid={owner['gid']}",
+        "--clear-groups",
+        "--no-new-privs",
+        "--bounding-set=-all",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--",
+        SYSTEM_PYTHON,
+        "-I",
+        "-B",
+        str(RETAINED_LOAD_EXPORT_EXECUTOR),
+        operation,
+    ]
+    try:
+        process = subprocess.Popen(  # nosec B603 - fixed command and closed JSON schemas.
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd="/",
+            env=EXPORT_EXECUTOR_ENV,
+            umask=0o077,
+            start_new_session=True,
+            close_fds=True,
+        )
+        process.communicate(input=raw, timeout=CLEANUP_OPERATION_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        if "process" in locals() and process.poll() is None:
+            _terminate_process_group(process)
+        return 1
+    return 0 if process.returncode == 0 else 1
+
+
+def _touch_complete(payload: dict[str, str]) -> int:
+    if not _current_pin_matches_host_generation(target_sha=payload["target_sha"]):
+        return 1
+    return _run_retained_export_executor(
+        "touch-complete", {"schema": 1, "load_run_id": payload["run_id"]}
+    )
 
 
 def _remove_exports(
-    *, load_run_id: str, cleanup_run_id: str
+    *, load_run_id: str, cleanup_run_id: str, target_sha: str
 ) -> int:
-    load_root = _run_id_path(EXTERNAL_EXPORT_PREFIX, load_run_id, "complete").parent
-    cleanup_root = _run_id_path(
-        CLEANUP_EXPORT_PREFIX, cleanup_run_id, "cleanup-summary.json"
-    ).parent
-    # These are the only files the two supervisors are allowed to export.  A
-    # cleanup must fail closed on any extra entry instead of recursively
-    # deleting an operator-created file, socket, mount or symlink.
-    inventories = (
-        (
-            load_root,
-            frozenset(
-                {
-                    "complete",
-                    "ready",
-                    "manifest.json",
-                    "matrix-summary.json",
-                    "canonical.log",
-                    "server-observability.json",
-                    "qa-command.log",
-                    "server-observer.log",
-                    "timeout-diagnostic-ids.json",
-                    "supervisor.exit",
-                }
-            ),
-        ),
-        (
-            cleanup_root,
-            frozenset({"cleanup-summary.json", "canonical.log", "cleanup.log"}),
-        ),
-    )
-    expected_uid = os.getuid()
-    planned_removals: list[
-        tuple[Path, os.stat_result, tuple[tuple[Path, os.stat_result], ...]]
-    ] = []
-    for root, allowed_names in inventories:
-        try:
-            root_metadata = root.lstat()
-        except FileNotFoundError:
-            # A second cleanup after a successful first cleanup is a safe
-            # no-op; this is the only absent-path case that is accepted.
-            continue
-        except OSError:
-            return 1
-        try:
-            resolved_root = root.resolve()
-        except (OSError, RuntimeError):
-            return 1
-        try:
-            parent_metadata = root.parent.lstat()
-        except OSError:
-            return 1
-        if (
-            stat.S_ISLNK(root_metadata.st_mode)
-            or not stat.S_ISDIR(root_metadata.st_mode)
-            or root_metadata.st_uid != expected_uid
-            or root_metadata.st_uid == 0
-            or stat.S_IMODE(root_metadata.st_mode) != 0o700
-            or root_metadata.st_dev != parent_metadata.st_dev
-            or resolved_root != root
-        ):
-            return 1
-        try:
-            entries = list(root.iterdir())
-        except OSError:
-            return 1
-        # Inventory before deletion, so an unknown entry cannot leave a
-        # partially erased directory that looks successful to the caller.
-        entry_metadata: list[tuple[Path, os.stat_result]] = []
-        for entry in entries:
-            if entry.name not in allowed_names:
-                return 1
-            try:
-                metadata = entry.lstat()
-            except OSError:
-                return 1
-            if (
-                stat.S_ISLNK(metadata.st_mode)
-                or not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_nlink != 1
-                or metadata.st_dev != root_metadata.st_dev
-                or metadata.st_uid != expected_uid
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-            ):
-                return 1
-            entry_metadata.append((entry, metadata))
-        planned_removals.append((root, root_metadata, tuple(entry_metadata)))
-
-    # Inventory both roots before deleting either one.  This keeps an unknown
-    # entry in the second root from turning the first root into a partial,
-    # apparently successful cleanup.
-    for root, root_metadata, entry_metadata in planned_removals:
-        try:
-            current_root_metadata = root.lstat()
-        except OSError:
-            return 1
-        if (
-            current_root_metadata.st_dev != root_metadata.st_dev
-            or current_root_metadata.st_ino != root_metadata.st_ino
-            or current_root_metadata.st_uid != expected_uid
-            or stat.S_IMODE(current_root_metadata.st_mode) != 0o700
-        ):
-            return 1
-        for entry, metadata in entry_metadata:
-            try:
-                current_entry_metadata = entry.lstat()
-            except OSError:
-                return 1
-            if (
-                current_entry_metadata.st_dev != metadata.st_dev
-                or current_entry_metadata.st_ino != metadata.st_ino
-                or current_entry_metadata.st_uid != metadata.st_uid
-                or current_entry_metadata.st_gid != metadata.st_gid
-                or current_entry_metadata.st_nlink != metadata.st_nlink
-                or current_entry_metadata.st_mode != metadata.st_mode
-            ):
-                return 1
-            try:
-                entry.unlink()
-            except OSError:
-                return 1
-        try:
-            root.rmdir()
-        except OSError:
-            # An unexpected rmdir failure is a cleanup failure, never a
-            # tolerated leftover.  The caller must fail the workflow.
-            return 1
-        try:
-            root.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return 1
+    if (
+        RUN_ID_RE.fullmatch(load_run_id) is None
+        or RUN_ID_RE.fullmatch(cleanup_run_id) is None
+        or not _current_pin_matches_host_generation(target_sha=target_sha)
+    ):
         return 1
-    return 0
+    return _run_retained_export_executor(
+        "remove",
+        {
+            "schema": 1,
+            "load_run_id": load_run_id,
+            "cleanup_run_id": cleanup_run_id,
+        },
+    )
+
+
+def _retained_load_export_owner() -> dict[str, int] | None:
+    """Resolve the one provisioned export identity through the pinned helper."""
+
+    if os.geteuid() != 0 or not _trusted_export_executor(RETAINED_LOAD_EXPORT_EXECUTOR):
+        return None
+    try:
+        completed = subprocess.run(
+            [SYSTEM_PYTHON, "-I", "-B", str(RETAINED_LOAD_EXPORT_EXECUTOR), "owner"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd="/",
+            env=EXPORT_EXECUTOR_ENV,
+            timeout=10,
+            umask=0o077,
+            close_fds=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > 128:
+        return None
+    try:
+        payload = _strict_baseline_json(completed.stdout)
+    except OSError:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"uid", "gid"}
+        or type(payload["uid"]) is not int
+        or type(payload["gid"]) is not int
+        or not 0 < payload["uid"] < 2**31
+        or not 0 < payload["gid"] < 2**31
+    ):
+        return None
+    return {"uid": payload["uid"], "gid": payload["gid"]}
 
 
 def _prepare_deployment(payload: dict[str, str]) -> int:
@@ -1298,7 +1546,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments == ["external-finalize"]:
             return _touch_complete(payload)
         if arguments == ["external-cleanup"]:
-            return _run_sudo(
+            return _run_retained_cleanup_sudo(
                 CLEANUP_HELPER,
                 [
                     DELETE_CONFIRMATION,
@@ -1307,19 +1555,19 @@ def main(argv: list[str] | None = None) -> int:
                     payload["control_email"],
                     payload["run_id"],
                 ],
-                timeout_seconds=CLEANUP_OPERATION_TIMEOUT_SECONDS,
             )
         if arguments == ["external-cleanup-exports"]:
             return _remove_exports(
                 load_run_id=payload["run_id"],
                 cleanup_run_id=payload["run_id"],
+                target_sha=payload["target_sha"],
             )
         if arguments == ["production-prepare-artifact"]:
             if payload["mode"] != "deploy":
                 return _fail()
             return _prepare_deployment(payload)
         if arguments == ["retained-cleanup"]:
-            return _run_sudo(
+            return _run_retained_cleanup_sudo(
                 CLEANUP_HELPER,
                 [
                     DELETE_CONFIRMATION,
@@ -1328,12 +1576,12 @@ def main(argv: list[str] | None = None) -> int:
                     payload["control_email"],
                     payload["cleanup_run_id"],
                 ],
-                timeout_seconds=CLEANUP_OPERATION_TIMEOUT_SECONDS,
             )
         if arguments == ["retained-cleanup-exports"]:
             return _remove_exports(
                 load_run_id=payload["load_run_id"],
                 cleanup_run_id=payload["cleanup_run_id"],
+                target_sha=payload["target_sha"],
             )
         if arguments == ["production-deploy"]:
             if payload["mode"] == "deploy" and not _verify_host_tools_contract(payload):

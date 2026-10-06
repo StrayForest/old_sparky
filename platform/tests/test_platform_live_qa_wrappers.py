@@ -8,7 +8,6 @@ from pathlib import Path
 import pwd
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -197,14 +196,21 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             cleanup_source.index('printf \'%s\\n\' "$PROD_SSH_KEY"'),
         )
         for workflow_source, modes in workflow_modes:
-            expected_dispatcher = (
-                dispatcher
-                if workflow_source is source
-                else '"$HOST_TOOLS_DISPATCHER"'
-                if workflow_source is deploy_source
-                else "/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py"
-            )
             for mode in modes:
+                if workflow_source is source:
+                    expected_dispatcher = dispatcher
+                elif workflow_source is deploy_source:
+                    expected_dispatcher = '"$HOST_TOOLS_DISPATCHER"'
+                elif (
+                    workflow_source is external_source
+                    and mode in {"external-finalize", "external-cleanup-exports"}
+                ) or (
+                    workflow_source is cleanup_source
+                    and mode == "retained-cleanup-exports"
+                ):
+                    expected_dispatcher = '"$retained_load_dispatcher"'
+                else:
+                    expected_dispatcher = "/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py"
                 mode_positions = [
                     position
                     for position in range(len(workflow_source))
@@ -1106,159 +1112,32 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         killpg.assert_called_once_with(9876, platform_workflow_remote_dispatch.signal.SIGTERM)
 
     def test_cleanup_export_inventory_is_closed_and_idempotent(self) -> None:
-        def build_root(prefix: str, run_id: str, names: tuple[str, ...]) -> Path:
-            root = Path(f"{prefix}{run_id}")
-            root.mkdir(mode=0o700)
-            os.chmod(root, 0o700)
-            if os.geteuid() == 0:
-                os.chown(root, 1000, 1000)
-            owner = root.stat().st_uid
-            for name in names:
-                entry = root / name
-                entry.write_text("{}\n", encoding="utf-8")
-                os.chmod(entry, 0o600)
-                if os.geteuid() == 0:
-                    os.chown(entry, owner, owner)
-            return root
-
-        load_names = (
-            "complete",
-            "ready",
-            "manifest.json",
-            "matrix-summary.json",
-            "canonical.log",
-            "server-observability.json",
-            "qa-command.log",
-            "server-observer.log",
-            "timeout-diagnostic-ids.json",
-            "supervisor.exit",
+        # The app-release dispatcher is deliberately not a privileged export
+        # remover. Only the exact pinned immutable host-tools generation may
+        # reach the fixed setpriv executor; filesystem inventory and deletion
+        # are covered by the executor's real non-root tests.
+        with patch.object(
+            platform_workflow_remote_dispatch,
+            "_current_pin_matches_host_generation",
+            return_value=False,
+        ), patch.object(
+            platform_workflow_remote_dispatch.subprocess,
+            "Popen",
+        ) as popen:
+            self.assertEqual(
+                platform_workflow_remote_dispatch._remove_exports(
+                    load_run_id="41",
+                    cleanup_run_id="42",
+                    target_sha="a" * 40,
+                ),
+                1,
+            )
+            popen.assert_not_called()
+        self.assertFalse(
+            platform_workflow_remote_dispatch._current_pin_matches_host_generation(
+                target_sha="not-a-source-sha"
+            )
         )
-        cleanup_names = ("cleanup-summary.json", "canonical.log", "cleanup.log")
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            load_prefix = f"{base}/load-"
-            cleanup_prefix = f"{base}/cleanup-"
-            expected_uid = 1000 if os.geteuid() == 0 else os.getuid()
-            with patch.object(platform_workflow_remote_dispatch, "EXTERNAL_EXPORT_PREFIX", load_prefix), \
-                patch.object(platform_workflow_remote_dispatch, "CLEANUP_EXPORT_PREFIX", cleanup_prefix), \
-                patch.object(platform_workflow_remote_dispatch.os, "getuid", return_value=expected_uid):
-                load_root = build_root(load_prefix, "41", load_names)
-                cleanup_root = build_root(cleanup_prefix, "42", cleanup_names)
-                self.assertEqual(
-                    platform_workflow_remote_dispatch._remove_exports(
-                        load_run_id="41", cleanup_run_id="42"
-                    ),
-                    0,
-                )
-                self.assertFalse(load_root.exists())
-                self.assertFalse(cleanup_root.exists())
-                # A retry after both roots have been removed is deliberately
-                # idempotent and does not turn an already-complete cleanup red.
-                self.assertEqual(
-                    platform_workflow_remote_dispatch._remove_exports(
-                        load_run_id="41", cleanup_run_id="42"
-                    ),
-                    0,
-                )
-
-                unknown_root = build_root(load_prefix, "43", ("unknown",))
-                self.assertEqual(
-                    platform_workflow_remote_dispatch._remove_exports(
-                        load_run_id="43", cleanup_run_id="44"
-                    ),
-                    1,
-                )
-                self.assertTrue(unknown_root.exists())
-                shutil.rmtree(unknown_root)
-
-                symlink_root = build_root(load_prefix, "45", ())
-                target = base / "symlink-target"
-                target.write_text("{}\n", encoding="utf-8")
-                (symlink_root / "canonical.log").symlink_to(target)
-                self.assertEqual(
-                    platform_workflow_remote_dispatch._remove_exports(
-                        load_run_id="45", cleanup_run_id="46"
-                    ),
-                    1,
-                )
-                symlink_root.unlink() if symlink_root.is_symlink() else None
-                shutil.rmtree(symlink_root)
-
-                socket_root = build_root(load_prefix, "47", ())
-                socket_path = socket_root / "canonical.log"
-                unix_socket = socket.socket(socket.AF_UNIX)
-                try:
-                    unix_socket.bind(str(socket_path))
-                    self.assertEqual(
-                        platform_workflow_remote_dispatch._remove_exports(
-                            load_run_id="47", cleanup_run_id="48"
-                        ),
-                        1,
-                    )
-                finally:
-                    unix_socket.close()
-                shutil.rmtree(socket_root)
-
-                rmdir_load = build_root(load_prefix, "49", ("canonical.log",))
-                build_root(cleanup_prefix, "50", ("canonical.log",))
-                with patch.object(Path, "rmdir", side_effect=OSError("blocked")):
-                    self.assertEqual(
-                        platform_workflow_remote_dispatch._remove_exports(
-                            load_run_id="49", cleanup_run_id="50"
-                        ),
-                        1,
-                    )
-                self.assertTrue(rmdir_load.exists())
-
-                identity_root = build_root(load_prefix, "51", ())
-                if os.geteuid() == 0:
-                    os.chown(identity_root, 0, 0)
-                    self.assertEqual(
-                        platform_workflow_remote_dispatch._remove_exports(
-                            load_run_id="51", cleanup_run_id="52"
-                        ),
-                        1,
-                    )
-                    self.assertTrue(identity_root.exists())
-
-                root_file_root = build_root(load_prefix, "53", ("canonical.log",))
-                if os.geteuid() == 0:
-                    os.chown(root_file_root / "canonical.log", 0, 0)
-                    self.assertEqual(
-                        platform_workflow_remote_dispatch._remove_exports(
-                            load_run_id="53", cleanup_run_id="54"
-                        ),
-                        1,
-                    )
-                self.assertTrue(root_file_root.exists())
-
-                root_barrier_root = build_root(load_prefix, "56", ("supervisor.exit",))
-                if os.geteuid() == 0:
-                    os.chown(root_barrier_root / "supervisor.exit", 0, 0)
-                    self.assertEqual(
-                        platform_workflow_remote_dispatch._remove_exports(
-                            load_run_id="56", cleanup_run_id="57"
-                        ),
-                        1,
-                    )
-                self.assertTrue(root_barrier_root.exists())
-                shutil.rmtree(root_barrier_root)
-
-                # Inventory both roots before deleting either one: an
-                # unexpected cleanup-export entry must not partially erase a
-                # valid load-export root.
-                valid_load_root = build_root(load_prefix, "54", ("canonical.log",))
-                invalid_cleanup_root = build_root(cleanup_prefix, "55", ("unknown",))
-                self.assertEqual(
-                    platform_workflow_remote_dispatch._remove_exports(
-                        load_run_id="54", cleanup_run_id="55"
-                    ),
-                    1,
-                )
-                self.assertTrue(valid_load_root.exists())
-                self.assertTrue(invalid_cleanup_root.exists())
-                shutil.rmtree(valid_load_root)
-                shutil.rmtree(invalid_cleanup_root)
 
     def test_cleanup_workflows_project_public_artifacts_before_private_deletion(self) -> None:
         external = (
@@ -1288,6 +1167,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             self.assertIn("cleanup_summary_unavailable", step)
         self.assertIn("steps.cleanup.outputs.cleanup_export_status", external)
         self.assertIn("steps.run-cleanup.outputs.cleanup_export_status", retained)
+        for workflow in (external, retained):
+            self.assertIn("RETAINED_CLEANUP_DIAGNOSTIC", workflow)
+            self.assertIn("external_vote_recovery", workflow)
+            self.assertIn("remote_ssh_exit_code", workflow)
+            self.assertIn('>> "$GITHUB_STEP_SUMMARY"', workflow)
 
         abort = (
             REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"

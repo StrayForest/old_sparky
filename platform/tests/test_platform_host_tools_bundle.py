@@ -426,6 +426,36 @@ class HostToolsBundleTests(unittest.TestCase):
             tuple(record["path"] for record in contract["closure"]),
             tuple(f"platform/tools/{name}" for name in bundle.HOST_TOOL_FILES),
         )
+        with tempfile.TemporaryDirectory() as temporary:
+            source_root = Path(temporary)
+            tools_dir = source_root / "platform" / "tools"
+            tools_dir.mkdir(parents=True)
+            bundle_source = tools_dir / "platform_host_tools_bundle.py"
+            bundle_source.write_text(
+                'PREPARE_ARTIFACT_FILES = ("a.py",)\n'
+                'PRODUCTION_DEPLOY_CONTROL_FILES = ("b.py",)\n'
+                'HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + PRODUCTION_DEPLOY_CONTROL_FILES\n',
+                encoding="ascii",
+            )
+            self.assertEqual(pin._bundle_file_names(source_root), ("a.py", "b.py"))
+            bundle_source.write_text(
+                'PREPARE_ARTIFACT_FILES = ("a.py",)\n'
+                'PRODUCTION_DEPLOY_CONTROL_FILES = ("b.py",)\n'
+                'RETAINED_LOAD_ARTIFACT_FILES = ("c.py",)\n'
+                'HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + PRODUCTION_DEPLOY_CONTROL_FILES + RETAINED_LOAD_ARTIFACT_FILES\n',
+                encoding="ascii",
+            )
+            self.assertEqual(
+                pin._bundle_file_names(source_root), ("a.py", "b.py", "c.py")
+            )
+            bundle_source.write_text(
+                'PREPARE_ARTIFACT_FILES = ("a.py",)\n'
+                'PRODUCTION_DEPLOY_CONTROL_FILES = ("b.py",)\n'
+                'HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + UNKNOWN_FILES\n',
+                encoding="ascii",
+            )
+            with self.assertRaises(pin.HostToolsPinError):
+                pin._bundle_file_names(source_root)
 
     def test_host_tools_provisioning_adr_matches_enforced_generation_pin(self) -> None:
         adr = (
@@ -1203,6 +1233,7 @@ module.ACTIVE_TOOLS_DIR = dispatcher_path.parent
 module._trusted_generation = lambda: True
 module._trusted_host_helper = lambda _path: True
 module._trusted_data = lambda _path: True
+module._retained_load_export_owner = lambda: {"uid": 65534, "gid": 65534}
 raise SystemExit(module.main(["host-capabilities"]))
 """
 
@@ -1235,7 +1266,8 @@ raise SystemExit(module.main(["host-capabilities"]))
             expected = (
                 f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
                 "dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 "
-                "release_baseline=1 python_isolated=1 python_bytecode_disabled=1\n"
+                "release_baseline=1 retained_load_export_cleanup=1 "
+                "python_isolated=1 python_bytecode_disabled=1\n"
             )
             bounded = limited_run("-I", "-B")
             self.assertEqual(bounded.returncode, 0, bounded.stderr)
@@ -1640,7 +1672,7 @@ raise SystemExit(module.main(["host-capabilities"]))
 
     def test_host_path_references_stay_inside_declared_components(self) -> None:
         supervisor = (TOOLS_ROOT / "platform_production_deploy_supervisor.sh").read_text()
-        dispatcher = (TOOLS_ROOT / "platform_workflow_remote_dispatch.py").read_text()
+        dispatcher_source = (TOOLS_ROOT / "platform_workflow_remote_dispatch.py").read_text()
         host_path_references = set(
             re.findall(r"\$host_tools_dir/(platform_[A-Za-z0-9_.-]+\.(?:py|sh))", supervisor)
         )
@@ -1650,9 +1682,123 @@ raise SystemExit(module.main(["host-capabilities"]))
             all(name in supervisor for name in bundle.PRODUCTION_DEPLOY_CONTROL_FILES)
         )
         self.assertTrue(set(bundle.PREPARE_ARTIFACT_FILES) <= set(bundle.HOST_TOOL_FILES))
+        self.assertEqual(
+            bundle.RETAINED_LOAD_ARTIFACT_FILES,
+            ("platform_retained_load_export_executor.py",),
+        )
         self.assertNotIn("platform_release_deploy.sh", bundle.HOST_TOOL_FILES)
         self.assertNotIn("platform_run_api.sh", bundle.HOST_TOOL_FILES)
-        self.assertIn("platform_prepare_artifact_dir.py", dispatcher)
+        self.assertIn("platform_prepare_artifact_dir.py", dispatcher_source)
+        self.assertIn("platform_retained_load_export_executor.py", dispatcher_source)
+
+        class CompletedChild:
+            returncode = 0
+
+            def __init__(self) -> None:
+                self.input_bytes: bytes | None = None
+                self.timeout: float | None = None
+
+            def communicate(self, *, input: bytes, timeout: float) -> tuple[bytes, bytes]:
+                self.input_bytes = input
+                self.timeout = timeout
+                return b"", b""
+
+        child = CompletedChild()
+        with patch.object(dispatcher.os, "geteuid", return_value=0), \
+            patch.object(dispatcher, "_trusted_generation", return_value=True), \
+            patch.object(dispatcher, "_trusted_export_executor", return_value=True), \
+            patch.object(dispatcher, "_current_pin_matches_host_generation", return_value=True), \
+            patch.object(
+                dispatcher,
+                "_retained_load_export_owner",
+                return_value={"uid": 987, "gid": 987},
+            ), \
+            patch.object(dispatcher.subprocess, "Popen", return_value=child) as popen:
+            self.assertEqual(
+                dispatcher._remove_exports(
+                    load_run_id="12345",
+                    cleanup_run_id="67890",
+                    target_sha="a" * 40,
+                ),
+                0,
+            )
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                dispatcher.SETPRIV,
+                "--reuid=987",
+                "--regid=987",
+                "--clear-groups",
+                "--no-new-privs",
+                "--bounding-set=-all",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "--",
+                dispatcher.SYSTEM_PYTHON,
+                "-I",
+                "-B",
+                str(dispatcher.RETAINED_LOAD_EXPORT_EXECUTOR),
+                "remove",
+            ],
+        )
+        child_options = popen.call_args.kwargs
+        self.assertEqual(child_options["cwd"], "/")
+        self.assertEqual(child_options["env"], dispatcher.EXPORT_EXECUTOR_ENV)
+        self.assertEqual(child_options["umask"], 0o077)
+        self.assertTrue(child_options["close_fds"])
+        self.assertEqual(
+            json.loads(child.input_bytes.decode("ascii")),
+            {"schema": 1, "load_run_id": "12345", "cleanup_run_id": "67890"},
+        )
+        self.assertEqual(set(json.loads(child.input_bytes)), {"schema", "load_run_id", "cleanup_run_id"})
+        self.assertEqual(
+            dispatcher._remove_exports(
+                load_run_id="../12345",
+                cleanup_run_id="67890",
+                target_sha="a" * 40,
+            ),
+            1,
+        )
+
+        real_popen = subprocess.Popen
+
+        def run_cleanup_child(script: str, expected_exit: int) -> str:
+            output = StringIO()
+
+            def spawn(_command: list[str], **options: object) -> subprocess.Popen[bytes]:
+                return real_popen(
+                    [sys.executable, "-c", script],
+                    **options,
+                )
+
+            with patch.object(dispatcher, "_trusted_helper", return_value=True), \
+                patch.object(dispatcher.subprocess, "Popen", side_effect=spawn), \
+                redirect_stdout(output):
+                result = dispatcher._run_retained_cleanup_sudo(
+                    Path("/fixed/cleanup-helper"), ["closed", "payload"]
+                )
+            self.assertEqual(result, expected_exit)
+            return output.getvalue()
+
+        failed_marker = run_cleanup_child(
+            "import sys; print('private output must not escape'); "
+            "print('RETAINED_CLEANUP_STAGE schema=1 stage=external_vote_recovery exit_code=7'); "
+            "raise SystemExit(7)",
+            7,
+        )
+        self.assertEqual(
+            failed_marker,
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 "
+            "stage=external_vote_recovery child_exit=7\n",
+        )
+        missing_marker = run_cleanup_child(
+            "import sys; print('untrusted output'); raise SystemExit(1)", 1
+        )
+        self.assertEqual(
+            missing_marker,
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=unknown child_exit=1\n",
+        )
 
     def test_declared_host_tools_are_the_recursive_static_runtime_closure(self) -> None:
         names = set(bundle.HOST_TOOL_FILES)
@@ -2021,7 +2167,8 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
         self.assertIn(
             'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA '
             'generation=$HOST_TOOLS_SHA dispatcher=3 artifact_prepare=2 supervisor=3 '
-            'input_guard=1 release_baseline=1 python_isolated=1 python_bytecode_disabled=1"',
+            'input_guard=1 release_baseline=1 retained_load_export_cleanup=1 '
+            'python_isolated=1 python_bytecode_disabled=1"',
             probe,
         )
         self.assertIn('printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"', probe)
@@ -2170,7 +2317,7 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
         expected_line = (
             f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
             "dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 "
-            "python_isolated=1 python_bytecode_disabled=1"
+            "retained_load_export_cleanup=1 python_isolated=1 python_bytecode_disabled=1"
         )
         expected_payload = (expected_line + "\n").encode("ascii")
         expected_sha256 = hashlib.sha256(expected_payload).hexdigest()
@@ -2437,6 +2584,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \
                 patch.object(dispatcher, "HOST_TOOLS_ROOT", host_root), \
                 patch.object(dispatcher, "__file__", str(generation / bundle.HOST_TOOL_FILES[0])), \
+                patch.object(dispatcher, "_retained_load_export_owner", return_value={"uid": 65534, "gid": 65534}), \
                 redirect_stdout(output):
                 self.assertEqual(dispatcher._host_capabilities(), 0)
             self.assertRegex(output.getvalue(), r"^HOST_TOOLS schema=1 source_sha=[0-9a-f]{40} ")

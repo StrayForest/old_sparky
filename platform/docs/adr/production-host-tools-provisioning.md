@@ -53,7 +53,10 @@ Application runtime files, current-release run wrappers and the candidate
 release deploy closure are not host-tools members. Release installation,
 transaction recovery, wheelhouse validation, deploy smoke and backup/restore
 drill helpers remain candidate/runtime or operator-owned tools and are never
-substituted into the trusted generation.
+substituted into the trusted generation. The retained-load export executor is
+a narrow exception: it is part of the immutable host generation because it
+removes only two exact, closed export roots after the workflow has copied and
+validated them.
 
 ## Workflow boundary
 
@@ -84,13 +87,23 @@ to a delimiter-encoded shell string.
 
 The release build is downstream of this gate.  The production consumer invokes
 only the exact immutable dispatcher path with `/usr/bin/python3.12 -I -B`.
-Toolset v2 publishes the explicit `python_bytecode_disabled` capability. The
+Toolset v3 publishes the explicit `python_bytecode_disabled` capability and
+the `retained_load_export_cleanup` capability. The
 reviewed baseline-capable generation also publishes `release_baseline=1` and
 provides the fixed `host-release-baseline` command. That query is root-only and
 read-only; it validates the current release receipt with the pinned artifact
 validator, rejects an active release/systemd transaction, and emits only the
 bounded source/release/pointer identity tuple used by the deployment
 supervisor's under-lock recheck. It does not read or execute application code.
+For the retained-load capability, the fixed dispatcher accepts marker and
+export-removal commands only from its exact immutable host-tools generation,
+only when the active release's `TARGET_SHA` matches the closed request and the
+release's pin names that same generation and closure. It then validates the
+dedicated export account and invokes only the bundled executor through the
+fixed `setpriv` command with a closed two-run-ID input. The candidate
+application dispatcher cannot create the completion marker or remove these
+exports. Fixture setup and database cleanup continue through the current
+application dispatcher and retain their exact target/current-release checks.
 The dispatcher also rejects a host-generation invocation that omits `-B`
 before loading its sibling guard, so a failed caller cannot leave a truncated
 `__pycache__` member in the generation:
@@ -312,6 +325,29 @@ never by pinning the commit that carries the pin itself:
    through the approved root-only console or host-image authority. Record **P**
    as `TARGET_SHA` and **C** as `HOST_TOOLS_SHA`; preserve both identities and
    the artifact provenance in the receipt.
+   As part of this trusted provisioning operation, create the dedicated
+   `oldsparky-load-artifacts` system user and same-named primary group only if
+   absent. It must have a unique nonzero UID/GID, no supplementary groups, home
+   `/nonexistent`, shell `/usr/sbin/nologin`, a locked password, no sudo rule,
+   and no collision with API, web, worker or live-QA identities. If an entry
+   exists but violates that contract, provisioning stops for operator review;
+   it must not change or repurpose the existing account. The app, workflow and
+   bundled executor never create or repair this account. For a wholly absent
+   account and group, the trusted root operator may create them with:
+
+   ```sh
+   /usr/sbin/groupadd --system oldsparky-load-artifacts
+   /usr/sbin/useradd --system --gid oldsparky-load-artifacts --no-create-home \
+     --home-dir /nonexistent --shell /usr/sbin/nologin oldsparky-load-artifacts
+   /usr/sbin/passwd --lock oldsparky-load-artifacts
+   ```
+
+   If either name already exists, or a command stops partway through, stop and
+   inspect the exact account state instead of retrying or repairing it
+   automatically. Verify the resulting contract using the bundled `owner`
+   command and retain only its success status in the root provisioning
+   receipt. The later `host-capabilities` check must also pass before any
+   retained-load workflow uses this capability.
 5. Activate the bootstrap-only range through the authenticated automatic
    baseline-reconcile path. Its exact full-CI and runtime proofs, current
    deployed-source proof, cumulative classifier result and lock-held host

@@ -259,7 +259,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 job = self.jobs[job_name]
                 step_names = re.findall(r"^      - name: (.+)$", job, re.MULTILINE)
                 self.assertTrue(step_names)
-                self.assertEqual(step_names[0], step_name)
+                self.assertIn(step_name, step_names)
+                prior_steps = job.split(f"- name: {step_name}", 1)[0]
+                self.assertNotIn("GITHUB_EVENT_PATH", prior_steps)
+                self.assertNotIn("control_email_path", prior_steps)
+                self.assertNotIn("CONTROL_EMAIL", prior_steps)
                 script = _step_script(job, step_name)
                 self.assertLess(script.index("GITHUB_EVENT_PATH"), script.index("::add-mask::"))
                 if "os.open(" in script:
@@ -405,6 +409,19 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
     def test_cleanup_exports_and_projection_are_failure_bearing(self) -> None:
         finalizer = self.jobs["fixture-finalize"]
         self.assertIn("external-cleanup-exports", finalizer)
+        self.assertIn("Checkout exact target for retained-load host-tools pin", finalizer)
+        self.assertIn("platform_host_tools_pin.py\" resolve", finalizer)
+        self.assertIn("--target-sha \"$TARGET_SHA\"", finalizer)
+        self.assertIn('"$retained_load_dispatcher" external-finalize', finalizer)
+        self.assertIn('"$retained_load_dispatcher" \\\n              external-cleanup-exports', finalizer)
+        # Fixture setup and DB cleanup retain their current-release helpers;
+        # only completion-marker creation and exact export deletion use C6.
+        fixture_setup = self.jobs["fixture-setup"]
+        self.assertIn(
+            "/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py external-fixture",
+            fixture_setup,
+        )
+        self.assertIn("/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \\\n              external-cleanup <", finalizer)
         self.assertIn("cleanup_exports_status=", finalizer)
         self.assertIn("cleanup_status\" != 0 || \"$cleanup_exports_status\" != 0", finalizer)
         self.assertIn("cleanup summary projection input is invalid", finalizer)

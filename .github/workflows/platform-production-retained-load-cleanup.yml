@@ -78,6 +78,38 @@ jobs:
           chmod 600 "$RUNNER_TEMP/platform-retained-cleanup-input.json"
           test "$(stat -c '%a' "$RUNNER_TEMP/platform-retained-cleanup-input.json")" = "600"
 
+      - name: Checkout exact target for retained-load host-tools pin
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+          path: target-source
+          persist-credentials: false
+
+      - name: Resolve exact retained-load host-tools generation
+        id: resolve_retained_load_host_tools
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"
+          target_source="$GITHUB_WORKSPACE/target-source"
+          test "$(git -C "$target_source" rev-parse HEAD)" = "$TARGET_SHA"
+          test -z "$(git -C "$target_source" status --porcelain=v1 --untracked-files=all -- platform)"
+          pin_output="$RUNNER_TEMP/retained-load-host-tools-pin"
+          /usr/bin/python3 "$target_source/platform/tools/platform_host_tools_pin.py" resolve \
+            --source-root "$target_source" --target-sha "$TARGET_SHA" \
+            --expected-repository "$EXPECTED_REPOSITORY" > "$pin_output"
+          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
+          test "$(wc -l < "$pin_output" | tr -d '[:space:]')" = 1
+          IFS= read -r host_tools_sha < "$pin_output"
+          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
+          rm -f -- "$pin_output"
+          test ! -e "$pin_output" && test ! -L "$pin_output"
+
       - name: Configure production SSH
         shell: bash
         env:
@@ -120,10 +152,14 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          HOST_TOOLS_SHA: ${{ steps.resolve_retained_load_host_tools.outputs.host_tools_sha }}
         run: |
           set -u
           umask 077
           remote_status=1
+          remote_ssh_exit_code=255
+          remote_stage=unknown
+          remote_child_exit=unknown
           cleanup_artifact_status=1
           cleanup_export_status=1
           input_path="$RUNNER_TEMP/platform-retained-cleanup-input.json"
@@ -135,6 +171,9 @@ jobs:
           export_dir="/tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID"
           test -s "$input_path" \
             || { echo "Cleanup workflow handoff is missing; refusing remote cleanup" >&2; exit 1; }
+          [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "Retained-load host-tools pin is invalid; refusing remote export cleanup" >&2; exit 1; }
+          retained_load_dispatcher="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA/platform_workflow_remote_dispatch.py"
           install -d -m 700 "$artifact_dir"
           trap 'rm -f -- "$ssh_output_file" "$input_path"; test ! -e "$input_path"; ssh_dir="$RUNNER_TEMP/production-retained-cleanup-ssh"; if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then test -d "$ssh_dir" && test ! -L "$ssh_dir"; rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/known_hosts.scan.1" "$ssh_dir/known_hosts.scan.2" "$ssh_dir/config" "$ssh_dir/control.sock" "$ssh_dir/control-master" "$ssh_dir/control-master.sock"; rmdir -- "$ssh_dir"; fi; test ! -e "$ssh_dir" && test ! -L "$ssh_dir"' EXIT
 
@@ -211,7 +250,26 @@ jobs:
             /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
             retained-cleanup < "$input_path" > "$ssh_output_file" 2>&1
           remote_status="$?"
+          remote_ssh_exit_code="$remote_status"
           set -e
+          if [[ -f "$ssh_output_file" && ! -L "$ssh_output_file" ]] \
+            && [[ "$(stat -c '%s' -- "$ssh_output_file" 2>/dev/null || echo 999999)" =~ ^[0-9]+$ ]] \
+            && (( $(stat -c '%s' -- "$ssh_output_file" 2>/dev/null || echo 999999) <= 512 )); then
+            diagnostic_count=0
+            while IFS= read -r diagnostic_line; do
+              if [[ "$diagnostic_line" =~ ^RETAINED_CLEANUP_DIAGNOSTIC\ schema=1\ stage=(lock|input|identity|release_binding|run_root|external_vote_recovery|orphan_cleanup|matrix_cleanup|export_cleanup|complete|dispatcher|timeout|unknown)\ child_exit=([0-9]{1,3})$ ]]; then
+                diagnostic_count=$((diagnostic_count + 1))
+                if (( diagnostic_count == 1 )); then
+                  remote_stage="${BASH_REMATCH[1]}"
+                  remote_child_exit="${BASH_REMATCH[2]}"
+                fi
+              fi
+            done < "$ssh_output_file"
+            if (( diagnostic_count != 1 )); then
+              remote_stage=unknown
+              remote_child_exit=unknown
+            fi
+          fi
           rm -f -- "$ssh_output_file"
           test ! -e "$ssh_output_file"
 
@@ -285,7 +343,7 @@ jobs:
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B \
-            /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+            "$retained_load_dispatcher" \
             retained-cleanup-exports < "$input_path" >/dev/null 2>&1
           cleanup_export_status="$?"
           set -e
@@ -294,8 +352,13 @@ jobs:
             remote_status=1
           fi
           echo "remote_exit_code=$remote_status" >> "$GITHUB_OUTPUT"
+          echo "remote_ssh_exit_code=$remote_ssh_exit_code" >> "$GITHUB_OUTPUT"
+          echo "remote_stage=$remote_stage" >> "$GITHUB_OUTPUT"
+          echo "remote_child_exit=$remote_child_exit" >> "$GITHUB_OUTPUT"
           echo "cleanup_artifact_status=$cleanup_artifact_status" >> "$GITHUB_OUTPUT"
           echo "cleanup_export_status=$cleanup_export_status" >> "$GITHUB_OUTPUT"
+          printf 'Retained cleanup diagnostic: ssh_exit=%s stage=%s child_exit=%s\n' \
+            "$remote_ssh_exit_code" "$remote_stage" "$remote_child_exit" >> "$GITHUB_STEP_SUMMARY"
           # The final always-run gate reports the preserved primary status and
           # rejects any incomplete artifact projection or export deletion.
           exit 0
@@ -341,6 +404,9 @@ jobs:
         shell: bash
         env:
           CLEANUP_REMOTE_EXIT: ${{ steps.run-cleanup.outputs.remote_exit_code }}
+          CLEANUP_SSH_EXIT_CODE: ${{ steps.run-cleanup.outputs.remote_ssh_exit_code }}
+          CLEANUP_REMOTE_STAGE: ${{ steps.run-cleanup.outputs.remote_stage }}
+          CLEANUP_REMOTE_CHILD_EXIT: ${{ steps.run-cleanup.outputs.remote_child_exit }}
           CLEANUP_ARTIFACT_STATUS: ${{ steps.run-cleanup.outputs.cleanup_artifact_status }}
           CLEANUP_EXPORT_STATUS: ${{ steps.run-cleanup.outputs.cleanup_export_status }}
           CLEANUP_SSH_STEP: ${{ steps.cleanup_ssh.outcome }}
@@ -365,7 +431,20 @@ jobs:
                   return "unknown"
 
           fields = {
-              "remote": classify("CLEANUP_REMOTE_EXIT", {"0": "ok", "1": "failed"}),
+              "remote": classify(
+                  "CLEANUP_REMOTE_EXIT",
+                  {"0": "ok", **{str(value): "failed" for value in range(1, 256)}},
+              ),
+              "ssh_exit": classify("CLEANUP_SSH_EXIT_CODE", {str(value): str(value) for value in range(256)}),
+              "remote_stage": classify("CLEANUP_REMOTE_STAGE", {
+                  "lock": "lock", "input": "input", "identity": "identity",
+                  "release_binding": "release_binding", "run_root": "run_root",
+                  "external_vote_recovery": "external_vote_recovery",
+                  "orphan_cleanup": "orphan_cleanup", "matrix_cleanup": "matrix_cleanup",
+                  "export_cleanup": "export_cleanup", "complete": "complete",
+                  "dispatcher": "dispatcher", "timeout": "timeout", "unknown": "unknown",
+              }),
+              "child_exit": classify("CLEANUP_REMOTE_CHILD_EXIT", {str(value): str(value) for value in range(256)}),
               "artifact": classify("CLEANUP_ARTIFACT_STATUS", {"0": "ok", "1": "failed"}),
               "exports": classify("CLEANUP_EXPORT_STATUS", {"0": "ok", "1": "failed"}),
               "ssh_cleanup": classify("CLEANUP_SSH_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),

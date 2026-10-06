@@ -1082,7 +1082,7 @@ jobs:
           IFS= read -r source_sha < "$contract_dir/source_sha"
           IFS= read -r toolset_version < "$contract_dir/toolset_version"
           test "$source_sha" = "$HOST_TOOLS_SHA"
-          test "$toolset_version" = "production-host-tools-v2"
+          test "$toolset_version" = "production-host-tools-v3"
           IFS= read -r manifest_hash < "$contract_dir/manifest.sha256"
           IFS= read -r capabilities_hash < "$contract_dir/capabilities.sha256"
           [[ "$manifest_hash" =~ ^[0-9a-f]{64}$ ]]
@@ -1149,15 +1149,16 @@ jobs:
           test "$(/usr/bin/sha256sum "$inner_root/manifest.json" | cut -d' ' -f1)" = "$manifest_hash"
           test "$(/usr/bin/sha256sum "$inner_root/capabilities.txt" | cut -d' ' -f1)" = "$capabilities_hash"
           grep -Fqx "schema=1" "$inner_root/capabilities.txt"
-          grep -Fqx "toolset_version=production-host-tools-v2" "$inner_root/capabilities.txt"
+          grep -Fqx "toolset_version=production-host-tools-v3" "$inner_root/capabilities.txt"
           grep -Fqx "source_sha=$HOST_TOOLS_SHA" "$inner_root/capabilities.txt"
           grep -Fqx "capability=production_deploy_control" "$inner_root/capabilities.txt"
+          grep -Fqx "capability=retained_load_export_cleanup" "$inner_root/capabilities.txt"
           grep -Fqx "capability=python_isolated" "$inner_root/capabilities.txt"
           grep -Fqx "capability=python_bytecode_disabled" "$inner_root/capabilities.txt"
           grep -Fqx '"schema":1,' "$inner_root/manifest.json" || grep -Fq '"schema":1' "$inner_root/manifest.json"
           grep -Fq "\"source_sha\":\"$HOST_TOOLS_SHA\"" "$inner_root/manifest.json"
           grep -Fq "\"generation\":\"$HOST_TOOLS_SHA\"" "$inner_root/manifest.json"
-          grep -Fq '"toolset_version":"production-host-tools-v2"' "$inner_root/manifest.json"
+          grep -Fq '"toolset_version":"production-host-tools-v3"' "$inner_root/manifest.json"
           expected_count=0
           while read -r expected_hash expected_path; do
             [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]
@@ -1472,7 +1473,7 @@ jobs:
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
           remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
-          expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 python_isolated=1 python_bytecode_disabled=1"
+          expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 retained_load_export_cleanup=1 python_isolated=1 python_bytecode_disabled=1"
           expected_bytes="$(printf '%s\n' "$expected_output" | wc -c | tr -d '[:space:]')"
           expected_sha256="$(printf '%s\n' "$expected_output" | sha256sum | cut -d' ' -f1)"
           # The file-size limit bounds the remote process, while ``head`` caps
@@ -4044,6 +4045,7 @@ jobs:
           expected_files = {
               "platform_workflow_remote_dispatch.py", "platform_workflow_input_guard.py",
               "platform_prepare_artifact_dir.py", "platform_production_deploy_supervisor.sh",
+              "platform_retained_load_export_executor.py",
               "platform_release_lock.sh", "platform_release_preflight.sh",
               "platform_validate_release_artifact.py", "platform_safe_env_exec.py",
               "platform_render_service_envs.py", "platform_validate_edge_policy.py",
@@ -4055,7 +4057,7 @@ jobs:
               raise SystemExit("host-tools inner bundle digest changed")
           if (outer / "contract/source_sha").read_text(encoding="ascii").strip() != host_tools_sha:
               raise SystemExit("host-tools source contract mismatch")
-          if (outer / "contract/toolset_version").read_text(encoding="ascii").strip() != "production-host-tools-v2":
+          if (outer / "contract/toolset_version").read_text(encoding="ascii").strip() != "production-host-tools-v3":
               raise SystemExit("host-tools toolset contract mismatch")
           manifest_contract = (outer / "contract/manifest.sha256").read_text(encoding="ascii").strip()
           capabilities_contract = (outer / "contract/capabilities.sha256").read_text(encoding="ascii").strip()
