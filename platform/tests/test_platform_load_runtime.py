@@ -173,6 +173,10 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
         worker_report: Path,
         **config: object,
     ):
+        config.setdefault(
+            "binding",
+            {"source_git_sha": "a" * 40, "external_run_id": "1"},
+        )
         return run_supervised(
             worker_command=(sys.executable, str(worker_script)),
             report_path=final_report,
@@ -553,7 +557,12 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                     # advance the final report gates beyond the deadline.
                     max_duration_seconds=2,
                     max_runner_minutes=1,
-                    worker_config={},
+                    worker_config={
+                        "binding": {
+                            "source_git_sha": "a" * 40,
+                            "external_run_id": "1",
+                        },
+                    },
                     term_grace_seconds=0.05,
                     poll_seconds=0.01,
                 )
@@ -808,6 +817,7 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                         max_duration_seconds=30,
                         max_runner_minutes=1,
                         worker_config={{
+                            'binding': {{'source_git_sha': 'a' * 40, 'external_run_id': '1'}},
                             'mode': 'pdeath-heartbeat',
                             'started_file': {str(root / 'worker.started')!r},
                             'heartbeat_file': {str(root / 'pdeath.heartbeat')!r},
@@ -1237,7 +1247,10 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                         worker_report_path=Path({str(root / 'child.json')!r}),
                         max_duration_seconds=10,
                         max_runner_minutes=1,
-                        worker_config={{'mode': 'external-term'}},
+                        worker_config={{
+                            'binding': {{'source_git_sha': 'a' * 40, 'external_run_id': '1'}},
+                            'mode': 'external-term',
+                        }},
                         term_grace_seconds=0.05,
                         poll_seconds=0.01,
                     )
