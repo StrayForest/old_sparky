@@ -2586,6 +2586,121 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                     )
 
     def test_host_capability_probe_checks_closed_generation_metadata(self) -> None:
+        pin_payload = json.loads(
+            (REPO_ROOT / pin.PIN_RELATIVE_PATH).read_text(encoding="utf-8")
+        )
+        expected_paths = {
+            f"platform/tools/{name}" for name in bundle.HOST_TOOL_FILES
+        }
+        checked_in_pin_records = pin_payload["closure"]
+        self.assertEqual(
+            {record["path"] for record in checked_in_pin_records}, expected_paths
+        )
+        self.assertEqual(len(checked_in_pin_records), len(expected_paths))
+        self.assertEqual(
+            {record["mode"] for record in checked_in_pin_records}, {0o644, 0o755}
+        )
+        source_modes = {
+            record["path"].removeprefix("platform/tools/"): record["mode"]
+            for record in checked_in_pin_records
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source_fixture(root)
+            for name, mode in source_modes.items():
+                os.chmod(source / "platform" / "tools" / name, mode)
+            built = bundle.build_bundle(source, SOURCE_SHA, root / "generation.zip")
+        generation_manifest = built["manifest"]
+        self.assertEqual(
+            {record["path"] for record in generation_manifest["files"]},
+            set(bundle.HOST_TOOL_FILES) | {"capabilities.txt"},
+        )
+        self.assertEqual(
+            {
+                record["mode"]
+                for record in generation_manifest["files"]
+                if record["path"] != "capabilities.txt"
+            },
+            {0o555},
+        )
+        self.assertEqual(
+            next(
+                record["mode"]
+                for record in generation_manifest["files"]
+                if record["path"] == "capabilities.txt"
+            ),
+            0o444,
+        )
+        pin_records = [
+            {
+                "path": f"platform/tools/{record['path']}",
+                "sha256": record["sha256"],
+                "mode": source_modes[record["path"]],
+            }
+            for record in generation_manifest["files"]
+            if record["path"] != "capabilities.txt"
+        ]
+        test_pin = {**pin_payload, "closure": list(reversed(pin_records))}
+        self.assertTrue(
+            dispatcher._pin_closure_matches_generation(test_pin, generation_manifest)
+        )
+
+        def rejects(
+            *,
+            source_records: list[dict[str, object]] | None = None,
+            installed: list[dict[str, object]] | None = None,
+        ) -> None:
+            candidate_pin = {
+                **test_pin,
+                "closure": (
+                    source_records if source_records is not None else test_pin["closure"]
+                ),
+            }
+            candidate_manifest = {
+                "files": (
+                    installed if installed is not None else generation_manifest["files"]
+                )
+            }
+            self.assertFalse(
+                dispatcher._pin_closure_matches_generation(
+                    candidate_pin, candidate_manifest
+                )
+            )
+
+        changed_digest = [dict(record) for record in test_pin["closure"]]
+        changed_digest[0]["sha256"] = "b" * 64
+        rejects(source_records=changed_digest)
+        rejects(source_records=[dict(record) for record in test_pin["closure"][:-1]])
+        duplicate_source = [dict(record) for record in test_pin["closure"]]
+        duplicate_source[-1] = dict(duplicate_source[0])
+        rejects(source_records=duplicate_source)
+        unexpected_source = [dict(record) for record in test_pin["closure"]]
+        unexpected_source[0]["path"] = "platform/tools/unapproved.py"
+        rejects(source_records=unexpected_source)
+        bad_source_mode = [dict(record) for record in test_pin["closure"]]
+        bad_source_mode[0]["mode"] = 0o666
+        rejects(source_records=bad_source_mode)
+
+        changed_installed_digest = [dict(record) for record in generation_manifest["files"]]
+        tool_record_index = next(
+            index
+            for index, record in enumerate(changed_installed_digest)
+            if record["path"] != "capabilities.txt"
+        )
+        changed_installed_digest[tool_record_index]["sha256"] = "c" * 64
+        rejects(installed=changed_installed_digest)
+        missing_installed = [dict(record) for record in generation_manifest["files"][:-1]]
+        rejects(installed=missing_installed)
+        duplicate_installed = [dict(record) for record in generation_manifest["files"]]
+        duplicate_installed[-1] = dict(duplicate_installed[0])
+        rejects(installed=duplicate_installed)
+        unexpected_installed = [dict(record) for record in generation_manifest["files"]]
+        unexpected_installed[-1]["path"] = "unexpected.txt"
+        rejects(installed=unexpected_installed)
+        bad_installed_mode = [dict(record) for record in generation_manifest["files"]]
+        bad_installed_mode[0]["mode"] = 0o755
+        rejects(installed=bad_installed_mode)
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             host_root = root / "shared" / "host-tools"
@@ -2603,13 +2718,14 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             os.chmod(generation, 0o555)
 
             real_lstat = Path.lstat
+            owner_overrides: dict[Path, int] = {}
 
             def root_owned_lstat(path: Path) -> SimpleNamespace | os.stat_result:
                 metadata = real_lstat(path)
                 if path == generation or path.parent == generation:
                     return SimpleNamespace(
                         st_mode=metadata.st_mode,
-                        st_uid=0,
+                        st_uid=owner_overrides.get(path, 0),
                         st_gid=0,
                         st_nlink=metadata.st_nlink,
                     )
@@ -2625,6 +2741,13 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 self.assertEqual(dispatcher._host_capabilities(), 0)
             self.assertRegex(output.getvalue(), r"^HOST_TOOLS schema=1 source_sha=[0-9a-f]{40} ")
             self.assertNotIn(str(generation), output.getvalue())
+            owner_overrides[generation / bundle.HOST_TOOL_FILES[0]] = 1000
+            with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_lstat), \
+                patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \
+                patch.object(dispatcher, "HOST_TOOLS_ROOT", host_root), \
+                patch.object(dispatcher, "__file__", str(generation / bundle.HOST_TOOL_FILES[0])):
+                self.assertEqual(dispatcher._host_capabilities(), 2)
+            owner_overrides.clear()
             os.chmod(generation / bundle.HOST_TOOL_FILES[-1], 0o554)
             with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_lstat), \
                 patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \

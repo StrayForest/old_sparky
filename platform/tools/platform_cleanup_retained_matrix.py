@@ -70,6 +70,81 @@ WRITE_BURST_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
     r"(?P<category>[a-z0-9_-]+)\.$"
 )
 READ_MODEL_KINDS = ("teams", "workspace_detail", "bracket_summary", "bracket_full")
+CLEANUP_RESULT_KEYS = frozenset(
+    {
+        "ok",
+        "markers",
+        "users_deleted",
+        "tournaments_deleted",
+        "control_account_preserved",
+        "remaining_users",
+        "remaining_tournaments",
+        "remaining_sessions",
+        "remaining_audit_logs",
+        "read_models",
+    }
+)
+READ_MODEL_RESULT_KEYS = frozenset(
+    {"keys_expected", "keys_deleted", "keys_remaining"}
+)
+
+
+def validate_cleanup_completion_result(result: object) -> None:
+    """Require the closed post-commit proof before emitting completion evidence."""
+
+    if not isinstance(result, dict):
+        raise RuntimeError("retained cleanup result is incomplete")
+    result_keys = set(result)
+    already_cleaned = result.get("already_cleaned")
+    expected_keys = CLEANUP_RESULT_KEYS
+    if "already_cleaned" in result:
+        if already_cleaned is not True:
+            raise RuntimeError("retained cleanup result is incomplete")
+        expected_keys = CLEANUP_RESULT_KEYS | {"already_cleaned"}
+    if result_keys != expected_keys:
+        raise RuntimeError("retained cleanup result is incomplete")
+    if result.get("ok") is not True or result.get("control_account_preserved") is not True:
+        raise RuntimeError("retained cleanup result is incomplete")
+    marker_count = result.get("markers")
+    if type(marker_count) is not int or marker_count < 1:
+        raise RuntimeError("retained cleanup result is incomplete")
+    for key in ("users_deleted", "tournaments_deleted"):
+        value = result.get(key)
+        if type(value) is not int or value < 0:
+            raise RuntimeError("retained cleanup result is incomplete")
+    if already_cleaned is True:
+        if result["users_deleted"] != 0 or result["tournaments_deleted"] != 0:
+            raise RuntimeError("retained cleanup result is incomplete")
+    elif result["users_deleted"] < 1:
+        raise RuntimeError("retained cleanup result is incomplete")
+    for key in (
+        "remaining_users",
+        "remaining_tournaments",
+        "remaining_sessions",
+        "remaining_audit_logs",
+    ):
+        if type(result.get(key)) is not int or result[key] != 0:
+            raise RuntimeError("retained cleanup result is incomplete")
+    read_models = result.get("read_models")
+    if not isinstance(read_models, dict) or set(read_models) != READ_MODEL_RESULT_KEYS:
+        raise RuntimeError("retained cleanup result is incomplete")
+    for key in READ_MODEL_RESULT_KEYS:
+        value = read_models.get(key)
+        if type(value) is not int or value < 0:
+            raise RuntimeError("retained cleanup result is incomplete")
+    if (
+        read_models["keys_remaining"] != 0
+        or read_models["keys_deleted"] > read_models["keys_expected"]
+    ):
+        raise RuntimeError("retained cleanup result is incomplete")
+
+
+def emit_cleanup_completion_result(result: dict[str, Any]) -> None:
+    """Print the ordinary result and one fixed success marker after validation."""
+
+    validate_cleanup_completion_result(result)
+    print(json.dumps(result, ensure_ascii=False))
+    print('{"status":"completed"}')
 
 
 def _tournament_description_matches(
@@ -434,7 +509,7 @@ async def _already_cleaned_manifest_result(
 
     read_models = await _delete_and_verify_read_models(tournament_ids)
 
-    return {
+    result = {
         "ok": True,
         "already_cleaned": True,
         "markers": len(markers),
@@ -447,6 +522,8 @@ async def _already_cleaned_manifest_result(
         "remaining_audit_logs": 0,
         "read_models": read_models,
     }
+    validate_cleanup_completion_result(result)
+    return result
 
 
 def _merge_recovered_marker_tournaments(
@@ -510,6 +587,7 @@ async def cleanup_manifest(
     async with session_factory()() as db_session:
         already_cleaned = await _already_cleaned_manifest_result(db_session, manifest)
         if already_cleaned is not None:
+            validate_cleanup_completion_result(already_cleaned)
             return already_cleaned
 
         recovered_tournament_ids: dict[str, set[str]] = {}
@@ -774,7 +852,7 @@ async def cleanup_manifest(
     # cleanup result with projections behind.
     read_models = await _delete_and_verify_read_models(tournament_ids)
 
-    return {
+    result = {
         "ok": True,
         "markers": len(markers),
         "users_deleted": len(user_ids),
@@ -786,6 +864,8 @@ async def cleanup_manifest(
         "remaining_audit_logs": 0,
         "read_models": read_models,
     }
+    validate_cleanup_completion_result(result)
+    return result
 
 
 async def async_main() -> int:
@@ -808,8 +888,9 @@ async def async_main() -> int:
         repair_permissions=True,
     )
     result = await cleanup_manifest(manifest)
+    validate_cleanup_completion_result(result)
     args.result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(result, ensure_ascii=False))
+    emit_cleanup_completion_result(result)
     return 0
 
 

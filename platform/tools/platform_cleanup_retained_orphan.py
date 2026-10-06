@@ -36,7 +36,9 @@ from platform_cleanup_retained_matrix import (
     _uuid_list,
     add_control_email_argument,
     cleanup_manifest,
+    emit_cleanup_completion_result,
     resolve_control_email,
+    validate_cleanup_completion_result,
 )
 
 
@@ -289,7 +291,8 @@ async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
 async def _main() -> int:
     try:
         result = await clean_orphan(parse_args())
-        print(json.dumps(result, ensure_ascii=False))
+        validate_cleanup_completion_result(result)
+        emit_cleanup_completion_result(result)
         return 0
     finally:
         await dispose_engine()
