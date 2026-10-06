@@ -3,8 +3,8 @@
 
 The SSH command line is deliberately constant.  Dispatch data is read from
 stdin as a bounded JSON document and validated before any production helper or
-filesystem mutation is reached.  Values then cross only a local
-``subprocess`` argv boundary; they are never interpreted by a remote shell.
+filesystem mutation is reached.  Validated values cross only closed argv or
+stdin boundaries; they are never interpolated into a remote shell command.
 """
 
 from __future__ import annotations
@@ -511,10 +511,34 @@ def _run_sudo(
     )
 
 
-def _run_retained_cleanup_sudo(helper: Path, arguments: list[str]) -> int:
+def _control_email_stdin(control_email: str) -> bytes:
+    """Serialize the only identity field passed to fixed cleanup helpers."""
+
+    if not isinstance(control_email, str) or len(control_email) > 254:
+        raise ValueError("control identity is invalid")
+    return (
+        json.dumps(
+            {"schema": 1, "control_email": control_email},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _run_retained_cleanup_sudo(
+    helper: Path, arguments: list[str], *, control_email: str
+) -> int:
     """Run exact cleanup while retaining only its fixed stage marker."""
 
     if not _trusted_helper(helper):
+        print(
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        )
+        return 2
+    try:
+        input_bytes = _control_email_stdin(control_email)
+    except (TypeError, ValueError, UnicodeEncodeError):
         print(
             "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
         )
@@ -523,7 +547,7 @@ def _run_retained_cleanup_sudo(helper: Path, arguments: list[str]) -> int:
     try:
         process = subprocess.Popen(  # nosec B603 - fixed helper and validated inputs.
             command,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -535,12 +559,32 @@ def _run_retained_cleanup_sudo(helper: Path, arguments: list[str]) -> int:
         )
         return 2
     stream = process.stdout
-    if stream is None:
+    input_stream = process.stdin
+    if stream is None or input_stream is None:
         _terminate_process_group(process)
         print(
             "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
         )
         return 2
+    try:
+        input_stream.write(input_bytes)
+        input_stream.flush()
+    except BrokenPipeError:
+        # Preserve the child marker/status if it rejected input before reading.
+        pass
+    except OSError:
+        _terminate_process_group(process)
+        input_stream.close()
+        stream.close()
+        print(
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        )
+        return 2
+    finally:
+        try:
+            input_stream.close()
+        except OSError:
+            pass
     try:
         descriptor = stream.fileno()
         os.set_blocking(descriptor, False)
@@ -1171,7 +1215,6 @@ def _external_fixture(payload: dict[str, str]) -> int:
     arguments = [
         payload["confirmation"],
         payload["target_sha"],
-        payload["control_email"],
         payload["setup_concurrency"],
         payload["run_id"],
         payload["profile"],
@@ -1189,14 +1232,35 @@ def _external_fixture(payload: dict[str, str]) -> int:
     # the long-running fixture.  ``start_new_session`` severs the SSH session;
     # the helper publishes its fixed supervisor.exit barrier on completion.
     command = [SUDO, "-n", "--", str(EXTERNAL_HELPER), *arguments]
-    process = subprocess.Popen(  # nosec B603
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    try:
+        control_input = _control_email_stdin(payload["control_email"])
+        process = subprocess.Popen(  # nosec B603 - fixed helper and validated inputs.
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        if process.stdin is None:
+            _terminate_process_group(process)
+            return 2
+        try:
+            process.stdin.write(control_input)
+            process.stdin.flush()
+        except BrokenPipeError:
+            _terminate_process_group(process)
+            return 2
+        except OSError:
+            _terminate_process_group(process)
+            return 2
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+    except (OSError, TypeError, ValueError, UnicodeEncodeError):
+        return 2
     del process
     return 0
 
@@ -1552,9 +1616,9 @@ def main(argv: list[str] | None = None) -> int:
                     DELETE_CONFIRMATION,
                     payload["target_sha"],
                     payload["run_id"],
-                    payload["control_email"],
                     payload["run_id"],
                 ],
+                control_email=payload["control_email"],
             )
         if arguments == ["external-cleanup-exports"]:
             return _remove_exports(
@@ -1573,9 +1637,9 @@ def main(argv: list[str] | None = None) -> int:
                     DELETE_CONFIRMATION,
                     payload["target_sha"],
                     payload["load_run_id"],
-                    payload["control_email"],
                     payload["cleanup_run_id"],
                 ],
+                control_email=payload["control_email"],
             )
         if arguments == ["retained-cleanup-exports"]:
             return _remove_exports(

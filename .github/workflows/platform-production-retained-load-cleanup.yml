@@ -24,16 +24,63 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve-host-tools-pin:
+    name: Resolve retained-load host-tools pin without production secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      host_tools_sha: ${{ steps.resolve.outputs.host_tools_sha }}
+    env:
+      TARGET_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout exact target as untrusted source data
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve exact retained-load host-tools generation
+        id: resolve
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          QA_CONFIRMATION: ${{ inputs.confirmation }}
+          LOAD_RUN_ID: ${{ inputs.load_run_id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REF" = "refs/heads/dev"
+          test "$QA_CONFIRMATION" = "DELETE-PRODUCTION-RETAINED-LOAD"
+          [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
+          pin_output="$RUNNER_TEMP/retained-load-host-tools-pin"
+          trap 'rm -f -- "$pin_output"' EXIT
+          /usr/bin/python3 platform/tools/platform_host_tools_pin.py resolve \
+            --source-root "$GITHUB_WORKSPACE" --target-sha "$TARGET_SHA" \
+            --expected-repository "$EXPECTED_REPOSITORY" > "$pin_output"
+          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
+          test "$(wc -l < "$pin_output" | tr -d '[:space:]')" = 1
+          IFS= read -r host_tools_sha < "$pin_output"
+          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
+
   cleanup:
     name: Exact cleanup of one production retained-load run
+    needs: resolve-host-tools-pin
+    if: needs.resolve-host-tools-pin.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production
     env:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       LOAD_RUN_ID: ${{ inputs.load_run_id }}
-      CONTROL_EMAIL: ${{ inputs.control_email }}
       TARGET_SHA: ${{ github.sha }}
+      HOST_TOOLS_SHA: ${{ needs.resolve-host-tools-pin.outputs.host_tools_sha }}
 
     steps:
       - name: Validate explicit cleanup confirmation
@@ -41,6 +88,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production cleanup must run from the reviewed dev branch." >&2; exit 1; }
           test "$QA_CONFIRMATION" = "DELETE-PRODUCTION-RETAINED-LOAD" \
@@ -52,63 +100,110 @@ jobs:
           # Validate and serialize operator-controlled identity before any
           # SSH key file, keyscan or remote command is reached.  This is a
           # data-only handoff; the secret job never loads repository code.
-          /usr/bin/python3 - "$TARGET_SHA" "$CONTROL_EMAIL" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/platform-retained-cleanup-input.json" <<'PY'
+          /usr/bin/python3 - "$TARGET_SHA" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" "$GITHUB_EVENT_PATH" <<'PY'
           import json
+          import os
+          from pathlib import Path
           import re
+          import stat
           import sys
 
-          target_sha, email, load_run_id, cleanup_run_id = sys.argv[1:]
+          target_sha, load_run_id, cleanup_run_id, event_path = sys.argv[1:]
+          try:
+              flags = os.O_RDONLY | os.O_NOFOLLOW
+              descriptor = os.open(event_path, flags)
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or metadata.st_size > 65536
+                      or stat.S_IMODE(metadata.st_mode) & 0o022
+                  ):
+                      raise ValueError
+                  with os.fdopen(descriptor, "rb", closefd=False) as event_file:
+                      raw_event = event_file.read(65537)
+              finally:
+                  os.close(descriptor)
+              if len(raw_event) > 65536:
+                  raise ValueError
+
+              def reject_duplicate_keys(pairs):
+                  values = {}
+                  for key, value in pairs:
+                      if key in values:
+                          raise ValueError
+                      values[key] = value
+                  return values
+
+              event = json.loads(
+                  raw_event.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
+              )
+              inputs = event.get("inputs") if isinstance(event, dict) else None
+              if not isinstance(inputs, dict) or set(inputs) != {
+                  "confirmation", "control_email", "load_run_id"
+              }:
+                  raise ValueError
+              email = inputs.get("control_email") if isinstance(inputs, dict) else None
+          except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+              raise SystemExit("cleanup control identity input is invalid")
           if (
               re.fullmatch(r"[0-9a-f]{40}", target_sha) is None
               or re.fullmatch(r"[1-9][0-9]{0,31}", load_run_id) is None
               or re.fullmatch(r"[1-9][0-9]{0,31}", cleanup_run_id) is None
+              or not isinstance(email, str)
               or not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9.-]{1,253}", email)
               or any(ord(character) < 0x21 or ord(character) > 0x7E for character in email)
           ):
               raise SystemExit("cleanup handoff is invalid")
-          print(json.dumps({
+          canonical_email = email.lower()
+          for value in dict.fromkeys((email, canonical_email)):
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              sys.stdout.write(f"::add-mask::{escaped}\n")
+          sys.stdout.flush()
+          handoff = json.dumps({
               "schema": 1,
               "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD",
               "target_sha": target_sha,
-              "control_email": email,
+              "control_email": canonical_email,
               "load_run_id": load_run_id,
               "cleanup_run_id": cleanup_run_id,
-          }, separators=(",", ":")))
+          }, separators=(",", ":")).encode("ascii") + b"\n"
+          output_path = Path(os.environ["RUNNER_TEMP"]) / "platform-retained-cleanup-input.json"
+          try:
+              descriptor = os.open(
+                  output_path,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                  0o600,
+              )
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or stat.S_IMODE(metadata.st_mode) != 0o600
+                  ):
+                      raise OSError
+                  with os.fdopen(descriptor, "wb", closefd=False) as output_file:
+                      output_file.write(handoff)
+                      output_file.flush()
+                      os.fsync(output_file.fileno())
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or stat.S_IMODE(metadata.st_mode) != 0o600
+                  ):
+                      raise OSError
+              finally:
+                  os.close(descriptor)
+          except OSError:
+              raise SystemExit("cleanup handoff could not be created safely")
           PY
-          chmod 600 "$RUNNER_TEMP/platform-retained-cleanup-input.json"
-          test "$(stat -c '%a' "$RUNNER_TEMP/platform-retained-cleanup-input.json")" = "600"
-
-      - name: Checkout exact target for retained-load host-tools pin
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ env.TARGET_SHA }}
-          fetch-depth: 0
-          path: target-source
-          persist-credentials: false
-
-      - name: Resolve exact retained-load host-tools generation
-        id: resolve_retained_load_host_tools
-        shell: bash
-        env:
-          EXPECTED_REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          umask 077
-          test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"
-          target_source="$GITHUB_WORKSPACE/target-source"
-          test "$(git -C "$target_source" rev-parse HEAD)" = "$TARGET_SHA"
-          test -z "$(git -C "$target_source" status --porcelain=v1 --untracked-files=all -- platform)"
-          pin_output="$RUNNER_TEMP/retained-load-host-tools-pin"
-          /usr/bin/python3 "$target_source/platform/tools/platform_host_tools_pin.py" resolve \
-            --source-root "$target_source" --target-sha "$TARGET_SHA" \
-            --expected-repository "$EXPECTED_REPOSITORY" > "$pin_output"
-          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
-          test "$(wc -l < "$pin_output" | tr -d '[:space:]')" = 1
-          IFS= read -r host_tools_sha < "$pin_output"
-          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
-          printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
-          rm -f -- "$pin_output"
-          test ! -e "$pin_output" && test ! -L "$pin_output"
+          test "$(stat -c '%F:%h:%a:%u' -- "$RUNNER_TEMP/platform-retained-cleanup-input.json")" = "regular file:1:600:$(id -u)"
 
       - name: Configure production SSH
         shell: bash

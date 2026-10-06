@@ -637,7 +637,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
                 ") 2>/dev/null < /dev/null | /usr/bin/head -c 512 > \"$probe_output\"",
                 'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
                 'dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 '
-                'python_isolated=1 python_bytecode_disabled=1"',
+                'retained_load_export_cleanup=1 python_isolated=1 python_bytecode_disabled=1"',
                 'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
                 "command_rc=",
                 "expected_bytes=",

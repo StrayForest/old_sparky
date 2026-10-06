@@ -22,6 +22,7 @@ from typing import Any, Mapping
 
 
 MAX_INPUT_BYTES = 64 * 1024
+MAX_CONTROL_EMAIL_STDIN_BYTES = 1_024
 MAX_EMAIL_LENGTH = 254
 MAX_EMAIL_LOCAL_LENGTH = 64
 MAX_EMAIL_DOMAIN_LENGTH = 253
@@ -640,6 +641,26 @@ def _load_json_bytes(raw: bytes) -> dict[str, Any]:
     return payload
 
 
+def load_control_email_stdin() -> str:
+    """Read one closed control-identity envelope from stdin.
+
+    The value is returned only to a caller that captures this function's
+    bounded output through a private local pipe.  It is never included in an
+    error or otherwise logged.
+    """
+
+    try:
+        raw = sys.stdin.buffer.read(MAX_CONTROL_EMAIL_STDIN_BYTES + 1)
+    except (AttributeError, OSError) as exc:
+        raise _invalid() from exc
+    if len(raw) > MAX_CONTROL_EMAIL_STDIN_BYTES:
+        raise _invalid()
+    payload = _load_json_bytes(raw)
+    if set(payload) != {"schema", "control_email"} or type(payload.get("schema")) is not int or payload["schema"] != 1:
+        raise _invalid()
+    return validate_control_email(payload.get("control_email"))
+
+
 def _reject_symlink_components(path: Path) -> None:
     """Reject a path whose leaf or any existing ancestor is a symlink."""
 
@@ -839,6 +860,8 @@ def _parser() -> argparse.ArgumentParser:
     email = subparsers.add_parser("email")
     email.add_argument("--value", required=True)
 
+    subparsers.add_parser("control-email-json-stdin")
+
     marker = subparsers.add_parser("marker")
     marker.add_argument("--value", required=True)
 
@@ -929,6 +952,9 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(argv)
         if args.command == "email":
             validate_control_email(args.value)
+            return 0
+        if args.command == "control-email-json-stdin":
+            print(load_control_email_stdin())
             return 0
         if args.command == "marker":
             validate_live_marker(args.value)

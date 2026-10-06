@@ -1763,10 +1763,12 @@ raise SystemExit(module.main(["host-capabilities"]))
 
         real_popen = subprocess.Popen
 
-        def run_cleanup_child(script: str, expected_exit: int) -> str:
+        def run_cleanup_child(script: str, expected_exit: int) -> tuple[str, list[str]]:
             output = StringIO()
+            observed_command: list[str] = []
 
-            def spawn(_command: list[str], **options: object) -> subprocess.Popen[bytes]:
+            def spawn(command: list[str], **options: object) -> subprocess.Popen[bytes]:
+                observed_command.extend(command)
                 return real_popen(
                     [sys.executable, "-c", script],
                     **options,
@@ -1776,13 +1778,18 @@ raise SystemExit(module.main(["host-capabilities"]))
                 patch.object(dispatcher.subprocess, "Popen", side_effect=spawn), \
                 redirect_stdout(output):
                 result = dispatcher._run_retained_cleanup_sudo(
-                    Path("/fixed/cleanup-helper"), ["closed", "payload"]
+                    Path("/fixed/cleanup-helper"),
+                    ["closed", "target-sha", "12345", "67890"],
+                    control_email="private@example.invalid",
                 )
             self.assertEqual(result, expected_exit)
-            return output.getvalue()
+            self.assertNotIn("private@example.invalid", observed_command)
+            return output.getvalue(), observed_command
 
-        failed_marker = run_cleanup_child(
-            "import sys; print('private output must not escape'); "
+        failed_marker, _ = run_cleanup_child(
+            "import json,sys; assert json.load(sys.stdin) == "
+            "{'schema': 1, 'control_email': 'private@example.invalid'}; "
+            "print('private output must not escape'); "
             "print('RETAINED_CLEANUP_STAGE schema=1 stage=external_vote_recovery exit_code=7'); "
             "raise SystemExit(7)",
             7,
@@ -1792,8 +1799,11 @@ raise SystemExit(module.main(["host-capabilities"]))
             "RETAINED_CLEANUP_DIAGNOSTIC schema=1 "
             "stage=external_vote_recovery child_exit=7\n",
         )
-        missing_marker = run_cleanup_child(
-            "import sys; print('untrusted output'); raise SystemExit(1)", 1
+        missing_marker, _ = run_cleanup_child(
+            "import json,sys; assert json.load(sys.stdin) == "
+            "{'schema': 1, 'control_email': 'private@example.invalid'}; "
+            "print('untrusted output'); raise SystemExit(1)",
+            1,
         )
         self.assertEqual(
             missing_marker,

@@ -265,9 +265,112 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 self.assertNotIn("control_email_path", prior_steps)
                 self.assertNotIn("CONTROL_EMAIL", prior_steps)
                 script = _step_script(job, step_name)
-                self.assertLess(script.index("GITHUB_EVENT_PATH"), script.index("::add-mask::"))
-                if "os.open(" in script:
-                    self.assertLess(script.index("sys.stdout.flush()"), script.index("os.open("))
+                self.assertLess(script.index("os.open("), script.index("::add-mask::"))
+                if "os.open(destination" in script:
+                    self.assertLess(
+                        script.index("sys.stdout.flush()"),
+                        script.index("os.open(destination"),
+                    )
+
+        valid_inputs = {
+            "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+            "control_email": "Control%qa@example.invalid",
+            "profile_id": "ready-vote-slo-v2",
+            "timeout_diagnostics": False,
+        }
+        invalid_payloads = (
+            json.dumps({"inputs": {**valid_inputs, "unexpected": "value"}}),
+            (
+                '{"inputs":{"confirmation":"RUN-PRODUCTION-EXTERNAL-LOAD",'
+                '"control_email":"control@example.invalid",'
+                '"control_email":"other@example.invalid",'
+                '"profile_id":"ready-vote-slo-v2","timeout_diagnostics":false}}'
+            ),
+        )
+        for job_name, step_name in mask_steps.items():
+            script = _step_script(self.jobs[job_name], step_name)
+            with self.subTest(job=job_name, event="closed-valid"):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    event_path = root / "event.json"
+                    event_path.write_text(
+                        json.dumps({"inputs": valid_inputs}), encoding="utf-8"
+                    )
+                    result = subprocess.run(
+                        ["/bin/bash", "-euo", "pipefail", "-c", script],
+                        env={
+                            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            "GITHUB_EVENT_PATH": str(event_path),
+                            "RUNNER_TEMP": str(root),
+                        },
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assertIn("::add-mask::", result.stdout)
+                    self.assertNotIn("::warning::", result.stdout)
+
+            for invalid_payload in invalid_payloads:
+                with self.subTest(job=job_name, event="invalid-closed-inputs"):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        event_path = root / "event.json"
+                        event_path.write_text(invalid_payload, encoding="utf-8")
+                        result = subprocess.run(
+                            ["/bin/bash", "-euo", "pipefail", "-c", script],
+                            env={
+                                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                                "GITHUB_EVENT_PATH": str(event_path),
+                                "RUNNER_TEMP": str(root),
+                            },
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, "")
+                        self.assertNotIn("control@example.invalid", result.stderr)
+
+        validator_script = _step_script(
+            self.jobs["validate-external-inputs"], mask_steps["validate-external-inputs"]
+        )
+        malformed_files = ("group-world-writable", "oversized", "symlink", "wrong-owner")
+        for case in malformed_files:
+            if case == "wrong-owner" and os.geteuid() != 0:
+                continue
+            with self.subTest(event_file=case):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    event_path = root / "event.json"
+                    event_bytes = json.dumps({"inputs": valid_inputs}).encode("utf-8")
+                    if case == "symlink":
+                        target = root / "event-target.json"
+                        target.write_bytes(event_bytes)
+                        event_path.symlink_to(target)
+                    elif case == "oversized":
+                        event_path.write_bytes(event_bytes + b" " * 65537)
+                    else:
+                        event_path.write_bytes(event_bytes)
+                        if case == "group-world-writable":
+                            event_path.chmod(0o666)
+                        elif case == "wrong-owner":
+                            os.chown(event_path, os.geteuid() + 1, -1)
+                    result = subprocess.run(
+                        ["/bin/bash", "-euo", "pipefail", "-c", validator_script],
+                        env={
+                            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            "GITHUB_EVENT_PATH": str(event_path),
+                            "RUNNER_TEMP": str(root),
+                        },
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertNotIn("control@example.invalid", result.stderr)
 
         # The two jobs that need a private local cleanup value stage it only
         # after the runner has received the masking command.
@@ -276,7 +379,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             ("fixture-finalize", mask_steps["fixture-finalize"]),
         ):
             script = _step_script(self.jobs[job_name], step_name)
-            self.assertLess(script.index("::add-mask::"), script.index("os.open("))
+            self.assertLess(
+                script.index("::add-mask::"), script.index("os.open(destination")
+            )
 
         finalizer = self.jobs["fixture-finalize"]
         self.assertIn('"$cleanup_input_path" "$TARGET_SHA" "$GITHUB_RUN_ID"', finalizer)
@@ -294,57 +399,150 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 self.assertIn('"$RUNNER_TEMP/platform-production-control-email"', cleanup)
                 self.assertIn("test ! -e", cleanup)
 
+    def test_retained_cleanup_identity_uses_event_file_and_private_stdin_handoff(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("CONTROL_EMAIL:", workflow)
+        self.assertNotIn("${{ inputs.control_email }}", workflow)
+        self.assertNotIn("$CONTROL_EMAIL", workflow)
+        self.assertIn('"$GITHUB_EVENT_PATH"', workflow)
+        self.assertIn("os.O_NOFOLLOW", workflow)
+        self.assertIn('os.fstat(descriptor)', workflow)
+        self.assertIn('"control_email": canonical_email', workflow)
+        self.assertIn('"$input_path"', workflow)
+        for mode in ("retained-cleanup", "retained-cleanup-exports"):
+            self.assertIn(f"{mode} < \"$input_path\"", workflow)
+        cleanup_step = _jobs(workflow)["cleanup"]
+        self.assertNotRegex(
+            cleanup_step,
+            r"python3\s+-[^\n]*\$\{?inputs\.control_email|"
+            r"python3\s+-[^\n]*\$CONTROL_EMAIL",
+        )
+
         valid_event = {"inputs": {"control_email": "Control%qa@example.invalid"}}
         invalid_event = {
             "inputs": {"control_email": "private@example.invalid\r\n::warning::injected"}
         }
-        for job_name, step_name in (
-            ("validate-external-inputs", mask_steps["validate-external-inputs"]),
-            ("fixture-setup", mask_steps["fixture-setup"]),
-            ("load-client", mask_steps["load-client"]),
-            ("fixture-finalize", mask_steps["fixture-finalize"]),
-        ):
-            script = _step_script(self.jobs[job_name], step_name)
-            with self.subTest(job=job_name, event="valid"):
+        valid_event["inputs"].update(
+            {
+                "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD",
+                "load_run_id": "123456",
+            }
+        )
+        invalid_event["inputs"].update(
+            {
+                "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD",
+                "load_run_id": "123456",
+            }
+        )
+        cleanup_validation = _step_script(
+            cleanup_step, "Validate explicit cleanup confirmation"
+        )
+        duplicate_event = (
+            '{"inputs":{"confirmation":"DELETE-PRODUCTION-RETAINED-LOAD",'
+            '"control_email":"first@example.invalid",'
+            '"control_email":"second@example.invalid","load_run_id":"123456"}}'
+        )
+        unknown_event = {
+            "inputs": {
+                **valid_event["inputs"],
+                "unexpected": "value",
+            }
+        }
+        event_cases = (
+            ("valid", valid_event, True),
+            ("invalid", invalid_event, True),
+            ("duplicate", duplicate_event, False),
+            ("unknown", unknown_event, True),
+        )
+        for event_name, event, serialize_event in event_cases:
+            with self.subTest(event=event_name):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
                     event_path = root / "event.json"
-                    event_path.write_text(json.dumps(valid_event), encoding="utf-8")
+                    output_path = root / "platform-retained-cleanup-input.json"
+                    event_contents = json.dumps(event) if serialize_event else event
+                    event_path.write_text(event_contents, encoding="utf-8")
                     result = subprocess.run(
-                        ["/bin/bash", "-euo", "pipefail", "-c", script],
+                        ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
                         env={
                             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            "GITHUB_REF": "refs/heads/dev",
                             "GITHUB_EVENT_PATH": str(event_path),
+                            "GITHUB_RUN_ID": "234567",
+                            "QA_CONFIRMATION": "DELETE-PRODUCTION-RETAINED-LOAD",
+                            "LOAD_RUN_ID": "123456",
+                            "TARGET_SHA": "a" * 40,
                             "RUNNER_TEMP": str(root),
                         },
                         capture_output=True,
                         text=True,
                         check=False,
                     )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertNotIn("::warning::", result.stdout)
-                    self.assertEqual(result.stderr, "")
-                    self.assertEqual(
-                        result.stdout.splitlines(),
-                        [
-                            "::add-mask::Control%25qa@example.invalid",
-                            "::add-mask::control%25qa@example.invalid",
-                        ],
-                    )
-                    if "stage" in step_name:
-                        email_file = root / "platform-production-control-email"
-                        self.assertEqual(email_file.read_text(encoding="ascii"), "control%qa@example.invalid\n")
-                        self.assertEqual(email_file.stat().st_mode & 0o777, 0o600)
-            with self.subTest(job=job_name, event="malicious-crlf"):
+                    self.assertNotIn("private@example.invalid", result.stdout)
+                    self.assertNotIn("private@example.invalid", result.stderr)
+                    if event_name == "valid":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(
+                            result.stdout.splitlines(),
+                            [
+                                "::add-mask::Control%25qa@example.invalid",
+                                "::add-mask::control%25qa@example.invalid",
+                            ],
+                        )
+                        self.assertEqual(result.stderr, "")
+                        self.assertNotIn("Control%qa@example.invalid", result.stdout)
+                        self.assertEqual(output_path.stat().st_mode & 0o777, 0o600)
+                        self.assertEqual(
+                            json.loads(output_path.read_text(encoding="ascii")),
+                            {
+                                "schema": 1,
+                                "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD",
+                                "target_sha": "a" * 40,
+                                "control_email": "control%qa@example.invalid",
+                                "load_run_id": "123456",
+                                "cleanup_run_id": "234567",
+                            },
+                        )
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(output_path.exists())
+
+        for event_file_case in (
+            "group-world-writable",
+            "oversized",
+            "symlink",
+            "wrong-owner",
+        ):
+            if event_file_case == "wrong-owner" and os.geteuid() != 0:
+                continue
+            with self.subTest(event_file=event_file_case):
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
                     event_path = root / "event.json"
-                    event_path.write_text(json.dumps(invalid_event), encoding="utf-8")
+                    valid_bytes = json.dumps(valid_event).encode("utf-8")
+                    if event_file_case == "symlink":
+                        event_target = root / "event-target.json"
+                        event_target.write_bytes(valid_bytes)
+                        event_path.symlink_to(event_target)
+                    else:
+                        extra = b" " * 65537 if event_file_case == "oversized" else b""
+                        event_path.write_bytes(valid_bytes + extra)
+                        if event_file_case == "group-world-writable":
+                            event_path.chmod(0o666)
+                        elif event_file_case == "wrong-owner":
+                            os.chown(event_path, os.geteuid() + 1, -1)
                     result = subprocess.run(
-                        ["/bin/bash", "-euo", "pipefail", "-c", script],
+                        ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
                         env={
                             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            "GITHUB_REF": "refs/heads/dev",
                             "GITHUB_EVENT_PATH": str(event_path),
+                            "GITHUB_RUN_ID": "234567",
+                            "QA_CONFIRMATION": "DELETE-PRODUCTION-RETAINED-LOAD",
+                            "LOAD_RUN_ID": "123456",
+                            "TARGET_SHA": "a" * 40,
                             "RUNNER_TEMP": str(root),
                         },
                         capture_output=True,
@@ -353,9 +551,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     )
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(result.stdout, "")
-                    self.assertNotIn("private@example.invalid", result.stderr)
-                    self.assertNotIn("::warning::", result.stderr)
-                    self.assertFalse((root / "platform-production-control-email").exists())
+                    self.assertFalse(
+                        (root / "platform-retained-cleanup-input.json").exists()
+                    )
 
     def test_load_runner_is_pinned_and_has_containment_probe_margin(self) -> None:
         self.assertNotIn("runs-on: ubuntu-latest", self.source)
@@ -409,9 +607,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
     def test_cleanup_exports_and_projection_are_failure_bearing(self) -> None:
         finalizer = self.jobs["fixture-finalize"]
         self.assertIn("external-cleanup-exports", finalizer)
-        self.assertIn("Checkout exact target for retained-load host-tools pin", finalizer)
-        self.assertIn("platform_host_tools_pin.py\" resolve", finalizer)
-        self.assertIn("--target-sha \"$TARGET_SHA\"", finalizer)
+        self.assertNotIn("actions/checkout@", finalizer)
+        self.assertIn(
+            "HOST_TOOLS_SHA: ${{ needs.resolve-host-tools-pin.outputs.host_tools_sha }}",
+            finalizer,
+        )
         self.assertIn('"$retained_load_dispatcher" external-finalize', finalizer)
         self.assertIn('"$retained_load_dispatcher" \\\n              external-cleanup-exports', finalizer)
         # Fixture setup and DB cleanup retain their current-release helpers;
@@ -425,6 +625,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("cleanup_exports_status=", finalizer)
         self.assertIn("cleanup_status\" != 0 || \"$cleanup_exports_status\" != 0", finalizer)
         self.assertIn("cleanup summary projection input is invalid", finalizer)
+        pin_job = self.jobs["resolve-host-tools-pin"]
+        self.assertIn("Checkout exact target as untrusted source data", pin_job)
+        self.assertIn("platform_host_tools_pin.py resolve", pin_job)
+        self.assertIn('--target-sha "$TARGET_SHA"', pin_job)
+        self.assertNotIn("secrets.PROD_SSH_", pin_job)
         diagnostic = finalizer.split(
             "- name: Diagnose origin evidence publication gate", 1
         )[1].split("- name: Publish origin evidence", 1)[0]

@@ -52,6 +52,133 @@ BROWSER_WRAPPERS = WRAPPERS[1:3]
 
 
 class LiveQaWrapperContractTests(unittest.TestCase):
+    def test_control_email_json_stdin_is_closed_bounded_and_redacted(self) -> None:
+        valid = '{"schema":1,"control_email":"Control+qa@example.invalid"}\n'
+        stdout = StringIO()
+        stderr = StringIO()
+        with patch.object(
+            platform_workflow_input_guard.sys,
+            "stdin",
+            TextIOWrapper(BytesIO(valid.encode("ascii")), encoding="ascii"),
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(
+                platform_workflow_input_guard.main(["control-email-json-stdin"]),
+                0,
+            )
+        self.assertEqual(stdout.getvalue(), "control+qa@example.invalid\n")
+        self.assertEqual(stderr.getvalue(), "")
+
+        invalid_payloads = (
+            '{"schema":1,"control_email":"private@example.invalid","extra":0}\n',
+            '{"schema":1,"schema":1,"control_email":"private@example.invalid"}\n',
+            '{"schema":true,"control_email":"private@example.invalid"}\n',
+            '{"schema":1,"control_email":"bad;id@example.invalid"}\n',
+            "{" + " " * 1_024 + "}\n",
+        )
+        for raw in invalid_payloads:
+            with self.subTest(length=len(raw)):
+                stdout = StringIO()
+                stderr = StringIO()
+                with patch.object(
+                    platform_workflow_input_guard.sys,
+                    "stdin",
+                    TextIOWrapper(BytesIO(raw.encode("ascii")), encoding="ascii"),
+                ), redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(
+                        platform_workflow_input_guard.main(
+                            ["control-email-json-stdin"]
+                        ),
+                        2,
+                    )
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "workflow input is invalid\n")
+                self.assertNotIn("private@example.invalid", stderr.getvalue())
+
+    def test_external_fixture_forwards_control_identity_only_on_stdin(self) -> None:
+        class CapturedInput:
+            def __init__(self) -> None:
+                self.data = b""
+                self.closed = False
+
+            def write(self, value: bytes) -> int:
+                self.data += value
+                return len(value)
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FailingInput(CapturedInput):
+            def write(self, value: bytes) -> int:
+                raise OSError("private control pipe failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            helper = root / "platform_production_external_fixture_qa.sh"
+            helper.write_text("#!/bin/sh\n", encoding="ascii")
+            helper.chmod(0o755)
+            child = Mock(pid=1234)
+            child.stdin = CapturedInput()
+            payload = {
+                "confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+                "target_sha": "a" * 40,
+                "control_email": "control@example.invalid",
+                "setup_concurrency": "8",
+                "run_id": "123456",
+                "profile": "external-vote",
+                "tournament_count": "1",
+                "users_per_tournament": "14",
+                "timeout_diagnostics": "false",
+            }
+            with patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", root), \
+                patch.object(platform_workflow_remote_dispatch, "EXTERNAL_HELPER", helper), \
+                patch.object(platform_workflow_remote_dispatch, "SUDO", "/usr/bin/sudo"), \
+                patch.object(
+                    platform_workflow_remote_dispatch.subprocess,
+                    "Popen",
+                    return_value=child,
+                ) as popen:
+                self.assertEqual(
+                    platform_workflow_remote_dispatch._external_fixture(payload), 0
+                )
+            command = popen.call_args.args[0]
+            self.assertEqual(
+                command,
+                [
+                    "/usr/bin/sudo", "-n", "--", str(helper),
+                    payload["confirmation"], payload["target_sha"],
+                    payload["setup_concurrency"], payload["run_id"],
+                    payload["profile"], payload["tournament_count"],
+                    payload["users_per_tournament"], payload["timeout_diagnostics"],
+                ],
+            )
+            self.assertNotIn(payload["control_email"], command)
+            self.assertEqual(
+                json.loads(child.stdin.data.decode("ascii")),
+                {"schema": 1, "control_email": payload["control_email"]},
+            )
+            self.assertTrue(child.stdin.closed)
+
+            failed_child = Mock(pid=5678)
+            failed_child.stdin = FailingInput()
+            with patch.object(
+                platform_workflow_remote_dispatch.subprocess,
+                "Popen",
+                return_value=failed_child,
+            ) as failed_popen, patch.object(
+                platform_workflow_remote_dispatch,
+                "_terminate_process_group",
+            ) as terminate:
+                self.assertEqual(
+                    platform_workflow_remote_dispatch._external_fixture(payload), 2
+                )
+            terminate.assert_called_once_with(failed_child)
+            self.assertTrue(failed_child.stdin.closed)
+            failed_command = failed_popen.call_args.args[0]
+            self.assertNotIn(payload["control_email"], failed_command)
+
     def test_release_baseline_input_requires_an_exact_integer_schema(self) -> None:
         valid = {
             "schema": 1,

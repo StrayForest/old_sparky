@@ -70,11 +70,47 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import stat
           import sys
 
           try:
-              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+              descriptor = os.open(
+                  os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
+              )
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or metadata.st_size > 65536
+                      or stat.S_IMODE(metadata.st_mode) & 0o022
+                  ):
+                      raise ValueError
+                  raw_event = os.read(descriptor, 65537)
+              finally:
+                  os.close(descriptor)
+              if len(raw_event) > 65536:
+                  raise ValueError
+
+              def reject_duplicate_keys(pairs):
+                  values = {}
+                  for key, value in pairs:
+                      if key in values:
+                          raise ValueError
+                      values[key] = value
+                  return values
+
+              event = json.loads(
+                  raw_event.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
+              )
+              if not isinstance(event, dict):
+                  raise ValueError
               inputs = event.get("inputs")
+              if not isinstance(inputs, dict) or set(inputs) != {
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics"
+              }:
+                  raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
               if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
                   raise ValueError
@@ -100,17 +136,34 @@ jobs:
           sys.stdout.flush()
 
           destination = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
-          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
           try:
               descriptor = os.open(destination, flags, 0o600)
-              with os.fdopen(descriptor, "w", encoding="ascii") as handle:
-                  handle.write(canonical_email + "\n")
-                  handle.flush()
-                  os.fsync(handle.fileno())
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or stat.S_IMODE(metadata.st_mode) != 0o600
+                  ):
+                      raise OSError
+                  with os.fdopen(descriptor, "w", encoding="ascii", closefd=False) as handle:
+                      handle.write(canonical_email + "\n")
+                      handle.flush()
+                      os.fsync(handle.fileno())
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or stat.S_IMODE(metadata.st_mode) != 0o600
+                  ):
+                      raise OSError
+              finally:
+                  os.close(descriptor)
           except OSError:
               raise SystemExit("control identity handoff could not be created safely")
-          if destination.is_symlink() or destination.stat().st_mode & 0o077:
-              raise SystemExit("control identity handoff permissions are unsafe")
           PY
 
       - name: Reject invalid external-load dispatch before checkout
@@ -255,6 +308,49 @@ jobs:
             "$RUNNER_TEMP/platform-production-control-email"
           test ! -e "$RUNNER_TEMP/platform-production-control-email" && test ! -L "$RUNNER_TEMP/platform-production-control-email"
 
+  resolve-host-tools-pin:
+    name: Resolve retained-load host-tools pin without production secrets
+    needs: validate-external-inputs
+    if: needs.validate-external-inputs.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      host_tools_sha: ${{ steps.resolve.outputs.host_tools_sha }}
+    env:
+      TARGET_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout exact target as untrusted source data
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve exact retained-load host-tools generation
+        id: resolve
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REF" = "refs/heads/dev"
+          test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
+          pin_output="$RUNNER_TEMP/retained-load-host-tools-pin"
+          trap 'rm -f -- "$pin_output"' EXIT
+          /usr/bin/python3 platform/tools/platform_host_tools_pin.py resolve \
+            --source-root "$GITHUB_WORKSPACE" --target-sha "$TARGET_SHA" \
+            --expected-repository "$EXPECTED_REPOSITORY" > "$pin_output"
+          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
+          test "$(wc -l < "$pin_output" | tr -d '[:space:]')" = 1
+          IFS= read -r host_tools_sha < "$pin_output"
+          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
+
   # This job owns SSH only for trusted fixture setup.  It does not checkout or
   # execute candidate code and publishes the manifest as data for a fresh
   # external load runner.
@@ -289,11 +385,47 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import stat
           import sys
 
           try:
-              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+              descriptor = os.open(
+                  os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
+              )
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or metadata.st_size > 65536
+                      or stat.S_IMODE(metadata.st_mode) & 0o022
+                  ):
+                      raise ValueError
+                  raw_event = os.read(descriptor, 65537)
+              finally:
+                  os.close(descriptor)
+              if len(raw_event) > 65536:
+                  raise ValueError
+
+              def reject_duplicate_keys(pairs):
+                  values = {}
+                  for key, value in pairs:
+                      if key in values:
+                          raise ValueError
+                      values[key] = value
+                  return values
+
+              event = json.loads(
+                  raw_event.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
+              )
+              if not isinstance(event, dict):
+                  raise ValueError
               inputs = event.get("inputs")
+              if not isinstance(inputs, dict) or set(inputs) != {
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics"
+              }:
+                  raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
               if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
                   raise ValueError
@@ -583,11 +715,47 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import stat
           import sys
 
           try:
-              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+              descriptor = os.open(
+                  os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
+              )
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or metadata.st_size > 65536
+                      or stat.S_IMODE(metadata.st_mode) & 0o022
+                  ):
+                      raise ValueError
+                  raw_event = os.read(descriptor, 65537)
+              finally:
+                  os.close(descriptor)
+              if len(raw_event) > 65536:
+                  raise ValueError
+
+              def reject_duplicate_keys(pairs):
+                  values = {}
+                  for key, value in pairs:
+                      if key in values:
+                          raise ValueError
+                      values[key] = value
+                  return values
+
+              event = json.loads(
+                  raw_event.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
+              )
+              if not isinstance(event, dict):
+                  raise ValueError
               inputs = event.get("inputs")
+              if not isinstance(inputs, dict) or set(inputs) != {
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics"
+              }:
+                  raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
               if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
                   raise ValueError
@@ -922,6 +1090,7 @@ jobs:
     name: Signal fixture completion and collect origin evidence
     needs:
       - validate-external-inputs
+      - resolve-host-tools-pin
       - fixture-setup
       - load-client
       - namespace-containment-barrier
@@ -957,39 +1126,8 @@ jobs:
       INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
       CANDIDATE_ARTIFACT_ID: ${{ needs.load-client.outputs.candidate_artifact_id }}
       CANDIDATE_ARTIFACT_DIGEST: ${{ needs.load-client.outputs.candidate_artifact_digest }}
+      HOST_TOOLS_SHA: ${{ needs.resolve-host-tools-pin.outputs.host_tools_sha }}
     steps:
-      - name: Checkout exact target for retained-load host-tools pin
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ env.TARGET_SHA }}
-          fetch-depth: 0
-          path: target-source
-          persist-credentials: false
-
-      - name: Resolve exact retained-load host-tools generation
-        id: resolve_retained_load_host_tools
-        shell: bash
-        env:
-          EXPECTED_REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          umask 077
-          test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"
-          target_source="$GITHUB_WORKSPACE/target-source"
-          test "$(git -C "$target_source" rev-parse HEAD)" = "$TARGET_SHA"
-          test -z "$(git -C "$target_source" status --porcelain=v1 --untracked-files=all -- platform)"
-          pin_output="$RUNNER_TEMP/retained-load-host-tools-pin"
-          /usr/bin/python3 "$target_source/platform/tools/platform_host_tools_pin.py" resolve \
-            --source-root "$target_source" --target-sha "$TARGET_SHA" \
-            --expected-repository "$EXPECTED_REPOSITORY" > "$pin_output"
-          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
-          test "$(wc -l < "$pin_output" | tr -d '[:space:]')" = 1
-          IFS= read -r host_tools_sha < "$pin_output"
-          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
-          printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
-          rm -f -- "$pin_output"
-          test ! -e "$pin_output" && test ! -L "$pin_output"
-
       - name: Mask and stage the control identity from the event file
         shell: bash
         run: |
@@ -999,11 +1137,47 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import stat
           import sys
 
           try:
-              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+              descriptor = os.open(
+                  os.environ["GITHUB_EVENT_PATH"], os.O_RDONLY | os.O_NOFOLLOW
+              )
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or metadata.st_size > 65536
+                      or stat.S_IMODE(metadata.st_mode) & 0o022
+                  ):
+                      raise ValueError
+                  raw_event = os.read(descriptor, 65537)
+              finally:
+                  os.close(descriptor)
+              if len(raw_event) > 65536:
+                  raise ValueError
+
+              def reject_duplicate_keys(pairs):
+                  values = {}
+                  for key, value in pairs:
+                      if key in values:
+                          raise ValueError
+                      values[key] = value
+                  return values
+
+              event = json.loads(
+                  raw_event.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
+              )
+              if not isinstance(event, dict):
+                  raise ValueError
               inputs = event.get("inputs")
+              if not isinstance(inputs, dict) or set(inputs) != {
+                  "confirmation", "control_email", "profile_id", "timeout_diagnostics"
+              }:
+                  raise ValueError
               email = inputs.get("control_email") if isinstance(inputs, dict) else None
               if not isinstance(email, str) or not email.isascii() or not 3 <= len(email) <= 254 or email != email.strip() or email.count("@") != 1:
                   raise ValueError
@@ -1026,17 +1200,34 @@ jobs:
           sys.stdout.flush()
 
           destination = Path(os.environ["RUNNER_TEMP"]) / "platform-production-control-email"
-          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
           try:
               descriptor = os.open(destination, flags, 0o600)
-              with os.fdopen(descriptor, "w", encoding="ascii") as handle:
-                  handle.write(canonical_email + "\n")
-                  handle.flush()
-                  os.fsync(handle.fileno())
+              try:
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or stat.S_IMODE(metadata.st_mode) != 0o600
+                  ):
+                      raise OSError
+                  with os.fdopen(descriptor, "w", encoding="ascii", closefd=False) as handle:
+                      handle.write(canonical_email + "\n")
+                      handle.flush()
+                      os.fsync(handle.fileno())
+                  metadata = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(metadata.st_mode)
+                      or metadata.st_uid != os.geteuid()
+                      or metadata.st_nlink != 1
+                      or stat.S_IMODE(metadata.st_mode) != 0o600
+                  ):
+                      raise OSError
+              finally:
+                  os.close(descriptor)
           except OSError:
               raise SystemExit("control identity handoff could not be created safely")
-          if destination.is_symlink() or destination.stat().st_mode & 0o077:
-              raise SystemExit("control identity handoff permissions are unsafe")
           PY
 
       - name: Download exact external-load handoff
