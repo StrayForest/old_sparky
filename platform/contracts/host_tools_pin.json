@@ -68,10 +68,10 @@
     {
       "mode": 420,
       "path": "platform/tools/platform_retained_load_export_executor.py",
-      "sha256": "da29999753d34988e1a16cbc780229cf83c5ed030fe6ccb4fd333d69705be733"
+      "sha256": "2d499f8cd41939f7664c17119391447595ee6cdd2960a183735b991ee09a75e0"
     }
   ],
-  "host_tools_sha": "9b9c0317776b8e788d916b2eb5d4d7ac9cb71af8",
+  "host_tools_sha": "f997be4747f70631b79439d02deffd1160bea149",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }
