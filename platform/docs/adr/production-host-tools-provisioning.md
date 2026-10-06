@@ -30,6 +30,11 @@ preserved. The retained-load export-authority bump uses **C**
 `b806ff4f141b29d2d970ada36b2e3521cd2ce1e9`; the pin records C's exact
 14-member closure. Root provisioning and the exact-P preflight/reconcile remain
 pending the reviewed merge and are required before the capability is used. The
+follow-up stdin-boundary and cleanup-ownership correction uses **C**
+`9b9c0317776b8e788d916b2eb5d4d7ac9cb71af8`; its pin update records the same
+14-member closure with the exact changed dispatcher and input-guard digests.
+The exact-P preflight and root provisioning remain required before that
+generation is used. The
 active application release and production health are owned by
 [`CURRENT.md`](../CURRENT.md); this ADR does not duplicate those changing facts.
 The pin records the
