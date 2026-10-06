@@ -1274,6 +1274,81 @@ def _run_id_path(prefix: str, run_id: str, leaf: str) -> Path:
     return Path(f"{prefix}{run_id}") / leaf
 
 
+def _pin_closure_matches_generation(
+    pin: dict[str, object], manifest: dict[str, object]
+) -> bool:
+    """Match source-pin records to the installed generation by exact path.
+
+    The repository pin records Git tree modes (0644/0755). The host-tools
+    builder deliberately installs every executable member as immutable 0555,
+    so source modes validate against that closed source-mode set while the
+    generation manifest validates the installed 0555 mode. Record ordering is
+    not a trust boundary; exact unique path sets and per-path digests are.
+    """
+
+    expected_paths = {f"platform/tools/{name}" for name in HOST_TOOL_FILES}
+    expected_manifest_paths = set(HOST_TOOL_FILES) | {"capabilities.txt"}
+    pin_records = pin.get("closure")
+    manifest_records = manifest.get("files")
+    if (
+        not isinstance(pin_records, list)
+        or len(pin_records) != len(expected_paths)
+        or not isinstance(manifest_records, list)
+        or len(manifest_records) != len(expected_manifest_paths)
+    ):
+        return False
+
+    pin_by_path: dict[str, dict[str, object]] = {}
+    for record in pin_records:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
+            return False
+        path = record.get("path")
+        digest = record.get("sha256")
+        mode = record.get("mode")
+        if (
+            not isinstance(path, str)
+            or path not in expected_paths
+            or path in pin_by_path
+            or not isinstance(digest, str)
+            or HEX_DIGEST_RE.fullmatch(digest) is None
+            or type(mode) is not int
+            or mode not in {0o644, 0o755}
+        ):
+            return False
+        pin_by_path[path] = record
+    if set(pin_by_path) != expected_paths:
+        return False
+
+    manifest_by_path: dict[str, dict[str, object]] = {}
+    for record in manifest_records:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
+            return False
+        path = record.get("path")
+        digest = record.get("sha256")
+        mode = record.get("mode")
+        if (
+            not isinstance(path, str)
+            or path not in expected_manifest_paths
+            or path in manifest_by_path
+            or not isinstance(digest, str)
+            or HEX_DIGEST_RE.fullmatch(digest) is None
+            or type(mode) is not int
+        ):
+            return False
+        installed_mode = 0o444 if path == "capabilities.txt" else 0o555
+        if mode != installed_mode:
+            return False
+        manifest_by_path[path] = record
+    if set(manifest_by_path) != expected_manifest_paths:
+        return False
+
+    return all(
+        pin_by_path[f"platform/tools/{name}"]["sha256"]
+        == manifest_by_path[name]["sha256"]
+        for name in HOST_TOOL_FILES
+    )
+
+
 def _current_pin_matches_host_generation(*, target_sha: str) -> bool:
     """Bind cleanup authority to the active release's exact C6 pin."""
 
@@ -1355,34 +1430,7 @@ def _current_pin_matches_host_generation(*, target_sha: str) -> bool:
         manifest = _strict_baseline_json(manifest_raw)
         if not isinstance(manifest, dict) or manifest.get("source_sha") != ACTIVE_TOOLS_DIR.name:
             return False
-        records = manifest.get("files")
-        if not isinstance(records, list):
-            return False
-        by_name: dict[str, dict[str, object]] = {}
-        for record in records:
-            if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
-                return False
-            name = record.get("path")
-            if not isinstance(name, str) or name == "capabilities.txt" or name in by_name:
-                continue
-            by_name[name] = record
-        expected_paths = tuple(f"platform/tools/{name}" for name in HOST_TOOL_FILES)
-        if len(pin["closure"]) != len(expected_paths):
-            return False
-        for path, record in zip(expected_paths, pin["closure"], strict=True):
-            name = path.removeprefix("platform/tools/")
-            expected = by_name.get(name)
-            if (
-                not isinstance(record, dict)
-                or set(record) != {"path", "sha256", "mode"}
-                or record.get("path") != path
-                or expected is None
-                or type(record.get("mode")) is not int
-                or record.get("sha256") != expected.get("sha256")
-                or record.get("mode") != expected.get("mode")
-            ):
-                return False
-        return set(by_name) == set(HOST_TOOL_FILES)
+        return _pin_closure_matches_generation(pin, manifest)
     except (OSError, RuntimeError, TypeError, ValueError):
         return False
 
