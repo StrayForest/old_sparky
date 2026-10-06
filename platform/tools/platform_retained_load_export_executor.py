@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import socket
 import subprocess
 import stat
 import sys
@@ -169,12 +170,17 @@ def _verify_no_sudo_access() -> None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ExportCleanupError("sudo_policy_check_failed") from exc
-    output = result.stdout.decode("utf-8", "replace")
-    denied = re.fullmatch(
-        rf"User {re.escape(ACCOUNT_NAME)} is not allowed to run sudo on [^\r\n]+\.?\s*",
-        output,
+    try:
+        output = result.stdout.decode("ascii")
+        hostname = socket.gethostname()
+    except (AttributeError, UnicodeError, OSError) as exc:
+        raise ExportCleanupError("sudo_policy_check_failed") from exc
+    if not hostname or "\r" in hostname or "\n" in hostname:
+        raise ExportCleanupError("sudo_policy_check_failed")
+    expected_denial = (
+        f"User {ACCOUNT_NAME} is not allowed to run sudo on {hostname}.\n"
     )
-    if result.returncode != 1 or denied is None:
+    if result.returncode not in {0, 1} or output != expected_denial:
         raise ExportCleanupError("sudo_access_present_or_unknown")
 
 

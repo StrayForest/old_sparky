@@ -57,6 +57,82 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(parent_metadata.st_mode), 0o711)
         return staged
 
+    def test_sudo_policy_accepts_only_exact_local_account_denial(self) -> None:
+        hostname = "fixture-host.example"
+        denial = (
+            f"User {executor.ACCOUNT_NAME} is not allowed to run sudo on "
+            f"{hostname}.\n"
+        ).encode("ascii")
+        sudo_metadata = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o755,
+            st_uid=0,
+            st_nlink=1,
+        )
+
+        for returncode in (0, 1):
+            with self.subTest(returncode=returncode):
+                with (
+                    patch.object(executor.os, "stat", return_value=sudo_metadata),
+                    patch.object(
+                        executor.subprocess,
+                        "run",
+                        return_value=SimpleNamespace(
+                            returncode=returncode, stdout=denial
+                        ),
+                    ) as run,
+                    patch.object(executor.socket, "gethostname", return_value=hostname),
+                ):
+                    executor._verify_no_sudo_access()
+                run.assert_called_once_with(
+                    ["/usr/bin/sudo", "-n", "-l", "-U", executor.ACCOUNT_NAME],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    close_fds=True,
+                    env={"PATH": executor.FIXED_ENVIRONMENT["PATH"], "LC_ALL": "C"},
+                    timeout=5,
+                )
+
+    def test_sudo_policy_rejects_grants_extra_output_wrong_host_and_status(self) -> None:
+        hostname = "fixture-host.example"
+        denial = (
+            f"User {executor.ACCOUNT_NAME} is not allowed to run sudo on "
+            f"{hostname}.\n"
+        ).encode("ascii")
+        sudo_metadata = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o755,
+            st_uid=0,
+            st_nlink=1,
+        )
+        invalid_results = (
+            (0, b"(ALL) NOPASSWD: ALL\n"),
+            (0, b"Policy listing follows:\n" + denial),
+            (0, denial + b"Additional status\n"),
+            (0, denial.replace(hostname.encode("ascii"), b"other-host")),
+            (2, denial),
+            (1, b"User is not allowed\n"),
+        )
+
+        for returncode, output in invalid_results:
+            with self.subTest(returncode=returncode, output=output):
+                with (
+                    patch.object(executor.os, "stat", return_value=sudo_metadata),
+                    patch.object(
+                        executor.subprocess,
+                        "run",
+                        return_value=SimpleNamespace(
+                            returncode=returncode, stdout=output
+                        ),
+                    ),
+                    patch.object(executor.socket, "gethostname", return_value=hostname),
+                ):
+                    with self.assertRaisesRegex(
+                        executor.ExportCleanupError,
+                        "sudo_access_present_or_unknown",
+                    ):
+                        executor._verify_no_sudo_access()
+
     def test_production_shell_handoffs_keep_control_identity_on_stdin(self) -> None:
         tools = Path(__file__).resolve().parents[1] / "tools"
         external = (tools / "platform_production_external_fixture_qa.sh").read_text(
