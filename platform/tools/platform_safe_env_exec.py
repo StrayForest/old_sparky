@@ -609,15 +609,34 @@ def validate_trusted_command(command: list[str], *, pythonpath: Path) -> None:
             metadata = path.lstat()
         except OSError as exc:
             raise SafeEnvError("clean exec target is unavailable") from exc
-        if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
-            raise SafeEnvError("clean exec target ownership is unsafe")
         if path == ACTIVE_PYTHON:
-            if resolved != TRUSTED_SYSTEM_PYTHON or not resolved.is_file():
+            # Symlink permission bits are not meaningful on Linux.  The
+            # production venv intentionally points at the fixed system Python,
+            # so validate the link owner and exact target, then validate the
+            # target file's own metadata.
+            if metadata.st_uid != 0 or metadata.st_nlink != 1:
+                raise SafeEnvError("clean exec target ownership is unsafe")
+            try:
+                python_metadata = resolved.stat()
+            except OSError as exc:
+                raise SafeEnvError("clean exec target is unavailable") from exc
+            if (
+                not stat.S_ISLNK(metadata.st_mode)
+                or resolved != TRUSTED_SYSTEM_PYTHON
+                or not stat.S_ISREG(python_metadata.st_mode)
+                or python_metadata.st_uid != 0
+                or python_metadata.st_nlink != 1
+                or stat.S_IMODE(python_metadata.st_mode) & 0o022
+                or python_metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
+            ):
                 raise SafeEnvError("clean exec Python target is unsafe")
-        elif path == script and (
+            continue
+        if path == script and (
             stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode)
         ):
             raise SafeEnvError("clean exec script target is unsafe")
+        if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise SafeEnvError("clean exec target ownership is unsafe")
 
 
 def _validate_root_owned_tree(root: Path) -> None:

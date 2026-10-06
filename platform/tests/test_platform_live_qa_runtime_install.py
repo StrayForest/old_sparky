@@ -302,9 +302,14 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         runtime._digest_regular(installed), manifest["files"][relative]
                     )
 
-                fake_python = Path(temporary) / "trusted-python"
-                fake_python.write_bytes(b"#!/bin/sh\nexit 0\n")
-                os.chmod(fake_python, 0o755)
+                fake_python_target = Path(temporary) / "trusted-python-target"
+                fake_python_target.write_bytes(b"#!/bin/sh\nexit 0\n")
+                os.chmod(fake_python_target, 0o755)
+                os.chown(fake_python_target, 0, 0)
+                fake_python = Path(temporary) / "venv/bin/python"
+                fake_python.parent.mkdir(parents=True, mode=0o755)
+                fake_python.symlink_to(fake_python_target)
+                os.chown(fake_python, 0, 0, follow_symlinks=False)
                 selected_tool = payload / "platform/tools/platform_cleanup_retained_matrix.py"
 
                 def execute_selected() -> int:
@@ -330,7 +335,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         LIVE_QA_ACTIVE_MANIFEST=trusted / "active-manifest.json",
                         LIVE_QA_ACTIVE_POINTER=trusted / "active",
                         ACTIVE_PYTHON=fake_python,
-                        TRUSTED_SYSTEM_PYTHON=fake_python,
+                        TRUSTED_SYSTEM_PYTHON=fake_python_target,
                     ),
                     mock.patch.object(safe_env, "validate_active_runtime"),
                     mock.patch.object(
