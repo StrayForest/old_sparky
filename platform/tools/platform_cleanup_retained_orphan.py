@@ -109,12 +109,10 @@ def build_durable_manifest(
         or str(stored.get("report_path") or "") != report_path
     ):
         raise RuntimeError("durable QA report path does not match the exact load run")
-    if str(run.origin or "").rstrip("/") != EXPECTED_ORIGIN:
+    if run.origin != EXPECTED_ORIGIN:
         raise RuntimeError("durable QA row is not from the canonical production origin")
-    if str(stored.get("origin") or "").rstrip("/") != EXPECTED_ORIGIN:
+    if stored.get("origin_class") != "production_origin":
         raise RuntimeError("durable QA report is not from the canonical production origin")
-    if str(stored.get("request_origin") or "").rstrip("/") != EXPECTED_ORIGIN:
-        raise RuntimeError("durable QA request origin is not canonical")
     marker = str(run.marker or stored.get("marker") or "")
     if not MARKER_PATTERN.fullmatch(marker) or stored.get("marker") != marker:
         raise RuntimeError("durable QA marker is not canonical")

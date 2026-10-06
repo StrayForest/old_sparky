@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
 import io
 import unittest
+from uuid import uuid4
 
 from tools import platform_cleanup_retained_orphan as cleanup
+from tools.platform_production_qa import ProductionQa
 
 
 class RetainedOrphanCleanupTests(unittest.TestCase):
@@ -41,8 +44,7 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
         )
         report = {
             "marker": marker,
-            "origin": cleanup.EXPECTED_ORIGIN,
-            "request_origin": cleanup.EXPECTED_ORIGIN,
+            "origin_class": "production_origin",
             "mode": mode,
             "report_path": report_path,
             "user_ids": ["00000000-0000-0000-0000-000000000001"],
@@ -82,19 +84,28 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
     def test_builds_manifest_for_legacy_external_vote_report(self) -> None:
         marker = "preprod260829000001abcd"
         report_path = cleanup._legacy_external_vote_report_path(run_id="12345")
-        run = self._run(
+        producer = ProductionQa(
+            origin=cleanup.EXPECTED_ORIGIN,
+            report_path=Path(report_path),
+            http_timeout=1.0,
+            keep_data=True,
             mode="write-burst",
+        )
+        producer.marker = marker
+        producer.user_ids.append(str(uuid4()))
+        producer.report["marker"] = marker
+        producer.report["external_vote"] = {"tournament_count": 11}
+        report = producer._preprod_report_snapshot(progress=False)
+        self.assertEqual(report["origin_class"], "production_origin")
+        self.assertNotIn("origin", report)
+        self.assertNotIn("request_origin", report)
+        run = SimpleNamespace(
+            marker=marker,
+            origin=producer.origin,
             report_path=report_path,
-            report={
-                "marker": marker,
-                "origin": cleanup.EXPECTED_ORIGIN,
-                "request_origin": cleanup.EXPECTED_ORIGIN,
-                "mode": "write-burst",
-                "report_path": report_path,
-                "external_vote": {"tournament_count": 11},
-                "user_ids": ["00000000-0000-0000-0000-000000000001"],
-                "tournament_ids": [],
-            },
+            report=report,
+            status="running",
+            cleanup_state={},
         )
 
         manifest = cleanup.build_durable_manifest(
@@ -105,6 +116,42 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
 
         self.assertEqual(manifest["mode"], "write-burst")
         self.assertEqual(manifest["rows"][0]["report_path"], report_path)
+        self.assertEqual(
+            manifest["rows"][0]["request_origin"], cleanup.EXPECTED_ORIGIN
+        )
+        self.assertNotIn("origin", report)
+        self.assertNotIn("request_origin", report)
+
+        invalid_provenance = (
+            (
+                SimpleNamespace(**{**vars(run), "origin": "https://other.invalid"}),
+                report,
+                "durable QA row is not from the canonical production origin",
+            ),
+            (
+                run,
+                {**report, "origin_class": "local_origin"},
+                "durable QA report is not from the canonical production origin",
+            ),
+            (
+                run,
+                {
+                    key: value
+                    for key, value in report.items()
+                    if key != "origin_class"
+                } | {"origin": cleanup.EXPECTED_ORIGIN},
+                "durable QA report is not from the canonical production origin",
+            ),
+        )
+        for invalid_run, invalid_report, error in invalid_provenance:
+            with self.subTest(error=error):
+                invalid_run.report = invalid_report
+                with self.assertRaisesRegex(RuntimeError, error):
+                    cleanup.build_durable_manifest(
+                        invalid_run,
+                        load_run_id="12345",
+                        control_email="control@example.com",
+                    )
 
     def test_legacy_external_vote_path_requires_report_metadata(self) -> None:
         report_path = cleanup._legacy_external_vote_report_path(run_id="12345")
@@ -115,8 +162,7 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
                     report_path=report_path,
                     report={
                         "marker": "preprod260829000001abcd",
-                        "origin": cleanup.EXPECTED_ORIGIN,
-                        "request_origin": cleanup.EXPECTED_ORIGIN,
+                        "origin_class": "production_origin",
                         "mode": "write-burst",
                         "report_path": report_path,
                         "user_ids": ["00000000-0000-0000-0000-000000000001"],
@@ -140,8 +186,7 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
             report_path=report_path,
             report={
                 "marker": "preprod260829000001abcd",
-                "origin": cleanup.EXPECTED_ORIGIN,
-                "request_origin": cleanup.EXPECTED_ORIGIN,
+                "origin_class": "production_origin",
                 "mode": "write-burst",
                 "report_path": report_path,
                 "external_vote": {"tournament_count": 11},

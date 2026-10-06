@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import importlib.util
+import json
 import os
 from pathlib import Path
 import stat
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 from unittest.mock import patch
 
+from tools import platform_cleanup_retained_matrix
 from tools.platform_production_qa import ProductionQa
 
 
@@ -186,36 +188,100 @@ class RetainedWriteBurstReportRecoveryTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(report_path.stat().st_mode), 0o600)
 
     def test_recovered_summary_is_an_exact_single_row_cleanup_manifest(self) -> None:
-        user_ids = [str(uuid4()), str(uuid4())]
-        tournament_ids = [str(uuid4())]
-        report_path = Path(
-            "/opt/oldsparky/platform/shared/production-retained-matrix/"
-            "gha-32767006384/write-burst/write-burst.json"
-        )
-        report = {
-            "user_ids": user_ids,
-            "tournament_ids": tournament_ids,
-            "mode": "write-burst",
-            "write_burst": {"selection": "all"},
-            "performance": {"http_client": {"overall": {"p95_ms": 12.5, "p99_ms": 19.0}}},
-        }
+        for recovered in (False, True):
+            with self.subTest(recovered=recovered), tempfile.TemporaryDirectory() as temporary:
+                run_root = Path(temporary) / "gha-32767006384"
+                detail_root = run_root / "external-vote"
+                detail_root.mkdir(parents=True, mode=0o700)
+                report_path = detail_root / "external-vote.json"
+                summary_path = detail_root / "matrix-summary.json"
+                marker = "preprod260824120000abcd"
+                user_ids = [str(uuid4()), str(uuid4())]
+                tournament_ids = [str(uuid4())]
+                producer = ProductionQa(
+                    origin=recovery.EXPECTED_ORIGIN,
+                    report_path=report_path,
+                    http_timeout=1.0,
+                    keep_data=True,
+                    mode="write-burst",
+                )
+                producer.marker = marker
+                producer.user_ids.extend(user_ids)
+                producer.tournament_ids.extend(tournament_ids)
+                producer.report["marker"] = marker
+                producer.report["user_ids"] = user_ids
+                producer.report["tournament_ids"] = tournament_ids
+                producer.report["write_burst"] = {"selection": "all"}
+                source_report = producer._preprod_report_snapshot(progress=False)
+                self.assertEqual(source_report["mode"], "write-burst")
+                self.assertEqual(source_report["origin_class"], "production_origin")
+                self.assertNotIn("origin", source_report)
 
-        summary = recovery.build_recovered_summary(
-            report,
-            marker="preprod260824120000abcd",
-            report_path=report_path,
-            load_run_id="32767006384",
-            control_email="qa@example.invalid",
-        )
+                if recovered:
+                    detail_report = recovery._build_recovered_detail_report(
+                        source_report,
+                        mode="external-vote",
+                        marker=marker,
+                        report_path=report_path,
+                        user_ids=user_ids,
+                        tournament_ids=tournament_ids,
+                        run_id="32767006384",
+                    )
+                    summary = recovery.build_recovered_summary(
+                        detail_report,
+                        marker=marker,
+                        report_path=report_path,
+                        load_run_id="32767006384",
+                        control_email="qa@example.invalid",
+                    )
+                else:
+                    detail_report = source_report
+                    summary = {
+                        "mode": "write-burst",
+                        "completed_tournaments": len(tournament_ids),
+                        "rows": [{
+                            "synthetic_users": len(user_ids),
+                            "report_path": str(report_path),
+                            "result": {"marker": marker, "report_path": str(report_path)},
+                        }],
+                    }
 
-        self.assertEqual(summary["mode"], "write-burst")
-        self.assertFalse(summary["passed"])
-        self.assertTrue(summary["recovered"])
-        self.assertEqual(summary["completed_users"], 2)
-        self.assertEqual(summary["completed_tournaments"], 1)
-        self.assertEqual(len(summary["rows"]), 1)
-        self.assertEqual(summary["rows"][0]["result"]["marker"], "preprod260824120000abcd")
-        self.assertEqual(summary["write_burst"]["selection"], "all")
+                self.assertEqual(detail_report["mode"], "write-burst")
+                self.assertEqual(summary["mode"], "write-burst")
+                self.assertFalse(summary.get("passed", False))
+                if recovered:
+                    self.assertTrue(summary["recovered"])
+                    self.assertEqual(summary["completed_users"], len(user_ids))
+                    self.assertEqual(summary["write_burst"]["selection"], "all")
+                report_path.write_text(
+                    json.dumps(detail_report), encoding="utf-8"
+                )
+                summary_path.write_text(
+                    json.dumps(summary), encoding="utf-8"
+                )
+                report_path.chmod(0o600)
+                summary_path.chmod(0o600)
+
+                manifest = platform_cleanup_retained_matrix.load_matrix_manifest(
+                    summary_path,
+                    run_root=run_root,
+                    expected_control_email="qa@example.invalid",
+                )
+                self.assertEqual(manifest["mode"], "write-burst")
+                self.assertEqual(manifest["user_ids"], set(user_ids))
+                self.assertEqual(manifest["tournament_ids"], set(tournament_ids))
+                self.assertEqual(manifest["rows"][0]["report_path"], str(report_path))
+
+                invalid_detail = dict(detail_report, mode="external-vote")
+                report_path.write_text(
+                    json.dumps(invalid_detail), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ValueError, "canonical production retained-load report"):
+                    platform_cleanup_retained_matrix.load_matrix_manifest(
+                        summary_path,
+                        run_root=run_root,
+                        expected_control_email="qa@example.invalid",
+                    )
 
     def test_read_mix_recovery_has_one_tournament(self) -> None:
         user_ids = [str(uuid4())]
