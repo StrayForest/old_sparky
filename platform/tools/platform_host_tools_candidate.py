@@ -176,6 +176,7 @@ EXPECTED_JOB_NAMES = frozenset(
     {
         "CI route classifier",
         "status-start",
+        "Authenticate internal baseline runtime proof",
         "Backend DB-free contours",
         "Backend PostgreSQL and Redis integration",
         "Backend privileged ephemeral contour",
@@ -190,6 +191,7 @@ EXPECTED_JOB_NAMES = frozenset(
         "Conditional release runtime fixture",
         "Trusted dev immutable release runtime",
         "status-final",
+        "Dispatch exact baseline proof finalizer",
     }
 )
 REQUIRED_SUCCESS_JOB_NAMES = frozenset(
@@ -210,7 +212,19 @@ REQUIRED_SUCCESS_JOB_NAMES = frozenset(
     }
 )
 CONDITIONAL_JOB_NAMES = frozenset(
-    {"status-start", "Conditional release runtime fixture", "Trusted dev immutable release runtime"}
+    {
+        "status-start",
+        "Authenticate internal baseline runtime proof",
+        "Conditional release runtime fixture",
+        "Trusted dev immutable release runtime",
+        "Dispatch exact baseline proof finalizer",
+    }
+)
+PR_ALWAYS_SKIPPED_JOB_NAMES = frozenset(
+    {
+        "Authenticate internal baseline runtime proof",
+        "Dispatch exact baseline proof finalizer",
+    }
 )
 
 
@@ -1380,6 +1394,9 @@ def verify_jobs(jobs_path: Path, context: RunContext, summary: Mapping[str, obje
     for name in CONDITIONAL_JOB_NAMES:
         if by_name[name].get("conclusion") not in {"success", "skipped"}:
             raise CandidateError("conditional security job conclusion is invalid")
+    for name in PR_ALWAYS_SKIPPED_JOB_NAMES:
+        if by_name[name].get("conclusion") != "skipped":
+            raise CandidateError("PR baseline proof job was unexpectedly run")
     if summary.get("requires_release_runtime") is True and by_name["Conditional release runtime fixture"].get("conclusion") != "success":
         raise CandidateError("summary required the release runtime fixture")
     if summary.get("requires_release_runtime") is False and by_name["Conditional release runtime fixture"].get("conclusion") != "skipped":
