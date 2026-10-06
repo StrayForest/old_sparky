@@ -72,7 +72,13 @@ cleanup_exit_report() {
 trap cleanup_exit_report EXIT
 run_external_vote_recovery() {
   CLEANUP_STAGE="external_vote_recovery"
-  "$@" >/dev/null 2>&1
+  "$SYSTEM_PYTHON" -I -B \
+    "$TOOLS_DIR/platform_capture_retained_recovery_stderr.py" \
+    --load-run-id "$load_run_id" \
+    --cleanup-run-id "$cleanup_run_id" \
+    --control-email "$control_email" \
+    --mode "$recovery_profile" \
+    >/dev/null 2>&1
 }
 if (( $# != 5 )) || [[ "$1" != "$CONFIRMATION" ]]; then
   echo "Usage: $0 $CONFIRMATION <target-sha> <load-run-id> <control-email> <cleanup-run-id>" >&2
@@ -333,13 +339,7 @@ if (( recovery_needed == 1 )) || {
     exit 0
   fi
   if (( profile_count == 1 )); then
-    run_external_vote_recovery "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
-      --pythonpath "$PLATFORM_ROOT" \
-      -- "$QA_PYTHON" "$TOOLS_DIR/platform_recover_retained_report.py" \
-      --run-root "$run_root" \
-      --load-run-id "$load_run_id" \
-      --control-email "$control_email" \
-      --mode "$recovery_profile"
+    run_external_vote_recovery
   fi
   shopt -s nullglob
   summaries=("$run_root"/*/matrix-summary.json)

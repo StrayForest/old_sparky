@@ -6,6 +6,7 @@ from pathlib import Path
 import pwd
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -13,9 +14,101 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 from tools import platform_retained_load_export_executor as executor
+from tools import platform_capture_retained_recovery_stderr as recovery_capture
 
 
 class RetainedLoadExportExecutorTests(unittest.TestCase):
+    def test_recovery_stderr_is_bounded_private_and_failure_is_preserved(self) -> None:
+        class FakeProcess:
+            def __init__(self, payload: bytes) -> None:
+                self.stderr = io.BytesIO(payload)
+
+            def wait(self) -> int:
+                return 37
+
+            def poll(self) -> int:
+                return 37
+
+        payload = b"private-recovery-diagnostic-" * 4000
+        with tempfile.TemporaryDirectory(
+            prefix="retained-recovery-", dir="/root"
+        ) as parent:
+            run_root_base = Path(parent) / "production-retained-matrix"
+            run_root = run_root_base / "gha-12345"
+            run_root.mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            with (
+                patch.object(recovery_capture, "RUN_ROOT_BASE", run_root_base),
+                patch.object(
+                    recovery_capture.subprocess,
+                    "Popen",
+                    return_value=FakeProcess(payload),
+                ) as popen,
+            ):
+                status = recovery_capture.capture_recovery_stderr(
+                    load_run_id="12345",
+                    cleanup_run_id="67890",
+                    control_email="private@example.invalid",
+                    mode="external-vote",
+                )
+
+            self.assertEqual(status, 37)
+            popen.assert_called_once()
+            command = popen.call_args.args[0]
+            self.assertEqual(command[0:3], ["/usr/bin/python3.12", "-I", "-B"])
+            self.assertTrue(
+                any(
+                    argument.endswith("platform_recover_retained_report.py")
+                    for argument in command
+                )
+            )
+            self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
+            self.assertEqual(popen.call_args.kwargs["close_fds"], True)
+
+            capture = run_root / "cleanup-recovery-12345-67890.stderr"
+            metadata = capture.lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual((metadata.st_uid, metadata.st_gid), (0, 0))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_nlink, 1)
+            content = capture.read_bytes()
+            self.assertLessEqual(len(content), recovery_capture.MAX_CAPTURE_BYTES)
+            self.assertIn(b"private-recovery-diagnostic", content)
+            self.assertTrue(content.endswith(recovery_capture.TRUNCATION_MARKER))
+
+    def test_recovery_capture_collision_preserves_existing_private_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="retained-recovery-collision-", dir="/root"
+        ) as parent:
+            run_root_base = Path(parent) / "production-retained-matrix"
+            run_root = run_root_base / "gha-12345"
+            run_root.mkdir(parents=True, mode=0o700)
+            run_root.chmod(0o700)
+            capture = run_root / "cleanup-recovery-12345-67890.stderr"
+            capture.write_bytes(b"existing failure evidence\n")
+            capture.chmod(0o600)
+            before = capture.stat()
+            with (
+                patch.object(recovery_capture, "RUN_ROOT_BASE", run_root_base),
+                patch.object(recovery_capture.subprocess, "Popen") as popen,
+            ):
+                with self.assertRaises(FileExistsError):
+                    recovery_capture.capture_recovery_stderr(
+                        load_run_id="12345",
+                        cleanup_run_id="67890",
+                        control_email="private@example.invalid",
+                        mode="external-vote",
+                    )
+            popen.assert_not_called()
+            after = capture.stat()
+            self.assertEqual(capture.read_bytes(), b"existing failure evidence\n")
+            self.assertEqual(
+                (before.st_dev, before.st_ino), (after.st_dev, after.st_ino)
+            )
+            self.assertEqual(before.st_mtime_ns, after.st_mtime_ns)
+
     def test_cleanup_recovery_failure_emits_only_fixed_stage_marker(self) -> None:
         script = (
             Path(__file__).resolve().parents[1]
@@ -32,7 +125,6 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             for name in (
                 "cleanup_stage_emit",
                 "cleanup_exit_report",
-                "run_external_vote_recovery",
             )
         )
         harness = "\n".join(
@@ -41,13 +133,17 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
                 'CLEANUP_STAGE="run_root"',
                 "platform_retained_load_lock_close() { :; }",
                 shell_functions,
-                "trap cleanup_exit_report EXIT",
-                "if run_external_vote_recovery /bin/bash -c "
+                "run_external_vote_recovery() {",
+                '  CLEANUP_STAGE="external_vote_recovery"',
+                "  /bin/bash -c "
                 + shlex.quote(
                     "printf 'private stdout sentinel\\n'; "
                     "printf 'private stderr sentinel\\n' >&2; exit 37"
                 )
-                + '; then exit 0; else status=$?; exit "$status"; fi',
+                + " >/dev/null 2>&1",
+                "}",
+                "trap cleanup_exit_report EXIT",
+                'if run_external_vote_recovery; then exit 0; else status=$?; exit "$status"; fi',
             )
         )
         completed = subprocess.run(
@@ -67,7 +163,13 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         self.assertNotIn(b"private", completed.stdout + completed.stderr)
         self.assertNotIn(b"PRODUCTION_RETAINED_LOAD_CLEANUP_OK", completed.stdout)
 
-        recovery_call = script.index('run_external_vote_recovery "$SYSTEM_PYTHON"')
+        recovery_call = script.index("run_external_vote_recovery\n")
+        self.assertIn('CLEANUP_STAGE="external_vote_recovery"', script)
+        recovery_function = script.split("run_external_vote_recovery() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertIn("platform_capture_retained_recovery_stderr.py", recovery_function)
+        self.assertIn(">/dev/null 2>&1", recovery_function)
         export_creation = script.index(
             '/usr/bin/mkdir -m 0700 -- "$export_dir"', recovery_call
         )
