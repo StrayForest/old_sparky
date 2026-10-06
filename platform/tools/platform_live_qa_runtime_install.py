@@ -131,6 +131,12 @@ TOOL_FILES = (
     "platform_provision_live_csp_qa.py",
     "platform_recover_live_user_qa.py",
     "platform_cleanup_live_user_qa.py",
+    # Retained-load cleanup runs only through the active, digest-bound live-QA
+    # payload.  safe_env_exec independently allowlists these fixed entrypoints
+    # and rejects current-release or checkout paths.
+    "platform_cleanup_retained_orphan.py",
+    "platform_recover_retained_report.py",
+    "platform_cleanup_retained_matrix.py",
 )
 SOURCE_TREES = (
     "apps/platform_api",
@@ -1019,6 +1025,9 @@ def _validate_payload(payload: dict[str, object]) -> None:
         "platform/tools/platform_live_qa_guard.py",
         "platform/tools/platform_safe_env_exec.py",
         "platform/tools/platform_live_qa_mailbox_helper.py",
+        "platform/tools/platform_cleanup_retained_orphan.py",
+        "platform/tools/platform_recover_retained_report.py",
+        "platform/tools/platform_cleanup_retained_matrix.py",
     }
     if not required_files.issubset(manifest_files):
         raise InstallerError("trusted live-QA manifest is missing a required entrypoint")
