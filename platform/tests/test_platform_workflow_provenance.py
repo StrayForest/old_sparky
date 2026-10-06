@@ -56,6 +56,7 @@ from tools.platform_deploy_baseline import (  # noqa: E402
     classify_cumulative_baseline,
     validate_active_baseline,
     validate_baseline_runtime_proof,
+    validate_cumulative_reconcile_route,
     validate_report_only_recovery_baseline,
     wait_for_autodeploy_completion,
 )
@@ -678,6 +679,50 @@ class WorkflowProvenanceTests(unittest.TestCase):
         self.assertTrue(manifest["deployable"])
         self.assertEqual(manifest["class"], "full")
         self.assertFalse(manifest["fallback"])
+        self.assertEqual(
+            validate_cumulative_reconcile_route(cumulative),
+            {"no_op": False, "runtime_required": True},
+        )
+
+        bootstrap = classify(
+            [".github/workflows/platform-production-deploy.yml"],
+            event="push",
+            branch="dev",
+            target_sha=self.SHA,
+        )
+        no_op = classify_cumulative_baseline(
+            bootstrap,
+            [".github/workflows/platform-production-deploy.yml"],
+            expected_target_sha=self.SHA,
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(no_op),
+            {"no_op": True, "runtime_required": False},
+        )
+
+        incremental_path = "platform/tests/test_platform_live_qa_wrappers.py"
+        incremental = classify(
+            [incremental_path], event="push", branch="dev", target_sha=self.SHA
+        )
+        cumulative_paths = [
+            ".github/workflows/platform-production-external-load.yml",
+            ".github/workflows/platform-production-retained-load-abort.yml",
+            ".github/workflows/platform-production-retained-load-cleanup.yml",
+            "platform/apps/platform_web/package-lock.json",
+            "platform/docs/operations-runbook.md",
+            "platform/tests/test_platform_external_load_workflow_contract.py",
+            incremental_path,
+        ]
+        nonruntime = classify_cumulative_baseline(
+            incremental, cumulative_paths, expected_target_sha=self.SHA
+        )
+        self.assertFalse(nonruntime["no_op"])
+        self.assertFalse(nonruntime["manifest"]["runtime_sensitive"])
+        self.assertTrue(nonruntime["manifest"]["deployable"])
+        self.assertEqual(
+            validate_cumulative_reconcile_route(nonruntime),
+            {"no_op": False, "runtime_required": False},
+        )
 
     def test_report_only_recovery_baseline_binds_exact_failed_release_and_closed_route(self) -> None:
         failed_sha = "a" * 40
@@ -861,6 +906,28 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_target_sha=self.SHA,
             )
 
+        valid_runtime = classify_cumulative_baseline(
+            incremental,
+            [incremental_path, "platform/tools/platform_build_release.sh"],
+            expected_target_sha=self.SHA,
+        )
+        valid_manifest = valid_runtime["manifest"]
+        invalid_routes = (
+            {"manifest": {**valid_manifest, "deployable": False}, "no_op": False},
+            {"manifest": {**valid_manifest, "fallback": True}, "no_op": False},
+            {
+                "manifest": {
+                    **valid_manifest,
+                    "expected_gates": valid_manifest["expected_gates"][:-1],
+                },
+                "no_op": False,
+            },
+            {"manifest": {**valid_manifest, "runtime_sensitive": False}, "no_op": True},
+        )
+        for route in invalid_routes:
+            with self.subTest(route=route), self.assertRaises(ProvenanceError):
+                validate_cumulative_reconcile_route(route)
+
     def test_cumulative_storage_recovery_family_is_a_separate_noop_decision(self) -> None:
         historical_storage_paths = [
             ".agents/skills/platform-storage-retention/SKILL.md",
@@ -905,6 +972,10 @@ class WorkflowProvenanceTests(unittest.TestCase):
         )
         self.assertTrue(actual16["no_op"])
         self.assertEqual(actual16["manifest"], actual16_manifest)
+        self.assertEqual(
+            validate_cumulative_reconcile_route(actual16),
+            {"no_op": True, "runtime_required": False},
+        )
 
         source_fix_incremental = classify(
             [
@@ -946,6 +1017,10 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 self.assertTrue(result["manifest"]["runtime_sensitive"])
                 self.assertTrue(result["manifest"]["deployable"])
                 self.assertFalse(result["manifest"]["fallback"])
+                self.assertEqual(
+                    validate_cumulative_reconcile_route(result),
+                    {"no_op": True, "runtime_required": False},
+                )
 
         # Removing every storage trigger leaves a valid historical recovery
         # no-op. It must retain its recovery manifest identity; the new
