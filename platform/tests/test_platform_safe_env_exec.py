@@ -174,24 +174,122 @@ class SafeEnvExecTests(unittest.TestCase):
         )
 
     def test_command_validation_requires_matching_runtime_contour(self) -> None:
-        with (
-            mock.patch.object(
-                safe_env,
-                "_read_liveqa_manifest",
-                return_value={"payload": str(self.LIVE_QA_PAYLOAD)},
-            ),
-            self.assertRaisesRegex(safe_env.SafeEnvError, "approved live QA DB tool"),
-        ):
-            safe_env.validate_trusted_command(
-                [
-                    str(safe_env.ACTIVE_PYTHON),
-                    str(
-                        safe_env.ACTIVE_PLATFORM_ROOT
-                        / "tools/platform_cleanup_live_user_qa.py"
+        def validate_case(
+            *,
+            symlink_owner: int = 0,
+            target_owner: int = 0,
+            target_mode: int = 0o755,
+            wrong_target: bool = False,
+            script_mode: int = 0o444,
+            payload_mode: int = 0o555,
+            script_symlink: bool = False,
+            expected_error: str | None = None,
+        ) -> None:
+            with self.active_payload_fixture() as (_manifest, payload):
+                fixture_root = payload.parents[2]
+                payload_tools = payload / "platform" / "tools"
+                payload_tools.mkdir(parents=True, mode=0o755)
+                script = payload_tools / "platform_recover_retained_report.py"
+                script.write_text("# fixed test tool\n", encoding="ascii")
+                os.chown(script, 0, 0)
+                os.chmod(script, 0o444)
+                if script_symlink:
+                    target_script = payload_tools / "target.py"
+                    target_script.write_text("# target\n", encoding="ascii")
+                    os.chown(target_script, 0, 0)
+                    os.chmod(target_script, 0o444)
+                    script.unlink()
+                    script.symlink_to(target_script)
+                else:
+                    os.chmod(script, script_mode)
+                os.chmod(payload_tools, 0o555)
+                os.chmod(payload, payload_mode)
+
+                python_target = fixture_root / "trusted-python"
+                python_target.write_bytes(b"fixed interpreter fixture\n")
+                os.chown(python_target, target_owner, target_owner)
+                os.chmod(python_target, target_mode)
+                wrong_python_target = fixture_root / "wrong-python"
+                wrong_python_target.write_bytes(b"wrong interpreter fixture\n")
+                os.chown(wrong_python_target, 0, 0)
+                os.chmod(wrong_python_target, 0o755)
+                python_link = (
+                    fixture_root
+                    / "production"
+                    / "shared"
+                    / "venv"
+                    / "bin"
+                    / "python"
+                )
+                python_link.parent.mkdir(mode=0o755, parents=True)
+                python_link.symlink_to(
+                    wrong_python_target if wrong_target else python_target
+                )
+                os.chown(
+                    python_link,
+                    symlink_owner,
+                    symlink_owner,
+                    follow_symlinks=False,
+                )
+
+                with (
+                    mock.patch.object(
+                        safe_env,
+                        "_read_liveqa_manifest",
+                        return_value={"payload": str(payload)},
                     ),
-                ],
-                pythonpath=self.LIVE_QA_PAYLOAD,
-            )
+                    mock.patch.object(safe_env, "validate_active_runtime"),
+                    mock.patch.object(safe_env, "ACTIVE_PYTHON", python_link),
+                    mock.patch.object(
+                        safe_env, "TRUSTED_SYSTEM_PYTHON", python_target
+                    ),
+                ):
+                    command = [str(python_link), str(script)]
+                    if expected_error is None:
+                        safe_env.validate_trusted_command(command, pythonpath=payload)
+                    else:
+                        with self.assertRaisesRegex(
+                            safe_env.SafeEnvError, expected_error
+                        ):
+                            safe_env.validate_trusted_command(
+                                command, pythonpath=payload
+                            )
+
+        with self.assertRaisesRegex(
+            safe_env.SafeEnvError, "approved live QA DB tool"
+        ):
+            with (
+                mock.patch.object(
+                    safe_env,
+                    "_read_liveqa_manifest",
+                    return_value={"payload": str(self.LIVE_QA_PAYLOAD)},
+                ),
+                mock.patch.object(safe_env, "validate_active_runtime"),
+            ):
+                safe_env.validate_trusted_command(
+                    [
+                        str(safe_env.ACTIVE_PYTHON),
+                        str(
+                            safe_env.ACTIVE_PLATFORM_ROOT
+                            / "tools/platform_cleanup_live_user_qa.py"
+                        ),
+                    ],
+                    pythonpath=self.LIVE_QA_PAYLOAD,
+                )
+
+        validate_case()
+        for kwargs, reason in (
+            ({"wrong_target": True}, "Python target is unsafe"),
+            ({"symlink_owner": 65534}, "target ownership is unsafe"),
+            ({"target_owner": 65534}, "Python target is unsafe"),
+            ({"target_mode": 0o775}, "Python target is unsafe"),
+            ({"target_mode": 0o4755}, "Python target is unsafe"),
+            ({"script_mode": 0o664}, "target ownership is unsafe"),
+            ({"payload_mode": 0o775}, "target ownership is unsafe"),
+            ({"script_symlink": True}, "script target is unsafe"),
+        ):
+            with self.subTest(**kwargs):
+                validate_case(**kwargs, expected_error=reason)
 
     def test_retained_report_recovery_is_an_approved_db_tool(self) -> None:
         self.assertIn(
