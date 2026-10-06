@@ -77,7 +77,6 @@ except ImportError:  # Direct execution from the tools directory.
 DEFAULT_APP_DIR = Path("/opt/oldsparky/platform")
 DEFAULT_SOURCE_RELEASE_DIR = Path("/root/old_sparky/platform/dist/releases")
 DEFAULT_WEB_ARTIFACT_DIR = Path("/root/old_sparky/platform/apps/platform_web")
-BACKUP_ONLY_KEEP = 14
 SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 SAFE_RUNTIME_ID_RE = re.compile(r"^runtime-[0-9a-f]{40}$")
 
@@ -142,6 +141,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-backup", action="store_true")
     parser.add_argument(
+        "--private-backup-diagnostics",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--backup-only",
         action="store_true",
         help=(
@@ -173,10 +177,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--backup-only cannot be combined with --skip-backup")
     if args.backup_only and not args.apply:
         parser.error("--backup-only requires --apply")
-    if args.backup_only and args.backup_keep != BACKUP_ONLY_KEEP:
-        parser.error(
-            f"--backup-only requires --backup-keep {BACKUP_ONLY_KEEP}"
-        )
+    if args.private_backup_diagnostics and not args.backup_only:
+        parser.error("--private-backup-diagnostics requires --backup-only")
     if args.report_keep < 1:
         parser.error("--report-keep must be at least 1")
     if not 1 <= args.live_qa_runtime_keep <= 100:
@@ -438,19 +440,38 @@ def disk_snapshot(path: Path) -> dict[str, int | float]:
     return disk_snapshot_for_path(path).as_dict()
 
 
-def _run_backup_command(command: list[str]) -> dict[str, Any]:
+def _run_backup_command(
+    command: list[str], *, forward_failure_diagnostics: bool = False
+) -> dict[str, Any]:
     completed = subprocess.run(command, check=False, capture_output=True, text=True)
     try:
         result = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
+        if forward_failure_diagnostics and completed.stderr:
+            sys.stderr.write(completed.stderr[:65536])
         raise RuntimeError("Platform backup returned invalid JSON output.") from exc
     if completed.returncode != 0 or not isinstance(result, dict) or not result.get("ok"):
+        if forward_failure_diagnostics:
+            diagnostic_parts = [
+                value[:65536]
+                for value in (completed.stderr, result.get("error") if isinstance(result, dict) else None)
+                if isinstance(value, str) and value
+            ]
+            if diagnostic_parts:
+                sys.stderr.write("\n".join(diagnostic_parts)[:65536])
+                if not diagnostic_parts[-1].endswith("\n"):
+                    sys.stderr.write("\n")
         raise RuntimeError("Platform backup failed.")
     return result
 
 
 def run_backup(
-    app_dir: Path, *, keep: int, max_age_hours: float = 24.0
+    app_dir: Path,
+    *,
+    keep: int,
+    max_age_hours: float = 24.0,
+    rotate_existing: bool = True,
+    private_failure_diagnostics: bool = False,
 ) -> dict[str, Any]:
     if not math.isfinite(max_age_hours) or max_age_hours <= 0:
         raise ValueError("backup max age must be finite and positive")
@@ -465,9 +486,13 @@ def run_backup(
         str(shared_dir / "backups"),
         "--keep",
         str(keep),
+        "--rotate-existing" if rotate_existing else "--preserve-existing",
         "--json",
     ]
-    result = _run_backup_command(create_command)
+    result = _run_backup_command(
+        create_command,
+        forward_failure_diagnostics=private_failure_diagnostics,
+    )
     check_result = _run_backup_command(
         [
             sys.executable,
@@ -480,7 +505,8 @@ def run_backup(
             "--max-age-hours",
             str(max_age_hours),
             "--json",
-        ]
+        ],
+        forward_failure_diagnostics=private_failure_diagnostics,
     )
     if result.get("restore_verified") is not True or check_result.get("restore_verified") is not True:
         raise RuntimeError("Platform backup was not restore-verified.")
@@ -509,6 +535,26 @@ def run_backup(
         and check_result.get("age_hours") >= 0
         else None,
         "removed_count": len(result.get("removed") or []),
+        "rotation_mode": result.get("rotation_mode"),
+        "preexisting_archive_count": result.get("preexisting_archive_count")
+        if isinstance(result.get("preexisting_archive_count"), int)
+        and not isinstance(result.get("preexisting_archive_count"), bool)
+        else None,
+        "preexisting_sidecar_count": result.get("preexisting_sidecar_count")
+        if isinstance(result.get("preexisting_sidecar_count"), int)
+        and not isinstance(result.get("preexisting_sidecar_count"), bool)
+        else None,
+        "preexisting_archive_inventory_sha256": result.get(
+            "preexisting_archive_inventory_sha256"
+        )
+        if isinstance(result.get("preexisting_archive_inventory_sha256"), str)
+        else None,
+        "postexisting_archive_inventory_sha256": result.get(
+            "postexisting_archive_inventory_sha256"
+        )
+        if isinstance(result.get("postexisting_archive_inventory_sha256"), str)
+        else None,
+        "preexisting_archives_preserved": result.get("preexisting_archives_preserved") is True,
     }
 
 
@@ -623,6 +669,7 @@ def _plan_and_maybe_apply(
                     app_dir,
                     keep=args.backup_keep,
                     max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
+                    rotate_existing=True,
                 ),
             }
         apply_release_plan(production_plan, app_dir=app_dir)
@@ -671,9 +718,9 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
             if getattr(args, "backup_only", False):
                 # Do not construct or apply release, artifact, transient or
                 # live-QA retention plans in this mode. The backup owner may
-                # rotate only its verified archive set, bounded to 14 copies.
-                # A backup/restore failure therefore exits before rotation
-                # or any other deletion path.
+                # Preserve every pre-existing archive; archive rotation belongs
+                # only to the separate full-maintenance retention path.
+                # A backup/restore failure exits before any deletion path.
                 maintenance_result = (
                     RetentionPlan((), (), ()),
                     ArtifactRetentionPlan((), (), ()),
@@ -684,8 +731,12 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                         "status": "completed",
                         **run_backup(
                             app_dir,
-                            keep=BACKUP_ONLY_KEEP,
+                            keep=args.backup_keep,
                             max_age_hours=getattr(args, "backup_max_age_hours", 24.0),
+                            rotate_existing=False,
+                            private_failure_diagnostics=getattr(
+                                args, "private_backup_diagnostics", False
+                            ),
                         ),
                     },
                     {
