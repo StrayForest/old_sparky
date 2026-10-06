@@ -34,7 +34,14 @@ follow-up stdin-boundary and cleanup-ownership correction uses **C**
 `9b9c0317776b8e788d916b2eb5d4d7ac9cb71af8`; its pin update records the same
 14-member closure with the exact changed dispatcher and input-guard digests.
 The exact-P preflight and root provisioning remain required before that
-generation is used. The
+generation is used. The sudo-policy denial compatibility correction uses **C**
+`f997be4747f70631b79439d02deffd1160bea149` and pin commit **P**
+`246184a12e19fcb2b9e3aabf2cd7d767a08d2214`; P records C's exact 14-member
+closure. Its retained-load executor accepts only status 0 or 1 paired with the
+exact single ASCII denial line for the fixed artifact account and local host.
+Granted privilege output, extra output, other statuses and check errors remain
+fail-closed. Exact-P provisioning and the installed generation self-test are
+required before this generation is used. The
 active application release and production health are owned by
 [`CURRENT.md`](../CURRENT.md); this ADR does not duplicate those changing facts.
 The pin records the
