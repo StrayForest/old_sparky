@@ -1487,7 +1487,6 @@ jobs:
         if: ${{ always() }}
         shell: bash
         env:
-          ORIGIN_PRIOR_STEPS_SUCCESS: ${{ success() }}
           ORIGIN_NAMESPACE_CLOSED: ${{ needs.namespace-containment-barrier.outputs.namespace_closed_status }}
           ORIGIN_MANUAL_REQUIRED: ${{ needs.namespace-containment-manual-barrier.outputs.manual_required }}
           ORIGIN_CLEANUP_SSH_OUTCOME: ${{ steps.cleanup_ssh.outcome }}
@@ -1510,7 +1509,6 @@ jobs:
               return allowed.get(value, "invalid")
 
           fields = {
-              "prior": classify("ORIGIN_PRIOR_STEPS_SUCCESS", {"true": "ok", "false": "blocked"}),
               "namespace": classify("ORIGIN_NAMESPACE_CLOSED", {"0": "closed", "1": "open"}),
               "manual": classify("ORIGIN_MANUAL_REQUIRED", {"0": "none", "1": "required"}),
               "ssh_step": classify(
@@ -1525,10 +1523,9 @@ jobs:
               "ssh_cleanup": classify("ORIGIN_SSH_CLEANUP_STATUS", {"0": "ok", "1": "failed"}),
               "identity": classify("ORIGIN_CLEANUP_IDENTITY_STATUS", {"0": "ok", "1": "failed"}),
           }
-          eligible = all(
+          explicit_conditions_met = all(
               fields[name] == expected
               for name, expected in (
-                  ("prior", "ok"),
                   ("namespace", "closed"),
                   ("manual", "none"),
                   ("ssh_step", "ok"),
@@ -1542,7 +1539,10 @@ jobs:
               )
           )
           summary = " ".join(f"{name}={value}" for name, value in fields.items())
-          print(f"ORIGIN_PUBLISH_GATE {summary} eligible={'yes' if eligible else 'no'}")
+          print(
+              "ORIGIN_PUBLISH_GATE "
+              f"{summary} explicit_conditions_met={'yes' if explicit_conditions_met else 'no'}"
+          )
           PY
           diagnostic_status="$?"
           if [[ "$diagnostic_status" != 0 ]]; then
