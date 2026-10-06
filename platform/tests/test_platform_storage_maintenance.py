@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import errno
 import fcntl
 import io
 import json
@@ -31,6 +32,27 @@ from tools.platform_storage_maintenance import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _read_linux_proc_state(proc_stat: Path) -> str | None:
+    try:
+        stat_text = proc_stat.read_text(encoding="ascii")
+    except FileNotFoundError as exc:
+        if exc.errno == errno.ENOENT:
+            return None
+        raise
+    except ProcessLookupError as exc:
+        if exc.errno == errno.ESRCH:
+            return None
+        raise
+
+    _prefix, separator, remainder = stat_text.rpartition(")")
+    if not separator:
+        raise ValueError("malformed /proc stat record")
+    fields = remainder.split()
+    if not fields or len(fields[0]) != 1 or fields[0] not in "RSDZTtXxKWPI":
+        raise ValueError("malformed /proc stat process state")
+    return fields[0]
 
 
 class PlatformStorageMaintenanceTests(unittest.TestCase):
@@ -862,6 +884,32 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         exec(function_source, namespace)
 
         with tempfile.TemporaryDirectory() as temporary_dir:
+            proc_stat = Path(f"/proc/{os.getpid()}/stat")
+            for missing_error in (
+                FileNotFoundError(errno.ENOENT, "process exited"),
+                ProcessLookupError(errno.ESRCH, "process exited"),
+            ):
+                with mock.patch.object(
+                    Path,
+                    "read_text",
+                    side_effect=missing_error,
+                ) as read_stat:
+                    self.assertIsNone(_read_linux_proc_state(proc_stat))
+                    read_stat.assert_called_once_with(encoding="ascii")
+            with mock.patch.object(
+                Path,
+                "read_text",
+                side_effect=PermissionError(errno.EACCES, "denied"),
+            ):
+                with self.assertRaises(PermissionError):
+                    _read_linux_proc_state(proc_stat)
+            with mock.patch.object(Path, "read_text", return_value="malformed"):
+                with self.assertRaises(ValueError):
+                    _read_linux_proc_state(proc_stat)
+            with mock.patch.object(Path, "read_text", return_value="123 (python) RR 1"):
+                with self.assertRaises(ValueError):
+                    _read_linux_proc_state(proc_stat)
+
             child_code = textwrap.dedent(
                 """
                 import signal
@@ -897,7 +945,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertIsNotNone(process.returncode)
             proc_stat = Path(f"/proc/{grandchild_pid}/stat")
             for _ in range(30):
-                if not proc_stat.exists() or proc_stat.read_text().split()[2] == "Z":
+                process_state = _read_linux_proc_state(proc_stat)
+                if process_state is None:
+                    break
+                if process_state == "Z":
                     break
                 time.sleep(0.1)
             else:
