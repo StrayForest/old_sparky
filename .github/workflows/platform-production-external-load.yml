@@ -1454,7 +1454,6 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-          HOST_TOOLS_SHA: ${{ steps.resolve_retained_load_host_tools.outputs.host_tools_sha }}
           HANDOFF_STATUS: ${{ steps.revalidate-finalizer.outputs.handoff_status }}
         run: |
           set -u
@@ -1502,7 +1501,6 @@ jobs:
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-          HOST_TOOLS_SHA: ${{ steps.resolve_retained_load_host_tools.outputs.host_tools_sha }}
           CLEANUP_IDENTITY_STATUS: ${{ steps.revalidate-finalizer.outputs.cleanup_identity_status }}
         run: |
           set -u
