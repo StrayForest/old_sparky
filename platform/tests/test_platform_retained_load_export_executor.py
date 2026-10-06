@@ -9,12 +9,24 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from tools import platform_retained_load_export_executor as executor
 
 
 class RetainedLoadExportExecutorTests(unittest.TestCase):
+    def test_missing_preprovisioned_owner_fails_closed_without_provisioning(
+        self,
+    ) -> None:
+        with patch.object(executor.pwd, "getpwnam", side_effect=KeyError):
+            with self.assertRaisesRegex(
+                executor.ExportCleanupError, "account_lookup_failed"
+            ):
+                executor.resolve_artifact_identity(
+                    require_root=False, verify_shadow=False
+                )
+
     def test_closed_payload_accepts_only_exact_positive_run_bindings(self) -> None:
         valid = io.BytesIO(
             b'{"schema":1,"load_run_id":"37418874056","cleanup_run_id":"37423702916"}'
@@ -38,6 +50,18 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             with self.subTest(document=document):
                 with self.assertRaises(executor.ExportCleanupError):
                     executor._parse_payload(
+                        SimpleNamespace(buffer=io.BytesIO(document))
+                    )
+        invalid_load_documents = (
+            b'{"schema":1,"load_run_id":"1","cleanup_run_id":"2"}',
+            b'{"schema":true,"load_run_id":"1"}',
+            b'{"schema":1,"load_run_id":"0"}',
+            b'{"schema":1,"load_run_id":"1","path":"/tmp/unsafe"}',
+        )
+        for document in invalid_load_documents:
+            with self.subTest(document=document):
+                with self.assertRaises(executor.ExportCleanupError):
+                    executor._parse_load_payload(
                         SimpleNamespace(buffer=io.BytesIO(document))
                     )
 
@@ -345,6 +369,183 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             completed.returncode, 0, completed.stderr.decode("utf-8", "replace")
         )
         self.assertEqual(completed.stdout, b"DROP_CONTRACT_PASS\n")
+
+    @unittest.skipUnless(
+        os.geteuid() == 0 and shutil.which("setpriv"),
+        "requires root setpriv and an isolated sticky directory",
+    )
+    def test_touch_complete_creates_exact_marker_and_is_idempotent(self) -> None:
+        try:
+            user = pwd.getpwnam("nobody")
+        except KeyError:
+            self.skipTest("no unprivileged test identity is installed")
+        with tempfile.TemporaryDirectory(prefix="load-export-complete-") as parent:
+            tmp_root = Path(parent) / "tmp"
+            tmp_root.mkdir(mode=0o700)
+            os.chmod(tmp_root, 0o1777)
+            os.chown(tmp_root, 0, 0)
+            os.chmod(parent, 0o711)
+            root = tmp_root / f"{executor.LOAD_PREFIX}123456789"
+            root.mkdir(mode=0o700)
+            os.chmod(root, 0o700)
+            os.chown(root, user.pw_uid, user.pw_gid)
+            module_path = Path(executor.__file__).resolve()
+            program = "\n".join(
+                (
+                    "import importlib.util",
+                    "from pathlib import Path",
+                    "import sys",
+                    "spec = importlib.util.spec_from_file_location('export_executor', "
+                    + repr(str(module_path))
+                    + ")",
+                    "module = importlib.util.module_from_spec(spec)",
+                    "sys.modules[spec.name] = module",
+                    "spec.loader.exec_module(module)",
+                    f"module.TMP_ROOT = Path({str(tmp_root)!r})",
+                    f"identity = module.ArtifactIdentity({user.pw_uid}, {user.pw_gid})",
+                    "payload = {'load_run_id': '123456789'}",
+                    "if module.touch_exact_complete(payload, identity) != 'created':",
+                    "    raise SystemExit('first marker creation was not reported')",
+                    "if module.touch_exact_complete(payload, identity) != 'existing':",
+                    "    raise SystemExit('repeat marker creation was not idempotent')",
+                    "marker = Path(" + repr(str(root / "complete")) + ")",
+                    "metadata = marker.stat(follow_symlinks=False)",
+                    "if marker.is_symlink() or marker.read_bytes() != b'':",
+                    "    raise SystemExit('marker is not an empty regular file')",
+                    "if (metadata.st_uid, metadata.st_gid, metadata.st_nlink, metadata.st_mode & 0o777) != ("
+                    + f"{user.pw_uid}, {user.pw_gid}, 1, 0o600):",
+                    "    raise SystemExit('marker metadata is outside the exact contract')",
+                    "print('TOUCH_COMPLETE_PASS')",
+                )
+            )
+            command = [
+                "/usr/bin/setpriv",
+                f"--reuid={user.pw_uid}",
+                f"--regid={user.pw_gid}",
+                "--clear-groups",
+                "--no-new-privs",
+                "--bounding-set=-all",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "/usr/bin/python3.12",
+                "-I",
+                "-B",
+                "-c",
+                program,
+            ]
+            completed = subprocess.run(
+                command,
+                cwd="/",
+                env=executor.FIXED_ENVIRONMENT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                close_fds=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                completed.returncode, 0, completed.stderr.decode("utf-8", "replace")
+            )
+            self.assertEqual(completed.stdout, b"TOUCH_COMPLETE_PASS\n")
+
+    @unittest.skipUnless(
+        os.geteuid() == 0 and shutil.which("setpriv"),
+        "requires root setpriv and an isolated sticky directory",
+    )
+    def test_touch_complete_rejects_marker_collision_and_symlinked_root(self) -> None:
+        try:
+            user = pwd.getpwnam("nobody")
+        except KeyError:
+            self.skipTest("no unprivileged test identity is installed")
+        with tempfile.TemporaryDirectory(
+            prefix="load-export-complete-collision-"
+        ) as parent:
+            tmp_root = Path(parent) / "tmp"
+            tmp_root.mkdir(mode=0o700)
+            os.chmod(tmp_root, 0o1777)
+            os.chown(tmp_root, 0, 0)
+            os.chmod(parent, 0o711)
+            root = tmp_root / f"{executor.LOAD_PREFIX}123456789"
+            root.mkdir(mode=0o700)
+            os.chown(root, user.pw_uid, user.pw_gid)
+            collision = root / "complete"
+            collision.write_bytes(b"existing marker evidence\n")
+            collision.chmod(0o644)
+            os.chown(collision, user.pw_uid, user.pw_gid)
+            before = collision.stat(follow_symlinks=False)
+            target = tmp_root / "target"
+            target.mkdir(mode=0o700)
+            os.chown(target, user.pw_uid, user.pw_gid)
+            symlink_root = tmp_root / f"{executor.LOAD_PREFIX}987654321"
+            symlink_root.symlink_to(target, target_is_directory=True)
+            module_path = Path(executor.__file__).resolve()
+            program = "\n".join(
+                (
+                    "import importlib.util",
+                    "from pathlib import Path",
+                    "import sys",
+                    "spec = importlib.util.spec_from_file_location('export_executor', "
+                    + repr(str(module_path))
+                    + ")",
+                    "module = importlib.util.module_from_spec(spec)",
+                    "sys.modules[spec.name] = module",
+                    "spec.loader.exec_module(module)",
+                    f"module.TMP_ROOT = Path({str(tmp_root)!r})",
+                    f"identity = module.ArtifactIdentity({user.pw_uid}, {user.pw_gid})",
+                    "try:",
+                    "    module.touch_exact_complete({'load_run_id': '123456789'}, identity)",
+                    "except module.ExportCleanupError as exc:",
+                    "    if exc.error_class != 'entry_metadata_invalid': raise",
+                    "else:",
+                    "    raise SystemExit('unsafe existing marker unexpectedly accepted')",
+                    "try:",
+                    "    module.touch_exact_complete({'load_run_id': '987654321'}, identity)",
+                    "except module.ExportCleanupError as exc:",
+                    "    if exc.error_class != 'export_root_open_failed': raise",
+                    "else:",
+                    "    raise SystemExit('symlinked exact root unexpectedly accepted')",
+                    "if Path(" + repr(str(target / "complete")) + ").exists():",
+                    "    raise SystemExit('symlink target was mutated')",
+                    "print('TOUCH_COLLISION_PASS')",
+                )
+            )
+            command = [
+                "/usr/bin/setpriv",
+                f"--reuid={user.pw_uid}",
+                f"--regid={user.pw_gid}",
+                "--clear-groups",
+                "--no-new-privs",
+                "--bounding-set=-all",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "/usr/bin/python3.12",
+                "-I",
+                "-B",
+                "-c",
+                program,
+            ]
+            completed = subprocess.run(
+                command,
+                cwd="/",
+                env=executor.FIXED_ENVIRONMENT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                close_fds=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                completed.returncode, 0, completed.stderr.decode("utf-8", "replace")
+            )
+            self.assertEqual(completed.stdout, b"TOUCH_COLLISION_PASS\n")
+            after = collision.stat(follow_symlinks=False)
+            self.assertEqual(collision.read_bytes(), b"existing marker evidence\n")
+            self.assertEqual(
+                (before.st_dev, before.st_ino, before.st_mode, before.st_mtime_ns),
+                (after.st_dev, after.st_ino, after.st_mode, after.st_mtime_ns),
+            )
 
 
 if __name__ == "__main__":

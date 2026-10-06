@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the dedicated retained-load artifact owner and remove exact exports.
+"""Resolve the dedicated retained-load artifact owner and manage exact exports.
 
 The root-only ``owner`` command validates the provisioned account before a
 producer creates private export files. The ``remove`` command is run only
@@ -308,6 +308,26 @@ def _parse_payload(stream: Any) -> dict[str, str]:
     return payload
 
 
+def _parse_load_payload(stream: Any) -> dict[str, str]:
+    raw = stream.buffer.read(MAX_STDIN_BYTES + 1)
+    if len(raw) > MAX_STDIN_BYTES:
+        raise ExportCleanupError("input_too_large")
+    try:
+        payload = json.loads(raw.decode("ascii"), object_pairs_hook=_unique_pairs)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ExportCleanupError("input_invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema", "load_run_id"}
+        or type(payload.get("schema")) is not int
+        or payload["schema"] != 1
+        or type(payload.get("load_run_id")) is not str
+        or RUN_ID_RE.fullmatch(payload["load_run_id"]) is None
+    ):
+        raise ExportCleanupError("input_invalid")
+    return payload
+
+
 def _tmp_descriptor() -> tuple[int, os.stat_result]:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -537,6 +557,88 @@ def remove_exact_exports(payload: dict[str, str], identity: ArtifactIdentity) ->
         os.close(tmp_fd)
 
 
+def touch_exact_complete(payload: dict[str, str], identity: ArtifactIdentity) -> str:
+    """Create the exact load stop marker through its validated export dirfd."""
+    _verify_dropped_identity(identity, {0, 1, 2})
+    tmp_fd, tmp_metadata = _tmp_descriptor()
+    root_fd: int | None = None
+    try:
+        root_name = f"{LOAD_PREFIX}{payload['load_run_id']}"
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_fd = os.open(root_name, flags, dir_fd=tmp_fd)
+        except OSError as exc:
+            raise ExportCleanupError("export_root_open_failed") from exc
+        root_metadata = os.fstat(root_fd)
+        path_metadata = os.stat(root_name, dir_fd=tmp_fd, follow_symlinks=False)
+        if (
+            (root_metadata.st_dev, root_metadata.st_ino)
+            != (path_metadata.st_dev, path_metadata.st_ino)
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_dev != tmp_metadata.st_dev
+            or root_metadata.st_uid != identity.uid
+            or root_metadata.st_gid != identity.gid
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise ExportCleanupError("export_root_metadata_invalid")
+
+        def verify_root_entry() -> None:
+            try:
+                current = os.stat(root_name, dir_fd=tmp_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ExportCleanupError("export_root_changed") from exc
+            if not _same_directory_identity(root_metadata, current):
+                raise ExportCleanupError("export_root_changed")
+
+        verify_root_entry()
+
+        _verify_dropped_identity(identity, {0, 1, 2, tmp_fd, root_fd})
+        marker_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        marker_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            marker_fd = os.open("complete", marker_flags, 0o600, dir_fd=root_fd)
+        except FileExistsError:
+            existing = _entry_metadata(root_fd, "complete", root_metadata, identity)
+            if existing.st_size != 0:
+                raise ExportCleanupError("complete_marker_invalid")
+            verify_root_entry()
+            return "existing"
+        except OSError as exc:
+            raise ExportCleanupError("complete_marker_create_failed") from exc
+        try:
+            marker_metadata = os.fstat(marker_fd)
+            path_marker = os.stat("complete", dir_fd=root_fd, follow_symlinks=False)
+            if (
+                (marker_metadata.st_dev, marker_metadata.st_ino)
+                != (path_marker.st_dev, path_marker.st_ino)
+                or not stat.S_ISREG(marker_metadata.st_mode)
+                or marker_metadata.st_dev != root_metadata.st_dev
+                or marker_metadata.st_uid != identity.uid
+                or marker_metadata.st_gid != identity.gid
+                or marker_metadata.st_nlink != 1
+                or stat.S_IMODE(marker_metadata.st_mode) != 0o600
+                or marker_metadata.st_size != 0
+            ):
+                raise ExportCleanupError("complete_marker_metadata_invalid")
+            os.fsync(marker_fd)
+        except OSError as exc:
+            raise ExportCleanupError("complete_marker_sync_failed") from exc
+        finally:
+            os.close(marker_fd)
+        os.fsync(root_fd)
+        verify_root_entry()
+        return "created"
+    except ExportCleanupError:
+        raise
+    except OSError as exc:
+        raise ExportCleanupError("filesystem_operation_failed") from exc
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(tmp_fd)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["owner"]:
@@ -569,6 +671,20 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"ARTIFACT_EXPORT_REMOVE schema=1 status=passed removed_roots={removed_roots}"
         )
+        return 0
+    if args == ["touch-complete"]:
+        try:
+            identity = resolve_artifact_identity(
+                require_root=False, verify_shadow=False
+            )
+            payload = _parse_load_payload(sys.stdin)
+            outcome = touch_exact_complete(payload, identity)
+        except ExportCleanupError as exc:
+            print(
+                f"ARTIFACT_EXPORT_COMPLETE schema=1 status=failed error_class={exc.error_class}"
+            )
+            return 1
+        print(f"ARTIFACT_EXPORT_COMPLETE schema=1 status=passed outcome={outcome}")
         return 0
     print(
         "ARTIFACT_EXPORT_EXECUTOR schema=1 status=failed error_class=invalid_command",
