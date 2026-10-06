@@ -276,6 +276,20 @@ def _expected_stored_mode(mode: str) -> str:
     return "write-burst" if mode == "external-vote" else mode
 
 
+def _validate_durable_provenance(run: Any, stored_report: dict[str, Any]) -> None:
+    """Validate provenance using the durable producer's closed report shape.
+
+    ``PreprodTestRun.origin`` stores the canonical origin URL.  Its report
+    intentionally stores only ``origin_class`` so a host, path, or query is
+    never persisted in report JSON.
+    """
+    if (
+        run.origin != EXPECTED_ORIGIN
+        or stored_report.get("origin_class") != "production_origin"
+    ):
+        raise RuntimeError("durable QA provenance is not the canonical production origin")
+
+
 def _persist_recovered_identity(
     run: Any,
     *,
@@ -337,8 +351,7 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
         marker = str(stored.get("marker") or run.marker or "")
         if not MARKER_PATTERN.fullmatch(marker) or run.marker != marker:
             raise RuntimeError("durable QA marker is not a canonical retained-load marker")
-        if run.origin != EXPECTED_ORIGIN or stored.get("origin") != EXPECTED_ORIGIN:
-            raise RuntimeError("durable QA provenance is not the canonical production origin")
+        _validate_durable_provenance(run, stored)
         if stored.get("mode") != _expected_stored_mode(args.mode):
             raise RuntimeError("durable QA row mode does not match the selected retained profile")
         user_ids = await _recover_progress_user_ids(

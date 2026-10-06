@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 from unittest.mock import patch
 
+from tools.platform_production_qa import ProductionQa
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
@@ -134,6 +136,44 @@ class RetainedWriteBurstReportRecoveryTests(unittest.TestCase):
     def test_external_vote_recovery_accepts_write_burst_durable_mode(self) -> None:
         self.assertEqual("write-burst", recovery._expected_stored_mode("external-vote"))
         self.assertEqual("read-mix", recovery._expected_stored_mode("read-mix"))
+
+    def test_durable_provenance_matches_producer_report_shape(self) -> None:
+        producer = ProductionQa(
+            origin=recovery.EXPECTED_ORIGIN,
+            report_path=Path("/tmp/platform-recovery-provenance-test.json"),
+            http_timeout=1.0,
+            keep_data=True,
+            mode="write-burst",
+        )
+        run = SimpleNamespace(origin=producer.origin)
+        report = producer._preprod_report_snapshot(progress=False)
+
+        self.assertEqual(report.get("origin_class"), "production_origin")
+        self.assertNotIn("origin", report)
+        recovery._validate_durable_provenance(run, report)
+
+    def test_durable_provenance_rejects_wrong_row_origin_or_report_class(self) -> None:
+        valid_report = {"origin_class": "production_origin"}
+        invalid_cases = (
+            (SimpleNamespace(origin="https://other.invalid"), valid_report),
+            (SimpleNamespace(origin=recovery.EXPECTED_ORIGIN), {}),
+            (
+                SimpleNamespace(origin=recovery.EXPECTED_ORIGIN),
+                {"origin_class": "local_origin"},
+            ),
+            (
+                SimpleNamespace(origin=recovery.EXPECTED_ORIGIN),
+                {"origin": recovery.EXPECTED_ORIGIN},
+            ),
+        )
+
+        for run, report in invalid_cases:
+            with self.subTest(report_keys=tuple(sorted(report))):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "durable QA provenance is not the canonical production origin",
+                ):
+                    recovery._validate_durable_provenance(run, report)
 
     @unittest.skipUnless(os.geteuid() == 0, "root-owned file contract")
     def test_existing_root_report_permissions_are_tightened(self) -> None:
