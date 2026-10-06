@@ -46,6 +46,22 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         self.assertNotIn('--control-email "$control_email"', cleanup)
         self.assertRegex(cleanup, r'printf .+\\n. \"\$control_email\" \\|')
 
+        lock_helper = (
+            tools / "platform_release_lock.sh"
+        ).read_text(encoding="utf-8")
+        retained_supervisor = lock_helper.split(
+            "platform_retained_load_lock_supervise() {", 1
+        )[1].split("\n}", 1)[0]
+        self.assertIn(
+            '/usr/bin/flock -n -E "$PLATFORM_RELEASE_LOCK_CONFLICT_EXIT_CODE" '
+            '\\\n      --close "$PLATFORM_RETAINED_LOAD_LOCK_PATH" "$0" "$@"',
+            retained_supervisor,
+        )
+        self.assertNotRegex(retained_supervisor, r"(?:</dev/null|<&-|stdin=)")
+        safe_env_exec = (tools / "platform_safe_env_exec.py").read_text(encoding="utf-8")
+        self.assertIn("os.execve(", safe_env_exec)
+        self.assertNotIn("stdin=subprocess.DEVNULL", safe_env_exec)
+
     def test_recovery_capture_accepts_only_closed_stdin_schema(self) -> None:
         valid = recovery_capture.parse_request(
             b'{"schema":1,"load_run_id":"12345","cleanup_run_id":"67890",'

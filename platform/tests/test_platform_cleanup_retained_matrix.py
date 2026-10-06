@@ -54,6 +54,10 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             cleanup.resolve_control_email(args, stdin=io.BytesIO(b"Control@example.invalid\n")),
             "control@example.invalid",
         )
+        self.assertEqual(
+            cleanup.resolve_control_email(args, stdin=io.BytesIO(b"Control@example.invalid")),
+            "control@example.invalid",
+        )
         for raw in (
             b"control@example.invalid\nsecond@example.invalid\n",
             b"control@example.invalid\r\n",
