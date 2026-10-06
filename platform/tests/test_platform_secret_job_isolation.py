@@ -63,7 +63,7 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertIn("needs:\n      - validate-external-inputs\n      - fixture-setup", jobs["load-client"])
         self.assertIn("actions/checkout@", jobs["load-client"])
         self.assertNotRegex(jobs["load-client"], r"secrets\.PROD_SSH_")
-        self.assertIn("needs:\n      - validate-external-inputs\n      - fixture-setup\n      - load-client", jobs["fixture-finalize"])
+        self.assertIn("needs:\n      - validate-external-inputs\n      - resolve-host-tools-pin\n      - fixture-setup\n      - load-client", jobs["fixture-finalize"])
         self.assertIn("if: ${{ always()", jobs["fixture-finalize"])
         self.assertIn("if: ${{ always()", jobs["evaluate-load"])
         self.assertIn("needs.fixture-finalize.outputs.cleanup_status", jobs["evaluate-load"])
