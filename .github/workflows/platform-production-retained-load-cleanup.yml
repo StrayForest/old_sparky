@@ -164,7 +164,6 @@ jobs:
           sys.stdout.flush()
           handoff = json.dumps({
               "schema": 1,
-              "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD",
               "target_sha": target_sha,
               "control_email": canonical_email,
               "load_run_id": load_run_id,
