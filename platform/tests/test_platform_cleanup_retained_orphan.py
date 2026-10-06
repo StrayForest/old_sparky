@@ -1,18 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 from pathlib import Path
+import tempfile
 from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
-import io
 import unittest
 from uuid import uuid4
 
 from tools import platform_cleanup_retained_orphan as cleanup
+from tools.platform_evidence_sanitizer import sanitized_log_summary
 from tools.platform_production_qa import ProductionQa
 
 
 class RetainedOrphanCleanupTests(unittest.TestCase):
+    @staticmethod
+    def _cleanup_result(*, valid: bool = True) -> dict[str, object]:
+        return {
+            "ok": True,
+            "markers": 1,
+            "users_deleted": 1 if valid else 0,
+            "tournaments_deleted": 0,
+            "control_account_preserved": True,
+            "remaining_users": 0,
+            "remaining_tournaments": 0,
+            "remaining_sessions": 0,
+            "remaining_audit_logs": 0,
+            "read_models": {
+                "keys_expected": 0,
+                "keys_deleted": 0,
+                "keys_remaining": 0,
+            },
+        }
+
     def test_invalid_control_stdin_stops_before_database_setup(self) -> None:
         argv = [
             "cleanup",
@@ -228,6 +250,58 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
         self.assertEqual(manifest["user_ids"], {
             "00000000-0000-0000-0000-000000000001"
         })
+
+    def test_orphan_cli_emits_completed_only_for_validated_cleanup_result(self) -> None:
+        for result, should_complete in (
+            (self._cleanup_result(), True),
+            (self._cleanup_result(valid=False), False),
+        ):
+            with self.subTest(should_complete=should_complete):
+                with tempfile.TemporaryDirectory() as temporary:
+                    result_path = Path(temporary) / "cleanup-result.json"
+                    output = io.StringIO()
+                    argv = [
+                        "cleanup",
+                        "--load-run-id",
+                        "12345",
+                        "--control-email",
+                        "control@example.com",
+                        "--confirm",
+                        cleanup.CONFIRMATION,
+                        "--result-path",
+                        str(result_path),
+                    ]
+
+                    async def clean_orphan_result(_args: object) -> dict[str, object]:
+                        cleanup.validate_cleanup_completion_result(result)
+                        result_path.write_text(json.dumps(result), encoding="utf-8")
+                        return result
+
+                    with (
+                        patch.object(cleanup.sys, "argv", argv),
+                        patch.object(cleanup.sys, "stdout", output),
+                        patch.object(
+                            cleanup,
+                            "clean_orphan",
+                            new=AsyncMock(side_effect=clean_orphan_result),
+                        ),
+                        patch.object(cleanup, "dispose_engine", new=AsyncMock()),
+                    ):
+                        if should_complete:
+                            self.assertEqual(asyncio.run(cleanup._main()), 0)
+                            lines = output.getvalue().splitlines()
+                            self.assertEqual(lines[-1], '{"status":"completed"}')
+                            self.assertEqual(
+                                sanitized_log_summary(lines)["status"], "passed"
+                            )
+                            self.assertNotIn("status", json.loads(result_path.read_text()))
+                        else:
+                            with self.assertRaisesRegex(
+                                RuntimeError, "result is incomplete"
+                            ):
+                                asyncio.run(cleanup._main())
+                            self.assertEqual(output.getvalue(), "")
+                            self.assertFalse(result_path.exists())
 
 
 if __name__ == "__main__":

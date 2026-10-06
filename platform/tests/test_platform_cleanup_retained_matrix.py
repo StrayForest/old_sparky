@@ -12,6 +12,8 @@ import unittest
 from unittest import mock
 from uuid import uuid4
 
+from tools.platform_evidence_sanitizer import sanitized_log_summary
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "tools" / "platform_cleanup_retained_matrix.py"
@@ -23,6 +25,28 @@ SPEC.loader.exec_module(cleanup)
 
 
 class RetainedMatrixManifestTests(unittest.TestCase):
+    @staticmethod
+    def _cleanup_result(*, already_cleaned: bool = False) -> dict[str, object]:
+        result: dict[str, object] = {
+            "ok": True,
+            "markers": 1,
+            "users_deleted": 0 if already_cleaned else 1,
+            "tournaments_deleted": 0,
+            "control_account_preserved": True,
+            "remaining_users": 0,
+            "remaining_tournaments": 0,
+            "remaining_sessions": 0,
+            "remaining_audit_logs": 0,
+            "read_models": {
+                "keys_expected": 0,
+                "keys_deleted": 0,
+                "keys_remaining": 0,
+            },
+        }
+        if already_cleaned:
+            result["already_cleaned"] = True
+        return result
+
     def test_invalid_control_stdin_stops_before_manifest_or_database_cleanup(self) -> None:
         argv = [
             "cleanup",
@@ -364,6 +388,95 @@ class RetainedMatrixManifestTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertTrue(result["already_cleaned"])
         self.assertEqual(result["remaining_users"], 0)
+        cleanup.validate_cleanup_completion_result(result)
+
+    def test_matrix_cli_emits_completed_only_after_zero_control_and_redis_proof(self) -> None:
+        valid_results = (
+            self._cleanup_result(),
+            self._cleanup_result(already_cleaned=True),
+        )
+        for result in valid_results:
+            with self.subTest(already_cleaned=result.get("already_cleaned", False)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    result_path = Path(temporary) / "cleanup-result.json"
+                    output = io.StringIO()
+                    argv = [
+                        "cleanup",
+                        "--summary",
+                        "/tmp/matrix-summary.json",
+                        "--run-root",
+                        "/tmp/run-root",
+                        "--control-email",
+                        "control@example.invalid",
+                        "--confirm",
+                        cleanup.CONFIRMATION,
+                        "--result-path",
+                        str(result_path),
+                    ]
+                    with (
+                        mock.patch.object(cleanup.sys, "argv", argv),
+                        mock.patch.object(cleanup.sys, "stdout", output),
+                        mock.patch.object(cleanup.os, "geteuid", return_value=0),
+                        mock.patch.object(cleanup, "load_matrix_manifest", return_value={}),
+                        mock.patch.object(
+                            cleanup, "cleanup_manifest", new=mock.AsyncMock(return_value=result)
+                        ),
+                    ):
+                        self.assertEqual(asyncio.run(cleanup.async_main()), 0)
+
+                    lines = output.getvalue().splitlines()
+                    self.assertEqual(lines[-1], '{"status":"completed"}')
+                    self.assertEqual(sanitized_log_summary(lines)["status"], "passed")
+                    self.assertNotIn("status", json.loads(result_path.read_text()))
+
+        invalid_results = []
+        residual_user = self._cleanup_result()
+        residual_user["remaining_users"] = 1
+        invalid_results.append(residual_user)
+        missing_control = self._cleanup_result()
+        missing_control["control_account_preserved"] = False
+        invalid_results.append(missing_control)
+        residual_projection = self._cleanup_result()
+        residual_projection["read_models"] = {
+            "keys_expected": 1,
+            "keys_deleted": 0,
+            "keys_remaining": 1,
+        }
+        invalid_results.append(residual_projection)
+        malformed_count = self._cleanup_result()
+        malformed_count["users_deleted"] = True
+        invalid_results.append(malformed_count)
+        for result in invalid_results:
+            with self.subTest(invalid_result=result):
+                with tempfile.TemporaryDirectory() as temporary:
+                    result_path = Path(temporary) / "cleanup-result.json"
+                    output = io.StringIO()
+                    argv = [
+                        "cleanup",
+                        "--summary",
+                        "/tmp/matrix-summary.json",
+                        "--run-root",
+                        "/tmp/run-root",
+                        "--control-email",
+                        "control@example.invalid",
+                        "--confirm",
+                        cleanup.CONFIRMATION,
+                        "--result-path",
+                        str(result_path),
+                    ]
+                    with (
+                        mock.patch.object(cleanup.sys, "argv", argv),
+                        mock.patch.object(cleanup.sys, "stdout", output),
+                        mock.patch.object(cleanup.os, "geteuid", return_value=0),
+                        mock.patch.object(cleanup, "load_matrix_manifest", return_value={}),
+                        mock.patch.object(
+                            cleanup, "cleanup_manifest", new=mock.AsyncMock(return_value=result)
+                        ),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "result is incomplete"):
+                            asyncio.run(cleanup.async_main())
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertFalse(result_path.exists())
 
 
 if __name__ == "__main__":
