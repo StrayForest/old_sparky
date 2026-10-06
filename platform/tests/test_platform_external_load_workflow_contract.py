@@ -17,6 +17,8 @@ import tempfile
 import textwrap
 import unittest
 
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-external-load.yml"
@@ -416,17 +418,31 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("ORIGIN_PUBLISH_GATE", diagnostic_script)
         self.assertNotIn("${{", diagnostic_script)
         self.assertNotIn("secrets.", diagnostic)
+        workflow = yaml.safe_load(self.source)
+        diagnostic_step = next(
+            step
+            for step in workflow["jobs"]["fixture-finalize"]["steps"]
+            if step.get("name") == "Diagnose origin evidence publication gate"
+        )
+        diagnostic_env = diagnostic_step["env"]
+        self.assertNotIn("ORIGIN_PRIOR_STEPS_SUCCESS", diagnostic_env)
+        for value in diagnostic_env.values():
+            with self.subTest(env_expression=value):
+                self.assertNotRegex(
+                    value,
+                    r"\b(?:success|failure|cancelled|always)\s*\(",
+                    "GitHub status functions are allowed in steps.if, not steps.env",
+                )
         for category in (
             '"missing"',
             '"invalid"',
             '"cancelled"',
             '"skipped"',
-            "eligible=",
+            "explicit_conditions_met=",
         ):
             with self.subTest(category=category):
                 self.assertIn(category, diagnostic_script)
         allowed_environment = {
-            "ORIGIN_PRIOR_STEPS_SUCCESS": "true",
             "ORIGIN_NAMESPACE_CLOSED": "0",
             "ORIGIN_MANUAL_REQUIRED": "0",
             "ORIGIN_CLEANUP_SSH_OUTCOME": "success",
@@ -446,7 +462,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             env=allowed_environment,
             timeout=10,
         ).stdout
-        self.assertIn("eligible=yes", valid_summary)
+        self.assertIn("explicit_conditions_met=yes", valid_summary)
 
         invalid_environment = dict(allowed_environment)
         invalid_environment["ORIGIN_REMOTE_STATUS"] = "0\nraw-path-or-secret"
@@ -463,7 +479,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("remote=invalid", invalid_summary)
         self.assertIn("ssh_step=skipped", invalid_summary)
         self.assertIn("finalize=missing", invalid_summary)
-        self.assertIn("eligible=no", invalid_summary)
+        self.assertIn("explicit_conditions_met=no", invalid_summary)
         self.assertNotIn("raw-path-or-secret", invalid_summary)
 
         publish = finalizer.split("- name: Publish origin evidence", 1)[1].split(
