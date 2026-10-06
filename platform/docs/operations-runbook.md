@@ -550,17 +550,18 @@ report from the matching durable `PreprodTestRun.report`, validates marker,
 email, tournament ownership and graph boundaries before deletion, and never
 counts a recovered run as a passed measurement.
 
-The cleanup supervisor also recovers a missing detail report from an exact
-`external-vote/external-vote.json` durable row, persists its full inventory to
-`PreprodTestRun.report`, then runs the normal exact validator. Missing or
-ambiguous profiles fail closed.
+Cleanup recovery rebuilds missing detail from exact `external-vote/external-vote.json` and validates it.
+External-vote is the transport directory; durable rows/manifests use `write-burst`, and rebuilt files keep that path.
+Existing files must already match. Recovery requires exact
+canonical `PreprodTestRun.origin` and `origin_class: production_origin`; reports
+omit origin URLs. Orphan cleanup derives fixed `request_origin` in memory after
+both checks. Marker and path must match.
 
-If a fixture was committed before an external runner timed out, the cleanup
-validator recovers only that run's exact marker and ownership scope. Malformed
-matches or ownership outside the manifest fail closed; recovery never broadens
-deletion to a historical search.
+If a fixture commits before an external runner times out, cleanup recovers only
+its exact marker and ownership scope. Malformed identities or out-of-scope
+ownership fail closed; recovery never searches historical rows.
 
-The cleanup command delegates disposal and zero-residual read-model checks to the [retained-load cleanup contract](#retained-load-cleanup-and-hermetic-web-verification); cross-loop asyncpg or Redis disposal errors in a successful cleanup log are a regression.
+The cleanup command delegates disposal and zero-residual checks to the [retained-load cleanup contract](#retained-load-cleanup-and-hermetic-web-verification); cross-loop asyncpg or Redis errors in a successful cleanup log are regressions.
 
 When the external load completes, clean only the exact load workflow run:
 
@@ -573,8 +574,7 @@ gh workflow run platform-production-retained-load-cleanup.yml \
 gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The cleanup supervisor holds the load host lock, validates production ownership,
-and delegates exact fixture/database/Redis checks to the [cleanup contract](#retained-load-cleanup-and-hermetic-web-verification) before removing matching reports. Failed cleanup retains data; never run broad cleanup. A durable cleaned row permits exact-ID artifact removal only after provenance, empty-fixture and root ownership/mode/symlink checks; mixed state fails closed.
+The cleanup supervisor holds the load host lock, validates production ownership, and delegates exact fixture/database/Redis checks to the [cleanup contract](#retained-load-cleanup-and-hermetic-web-verification) before removing matching reports. Failed cleanup retains data; never run broad cleanup. A durable cleaned row permits exact-ID artifact removal only after provenance, empty-fixture and root ownership/mode/symlink checks; mixed state fails closed.
 
 Cleanup and abort diagnostics emit `RETAINED_CLEANUP_INPUT`,
 `RETAINED_CLEANUP_EVIDENCE`, `RETAINED_ABORT_INPUT` and

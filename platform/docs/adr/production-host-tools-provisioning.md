@@ -248,12 +248,24 @@ installer:
 2. Run the offline `platform_host_tools_bundle.py verify` command from the
    pinned reviewed checkout with the expected `HOST_TOOLS_SHA`. Retain the
    generated manifest/capability checksum files with the provisioning record.
-3. Through the approved root-only console or host-image pipeline, install the
-   validated members atomically at the exact versioned generation path.  Create
-   the directory with `0555`, files with `0555`/`0444` as specified, and verify
-   root ownership, link counts, type and every recorded digest after the copy.
-   Never install through the deployment workflow and never execute a downloaded
-   installer or candidate repository file on the host.
+   A v3 archive has exactly 16 top-level members: the 14 declared tools,
+   `capabilities.txt` and `manifest.json`. The manifest's `files` array has 15
+   records for the 14 tools plus `capabilities.txt`; `manifest.json` is the
+   separate sixteenth archive member and is not self-listed. Do not treat the
+   record count as the archive member count.
+3. Through the approved root-only console or host-image pipeline, extract
+   verified bytes into a private staging directory for the exact
+   `HOST_TOOLS_SHA`. Before publication, independently check the complete
+   top-level name set against those 16 expected members, then verify each
+   member is a root-owned regular single-link file with the mode and digest
+   bound by the verified bundle and manifest. Reject extra entries such as
+   `__pycache__` and reject a missing `manifest.json`, even if all 14 tools
+   match. Do not import or execute a staged archive member while validating
+   this tree. Create the published generation with a `0555` directory and
+   `0555`/`0444` files as specified, and use an atomic no-replace rename only
+   after the complete independent check passes. Never install through the
+   deployment workflow or execute a downloaded installer or candidate
+   repository file on the host.
 4. Keep the previous valid generation untouched.  Before allowing deployment,
    run the same inventory checks recorded by the workflow.  If any check fails,
    remove only the incomplete new generation through the approved authority
@@ -278,10 +290,12 @@ CONTRACT=/secure/handoff/platform-host-tools-contract
 The approved root-console/configuration-management operation then extracts
 only the verifier-accepted regular members into a private staging directory
 named for `HOST_TOOLS_SHA`, applies the manifest modes/ownership, verifies every
-post-copy digest and performs an atomic `rename` into the versioned generation
-path only after all checks pass.  It must not execute an archive member while
-staging and must leave the prior generation untouched.  The harmless post-copy
-self-test is the fixed installed entrypoint, with no candidate input:
+post-copy digest and performs an atomic no-replace rename into the versioned
+generation path only after all checks pass. It must not execute an archive
+member while staging and must leave the prior generation untouched. The
+post-publish self-test is the fixed installed entrypoint, with no candidate
+input. Run it with isolated Python and bytecode disabled; do not use an
+import-only diagnostic against the published generation:
 
 ```bash
 /usr/bin/python3.12 -I -B \

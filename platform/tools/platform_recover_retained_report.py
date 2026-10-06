@@ -217,6 +217,8 @@ def build_recovered_summary(
     http_overall = http_client.get("overall") if isinstance(http_client.get("overall"), dict) else {}
     bottleneck = performance.get("bottleneck_summary") if isinstance(performance.get("bottleneck_summary"), dict) else {}
     mode = str(report.get("mode") or "write-burst")
+    if mode not in {"read-mix", "write-burst"}:
+        raise RuntimeError("recovered summary mode is not a supported cleanup mode")
     write_burst = report.get("write_burst") if isinstance(report.get("write_burst"), dict) else {}
     selection = str(write_burst.get("selection") or "all")
     planned_tournaments = (
@@ -276,6 +278,20 @@ def _expected_stored_mode(mode: str) -> str:
     return "write-burst" if mode == "external-vote" else mode
 
 
+def _validate_durable_provenance(run: Any, stored_report: dict[str, Any]) -> None:
+    """Validate provenance using the durable producer's closed report shape.
+
+    ``PreprodTestRun.origin`` stores the canonical origin URL.  Its report
+    intentionally stores only ``origin_class`` so a host, path, or query is
+    never persisted in report JSON.
+    """
+    if (
+        run.origin != EXPECTED_ORIGIN
+        or stored_report.get("origin_class") != "production_origin"
+    ):
+        raise RuntimeError("durable QA provenance is not the canonical production origin")
+
+
 def _persist_recovered_identity(
     run: Any,
     *,
@@ -291,6 +307,38 @@ def _persist_recovered_identity(
     recovered["recovered_from_preprod_test_run"] = str(run.id)
     recovered["recovered_at"] = datetime.now(UTC).isoformat()
     run.report = recovered
+    return recovered
+
+
+def _build_recovered_detail_report(
+    stored_report: dict[str, Any],
+    *,
+    mode: str,
+    marker: str,
+    report_path: Path,
+    user_ids: list[str],
+    tournament_ids: list[str],
+    run_id: Any,
+) -> dict[str, Any]:
+    """Build the downstream cleanup report for its canonical stored mode.
+
+    ``external-vote`` names the transport-specific directory only. Its durable
+    ``PreprodTestRun`` row and retained-matrix validator use ``write-burst``.
+    """
+    recovered = dict(stored_report)
+    recovered.update(
+        {
+            "marker": marker,
+            "origin": EXPECTED_ORIGIN,
+            "mode": _expected_stored_mode(mode),
+            "report_path": str(report_path),
+            "user_ids": user_ids,
+            "tournament_ids": tournament_ids,
+            "passed": False,
+            "recovered_from_preprod_test_run": str(run_id),
+            "recovered_at": stored_report.get("recovered_at"),
+        }
+    )
     return recovered
 
 
@@ -337,8 +385,7 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
         marker = str(stored.get("marker") or run.marker or "")
         if not MARKER_PATTERN.fullmatch(marker) or run.marker != marker:
             raise RuntimeError("durable QA marker is not a canonical retained-load marker")
-        if run.origin != EXPECTED_ORIGIN or stored.get("origin") != EXPECTED_ORIGIN:
-            raise RuntimeError("durable QA provenance is not the canonical production origin")
+        _validate_durable_provenance(run, stored)
         if stored.get("mode") != _expected_stored_mode(args.mode):
             raise RuntimeError("durable QA row mode does not match the selected retained profile")
         user_ids = await _recover_progress_user_ids(
@@ -369,6 +416,7 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
         if (
             existing.get("marker") != marker
             or existing.get("report_path") != str(report_path)
+            or existing.get("mode") != _expected_stored_mode(args.mode)
             or set(_uuid_list(existing.get("user_ids"), field="existing user_ids"))
             != set(user_ids)
             or set(_uuid_list(existing.get("tournament_ids"), field="existing tournament_ids"))
@@ -377,16 +425,15 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("existing retained report does not match durable QA identity")
         report = existing
     else:
-        report = stored
-        report["marker"] = marker
-        report["origin"] = EXPECTED_ORIGIN
-        report["mode"] = args.mode
-        report["report_path"] = str(report_path)
-        report["user_ids"] = user_ids
-        report["tournament_ids"] = tournament_ids
-        report["passed"] = False
-        report["recovered_from_preprod_test_run"] = str(run.id)
-        report["recovered_at"] = stored.get("recovered_at")
+        report = _build_recovered_detail_report(
+            stored,
+            mode=args.mode,
+            marker=marker,
+            report_path=report_path,
+            user_ids=user_ids,
+            tournament_ids=tournament_ids,
+            run_id=run.id,
+        )
         _write_root_json(report_path, report)
 
     if _regular_file(summary_path, required=False):
@@ -394,7 +441,11 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
             existing_summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("existing retained summary is not valid JSON") from exc
-        if not isinstance(existing_summary, dict) or not existing_summary.get("rows"):
+        if (
+            not isinstance(existing_summary, dict)
+            or existing_summary.get("mode") != _expected_stored_mode(args.mode)
+            or not existing_summary.get("rows")
+        ):
             raise RuntimeError("existing retained summary is not an exact cleanup manifest")
     else:
         summary = build_recovered_summary(
