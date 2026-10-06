@@ -15,7 +15,9 @@ import errno
 import json
 import os
 from pathlib import Path
+import re
 import signal
+import stat
 import sys
 import time
 
@@ -45,9 +47,32 @@ except ModuleNotFoundError:  # Direct execution from platform/tools.
     )
 
 
+_SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_EXTERNAL_RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
+_WORKER_BINDING_KEYS = frozenset({"source_git_sha", "external_run_id"})
+_MAX_CONFIG_BYTES = 1024 * 1024
+
+
 def _config(path: Path, *, verify_worker_identity: bool = True) -> dict[str, object]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size > _MAX_CONFIG_BYTES
+            ):
+                raise NamespaceIntegrityError("namespace config permissions are invalid")
+            raw_payload = handle.read(_MAX_CONFIG_BYTES + 1)
+            if len(raw_payload) > _MAX_CONFIG_BYTES:
+                raise NamespaceIntegrityError("namespace config is too large")
+        payload = json.loads(raw_payload.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise NamespaceIntegrityError("namespace config is unreadable") from exc
     if not isinstance(payload, dict):
@@ -65,9 +90,42 @@ def _config(path: Path, *, verify_worker_identity: bool = True) -> dict[str, obj
         expected_gid = int(payload["runner_gid"])
     except (KeyError, TypeError, ValueError) as exc:
         raise NamespaceIntegrityError("namespace runner identity is missing") from exc
+    if expected_uid != os.getuid():
+        raise NamespaceIntegrityError("namespace config owner does not match runner")
+    binding = payload.get("binding")
+    if not isinstance(binding, dict) or set(binding) != _WORKER_BINDING_KEYS:
+        raise NamespaceIntegrityError("namespace worker binding is invalid")
+    source_git_sha = binding.get("source_git_sha")
+    external_run_id = binding.get("external_run_id")
+    if (
+        not isinstance(source_git_sha, str)
+        or _SOURCE_SHA_RE.fullmatch(source_git_sha) is None
+        or not isinstance(external_run_id, str)
+        or _EXTERNAL_RUN_ID_RE.fullmatch(external_run_id) is None
+    ):
+        raise NamespaceIntegrityError("namespace worker binding is invalid")
     if verify_worker_identity:
         _assert_namespace_worker_identity(expected_uid, expected_gid)
     return payload
+
+
+def _restore_worker_binding_environment(payload: dict[str, object]) -> None:
+    """Restore only the validated source/run binding after sudo resets env."""
+
+    binding = payload.get("binding")
+    if not isinstance(binding, dict) or set(binding) != _WORKER_BINDING_KEYS:
+        raise NamespaceIntegrityError("namespace worker binding is invalid")
+    source_git_sha = binding.get("source_git_sha")
+    external_run_id = binding.get("external_run_id")
+    if (
+        not isinstance(source_git_sha, str)
+        or _SOURCE_SHA_RE.fullmatch(source_git_sha) is None
+        or not isinstance(external_run_id, str)
+        or _EXTERNAL_RUN_ID_RE.fullmatch(external_run_id) is None
+    ):
+        raise NamespaceIntegrityError("namespace worker binding is invalid")
+    os.environ["SOURCE_GIT_SHA"] = source_git_sha
+    os.environ["GITHUB_RUN_ID"] = external_run_id
 
 
 _TRUSTED_ROOT_MEDIATOR_NAMES = frozenset({"sudo", "setpriv", "unshare"})
@@ -334,9 +392,10 @@ def _namespace_worker(config_path: Path) -> None:
         os.close(devnull)
     command = [str(value) for value in payload["worker_command"]]
     # sudo is allowed to close/reset arbitrary inherited descriptors and
-    # environment entries.  Re-establish the private config path only after
-    # the non-root drop, immediately before execing the actual worker.
+    # environment entries. Re-establish the exact validated report binding
+    # only after the non-root drop, immediately before the worker exec.
     os.environ["PLATFORM_LOAD_WORKER_CONFIG"] = str(config_path)
+    _restore_worker_binding_environment(payload)
     os.execv(command[0], command)
 
 
