@@ -20,6 +20,13 @@ SPEC = importlib.util.spec_from_file_location("platform_live_qa_runtime_install_
 assert SPEC is not None and SPEC.loader is not None
 runtime = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runtime)
+SAFE_ENV_SCRIPT = SCRIPT.with_name("platform_safe_env_exec.py")
+SAFE_ENV_SPEC = importlib.util.spec_from_file_location(
+    "platform_safe_env_exec_runtime_install_tested", SAFE_ENV_SCRIPT
+)
+assert SAFE_ENV_SPEC is not None and SAFE_ENV_SPEC.loader is not None
+safe_env = importlib.util.module_from_spec(SAFE_ENV_SPEC)
+SAFE_ENV_SPEC.loader.exec_module(safe_env)
 
 
 @unittest.skipUnless(os.geteuid() == 0, "installer contract requires root-owned test paths")
@@ -83,6 +90,62 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             mock.patch.object(runtime, "_validate_runtime_source"), \
             mock.patch.object(runtime, "_copy_tree", side_effect=self._copy_empty_tree), \
             mock.patch.object(runtime, "_validate_payload"), \
+            mock.patch.object(runtime, "_retention", return_value=0), \
+            mock.patch.object(runtime, "_cleanup_staging", return_value=0):
+            yield app_dir, release, trusted, payload_root
+
+    @contextmanager
+    def canonical_runtime_tree(self, root: Path, source_sha: str):
+        """Build the installer fixture from the production TOOL_FILES set."""
+
+        trusted = root / "liveqa"
+        payload_root = trusted / "releases"
+        app_dir = root / "platform"
+        releases = app_dir / "releases"
+        release = releases / f"release-{source_sha[:8]}"
+        tools = release / "tools"
+        tools.mkdir(mode=0o755, parents=True)
+        os.chmod(releases, 0o755)
+        os.chmod(release, 0o755)
+        os.chmod(tools, 0o755)
+        app_dir.mkdir(mode=0o755, exist_ok=True)
+        os.chmod(app_dir, 0o755)
+        (release / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": source_sha, "release_slug": release.name})
+            + "\n",
+            encoding="ascii",
+        )
+        os.chmod(release / "RELEASE.json", 0o444)
+        (app_dir / "current").symlink_to(release)
+        runtime_source = release / "liveqa-runtime"
+        runtime_source.mkdir(mode=0o755)
+
+        source_tools = SCRIPT.parent
+        for name in runtime.TOOL_FILES:
+            source = source_tools / name
+            destination = tools / name
+            destination.write_bytes(source.read_bytes())
+            os.chmod(destination, 0o555 if name.endswith(".sh") else 0o444)
+
+        constants = {
+            "TRUSTED_ROOT": trusted,
+            "PAYLOAD_ROOT": payload_root,
+            "ACTIVE_MANIFEST": trusted / "active-manifest.json",
+            "ACTIVE_POINTER": trusted / "active",
+            "HELPER_PATH": trusted / "platform_live_user_qa_trusted.sh",
+            "LAUNCH_HELPER_PATH": trusted / "platform_live_launch_trusted.sh",
+            "DISPATCHER_PATH": trusted / "platform_live_user_qa_dispatch.py",
+            "REMOTE_DISPATCHER_PATH": trusted / "platform_workflow_remote_dispatch.py",
+            "REMOTE_INPUT_GUARD_PATH": trusted / "platform_workflow_input_guard.py",
+            "RELEASE_LOCK_EXEC_PATH": trusted / "platform_release_lock_exec.sh",
+            "RELEASE_LOCK_HELPER_PATH": trusted / "platform_release_lock.sh",
+            "MAILBOX_HELPER_PATH": trusted / "platform_live_qa_mailbox_helper.py",
+            "SOURCE_TREES": (),
+            "SOURCE_FILES": (),
+        }
+        with mock.patch.multiple(runtime, **constants), \
+            mock.patch.object(runtime, "_require_release_lock"), \
+            mock.patch.object(runtime, "_validate_runtime_source"), \
             mock.patch.object(runtime, "_retention", return_value=0), \
             mock.patch.object(runtime, "_cleanup_staging", return_value=0):
             yield app_dir, release, trusted, payload_root
@@ -212,6 +275,149 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(payload_root.stat().st_mode), 0o755)
                 self.assertEqual(stat.S_IMODE(trusted.stat().st_mode), 0o700)
                 runtime._validate_active_pointer(source_sha)
+
+        # Exercise the real fixed TOOL_FILES list and installer copy/digest
+        # path: retained cleanup must be present in the installed generation,
+        # not just in a hand-built test manifest.
+        source_sha = "f" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.canonical_runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                payload_root,
+            ):
+                manifest = runtime.install(app_dir, release)
+                payload = payload_root / source_sha
+                cleanup_tools = (
+                    "platform_cleanup_retained_orphan.py",
+                    "platform_recover_retained_report.py",
+                    "platform_cleanup_retained_matrix.py",
+                )
+                for name in cleanup_tools:
+                    relative = f"platform/tools/{name}"
+                    installed = payload / relative
+                    self.assertTrue(installed.is_file(), name)
+                    self.assertEqual(
+                        runtime._digest_regular(installed), manifest["files"][relative]
+                    )
+
+                fake_python = Path(temporary) / "trusted-python"
+                fake_python.write_bytes(b"#!/bin/sh\nexit 0\n")
+                os.chmod(fake_python, 0o755)
+                selected_tool = payload / "platform/tools/platform_cleanup_retained_matrix.py"
+
+                def execute_selected() -> int:
+                    return safe_env.main(
+                        [
+                            "exec",
+                            "--pythonpath",
+                            str(payload),
+                            "--",
+                            str(fake_python),
+                            str(selected_tool),
+                            "--help",
+                        ]
+                    )
+
+                with (
+                    mock.patch.multiple(
+                        safe_env,
+                        PRODUCTION_RUNTIME_ROOT=app_dir,
+                        ACTIVE_PLATFORM_ROOT=app_dir / "current",
+                        LIVE_QA_ROOT=trusted,
+                        LIVE_QA_RELEASE_ROOT=payload_root,
+                        LIVE_QA_ACTIVE_MANIFEST=trusted / "active-manifest.json",
+                        LIVE_QA_ACTIVE_POINTER=trusted / "active",
+                        ACTIVE_PYTHON=fake_python,
+                        TRUSTED_SYSTEM_PYTHON=fake_python,
+                    ),
+                    mock.patch.object(safe_env, "validate_active_runtime"),
+                    mock.patch.object(
+                        safe_env,
+                        "read_production_env_bytes",
+                        return_value=b"PLATFORM_ENVIRONMENT=production\n",
+                    ),
+                ):
+                    # Exercise the unchanged safe-env exec boundary against
+                    # the actual installed helper path.  Intercept execve so
+                    # no database tool or production environment is run.
+                    with (
+                        mock.patch.object(
+                            safe_env.os, "execve", side_effect=SystemExit(0)
+                        ) as execve,
+                        self.assertRaises(SystemExit),
+                    ):
+                        execute_selected()
+                    execve.assert_called_once()
+                    self.assertEqual(
+                        execve.call_args.args[1][1], str(selected_tool)
+                    )
+
+                    with (
+                        mock.patch.object(safe_env.os, "execve") as execve,
+                        redirect_stderr(io.StringIO()),
+                    ):
+                        self.assertEqual(
+                            safe_env.main(
+                                [
+                                    "exec",
+                                    "--pythonpath",
+                                    str(payload),
+                                    "--",
+                                    str(fake_python),
+                                    str(release / "tools/platform_cleanup_retained_matrix.py"),
+                                ]
+                            ),
+                            2,
+                        )
+                    execve.assert_not_called()
+
+                    release_json = release / "RELEASE.json"
+                    release_json.chmod(0o644)
+                    release_json.write_text(
+                        json.dumps(
+                            {"source_git_commit": "e" * 40, "release_slug": release.name}
+                        )
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    release_json.chmod(0o444)
+                    with (
+                        mock.patch.object(safe_env.os, "execve") as execve,
+                        redirect_stderr(io.StringIO()),
+                    ):
+                        self.assertEqual(execute_selected(), 2)
+                    execve.assert_not_called()
+
+                    # A self-consistent tree with a required member removed
+                    # still fails the installer's required-entrypoint check;
+                    # the active safe-env manifest also rejects the changed
+                    # generation digest.
+                    release_json.chmod(0o644)
+                    release_json.write_text(
+                        json.dumps(
+                            {"source_git_commit": source_sha, "release_slug": release.name}
+                        )
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    release_json.chmod(0o444)
+                    selected_tool.unlink()
+                    changed_digest, changed_files = runtime._tree_digest(payload)
+                    changed_manifest = dict(manifest)
+                    changed_manifest["payload_tree_sha256"] = changed_digest
+                    changed_manifest["files"] = changed_files
+                    with self.assertRaisesRegex(
+                        runtime.InstallerError, "missing a required entrypoint"
+                    ):
+                        runtime._validate_payload(changed_manifest)
+                    with (
+                        mock.patch.object(safe_env.os, "execve") as execve,
+                        redirect_stderr(io.StringIO()),
+                    ):
+                        self.assertEqual(execute_selected(), 2)
+                    execve.assert_not_called()
 
     def test_postpromotion_retention_failure_reports_closed_stage_and_keeps_pointer(self) -> None:
         source_sha = "e" * 40

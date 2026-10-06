@@ -8,6 +8,7 @@ TOOLS_DIR="$PLATFORM_ROOT/tools"
 SCRIPT_PATH="$(readlink -f -- "$TOOLS_DIR/platform_production_retained_load_cleanup_qa.sh")"
 QA_PYTHON="$RUNTIME_ROOT/shared/venv/bin/python"
 RUN_ROOT_BASE="$RUNTIME_ROOT/shared/production-retained-matrix"
+LIVE_QA_RELEASE_ROOT="/root/.oldsparky/liveqa/releases"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 CONFIRMATION="DELETE-PRODUCTION-RETAINED-LOAD"
 EXPECTED_ORIGIN="https://old-sparky.com"
@@ -75,7 +76,7 @@ run_external_vote_recovery() {
   "$SYSTEM_PYTHON" -I -B \
     "$TOOLS_DIR/platform_capture_retained_recovery_stderr.py" \
     >/dev/null 2>&1 <<EOF
-{"schema":1,"load_run_id":"$load_run_id","cleanup_run_id":"$cleanup_run_id","control_email":"$control_email","mode":"$recovery_profile"}
+{"schema":1,"target_sha":"$target_sha","load_run_id":"$load_run_id","cleanup_run_id":"$cleanup_run_id","control_email":"$control_email","mode":"$recovery_profile"}
 EOF
 }
 if (( $# != 4 )) || [[ "$1" != "$CONFIRMATION" ]]; then
@@ -186,6 +187,7 @@ test "$release_sha" = "$target_sha" || {
   echo "Active production release does not match the cleanup workflow SHA." >&2
   exit 1
 }
+LIVE_QA_PAYLOAD_ROOT="$LIVE_QA_RELEASE_ROOT/$target_sha"
 platform_environment="$($SYSTEM_PYTHON -I -B "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_ENVIRONMENT)"
 test "$platform_environment" = "production" || {
   echo "Production retained cleanup requires PLATFORM_ENVIRONMENT=production." >&2
@@ -218,8 +220,8 @@ if [[ ! -e "$run_root" ]]; then
   CLEANUP_STAGE="orphan_cleanup"
   set +e
   printf '%s\n' "$control_email" | "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
-    --pythonpath "$PLATFORM_ROOT" \
-    -- "$QA_PYTHON" "$TOOLS_DIR/platform_cleanup_retained_orphan.py" \
+    --pythonpath "$LIVE_QA_PAYLOAD_ROOT" \
+    -- "$QA_PYTHON" "$LIVE_QA_PAYLOAD_ROOT/platform/tools/platform_cleanup_retained_orphan.py" \
     --load-run-id "$load_run_id" \
     --control-email-stdin \
     --confirm "$CONFIRMATION" \
@@ -368,8 +370,8 @@ result_path="$export_dir/cleanup-summary.json"
 
 set +e
 printf '%s\n' "$control_email" | "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
-  --pythonpath "$PLATFORM_ROOT" \
-  -- "$QA_PYTHON" "$TOOLS_DIR/platform_cleanup_retained_matrix.py" \
+  --pythonpath "$LIVE_QA_PAYLOAD_ROOT" \
+  -- "$QA_PYTHON" "$LIVE_QA_PAYLOAD_ROOT/platform/tools/platform_cleanup_retained_matrix.py" \
   --summary "$summary_path" \
   --run-root "$run_root" \
   --control-email-stdin \

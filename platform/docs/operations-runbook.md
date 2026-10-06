@@ -61,9 +61,9 @@ Maintenance keeps:
 It never deletes shared env/runtimes, upload staging, current/previous releases, the active trusted live-QA generation, or trusted generations for current/previous
 source commits, legacy live-QA caches for the current/previous source commits,
 business rows or canonical retained reports. Backup failure stops all pruning.
-A successful backup-only run may rotate only verified backup archives, bounded
-to 14 retained copies; it never plans or applies release, source-artifact,
-transient-browser or live-QA retention. Live-QA cache pruning also takes the
+Backup-only preserves all pre-existing archive pairs; full maintenance rotates to 14
+after restore verification. Backup-only skips other retention; see the [backup and
+restore runbook](backup-restore-runbook.md). Live-QA cache pruning takes the
 machine-wide live-QA lock, requires the dedicated browser cgroup
 and user identity to be idle, accepts only root-owned non-symlink
 `runtime-<40 lowercase hex>` trees with the published read-only manifest

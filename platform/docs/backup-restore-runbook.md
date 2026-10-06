@@ -22,9 +22,17 @@ cd /opt/oldsparky/platform/current
 /opt/oldsparky/platform/shared/venv/bin/python \
   tools/platform_storage_maintenance.py \
   --app-dir /opt/oldsparky/platform \
-  --backup-keep 14 --backup-max-age-hours 24 \
+  --backup-max-age-hours 24 \
   --backup-only --apply --json
 ```
+
+Backup-only preserves every archive and metadata sidecar that exists before
+the run; it does not apply the 14-copy rotation limit. The backup operation
+checks the pre-existing archive inventory before publishing the new pair and
+fails closed if that inventory changes. Use full storage maintenance with
+`--backup-keep 14` when the reviewed maintenance policy calls for bounded
+rotation. The low-level backup CLI retains its historical rotation default;
+the lock-aware backup-only caller explicitly selects preservation.
 
 For a reviewed `dev` release, an operator may run the same guarded backup
 through GitHub Actions without opening a direct production shell:
@@ -40,10 +48,13 @@ or repeating the automatic production deployment. It invokes the same
 lock-aware backup-only mode and acquires locks in the fixed order
 release -> retained-load -> build -> live-QA. Backup-only does not apply
 production-release, source-artifact, transient-browser or live-QA retention.
-After the backup is restore/Alembic/checksum/freshness verified, the backup
-owner may rotate only its own archive/metadata set, bounded to 14 retained
-copies. A create or restore failure exits before rotation or any other
-pruning path, and leaves all existing backup archives untouched.
+The workflow verifies that the pre-existing archive inventory is unchanged
+and that the new archive is restore/Alembic/checksum/freshness verified. Its
+bounded public receipt contains counts, byte totals and inventory digests;
+failure diagnostics stay in a root-private file and are not copied to the
+public artifact. No backup-only branch rotates or removes existing archives.
+Full storage maintenance owns the separate archive-rotation path and applies
+its configured keep count only after a successful restore drill.
 
 Check freshness without restoring production:
 

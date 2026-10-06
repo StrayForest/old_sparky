@@ -158,6 +158,18 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         self.assertNotIn("export control_email", cleanup)
         self.assertIn("<target-sha> <load-run-id> <cleanup-run-id>", cleanup)
         self.assertIn("--control-email-stdin", cleanup)
+        self.assertIn(
+            'LIVE_QA_PAYLOAD_ROOT="$LIVE_QA_RELEASE_ROOT/$target_sha"', cleanup
+        )
+        for tool_name in (
+            "platform_cleanup_retained_orphan.py",
+            "platform_cleanup_retained_matrix.py",
+        ):
+            self.assertIn(
+                f'"$LIVE_QA_PAYLOAD_ROOT/platform/tools/{tool_name}"', cleanup
+            )
+        self.assertNotIn('"$TOOLS_DIR/platform_cleanup_retained_orphan.py"', cleanup)
+        self.assertNotIn('"$TOOLS_DIR/platform_cleanup_retained_matrix.py"', cleanup)
         self.assertNotIn('--control-email "$control_email"', cleanup)
         self.assertRegex(cleanup, r'printf .+\\n. \"\$control_email\" \\|')
 
@@ -179,12 +191,14 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
 
     def test_recovery_capture_accepts_only_closed_stdin_schema(self) -> None:
         valid = recovery_capture.parse_request(
-            b'{"schema":1,"load_run_id":"12345","cleanup_run_id":"67890",'
+            b'{"schema":1,"target_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"load_run_id":"12345","cleanup_run_id":"67890",'
             b'"control_email":"control@example.invalid","mode":"external-vote"}'
         )
         self.assertEqual(
             valid,
             {
+                "target_sha": "a" * 40,
                 "load_run_id": "12345",
                 "cleanup_run_id": "67890",
                 "control_email": "control@example.invalid",
@@ -192,15 +206,19 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             },
         )
         invalid = (
-            b'{"schema":1,"load_run_id":"1","cleanup_run_id":"2",'
+            b'{"schema":1,"target_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"load_run_id":"1","cleanup_run_id":"2",'
             b'"control_email":"control@example.invalid","mode":"external-vote",'
             b'"path":"/tmp/unsafe"}',
-            b'{"schema":1,"load_run_id":"1","cleanup_run_id":"2",'
+            b'{"schema":1,"target_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"load_run_id":"1","cleanup_run_id":"2",'
             b'"control_email":"control@example.invalid","mode":"external-vote",'
             b'"load_run_id":"3"}',
-            b'{"schema":true,"load_run_id":"1","cleanup_run_id":"2",'
+            b'{"schema":true,"target_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"load_run_id":"1","cleanup_run_id":"2",'
             b'"control_email":"control@example.invalid","mode":"external-vote"}',
-            b'{"schema":1,"load_run_id":"1","cleanup_run_id":"2",'
+            b'{"schema":1,"target_sha":"bad",'
+            b'"load_run_id":"1","cleanup_run_id":"2",'
             b'"control_email":"bad\\"@example.invalid","mode":"external-vote"}',
         )
         for document in invalid:
@@ -233,6 +251,7 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
                 return 37
 
         payload = b"private-recovery-diagnostic-" * 4000
+        target_sha = "a" * 40
         with tempfile.TemporaryDirectory(
             prefix="retained-recovery-", dir="/root"
         ) as parent:
@@ -249,6 +268,7 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
                 ) as popen,
             ):
                 status = recovery_capture.capture_recovery_stderr(
+                    target_sha=target_sha,
                     load_run_id="12345",
                     cleanup_run_id="67890",
                     control_email="private@example.invalid",
@@ -259,11 +279,11 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             popen.assert_called_once()
             command = popen.call_args.args[0]
             self.assertEqual(command[0:3], ["/usr/bin/python3.12", "-I", "-B"])
-            self.assertTrue(
-                any(
-                    argument.endswith("platform_recover_retained_report.py")
-                    for argument in command
-                )
+            payload_root = recovery_capture.LIVE_QA_RELEASE_ROOT / target_sha
+            self.assertIn(str(payload_root), command)
+            self.assertIn(
+                str(payload_root / "platform/tools/platform_recover_retained_report.py"),
+                command,
             )
             self.assertIn("--control-email-stdin", command)
             self.assertNotIn("private@example.invalid", command)
@@ -311,6 +331,7 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             ):
                 with self.assertRaises(FileExistsError):
                     recovery_capture.capture_recovery_stderr(
+                        target_sha="a" * 40,
                         load_run_id="12345",
                         cleanup_run_id="67890",
                         control_email="private@example.invalid",
@@ -360,6 +381,7 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     recovery_capture.capture_recovery_stderr(
+                        target_sha="a" * 40,
                         load_run_id="12345",
                         cleanup_run_id="67890",
                         control_email="private@example.invalid",
@@ -437,7 +459,10 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         self.assertIn("platform_capture_retained_recovery_stderr.py", recovery_function)
         self.assertIn(">/dev/null 2>&1", recovery_function)
         self.assertNotIn("--control-email", recovery_function)
-        self.assertIn('"schema":1,"load_run_id":"$load_run_id"', recovery_function)
+        self.assertIn(
+            '"schema":1,"target_sha":"$target_sha","load_run_id":"$load_run_id"',
+            recovery_function,
+        )
         export_creation = script.index(
             '/usr/bin/mkdir -m 0700 -- "$export_dir"', recovery_call
         )

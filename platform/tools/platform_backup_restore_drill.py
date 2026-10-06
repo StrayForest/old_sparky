@@ -9,8 +9,10 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 from typing import Any
 
@@ -43,6 +45,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--keep", type=int, default=14)
+    rotation = parser.add_mutually_exclusive_group()
+    rotation.add_argument(
+        "--preserve-existing",
+        dest="rotate_existing",
+        action="store_false",
+        help="Keep every pre-existing archive and sidecar; do not rotate backups.",
+    )
+    rotation.add_argument(
+        "--rotate-existing",
+        dest="rotate_existing",
+        action="store_true",
+        help="Apply the requested retention policy to older verified backups.",
+    )
+    # Keep the low-level CLI's historical rotation behavior. Backup-only
+    # maintenance opts into preservation explicitly through its own caller.
+    parser.set_defaults(rotate_existing=True)
     parser.add_argument(
         "--admin-database-url",
         default=None,
@@ -272,6 +290,67 @@ def prune_unverified_backups(
     return removed
 
 
+def backup_inventory(output_dir: pathlib.Path) -> tuple[tuple[str, int, int, int, int, int, int], ...]:
+    entries: list[tuple[str, int, int, int, int, int, int]] = []
+    for path in sorted(output_dir.iterdir(), key=lambda item: item.name):
+        if not path.name.startswith("platformdb-") or path.suffix not in {".dump", ".json"}:
+            continue
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError("Refusing unsafe existing backup entry.")
+        entries.append(
+            (
+                path.name,
+                metadata.st_dev,
+                metadata.st_ino,
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+        )
+    return tuple(entries)
+
+
+def backup_inventory_digest(
+    entries: tuple[tuple[str, int, int, int, int, int, int], ...],
+) -> str:
+    encoded = json.dumps(entries, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _publish_noclobber(temporary_path: pathlib.Path, target_path: pathlib.Path) -> os.stat_result:
+    temporary_identity = temporary_path.lstat()
+    try:
+        os.link(temporary_path, target_path, follow_symlinks=False)
+    except FileExistsError as exc:
+        raise RuntimeError("Backup destination already exists; refusing to replace it.") from exc
+    try:
+        published = target_path.lstat()
+        temporary = temporary_path.lstat()
+        if (published.st_dev, published.st_ino) != (temporary.st_dev, temporary.st_ino):
+            raise RuntimeError("Backup publication identity changed.")
+    except Exception:
+        _unlink_if_same_inode(
+            target_path,
+            (temporary_identity.st_dev, temporary_identity.st_ino),
+        )
+        raise
+    temporary_path.unlink()
+    return published
+
+
+def _unlink_if_same_inode(path: pathlib.Path, identity: tuple[int, int] | None) -> None:
+    if path is None or identity is None:
+        return
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) == identity and stat.S_ISREG(current.st_mode):
+        path.unlink()
+
+
 def perform_restore_drill(
     dump_path: pathlib.Path,
     *,
@@ -426,17 +505,33 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     app_target = parse_database_url(database_url)
     admin_url = args.admin_database_url or merged_env.get("PLATFORM_BACKUP_ADMIN_URL")
     admin_target = parse_database_url(admin_url, require_platformdb=False) if admin_url else None
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rotate_existing = bool(getattr(args, "rotate_existing", True))
+    preserve_existing = not rotate_existing
+    initial_inventory = backup_inventory(output_dir) if preserve_existing else ()
+    initial_inventory_digest = backup_inventory_digest(initial_inventory)
+    timestamp = utc_now()
+    timestamp_slug = timestamp.strftime("%Y%m%dT%H%M%SZ")
+    dump_path = output_dir / f"platformdb-{timestamp_slug}.dump"
+    metadata_path = dump_path.with_suffix(".json")
+    if os.path.lexists(dump_path) or os.path.lexists(metadata_path):
+        raise RuntimeError("Backup destination already exists; refusing to replace it.")
+
     required = ["pg_dump", "pg_restore"]
     if not args.dump_only:
         required.extend(["createdb", "dropdb", "psql"])
     require_commands(*required)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = utc_now()
-    timestamp_slug = timestamp.strftime("%Y%m%dT%H%M%SZ")
-    dump_path = output_dir / f"platformdb-{timestamp_slug}.dump"
-    temporary_dump_path = output_dir / f".{dump_path.name}.{os.getpid()}.tmp"
-    metadata_path = dump_path.with_suffix(".json")
+    dump_fd, dump_tmp_name = tempfile.mkstemp(
+        prefix=f".{dump_path.name}.", suffix=".tmp", dir=output_dir
+    )
+    temporary_dump_path = pathlib.Path(dump_tmp_name)
+    os.close(dump_fd)
+    temporary_dump_identity = temporary_dump_path.lstat()
+    temporary_metadata_path: pathlib.Path | None = None
+    temporary_metadata_identity: tuple[int, int] | None = None
+    published_dump_identity: tuple[int, int] | None = None
+    published_metadata_identity: tuple[int, int] | None = None
     started_at = utc_now()
     restore_verified = False
     restored_table_count: int | None = None
@@ -459,14 +554,18 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not temporary_dump_path.is_file() or temporary_dump_path.stat().st_size <= 0:
             raise RuntimeError("pg_dump did not produce a non-empty archive.")
+        temporary_dump_stat = temporary_dump_path.lstat()
+        if (temporary_dump_stat.st_dev, temporary_dump_stat.st_ino) != (
+            temporary_dump_identity.st_dev,
+            temporary_dump_identity.st_ino,
+        ):
+            raise RuntimeError("Temporary backup archive identity changed.")
         run_command(["pg_restore", "--list", str(temporary_dump_path)], capture_output=True)
-        temporary_dump_path.replace(dump_path)
-        dump_path.chmod(0o600)
 
         if not args.dump_only:
             try:
                 restored_table_count = perform_restore_drill(
-                    dump_path,
+                    temporary_dump_path,
                     app_target=app_target,
                     admin_target=admin_target,
                     timestamp_slug=timestamp_slug,
@@ -482,8 +581,8 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             "schemas": ["platform", "public"],
             "required_extensions": list(REQUIRED_PLATFORM_EXTENSIONS),
             "dump_file": dump_path.name,
-            "size_bytes": dump_path.stat().st_size,
-            "sha256": sha256_file(dump_path),
+            "size_bytes": temporary_dump_path.stat().st_size,
+            "sha256": sha256_file(temporary_dump_path),
             "started_at_utc": started_at.isoformat().replace("+00:00", "Z"),
             "completed_at_utc": completed_at.isoformat().replace("+00:00", "Z"),
             "duration_seconds": round((completed_at - started_at).total_seconds(), 3),
@@ -492,19 +591,99 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
             "restored_table_count": restored_table_count,
             "restore_error": restore_error,
         }
-        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-        metadata_path.chmod(0o600)
+        if preserve_existing:
+            before_publish_inventory = backup_inventory(output_dir)
+            before_publish_digest = backup_inventory_digest(before_publish_inventory)
+            if before_publish_inventory != initial_inventory:
+                raise RuntimeError("Pre-existing backup inventory changed before publication.")
+            metadata.update(
+                {
+                    "preexisting_archive_count": sum(
+                        1 for entry in initial_inventory if entry[0].endswith(".dump")
+                    ),
+                    "preexisting_sidecar_count": sum(
+                        1 for entry in initial_inventory if entry[0].endswith(".json")
+                    ),
+                    "preexisting_archive_inventory_sha256": initial_inventory_digest,
+                    "postexisting_archive_inventory_sha256": before_publish_digest,
+                    "preexisting_archives_preserved": True,
+                }
+            )
+        metadata_fd, metadata_tmp_name = tempfile.mkstemp(
+            prefix=f".{metadata_path.name}.", suffix=".tmp", dir=output_dir
+        )
+        temporary_metadata_path = pathlib.Path(metadata_tmp_name)
+        temporary_metadata_identity_stat = temporary_metadata_path.lstat()
+        temporary_metadata_identity = (
+            temporary_metadata_identity_stat.st_dev,
+            temporary_metadata_identity_stat.st_ino,
+        )
+        with os.fdopen(metadata_fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(metadata, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_dump_path, 0o600)
+        os.chmod(temporary_metadata_path, 0o600)
+        metadata_stat = temporary_metadata_path.lstat()
+        if (metadata_stat.st_dev, metadata_stat.st_ino) != temporary_metadata_identity:
+            raise RuntimeError("Temporary backup metadata identity changed.")
+        published_dump = _publish_noclobber(temporary_dump_path, dump_path)
+        published_dump_identity = (published_dump.st_dev, published_dump.st_ino)
+        try:
+            published_metadata = _publish_noclobber(temporary_metadata_path, metadata_path)
+            published_metadata_identity = (published_metadata.st_dev, published_metadata.st_ino)
+            temporary_metadata_path = None
+        except Exception:
+            _unlink_if_same_inode(dump_path, published_dump_identity)
+            published_dump_identity = None
+            raise
+
         removed: list[str] = []
-        if restore_verified:
+        if restore_verified and rotate_existing:
             removed.extend(prune_unverified_backups(output_dir, preserve_metadata=metadata_path))
             removed.extend(prune_backups(output_dir, keep=args.keep))
-        result = {"ok": restore_error is None, **metadata, "metadata_file": str(metadata_path), "removed": removed}
+        result = {
+            "ok": restore_error is None,
+            **metadata,
+            "rotation_mode": "rotate-existing" if rotate_existing else "preserve-existing",
+            "metadata_file": str(metadata_path),
+            "removed": removed,
+        }
         if restore_error is not None:
             raise RuntimeError(f"Platform backup was created but restore verification failed: {restore_error}")
         return result
     finally:
-        if temporary_dump_path.exists():
-            temporary_dump_path.unlink()
+        active_exception = sys.exception()
+        _unlink_if_same_inode(
+            temporary_dump_path,
+            (temporary_dump_identity.st_dev, temporary_dump_identity.st_ino),
+        )
+        _unlink_if_same_inode(temporary_metadata_path, temporary_metadata_identity)
+        if preserve_existing:
+            try:
+                current_inventory = backup_inventory(output_dir)
+                owned = {dump_path.name: published_dump_identity}
+                owned[metadata_path.name] = published_metadata_identity
+                current_old_inventory = tuple(
+                    entry
+                    for entry in current_inventory
+                    if owned.get(entry[0]) != (entry[1], entry[2])
+                )
+                if current_old_inventory != initial_inventory:
+                    raise RuntimeError("Pre-existing backup inventory changed during preserve mode.")
+            except Exception as integrity_error:
+                if active_exception is None:
+                    setattr(
+                        integrity_error,
+                        "_backup_preservation_integrity",
+                        "preexisting_inventory_changed",
+                    )
+                    raise
+                setattr(
+                    active_exception,
+                    "_backup_preservation_integrity",
+                    "preexisting_inventory_changed",
+                )
 
 
 def print_result(result: dict[str, Any], *, as_json: bool) -> None:
@@ -566,10 +745,16 @@ def main() -> int:
         print_result(result, as_json=args.as_json)
         return 0
     except Exception as exc:
+        error_message = str(exc)
+        if (
+            getattr(exc, "_backup_preservation_integrity", None)
+            == "preexisting_inventory_changed"
+        ):
+            error_message += " [backup_integrity=preexisting_inventory_changed]"
         if args.as_json:
-            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
+            print(json.dumps({"ok": False, "error": error_message}, ensure_ascii=False, indent=2))
         else:
-            print(f"[FAIL] {exc}", file=sys.stderr)
+            print(f"[FAIL] {error_message}", file=sys.stderr)
         return 1
 
 

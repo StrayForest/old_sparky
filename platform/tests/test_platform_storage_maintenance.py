@@ -2,16 +2,21 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import textwrap
 import unittest
 from unittest import mock
+
+import yaml
 
 from tests import platform_test_lock_support as lock_support
 from tools import platform_storage_maintenance as maintenance
@@ -225,12 +230,29 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_storage_maintenance.py",
                 "--backup-only",
                 "--apply",
+                "--private-backup-diagnostics",
+            ],
+        ):
+            self.assertTrue(maintenance.parse_args().private_backup_diagnostics)
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            ["platform_storage_maintenance.py", "--private-backup-diagnostics"],
+        ):
+            with self.assertRaises(SystemExit):
+                maintenance.parse_args()
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--backup-only",
+                "--apply",
                 "--backup-keep",
                 "13",
             ],
         ):
-            with self.assertRaises(SystemExit):
-                maintenance.parse_args()
+            self.assertEqual(maintenance.parse_args().backup_keep, 13)
         with mock.patch.object(
             maintenance.sys,
             "argv",
@@ -254,6 +276,16 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             "sha256": "a" * 64,
             "restored_table_count": 12,
             "removed": [],
+            "rotation_mode": "rotate-existing",
+        }
+        preserve_result = {
+            **create_result,
+            "rotation_mode": "preserve-existing",
+            "preexisting_archive_count": 9,
+            "preexisting_sidecar_count": 9,
+            "preexisting_archive_inventory_sha256": "a" * 64,
+            "postexisting_archive_inventory_sha256": "a" * 64,
+            "preexisting_archives_preserved": True,
         }
         check_result = {
             "ok": True,
@@ -266,6 +298,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             side_effect=(
                 subprocess.CompletedProcess([], 0, json.dumps(create_result), ""),
                 subprocess.CompletedProcess([], 0, json.dumps(check_result), ""),
+                subprocess.CompletedProcess([], 0, json.dumps(preserve_result), ""),
+                subprocess.CompletedProcess([], 0, json.dumps(check_result), ""),
             ),
         ) as run:
             result = maintenance.run_backup(
@@ -273,16 +307,51 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 keep=14,
                 max_age_hours=24.0,
             )
+            preserved_result = maintenance.run_backup(
+                self.root / "runtime" / "platform",
+                keep=14,
+                max_age_hours=24.0,
+                rotate_existing=False,
+            )
 
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 4)
         self.assertIn("--keep", run.call_args_list[0].args[0])
         self.assertIn("14", run.call_args_list[0].args[0])
+        self.assertIn("--rotate-existing", run.call_args_list[0].args[0])
         self.assertIn("--check-latest", run.call_args_list[1].args[0])
         self.assertIn("24.0", run.call_args_list[1].args[0])
+        self.assertIn("--preserve-existing", run.call_args_list[2].args[0])
+        self.assertNotIn("--rotate-existing", run.call_args_list[2].args[0])
         self.assertTrue(result["restore_verified"])
         self.assertTrue(result["alembic_revision_verified"])
         self.assertTrue(result["checksum_present"])
         self.assertEqual(result["age_hours"], 0.25)
+        self.assertEqual(result["rotation_mode"], "rotate-existing")
+        self.assertTrue(preserved_result["preexisting_archives_preserved"])
+        self.assertEqual(preserved_result["preexisting_archive_count"], 9)
+
+        failure = subprocess.CompletedProcess(
+            [], 1, json.dumps({"ok": False, "error": "private failure detail"}), "child diagnostic"
+        )
+        private_stderr = io.StringIO()
+        with (
+            mock.patch.object(maintenance.subprocess, "run", return_value=failure),
+            mock.patch.object(maintenance.sys, "stderr", private_stderr),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Platform backup failed"):
+                maintenance._run_backup_command(
+                    ["fixed-backup-child"], forward_failure_diagnostics=True
+                )
+        self.assertIn("private failure detail", private_stderr.getvalue())
+        self.assertIn("child diagnostic", private_stderr.getvalue())
+        public_stderr = io.StringIO()
+        with (
+            mock.patch.object(maintenance.subprocess, "run", return_value=failure),
+            mock.patch.object(maintenance.sys, "stderr", public_stderr),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Platform backup failed"):
+                maintenance._run_backup_command(["fixed-backup-child"])
+        self.assertEqual(public_stderr.getvalue(), "")
 
     def test_backup_failure_prevents_retention_deletion(self) -> None:
         app_dir = self.root / "runtime" / "platform"
@@ -470,6 +539,12 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "restored_table_count": 3,
                     "age_hours": 0.1,
                     "removed_count": 0,
+                    "rotation_mode": "preserve-existing",
+                    "preexisting_archive_count": 9,
+                    "preexisting_sidecar_count": 9,
+                    "preexisting_archive_inventory_sha256": "a" * 64,
+                    "postexisting_archive_inventory_sha256": "a" * 64,
+                    "preexisting_archives_preserved": True,
                 },
             ) as run_backup,
             mock.patch.object(
@@ -481,11 +556,15 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         self.assertEqual(report["mode"], "backup-only")
         self.assertTrue(report["backup"]["restore_verified"])
+        self.assertEqual(report["backup"]["rotation_mode"], "preserve-existing")
+        self.assertTrue(report["backup"]["preexisting_archives_preserved"])
         self.assertEqual(events, ["locks-enter", "locks-exit"])
         run_backup.assert_called_once_with(
             app_dir,
             keep=14,
             max_age_hours=24.0,
+            rotate_existing=False,
+            private_failure_diagnostics=False,
         )
         live_qa_prune.assert_not_called()
         retention_plan.assert_not_called()
@@ -672,18 +751,46 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn('chmod 0600 "$SHARED_ENV_FILE"', release_install)
 
     def test_manual_backup_uses_lock_aware_backup_only_workflow(self) -> None:
-        workflow = (
-            REPO_ROOT / ".github/workflows/platform-production-backup.yml"
-        ).read_text()
+        workflow_path = REPO_ROOT / ".github/workflows/platform-production-backup.yml"
+        workflow = workflow_path.read_text()
         self.assertIn("platform_storage_maintenance.py", workflow)
         self.assertIn("--backup-only", workflow)
-        self.assertIn("--backup-max-age-hours 24", workflow)
-        self.assertIn("--backup-keep 14", workflow)
+        self.assertIn('"--backup-max-age-hours", "24"', workflow)
+        self.assertNotIn("--backup-keep 14", workflow)
         self.assertIn("--apply", workflow)
         self.assertNotIn("platform_backup_restore_drill.py", workflow)
         self.assertNotIn("--check-latest", workflow)
         self.assertIn('report.get("mode") != "backup-only"', workflow)
-        self.assertIn('limits.get("backup_keep") != 14', workflow)
+        self.assertIn('backup.get("rotation_mode") != "preserve-existing"', workflow)
+        self.assertIn('backup.get("preexisting_archives_preserved") is not True', workflow)
+        self.assertIn('backup.get("removed_count") != 0', workflow)
+        self.assertIn('isinstance(backup.get("preexisting_archive_count"), int)', workflow)
+        self.assertIn('isinstance(backup.get("preexisting_sidecar_count"), int)', workflow)
+        self.assertIn('r"[0-9a-f]{64}"', workflow)
+        self.assertIn("BACKUP_FAILURE schema=1 stage=", workflow)
+        self.assertIn('test "$(id -u)" -eq 0', workflow)
+        self.assertIn("exit_code=", workflow)
+        self.assertEqual(workflow.count("trap backup_failure_marker EXIT"), 1)
+        self.assertNotIn("trap cleanup EXIT", workflow)
+        self.assertIn('backup_report_file=""', workflow)
+        self.assertIn('rm -f -- "$backup_report_file"', workflow)
+        self.assertIn('trap - EXIT', workflow)
+        self.assertIn('exit "$exit_code"', workflow)
+        self.assertIn("start_new_session=True", workflow)
+        self.assertIn("os.killpg(process.pid, signal.SIGTERM)", workflow)
+        self.assertIn("process.wait(timeout=10)", workflow)
+        self.assertIn("os.killpg(process.pid, signal.SIGKILL)", workflow)
+        self.assertIn("if process is not None:\n                  stop_child_group(process)", workflow)
+        self.assertIn("oldsparky-production-backup-{run_id}-{run_attempt}.stderr", workflow)
+        self.assertIn("os.O_EXCL | os.O_NOFOLLOW", workflow)
+        self.assertIn("captured < 65536", workflow)
+        self.assertIn('"--private-backup-diagnostics"', workflow)
+        self.assertIn("failure_stage=private_capture_cleanup", workflow)
+        self.assertNotIn('cat "$remote_error"', workflow)
+        self.assertLess(
+            workflow.index("failure_stage=private_capture_cleanup"),
+            workflow.index('printf \'%s\\n\' "$public_report"'),
+        )
         self.assertIn('backup.get("restore_verified") is not True', workflow)
         self.assertIn('backup.get("checksum_present") is not True', workflow)
         self.assertIn('public["mode"] = "backup-only"', workflow)
@@ -691,6 +798,173 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             '"production_releases",\n              "source_release_artifacts",\n              "live_qa_runtime_caches"',
             workflow,
         )
+        self._assert_backup_failure_trap_executes(workflow_path)
+        self._assert_backup_child_group_is_terminated(workflow_path)
+        self._assert_backup_wrapper_bounds_private_stderr(workflow_path)
+
+    def _assert_backup_failure_trap_executes(self, workflow_path: Path) -> None:
+        workflow = yaml.safe_load(
+            workflow_path.read_text()
+        )
+        run_script = next(
+            step["run"]
+            for step in workflow["jobs"]["backup"]["steps"]
+            if step.get("name") == "Create and verify the production backup"
+        )
+        remote_script = run_script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
+        remote_script = remote_script.replace(
+            "runtime=/opt/oldsparky/platform", "runtime=/not-a-production-tree"
+        )
+        remote_script = remote_script.replace(
+            'test "$(id -u)" -eq 0 || { echo "Production backup must run as root" >&2; exit 1; }',
+            ":",
+        )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            report_path = Path(temporary_dir) / "remote-report"
+            remote_script = remote_script.replace(
+                'backup_report_file="$(mktemp /tmp/oldsparky-production-backup-report.XXXXXX)"',
+                f'backup_report_file="$(mktemp {report_path}.XXXXXX)"',
+            )
+            completed = subprocess.run(
+                ["bash", "-s", "--", "123456", "1"],
+                input=remote_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertRegex(
+                completed.stdout,
+                r"^BACKUP_FAILURE schema=1 stage=preflight exit_code=[1-9][0-9]{0,2}\n$",
+            )
+            self.assertIn("Current release symlink is missing", completed.stderr)
+            self.assertEqual(list(Path(temporary_dir).iterdir()), [])
+
+    def _assert_backup_child_group_is_terminated(self, workflow_path: Path) -> None:
+        workflow = yaml.safe_load(workflow_path.read_text())
+        run_script = next(
+            step["run"]
+            for step in workflow["jobs"]["backup"]["steps"]
+            if step.get("name") == "Create and verify the production backup"
+        )
+        remote_script = run_script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
+        wrapper_script = remote_script.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        function_start = wrapper_script.index("def stop_child_group(process):")
+        function_end = wrapper_script.index("signal.signal(signal.SIGTERM", function_start)
+        function_source = wrapper_script[function_start:function_end].replace(
+            "timeout=10", "timeout=0.2"
+        )
+        namespace: dict[str, object] = {
+            "os": os,
+            "signal": signal,
+            "subprocess": subprocess,
+        }
+        exec(function_source, namespace)
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            child_code = textwrap.dedent(
+                """
+                import signal
+                import subprocess
+                import sys
+                import time
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                grandchild_code = (
+                    "import signal,time; "
+                    "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                    "time.sleep(120)"
+                )
+                grandchild = subprocess.Popen([sys.executable, "-c", grandchild_code])
+                print(grandchild.pid, flush=True)
+                while True:
+                    time.sleep(1)
+                """
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", child_code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                start_new_session=True,
+                cwd=temporary_dir,
+            )
+            assert process.stdout is not None
+            grandchild_pid = int(process.stdout.readline().strip())
+            namespace["process"] = process
+            with self.assertRaises(InterruptedError):
+                namespace["interrupt_child"](signal.SIGTERM, None)  # type: ignore[operator]
+            process.stdout.close()
+            self.assertIsNotNone(process.returncode)
+            proc_stat = Path(f"/proc/{grandchild_pid}/stat")
+            for _ in range(30):
+                if not proc_stat.exists() or proc_stat.read_text().split()[2] == "Z":
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("backup cancellation left a child process running")
+
+    def _assert_backup_wrapper_bounds_private_stderr(self, workflow_path: Path) -> None:
+        workflow = yaml.safe_load(workflow_path.read_text())
+        run_script = next(
+            step["run"]
+            for step in workflow["jobs"]["backup"]["steps"]
+            if step.get("name") == "Create and verify the production backup"
+        )
+        remote_script = run_script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
+        wrapper_script = remote_script.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        wrapper_script = wrapper_script.replace(
+            'capture_path = Path(f"/tmp/oldsparky-production-backup-{run_id}-{run_attempt}.stderr")',
+            'capture_path = Path("/tmp/placeholder.stderr")',
+        )
+        wrapper_script = wrapper_script.replace(
+            'capture_path = Path("/tmp/placeholder.stderr")',
+            'capture_path = Path(sys.argv[7])',
+        )
+        wrapper_script = wrapper_script.replace(
+            "capture_stat.st_uid != 0", "capture_stat.st_uid != os.geteuid()"
+        ).replace("report_stat.st_uid != 0", "report_stat.st_uid != os.geteuid()")
+        command_start = wrapper_script.index("command = [")
+        command_end = wrapper_script.index("def stop_child_group", command_start)
+        child_code = "import sys; sys.stderr.buffer.write(b'x' * 100000); raise SystemExit(7)"
+        wrapper_script = (
+            wrapper_script[:command_start]
+            + f"command = [sys.executable, '-I', '-c', {child_code!r}]\n\n"
+            + wrapper_script[command_end:]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            report_path = Path(temporary_dir) / "report.json"
+            report_path.write_text("", encoding="utf-8")
+            os.chmod(report_path, 0o600)
+            capture_path = Path(temporary_dir) / "private.stderr"
+            wrapper_script = wrapper_script.replace(
+                "capture_path = Path(sys.argv[7])",
+                f"capture_path = Path({str(capture_path)!r})",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    "unused-python",
+                    "unused-maintenance",
+                    "unused-runtime",
+                    "123456",
+                    "1",
+                    str(report_path),
+                ],
+                input=wrapper_script,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 7, completed.stderr)
+            self.assertEqual(completed.stdout, "")
+            captured = capture_path.stat()
+            self.assertEqual(captured.st_mode & 0o777, 0o600)
+            self.assertEqual(captured.st_size, 65536)
+            self.assertEqual(capture_path.read_bytes(), b"x" * 65536)
 
         maintenance_source = (
             REPO_ROOT / "platform/tools/platform_storage_maintenance.py"

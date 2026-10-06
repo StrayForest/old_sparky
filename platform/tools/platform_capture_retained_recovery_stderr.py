@@ -14,6 +14,7 @@ from typing import BinaryIO
 
 RUNTIME_ROOT = Path("/opt/oldsparky/platform")
 RUN_ROOT_BASE = RUNTIME_ROOT / "shared" / "production-retained-matrix"
+LIVE_QA_RELEASE_ROOT = Path("/root/.oldsparky/liveqa/releases")
 MAX_CAPTURE_BYTES = 65_536
 MAX_STDIN_BYTES = 4096
 TRUNCATION_MARKER = b"\n[stderr capture truncated at 64 KiB]\n"
@@ -51,6 +52,7 @@ def parse_request(raw: bytes) -> dict[str, str]:
         raise CaptureError("input_invalid") from exc
     if not isinstance(value, dict) or set(value) != {
         "schema",
+        "target_sha",
         "load_run_id",
         "cleanup_run_id",
         "control_email",
@@ -59,10 +61,13 @@ def parse_request(raw: bytes) -> dict[str, str]:
         raise CaptureError("input_schema_invalid")
     if type(value["schema"]) is not int or value["schema"] != 1:
         raise CaptureError("input_schema_invalid")
+    target_sha = value["target_sha"]
     load_run_id = value["load_run_id"]
     cleanup_run_id = value["cleanup_run_id"]
     control_email = value["control_email"]
     mode = value["mode"]
+    if not isinstance(target_sha, str) or re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
+        raise CaptureError("target_sha_invalid")
     if not isinstance(load_run_id, str) or RUN_ID_RE.fullmatch(load_run_id) is None:
         raise CaptureError("load_run_id_invalid")
     if (
@@ -75,6 +80,7 @@ def parse_request(raw: bytes) -> dict[str, str]:
     if not isinstance(mode, str) or mode not in MODES:
         raise CaptureError("mode_invalid")
     return {
+        "target_sha": target_sha,
         "load_run_id": load_run_id,
         "cleanup_run_id": cleanup_run_id,
         "control_email": control_email,
@@ -196,9 +202,16 @@ def _write_bounded(stream: BinaryIO, output: BinaryIO) -> bool:
 
 
 def capture_recovery_stderr(
-    *, load_run_id: str, cleanup_run_id: str, control_email: str, mode: str
+    *,
+    target_sha: str,
+    load_run_id: str,
+    cleanup_run_id: str,
+    control_email: str,
+    mode: str,
 ) -> int:
     """Run the fixed recovery command and retain at most 64 KiB of stderr."""
+    if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
+        raise CaptureError("target_sha_invalid")
     if RUN_ID_RE.fullmatch(cleanup_run_id) is None:
         raise CaptureError("cleanup_run_id_invalid")
     if mode not in MODES:
@@ -233,7 +246,8 @@ def capture_recovery_stderr(
         _verify_root_binding(root_fd, root_metadata, root_name)
 
         tools_dir = RUNTIME_ROOT / "current" / "tools"
-        platform_root = RUNTIME_ROOT / "current"
+        payload_root = LIVE_QA_RELEASE_ROOT / target_sha
+        payload_tools_dir = payload_root / "platform" / "tools"
         command = [
             "/usr/bin/python3.12",
             "-I",
@@ -241,10 +255,10 @@ def capture_recovery_stderr(
             str(tools_dir / "platform_safe_env_exec.py"),
             "exec",
             "--pythonpath",
-            str(platform_root),
+            str(payload_root),
             "--",
             str(RUNTIME_ROOT / "shared" / "venv" / "bin" / "python"),
-            str(tools_dir / "platform_recover_retained_report.py"),
+            str(payload_tools_dir / "platform_recover_retained_report.py"),
             "--run-root",
             str(RUN_ROOT_BASE / root_name),
             "--load-run-id",
@@ -311,6 +325,7 @@ def main() -> int:
             return 125
         request = parse_request(sys.stdin.buffer.read(MAX_STDIN_BYTES + 1))
         return capture_recovery_stderr(
+            target_sha=request["target_sha"],
             load_run_id=request["load_run_id"],
             cleanup_run_id=request["cleanup_run_id"],
             control_email=request["control_email"],
