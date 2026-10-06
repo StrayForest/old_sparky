@@ -74,11 +74,9 @@ run_external_vote_recovery() {
   CLEANUP_STAGE="external_vote_recovery"
   "$SYSTEM_PYTHON" -I -B \
     "$TOOLS_DIR/platform_capture_retained_recovery_stderr.py" \
-    --load-run-id "$load_run_id" \
-    --cleanup-run-id "$cleanup_run_id" \
-    --control-email "$control_email" \
-    --mode "$recovery_profile" \
-    >/dev/null 2>&1
+    >/dev/null 2>&1 <<EOF
+{"schema":1,"load_run_id":"$load_run_id","cleanup_run_id":"$cleanup_run_id","control_email":"$control_email","mode":"$recovery_profile"}
+EOF
 }
 if (( $# != 5 )) || [[ "$1" != "$CONFIRMATION" ]]; then
   echo "Usage: $0 $CONFIRMATION <target-sha> <load-run-id> <control-email> <cleanup-run-id>" >&2

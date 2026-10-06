@@ -18,6 +18,37 @@ from tools import platform_capture_retained_recovery_stderr as recovery_capture
 
 
 class RetainedLoadExportExecutorTests(unittest.TestCase):
+    def test_recovery_capture_accepts_only_closed_stdin_schema(self) -> None:
+        valid = recovery_capture.parse_request(
+            b'{"schema":1,"load_run_id":"12345","cleanup_run_id":"67890",'
+            b'"control_email":"control@example.invalid","mode":"external-vote"}'
+        )
+        self.assertEqual(
+            valid,
+            {
+                "load_run_id": "12345",
+                "cleanup_run_id": "67890",
+                "control_email": "control@example.invalid",
+                "mode": "external-vote",
+            },
+        )
+        invalid = (
+            b'{"schema":1,"load_run_id":"1","cleanup_run_id":"2",'
+            b'"control_email":"control@example.invalid","mode":"external-vote",'
+            b'"path":"/tmp/unsafe"}',
+            b'{"schema":1,"load_run_id":"1","cleanup_run_id":"2",'
+            b'"control_email":"control@example.invalid","mode":"external-vote",'
+            b'"load_run_id":"3"}',
+            b'{"schema":true,"load_run_id":"1","cleanup_run_id":"2",'
+            b'"control_email":"control@example.invalid","mode":"external-vote"}',
+            b'{"schema":1,"load_run_id":"1","cleanup_run_id":"2",'
+            b'"control_email":"bad\\"@example.invalid","mode":"external-vote"}',
+        )
+        for document in invalid:
+            with self.subTest(document=document):
+                with self.assertRaises(recovery_capture.CaptureError):
+                    recovery_capture.parse_request(document)
+
     def test_recovery_stderr_is_bounded_private_and_failure_is_preserved(self) -> None:
         class FakeProcess:
             def __init__(self, payload: bytes) -> None:
@@ -170,6 +201,8 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         )[0]
         self.assertIn("platform_capture_retained_recovery_stderr.py", recovery_function)
         self.assertIn(">/dev/null 2>&1", recovery_function)
+        self.assertNotIn("--control-email", recovery_function)
+        self.assertIn('"schema":1,"load_run_id":"$load_run_id"', recovery_function)
         export_creation = script.index(
             '/usr/bin/mkdir -m 0700 -- "$export_dir"', recovery_call
         )

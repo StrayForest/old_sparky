@@ -2,25 +2,94 @@
 
 from __future__ import annotations
 
-import argparse
+import json
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 from typing import BinaryIO
 
 
 RUNTIME_ROOT = Path("/opt/oldsparky/platform")
 RUN_ROOT_BASE = RUNTIME_ROOT / "shared" / "production-retained-matrix"
 MAX_CAPTURE_BYTES = 65_536
+MAX_STDIN_BYTES = 4096
 TRUNCATION_MARKER = b"\n[stderr capture truncated at 64 KiB]\n"
 RUN_ID_RE = re.compile(r"[1-9][0-9]{0,31}\Z")
 MODES = frozenset({"read-mix", "write-burst", "external-vote"})
+EMAIL_LOCAL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?\Z")
+EMAIL_DOMAIN_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\Z")
 
 
 class CaptureError(RuntimeError):
     """A fixed failure class; details must remain private."""
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CaptureError("duplicate_input_key")
+        result[key] = value
+    return result
+
+
+def parse_request(raw: bytes) -> dict[str, str]:
+    if len(raw) > MAX_STDIN_BYTES:
+        raise CaptureError("input_too_large")
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CaptureError("input_invalid") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "load_run_id",
+        "cleanup_run_id",
+        "control_email",
+        "mode",
+    }:
+        raise CaptureError("input_schema_invalid")
+    if type(value["schema"]) is not int or value["schema"] != 1:
+        raise CaptureError("input_schema_invalid")
+    load_run_id = value["load_run_id"]
+    cleanup_run_id = value["cleanup_run_id"]
+    control_email = value["control_email"]
+    mode = value["mode"]
+    if not isinstance(load_run_id, str) or RUN_ID_RE.fullmatch(load_run_id) is None:
+        raise CaptureError("load_run_id_invalid")
+    if (
+        not isinstance(cleanup_run_id, str)
+        or RUN_ID_RE.fullmatch(cleanup_run_id) is None
+    ):
+        raise CaptureError("cleanup_run_id_invalid")
+    if not isinstance(control_email, str) or not _valid_control_email(control_email):
+        raise CaptureError("control_input_invalid")
+    if not isinstance(mode, str) or mode not in MODES:
+        raise CaptureError("mode_invalid")
+    return {
+        "load_run_id": load_run_id,
+        "cleanup_run_id": cleanup_run_id,
+        "control_email": control_email,
+        "mode": mode,
+    }
+
+
+def _valid_control_email(value: str) -> bool:
+    if not value.isascii() or not 3 <= len(value) <= 254 or value != value.strip():
+        return False
+    if any(ord(character) < 0x21 or ord(character) == 0x7F for character in value):
+        return False
+    if value.count("@") != 1:
+        return False
+    local, domain = value.split("@", 1)
+    if not 1 <= len(local) <= 64 or EMAIL_LOCAL_RE.fullmatch(local) is None:
+        return False
+    if not 1 <= len(domain) <= 253 or "." not in domain:
+        return False
+    labels = domain.split(".")
+    return all(EMAIL_DOMAIN_LABEL_RE.fullmatch(label) is not None for label in labels)
 
 
 def _open_parent_directory(path: Path) -> int:
@@ -219,18 +288,15 @@ def capture_recovery_stderr(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--load-run-id", required=True)
-    parser.add_argument("--cleanup-run-id", required=True)
-    parser.add_argument("--control-email", required=True)
-    parser.add_argument("--mode", required=True)
     try:
-        args = parser.parse_args()
+        if len(sys.argv) != 1:
+            return 125
+        request = parse_request(sys.stdin.buffer.read(MAX_STDIN_BYTES + 1))
         return capture_recovery_stderr(
-            load_run_id=args.load_run_id,
-            cleanup_run_id=args.cleanup_run_id,
-            control_email=args.control_email,
-            mode=args.mode,
+            load_run_id=request["load_run_id"],
+            cleanup_run_id=request["cleanup_run_id"],
+            control_email=request["control_email"],
+            mode=request["mode"],
         )
     except BaseException:
         return 125
