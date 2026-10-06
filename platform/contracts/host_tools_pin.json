@@ -18,7 +18,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_production_deploy_supervisor.sh",
-      "sha256": "a1b56a151f76bfd15a016be383759b45d3b2cf5667eb200d0c75ee20aadc7d78"
+      "sha256": "6910e024ee041f2a2f0675bcd7315661a8555e673c7bd1556a05dfa4ab0d7834"
     },
     {
       "mode": 493,
@@ -71,7 +71,7 @@
       "sha256": "2d499f8cd41939f7664c17119391447595ee6cdd2960a183735b991ee09a75e0"
     }
   ],
-  "host_tools_sha": "f997be4747f70631b79439d02deffd1160bea149",
+  "host_tools_sha": "53e99544da7a98e14909f4cd17737cb76e176d22",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }
