@@ -68,12 +68,38 @@ cleanup_run_id="$5"
   exit 1
 }
 
-export_uid="${SUDO_UID:-0}"
-export_gid="${SUDO_GID:-0}"
-[[ "$export_uid" =~ ^[0-9]+$ && "$export_gid" =~ ^[0-9]+$ ]] || {
-  echo "Unable to determine the SSH caller identity for cleanup export." >&2
+legacy_export_uid="${SUDO_UID:-0}"
+[[ "$legacy_export_uid" =~ ^[0-9]+$ ]] || {
+  echo "Unable to validate the legacy retained-load export owner." >&2
   exit 1
 }
+artifact_owner_json="$("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_retained_load_export_executor.py" owner)" || {
+  echo "Dedicated retained-load artifact owner is not available." >&2
+  exit 1
+}
+artifact_owner_pair="$("$SYSTEM_PYTHON" -I -B -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if (
+    not isinstance(payload, dict)
+    or set(payload) != {"uid", "gid"}
+    or type(payload.get("uid")) is not int
+    or type(payload.get("gid")) is not int
+    or payload["uid"] <= 0
+    or payload["gid"] <= 0
+):
+    raise SystemExit(1)
+print("{} {}".format(payload["uid"], payload["gid"]))
+' <<< "$artifact_owner_json")" || {
+  echo "Dedicated retained-load artifact owner projection is invalid." >&2
+  exit 1
+}
+read -r export_uid export_gid <<< "$artifact_owner_pair"
 
 external_load_export_dir="/tmp/old-sparky-production-retained-load-$load_run_id"
 remove_external_load_export() {
@@ -86,11 +112,17 @@ remove_external_load_export() {
   fi
   if find "$external_load_export_dir" -xdev \
     \( -type l -o ! \( -type f -o -type d \) \
-      -o ! \( -user "$export_uid" -o -user 0 \) \
+      -o ! \( -user "$legacy_export_uid" -o -user "$export_uid" -o -user 0 \) \
       -o -perm /022 -o \( -type f ! -links 1 \) \) \
     -print -quit | grep -q .; then
     echo "Refusing external retained-load export removal with unexpected ownership, mode, inode, or symlink." >&2
     return 1
+  fi
+  if [[ "$(stat -c '%u' -- "$external_load_export_dir")" == "$export_uid" ]]; then
+    # Dedicated-owner exports remain available through report projection and
+    # transfer; the pinned host-tools wrapper removes both exact exports only
+    # after it has validated and copied them.
+    return 0
   fi
   rm -rf -- "$external_load_export_dir"
 }
@@ -134,8 +166,13 @@ if [[ -L "$run_root" ]]; then
 fi
 if [[ ! -e "$run_root" ]]; then
   export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
-  rm -rf -- "$export_dir"
-  install -d -o root -g root -m 0700 "$export_dir"
+  if [[ -e "$export_dir" || -L "$export_dir" ]]; then
+    echo "A retained-load cleanup export already exists for this cleanup run id." >&2
+    exit 1
+  fi
+  /usr/bin/mkdir -m 0700 -- "$export_dir"
+  /usr/bin/chown "$export_uid:$export_gid" -- "$export_dir"
+  /usr/bin/chmod 0700 -- "$export_dir"
   log_path="$export_dir/canonical.log"
   raw_log_path="$export_dir/cleanup-raw.log"
   result_path="$export_dir/cleanup-summary.json"
@@ -163,8 +200,10 @@ if [[ ! -e "$run_root" ]]; then
   if [[ "$cleanup_status" == "0" ]] && ! remove_external_load_export; then
     cleanup_status=1
   fi
-  chown -R "$export_uid:$export_gid" "$export_dir"
-  chmod 0700 "$export_dir"
+  chown "$export_uid:$export_gid" "$log_path"
+  if [[ -f "$result_path" && ! -L "$result_path" ]]; then
+    chown "$export_uid:$export_gid" "$result_path"
+  fi
   chmod 0600 "$log_path" "$result_path" 2>/dev/null || true
   printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=%s\n' "$export_dir"
   printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$result_path"
@@ -234,14 +273,18 @@ if (( recovery_needed == 1 )) || {
     remove_external_load_export
     rm -rf -- "$run_root"
     partial_export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
-    rm -rf -- "$partial_export_dir"
-    install -d -o root -g root -m 0700 "$partial_export_dir"
+    if [[ -e "$partial_export_dir" || -L "$partial_export_dir" ]]; then
+      echo "A retained-load cleanup export already exists for this cleanup run id." >&2
+      exit 1
+    fi
+    /usr/bin/mkdir -m 0700 -- "$partial_export_dir"
+    /usr/bin/chown "$export_uid:$export_gid" -- "$partial_export_dir"
+    /usr/bin/chmod 0700 -- "$partial_export_dir"
     printf '%s\n' '{"schema":1,"status":"passed","event":"partial_run_root_removed"}' \
       > "$partial_export_dir/canonical.log"
     printf '%s\n' '{"ok":true,"markers":0,"users_deleted":0,"tournaments_deleted":0,"control_account_preserved":true,"partial_run_root_removed":true}' \
       > "$partial_export_dir/cleanup-summary.json"
-    chown -R "$export_uid:$export_gid" "$partial_export_dir"
-    chmod 0700 "$partial_export_dir"
+    chown "$export_uid:$export_gid" "$partial_export_dir/canonical.log" "$partial_export_dir/cleanup-summary.json"
     chmod 0600 "$partial_export_dir/canonical.log" "$partial_export_dir/cleanup-summary.json"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=%s\n' "$partial_export_dir"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$partial_export_dir/cleanup-summary.json"
@@ -274,14 +317,13 @@ test -f "$summary_path" || {
 }
 
 export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
-export_uid="${SUDO_UID:-0}"
-export_gid="${SUDO_GID:-0}"
-[[ "$export_uid" =~ ^[0-9]+$ && "$export_gid" =~ ^[0-9]+$ ]] || {
-  echo "Unable to determine the SSH caller identity for cleanup export." >&2
+if [[ -e "$export_dir" || -L "$export_dir" ]]; then
+  echo "A retained-load cleanup export already exists for this cleanup run id." >&2
   exit 1
-}
-rm -rf -- "$export_dir"
-install -d -o root -g root -m 0700 "$export_dir"
+fi
+/usr/bin/mkdir -m 0700 -- "$export_dir"
+/usr/bin/chown "$export_uid:$export_gid" -- "$export_dir"
+/usr/bin/chmod 0700 -- "$export_dir"
 log_path="$export_dir/canonical.log"
 raw_log_path="$export_dir/cleanup-raw.log"
 result_path="$export_dir/cleanup-summary.json"
@@ -322,8 +364,10 @@ fi
 if [[ "$cleanup_status" == "0" ]]; then
   rm -rf -- "$run_root"
 fi
-chown -R "$export_uid:$export_gid" "$export_dir"
-chmod 0700 "$export_dir"
+chown "$export_uid:$export_gid" "$export_dir/canonical.log"
+if [[ -f "$export_dir/cleanup-summary.json" && ! -L "$export_dir/cleanup-summary.json" ]]; then
+  chown "$export_uid:$export_gid" "$export_dir/cleanup-summary.json"
+fi
 chmod 0600 "$export_dir/canonical.log" "$export_dir/cleanup-summary.json" 2>/dev/null || true
 printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=%s\n' "$export_dir"
 printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$export_dir/cleanup-summary.json"
