@@ -30,18 +30,50 @@ fi
 # shellcheck source=/dev/null
 source "$LOCK_HELPER"
 ORIGINAL_ARGS=("$@")
-platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}" || {
-  echo "Another retained load or cleanup operation is already running on this host." >&2
-  exit 1
+cleanup_stage_emit() {
+  local stage="$1" exit_code="$2"
+  case "$stage" in
+    lock|input|identity|release_binding|run_root|external_vote_recovery|orphan_cleanup|matrix_cleanup|export_cleanup|complete) ;;
+    *) stage="unknown" ;;
+  esac
+  [[ "$exit_code" =~ ^(0|[1-9][0-9]{0,2})$ ]] || exit_code=255
+  if (( exit_code > 255 )); then exit_code=255; fi
+  printf 'RETAINED_CLEANUP_STAGE schema=1 stage=%s exit_code=%s\n' "$stage" "$exit_code"
 }
+if platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}"; then
+  :
+else
+  lock_status="$?"
+  cleanup_stage_emit lock "$lock_status"
+  echo "Another retained load or cleanup operation is already running on this host." >&2
+  exit "$lock_status"
+fi
 if [[ "${PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED:-}" != "1" ]]; then
   exit 0
 fi
-platform_retained_load_lock_open || {
+if platform_retained_load_lock_open; then
+  :
+else
+  lock_status="$?"
+  cleanup_stage_emit lock "$lock_status"
   echo "Retained-load lock supervisor could not be validated." >&2
-  exit 1
+  exit "$lock_status"
+fi
+CLEANUP_STAGE="input"
+# Invoked indirectly by the registered EXIT trap.
+# shellcheck disable=SC2317
+cleanup_exit_report() {
+  local exit_code="$?"
+  trap - EXIT
+  platform_retained_load_lock_close >/dev/null 2>&1 || true
+  cleanup_stage_emit "${CLEANUP_STAGE:-input}" "$exit_code"
+  return "$exit_code"
 }
-trap platform_retained_load_lock_close EXIT
+trap cleanup_exit_report EXIT
+run_external_vote_recovery() {
+  CLEANUP_STAGE="external_vote_recovery"
+  "$@" >/dev/null 2>&1
+}
 if (( $# != 5 )) || [[ "$1" != "$CONFIRMATION" ]]; then
   echo "Usage: $0 $CONFIRMATION <target-sha> <load-run-id> <control-email> <cleanup-run-id>" >&2
   exit 2
@@ -69,6 +101,7 @@ cleanup_run_id="$5"
 }
 
 legacy_export_uid="${SUDO_UID:-0}"
+CLEANUP_STAGE="identity"
 [[ "$legacy_export_uid" =~ ^[0-9]+$ ]] || {
   echo "Unable to validate the legacy retained-load export owner." >&2
   exit 1
@@ -135,6 +168,7 @@ test -L "$RUNTIME_ROOT/current" || {
   echo "Active production release is missing." >&2
   exit 1
 }
+CLEANUP_STAGE="release_binding"
 release_sha="$($SYSTEM_PYTHON -I -B - "$RUNTIME_ROOT/current/RELEASE.json" <<'PY'
 import json
 from pathlib import Path
@@ -159,6 +193,7 @@ test "$platform_origin" = "$EXPECTED_ORIGIN" || {
   exit 1
 }
 
+CLEANUP_STAGE="run_root"
 run_root="$RUN_ROOT_BASE/gha-$load_run_id"
 if [[ -L "$run_root" ]]; then
   echo "The selected retained load run root must not be a symlink." >&2
@@ -176,6 +211,7 @@ if [[ ! -e "$run_root" ]]; then
   log_path="$export_dir/canonical.log"
   raw_log_path="$export_dir/cleanup-raw.log"
   result_path="$export_dir/cleanup-summary.json"
+  CLEANUP_STAGE="orphan_cleanup"
   set +e
   "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
     --pythonpath "$PLATFORM_ROOT" \
@@ -209,6 +245,7 @@ if [[ ! -e "$run_root" ]]; then
   printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$result_path"
   printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXIT_CODE=%s\n' "$cleanup_status"
   if [[ "$cleanup_status" == "0" ]]; then
+    CLEANUP_STAGE="complete"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1\n'
   fi
   exit "$cleanup_status"
@@ -270,6 +307,7 @@ if (( recovery_needed == 1 )) || {
       echo "The selected partial retained load run contains an unexpected symlink." >&2
       exit 1
     fi
+    CLEANUP_STAGE="export_cleanup"
     remove_external_load_export
     rm -rf -- "$run_root"
     partial_export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
@@ -289,12 +327,13 @@ if (( recovery_needed == 1 )) || {
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=%s\n' "$partial_export_dir"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$partial_export_dir/cleanup-summary.json"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXIT_CODE=0\n'
+    CLEANUP_STAGE="complete"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1\n'
     echo "No fixture inventory was published; removed the exact partial run root."
     exit 0
   fi
   if (( profile_count == 1 )); then
-    "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+    run_external_vote_recovery "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
       --pythonpath "$PLATFORM_ROOT" \
       -- "$QA_PYTHON" "$TOOLS_DIR/platform_recover_retained_report.py" \
       --run-root "$run_root" \
@@ -306,6 +345,7 @@ if (( recovery_needed == 1 )) || {
   summaries=("$run_root"/*/matrix-summary.json)
   shopt -u nullglob
 fi
+CLEANUP_STAGE="matrix_cleanup"
 if (( ${#summaries[@]} != 1 )); then
   echo "The selected load run must contain exactly one matrix summary." >&2
   exit 1
@@ -357,6 +397,7 @@ if [[ "$cleanup_status" == "0" ]]; then
   fi
 fi
 if [[ "$cleanup_status" == "0" ]]; then
+  CLEANUP_STAGE="export_cleanup"
   if ! remove_external_load_export; then
     cleanup_status=1
   fi
@@ -374,5 +415,6 @@ printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$export_dir/cleanup-summ
 printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXIT_CODE=%s\n' "$cleanup_status"
 if [[ "$cleanup_status" == "0" ]]; then
   printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1\n'
+  CLEANUP_STAGE="complete"
 fi
 exit "$cleanup_status"

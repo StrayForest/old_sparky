@@ -16,6 +16,63 @@ from tools import platform_retained_load_export_executor as executor
 
 
 class RetainedLoadExportExecutorTests(unittest.TestCase):
+    def test_cleanup_recovery_failure_emits_only_fixed_stage_marker(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "tools"
+            / "platform_production_retained_load_cleanup_qa.sh"
+        ).read_text(encoding="utf-8")
+
+        def function_body(name: str) -> str:
+            prefix = f"{name}() {{"
+            return prefix + script.split(prefix, 1)[1].split("\n}", 1)[0] + "\n}"
+
+        shell_functions = "\n".join(
+            function_body(name)
+            for name in (
+                "cleanup_stage_emit",
+                "cleanup_exit_report",
+                "run_external_vote_recovery",
+            )
+        )
+        harness = "\n".join(
+            (
+                "set -Eeuo pipefail",
+                'CLEANUP_STAGE="run_root"',
+                "platform_retained_load_lock_close() { :; }",
+                shell_functions,
+                "trap cleanup_exit_report EXIT",
+                "if run_external_vote_recovery /bin/bash -c "
+                + shlex.quote(
+                    "printf 'private stdout sentinel\\n'; "
+                    "printf 'private stderr sentinel\\n' >&2; exit 37"
+                )
+                + '; then exit 0; else status=$?; exit "$status"; fi',
+            )
+        )
+        completed = subprocess.run(
+            ["/bin/bash", "-c", harness],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 37)
+        self.assertEqual(
+            completed.stdout.decode("ascii"),
+            "RETAINED_CLEANUP_STAGE schema=1 stage=external_vote_recovery exit_code=37\n",
+        )
+        self.assertEqual(completed.stderr, b"")
+        self.assertNotIn(b"private", completed.stdout + completed.stderr)
+        self.assertNotIn(b"PRODUCTION_RETAINED_LOAD_CLEANUP_OK", completed.stdout)
+
+        recovery_call = script.index('run_external_vote_recovery "$SYSTEM_PYTHON"')
+        export_creation = script.index(
+            '/usr/bin/mkdir -m 0700 -- "$export_dir"', recovery_call
+        )
+        self.assertLess(recovery_call, export_creation)
+
     def test_missing_preprovisioned_owner_fails_closed_without_provisioning(
         self,
     ) -> None:
