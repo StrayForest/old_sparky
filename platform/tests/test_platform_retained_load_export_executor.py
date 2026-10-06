@@ -29,6 +29,9 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
 
         self.assertIn("control-email-json-stdin", external)
         self.assertNotIn('--value "$control_email"', external)
+        self.assertIn('unset control_email\ncontrol_email="$(', external)
+        self.assertIn('[[ -n "$control_email" ]]', external)
+        self.assertNotIn("export control_email", external)
         self.assertIn("<target-sha> <concurrency> <run-id>", external)
         external_parse = external.index("control-email-json-stdin")
         external_lock = external.index('PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED:-}')
@@ -36,6 +39,8 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
 
         self.assertIn("control-email-json-stdin", cleanup)
         self.assertNotIn('--value "$control_email"', cleanup)
+        self.assertIn('unset control_email\ncontrol_email="$(', cleanup)
+        self.assertNotIn("export control_email", cleanup)
         self.assertIn("<target-sha> <load-run-id> <cleanup-run-id>", cleanup)
         self.assertIn("--control-email-stdin", cleanup)
         self.assertNotIn('--control-email "$control_email"', cleanup)

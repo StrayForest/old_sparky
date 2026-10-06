@@ -74,8 +74,13 @@ timeout_diagnostics="${8:-false}"
   echo "Target SHA must be a lowercase 40-character commit SHA." >&2
   exit 1
 }
-"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" \
-  control-email-json-stdin >/dev/null || {
+unset control_email
+control_email="$("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" \
+  control-email-json-stdin)" || {
+  echo "Control email is invalid." >&2
+  exit 1
+}
+[[ -n "$control_email" ]] || {
   echo "Control email is invalid." >&2
   exit 1
 }
