@@ -1681,6 +1681,32 @@ raise SystemExit(module.main(["host-capabilities"]))
         self.assertTrue(
             all(name in supervisor for name in bundle.PRODUCTION_DEPLOY_CONTROL_FILES)
         )
+        manifest_set = re.search(
+            r"(?ms)^expected_files = \{\n(?P<body>.*?)^\}", supervisor
+        )
+        self.assertIsNotNone(manifest_set)
+        manifest_names = set(
+            re.findall(
+                r'^\s+"(platform_[A-Za-z0-9_.-]+\.(?:py|sh)|capabilities\.txt)",$',
+                manifest_set["body"],
+                re.M,
+            )
+        )
+        self.assertEqual(
+            manifest_names, set(bundle.HOST_TOOL_FILES) | {"capabilities.txt"}
+        )
+        helper_loop = re.search(
+            r"(?ms)^for host_helper in \\\n(?P<body>.*?)^done$", supervisor
+        )
+        self.assertIsNotNone(helper_loop)
+        helper_names = set(
+            re.findall(
+                r"^\s+(platform_[A-Za-z0-9_.-]+\.(?:py|sh))",
+                helper_loop["body"],
+                re.M,
+            )
+        ) | {"platform_storage_evidence_summary.py"}
+        self.assertEqual(helper_names, set(bundle.HOST_TOOL_FILES))
         self.assertTrue(set(bundle.PREPARE_ARTIFACT_FILES) <= set(bundle.HOST_TOOL_FILES))
         self.assertEqual(
             bundle.RETAINED_LOAD_ARTIFACT_FILES,
