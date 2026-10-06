@@ -2718,13 +2718,14 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             os.chmod(generation, 0o555)
 
             real_lstat = Path.lstat
+            owner_overrides: dict[Path, int] = {}
 
             def root_owned_lstat(path: Path) -> SimpleNamespace | os.stat_result:
                 metadata = real_lstat(path)
                 if path == generation or path.parent == generation:
                     return SimpleNamespace(
                         st_mode=metadata.st_mode,
-                        st_uid=0,
+                        st_uid=owner_overrides.get(path, 0),
                         st_gid=0,
                         st_nlink=metadata.st_nlink,
                     )
@@ -2740,6 +2741,13 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 self.assertEqual(dispatcher._host_capabilities(), 0)
             self.assertRegex(output.getvalue(), r"^HOST_TOOLS schema=1 source_sha=[0-9a-f]{40} ")
             self.assertNotIn(str(generation), output.getvalue())
+            owner_overrides[generation / bundle.HOST_TOOL_FILES[0]] = 1000
+            with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_lstat), \
+                patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \
+                patch.object(dispatcher, "HOST_TOOLS_ROOT", host_root), \
+                patch.object(dispatcher, "__file__", str(generation / bundle.HOST_TOOL_FILES[0])):
+                self.assertEqual(dispatcher._host_capabilities(), 2)
+            owner_overrides.clear()
             os.chmod(generation / bundle.HOST_TOOL_FILES[-1], 0o554)
             with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_lstat), \
                 patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \

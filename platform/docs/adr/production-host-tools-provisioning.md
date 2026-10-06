@@ -62,6 +62,18 @@ approved-tool, script and runtime-ancestry checks remain required. Provisioning
 and the installed-generation self-test are required before this generation is
 used. The active application release and production health are owned by
 [`CURRENT.md`](../CURRENT.md); this ADR does not duplicate those changing facts.
+The retained-export pin-comparison correction uses **C**
+`97f90674ccc45d6e223ee2793ed3f3c46d928fff` and pin-only **P**
+`ef48bd2b6b354a95094dd51260397759b4342445`. P binds the exact 14-member C
+closure. The pin records source Git modes (`0644` or `0755`); the builder
+normalizes installed tool files to `0555`, with `capabilities.txt` and
+`manifest.json` at `0444`. Compare the closed path set and each digest by exact
+relative path, and validate source and installed modes against their separate
+contracts instead of comparing those mode values directly. The reviewed
+source pin is not proof of installation: the verified production app remains
+`f0c5f9bcf7ae7389ec2bf347fd0209ced3273961` with the previous host generation
+`b186fbd177ab82330c1ec001d96a2d40474f9552` until the approved signed-artifact
+provisioning and self-test complete.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable

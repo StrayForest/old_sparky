@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-05
+- Last reviewed: 2026-10-07
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -21,11 +21,11 @@ Read this file for the current production baseline and next engineering priority
   `cc797eb6d7603b0aa7c6dc3de0cff5149eb3e5be6e3e498b9296d48462ccddf9`) and DB
   head `20260913_0053`.
 - Storage diagnostic [`37359027285`](https://github.com/StrayForest/old_sparky/actions/runs/37359027285): healthy services/locks; 6,824,091,648 B free (83%) after cache-only cleanup; no release or backup was deleted.
-- Host-tools S11 (`138128c99025069143f5c234f6cb58545ed8ab1c`) is installed;
-  all 15 members, no bytecode and receipt SHA-256 `2f182be1aaf90ee56ed83f7c755e4f38ec860d6f7f20e2ae003084c1a0a7c3f7` passed.
-  S10, S9 and recovery generation
-  `d47ae6a278f76bb8a46cca0bbe9019427584c3d2861880e8a7365d87a627be66` remain
-  preserved separately.
+- Current app `f0c5f9bcf7ae7389ec2bf347fd0209ced3273961` uses installed host-tools generation `b186fbd177ab82330c1ec001d96a2d40474f9552`; reviewed
+  source **C** `97f90674ccc45d6e223ee2793ed3f3c46d928fff` and pin-only **P**
+  `ef48bd2b6b354a95094dd51260397759b4342445` remain uninstalled pending signed
+  provisioning/self-test; earlier S11/S10/S9 and recovery generations remain
+  preserved (see the [host-tools provisioning ADR](adr/production-host-tools-provisioning.md)).
 - The authenticated HTML follow-up compared the unchanged v1 control, the
   HTTP/1.1 keep-alive client, the one-worker native server transport and the
   two-worker native profile. All pressure windows observed web-process
