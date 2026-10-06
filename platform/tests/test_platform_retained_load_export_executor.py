@@ -95,6 +95,10 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
             )
             self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
             self.assertEqual(popen.call_args.kwargs["close_fds"], True)
+            self.assertEqual(popen.call_args.kwargs["cwd"], "/")
+            self.assertEqual(
+                popen.call_args.kwargs["env"], recovery_capture.RECOVERY_ENV
+            )
 
             capture = run_root / "cleanup-recovery-12345-67890.stderr"
             metadata = capture.lstat()

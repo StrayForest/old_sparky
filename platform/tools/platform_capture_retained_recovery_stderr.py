@@ -19,6 +19,12 @@ MAX_STDIN_BYTES = 4096
 TRUNCATION_MARKER = b"\n[stderr capture truncated at 64 KiB]\n"
 RUN_ID_RE = re.compile(r"[1-9][0-9]{0,31}\Z")
 MODES = frozenset({"read-mix", "write-burst", "external-vote"})
+RECOVERY_ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "LC_CTYPE": "C.UTF-8",
+}
 EMAIL_LOCAL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._%+\-]{0,62}[A-Za-z0-9])?\Z")
 EMAIL_DOMAIN_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\Z")
 
@@ -253,6 +259,8 @@ def capture_recovery_stderr(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            cwd="/",
+            env=RECOVERY_ENV,
             close_fds=True,
         )
         assert process.stderr is not None
