@@ -1703,6 +1703,7 @@ jobs:
               active_deployment_status_identity,
               classify_cumulative_baseline,
               validate_active_baseline,
+              validate_cumulative_reconcile_route,
           )
           from tools.platform_workflow_provenance import (  # noqa: E402
               ProvenanceError,
@@ -1924,15 +1925,15 @@ jobs:
               raise SystemExit("cumulative classifier result is malformed")
           cumulative = cumulative_result["manifest"]
           cumulative_no_op = cumulative_result["no_op"]
-          if not isinstance(cumulative, dict) or type(cumulative_no_op) is not bool:
-              raise SystemExit("cumulative classifier result is malformed")
-          if cumulative_no_op is not True or cumulative.get("runtime_sensitive") is not True:
-              raise SystemExit("recovery target is not a runtime-sensitive cumulative no-op route")
+          try:
+              reconcile_route = validate_cumulative_reconcile_route(cumulative_result)
+          except ProvenanceError as exc:
+              raise SystemExit(f"cumulative baseline route is not authorized: {exc}") from exc
           manifest_bytes = json.dumps(
               cumulative, sort_keys=True, separators=(",", ":")
           ).encode("utf-8")
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-              runtime_required = not cumulative_no_op and cumulative["runtime_sensitive"] is True
+              runtime_required = reconcile_route["runtime_required"]
               output.write(f"runtime_required={str(runtime_required).lower()}\n")
               output.write(f"cumulative_no_op={str(cumulative_no_op).lower()}\n")
               output.write(f"manifest_sha256={hashlib.sha256(manifest_bytes).hexdigest()}\n")

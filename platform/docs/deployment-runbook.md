@@ -42,17 +42,16 @@ to `dev`. The chain is:
    security run, validates its schema, digest, target SHA and non-fallback
    route, then consumes its `deployable` bit: a deployable `full` route
    proceeds while a valid full CI-only route completes as a no-op. A route
-   classified as recovery-bootstrap-only stays `deployable=false`; the
-   automatic chain may send it to `baseline-reconcile`, which authenticates
-   the active baseline and complete baseline-to-target range. A separately
-   reported operational no-op is allowed only for an authenticated recovery
-   input plus a storage-triggered range wholly in the closed recovery, storage
-   and docs sets; it does not change classifier fields or authorize app work.
-   Other ranges need normal release checks. The gate re-reads current `dev` HEAD
-   and refuses a stale successful CI result.
-   The source run and both status snapshots are
-   checked by the shared dependency-free
-   [`platform_workflow_provenance.py`](../tools/platform_workflow_provenance.py)
+   classified as recovery-bootstrap-only stays `deployable=false`; the automatic
+   chain may send it to `baseline-reconcile` to authenticate the active baseline
+   and full baseline-to-target range. Reconcile is a verified no-op for an
+   allowed cumulative no-op; an application release requires a deployable full
+   cumulative route with every canonical gate, no fallback, and exact-target
+   runtime proof when sensitive. A storage no-op is allowed only for an
+   authenticated recovery input and a range wholly in the closed recovery,
+   storage and docs sets; it changes no classifier field and authorizes no app
+   work. Other ranges need normal release checks. The gate re-reads current `dev` HEAD and refuses a stale successful CI result.
+   The source run and both status snapshots are checked by the shared dependency-free [`platform_workflow_provenance.py`](../tools/platform_workflow_provenance.py)
    validator, including the exact repository/workflow/run attempt, SHA, event,
    branch, conclusion, trusted actor, description and attempt URL. The gate
    reads GitHub's paginated [list commit statuses endpoint](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference)
@@ -63,8 +62,8 @@ to `dev`. The chain is:
 4. The automatic chain dispatches `mode=deploy` for ordinary deployable full
    routes. For a recovery-bootstrap-only route it dispatches
    `mode=baseline-reconcile` only as part of the validated automatic chain; the
-   production workflow authenticates the source and caller and requires the
-   active baseline's unique latest bot-authored deploy marker, canonical
+   production workflow authenticates source and caller, validates the complete
+   cumulative range and active baseline's unique latest bot-authored deploy marker,
    attempt URL and successful exact `Deploy production` job. Legacy support is
    limited to a root-validated `gha-<run_id>-1-<UTC timestamp>` slug whose run ID matches the
    latest bot-authored bare URL; GitHub must report attempt 1 and exact checks must pass.

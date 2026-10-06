@@ -432,6 +432,41 @@ def classify_cumulative_baseline(
     raise ProvenanceError("cumulative classifier route is non-deployable and not a verified reconcile no-op")
 
 
+def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
+    """Validate the two authenticated baseline-reconcile route families.
+
+    A reconcile can either prove the established runtime-sensitive no-op, or
+    carry a canonical deployable full cumulative manifest. Keep these routes
+    disjoint: no-op routes never build an application release, and a real
+    cumulative release is accepted only with every full gate and no fallback.
+    """
+
+    if not isinstance(route, Mapping) or set(route) != {"manifest", "no_op"}:
+        raise ProvenanceError("cumulative classifier result is malformed")
+    manifest = route.get("manifest")
+    no_op = route.get("no_op")
+    if (
+        not isinstance(manifest, Mapping)
+        or type(no_op) is not bool
+        or manifest.get("class") != "full"
+        or manifest.get("expected_gates") != list(FULL_GATE_IDS)
+        or manifest.get("fallback") is not False
+        or type(manifest.get("runtime_sensitive")) is not bool
+        or type(manifest.get("deployable")) is not bool
+    ):
+        raise ProvenanceError("cumulative classifier route is not canonical full verification")
+    if no_op:
+        if manifest["runtime_sensitive"] is not True:
+            raise ProvenanceError("cumulative no-op route is not runtime-sensitive")
+        return {"no_op": True, "runtime_required": False}
+    if manifest["deployable"] is not True:
+        raise ProvenanceError("cumulative non-no-op route is not deployable")
+    return {
+        "no_op": False,
+        "runtime_required": manifest["runtime_sensitive"] is True,
+    }
+
+
 def _expected_run_identity(value: object, field: str) -> str:
     if isinstance(value, str):
         return str(parse_run_id(value, field))

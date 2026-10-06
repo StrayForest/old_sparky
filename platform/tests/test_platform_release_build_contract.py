@@ -5437,6 +5437,12 @@ cleanup
         self.assertIn("validate_security_marker(", baseline)
         self.assertIn("validate_autodeploy_dispatch(", baseline)
         self.assertIn("classify_cumulative_baseline(", baseline)
+        self.assertIn("validate_cumulative_reconcile_route(cumulative_result)", baseline)
+        self.assertIn('runtime_required = reconcile_route["runtime_required"]', baseline)
+        self.assertNotIn(
+            "recovery target is not a runtime-sensitive cumulative no-op route",
+            baseline,
+        )
         self.assertIn("platform_baseline_runtime_proof.py", proof)
         self.assertIn("needs.dispatch-baseline-runtime.result == 'success'", proof)
         self.assertIn("needs.validate-baseline-runtime-proof", build)
