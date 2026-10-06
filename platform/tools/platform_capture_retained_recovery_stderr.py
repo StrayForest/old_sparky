@@ -203,7 +203,7 @@ def capture_recovery_stderr(
         raise CaptureError("cleanup_run_id_invalid")
     if mode not in MODES:
         raise CaptureError("mode_invalid")
-    if not control_email or "\x00" in control_email:
+    if not _valid_control_email(control_email):
         raise CaptureError("control_input_invalid")
 
     root_fd, root_metadata, root_name = _root_descriptor(load_run_id)
@@ -249,21 +249,22 @@ def capture_recovery_stderr(
             str(RUN_ROOT_BASE / root_name),
             "--load-run-id",
             load_run_id,
-            "--control-email",
-            control_email,
+            "--control-email-stdin",
             "--mode",
             mode,
         ]
         process = subprocess.Popen(
             command,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             cwd="/",
             env=RECOVERY_ENV,
             close_fds=True,
         )
-        assert process.stderr is not None
+        assert process.stdin is not None and process.stderr is not None
+        process.stdin.write(control_email.encode("ascii") + b"\n")
+        process.stdin.close()
         with os.fdopen(descriptor, "wb", closefd=True) as output:
             descriptor = -1
             _write_bounded(process.stderr, output)

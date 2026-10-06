@@ -50,8 +50,21 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
                     recovery_capture.parse_request(document)
 
     def test_recovery_stderr_is_bounded_private_and_failure_is_preserved(self) -> None:
+        class FakeInput:
+            def __init__(self) -> None:
+                self.value = b""
+                self.closed = False
+
+            def write(self, value: bytes) -> int:
+                self.value += value
+                return len(value)
+
+            def close(self) -> None:
+                self.closed = True
+
         class FakeProcess:
             def __init__(self, payload: bytes) -> None:
+                self.stdin = FakeInput()
                 self.stderr = io.BytesIO(payload)
 
             def wait(self) -> int:
@@ -92,6 +105,14 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
                     argument.endswith("platform_recover_retained_report.py")
                     for argument in command
                 )
+            )
+            self.assertIn("--control-email-stdin", command)
+            self.assertNotIn("private@example.invalid", command)
+            self.assertTrue(popen.call_args.kwargs["stdin"] == subprocess.PIPE)
+            self.assertNotIn("private@example.invalid", str(popen.call_args.kwargs["env"]))
+            self.assertTrue(popen.return_value.stdin.closed)
+            self.assertEqual(
+                popen.return_value.stdin.value, b"private@example.invalid\n"
             )
             self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
             self.assertEqual(popen.call_args.kwargs["close_fds"], True)

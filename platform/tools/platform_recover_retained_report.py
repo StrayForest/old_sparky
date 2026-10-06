@@ -42,19 +42,66 @@ RUN_ROOT_PATTERN = re.compile(
     r"^/opt/oldsparky/platform/shared/production-retained-matrix/gha-(?P<run_id>[1-9][0-9]{0,31})$"
 )
 RECOVERY_MODES = ("read-mix", "write-burst", "external-vote")
+CONTROL_EMAIL_MAX_BYTES = 254
+CONTROL_EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\Z")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--load-run-id", required=True)
-    parser.add_argument("--control-email", required=True)
+    control_email = parser.add_mutually_exclusive_group(required=True)
+    control_email.add_argument("--control-email")
+    control_email.add_argument("--control-email-stdin", action="store_true")
     parser.add_argument(
         "--mode",
         choices=RECOVERY_MODES,
         default="write-burst",
     )
     return parser.parse_args()
+
+
+def read_control_email_stdin(stream: Any | None = None) -> str:
+    """Read one bounded ASCII email line; never echo or include it in errors."""
+    source = sys.stdin.buffer if stream is None else stream
+    raw = source.read(CONTROL_EMAIL_MAX_BYTES + 2)
+    if (
+        len(raw) > CONTROL_EMAIL_MAX_BYTES + 1
+        or not raw.endswith(b"\n")
+        or raw.count(b"\n") != 1
+        or b"\r" in raw
+    ):
+        raise ValueError("control email input is invalid")
+    try:
+        value = raw[:-1].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("control email input is invalid") from exc
+    if (
+        not value
+        or value != value.strip()
+        or len(value) > CONTROL_EMAIL_MAX_BYTES
+        or CONTROL_EMAIL_PATTERN.fullmatch(value.lower()) is None
+    ):
+        raise ValueError("control email input is invalid")
+    return value.lower()
+
+
+def resolve_control_email(args: argparse.Namespace, stream: Any | None = None) -> str:
+    """Resolve the legacy argument or the production stdin-only channel."""
+    if args.control_email_stdin:
+        return read_control_email_stdin(stream)
+    value = args.control_email
+    if not isinstance(value, str):
+        raise ValueError("control email input is invalid")
+    normalized = value.strip().lower()
+    if (
+        not normalized
+        or len(normalized) > CONTROL_EMAIL_MAX_BYTES
+        or normalized != normalized.strip()
+        or CONTROL_EMAIL_PATTERN.fullmatch(normalized) is None
+    ):
+        raise ValueError("control email input is invalid")
+    return normalized
 
 
 def _regular_file(path: Path, *, required: bool) -> bool:
@@ -393,7 +440,13 @@ async def _async_main(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    return asyncio.run(_async_main(parse_args()))
+    args = parse_args()
+    try:
+        args.control_email = resolve_control_email(args)
+    except ValueError:
+        print("Retained report recovery refused invalid control input.", file=sys.stderr)
+        return 2
+    return asyncio.run(_async_main(args))
 
 
 if __name__ == "__main__":

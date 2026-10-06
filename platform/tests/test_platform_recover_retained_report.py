@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import io
 import importlib.util
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from uuid import uuid4
+from unittest.mock import patch
 
 
 SCRIPT_PATH = (
@@ -23,6 +27,94 @@ SPEC.loader.exec_module(recovery)
 
 
 class RetainedWriteBurstReportRecoveryTests(unittest.TestCase):
+    def test_control_email_stdin_is_bounded_and_normalized_before_recovery(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "platform_recover_retained_report.py",
+                "--run-root",
+                "/opt/oldsparky/platform/shared/production-retained-matrix/gha-1",
+                "--load-run-id",
+                "1",
+                "--control-email-stdin",
+                "--mode",
+                "external-vote",
+            ],
+        ):
+            args = recovery.parse_args()
+        self.assertTrue(args.control_email_stdin)
+        self.assertIsNone(args.control_email)
+        self.assertEqual(
+            recovery.resolve_control_email(
+                args, io.BytesIO(b"Control@Example.invalid\n")
+            ),
+            "control@example.invalid",
+        )
+
+        invalid = (
+            b"control@example.invalid",
+            b" control@example.invalid\n",
+            b"control@example.invalid \n",
+            b"control@example.invalid\n\n",
+            b"control@example.invalid\r\n",
+            b"control@example.invalid\x80\n",
+            b"x" * (recovery.CONTROL_EMAIL_MAX_BYTES + 1) + b"\n",
+        )
+        for raw in invalid:
+            with self.subTest(raw_length=len(raw)):
+                with self.assertRaisesRegex(ValueError, "control email input is invalid"):
+                    recovery.read_control_email_stdin(io.BytesIO(raw))
+
+    def test_legacy_control_email_argument_remains_supported(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "platform_recover_retained_report.py",
+                "--run-root",
+                "/opt/oldsparky/platform/shared/production-retained-matrix/gha-1",
+                "--load-run-id",
+                "1",
+                "--control-email",
+                "Control@Example.invalid",
+            ],
+        ):
+            args = recovery.parse_args()
+        self.assertEqual(
+            recovery.resolve_control_email(args), "control@example.invalid"
+        )
+
+    def test_main_delivers_stdin_identity_to_recovery_consumer(self) -> None:
+        observed: list[str] = []
+
+        async def consume(args: object) -> int:
+            observed.append(args.control_email)
+            return 0
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "platform_recover_retained_report.py",
+                    "--run-root",
+                    "/opt/oldsparky/platform/shared/production-retained-matrix/gha-1",
+                    "--load-run-id",
+                    "1",
+                    "--control-email-stdin",
+                ],
+            ),
+            patch.object(
+                sys,
+                "stdin",
+                SimpleNamespace(buffer=io.BytesIO(b"control@example.invalid\n")),
+            ),
+            patch.object(recovery, "_async_main", consume),
+        ):
+            self.assertEqual(recovery.main(), 0)
+        self.assertEqual(observed, ["control@example.invalid"])
+
     def test_external_vote_recovery_uses_transport_specific_paths(self) -> None:
         run_root = Path(
             "/opt/oldsparky/platform/shared/production-retained-matrix/gha-32767006384"
