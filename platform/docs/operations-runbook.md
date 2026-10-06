@@ -545,27 +545,22 @@ gh workflow run platform-production-retained-load-abort.yml \
 gh run watch <abort-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-If the canceled run has no final report, the exact cleanup supervisor rebuilds
-its retained report and one-row summary from the matching durable
-`PreprodTestRun.report`. It still performs every marker, email, tournament
-ownership and graph-boundary check before deleting anything. A recovered run
-is never considered a passed load measurement.
+If the canceled run has no final report, the cleanup supervisor rebuilds its
+report from the matching durable `PreprodTestRun.report`, validates marker,
+email, tournament ownership and graph boundaries before deletion, and never
+counts a recovered run as a passed measurement.
 
-The same recovery is required when the supervisor published
-`matrix-summary.json` but was interrupted before its detail report. The cleanup
-supervisor recognizes the transport-specific
-`external-vote/external-vote.json` path, reconstructs the full user inventory
-from the marker-scoped durable row, persists that recovered identity back to
-`PreprodTestRun.report`, and only then invokes the normal exact cleanup
-validator. A missing or ambiguous profile remains fail-closed.
+The cleanup supervisor also recovers a missing detail report from an exact
+`external-vote/external-vote.json` durable row, persists its full inventory to
+`PreprodTestRun.report`, then runs the normal exact validator. Missing or
+ambiguous profiles fail closed.
 
-If a fixture was committed before the external runner timed out at the edge,
-the cleanup validator recovers only the exact external-load marker and
-ownership scope recorded for that run. Any malformed marker match or ownership
-outside the manifest remains a fail-closed cleanup error; this recovery never
-broadens deletion to a generic historical search.
+If a fixture was committed before an external runner timed out, the cleanup
+validator recovers only that run's exact marker and ownership scope. Malformed
+matches or ownership outside the manifest fail closed; recovery never broadens
+deletion to a historical search.
 
-The cleanup command delegates disposal and zero-residual read-model checks to the [retained-load cleanup contract](#retained-load-cleanup-and-hermetic-web-verification); cross-loop asyncpg or Redis disposal errors in a successful cleanup log are a regression and must not be ignored.
+The cleanup command delegates disposal and zero-residual read-model checks to the [retained-load cleanup contract](#retained-load-cleanup-and-hermetic-web-verification); cross-loop asyncpg or Redis disposal errors in a successful cleanup log are a regression.
 
 When the external load completes, clean only the exact load workflow run:
 
@@ -578,13 +573,18 @@ gh workflow run platform-production-retained-load-cleanup.yml \
 gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The cleanup supervisor holds the load's host lock, validates its summary and
-production ownership, then delegates exact fixture/database/Redis checks to
-the [retained-load cleanup contract](#retained-load-cleanup-and-hermetic-web-verification)
-before removing matching report/export directories. Failed cleanup retains
-data and reports for recovery; never run broad production cleanup. A durable
-cleaned row permits exact-ID artifact removal only after provenance, empty-
-fixture and root ownership/mode/symlink revalidation; mixed state fails closed.
+The cleanup supervisor holds the load host lock, validates production ownership,
+and delegates exact fixture/database/Redis checks to the [cleanup contract](#retained-load-cleanup-and-hermetic-web-verification) before removing matching reports. Failed cleanup retains data; never run broad cleanup. A durable cleaned row permits exact-ID artifact removal only after provenance, empty-fixture and root ownership/mode/symlink checks; mixed state fails closed.
+
+Cleanup and abort diagnostics emit `RETAINED_CLEANUP_INPUT`,
+`RETAINED_CLEANUP_EVIDENCE`, `RETAINED_ABORT_INPUT` and
+`RETAINED_ABORT_EVIDENCE`; external finalization emits `ORIGIN_PUBLISH_GATE`.
+They contain allowlisted statuses and file-presence booleans only. A green
+step/job conclusion alone does not prove cleanup or process-tree closure. Trust
+cleanup only when its final gate passes, the normalized summary says `ok=true`
+with the control preserved, and canonical evidence is complete and
+untruncated. Missing, invalid or unavailable evidence leaves the exact run
+unverified; retain its data and use exact-run recovery.
 
 The external-load workflow always invokes this supervisor, even when the filesystem run root is missing. In that case it uses the durable `PreprodTestRun` orphan path; a missing directory is not proof that the database fixture is absent.
 

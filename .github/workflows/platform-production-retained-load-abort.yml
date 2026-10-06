@@ -80,6 +80,7 @@ jobs:
           echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Abort the exact production load process tree
+        id: abort_remote
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -166,6 +167,51 @@ jobs:
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
+
+      - name: Diagnose abort evidence inputs
+        if: ${{ always() }}
+        shell: bash
+        env:
+          ABORT_REMOTE_STEP: ${{ steps.abort_remote.outcome }}
+          ABORT_REMOTE_STATUS: ${{ steps.abort_remote.outputs.remote_status }}
+          ABORT_SSH_CLEANUP_STEP: ${{ steps.cleanup_ssh.outcome }}
+        run: |
+          set +e
+          /usr/bin/python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          def classify(name: str, allowed: dict[str, str]) -> str:
+              value = os.environ.get(name)
+              if value is None or value == "":
+                  return "missing"
+              return allowed.get(value, "invalid")
+
+          artifact_dir = Path(os.environ["RUNNER_TEMP"]) / "production-retained-abort-artifacts"
+          def present(name: str) -> str:
+              try:
+                  path = artifact_dir / name
+                  return "present" if path.is_file() and path.stat().st_size > 0 else "absent"
+              except OSError:
+                  return "unknown"
+
+          fields = {
+              "remote_step": classify("ABORT_REMOTE_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
+              "remote": classify("ABORT_REMOTE_STATUS", {"0": "ok", "1": "failed"}),
+              "ssh_cleanup": classify("ABORT_SSH_CLEANUP_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
+              "raw_log": present("abort-raw.log"),
+              "process_tree": present("abort-process-tree.txt"),
+              "canonical": present("canonical.log"),
+              "matrix": present("matrix-summary.json"),
+              "observer": present("server-observability.json"),
+          }
+          print("RETAINED_ABORT_INPUT " + " ".join(f"{name}={value}" for name, value in fields.items()))
+          PY
+          diagnostic_status="$?"
+          if [[ "$diagnostic_status" != 0 ]]; then
+            printf '%s\n' 'RETAINED_ABORT_INPUT diagnostic=unavailable'
+          fi
+          exit 0
 
       - name: Normalize abort evidence
         id: normalize_abort_evidence
@@ -287,6 +333,74 @@ jobs:
           ):
               raise SystemExit("required abort log evidence is incomplete")
           PY
+
+      - name: Diagnose abort evidence normalization
+        if: ${{ always() }}
+        shell: bash
+        env:
+          ABORT_REMOTE_STEP: ${{ steps.abort_remote.outcome }}
+          ABORT_REMOTE_STATUS: ${{ steps.abort_remote.outputs.remote_status }}
+          ABORT_SSH_CLEANUP_STEP: ${{ steps.cleanup_ssh.outcome }}
+          ABORT_NORMALIZE_STEP: ${{ steps.normalize_abort_evidence.outcome }}
+        run: |
+          set +e
+          /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def classify(name: str, allowed: dict[str, str]) -> str:
+              value = os.environ.get(name)
+              if value is None or value == "":
+                  return "missing"
+              return allowed.get(value, "invalid")
+
+          artifact_dir = Path(os.environ["RUNNER_TEMP"]) / "production-retained-abort-artifacts"
+          def present(name: str) -> str:
+              try:
+                  path = artifact_dir / name
+                  return "present" if path.is_file() and path.stat().st_size > 0 else "absent"
+              except OSError:
+                  return "unknown"
+
+          evidence_status = "missing"
+          evidence_truncated = "unknown"
+          try:
+              path = artifact_dir / "canonical.log"
+              if path.is_file():
+                  with path.open("rb") as source:
+                      raw = source.read(262145)
+                  if len(raw) > 262144:
+                      raise ValueError
+                  payload = json.loads(raw.decode("utf-8"))
+                  if isinstance(payload, dict) and payload.get("schema") == 1:
+                      status = payload.get("status")
+                      evidence_status = status if isinstance(status, str) and status in {"passed", "failed", "unavailable", "unknown"} else "invalid"
+                      evidence_truncated = "yes" if payload.get("truncated") is True else "no" if payload.get("truncated") is False else "unknown"
+                  else:
+                      evidence_status = "invalid"
+          except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+              evidence_status = "invalid"
+
+          fields = {
+              "remote_step": classify("ABORT_REMOTE_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
+              "remote": classify("ABORT_REMOTE_STATUS", {"0": "ok", "1": "failed"}),
+              "ssh_cleanup": classify("ABORT_SSH_CLEANUP_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
+              "normalize": classify("ABORT_NORMALIZE_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
+              "canonical": present("canonical.log"),
+              "process_tree": present("abort-process-tree.txt"),
+              "matrix": present("matrix-summary.json"),
+              "observer": present("server-observability.json"),
+              "evidence_status": evidence_status,
+              "truncated": evidence_truncated,
+          }
+          print("RETAINED_ABORT_EVIDENCE " + " ".join(f"{name}={value}" for name, value in fields.items()))
+          PY
+          diagnostic_status="$?"
+          if [[ "$diagnostic_status" != 0 ]]; then
+            printf '%s\n' 'RETAINED_ABORT_EVIDENCE diagnostic=unavailable'
+          fi
+          exit 0
 
       - name: Publish abort evidence
         if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.normalize_abort_evidence.outcome == 'success' }}

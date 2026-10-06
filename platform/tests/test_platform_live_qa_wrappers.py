@@ -1289,6 +1289,69 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("steps.cleanup.outputs.cleanup_export_status", external)
         self.assertIn("steps.run-cleanup.outputs.cleanup_export_status", retained)
 
+        abort = (
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"
+        ).read_text(encoding="utf-8")
+        for source, marker, next_step, fields in (
+            (
+                external,
+                "      - name: Diagnose origin evidence publication gate",
+                "      - name: Publish origin evidence",
+                ("ORIGIN_PUBLISH_GATE", "eligible=", "ORIGIN_OBSERVER_READY"),
+            ),
+            (
+                abort,
+                "      - name: Diagnose abort evidence inputs",
+                "      - name: Normalize abort evidence",
+                ("RETAINED_ABORT_INPUT", "process_tree", "observer"),
+            ),
+            (
+                abort,
+                "      - name: Diagnose abort evidence normalization",
+                "      - name: Publish abort evidence",
+                ("RETAINED_ABORT_EVIDENCE", "evidence_status", "truncated"),
+            ),
+            (
+                retained,
+                "      - name: Diagnose cleanup evidence inputs",
+                "      - name: Normalize cleanup evidence",
+                ("RETAINED_CLEANUP_INPUT", "canonical_raw", "summary"),
+            ),
+            (
+                retained,
+                "      - name: Diagnose normalized cleanup evidence",
+                "      - name: Reject incomplete cleanup log evidence",
+                ("RETAINED_CLEANUP_EVIDENCE", "summary_error", "canonical"),
+            ),
+        ):
+            start = source.index(marker)
+            end = source.index(next_step, start + 1)
+            step = source[start:end]
+            self.assertIn("if: ${{ always() }}", step)
+            for field in fields:
+                self.assertIn(field, step)
+            self.assertNotIn("GITHUB_STEP_SUMMARY", step)
+            self.assertNotRegex(step, r"(?:PROD_SSH|CONTROL_EMAIL|TARGET_SHA|LOAD_RUN_ID)")
+            self.assertNotRegex(step, r"print\([^\n]*(?:path|raw|payload|email|secret)")
+
+        self.assertIn(
+            "if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.normalize_abort_evidence.outcome == 'success' }}",
+            abort,
+        )
+        self.assertIn(
+            "if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.validate_cleanup_evidence.outcome == 'success' }}",
+            retained,
+        )
+        self.assertIn(
+            "test \"${{ steps.run-cleanup.outputs.cleanup_artifact_status }}\" = \"0\"",
+            retained,
+        )
+        self.assertIn('elif error_class is None:', retained)
+        self.assertIn(
+            'summary_error = "none" if payload.get("ok") is True else "missing"',
+            retained,
+        )
+
     def test_live_user_qa_is_dispatchable_and_runs_on_the_server(self) -> None:
         source = (REPO_ROOT / ".github/workflows/platform-live-user-qa.yml").read_text(
             encoding="utf-8"

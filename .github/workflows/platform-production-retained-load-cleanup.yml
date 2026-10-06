@@ -336,6 +336,51 @@ jobs:
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
 
+      - name: Diagnose cleanup evidence inputs
+        if: ${{ always() }}
+        shell: bash
+        env:
+          CLEANUP_REMOTE_EXIT: ${{ steps.run-cleanup.outputs.remote_exit_code }}
+          CLEANUP_ARTIFACT_STATUS: ${{ steps.run-cleanup.outputs.cleanup_artifact_status }}
+          CLEANUP_EXPORT_STATUS: ${{ steps.run-cleanup.outputs.cleanup_export_status }}
+          CLEANUP_SSH_STEP: ${{ steps.cleanup_ssh.outcome }}
+        run: |
+          set +e
+          /usr/bin/python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          def classify(name: str, allowed: dict[str, str]) -> str:
+              value = os.environ.get(name)
+              if value is None or value == "":
+                  return "missing"
+              return allowed.get(value, "invalid")
+
+          runner_temp = Path(os.environ["RUNNER_TEMP"])
+          artifact_dir = runner_temp / "production-retained-cleanup-artifacts"
+          def present(path: Path) -> str:
+              try:
+                  return "present" if path.is_file() and path.stat().st_size > 0 else "absent"
+              except OSError:
+                  return "unknown"
+
+          fields = {
+              "remote": classify("CLEANUP_REMOTE_EXIT", {"0": "ok", "1": "failed"}),
+              "artifact": classify("CLEANUP_ARTIFACT_STATUS", {"0": "ok", "1": "failed"}),
+              "exports": classify("CLEANUP_EXPORT_STATUS", {"0": "ok", "1": "failed"}),
+              "ssh_cleanup": classify("CLEANUP_SSH_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
+              "canonical_raw": present(runner_temp / "production-retained-cleanup-canonical.raw"),
+              "summary": present(artifact_dir / "cleanup-summary.json"),
+              "canonical": present(artifact_dir / "canonical.log"),
+          }
+          print("RETAINED_CLEANUP_INPUT " + " ".join(f"{name}={value}" for name, value in fields.items()))
+          PY
+          diagnostic_status="$?"
+          if [[ "$diagnostic_status" != 0 ]]; then
+            printf '%s\n' 'RETAINED_CLEANUP_INPUT diagnostic=unavailable'
+          fi
+          exit 0
+
       - name: Normalize cleanup evidence
         id: normalize_cleanup_evidence
         if: ${{ always() }}
@@ -395,6 +440,103 @@ jobs:
           chmod 600 "$artifact_dir/cleanup-summary.json" "$artifact_dir/canonical.log"
           rm -f -- "$RUNNER_TEMP/production-retained-cleanup-remote.log"
           test ! -e "$RUNNER_TEMP/production-retained-cleanup-remote.log"
+
+      - name: Diagnose normalized cleanup evidence
+        if: ${{ always() }}
+        shell: bash
+        env:
+          CLEANUP_REMOTE_EXIT: ${{ steps.run-cleanup.outputs.remote_exit_code }}
+          CLEANUP_ARTIFACT_STATUS: ${{ steps.run-cleanup.outputs.cleanup_artifact_status }}
+          CLEANUP_EXPORT_STATUS: ${{ steps.run-cleanup.outputs.cleanup_export_status }}
+          CLEANUP_SANITATION_STATUS: ${{ steps.normalize_cleanup_evidence.outputs.sanitation_status }}
+          CLEANUP_NORMALIZE_STEP: ${{ steps.normalize_cleanup_evidence.outcome }}
+          CLEANUP_SSH_STEP: ${{ steps.cleanup_ssh.outcome }}
+        run: |
+          set +e
+          /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def classify(name: str, allowed: dict[str, str]) -> str:
+              value = os.environ.get(name)
+              if value is None or value == "":
+                  return "missing"
+              return allowed.get(value, "invalid")
+
+          artifact_dir = Path(os.environ["RUNNER_TEMP"]) / "production-retained-cleanup-artifacts"
+          summary_status = "missing"
+          summary_error = "missing"
+          control_preserved = "unknown"
+          try:
+              path = artifact_dir / "cleanup-summary.json"
+              if path.is_file():
+                  with path.open("rb") as source:
+                      raw = source.read(65537)
+                  if len(raw) > 65536:
+                      raise ValueError
+                  payload = json.loads(raw.decode("utf-8"))
+                  if isinstance(payload, dict) and payload.get("schema") == 1:
+                      if payload.get("ok") is True:
+                          summary_status = "passed"
+                      elif payload.get("ok") is False:
+                          summary_status = "failed"
+                      else:
+                          summary_status = "invalid"
+                      error_class = payload.get("error_class")
+                      if isinstance(error_class, str) and error_class in {"cleanup_summary_invalid", "cleanup_summary_unavailable", "cleanup_unavailable"}:
+                          summary_error = error_class
+                      elif error_class is None:
+                          summary_error = "none" if payload.get("ok") is True else "missing"
+                      else:
+                          summary_error = "other"
+                      control_preserved = "yes" if payload.get("control_account_preserved") is True else "no" if payload.get("control_account_preserved") is False else "unknown"
+                  else:
+                      summary_status = "invalid"
+                      summary_error = "invalid"
+          except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+              summary_status = "invalid"
+              summary_error = "invalid"
+
+          canonical_status = "missing"
+          canonical_truncated = "unknown"
+          try:
+              path = artifact_dir / "canonical.log"
+              if path.is_file():
+                  with path.open("rb") as source:
+                      raw = source.read(262145)
+                  if len(raw) > 262144:
+                      raise ValueError
+                  payload = json.loads(raw.decode("utf-8"))
+                  if isinstance(payload, dict) and payload.get("schema") == 1:
+                      status = payload.get("status")
+                      canonical_status = status if isinstance(status, str) and status in {"passed", "failed", "unavailable", "unknown"} else "invalid"
+                      canonical_truncated = "yes" if payload.get("truncated") is True else "no" if payload.get("truncated") is False else "unknown"
+                  else:
+                      canonical_status = "invalid"
+          except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+              canonical_status = "invalid"
+
+          fields = {
+              "remote": classify("CLEANUP_REMOTE_EXIT", {"0": "ok", "1": "failed"}),
+              "artifact": classify("CLEANUP_ARTIFACT_STATUS", {"0": "ok", "1": "failed"}),
+              "exports": classify("CLEANUP_EXPORT_STATUS", {"0": "ok", "1": "failed"}),
+              "ssh_cleanup": classify("CLEANUP_SSH_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
+              "normalize": classify("CLEANUP_NORMALIZE_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
+              "sanitation": classify("CLEANUP_SANITATION_STATUS", {"0": "ok", "1": "failed"}),
+              "summary": summary_status,
+              "summary_error": summary_error,
+              "control_preserved": control_preserved,
+              "canonical": canonical_status,
+              "truncated": canonical_truncated,
+          }
+          print("RETAINED_CLEANUP_EVIDENCE " + " ".join(f"{name}={value}" for name, value in fields.items()))
+          PY
+          diagnostic_status="$?"
+          if [[ "$diagnostic_status" != 0 ]]; then
+            printf '%s\n' 'RETAINED_CLEANUP_EVIDENCE diagnostic=unavailable'
+          fi
+          exit 0
 
       - name: Reject incomplete cleanup log evidence
         id: validate_cleanup_evidence
