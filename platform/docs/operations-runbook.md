@@ -550,10 +550,10 @@ report from the matching durable `PreprodTestRun.report`, validates marker,
 email, tournament ownership and graph boundaries before deletion, and never
 counts a recovered run as a passed measurement.
 
-The cleanup supervisor also recovers a missing detail report from an exact
-`external-vote/external-vote.json` durable row, persists its full inventory to
-`PreprodTestRun.report`, then runs the normal exact validator. Missing or
-ambiguous profiles fail closed.
+The cleanup supervisor recovers a missing detail from the exact
+`external-vote/external-vote.json` row, persists its inventory, then validates it.
+`PreprodTestRun.origin` must equal the canonical public origin; the report
+stores only `origin_class: production_origin`. Marker, mode and path must match.
 
 If a fixture was committed before an external runner timed out, the cleanup
 validator recovers only that run's exact marker and ownership scope. Malformed
