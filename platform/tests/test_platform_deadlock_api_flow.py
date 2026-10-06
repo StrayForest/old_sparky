@@ -1094,6 +1094,25 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         )
         self.assertEqual(ready_state_payload["active_round"]["ready_count"], 14)
 
+        workspace_payload = self._assert_status(
+            await organizer["client"].get(
+                f"/api/v1/tournaments/{slug}/workspace",
+                params={
+                    "participants_limit": 0,
+                    "workspace_view": "detail",
+                    "include_current_user": "false",
+                },
+            ),
+            200,
+        )
+        workspace_ready_round = workspace_payload["ready_check"]["active_round"]
+        self.assertEqual(workspace_ready_round["eligible_participant_count"], 14)
+        self.assertEqual(workspace_ready_round["ready_count"], 14)
+        self.assertEqual(workspace_ready_round["declined_count"], 0)
+        self.assertEqual(workspace_ready_round["current_user_choice"], "yes")
+        self.assertEqual(workspace_payload["participants"], [])
+        self.assertEqual(workspace_payload["participants_total"], 14)
+
         preview_payload = self._assert_status(
             await organizer["client"].get(
                 f"/api/v1/tournaments/{slug}/deadlock/captain-preview",

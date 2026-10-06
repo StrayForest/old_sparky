@@ -648,7 +648,7 @@ class WorkspaceReadyRoundSnapshot:
     id: int
     tournament_id: str
     status: str
-    eligible_user_ids: list[str]
+    eligible_participant_count: int
     initiated_by_user_id: str | None
     created_at: datetime
     closed_at: datetime | None
@@ -904,6 +904,17 @@ def _ready_round_snapshot_for_user(
     )
 
 
+def _workspace_eligible_participant_count(
+    projected_array_count: int | None,
+    legacy_non_array_value: Any,
+) -> int:
+    """Count valid stored arrays in SQL and preserve legacy JSON edge behavior."""
+
+    if projected_array_count is not None:
+        return int(projected_array_count)
+    return len(list(legacy_non_array_value or []))
+
+
 def _ready_check_state_response_from_cache(
     entry: ReadyCheckStateCacheEntry,
     *,
@@ -940,7 +951,7 @@ def _ready_check_state_response_from_preflight(
         id=round_row.id,
         tournament_id=round_row.tournament_id,
         status=round_row.status,
-        eligible_participant_count=len(list(round_row.eligible_user_ids or [])),
+        eligible_participant_count=round_row.eligible_participant_count,
         ready_count=preflight.ready_count,
         declined_count=preflight.declined_count,
         initiated_by_user_id=round_row.initiated_by_user_id,
@@ -1152,7 +1163,20 @@ def _build_workspace_base_preflight_stmt() -> Select:
             ready_round.id.label("workspace_ready_round_id"),
             ready_round.tournament_id.label("workspace_ready_round_tournament_id"),
             ready_round.status.label("workspace_ready_round_status"),
-            ready_round.eligible_user_ids.label("workspace_ready_round_eligible_user_ids"),
+            case(
+                (
+                    func.json_typeof(ready_round.eligible_user_ids) == "array",
+                    func.json_array_length(ready_round.eligible_user_ids),
+                ),
+            ).label("workspace_ready_round_eligible_participant_count"),
+            case(
+                (
+                    func.json_typeof(ready_round.eligible_user_ids).is_distinct_from(
+                        "array"
+                    ),
+                    ready_round.eligible_user_ids,
+                ),
+            ).label("workspace_ready_round_legacy_eligible_user_ids"),
             ready_round.initiated_by_user_id.label("workspace_ready_round_initiated_by_user_id"),
             ready_round.created_at.label("workspace_ready_round_created_at"),
             ready_round.closed_at.label("workspace_ready_round_closed_at"),
@@ -1269,8 +1293,9 @@ async def workspace_base_preflight(
             id=int(row["workspace_ready_round_id"]),
             tournament_id=str(row["workspace_ready_round_tournament_id"]),
             status=str(row["workspace_ready_round_status"]),
-            eligible_user_ids=list(
-                row["workspace_ready_round_eligible_user_ids"] or []
+            eligible_participant_count=_workspace_eligible_participant_count(
+                row["workspace_ready_round_eligible_participant_count"],
+                row["workspace_ready_round_legacy_eligible_user_ids"],
             ),
             initiated_by_user_id=row[
                 "workspace_ready_round_initiated_by_user_id"
