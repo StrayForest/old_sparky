@@ -470,6 +470,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         cleanup_validation = _step_script(
             cleanup_step, "Validate explicit cleanup confirmation"
         )
+        self.assertIn(
+            'test "$QA_CONFIRMATION" = "DELETE-PRODUCTION-RETAINED-LOAD"',
+            cleanup_validation,
+        )
         duplicate_event = (
             '{"inputs":{"confirmation":"DELETE-PRODUCTION-RETAINED-LOAD",'
             '"control_email":"first@example.invalid",'
@@ -525,20 +529,56 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         self.assertEqual(result.stderr, "")
                         self.assertNotIn("Control%qa@example.invalid", result.stdout)
                         self.assertEqual(output_path.stat().st_mode & 0o777, 0o600)
+                        cleanup_payload = json.loads(
+                            output_path.read_text(encoding="ascii")
+                        )
                         self.assertEqual(
-                            json.loads(output_path.read_text(encoding="ascii")),
+                            cleanup_payload,
                             {
                                 "schema": 1,
-                                "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD",
                                 "target_sha": "a" * 40,
                                 "control_email": "control%qa@example.invalid",
                                 "load_run_id": "123456",
                                 "cleanup_run_id": "234567",
                             },
                         )
+                        self.assertEqual(
+                            set(cleanup_payload),
+                            {
+                                "schema",
+                                "target_sha",
+                                "control_email",
+                                "load_run_id",
+                                "cleanup_run_id",
+                            },
+                        )
                     else:
                         self.assertNotEqual(result.returncode, 0)
                         self.assertFalse(output_path.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            output_path = root / "platform-retained-cleanup-input.json"
+            event_path.write_text(json.dumps(valid_event), encoding="utf-8")
+            result = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", cleanup_validation],
+                env={
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "GITHUB_REF": "refs/heads/dev",
+                    "GITHUB_EVENT_PATH": str(event_path),
+                    "GITHUB_RUN_ID": "234567",
+                    "QA_CONFIRMATION": "WRONG-CONFIRMATION",
+                    "LOAD_RUN_ID": "123456",
+                    "TARGET_SHA": "a" * 40,
+                    "RUNNER_TEMP": str(root),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(output_path.exists())
 
         for event_file_case in (
             "group-world-writable",

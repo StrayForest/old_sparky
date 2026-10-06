@@ -42,6 +42,14 @@ exact single ASCII denial line for the fixed artifact account and local host.
 Granted privilege output, extra output, other statuses and check errors remain
 fail-closed. Exact-P provisioning and the installed generation self-test are
 required before this generation is used. The
+deploy-supervisor inventory alignment uses **C**
+`53e99544da7a98e14909f4cd17737cb76e176d22` and pin commit **P**
+`626d7c03a79b0a5bff46185bdf4398d547c055a3`; P records C's exact 14-member
+closure. C includes `platform_retained_load_export_executor.py` in both the
+supervisor's exact manifest inventory and its root-owned helper metadata
+checks, matching the dispatcher and signed bundle. Exact-P provisioning and
+the installed generation self-test are required before this generation is
+used. The
 active application release and production health are owned by
 [`CURRENT.md`](../CURRENT.md); this ADR does not duplicate those changing facts.
 The pin records the
