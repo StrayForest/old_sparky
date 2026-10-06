@@ -215,6 +215,201 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             self.assertFalse(worker_report_path.exists())
             self.assertEqual(stale_report.read_text(encoding="ascii"), "keep-me")
 
+    def test_namespace_worker_restores_only_validated_bindings_after_env_reset(self) -> None:
+        from tools import platform_load_namespace as namespace
+        from tools.platform_load import get_profile, run_profile
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from types import SimpleNamespace
+
+        source_sha = "a" * 40
+        external_run_id = "123456789"
+        valid_payload: dict[str, object] = {
+            "worker_command": ["/usr/bin/python3", "/checkout/worker.py"],
+            "runner_uid": os.getuid(),
+            "runner_gid": os.getgid(),
+            "binding": {
+                "source_git_sha": source_sha,
+                "external_run_id": external_run_id,
+            },
+            # A config must never act as a general environment restoration
+            # channel across sudo's deliberate environment reset.
+            "environment": {"UNRELATED_SENTINEL": "must-not-be-restored"},
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "worker.config"
+
+            def write_config(payload: dict[str, object], *, mode: int = 0o600) -> None:
+                config_path.write_text(json.dumps(payload), encoding="utf-8")
+                config_path.chmod(mode)
+
+            write_config(valid_payload)
+            config_info = config_path.stat(follow_symlinks=False)
+            self.assertEqual(config_info.st_uid, os.getuid())
+            self.assertEqual(config_info.st_mode & 0o777, 0o600)
+            self.assertEqual(config_info.st_nlink, 1)
+            self.assertTrue(config_path.is_file())
+
+            class WorkerExecReached(Exception):
+                pass
+
+            def capture_worker_exec(_path: str, _argv: list[str]) -> None:
+                self.assertEqual(
+                    dict(os.environ),
+                    {
+                        "PLATFORM_LOAD_WORKER_CONFIG": str(config_path),
+                        "SOURCE_GIT_SHA": source_sha,
+                        "GITHUB_RUN_ID": external_run_id,
+                    },
+                )
+                raise WorkerExecReached
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(namespace, "_set_parent_death_signal"),
+                patch.object(namespace, "_assert_namespace_worker_identity"),
+                patch.object(namespace.os, "write"),
+                patch.object(namespace.os, "read", return_value=b"ACK\n"),
+                patch.object(namespace.os, "dup2"),
+                patch.object(namespace.os, "execv", side_effect=capture_worker_exec) as execv,
+            ):
+                with self.assertRaises(WorkerExecReached):
+                    namespace._namespace_worker(config_path)
+            execv.assert_called_once_with(
+                "/usr/bin/python3",
+                ["/usr/bin/python3", "/checkout/worker.py"],
+            )
+
+            # Prove that run_profile puts exactly its already-validated caller
+            # bindings into the private supervisor config passed to the helper.
+            expected_supervisor_result = SimpleNamespace(
+                report={"acceptance": {"decision": "TEST ONLY", "passed": False}},
+                reason="worker_failed",
+                partial_work=False,
+                inflight_unknown=False,
+                signal=None,
+                returncode=1,
+            )
+            with tempfile.TemporaryDirectory() as run_directory:
+                report_path = Path(run_directory) / "report.json"
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "SOURCE_GIT_SHA": source_sha,
+                            "GITHUB_RUN_ID": external_run_id,
+                        },
+                        clear=True,
+                    ),
+                    patch(
+                        "tools.platform_load_runtime.require_pid_namespace_capability"
+                    ),
+                    patch(
+                        "tools.platform_load_runtime.run_supervised",
+                        return_value=expected_supervisor_result,
+                    ) as supervised,
+                    redirect_stdout(StringIO()),
+                ):
+                    status = run_profile(
+                        get_profile("authenticated-page-load-v1"),
+                        Path(run_directory) / "manifest.json",
+                        report_path,
+                    )
+                self.assertEqual(status, 1)
+                self.assertEqual(
+                    supervised.call_args.kwargs["worker_config"]["binding"],
+                    {
+                        "source_git_sha": source_sha,
+                        "external_run_id": external_run_id,
+                    },
+                )
+
+            invalid_payloads: list[dict[str, object]] = []
+            missing_binding = dict(valid_payload)
+            missing_binding.pop("binding")
+            invalid_payloads.append(missing_binding)
+            invalid_sha = dict(valid_payload)
+            invalid_sha["binding"] = {
+                "source_git_sha": source_sha.upper(),
+                "external_run_id": external_run_id,
+            }
+            invalid_payloads.append(invalid_sha)
+            invalid_run_id = dict(valid_payload)
+            invalid_run_id["binding"] = {
+                "source_git_sha": source_sha,
+                "external_run_id": "0",
+            }
+            invalid_payloads.append(invalid_run_id)
+            extra_binding = dict(valid_payload)
+            extra_binding["binding"] = {
+                "source_git_sha": source_sha,
+                "external_run_id": external_run_id,
+                "arbitrary_environment": {"UNRELATED_SENTINEL": "restore-me"},
+            }
+            invalid_payloads.append(extra_binding)
+
+            for payload in invalid_payloads:
+                with self.subTest(binding=payload.get("binding")):
+                    write_config(payload)
+                    with (
+                        patch.dict(os.environ, {}, clear=True),
+                        patch.object(namespace, "_set_parent_death_signal"),
+                        patch.object(namespace, "_assert_namespace_worker_identity"),
+                        patch.object(namespace.os, "write") as write,
+                        patch.object(namespace.os, "execv") as rejected_exec,
+                    ):
+                        with self.assertRaises(NamespaceIntegrityError):
+                            namespace._namespace_worker(config_path)
+                    write.assert_not_called()
+                    rejected_exec.assert_not_called()
+
+            write_config(valid_payload, mode=0o644)
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(namespace, "_set_parent_death_signal"),
+                patch.object(namespace, "_assert_namespace_worker_identity"),
+                patch.object(namespace.os, "write") as write,
+                patch.object(namespace.os, "execv") as rejected_exec,
+            ):
+                with self.assertRaises(NamespaceIntegrityError):
+                    namespace._namespace_worker(config_path)
+            write.assert_not_called()
+            rejected_exec.assert_not_called()
+
+            write_config(valid_payload)
+            os.link(config_path, config_path.with_name("worker.config.link"))
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(namespace, "_set_parent_death_signal"),
+                patch.object(namespace, "_assert_namespace_worker_identity"),
+                patch.object(namespace.os, "write") as write,
+                patch.object(namespace.os, "execv") as rejected_exec,
+            ):
+                with self.assertRaises(NamespaceIntegrityError):
+                    namespace._namespace_worker(config_path)
+            write.assert_not_called()
+            rejected_exec.assert_not_called()
+            config_path.with_name("worker.config.link").unlink()
+
+            config_path.unlink()
+            config_path.symlink_to(Path(directory) / "regular-target")
+            config_path.with_name("regular-target").write_text(
+                json.dumps(valid_payload), encoding="utf-8"
+            )
+            config_path.with_name("regular-target").chmod(0o600)
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(namespace, "_set_parent_death_signal"),
+                patch.object(namespace, "_assert_namespace_worker_identity"),
+                patch.object(namespace.os, "write") as write,
+                patch.object(namespace.os, "execv") as rejected_exec,
+            ):
+                with self.assertRaises(NamespaceIntegrityError):
+                    namespace._namespace_worker(config_path)
+            write.assert_not_called()
+            rejected_exec.assert_not_called()
+
     def test_run_profile_preflight_uses_pure_error_channel(self) -> None:
         from tools.platform_load import run_profile
 

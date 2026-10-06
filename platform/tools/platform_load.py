@@ -1835,8 +1835,8 @@ def run_profile(
     ensure_dispatchable(profile)
     contract = profile_contract(profile)
     try:
-        _source_git_sha()
-        _external_run_id()
+        source_git_sha = _source_git_sha()
+        external_run_id = _external_run_id()
     except LoadProfileError as exc:
         _write_failed_report(
             profile,
@@ -1877,6 +1877,10 @@ def run_profile(
             "profile_id": str(profile["profile_id"]),
             "manifest_path": str(manifest_path),
             "timeout_diagnostics_run_id": timeout_diagnostics_run_id,
+            "binding": {
+                "source_git_sha": source_git_sha,
+                "external_run_id": external_run_id,
+            },
         }
         result = run_supervised(
             worker_command=(
