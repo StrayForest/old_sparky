@@ -354,6 +354,210 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         self.assertNotEqual(run(altered).returncode, 0)
                     self.assertNotEqual(run(metadata, archive_bytes + b"tampered").returncode, 0)
 
+    def test_evaluator_uses_declared_source_sha_for_artifact_and_candidate_binding(self) -> None:
+        workflow = yaml.safe_load(self.source)
+        evaluator_job = workflow["jobs"]["evaluate-load"]
+        job_env = evaluator_job["env"]
+        self.assertEqual(job_env["SOURCE_GIT_SHA"], "${{ github.sha }}")
+        self.assertNotIn("TARGET_SHA", job_env)
+        verifier_sha_envs = {
+            "fixture-setup": "TARGET_SHA",
+            "load-client": "TARGET_SHA",
+            "fixture-finalize": "TARGET_SHA",
+            "evaluate-load": "SOURCE_GIT_SHA",
+        }
+        for job_name, sha_env in verifier_sha_envs.items():
+            with self.subTest(job=job_name):
+                job = workflow["jobs"][job_name]
+                self.assertEqual(job["env"][sha_env], "${{ github.sha }}")
+                calls = [
+                    match.group(1)
+                    for step in job["steps"]
+                    for match in re.finditer(
+                        r'/usr/bin/python3 - "\$metadata" "\$archive" .*? "\$GITHUB_RUN_ID" "\$(\w+)" <<\'PY\'',
+                        step.get("run", ""),
+                    )
+                ]
+                self.assertTrue(calls, f"{job_name} has no metadata verifier")
+                self.assertEqual(set(calls), {sha_env})
+
+        target_sha = "a" * 40
+        run_id = "123456789"
+        attempt = "3"
+        candidate_id = "4815162342"
+        origin_id = "4815162343"
+        archive_bytes = b"evaluator artifact bytes bound to authenticated metadata"
+        archive_digest = "sha256:" + hashlib.sha256(archive_bytes).hexdigest()
+        artifacts = {
+            candidate_id: {
+                "id": int(candidate_id),
+                "name": f"platform-production-external-load-client-{run_id}-{attempt}",
+                "size_in_bytes": len(archive_bytes),
+                "expired": False,
+                "digest": archive_digest,
+                "workflow_run": {"id": int(run_id), "head_sha": target_sha},
+            },
+            origin_id: {
+                "id": int(origin_id),
+                "name": f"platform-production-external-load-origin-{run_id}-{attempt}",
+                "size_in_bytes": len(archive_bytes),
+                "expired": False,
+                "digest": archive_digest,
+                "workflow_run": {"id": int(run_id), "head_sha": target_sha},
+            },
+        }
+        verifier_step = next(
+            step
+            for step in evaluator_job["steps"]
+            if step.get("name") == "Verify evaluator artifact identity and digest"
+        )
+        with tempfile.TemporaryDirectory(prefix="external-load-evaluator-sha-") as temporary:
+            root = Path(temporary)
+            metadata_root = root / "metadata"
+            metadata_root.mkdir()
+            archive_root = root / "archives"
+            archive_root.mkdir()
+            for artifact_id, payload in artifacts.items():
+                (metadata_root / f"{artifact_id}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                (archive_root / f"{artifact_id}.zip").write_bytes(archive_bytes)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            curl_stub = bin_dir / "curl"
+            curl_stub.write_text(
+                "#!/usr/bin/python3\n"
+                "import os, shutil, sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "output = Path(args[args.index('--output') + 1])\n"
+                "url = next(arg for arg in args if arg.startswith('https://'))\n"
+                "artifact_id = url.rsplit('/', 1)[-1] if not url.endswith('/zip') else url.rsplit('/', 2)[-2]\n"
+                "root = Path(os.environ['TEST_ARTIFACT_ROOT'])\n"
+                "source = root / ('archives' if url.endswith('/zip') else 'metadata') / (artifact_id + ('.zip' if url.endswith('/zip') else '.json'))\n"
+                "shutil.copyfile(source, output)\n",
+                encoding="ascii",
+            )
+            curl_stub.chmod(0o755)
+            github_output = root / "github-output"
+            github_output.touch()
+
+            def evaluator_env(source_sha: str = target_sha) -> dict[str, str]:
+                resolved = {
+                    "SOURCE_GIT_SHA": source_sha,
+                    "PROFILE_ID": "ready-vote-slo-v2",
+                    "TIMEOUT_DIAGNOSTICS": "false",
+                    "INPUT_ARTIFACT_ID": "4815162341",
+                    "CANDIDATE_ARTIFACT_ID": candidate_id,
+                    "ORIGIN_ARTIFACT_ID": origin_id,
+                }
+                self.assertNotIn("TARGET_SHA", resolved)
+                return {
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                    "HOME": str(root),
+                    "RUNNER_TEMP": str(root),
+                    "GITHUB_OUTPUT": str(github_output),
+                    "GITHUB_API_URL": "https://api.github.com",
+                    "GITHUB_REPOSITORY": "StrayForest/old_sparky",
+                    "GITHUB_RUN_ID": run_id,
+                    "GITHUB_RUN_ATTEMPT": attempt,
+                    "GH_TOKEN": "synthetic-read-token",
+                    "TEST_ARTIFACT_ROOT": str(root),
+                    **resolved,
+                }
+
+            result = subprocess.run(
+                ["/bin/bash", "-e", "-o", "pipefail", "-c", verifier_step["run"]],
+                env=evaluator_env(),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "candidate_artifact_status=0",
+                github_output.read_text(),
+                result.stdout + result.stderr,
+            )
+            self.assertIn(
+                "origin_artifact_status=0",
+                github_output.read_text(),
+                result.stdout + result.stderr,
+            )
+
+            github_output.write_text("", encoding="ascii")
+            result = subprocess.run(
+                ["/bin/bash", "-e", "-o", "pipefail", "-c", verifier_step["run"]],
+                env=evaluator_env("b" * 40),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("candidate_artifact_status=1", github_output.read_text())
+            self.assertIn("origin_artifact_status=1", github_output.read_text())
+
+            evaluate_step = next(
+                step
+                for step in evaluator_job["steps"]
+                if step.get("name") == "Evaluate checked-out load report"
+            )
+            status_match = re.search(
+                r'if /usr/bin/python3 - "\$load_status_file" "\$report" "\$(?P<sha_env>[A-Z_]+)" '
+                r'"\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
+                r"(?P<script>.*?)\nPY",
+                evaluate_step["run"],
+                re.DOTALL,
+            )
+            self.assertIsNotNone(status_match)
+            assert status_match is not None
+            sha_env = status_match.group("sha_env")
+            env = evaluator_env()
+            self.assertIn(sha_env, env)
+            self.assertEqual(sha_env, "SOURCE_GIT_SHA")
+            report_path = root / "candidate-report.json"
+            report_bytes = b"{}\n"
+            report_path.write_bytes(report_bytes)
+            status_path = root / "load-status.json"
+            receipt = {
+                "schema": 2,
+                "status": 0,
+                "client_exit_status": 3,
+                "candidate_state": "pending_origin",
+                "report_ready": True,
+                "target_sha": target_sha,
+                "run_id": run_id,
+                "run_attempt": attempt,
+                "profile_id": "ready-vote-slo-v2",
+                "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+            }
+            status_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            def validate_status(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+                status_path.write_text(json.dumps(payload), encoding="utf-8")
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        textwrap.dedent(status_match.group("script")),
+                        str(status_path),
+                        str(report_path),
+                        env[sha_env],
+                        run_id,
+                        attempt,
+                        "ready-vote-slo-v2",
+                        "false",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            self.assertEqual(validate_status(receipt).returncode, 0)
+            wrong_sha_receipt = dict(receipt)
+            wrong_sha_receipt["target_sha"] = "b" * 40
+            self.assertNotEqual(validate_status(wrong_sha_receipt).returncode, 0)
+
     def test_control_identity_is_masked_before_consuming_steps_and_never_becomes_env_or_argv(self) -> None:
         self.assertNotIn("${{ inputs.control_email }}", self.source)
         self.assertNotIn("CONTROL_EMAIL:", self.source)

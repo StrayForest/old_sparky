@@ -2050,7 +2050,7 @@ jobs:
               --header "X-GitHub-Api-Version: 2022-11-28" \
               "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
               --output "$archive" || return 1
-            /usr/bin/python3 - "$metadata" "$archive" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY' || return 1
+            /usr/bin/python3 - "$metadata" "$archive" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$SOURCE_GIT_SHA" <<'PY' || return 1
           import hashlib
           import json
           import os
@@ -2125,7 +2125,7 @@ jobs:
             && "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" == 0 \
             && "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" == 0 \
             && -s "$report" && -s "$load_status_file" && -s "$observer" ]]; then
-            if /usr/bin/python3 - "$load_status_file" "$report" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$TIMEOUT_DIAGNOSTICS" <<'PY'
+            if /usr/bin/python3 - "$load_status_file" "$report" "$SOURCE_GIT_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$TIMEOUT_DIAGNOSTICS" <<'PY'
           import hashlib
           import json
           import os
