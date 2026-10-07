@@ -79,6 +79,17 @@ verified production app is `01bde73dffe2c7532be97f6c14c07f32e0f41b90` and the
 installed host generation remains
 `b186fbd177ab82330c1ec001d96a2d40474f9552` until signed-artifact provisioning
 and the installed-generation self-test for C complete.
+The live-launch status and bounded-collection correction uses **C**
+`f8909e185fd5120606d43a675ce146287be3b10f` and pin-only **P**
+`6e877addc8b49880c6b83f7c56d93e6454db4da5`. P records C's exact 14-member
+closure. The dispatcher accepts only the fixed SHA-bound live-launch status
+record from the installed supervisor; it does not forward child output. The
+supervisor treats `oldsparky-platform` as the required live-QA identity while
+keeping the legacy `oldsparky` name in collision checks. The bounded collector
+limits both retained status bytes and total stream bytes, and verifies process
+group closure before reporting completion. Signed provisioning and the
+installed-generation self-test for C are required before this generation is
+used.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable

@@ -632,7 +632,6 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 BytesIO((json.dumps(valid_live) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
-            child = Mock(pid=1234)
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_ROOT", root), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_LAUNCH", helper), \
