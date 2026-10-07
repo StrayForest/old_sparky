@@ -696,6 +696,61 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("cleanup_exports_status=", finalizer)
         self.assertIn("cleanup_status\" != 0 || \"$cleanup_exports_status\" != 0", finalizer)
         self.assertIn("cleanup summary projection input is invalid", finalizer)
+        fixture_cleanup = _step_script(
+            fixture_setup, "Remove fixture-setup SSH material"
+        )
+        with tempfile.TemporaryDirectory(prefix="external-load-ssh-cleanup-") as temp:
+            runner_temp = Path(temp)
+            ssh_dir = runner_temp / "production-external-load-ssh-setup"
+            ssh_dir.mkdir()
+            (ssh_dir / "id_ed25519").write_text("test key material", encoding="ascii")
+            (ssh_dir / "config").write_text("test config", encoding="ascii")
+            output_path = runner_temp / "github-output"
+            output_path.touch()
+            env_file = runner_temp / "github-env"
+            env_file.touch()
+            fixture_env = {
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_RUN_ID": f"codex-test-{os.getpid()}",
+                "GITHUB_OUTPUT": str(output_path),
+                "GITHUB_ENV": str(env_file),
+            }
+            completed = subprocess.run(
+                ["/bin/bash", "-c", fixture_cleanup],
+                capture_output=True,
+                text=True,
+                env=fixture_env,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(output_path.read_text(encoding="ascii"), "ssh_cleanup_status=0\n")
+            self.assertFalse(ssh_dir.exists())
+
+        with tempfile.TemporaryDirectory(prefix="external-load-ssh-cleanup-fail-") as temp:
+            runner_temp = Path(temp)
+            target = runner_temp / "unexpected-target"
+            target.mkdir()
+            ssh_dir = runner_temp / "production-external-load-ssh-setup"
+            ssh_dir.symlink_to(target, target_is_directory=True)
+            output_path = runner_temp / "github-output"
+            output_path.touch()
+            env_file = runner_temp / "github-env"
+            env_file.touch()
+            completed = subprocess.run(
+                ["/bin/bash", "-c", fixture_cleanup],
+                capture_output=True,
+                text=True,
+                env={
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_RUN_ID": f"codex-test-fail-{os.getpid()}",
+                    "GITHUB_OUTPUT": str(output_path),
+                    "GITHUB_ENV": str(env_file),
+                },
+                timeout=10,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(output_path.read_text(encoding="ascii"), "")
+
         pin_job = self.jobs["resolve-host-tools-pin"]
         self.assertIn("Checkout exact target as untrusted source data", pin_job)
         self.assertIn("platform_host_tools_pin.py resolve", pin_job)
@@ -709,6 +764,17 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("if: ${{ always() }}", diagnostic)
         self.assertIn("ORIGIN_PUBLISH_GATE", diagnostic_script)
+        diagnostic_yaml = yaml.safe_load(self.source)["jobs"]["fixture-finalize"]["steps"]
+        diagnostic_upload = next(
+            step
+            for step in diagnostic_yaml
+            if step.get("name") == "Publish closed cleanup failure diagnostic"
+        )
+        self.assertIn("always()", diagnostic_upload["if"])
+        self.assertIn("steps.cleanup_ssh.outcome == 'success'", diagnostic_upload["if"])
+        self.assertIn("explicit_conditions_met == 'no'", diagnostic_upload["if"])
+        self.assertIn("cleanup-diagnostic.json", diagnostic_upload["with"]["path"])
+        self.assertIn("retention-days: 1", self.source)
         self.assertNotIn("${{", diagnostic_script)
         self.assertNotIn("secrets.", diagnostic)
         workflow = yaml.safe_load(self.source)
@@ -746,16 +812,36 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "ORIGIN_CLEANUP_EXPORTS_STATUS": "0",
             "ORIGIN_SSH_CLEANUP_STATUS": "0",
             "ORIGIN_CLEANUP_IDENTITY_STATUS": "0",
+            "ORIGIN_CLEANUP_REMOTE_SSH_EXIT": "0",
+            "ORIGIN_CLEANUP_REMOTE_STAGE": "complete",
+            "ORIGIN_CLEANUP_REMOTE_CHILD_EXIT": "0",
         }
-        valid_summary = subprocess.run(
-            ["/bin/bash", "-c", diagnostic_script],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=allowed_environment,
-            timeout=10,
-        ).stdout
-        self.assertIn("explicit_conditions_met=yes", valid_summary)
+        with tempfile.TemporaryDirectory(prefix="external-load-origin-diagnostic-") as temp:
+            evidence_root = Path(temp) / "external-evidence"
+            evidence_root.mkdir(mode=0o700)
+            output_path = Path(temp) / "github-output"
+            output_path.touch()
+            valid_summary = subprocess.run(
+                ["/bin/bash", "-c", diagnostic_script],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={
+                    **allowed_environment,
+                    "RUNNER_TEMP": temp,
+                    "GITHUB_OUTPUT": str(output_path),
+                },
+                timeout=10,
+            ).stdout
+            self.assertIn("explicit_conditions_met=yes", valid_summary)
+            diagnostic_path = evidence_root / "cleanup-diagnostic.json"
+            diagnostic = json.loads(diagnostic_path.read_text(encoding="ascii"))
+            self.assertEqual(set(diagnostic), {"schema", "conditions", "explicit_conditions_met"})
+            self.assertEqual(diagnostic["schema"], 1)
+            self.assertEqual(diagnostic["explicit_conditions_met"], "yes")
+            self.assertEqual(diagnostic["conditions"]["cleanup_stage"], "complete")
+            self.assertEqual(output_path.read_text(encoding="ascii"), "explicit_conditions_met=yes\n")
+            self.assertEqual(diagnostic_path.stat().st_mode & 0o777, 0o600)
 
         invalid_environment = dict(allowed_environment)
         invalid_environment["ORIGIN_REMOTE_STATUS"] = "0\nraw-path-or-secret"
@@ -774,12 +860,64 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("finalize=missing", invalid_summary)
         self.assertIn("explicit_conditions_met=no", invalid_summary)
         self.assertNotIn("raw-path-or-secret", invalid_summary)
+        with tempfile.TemporaryDirectory(prefix="external-load-origin-failure-") as temp:
+            evidence_root = Path(temp) / "external-evidence"
+            evidence_root.mkdir(mode=0o700)
+            output_path = Path(temp) / "github-output"
+            output_path.touch()
+            failure_environment = {
+                **allowed_environment,
+                "ORIGIN_REMOTE_STATUS": "0\nsecret-path-marker",
+                "ORIGIN_CLEANUP_REMOTE_STAGE": "untrusted-stage",
+                "ORIGIN_CLEANUP_REMOTE_CHILD_EXIT": "7",
+                "RUNNER_TEMP": temp,
+                "GITHUB_OUTPUT": str(output_path),
+            }
+            subprocess.run(
+                ["/bin/bash", "-c", diagnostic_script],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=failure_environment,
+                timeout=10,
+            )
+            failure_path = evidence_root / "cleanup-diagnostic.json"
+            failure_diagnostic = json.loads(failure_path.read_text(encoding="ascii"))
+            self.assertEqual(failure_diagnostic["explicit_conditions_met"], "no")
+            self.assertEqual(failure_diagnostic["conditions"]["remote"], "invalid")
+            self.assertEqual(failure_diagnostic["conditions"]["cleanup_stage"], "invalid")
+            self.assertEqual(failure_diagnostic["conditions"]["cleanup_child_exit"], "7")
+            self.assertNotIn("secret-path-marker", failure_path.read_text(encoding="ascii"))
+            self.assertEqual(output_path.read_text(encoding="ascii"), "explicit_conditions_met=no\n")
+        with tempfile.TemporaryDirectory(prefix="external-load-origin-missing-stage-") as temp:
+            evidence_root = Path(temp) / "external-evidence"
+            evidence_root.mkdir(mode=0o700)
+            output_path = Path(temp) / "github-output"
+            output_path.touch()
+            missing_environment = dict(allowed_environment)
+            missing_environment.pop("ORIGIN_CLEANUP_REMOTE_CHILD_EXIT")
+            missing_environment.update(
+                {"RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(output_path)}
+            )
+            subprocess.run(
+                ["/bin/bash", "-c", diagnostic_script],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=missing_environment,
+                timeout=10,
+            )
+            missing_diagnostic = json.loads(
+                (evidence_root / "cleanup-diagnostic.json").read_text(encoding="ascii")
+            )
+            self.assertEqual(missing_diagnostic["explicit_conditions_met"], "no")
+            self.assertEqual(missing_diagnostic["conditions"]["cleanup_child_exit"], "missing")
 
         publish = finalizer.split("- name: Publish origin evidence", 1)[1].split(
             "\n      - name:", 1
         )[0]
         for gate_input in (
-            "success()",
+            "always()",
             "needs.namespace-containment-barrier.outputs.namespace_closed_status == '0'",
             "needs.namespace-containment-manual-barrier.outputs.manual_required == '0'",
             "steps.cleanup_ssh.outcome == 'success'",
@@ -787,12 +925,16 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "steps.external-finalize.outputs.observer_ready == '1'",
             "steps.external-finalize.outputs.finalize_status == '0'",
             "steps.cleanup.outputs.cleanup_status == '0'",
+            "steps.cleanup.outputs.cleanup_remote_ssh_exit_code == '0'",
+            "steps.cleanup.outputs.cleanup_remote_stage == 'complete'",
+            "steps.cleanup.outputs.cleanup_remote_child_exit == '0'",
             "steps.cleanup.outputs.cleanup_exports_status == '0'",
             "steps.cleanup_ssh.outputs.ssh_cleanup_status == '0'",
             "steps.revalidate-finalizer.outputs.cleanup_identity_status == '0'",
         ):
             with self.subTest(gate_input=gate_input):
                 self.assertIn(gate_input, publish)
+        self.assertNotIn("success()", publish)
 
         evaluator = self.jobs["evaluate-load"]
         self.assertIn("sanitizer_status=0", evaluator)
