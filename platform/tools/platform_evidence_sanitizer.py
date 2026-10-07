@@ -1068,6 +1068,29 @@ def _copy_bool(source: dict[str, Any], key: str) -> bool | None:
     return value if type(value) is bool else None
 
 
+def _project_request_perf_sampling(value: Any) -> dict[str, Any]:
+    source = _mapping(value)
+    raw_counts = _mapping(source.get("selection_reason_counts"))
+    allowed_reasons = frozenset({"trigger", "interval", "trigger_and_interval"})
+    counts: dict[str, int] = {}
+    for reason in allowed_reasons:
+        count = safe_int(raw_counts.get(reason))
+        if count is not None:
+            counts[reason] = count
+    if not counts:
+        return {}
+    output: dict[str, Any] = {
+        "selection_reason_counts": dict(sorted(counts.items())),
+        "annotated_rows": sum(counts.values()),
+        "interval_selected_rows": counts.get("interval", 0)
+        + counts.get("trigger_and_interval", 0),
+    }
+    interval = safe_int(source.get("sample_interval"), maximum=1024)
+    if interval is not None and interval > 0:
+        output["sample_interval"] = interval
+    return output
+
+
 def _copy_status(source: dict[str, Any], key: str) -> int | None:
     value = source.get(key)
     if type(value) is not int:
@@ -1396,6 +1419,11 @@ def _project_summary(value: Any) -> dict[str, Any]:
         metric = _project_metric(source.get(key))
         if metric:
             output[key] = metric
+    request_perf_sampling = _project_request_perf_sampling(
+        source.get("request_perf_sampling")
+    )
+    if request_perf_sampling:
+        output["request_perf_sampling"] = request_perf_sampling
     timing = _project_timing(source.get("timing"))
     if timing:
         output["timing"] = timing

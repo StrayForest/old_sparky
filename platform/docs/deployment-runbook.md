@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-03
+- Last reviewed: 2026-10-07
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -104,7 +104,7 @@ to `dev`. The chain is:
    `workflow_run.run_attempt` may be absent, the secret-free builder resolves
    the exact attempt through GitHub's authoritative attempt endpoint.
    The one-time out-of-band provisioning and rollback procedure is the owner of
-   [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
+   [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md). Shared-venv reuse and managed LiveQA runtime procedures are in the [CSP and live-QA runbook](csp-live-qa-runbook.md).
 
 ### Recovery-bootstrap baseline reconciliation
 

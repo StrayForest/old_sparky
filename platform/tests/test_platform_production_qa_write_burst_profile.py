@@ -197,6 +197,44 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             1,
         )
 
+    def test_request_perf_sampling_summary_preserves_legacy_rows_and_scope(
+        self,
+    ) -> None:
+        summary = summarize_request_perf_logs(
+            [
+                "request_perf method=GET path=/api/v1/users/me status=200 "
+                "request_ms=10.00 pool_checkout_wait_ms=1.00 "
+                "request_perf_selection=interval "
+                "request_perf_completion_count=16 request_perf_sample_interval=16",
+                "request_perf method=GET path=/api/v1/users/me status=200 "
+                "request_ms=20.00 pool_checkout_wait_ms=2.00 "
+                "request_perf_selection=trigger_and_interval "
+                "request_perf_completion_count=32 request_perf_sample_interval=16",
+                # Pre-sampler rows remain parseable and contribute their real
+                # measurements without being assigned synthetic selection data.
+                "request_perf method=GET path=/api/v1/users/me status=200 "
+                "request_ms=30.00 pool_checkout_wait_ms=3.00",
+            ],
+            tournament_slug=None,
+        )
+
+        self.assertEqual(summary["scope"]["kind"], "diagnostic_sample")
+        self.assertEqual(summary["scope"]["full_population_source"], "http_client")
+        self.assertEqual(summary["logged_requests"], 3)
+        self.assertEqual(summary["pool_checkout_wait_ms"]["count"], 3)
+        self.assertEqual(
+            summary["request_perf_sampling"],
+            {
+                "selection_reason_counts": {
+                    "interval": 1,
+                    "trigger_and_interval": 1,
+                },
+                "annotated_rows": 2,
+                "interval_selected_rows": 2,
+                "sample_interval": 16,
+            },
+        )
+
     def test_request_perf_summary_exposes_ready_vote_spans(self) -> None:
         summary = summarize_request_perf_logs(
             [

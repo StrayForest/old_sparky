@@ -11,10 +11,12 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
     def settings(
         self,
         *,
+        enabled: bool = True,
         log_mutations: bool = True,
         auth_bootstrap_log_enabled: bool = False,
     ) -> SimpleNamespace:
         return SimpleNamespace(
+            platform_perf_log_enabled=enabled,
             platform_perf_log_mutations=log_mutations,
             platform_perf_slow_request_ms=1000,
             platform_perf_slow_db_ms=500,
@@ -46,10 +48,10 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
             )
 
         log_info.assert_called_once()
-        self.assertEqual(log_info.call_args.args[-5], 320)
-        self.assertEqual(log_info.call_args.args[-4], "-")
-        self.assertEqual(log_info.call_args.args[-3], 0.0)
-        self.assertEqual(log_info.call_args.args[-2:], ("-", "-"))
+        self.assertEqual(log_info.call_args.args[-8], 320)
+        self.assertEqual(log_info.call_args.args[-7], "-")
+        self.assertEqual(log_info.call_args.args[-6], 0.0)
+        self.assertEqual(log_info.call_args.args[-5:-3], ("-", "-"))
 
     def test_fast_reads_are_not_logged_by_mutation_rule(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)
@@ -64,6 +66,106 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
             )
 
         log_info.assert_not_called()
+
+    def test_fast_reads_are_logged_on_fixed_completion_interval(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings()),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            for _ in range(performance.REQUEST_PERF_SAMPLE_INTERVAL):
+                middleware._log_if_slow(
+                    {"route": SimpleNamespace(path="/tournaments/{slug}")},
+                    self.metrics(method="GET"),
+                    200,
+                )
+
+        log_info.assert_called_once()
+        rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+        self.assertIn("request_perf_selection=interval", rendered)
+        self.assertIn("request_perf_completion_count=16", rendered)
+        self.assertIn("request_perf_sample_interval=16", rendered)
+
+    def test_ready_vote_success_is_included_when_interval_selected(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        vote_metrics = self.metrics(method="POST")
+        vote_metrics.path = "/api/v1/tournaments/demo/deadlock/ready-check/vote"
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings()),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            for index in range(performance.REQUEST_PERF_SAMPLE_INTERVAL):
+                metrics = vote_metrics if index == 15 else self.metrics(method="GET")
+                middleware._log_if_slow(
+                    {
+                        "route": SimpleNamespace(
+                            path="/{slug}/deadlock/ready-check/vote"
+                        )
+                    },
+                    metrics,
+                    200,
+                )
+
+        log_info.assert_called_once()
+        rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+        self.assertIn("request_perf_selection=interval", rendered)
+        self.assertIn("request_perf_completion_count=16", rendered)
+
+    def test_trigger_and_interval_overlap_logs_once_with_safe_reason(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings()),
+            patch.object(performance.logger, "warning") as log_warning,
+        ):
+            for _ in range(performance.REQUEST_PERF_SAMPLE_INTERVAL - 1):
+                middleware._log_if_slow(
+                    {"route": SimpleNamespace(path="/tournaments/{slug}")},
+                    self.metrics(method="GET"),
+                    200,
+                )
+            middleware._log_if_slow(
+                {"route": SimpleNamespace(path="/tournaments/{slug}")},
+                self.metrics(method="GET"),
+                503,
+            )
+
+        log_warning.assert_called_once()
+        rendered = log_warning.call_args.args[0] % log_warning.call_args.args[1:]
+        self.assertIn("request_perf_selection=trigger_and_interval", rendered)
+        self.assertIn("request_perf_completion_count=16", rendered)
+
+    def test_disabled_request_perf_gate_does_not_sample_fast_requests(self) -> None:
+        async def app(_scope: dict, _receive: object, send: object) -> None:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send(
+                {"type": "http.response.body", "body": b"ok", "more_body": False}
+            )
+
+        async def receive() -> dict[str, object]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message: dict[str, object]) -> None:
+            return None
+
+        middleware = performance.RequestPerformanceMiddleware(app)
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/tournaments/demo",
+            "headers": [],
+            "client": None,
+        }
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings(enabled=False)),
+            patch.object(performance.logger, "info") as log_info,
+            patch.object(performance.logger, "warning") as log_warning,
+        ):
+            for _ in range(performance.REQUEST_PERF_SAMPLE_INTERVAL):
+                asyncio.run(middleware(scope, receive, send))
+
+        log_info.assert_not_called()
+        log_warning.assert_not_called()
+        self.assertEqual(middleware._completed_request_count, 0)
 
     def test_fast_failed_requests_are_always_logged_as_warnings(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)

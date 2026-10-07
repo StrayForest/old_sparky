@@ -6,6 +6,7 @@ TRUSTED_REPO_ROOT="/root/old_sparky"
 PLATFORM_ROOT="$TRUSTED_REPO_ROOT/platform"
 TOOLS_DIR="$PLATFORM_ROOT/tools"
 SCRIPT_PATH="$TOOLS_DIR/platform_live_user_qa.sh"
+SAFE_PYTHONPATH="$PLATFORM_ROOT"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 QA_PYTHON="$PLATFORM_ROOT/.venv_platform/bin/python"
 TRUSTED_INSTALL_ROOT="${PLATFORM_LIVE_QA_INSTALL_ROOT:-}"
@@ -20,6 +21,7 @@ if [[ -n "$TRUSTED_INSTALL_ROOT" ]]; then
   TOOLS_DIR="$PLATFORM_ROOT/tools"
   SCRIPT_PATH="$TOOLS_DIR/platform_live_user_qa.sh"
   QA_PYTHON="/opt/oldsparky/platform/shared/venv/bin/python"
+  SAFE_PYTHONPATH="$TRUSTED_INSTALL_ROOT"
 fi
 
 usage() {
@@ -107,7 +109,7 @@ fi
 
 safe_database_python() {
   "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
-    --pythonpath "$PLATFORM_ROOT" \
+    --pythonpath "$SAFE_PYTHONPATH" \
     -- "$QA_PYTHON" "$@"
 }
 

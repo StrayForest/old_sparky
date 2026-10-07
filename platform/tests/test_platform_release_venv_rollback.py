@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import csv
 import hashlib
+import io
 import json
 from pathlib import Path, PurePosixPath
 import os
@@ -11,13 +14,16 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
 from tests import platform_test_lock_support as lock_support
+from tools import platform_release_transaction
 from tools import platform_release_systemd_state
 from tools import platform_validate_release_artifact
 from tools import platform_validate_wheelhouse
+from tools import platform_verify_venv_reuse
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -133,6 +139,27 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             (self.shared_dir / "venv" / "deps-version").read_text(), "new\n"
         )
         installed_venv = self.shared_dir / "venv"
+        relocation_script = installed_venv / "bin" / "relocation_probe.py"
+        self.assertIn(str(installed_venv), relocation_script.read_text().splitlines()[0])
+        relocation_cache = installed_venv / "bin" / "__pycache__" / "relocation_probe.cpython-312.pyc"
+        self.assertTrue(relocation_cache.is_file())
+        relocation_bytes = relocation_cache.read_bytes()
+        import importlib.util
+        import marshal
+
+        self.assertEqual(relocation_bytes[:4], importlib.util.MAGIC_NUMBER)
+        self.assertEqual(int.from_bytes(relocation_bytes[8:12], "little"), int(relocation_script.stat().st_mtime))
+        self.assertEqual(int.from_bytes(relocation_bytes[12:16], "little"), relocation_script.stat().st_size)
+        self.assertEqual(stat.S_IMODE(relocation_cache.stat().st_mode), 0o644)
+        self.assertEqual(
+            marshal.loads(relocation_bytes[16:]),
+            compile(relocation_script.read_bytes(), str(relocation_script), "exec", dont_inherit=True),
+        )
+        unrelated_cache = installed_venv / "bin" / "__pycache__" / "unrelated_probe.cpython-312.pyc"
+        self.assertTrue(unrelated_cache.is_file())
+        unrelated_script = installed_venv / "bin" / "unrelated_probe.py"
+        unrelated_bytes = unrelated_cache.read_bytes()
+        self.assertEqual(int.from_bytes(unrelated_bytes[12:16], "little"), unrelated_script.stat().st_size)
         self.assertEqual(stat.S_IMODE((installed_venv / "bin").stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE((installed_venv / "lib").stat().st_mode), 0o755)
         site_packages = next(installed_venv.glob("lib/python*/site-packages"))
@@ -220,6 +247,45 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         self.assertFalse((self.releases_dir / f"broken-release-{BUILT_AT}").exists())
         self.assertEqual(
             (self.shared_dir / "venv" / "deps-version").read_text(), "old\n"
+        )
+
+    def test_relocation_cache_cleanup_is_source_bound_and_fail_closed(self) -> None:
+        def install_case(case: str, *, expect_success: bool) -> tuple[Path, Path, subprocess.CompletedProcess[str]]:
+            app = self.root / f"relocation-{case}" / "platform"
+            shared = app / "shared"
+            releases = app / "releases"
+            releases.mkdir(parents=True)
+            shared.mkdir()
+            venv = shared / "venv"
+            self.add_fake_venv(venv, marker="old")
+            artifact = self.build_artifact(f"cache-{case}", pip_result=case)
+            result = self.run_script(
+                INSTALL_SCRIPT, "--stage-only", str(artifact), str(app), check=False,
+                relocation_case=case,
+            )
+            if expect_success:
+                self.assertEqual(result.returncode, 0, result.stderr)
+            else:
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse((app / "current").is_symlink())
+                self.assertEqual((venv / "deps-version").read_text(), "old\n")
+            return app, shared, result
+
+        for case in (
+            "hashed-cache-row",
+            "duplicate-cache-row",
+            "noncanonical-cache-row",
+            "bad-cache-header",
+            "bad-cache-code",
+        ):
+            with self.subTest(case=case):
+                install_case(case, expect_success=False)
+
+        _, shared, _ = install_case("no-cache", expect_success=True)
+        installed = shared / "venv"
+        self.assertTrue((installed / "bin" / "relocation_probe.py").is_file())
+        self.assertFalse(
+            (installed / "bin" / "__pycache__" / "relocation_probe.cpython-312.pyc").exists()
         )
         self.assertFalse(any(self.shared_dir.glob(".venv-install-*")))
 
@@ -332,6 +398,348 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         )
         self.assertFalse((self.releases_dir / f"skip-mismatch-{BUILT_AT}").exists())
 
+    def test_venv_reuse_accepts_only_the_exact_active_quiesce_receipt(self) -> None:
+        current = self.add_installed_release("reuse-current")
+        candidate = self.releases_dir / "reuse-candidate"
+        previous = self.add_installed_release("reuse-previous")
+        (self.app_dir / "current").symlink_to(current)
+
+        def add_proof_release(release: Path) -> None:
+            release.mkdir(exist_ok=True)
+            metadata = {
+                "release_slug": release.name,
+                "source_git_commit": "a" * 40,
+            }
+            release_json = release / "RELEASE.json"
+            release_json.write_text(json.dumps(metadata) + "\n")
+            release_json.chmod(0o444)
+            for relative, content in (
+                ("requirements-platform.txt", b"pip==26.1.2\n"),
+                ("requirements-platform.lock.txt", b"pip==26.1.2 --hash=sha256:fixture\n"),
+                ("requirements-platform.freeze.txt", b"pip==26.1.2\n"),
+            ):
+                path = release / relative
+                path.write_bytes(content)
+                path.chmod(0o444)
+            (release / "wheelhouse").mkdir()
+            (release / "wheelhouse" / "WHEELHOUSE.sha256").write_text("fixture manifest\n")
+            (release / "wheelhouse" / "pip-26.1.2-py3-none-any.whl").write_bytes(b"fixture wheel\n")
+
+        add_proof_release(current)
+        add_proof_release(previous)
+        rollback = current / ".rollback"
+        rollback.mkdir()
+        transition = rollback / "venv-transition"
+        transition.write_text("unchanged\n")
+        transition.chmod(0o600)
+        previous_file = rollback / "previous-release"
+        previous_file.write_text(f"{previous}\n")
+        previous_file.chmod(0o600)
+        freeze = current / "requirements-platform.freeze.txt"
+        freeze_record = rollback / "shared-freeze.sha256"
+        freeze_record.write_text(hashlib.sha256(freeze.read_bytes()).hexdigest() + "\n")
+        freeze_record.chmod(0o600)
+        (self.shared_dir / "venv").mkdir()
+        venv_python = self.shared_dir / "venv" / "bin" / "python"
+        venv_python.parent.mkdir()
+        self.write_executable(
+            venv_python,
+            'if [ "$*" = "-B -I -m pip check" ]; then exit 0; fi\n'
+            'if [ "$*" = "-B -I -m pip freeze --all" ]; then '
+            "printf '%s\\n' 'pip==26.1.2'; exit 0; fi\n"
+            "exit 1\n",
+        )
+        quiesce_state = self.shared_dir / ".release-quiesce.json"
+        platform_release_transaction.prepare_quiesce(
+            quiesce_state,
+            app_dir=self.app_dir,
+            candidate_release=candidate,
+            service_states=[
+                "deadlock-api=active", "deadlock-worker=active", "deadlock-web=active"
+            ],
+            timer_active_before="inactive",
+            service_enabled=[
+                "deadlock-api=enabled", "deadlock-worker=enabled", "deadlock-web=enabled"
+            ],
+            timer_enabled_before="enabled",
+            candidate_may_exist=False,
+        )
+        add_proof_release(candidate)
+        with mock.patch.object(platform_verify_venv_reuse, "_runtime") as runtime_check, \
+                mock.patch.object(platform_verify_venv_reuse, "_venv_integrity") as integrity_check:
+            platform_verify_venv_reuse.prove(
+                self.app_dir, current, candidate, self.shared_dir / "venv",
+                Path("/usr/bin/python3.12"), self.shared_dir / ".release-operation.json",
+                quiesce_state, "",
+            )
+            runtime_check.assert_called_once()
+            integrity_check.assert_called_once()
+            foreign_candidate = self.releases_dir / "foreign-candidate"
+            foreign_candidate.mkdir()
+            foreign_metadata = foreign_candidate / "RELEASE.json"
+            foreign_metadata.write_text(json.dumps({
+                "release_slug": foreign_candidate.name,
+                "source_git_commit": "b" * 40,
+            }) + "\n")
+            foreign_metadata.chmod(0o444)
+            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
+                platform_verify_venv_reuse.prove(
+                    self.app_dir, current, foreign_candidate, self.shared_dir / "venv",
+                    Path("/usr/bin/python3.12"), self.shared_dir / ".release-operation.json",
+                    quiesce_state, "",
+                )
+
+    def test_venv_reuse_compile_proof_does_not_inherit_future_flags(self) -> None:
+        import __future__
+
+        code = platform_verify_venv_reuse._compile_source(b"annotation: object\n", "proof.py")
+        self.assertEqual(code.co_flags & __future__.annotations.compiler_flag, 0)
+
+    def test_venv_reuse_rejects_source_tamper_even_with_rewritten_record(self) -> None:
+        venv = self.root / "proof-venv"
+        site = venv / "lib" / "python3.12" / "site-packages"
+        package_dir = site / "proof_pkg"
+        dist_info = site / "proof_pkg-1.0.dist-info"
+        package_dir.mkdir(parents=True)
+        dist_info.mkdir()
+        (venv / "bin").mkdir(parents=True)
+        wheelhouse = self.root / "proof-wheelhouse"
+        wheelhouse.mkdir()
+        payloads = {
+            "proof_pkg/__init__.py": b"VALUE = 'trusted'\n",
+            "proof_pkg-1.0.dist-info/METADATA": b"Metadata-Version: 2.1\nName: proof-pkg\nVersion: 1.0\n\n",
+            "proof_pkg-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n",
+            "proof_hook.pth": b"# trusted inert fixture\n",
+        }
+
+        def record_bytes(files: dict[str, bytes], extra_rows: tuple[tuple[str, str, str], ...] = ()) -> bytes:
+            import base64
+            import csv
+            import io
+
+            output = io.StringIO(newline="")
+            writer = csv.writer(output, lineterminator="\n")
+            for name, content in sorted(files.items()):
+                digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode()
+                writer.writerow((name, f"sha256={digest}", str(len(content))))
+            for row in extra_rows:
+                writer.writerow(row)
+            writer.writerow(("proof_pkg-1.0.dist-info/RECORD", "", ""))
+            return output.getvalue().encode()
+
+        data_script_name = "proof_pkg-1.0.data/scripts/proof.py"
+        data_script_source = b"#!python\nprint('trusted')\n"
+        wheel_payloads = {**payloads, data_script_name: data_script_source}
+        wheel_files = {
+            **wheel_payloads,
+            "proof_pkg-1.0.dist-info/RECORD": record_bytes(wheel_payloads),
+        }
+        wheel = wheelhouse / "proof_pkg-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for name, content in wheel_files.items():
+                archive.writestr(name, content)
+        for name, content in payloads.items():
+            target = site / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            target.chmod(0o644)
+        transformed_script = b"#!" + str(venv / "bin/python").encode() + b"\nprint('trusted')\n"
+        script_target = venv / "bin" / "proof.py"
+        script_target.write_bytes(transformed_script)
+        script_target.chmod(0o755)
+        intermediate_script = b"#!/tmp/.venv-install-proof.XYZ123/bin/python\nprint('trusted')\n"
+        installed_extra = (
+            "../../../bin/proof.py",
+            "sha256=" + __import__("base64").urlsafe_b64encode(
+                hashlib.sha256(intermediate_script).digest()
+            ).rstrip(b"=").decode(),
+            str(len(intermediate_script)),
+        )
+        (dist_info / "RECORD").write_bytes(record_bytes(payloads, (installed_extra,)))
+        (venv / "bin").chmod(0o755)
+        temporary_name = ".venv-install-proof-current.A1b2C3"
+        trusted_python = Path("/usr/bin/python3.12")
+        self.assertTrue(trusted_python.is_file())
+        trusted_fixture_script = """
+import importlib.util
+import importlib.machinery
+import marshal
+from pathlib import Path
+import stat
+import sys
+
+module_path = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("platform_verify_venv_reuse", module_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+operation = sys.argv[2]
+if operation == "render":
+    venv = Path(sys.argv[3])
+    activation = module._render_activation_scripts(venv, sys.argv[4])
+    for path, (content, mode) in activation.items():
+        path.write_bytes(content)
+        path.chmod(mode)
+elif operation in {"verify", "verify-no-pip"}:
+    if operation == "verify-no-pip":
+        module._expected_console_scripts = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("unverified pip must not execute")
+        )
+    else:
+        module._expected_console_scripts = lambda *_args: {}
+    try:
+        module._venv_integrity(Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5])
+    except module.ReuseRefused as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(42)
+elif operation in {"timestamp-cache", "hash-cache"}:
+    source = Path(sys.argv[3])
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    source_bytes = source.read_bytes()
+    code = marshal.dumps(module._compile_source(source_bytes, str(source)))
+    if operation == "timestamp-cache":
+        header = (importlib.util.MAGIC_NUMBER + (0).to_bytes(4, "little")
+                  + int(source.stat().st_mtime).to_bytes(4, "little")
+                  + len(source_bytes).to_bytes(4, "little"))
+    else:
+        header = (importlib.util.MAGIC_NUMBER + (3).to_bytes(4, "little")
+                  + importlib.util.source_hash(source_bytes))
+    cache.write_bytes(header + code)
+    cache.chmod(0o644)
+else:
+    raise SystemExit(f"unknown fixture operation: {operation}")
+"""
+        verifier_path = Path(platform_verify_venv_reuse.__file__)
+
+        def run_trusted_fixture(operation: str, *arguments: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    str(trusted_python),
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    trusted_fixture_script,
+                    str(verifier_path),
+                    operation,
+                    *(str(argument) for argument in arguments),
+                ],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": "/nonexistent",
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8",
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        def assert_reuse_refused(*, no_pip: bool = False) -> None:
+            operation = "verify-no-pip" if no_pip else "verify"
+            result = run_trusted_fixture(operation, venv, wheelhouse, "proof-current")
+            self.assertEqual(result.returncode, 42, result.stderr)
+
+        rendered = run_trusted_fixture("render", venv, temporary_name)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        for name in ("python", "python3", "python3.12"):
+            (venv / "bin" / name).symlink_to("/usr/bin/python3.12")
+        verified = run_trusted_fixture("verify", venv, wheelhouse, "proof-current")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+
+        import importlib.util
+
+        cache = Path(importlib.util.cache_from_source(str(script_target)))
+        cache_source = script_target.read_bytes()
+        timestamp_cache = run_trusted_fixture("timestamp-cache", script_target)
+        self.assertEqual(timestamp_cache.returncode, 0, timestamp_cache.stderr)
+        verified = run_trusted_fixture("verify", venv, wheelhouse, "proof-current")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        cache_bytes = cache.read_bytes()
+        hash_cache = run_trusted_fixture("hash-cache", script_target)
+        self.assertEqual(hash_cache.returncode, 0, hash_cache.stderr)
+        verified = run_trusted_fixture("verify", venv, wheelhouse, "proof-current")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        cache.write_bytes(cache_bytes)
+        cache.write_bytes(
+            cache_bytes[:12]
+            + (len(cache_source) + 1).to_bytes(4, "little")
+            + cache_bytes[16:]
+        )
+        assert_reuse_refused()
+        cache.unlink()
+        cache.parent.rmdir()
+
+        activation_file = venv / "bin" / "activate"
+        activation_file.write_bytes(activation_file.read_bytes() + b"# changed\n")
+        assert_reuse_refused()
+        restored_activation = run_trusted_fixture("render", venv, temporary_name)
+        self.assertEqual(restored_activation.returncode, 0, restored_activation.stderr)
+
+        rogue_script = venv / "bin" / "unrecorded-script"
+        rogue_script.write_text("#!/bin/sh\nexit 0\n")
+        rogue_script.chmod(0o755)
+        assert_reuse_refused()
+        rogue_script.unlink()
+
+        package_dir.chmod(0o700)
+        assert_reuse_refused()
+        package_dir.chmod(0o755)
+        source = package_dir / "__init__.py"
+        source.chmod(0o600)
+        assert_reuse_refused()
+        source.chmod(0o644)
+        script_target.chmod(0o700)
+        assert_reuse_refused()
+        script_target.chmod(0o755)
+
+        alternate_spelling = (
+            "lib/python3.12/site-packages/../../../bin/proof.py",
+            installed_extra[1],
+            installed_extra[2],
+        )
+        (dist_info / "RECORD").write_bytes(record_bytes(payloads, (alternate_spelling,)))
+        assert_reuse_refused()
+        duplicate_rows = (installed_extra, alternate_spelling)
+        (dist_info / "RECORD").write_bytes(record_bytes(payloads, duplicate_rows))
+        assert_reuse_refused()
+        (dist_info / "RECORD").write_bytes(record_bytes(payloads, (installed_extra,)))
+
+        script_target.write_bytes(b"#!" + str(venv / "bin/python").encode() + b"\nprint('changed')\n")
+        assert_reuse_refused()
+        script_target.write_bytes(transformed_script)
+
+        changed = b"VALUE = 'changed'\n"
+        source.write_bytes(changed)
+        record_path = dist_info / "RECORD"
+        changed_files = {**payloads, "proof_pkg/__init__.py": changed}
+        record_path.write_bytes(record_bytes(changed_files))
+        assert_reuse_refused()
+
+        source.write_bytes(payloads["proof_pkg/__init__.py"])
+        marker = self.root / "pth-side-effect"
+        malicious_pth = (
+            "import pathlib; pathlib.Path(" + repr(str(marker)) + ").write_text('executed')\n"
+        ).encode()
+        (site / "proof_hook.pth").write_bytes(malicious_pth)
+        changed_files = {**payloads, "proof_hook.pth": malicious_pth}
+        record_path.write_bytes(record_bytes(changed_files))
+        assert_reuse_refused(no_pip=True)
+        self.assertFalse(marker.exists())
+
+        (site / "proof_hook.pth").write_bytes(payloads["proof_hook.pth"])
+        record_path.write_bytes(record_bytes(payloads))
+        source.unlink()
+        source.symlink_to(self.root / "trusted-source.py")
+        (self.root / "trusted-source.py").write_bytes(payloads["proof_pkg/__init__.py"])
+        assert_reuse_refused()
+
+        source.unlink()
+        source.write_bytes(payloads["proof_pkg/__init__.py"])
+        source.chmod(0o4755)
+        assert_reuse_refused()
+
     def test_skip_python_deps_publishes_receipt_and_default_rollback_preserves_venv(
         self,
     ) -> None:
@@ -417,7 +825,8 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 else:
                     self.write_executable(
                         self.shared_dir / "venv" / "bin" / "python",
-                        'if [ "$*" = "-I -m pip freeze --all" ]; then\n'
+                        'if [ "$*" = "-I -B -m pip freeze --all" ] || '
+                        '[ "$*" = "-I -m pip freeze --all" ]; then\n'
                         "  printf '%s\\n' 'pip==0.0.0'\n"
                         "fi\n",
                     )
@@ -1139,6 +1548,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "node/bin/node": b"node\n",
             "web/package-lock.json": b"{}\n",
             "web/playwright.live.config.ts": b"export default {};\n",
+            "web/tests/smoke/live-launch.spec.ts": b"test('live launch', () => {});\n",
             "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
             "web/tests/support/live-qa-origin.ts": b"export {};\n",
             "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
@@ -1200,9 +1610,17 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         wheel = wheelhouse / "pip-26.1.2-py3-none-any.whl"
         module = f"""\
 from pathlib import Path
+import base64
+import csv
+import hashlib
+import io
+import os
+import py_compile
 import sys
+import zipfile
 
 arguments = sys.argv[1:]
+install_result = {result!r}
 if arguments and arguments[0] == "install":
     Path(sys.prefix, "deps-version").write_text({result!r} + "\\n")
     import sysconfig
@@ -1211,6 +1629,39 @@ if arguments and arguments[0] == "install":
     (site_packages / "release_permission_probe.py").write_text(
         "VALUE = 'readable dependency'\\n"
     )
+    wheel_arg = Path(arguments[-1])
+    if wheel_arg.suffix == ".whl":
+        with zipfile.ZipFile(wheel_arg) as archive:
+            script_members = [
+                name for name in archive.namelist()
+                if ".data/scripts/" in name and name.endswith(".py")
+            ]
+            script_payloads = [(Path(name).name, archive.read(name)) for name in script_members]
+        installed_payloads = []
+        for script_name, script_body in script_payloads:
+            script_target = Path(sys.prefix, "bin", script_name)
+            if script_body.startswith(b"#!python"):
+                installed_script = b"#!" + os.fsencode(sys.executable) + script_body[len(b"#!python"):]
+            else:
+                installed_script = script_body
+            script_target.write_bytes(installed_script)
+            script_target.chmod(0o755)
+            cache_target = Path(py_compile.cache_from_source(str(script_target)))
+            if install_result != "no-cache":
+                py_compile.compile(str(script_target), doraise=True)
+            installed_payloads.append((script_target, cache_target, installed_script))
+        record = site_packages / "pip-26.1.2.dist-info" / "RECORD"
+        if wheel_arg.suffix == ".whl":
+            record.parent.mkdir(parents=True, exist_ok=True)
+            output = io.StringIO(newline="")
+            writer = csv.writer(output, lineterminator="\\n")
+            for script_target, cache_target, installed_script in installed_payloads:
+                script_hash = base64.urlsafe_b64encode(hashlib.sha256(installed_script).digest()).rstrip(b"=").decode()
+                writer.writerow((os.path.relpath(script_target, site_packages), "sha256=" + script_hash, str(len(installed_script))))
+                cache_relative = os.path.relpath(cache_target, site_packages)
+                writer.writerow((cache_relative, "", ""))
+            writer.writerow(("pip-26.1.2.dist-info/RECORD", "", ""))
+            record.write_text(output.getvalue())
     raise SystemExit({42 if result == "fail" else 0})
 if arguments and arguments[0] == "check":
     print("No broken requirements found.")
@@ -1221,27 +1672,26 @@ if arguments[:2] == ["freeze", "--all"]:
 raise SystemExit("unsupported fake pip invocation: " + repr(arguments))
 """
         dist_info = "pip-26.1.2.dist-info"
+        wheel_payloads = {
+            "pip/__init__.py": b'__version__ = "26.1.2"\n',
+            "pip/__main__.py": module.encode(),
+            "pip/cli.py": b'def main():\n    print("relocated console script")\n',
+            f"{dist_info}/METADATA": b"Metadata-Version: 2.1\nName: pip\nVersion: 26.1.2\n\n",
+            f"{dist_info}/WHEEL": b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            f"{dist_info}/entry_points.txt": b"[console_scripts]\nfake-pip-cli = pip.cli:main\n",
+            "pip-26.1.2.data/scripts/relocation_probe.py": b"#!python\nprint('relocated probe')\n",
+            "pip-26.1.2.data/scripts/unrelated_probe.py": b"#!/usr/bin/env python3\nprint('unrelated probe')\n",
+        }
+        record = io.StringIO(newline="")
+        writer = csv.writer(record, lineterminator="\n")
+        for member_name, content in sorted(wheel_payloads.items()):
+            digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode()
+            writer.writerow((member_name, "sha256=" + digest, str(len(content))))
+        writer.writerow((f"{dist_info}/RECORD", "", ""))
         with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("pip/__init__.py", '__version__ = "26.1.2"\n')
-            archive.writestr("pip/__main__.py", module)
-            archive.writestr(
-                "pip/cli.py",
-                'def main():\n    print("relocated console script")\n',
-            )
-            archive.writestr(
-                f"{dist_info}/METADATA",
-                "Metadata-Version: 2.1\nName: pip\nVersion: 26.1.2\n\n",
-            )
-            archive.writestr(
-                f"{dist_info}/WHEEL",
-                "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
-                "Tag: py3-none-any\n",
-            )
-            archive.writestr(
-                f"{dist_info}/entry_points.txt",
-                "[console_scripts]\nfake-pip-cli = pip.cli:main\n",
-            )
-            archive.writestr(f"{dist_info}/RECORD", "")
+            for member_name, content in wheel_payloads.items():
+                archive.writestr(member_name, content)
+            archive.writestr(f"{dist_info}/RECORD", record.getvalue())
         return wheel
 
     def add_fake_shared_venv(
@@ -1251,7 +1701,8 @@ raise SystemExit("unsupported fake pip invocation: " + repr(arguments))
         if matching_freeze:
             self.write_executable(
                 self.shared_dir / "venv" / "bin" / "python",
-                'if [ "$*" = "-I -m pip freeze --all" ]; then\n'
+                'if [ "$*" = "-I -B -m pip freeze --all" ] || '
+                '[ "$*" = "-I -m pip freeze --all" ]; then\n'
                 "  printf '%s\\n' 'pip==26.1.2'\n"
                 "fi\n",
             )
@@ -1272,10 +1723,18 @@ raise SystemExit("unsupported fake pip invocation: " + repr(arguments))
         *args: str,
         check: bool = True,
         cwd: Path | None = None,
+        relocation_case: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command_env = os.environ.copy()
         command_env["PLATFORM_ENVIRONMENT"] = "test"
         command_env["PLATFORM_TESTING"] = "1"
+        if relocation_case is not None:
+            if relocation_case not in {
+                "hashed-cache-row", "duplicate-cache-row", "noncanonical-cache-row",
+                "bad-cache-header", "bad-cache-code", "no-cache",
+            }:
+                raise AssertionError("unknown relocation test case")
+            command_env["PLATFORM_TEST_RELOCATION_CASE"] = relocation_case
         command_script = script
         if script in (INSTALL_SCRIPT, ROLLBACK_SCRIPT) or "platform_release_rollback" in script.name:
             command_script = self.root / f".{script.stem}.systemctl.sh"
@@ -1287,6 +1746,60 @@ raise SystemExit("unsupported fake pip invocation: " + repr(arguments))
                     tools_dir = script.parent.resolve()
                 script_text = script_text.replace(
                     tools_needle, f'TOOLS_DIR="{tools_dir}"', 1
+                )
+            if relocation_case is not None and script == INSTALL_SCRIPT:
+                relocation_call = '  relocate_venv_paths "$NEW_VENV_DIR" "$SHARED_VENV_DIR" "$RELEASE_DIR/wheelhouse" >/dev/null 2>/dev/null'
+                test_mutation = '''  if [[ -n "${PLATFORM_TEST_RELOCATION_CASE:-}" ]]; then
+    /usr/bin/python3 -I -S -B - "$NEW_VENV_DIR" "$PLATFORM_TEST_RELOCATION_CASE" <<'PYTEST_RELOCATION_CACHE'
+import csv
+import importlib.util
+import marshal
+import os
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+case = sys.argv[2]
+site = next(root.glob("lib/python*/site-packages"))
+script = root / "bin" / "relocation_probe.py"
+cache = Path(importlib.util.cache_from_source(str(script)))
+if case == "no-cache":
+    cache.unlink(missing_ok=True)
+else:
+    record = site / "pip-26.1.2.dist-info" / "RECORD"
+    rows = list(csv.reader(record.read_text().splitlines()))
+    relative = os.path.relpath(cache, site).replace(os.sep, "/")
+    if case == "hashed-cache-row":
+        import base64
+        import hashlib
+        content = cache.read_bytes()
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode("ascii")
+        rows = [(row[0], "sha256=" + digest, str(len(content))) if row[0] == relative else row for row in rows]
+    elif case == "duplicate-cache-row":
+        rows.append((relative, "", ""))
+    elif case == "noncanonical-cache-row":
+        rows = [("missing/../" + row[0], row[1], row[2]) if row[0] == relative else row for row in rows]
+    elif case == "bad-cache-header":
+        content = bytearray(cache.read_bytes())
+        content[12] ^= 1
+        cache.write_bytes(content)
+    elif case == "bad-cache-code":
+        content = cache.read_bytes()
+        cache.write_bytes(content[:16] + marshal.dumps(compile("pass\\n", str(script), "exec", dont_inherit=True)))
+    output = []
+    for row in rows:
+        line = []
+        for value in row:
+            line.append('"' + value.replace('"', '""') + '"' if any(c in value for c in ',"\\n') else value)
+        output.append(",".join(line))
+    record.write_text("\\n".join(output) + "\\n")
+PYTEST_RELOCATION_CACHE
+  fi
+'''
+                if relocation_call not in script_text:
+                    raise AssertionError("installer relocation call changed; update the focused test hook")
+                script_text = script_text.replace(
+                    relocation_call, test_mutation + relocation_call, 1
                 )
             command_script.write_text(
                 script_text.replace("/usr/bin/systemctl", str(self.fake_systemctl))

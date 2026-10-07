@@ -51,6 +51,48 @@ def serialized(value: object) -> str:
 
 
 class EvidencePrivacyTests(unittest.TestCase):
+    def test_server_observability_projects_only_safe_request_perf_sampling_fields(
+        self,
+    ) -> None:
+        report = project_public_artifact(
+            "server_observability",
+            {
+                "server_request_perf_logs": {
+                    "scope": "diagnostic_sample",
+                    "logged_requests": 3,
+                    "request_perf_sampling": {
+                        "selection_reason_counts": {
+                            "interval": 1,
+                            "trigger_and_interval": 1,
+                            "operator@example.test": 50,
+                        },
+                        "annotated_rows": 999,
+                        "interval_selected_rows": 999,
+                        "sample_interval": 16,
+                        "client_identity": "Authorization Bearer secret-token",
+                    },
+                }
+            },
+        )
+
+        request_perf = report["server_request_perf_logs"]
+        self.assertEqual(request_perf["scope"], "diagnostic_sample")
+        self.assertEqual(
+            request_perf["request_perf_sampling"],
+            {
+                "selection_reason_counts": {
+                    "interval": 1,
+                    "trigger_and_interval": 1,
+                },
+                "annotated_rows": 2,
+                "interval_selected_rows": 2,
+                "sample_interval": 16,
+            },
+        )
+        self.assertNotIn("client_identity", serialized(report))
+        for value in FORBIDDEN_VALUES:
+            self.assertNotIn(value.lower(), serialized(report).lower())
+
     def test_live_launch_report_drops_adversarial_values(self) -> None:
         lines = [
             (

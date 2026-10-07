@@ -320,6 +320,84 @@ class LiveQaGuardTests(unittest.TestCase):
                 recovery=False,
             )
 
+    def test_locked_exec_preserves_only_validated_payload_identity(self) -> None:
+        source_sha = "a" * 40
+        installed_root = f"/root/.oldsparky/liveqa/releases/{source_sha}"
+        wrapper = (
+            f"{installed_root}/platform/tools/platform_live_user_qa.sh"
+        )
+        descriptor = os.open(os.devnull, os.O_RDONLY)
+        captured: dict[str, object] = {}
+
+        def validate_payload(root: Path, *, target_sha: str | None = None) -> str:
+            self.assertEqual(str(root), installed_root)
+            self.assertEqual(target_sha, source_sha)
+            return source_sha
+
+        def capture_exec(
+            _path: str, _argv: list[str], child_env: dict[str, str]
+        ) -> None:
+            captured.update(child_env)
+            raise OSError("stop after inspecting locked child environment")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_LIVE_QA_INSTALL_ROOT": installed_root,
+                    "PLATFORM_LIVE_QA_TARGET_SHA": source_sha,
+                    "UNTRUSTED_TEST_VALUE": "must-not-cross-lock-exec",
+                },
+                clear=True,
+            ),
+            mock.patch.object(
+                guard,
+                "_validate_installed_payload_root",
+                side_effect=validate_payload,
+            ),
+            mock.patch.object(guard, "_assert_root_controlled_path"),
+            mock.patch.object(guard, "_open_bundle_lock", return_value=descriptor),
+            mock.patch.object(guard.os, "execve", side_effect=capture_exec),
+            self.assertRaisesRegex(OSError, "stop after inspecting"),
+        ):
+            guard.locked_exec(Path("/root/csp-live-qa.json"), [wrapper])
+
+        self.assertEqual(
+            set(captured),
+            {
+                "LANG",
+                "PATH",
+                guard.LOCK_ENV_NAME,
+                "PLATFORM_LIVE_QA_INSTALL_ROOT",
+                "PLATFORM_LIVE_QA_TARGET_SHA",
+            },
+        )
+        self.assertEqual(captured["PLATFORM_LIVE_QA_INSTALL_ROOT"], installed_root)
+        self.assertEqual(captured["PLATFORM_LIVE_QA_TARGET_SHA"], source_sha)
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+
+    def test_locked_exec_rejects_mismatched_target_before_lock_or_exec(self) -> None:
+        source_sha = "a" * 40
+        installed_root = f"/root/.oldsparky/liveqa/releases/{source_sha}"
+        wrapper = f"{installed_root}/platform/tools/platform_live_user_qa.sh"
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_LIVE_QA_INSTALL_ROOT": installed_root,
+                    "PLATFORM_LIVE_QA_TARGET_SHA": "b" * 40,
+                },
+                clear=True,
+            ),
+            mock.patch.object(guard, "_open_bundle_lock") as open_lock,
+            mock.patch.object(guard.os, "execve") as execve,
+            self.assertRaisesRegex(guard.GuardError, "wrapper root is invalid"),
+        ):
+            guard.locked_exec(Path("/root/csp-live-qa.json"), [wrapper])
+        open_lock.assert_not_called()
+        execve.assert_not_called()
+
     def test_recovery_exec_requires_an_exact_recovery_command(self) -> None:
         with synthetic_trusted_tools() as tools_root:
             wrapper = tools_root / "platform_live_user_qa.sh"
@@ -1107,6 +1185,139 @@ class LiveQaGuardTests(unittest.TestCase):
         self.assertFalse(args.apply)
         self.assertEqual(args.keep, 1)
         self.assertFalse(hasattr(args, "max_age_days"))
+
+    def test_trusted_runtime_root_takes_no_caller_selected_path(self) -> None:
+        self.assertEqual(guard._parser().parse_args(["runtime-root"]).command, "runtime-root")
+        with self.assertRaises(SystemExit):
+            guard._parser().parse_args(["runtime-root", "/tmp/untrusted-runtime"])
+
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned runtime mapping contract")
+    def test_runtime_mount_aliases_are_fixed_empty_root_owned_and_removed_by_identity(
+        self,
+    ) -> None:
+        source_sha = "a" * 40
+        provider_sha = "b" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            base = Path(temporary)
+            cache = base / "cache"
+            cache.mkdir(mode=0o755)
+            gate_root = base / "run"
+            gate_root.mkdir(mode=0o711)
+            gate = gate_root / "public-live-qa.abcdefgh"
+            gate.mkdir(mode=0o700)
+            os.chown(gate, 12345, 12345)
+            engine_root = cache / provider_sha / "runtime"
+            engine_root.parent.mkdir(mode=0o755)
+            engine_root.mkdir(mode=0o555)
+            pointer_target = base / "active-payload"
+            pointer_target.mkdir()
+            active_pointer = base / "active"
+            active_pointer.symlink_to(pointer_target)
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache),
+                mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
+                mock.patch.object(guard, "TRUSTED_ACTIVE_POINTER", active_pointer),
+                mock.patch.object(guard, "liveqa_identity", return_value=(12345, 12345)),
+                mock.patch.object(
+                    guard, "_validate_installed_payload_root", return_value=source_sha
+                ),
+                mock.patch.object(guard, "_trusted_runtime_root", return_value=engine_root),
+            ):
+                values = guard._runtime_mount_aliases(gate)
+                self.assertEqual(values[:3], (source_sha, provider_sha, "abcdefgh"))
+                suite = cache / f"runtime-suite-{source_sha}-abcdefgh"
+                engine = cache / f"runtime-engine-{provider_sha}-abcdefgh"
+                for target, identity in zip((suite, engine), values[3:], strict=True):
+                    metadata = target.lstat()
+                    self.assertTrue(stat.S_ISDIR(metadata.st_mode))
+                    self.assertEqual((metadata.st_uid, metadata.st_gid), (0, 0))
+                    self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o555)
+                    self.assertEqual(metadata.st_nlink, 2)
+                    self.assertFalse(any(target.iterdir()))
+                    self.assertEqual(identity, f"{metadata.st_dev}:{metadata.st_ino}")
+                guard._cleanup_runtime_mount_aliases(*values)
+                self.assertFalse(suite.exists())
+                self.assertFalse(engine.exists())
+
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned runtime mapping contract")
+    def test_runtime_mount_alias_collision_and_changed_identity_fail_closed(self) -> None:
+        source_sha = "a" * 40
+        provider_sha = "b" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            base = Path(temporary)
+            cache = base / "cache"
+            cache.mkdir(mode=0o755)
+            gate_root = base / "run"
+            gate_root.mkdir(mode=0o711)
+            gate = gate_root / "public-live-qa.abcdefgh"
+            gate.mkdir(mode=0o700)
+            os.chown(gate, 12345, 12345)
+            engine_root = cache / provider_sha / "runtime"
+            engine_root.parent.mkdir(mode=0o755)
+            engine_root.mkdir(mode=0o555)
+            pointer_target = base / "active-payload"
+            pointer_target.mkdir()
+            active_pointer = base / "active"
+            active_pointer.symlink_to(pointer_target)
+            collision = cache / f"runtime-engine-{provider_sha}-abcdefgh"
+            collision.mkdir(mode=0o555)
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache),
+                mock.patch.object(guard, "RUN_GATE_ROOT", gate_root),
+                mock.patch.object(guard, "TRUSTED_ACTIVE_POINTER", active_pointer),
+                mock.patch.object(guard, "liveqa_identity", return_value=(12345, 12345)),
+                mock.patch.object(
+                    guard, "_validate_installed_payload_root", return_value=source_sha
+                ),
+                mock.patch.object(guard, "_trusted_runtime_root", return_value=engine_root),
+            ):
+                with self.assertRaisesRegex(guard.GuardError, "already exists"):
+                    guard._runtime_mount_aliases(gate)
+                self.assertFalse((cache / f"runtime-suite-{source_sha}-abcdefgh").exists())
+                self.assertTrue(collision.is_dir())
+                collision.rmdir()
+                values = guard._runtime_mount_aliases(gate)
+                suite, engine = (
+                    cache / f"runtime-suite-{source_sha}-abcdefgh",
+                    cache / f"runtime-engine-{provider_sha}-abcdefgh",
+                )
+                with self.assertRaisesRegex(guard.GuardError, "unsafe"):
+                    guard._cleanup_runtime_mount_aliases(
+                        *values[:3], "0:1", values[4]
+                    )
+                self.assertTrue(suite.is_dir())
+                self.assertTrue(engine.is_dir())
+
+    def test_runtime_mount_cleanup_requires_collected_unit_and_reaped_processes(self) -> None:
+        with (
+            mock.patch.object(guard, "assert_liveqa_idle") as assert_idle,
+            mock.patch.object(
+                guard.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=["systemctl"], returncode=0, stdout="loaded\n", stderr=""
+                ),
+            ),
+            self.assertRaisesRegex(guard.GuardError, "not been collected"),
+        ):
+            guard._assert_runtime_unit_collected()
+        assert_idle.assert_called_once_with()
+
+    def test_live_browser_runner_maps_all_read_only_runtime_paths_in_unit_namespace(self) -> None:
+        runner = SCRIPT_PATH.with_name("platform_live_browser_qa.sh").read_text()
+        self.assertIn("--property=BindReadOnlyPaths=$RUNTIME_SUITE_SOURCE:$RUNTIME_MOUNT_SUITE_TARGET", runner)
+        self.assertIn("--property=BindReadOnlyPaths=$RUNTIME_ENGINE_SOURCE:$RUNTIME_MOUNT_ENGINE_TARGET", runner)
+        self.assertIn('--working-directory="$RUNTIME_SUITE/web"', runner)
+        self.assertIn('PATH="$RUNTIME_CACHE/node/bin:/usr/bin:/bin"', runner)
+        self.assertIn('NODE_PATH="$RUNTIME_CACHE/web/node_modules"', runner)
+        self.assertIn('PLAYWRIGHT_BROWSERS_PATH="$RUNTIME_CACHE/browsers"', runner)
+        self.assertIn('CHROME_DEVEL_SANDBOX="$CHROMIUM_SANDBOX"', runner)
+        self.assertIn('"$RUNTIME_CACHE/web/node_modules/@playwright/test/cli.js"', runner)
+        self.assertIn('"$RUNTIME_SUITE/web/playwright.live.config.ts"', runner)
+        self.assertIn('"$RUNTIME_SUITE/web/tests/smoke/live-launch.spec.ts"', runner)
+        self.assertIn('HOME="$BROWSER_GATE/home"', runner)
+        self.assertIn('TMPDIR="$BROWSER_GATE/tmp"', runner)
+        self.assertIn('PLATFORM_QA_BROWSER_GATE_DIR="$BROWSER_GATE"', runner)
 
     def test_runtime_contract_rejects_64_character_commits_end_to_end(self) -> None:
         self.assertIsNotNone(guard.COMMIT_PATTERN.fullmatch("a" * 40))

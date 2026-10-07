@@ -93,28 +93,56 @@ if [[ "$EXPECTED_ENVIRONMENT" != "production" \
   exit 1
 fi
 if (( TRUSTED_MODE == 1 )); then
-  RUNTIME_CACHE="$TRUSTED_INSTALL_ROOT/runtime"
+  RUNTIME_ENGINE_SOURCE="$("${GUARD[@]}" runtime-root)"
+  RUNTIME_SUITE_SOURCE="$TRUSTED_INSTALL_ROOT/runtime"
 else
-  RUNTIME_CACHE="$("${GUARD[@]}" prepare-runtime-cache \
+  RUNTIME_ENGINE_SOURCE="$("${GUARD[@]}" prepare-runtime-cache \
     --platform-root "$PLATFORM_ROOT" \
     --commit "$SOURCE_COMMIT")"
+  RUNTIME_SUITE_SOURCE="$RUNTIME_ENGINE_SOURCE"
 fi
+RUNTIME_CACHE="$RUNTIME_ENGINE_SOURCE"
+RUNTIME_SUITE="$RUNTIME_SUITE_SOURCE"
 RUNTIME_NODE="$RUNTIME_CACHE/node/bin/node"
-CHROMIUM_SANDBOX="$(
-  "${GUARD[@]}" sandbox-path --runtime-cache "$RUNTIME_CACHE"
-)"
+if (( TRUSTED_MODE == 1 )); then
+  CHROMIUM_SANDBOX="$RUNTIME_CACHE/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+else
+  CHROMIUM_SANDBOX="$(
+    "${GUARD[@]}" sandbox-path --runtime-cache "$RUNTIME_CACHE"
+  )"
+fi
 BROWSER_GATE="$("${GUARD[@]}" prepare-public-browser-gate)"
 LIVE_QA_UID="$(/usr/bin/id -u oldsparky-liveqa)"
 LIVE_QA_GID="$(/usr/bin/id -g oldsparky-liveqa)"
+RUNTIME_MOUNTS_READY=0
+RUNTIME_MOUNT_SOURCE_SHA=""
+RUNTIME_MOUNT_PROVIDER_SHA=""
+RUNTIME_MOUNT_SUFFIX=""
+RUNTIME_MOUNT_SUITE_IDENTITY=""
+RUNTIME_MOUNT_ENGINE_IDENTITY=""
 
 cleanup_gate() {
   local original_status=$?
   local cleanup_status=0
+  local gate_cleanup_status=0
   trap - EXIT INT TERM HUP
   set +e
+  if (( RUNTIME_MOUNTS_READY == 1 )); then
+    "${GUARD[@]}" cleanup-runtime-mounts \
+      --source-sha "$RUNTIME_MOUNT_SOURCE_SHA" \
+      --provider-sha "$RUNTIME_MOUNT_PROVIDER_SHA" \
+      --suffix "$RUNTIME_MOUNT_SUFFIX" \
+      --suite-identity "$RUNTIME_MOUNT_SUITE_IDENTITY" \
+      --engine-identity "$RUNTIME_MOUNT_ENGINE_IDENTITY"
+    cleanup_status=$?
+    if (( cleanup_status != 0 )); then
+      echo "Validated runtime mount targets retained for recovery." >&2
+    fi
+  fi
   "${GUARD[@]}" remove-public-browser-gate --gate "$BROWSER_GATE"
-  cleanup_status=$?
-  if (( cleanup_status != 0 )); then
+  gate_cleanup_status=$?
+  if (( gate_cleanup_status != 0 )); then
+    cleanup_status=$gate_cleanup_status
     echo "Public browser QA recovery gate retained: $BROWSER_GATE" >&2
     echo "Run this exact recovery command after resolving the failure:" >&2
     printf '  PLATFORM_APP_DIR=/opt/oldsparky/platform PLATFORM_LIVE_CSP_QA_BUNDLE=%q %q recover %q\n' \
@@ -127,6 +155,34 @@ cleanup_gate() {
 }
 trap cleanup_gate EXIT INT TERM HUP
 
+SYSTEMD_BIND_ARGS=()
+if (( TRUSTED_MODE == 1 )); then
+  IFS=$'\t' read -r \
+    RUNTIME_MOUNT_SOURCE_SHA \
+    RUNTIME_MOUNT_PROVIDER_SHA \
+    RUNTIME_MOUNT_SUFFIX \
+    RUNTIME_MOUNT_SUITE_IDENTITY \
+    RUNTIME_MOUNT_ENGINE_IDENTITY \
+    < <("${GUARD[@]}" prepare-runtime-mounts --gate-path "$BROWSER_GATE")
+  RUNTIME_MOUNTS_READY=1
+  [[ "$RUNTIME_MOUNT_SOURCE_SHA" == "$SOURCE_COMMIT" \
+    && "$RUNTIME_MOUNT_PROVIDER_SHA" =~ ^[0-9a-f]{40}$ \
+    && "$RUNTIME_MOUNT_SUFFIX" =~ ^[a-z0-9_]{8}$ \
+    && "$RUNTIME_MOUNT_SUITE_IDENTITY" =~ ^[0-9]+:[0-9]+$ \
+    && "$RUNTIME_MOUNT_ENGINE_IDENTITY" =~ ^[0-9]+:[0-9]+$ ]] \
+    || { echo "Validated live-QA runtime mapping identity is invalid." >&2; exit 1; }
+  RUNTIME_MOUNT_SUITE_TARGET="/var/lib/oldsparky-liveqa/runtime-suite-${RUNTIME_MOUNT_SOURCE_SHA}-${RUNTIME_MOUNT_SUFFIX}"
+  RUNTIME_MOUNT_ENGINE_TARGET="/var/lib/oldsparky-liveqa/runtime-engine-${RUNTIME_MOUNT_PROVIDER_SHA}-${RUNTIME_MOUNT_SUFFIX}"
+  RUNTIME_SUITE="$RUNTIME_MOUNT_SUITE_TARGET"
+  RUNTIME_CACHE="$RUNTIME_MOUNT_ENGINE_TARGET"
+  RUNTIME_NODE="$RUNTIME_CACHE/node/bin/node"
+  CHROMIUM_SANDBOX="$RUNTIME_CACHE/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+  SYSTEMD_BIND_ARGS+=(
+    "--property=BindReadOnlyPaths=$RUNTIME_SUITE_SOURCE:$RUNTIME_MOUNT_SUITE_TARGET"
+    "--property=BindReadOnlyPaths=$RUNTIME_ENGINE_SOURCE:$RUNTIME_MOUNT_ENGINE_TARGET"
+  )
+fi
+
 /usr/bin/systemd-run \
   --no-ask-password \
   --quiet \
@@ -138,18 +194,20 @@ trap cleanup_gate EXIT INT TERM HUP
   --unit=oldsparky-liveqa-browser.service \
   --uid="$LIVE_QA_UID" \
   --gid="$LIVE_QA_GID" \
-  --working-directory="$RUNTIME_CACHE/web" \
+  --working-directory="$RUNTIME_SUITE/web" \
   --property=KillMode=control-group \
   --property=Restart=no \
   --property=RuntimeMaxSec=30min \
   --property=SendSIGKILL=yes \
   --property=TimeoutStopSec=5s \
   --property=UMask=0077 \
+  "${SYSTEMD_BIND_ARGS[@]}" \
   -- \
   /usr/bin/env -i \
     CHROME_DEVEL_SANDBOX="$CHROMIUM_SANDBOX" \
     HOME="$BROWSER_GATE/home" \
     LANG=C.UTF-8 \
+    NODE_PATH="$RUNTIME_CACHE/web/node_modules" \
     PATH="$RUNTIME_CACHE/node/bin:/usr/bin:/bin" \
     PLATFORM_LIVE_EXPECTED_ORIGIN="$EXPECTED_LIVE_ORIGIN" \
     PLATFORM_LIVE_USER_QA_UID="$LIVE_QA_UID" \
@@ -161,7 +219,7 @@ trap cleanup_gate EXIT INT TERM HUP
     "$RUNTIME_NODE" \
       "$RUNTIME_CACHE/web/node_modules/@playwright/test/cli.js" \
       test \
-      --config="$RUNTIME_CACHE/web/playwright.live.config.ts" \
-      "$RUNTIME_CACHE/web/tests/smoke/live-launch.spec.ts"
+      --config="$RUNTIME_SUITE/web/playwright.live.config.ts" \
+      "$RUNTIME_SUITE/web/tests/smoke/live-launch.spec.ts"
 
 printf 'LIVE_BROWSER_QA_SUCCESS source_commit=%s\n' "$SOURCE_COMMIT"

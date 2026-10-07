@@ -1815,6 +1815,8 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
         "response_bytes": int,
         "pool_wait_ms": float,
         "pool_checkout_wait_ms": float,
+        "request_perf_completion_count": int,
+        "request_perf_sample_interval": int,
         "pool_connection_hold_ms": float,
         "pool_connection_hold_count": int,
         "authenticated_read_admission_wait_ms": float,
@@ -1884,9 +1886,9 @@ def summarize_request_perf_logs(
     tournament_slugs: list[str] | tuple[str, ...] = (),
 ) -> dict[str, Any]:
     # ``request_perf`` is intentionally a bounded diagnostic stream: fast
-    # successful Ready Vote requests are normally suppressed by the API
-    # logger. Keep this scope in the parser output so it cannot be mistaken
-    # for the full-population HTTP client measurements.
+    # successful requests are selected by the API logging policy, including
+    # its fixed process-local interval sample. Keep this scope in the parser
+    # output so it cannot be mistaken for full-population HTTP client metrics.
     diagnostic_scope = {
         "kind": "diagnostic_sample",
         "population": "journal_lines_selected_by_request_perf_logging_policy",
@@ -2016,6 +2018,32 @@ def summarize_request_perf_logs(
         )
         for row in rows
     ]
+    allowed_selection_reasons = {
+        "trigger",
+        "interval",
+        "trigger_and_interval",
+    }
+    selection_counts = Counter(
+        str(row["request_perf_selection"])
+        for row in rows
+        if row.get("request_perf_selection") in allowed_selection_reasons
+    )
+    request_perf_sampling: dict[str, Any] | None = None
+    if selection_counts:
+        intervals = {
+            int(row["request_perf_sample_interval"])
+            for row in rows
+            if isinstance(row.get("request_perf_sample_interval"), int)
+            and 1 <= int(row["request_perf_sample_interval"]) <= 1024
+        }
+        request_perf_sampling = {
+            "selection_reason_counts": dict(sorted(selection_counts.items())),
+            "annotated_rows": sum(selection_counts.values()),
+            "interval_selected_rows": selection_counts.get("interval", 0)
+            + selection_counts.get("trigger_and_interval", 0),
+        }
+        if len(intervals) == 1:
+            request_perf_sampling["sample_interval"] = next(iter(intervals))
 
     def summarize_route_rows(row_values: list[dict[str, Any]]) -> dict[str, Any]:
         non_sql_times = [
@@ -2089,7 +2117,7 @@ def summarize_request_perf_logs(
             },
         }
 
-    return {
+    summary = {
         "logged_requests": len(rows),
         "scope": diagnostic_scope,
         "overall": metric_stats(totals),
@@ -2145,6 +2173,9 @@ def summarize_request_perf_logs(
             for phase, row_values in sorted(by_qa_phase.items())
         },
     }
+    if request_perf_sampling is not None:
+        summary["request_perf_sampling"] = request_perf_sampling
+    return summary
 
 
 def _attach_server_diagnostic_sample(

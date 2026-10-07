@@ -719,6 +719,61 @@ def _runtime_path_order_key(relative: str) -> tuple[str, ...]:
     return PurePosixPath(relative).parts
 
 
+def _file_map_digest(files: dict[str, str], *, domain: bytes) -> str:
+    digest = hashlib.sha256(domain)
+    for relative, file_digest in sorted(files.items()):
+        digest.update(relative.encode("utf-8") + b"\0f\0")
+        digest.update(bytes.fromhex(file_digest))
+    return digest.hexdigest()
+
+
+def _engine_digest(
+    files: dict[str, str], *, node_version: str, package_lock_sha256: str
+) -> str:
+    return _file_map_digest(
+        files,
+        domain=(
+            b"oldsparky-liveqa-engine-v1\0"
+            + node_version.encode("ascii")
+            + b"\0"
+            + package_lock_sha256.encode("ascii")
+            + b"\0"
+        ),
+    )
+
+
+def _runtime_file_map(
+    root: Path,
+    *,
+    prefixes: tuple[str, ...],
+    excluded_prefixes: tuple[str, ...] = (),
+) -> dict[str, str]:
+    files: dict[str, str] = {}
+    for path in sorted(root.rglob("*"), key=lambda candidate: _runtime_path_order_key(candidate.relative_to(root).as_posix())):
+        relative = path.relative_to(root).as_posix()
+        if (
+            path.is_dir()
+            or not any(relative.startswith(prefix) for prefix in prefixes)
+            or any(relative.startswith(prefix) for prefix in excluded_prefixes)
+        ):
+            continue
+        metadata = _regular(
+            path,
+            allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix(),
+        )
+        if (
+            stat.S_IMODE(metadata.st_mode)
+            not in ({0o4755} if relative == RUNTIME_SANDBOX_RELATIVE.as_posix() else {0o444, 0o555})
+        ):
+            raise InstallerError("runtime file map contains an unsafe mode")
+        files[relative] = (
+            _sandbox_digest(path)
+            if relative == RUNTIME_SANDBOX_RELATIVE.as_posix()
+            else _digest_regular(path)
+        )
+    return files
+
+
 def _tree_digest(
     root: Path,
     *,
@@ -768,21 +823,27 @@ def _tree_digest(
     return digest.hexdigest(), files
 
 
-def _validate_runtime_source(root: Path) -> None:
+def _validate_runtime_source(root: Path) -> dict[str, object]:
     """Recheck the artifact member before any secret-bearing promotion."""
 
     _directory(root, mode=0o555)
     _validate_source_tree(root.parent, root.name)
-    required = [*RUNTIME_REQUIRED_FILES]
+    required = [
+        "web/package-lock.json",
+        "web/playwright.live.config.ts",
+        "web/tests/smoke/live-launch.spec.ts",
+        "web/tests/smoke/live-user-journey.spec.ts",
+        "web/tests/support/live-qa-origin.ts",
+        "web/tests/support/live-qa-sandbox.ts",
+    ]
     for relative in required:
         path = root / relative
         _regular(path, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
-    for browser_root in RUNTIME_BROWSER_ROOTS:
-        _directory(root / "browsers" / browser_root)
     allowed_top = {"node", "web", "browsers", RUNTIME_MANIFEST_RELATIVE.name}
     allowed_web_files = {
         "web/package-lock.json",
         "web/playwright.live.config.ts",
+        "web/tests/smoke/live-launch.spec.ts",
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
@@ -839,9 +900,100 @@ def _validate_runtime_source(root: Path) -> None:
         )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise InstallerError("live-QA runtime manifest is invalid") from exc
+    if not isinstance(manifest, dict):
+        raise InstallerError("live-QA runtime manifest schema is invalid")
+    lock_digest = _digest_regular(root / "web/package-lock.json")
+    if manifest.get("version") == 2:
+        expected_keys = {
+            "version",
+            "node_version",
+            "package_lock_sha256",
+            "engine_tree_sha256",
+            "engine_files",
+            "suite_tree_sha256",
+            "suite_files",
+        }
+        if (
+            set(manifest) != expected_keys
+            or manifest.get("node_version") != "26.3.1"
+            or manifest.get("package_lock_sha256") != lock_digest
+            or not isinstance(manifest.get("engine_tree_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest["engine_tree_sha256"])
+            or not isinstance(manifest.get("suite_tree_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest["suite_tree_sha256"])
+            or not isinstance(manifest.get("engine_files"), dict)
+            or not isinstance(manifest.get("suite_files"), dict)
+        ):
+            raise InstallerError("live-QA runtime reference manifest schema is invalid")
+        allowed_v2_top = {"web", RUNTIME_MANIFEST_RELATIVE.name}
+        for path in root.rglob("*"):
+            relative = path.relative_to(root).as_posix()
+            if relative.split("/", 1)[0] not in allowed_v2_top:
+                raise InstallerError("source-only live-QA runtime contains engine bytes")
+        expected_suite_files = _runtime_file_map(
+            root,
+            prefixes=("web/",),
+            excluded_prefixes=("web/node_modules/",),
+        )
+        suite_files = manifest["suite_files"]
+        engine_files = manifest["engine_files"]
+        if (
+            suite_files != expected_suite_files
+            or manifest["suite_tree_sha256"]
+            != _file_map_digest(suite_files, domain=b"oldsparky-liveqa-suite-v1\0")
+            or not engine_files
+            or any(
+                not isinstance(relative, str)
+                or relative.startswith("/")
+                or "\\" in relative
+                or any(part in {"", ".", ".."} for part in relative.split("/"))
+                or not (
+                    relative == "node/bin/node"
+                    or relative.startswith("browsers/")
+                    or relative.startswith("web/node_modules/")
+                )
+                or not isinstance(file_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", file_digest) is None
+                for relative, file_digest in engine_files.items()
+            )
+            or any(
+                not any(key.startswith(f"browsers/{browser_root}/") for key in engine_files)
+                for browser_root in RUNTIME_BROWSER_ROOTS
+            )
+            or "node/bin/node" not in engine_files
+            or engine_files.get(RUNTIME_SANDBOX_RELATIVE.as_posix())
+            != CHROMIUM_SANDBOX_SHA256
+            or manifest["engine_tree_sha256"]
+            != _engine_digest(
+                engine_files,
+                node_version="26.3.1",
+                package_lock_sha256=lock_digest,
+            )
+        ):
+            raise InstallerError("live-QA runtime reference digest is invalid")
+        required_suite = {
+            "web/package-lock.json",
+            "web/playwright.live.config.ts",
+            "web/tests/smoke/live-launch.spec.ts",
+            "web/tests/smoke/live-user-journey.spec.ts",
+            "web/tests/support/live-qa-origin.ts",
+            "web/tests/support/live-qa-sandbox.ts",
+        }
+        if not required_suite.issubset(suite_files):
+            raise InstallerError("source-only live-QA suite is incomplete")
+        if not {
+            "web/node_modules/@playwright/test/package.json",
+            "web/node_modules/playwright/package.json",
+            "web/node_modules/playwright-core/package.json",
+        }.issubset(engine_files):
+            raise InstallerError("source-only live-QA dependency set is incomplete")
+        return manifest
+    for relative in RUNTIME_REQUIRED_FILES:
+        _regular(root / relative, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
+    for browser_root in RUNTIME_BROWSER_ROOTS:
+        _directory(root / "browsers" / browser_root)
     if (
-        not isinstance(manifest, dict)
-        or set(manifest) != {"version", "node_version", "package_lock_sha256", "tree_sha256", "files"}
+        set(manifest) != {"version", "node_version", "package_lock_sha256", "tree_sha256", "files"}
         or manifest.get("version") != 1
         or manifest.get("node_version") != "26.3.1"
         or not isinstance(manifest.get("package_lock_sha256"), str)
@@ -851,7 +1003,6 @@ def _validate_runtime_source(root: Path) -> None:
         or not isinstance(manifest.get("files"), dict)
     ):
         raise InstallerError("live-QA runtime manifest schema is invalid")
-    lock_digest = _digest_regular(root / "web/package-lock.json")
     tree_digest, files = _tree_digest(
         root,
         ignored=frozenset({RUNTIME_MANIFEST_RELATIVE.as_posix()}),
@@ -863,6 +1014,173 @@ def _validate_runtime_source(root: Path) -> None:
         or manifest["files"] != files
     ):
         raise InstallerError("live-QA runtime manifest digest is invalid")
+    return manifest
+
+
+def _validate_engine_root(
+    root: Path,
+    *,
+    expected_files: dict[str, str],
+    engine_sha256: str,
+    node_version: str,
+    package_lock_sha256: str,
+) -> None:
+    _directory(root, mode=0o555)
+    for path in root.iterdir():
+        if path.name not in {"node", "browsers", "web", "runtime-manifest.json"}:
+            raise InstallerError("runtime provider contains an unreviewed top-level member")
+    for browser_root in RUNTIME_BROWSER_ROOTS:
+        _directory(root / "browsers" / browser_root, mode=0o555)
+    _directory(root / "node", mode=0o555)
+    _directory(root / "node" / "bin", mode=0o555)
+    _directory(root / "web", mode=0o555)
+    _directory(root / "web" / "node_modules", mode=0o555)
+    allowed_web_files = {
+        "web/package-lock.json",
+        "web/playwright.live.config.ts",
+        "web/tests/smoke/live-launch.spec.ts",
+        "web/tests/smoke/live-user-journey.spec.ts",
+        "web/tests/support/live-qa-origin.ts",
+        "web/tests/support/live-qa-sandbox.ts",
+    }
+    allowed_web_directories = {
+        "web",
+        "web/tests",
+        "web/tests/smoke",
+        "web/tests/support",
+        "web/node_modules",
+        "web/node_modules/@playwright",
+        "web/node_modules/@playwright/test",
+        "web/node_modules/playwright",
+        "web/node_modules/playwright-core",
+    }
+    allowed_package_prefixes = (
+        "web/node_modules/@playwright/test/",
+        "web/node_modules/playwright/",
+        "web/node_modules/playwright-core/",
+    )
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        top = relative.split("/", 1)[0]
+        if path.is_dir():
+            if top == "web" and relative not in allowed_web_directories and not any(
+                relative.startswith(prefix) for prefix in allowed_package_prefixes
+            ):
+                raise InstallerError("runtime provider dependency tree contains an unreviewed directory")
+            if top in {"node", "browsers", "web"}:
+                _directory(path, mode=0o555)
+            continue
+        if top == "web" and not (
+            relative in allowed_web_files
+            or any(relative.startswith(prefix) for prefix in allowed_package_prefixes)
+        ):
+            raise InstallerError("runtime provider dependency tree contains an unreviewed file")
+        if top == "web" and any(relative.startswith(prefix) for prefix in allowed_package_prefixes):
+            if relative.count("/node_modules/") > 1:
+                raise InstallerError("runtime provider contains nested node_modules")
+    actual_files = _runtime_file_map(
+        root,
+        prefixes=("node/", "browsers/", "web/node_modules/"),
+    )
+    if (
+        actual_files != expected_files
+        or "node/bin/node" not in actual_files
+        or not {
+            "web/node_modules/@playwright/test/package.json",
+            "web/node_modules/playwright/package.json",
+            "web/node_modules/playwright-core/package.json",
+        }.issubset(actual_files)
+        or actual_files.get(RUNTIME_SANDBOX_RELATIVE.as_posix())
+        != CHROMIUM_SANDBOX_SHA256
+        or _engine_digest(
+            actual_files,
+            node_version=node_version,
+            package_lock_sha256=package_lock_sha256,
+        )
+        != engine_sha256
+    ):
+        raise InstallerError("runtime provider engine digest is invalid")
+    lock_digest = _digest_regular(root / "web/package-lock.json")
+    if lock_digest != package_lock_sha256:
+        raise InstallerError("runtime provider package lock identity is invalid")
+
+
+def _runtime_provider_payload(
+    app_dir: Path,
+    *,
+    expected_manifest: dict[str, object],
+) -> dict[str, object]:
+    manifest = _read_manifest()
+    source_sha = str(manifest["source_sha"])
+    active_root = PAYLOAD_ROOT / source_sha
+    _validate_payload(manifest, app_dir=app_dir)
+    provider_file = active_root / "runtime-provider.json"
+    if os.path.lexists(provider_file):
+        metadata = _regular(provider_file, mode=0o444, maximum=MAX_RUNTIME_MANIFEST_BYTES)
+        try:
+            provider = json.loads(
+                _read_bounded_regular(
+                    provider_file,
+                    metadata=metadata,
+                    maximum=MAX_RUNTIME_MANIFEST_BYTES,
+                    mode=0o444,
+                ).decode("ascii"),
+                object_pairs_hook=_strict_object,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise InstallerError("active runtime provider manifest is invalid") from exc
+        expected_keys = {
+            "version",
+            "source_sha",
+            "provider_sha",
+            "engine_tree_sha256",
+            "node_version",
+            "package_lock_sha256",
+            "engine_files",
+        }
+        if (
+            not isinstance(provider, dict)
+            or set(provider) != expected_keys
+            or provider.get("version") != 1
+            or provider.get("source_sha") != source_sha
+            or not isinstance(provider.get("provider_sha"), str)
+            or SHA_PATTERN.fullmatch(provider["provider_sha"]) is None
+            or provider.get("engine_tree_sha256") != expected_manifest.get("engine_tree_sha256")
+            or provider.get("node_version") != expected_manifest.get("node_version")
+            or provider.get("package_lock_sha256") != expected_manifest.get("package_lock_sha256")
+            or provider.get("engine_files") != expected_manifest.get("engine_files")
+        ):
+            raise InstallerError("active runtime provider does not match candidate engine")
+        provider_sha = str(provider["provider_sha"])
+    else:
+        provider_sha = source_sha
+        active_files = manifest.get("files")
+        if not isinstance(active_files, dict):
+            raise InstallerError("active runtime payload file map is invalid")
+        engine_files = {
+            relative.removeprefix("runtime/"): digest
+            for relative, digest in active_files.items()
+            if relative.startswith(("runtime/node/", "runtime/browsers/", "runtime/web/node_modules/"))
+        }
+        if (
+            engine_files != expected_manifest.get("engine_files")
+            or active_files.get("runtime/web/package-lock.json")
+            != expected_manifest.get("package_lock_sha256")
+        ):
+            raise InstallerError("protected legacy runtime differs from candidate engine")
+        provider = {
+            "version": 1,
+            "source_sha": source_sha,
+            "provider_sha": provider_sha,
+            "engine_tree_sha256": expected_manifest.get("engine_tree_sha256"),
+            "node_version": expected_manifest.get("node_version"),
+            "package_lock_sha256": expected_manifest.get("package_lock_sha256"),
+            "engine_files": expected_manifest.get("engine_files"),
+        }
+    protected = _protected_shas(app_dir)
+    if provider_sha not in protected:
+        raise InstallerError("runtime provider is outside the protected release closure")
+    return provider
 
 
 def _normalize_tree(root: Path) -> None:
@@ -1001,7 +1319,12 @@ def _validate_active_pointer(source_sha: str) -> None:
         raise InstallerError("trusted live-QA active generation pointer is invalid")
 
 
-def _validate_payload(payload: dict[str, object]) -> None:
+def _validate_payload(
+    payload: dict[str, object],
+    *,
+    app_dir: Path = APP_DIR,
+    validate_provider: bool = True,
+) -> None:
     source_sha = str(payload["source_sha"])
     root = Path(str(payload["payload"]))
     if root != PAYLOAD_ROOT / source_sha:
@@ -1036,6 +1359,59 @@ def _validate_payload(payload: dict[str, object]) -> None:
     }
     if not required_files.issubset(manifest_files):
         raise InstallerError("trusted live-QA manifest is missing a required entrypoint")
+    provider_path = root / "runtime-provider.json"
+    if "runtime-provider.json" in manifest_files:
+        provider_metadata = _regular(
+            provider_path,
+            mode=0o444,
+            maximum=MAX_RUNTIME_MANIFEST_BYTES,
+        )
+        try:
+            provider = json.loads(
+                _read_bounded_regular(
+                    provider_path,
+                    metadata=provider_metadata,
+                    maximum=MAX_RUNTIME_MANIFEST_BYTES,
+                    mode=0o444,
+                ).decode("ascii"),
+                object_pairs_hook=_strict_object,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise InstallerError("trusted runtime provider manifest is invalid") from exc
+        runtime_manifest = _validate_runtime_source(root / "runtime")
+        if (
+            not isinstance(provider, dict)
+            or set(provider)
+            != {
+                "version",
+                "source_sha",
+                "provider_sha",
+                "engine_tree_sha256",
+                "node_version",
+                "package_lock_sha256",
+                "engine_files",
+            }
+            or provider.get("version") != 1
+            or provider.get("source_sha") != source_sha
+            or not isinstance(provider.get("provider_sha"), str)
+            or SHA_PATTERN.fullmatch(provider["provider_sha"]) is None
+            or provider.get("engine_tree_sha256") != runtime_manifest.get("engine_tree_sha256")
+            or provider.get("node_version") != runtime_manifest.get("node_version")
+            or provider.get("package_lock_sha256") != runtime_manifest.get("package_lock_sha256")
+            or provider.get("engine_files") != runtime_manifest.get("engine_files")
+        ):
+            raise InstallerError("trusted runtime provider identity does not match suite")
+        provider_sha = str(provider["provider_sha"])
+        if provider_sha not in _protected_shas(app_dir):
+            raise InstallerError("trusted runtime provider is outside protected release closure")
+        if validate_provider:
+            _validate_engine_root(
+                PAYLOAD_ROOT / provider_sha / "runtime",
+                expected_files=runtime_manifest["engine_files"],
+                engine_sha256=str(runtime_manifest["engine_tree_sha256"]),
+                node_version=str(runtime_manifest["node_version"]),
+                package_lock_sha256=str(runtime_manifest["package_lock_sha256"]),
+            )
     for path, mode, relative in (
         (HELPER_PATH, 0o755, "platform/tools/platform_live_user_qa_trusted.sh"),
         (LAUNCH_HELPER_PATH, 0o755, "platform/tools/platform_live_launch_trusted.sh"),
@@ -1142,6 +1518,65 @@ def _protected_shas(app_dir: Path) -> set[str]:
         ):
             raise InstallerError("active live-QA generation pointer is invalid")
         values.add(target.name)
+    pending = list(values)
+    visited: set[str] = set()
+    while pending:
+        owner_sha = pending.pop()
+        if owner_sha in visited:
+            continue
+        visited.add(owner_sha)
+        owner_root = PAYLOAD_ROOT / owner_sha
+        if not os.path.lexists(owner_root):
+            continue
+        _directory(owner_root, mode=0o555)
+        reference_path = owner_root / "runtime-provider.json"
+        if not os.path.lexists(reference_path):
+            continue
+        metadata = _regular(
+            reference_path,
+            mode=0o444,
+            maximum=MAX_RUNTIME_MANIFEST_BYTES,
+        )
+        try:
+            provider = json.loads(
+                _read_bounded_regular(
+                    reference_path,
+                    metadata=metadata,
+                    maximum=MAX_RUNTIME_MANIFEST_BYTES,
+                    mode=0o444,
+                ).decode("ascii"),
+                object_pairs_hook=_strict_object,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise InstallerError("protected runtime provider manifest is invalid") from exc
+        if (
+            not isinstance(provider, dict)
+            or set(provider)
+            != {
+                "version",
+                "source_sha",
+                "provider_sha",
+                "engine_tree_sha256",
+                "node_version",
+                "package_lock_sha256",
+                "engine_files",
+            }
+            or provider.get("version") != 1
+            or provider.get("source_sha") != owner_sha
+            or not isinstance(provider.get("provider_sha"), str)
+            or SHA_PATTERN.fullmatch(provider["provider_sha"]) is None
+            or not isinstance(provider.get("engine_tree_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", provider["engine_tree_sha256"]) is None
+            or provider.get("node_version") != "26.3.1"
+            or not isinstance(provider.get("package_lock_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", provider["package_lock_sha256"]) is None
+            or not isinstance(provider.get("engine_files"), dict)
+        ):
+            raise InstallerError("protected runtime provider identity is invalid")
+        provider_sha = str(provider["provider_sha"])
+        if provider_sha not in values:
+            values.add(provider_sha)
+            pending.append(provider_sha)
     return values
 
 
@@ -1194,6 +1629,8 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
     runtime_source = source_platform / "liveqa-runtime"
     stage = PAYLOAD_ROOT / f".{source_sha}.install-{uuid4().hex}"
     temporary_paths: list[Path] = []
+    runtime_manifest: dict[str, object] = {}
+    runtime_provider: dict[str, object] | None = None
 
     def prepare_trusted_layout() -> None:
         _trusted_chain(Path("/root"))
@@ -1215,7 +1652,13 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
         _cleanup_staging(apply=True)
 
     def validate_sources() -> None:
-        _validate_runtime_source(runtime_source)
+        nonlocal runtime_manifest, runtime_provider
+        runtime_manifest = _validate_runtime_source(runtime_source)
+        if runtime_manifest.get("version") == 2:
+            runtime_provider = _runtime_provider_payload(
+                app_dir,
+                expected_manifest=runtime_manifest,
+            )
         for relative in TOOL_FILES:
             _regular(source_platform / "tools" / relative)
         for relative in SOURCE_TREES:
@@ -1249,9 +1692,33 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
         runtime_digests = _copy_tree(
             runtime_source,
             stage / "runtime",
-            allow_sandbox=True,
+            allow_sandbox=runtime_manifest.get("version") == 1,
         )
         files.update({f"runtime/{name}": digest for name, digest in runtime_digests.items()})
+        if runtime_provider is not None:
+            provider_record = {
+                **runtime_provider,
+                "source_sha": source_sha,
+            }
+            provider_raw = (
+                json.dumps(
+                    provider_record,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("ascii")
+            provider_path = stage / "runtime-provider.json"
+            provider_path.write_bytes(provider_raw)
+            os.chown(provider_path, 0, 0)
+            os.chmod(provider_path, 0o444)
+            descriptor = os.open(provider_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            files["runtime-provider.json"] = hashlib.sha256(provider_raw).hexdigest()
         (stage / "source-sha").write_text(source_sha + "\n", encoding="ascii")
         os.chmod(stage / "source-sha", 0o444)
         files["source-sha"] = hashlib.sha256((source_sha + "\n").encode("ascii")).hexdigest()
@@ -1324,7 +1791,7 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
         _install_stage_finish(active_stage, stage_started_ns, "passed")
         active_stage = "final_payload_validation"
         stage_started_ns = _install_stage_start(active_stage)
-        _validate_payload(manifest)
+        _validate_payload(manifest, app_dir=app_dir, validate_provider=False)
         _install_stage_finish(active_stage, stage_started_ns, "passed")
         return manifest
     except BaseException:
@@ -1370,7 +1837,7 @@ def verify(app_dir: Path, target_sha: str) -> dict[str, object]:
         raise InstallerError("trusted live-QA manifest is stale")
     if manifest.get("release_slug") != release_slug:
         raise InstallerError("trusted live-QA manifest release is stale")
-    _validate_payload(manifest)
+    _validate_payload(manifest, app_dir=app_dir)
     helper_metadata = _regular(HELPER_PATH, mode=0o755)
     dispatcher_metadata = _regular(DISPATCHER_PATH, mode=0o500)
     mailbox_metadata = _regular(MAILBOX_HELPER_PATH, mode=0o500)

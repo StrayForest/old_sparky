@@ -95,6 +95,7 @@ else:
 
 RUNTIME_SOURCE_FILES = (
     "playwright.live.config.ts",
+    "tests/smoke/live-launch.spec.ts",
     "tests/smoke/live-user-journey.spec.ts",
     "tests/support/live-qa-origin.ts",
     "tests/support/live-qa-sandbox.ts",
@@ -689,7 +690,67 @@ def _tree_digest(root: Path) -> tuple[str, dict[str, str]]:
     return digest.hexdigest(), files
 
 
-def build(platform_root: Path, node_home: Path, output: Path) -> dict[str, object]:
+def _file_map_digest(files: dict[str, str], *, domain: bytes) -> str:
+    digest = hashlib.sha256(domain)
+    for relative, file_digest in sorted(files.items()):
+        digest.update(relative.encode("utf-8") + b"\0f\0")
+        digest.update(bytes.fromhex(file_digest))
+    return digest.hexdigest()
+
+
+def _runtime_file_map(
+    output: Path,
+    *,
+    prefixes: tuple[str, ...],
+    excluded_prefixes: tuple[str, ...] = (),
+) -> dict[str, str]:
+    files: dict[str, str] = {}
+    for path in sorted(output.rglob("*")):
+        relative = path.relative_to(output).as_posix()
+        if (
+            path.is_dir()
+            or not any(relative.startswith(prefix) for prefix in prefixes)
+            or any(relative.startswith(prefix) for prefix in excluded_prefixes)
+        ):
+            continue
+        if relative == SANDBOX_RELATIVE.as_posix():
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o4755
+                or metadata.st_size != SANDBOX_SIZE
+            ):
+                raise RuntimeBuildError("live-QA runtime sandbox metadata is unsafe")
+            file_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if file_digest != SANDBOX_SHA256:
+                raise RuntimeBuildError("live-QA runtime sandbox checksum is invalid")
+            files[relative] = file_digest
+        else:
+            _metadata(path)
+            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return files
+
+
+def _remove_tree(root: Path) -> None:
+    if not root.exists():
+        return
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_dir() and not path.is_symlink():
+            os.chmod(path, 0o700)
+    os.chmod(root, 0o700)
+    shutil.rmtree(root)
+
+
+def build(
+    platform_root: Path,
+    node_home: Path,
+    output: Path,
+    *,
+    source_only: bool = False,
+) -> dict[str, object]:
     if _guard_load_error is not None or guard is None:
         raise RuntimeBuildError(
             "staged live-QA guard is unavailable",
@@ -780,13 +841,50 @@ def build(platform_root: Path, node_home: Path, output: Path) -> dict[str, objec
         phase = "manifest"
         tree_sha256, files = _tree_digest(output)
         lock_sha256 = hashlib.sha256((web / "package-lock.json").read_bytes()).hexdigest()
-        manifest = {
-            "version": 1,
-            "node_version": guard.NODE_VERSION,
-            "package_lock_sha256": lock_sha256,
-            "tree_sha256": tree_sha256,
-            "files": files,
-        }
+        if source_only:
+            engine_files = _runtime_file_map(
+                output,
+                prefixes=("node/", "browsers/", "web/node_modules/"),
+            )
+            suite_files = _runtime_file_map(
+                output,
+                prefixes=("web/",),
+                excluded_prefixes=("web/node_modules/",),
+            )
+            engine_sha256 = _file_map_digest(
+                engine_files,
+                domain=(
+                    b"oldsparky-liveqa-engine-v1\0"
+                    + guard.NODE_VERSION.encode("ascii")
+                    + b"\0"
+                    + lock_sha256.encode("ascii")
+                    + b"\0"
+                ),
+            )
+            suite_sha256 = _file_map_digest(
+                suite_files,
+                domain=b"oldsparky-liveqa-suite-v1\0",
+            )
+            manifest = {
+                "version": 2,
+                "node_version": guard.NODE_VERSION,
+                "package_lock_sha256": lock_sha256,
+                "engine_tree_sha256": engine_sha256,
+                "engine_files": engine_files,
+                "suite_tree_sha256": suite_sha256,
+                "suite_files": suite_files,
+            }
+            for component in (output / "node", output / "browsers", output / "web/node_modules"):
+                _remove_tree(component)
+            tree_sha256, files = _tree_digest(output)
+        else:
+            manifest = {
+                "version": 1,
+                "node_version": guard.NODE_VERSION,
+                "package_lock_sha256": lock_sha256,
+                "tree_sha256": tree_sha256,
+                "files": files,
+            }
         manifest_raw = (
             json.dumps(
                 manifest,
@@ -863,15 +961,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--platform-root", type=Path, required=True)
     parser.add_argument("--node-home", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--source-only",
+        action="store_true",
+        help="emit the per-source suite and pinned engine digest, omitting engine bytes",
+    )
     args = parser.parse_args(argv)
     try:
-        manifest = build(args.platform_root, args.node_home, args.output)
+        manifest = build(
+            args.platform_root,
+            args.node_home,
+            args.output,
+            source_only=args.source_only,
+        )
         _print_diagnostic(
             phase="complete",
             status="passed",
             reason="ok",
             cleanup="not-needed",
-            tree_sha256=str(manifest["tree_sha256"]),
+            tree_sha256=str(manifest.get("tree_sha256", manifest.get("suite_tree_sha256", ""))),
         )
         return 0
     except Exception as exc:

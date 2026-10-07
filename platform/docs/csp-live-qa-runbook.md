@@ -73,6 +73,10 @@ tools/platform_release_preflight.sh \
 
 Do not print the shared environment. Use `--skip-python-deps` only after
 dependency compatibility has been verified against the existing shared venv.
+Normal installs reuse it only after the root verifier proves release and
+transaction identities, dependency and wheelhouse bytes, interpreter ABI,
+installed records/scripts/bytecode, `pip check` and exact freeze; any mismatch
+uses the offline rebuild and full rollback snapshot.
 That mode now publishes a root-only rollback receipt containing the exact
 pre-install release target, an `unchanged` transition marker and the accepted
 artifact-freeze digest. A normal rollback then proves the shared venv still
@@ -154,18 +158,40 @@ until the automated inventory, users, sessions, tournament and media have all
 been confirmed absent.
 
 The credential-bearing automated journey never runs a candidate checkout or an
-unverified mailbox helper. Every release artifact must contain the reviewed,
-minimal `liveqa-runtime` member: pinned Node, the three Playwright packages,
-the reviewed journey/configuration, checksum-pinned browser archives and a
-content manifest. Release activation reconciles that member under the
-canonical release lock into the digest-bound generation at
-`/root/.oldsparky/liveqa/releases/<source-sha>` and atomically switches the
-active pointer. The fixed root-owned supervisor at
+unverified mailbox helper. New release artifacts carry a source-only
+`liveqa-runtime` member: the reviewed journey/configuration, package lock and a
+closed manifest containing the exact file map and digest of the required Node,
+Playwright and browser engine. The engine bytes are supplied by a previously
+verified immutable runtime provider; the manifest fixes Node 26.3.1, the
+package-lock digest, required Playwright packages, browser roots and the
+Chromium sandbox digest. During activation, the installer validates the
+candidate suite and its engine map against the protected provider under the
+canonical release lock, then records the provider generation in the new
+digest-bound payload at `/root/.oldsparky/liveqa/releases/<source-sha>` before
+atomically switching the active pointer. A missing, stale or incompatible
+provider fails closed; it is not replaced by a path from the environment or
+candidate checkout. Existing complete v1 generations remain immutable and may
+serve as the provider only when their exact engine file map and package-lock
+digest match the candidate manifest. Release bootstrap validates the complete
+archive and source SHA before omitting only the wheelhouse and standalone web
+bundle from its temporary control tree; full release contents remain intact.
+The fixed root-owned supervisor at
 `/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh` (mode `0755`) then
 dispatches only that active generation; a missing, stale, symlinked or
 interrupted installation fails closed. The host still needs the dedicated
 account/AppArmor profile. Run as root and first create the root-only bundle
 through the public shell wrapper:
+
+The root-only generation remains under `/root`, which the dedicated browser
+identity cannot traverse. The trusted runner therefore binds the validated
+suite and engine directories read-only into unique
+`/var/lib/oldsparky-liveqa/runtime-suite-<source-sha>-<gate-nonce>` and
+`runtime-engine-<provider-sha>-<gate-nonce>` paths in the transient systemd
+unit's private mount namespace. The aliases exist only for that collected
+unit and are removed after its processes have exited; the host mount table and
+generation ownership do not change. The browser's preseeded input, home,
+temporary files and test results remain in its dedicated writable
+`/run/oldsparky-liveqa` gate.
 
 The generation manifest includes the launch supervisor's direct script and
 data dependencies, including the provisioning shell wrapper, its Python
@@ -265,7 +291,10 @@ profile with a global sysctl change.
 do not invoke it directly or print/load the production environment in the
 interactive shell. The provisioner writes only to `platformdb`, schema
 `platform`, and success output contains only the marker, bundle path and account
-count. It never prints generated credentials.
+count. It never prints generated credentials. In trusted runs, safe-env binds
+the interpreter's Python path to the complete immutable QA payload root; each
+database helper derives its nested `platform` package directory from its own
+installed file path before importing platform packages.
 
 The bundle is an exact v1 object:
 

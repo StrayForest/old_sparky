@@ -14,6 +14,7 @@ from sqlalchemy import event
 from python_packages.platform_infra.config import get_settings
 
 logger = logging.getLogger("platform.performance")
+REQUEST_PERF_SAMPLE_INTERVAL = 16
 QA_PHASE_RE = re.compile(
     r"^(?:write|browser|scale|qa|lifecycle|mass|registration|ready|captain|"
     r"auto|assignment|post|teammate|opponent|bracket|mixed|tournament|"
@@ -469,6 +470,11 @@ def measure_compute_block() -> Iterator[None]:
 class RequestPerformanceMiddleware:
     def __init__(self, app: Any) -> None:
         self.app = app
+        # One middleware instance is created per API process. Count every
+        # completed HTTP request while request_perf logging is enabled so
+        # successful fast requests are sampled without consulting identity,
+        # route, or request headers.
+        self._completed_request_count = 0
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -540,7 +546,10 @@ class RequestPerformanceMiddleware:
             and str(route_path).endswith("/auth/bootstrap")
             and _header_from_scope(scope, b"x-platform-ssr-trace") == "1"
         )
-        should_log = (
+        self._completed_request_count += 1
+        completion_count = self._completed_request_count
+        interval_sampled = completion_count % REQUEST_PERF_SAMPLE_INTERVAL == 0
+        policy_triggered = (
             status_code >= 500
             or (
                 settings.platform_perf_log_mutations
@@ -576,8 +585,16 @@ class RequestPerformanceMiddleware:
                 )
             )
         )
+        should_log = policy_triggered or interval_sampled
         if not should_log:
             return
+
+        if policy_triggered and interval_sampled:
+            selection_reason = "trigger_and_interval"
+        elif policy_triggered:
+            selection_reason = "trigger"
+        else:
+            selection_reason = "interval"
 
         log_method = logger.warning if status_code >= 500 else logger.info
         log_method(
@@ -619,7 +636,9 @@ class RequestPerformanceMiddleware:
             "workspace_ready_check_ms=%.2f workspace_serialization_ms=%.2f "
             "workspace_etag_ms=%.2f "
             "response_bytes=%s qa_phase=%s "
-            "pool_wait_ms=%.2f cf_ray=%s client=%s",
+            "pool_wait_ms=%.2f cf_ray=%s client=%s "
+            "request_perf_selection=%s request_perf_completion_count=%s "
+            "request_perf_sample_interval=%s",
             metrics.request_id,
             metrics.method,
             metrics.path,
@@ -703,4 +722,7 @@ class RequestPerformanceMiddleware:
             metrics.pool_checkout_wait_seconds * 1000,
             metrics.cf_ray or "-",
             metrics.client_fingerprint or "-",
+            selection_reason,
+            completion_count,
+            REQUEST_PERF_SAMPLE_INTERVAL,
         )

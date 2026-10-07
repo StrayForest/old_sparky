@@ -59,12 +59,12 @@ enables it for an exact runtime-sensitive path change or for a fail-closed
 fallback route. The fallback condition ensures an uncertain route receives
 the release-runtime coverage without granting it production authority.
 On pull requests and `merge_group`, `release-runtime` is fixture-only: it
-builds the staged runtime with local small pinned-fixture ZIPs under
-`python -I`, verifies link materialization, manifest/tree/mode invariants and
-downstream install validation. Runtime manifest trees use one explicit POSIX
-component-order key across the builder, installer and standalone artifact
-validator; the fixture gate includes a divergent-path parity regression and a
-builder-to-tar-to-standalone-validator check. The gate has no production
+builds staged runtime from pinned ZIP fixtures under `python -I`, then checks
+file-map/mode parity, ordered paths, archive validation and install behavior.
+Compact-v2 fixtures verify the source-suite/provider digests, provider
+retention, validator agreement and fixed read-only unit aliases; collision,
+identity-bound cleanup and UID paths are covered without a live browser. The
+gate has no production
 network, credentials or deployment authority. A separate `release-runtime-real`
 job runs only for a
 classifier-sensitive or fallback `push` to canonical `dev`, or for
@@ -113,10 +113,10 @@ these five catalog contours:
 | Catalog contour | Timeout | Shared-resource execution | Ownership boundary |
 | --- | ---: | --- | --- |
 | `backend-unit` | 300s | not serial-resource constrained | unit/domain/backend tests with no external operator contour |
-| `backend-tool-contract` | 600s | not serial-resource constrained | repository tool and contract tests that are hermetic and do not require root-owned host metadata |
+| `backend-tool-contract` | 600s | not serial-resource constrained | repository tool and contract tests that are hermetic and do not require root-owned host metadata; privacy-safe sampling projections (`test_platform_evidence_privacy`) |
 | `backend-integration` | 1200s | serial | PostgreSQL/Redis integration tests and real workflow races |
 | `backend-privileged` | 1200s | serial | root/service-identity, media, release/install/systemd, root-owned artifact metadata and privileged wrapper tests |
-| `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts |
+| `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts, including request sampling (`test_platform_request_performance`) and production-QA summary (`test_platform_production_qa_write_burst_profile`) |
 | `backend` (aggregate) | 3600s | serial orchestration | disjoint union of the five contours |
 
 The timeout values are the catalog's executable contract, not a moving test
@@ -275,10 +275,10 @@ Operation-bound legacy LiveQA fixtures in `test_platform_recovery_bootstrap` sta
 checks the helper preserves reconcile stderr. Its companion
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` verifies private
 capture and closed stdout/public markers; the executable catalog snapshot tracks these IDs.
-The privileged release tests also prove promoted venv dependencies remain
-readable by service identities, candidate cache cleanup stays receipt-,
-readiness- and loaded-cgroup-bound, and runtime-config summaries cannot
-pollute the strict deployment marker stream.
+Privileged release tests prove promoted dependencies stay readable, relocation removes only wheel/RECORD-bound generated caches, cleanup is receipt/readiness/cgroup-bound, and runtime summaries stay out of deployment markers.
+Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused.
+A proof miss uses the existing fresh-venv snapshot path. These root-owned cases remain in `backend-privileged`; bootstrap extraction tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
+The canonical AST snapshot is 1,718 tests (1,646 backend, including 555 privileged) across 162 modules, with every ID assigned exactly once.
 Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
 

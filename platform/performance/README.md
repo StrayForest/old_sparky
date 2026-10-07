@@ -308,6 +308,13 @@ lifecycle phase with full HTTP request/success/error/percentile/throughput/
 goodput/response-byte metrics plus the existing system sampler and diagnostic
 `request_perf` data.
 
+When API request-performance logging is enabled, `request_perf` retains its
+existing slow, error and diagnostic triggers and also emits every sixteenth
+completed HTTP request per API process. Each retained row identifies only its
+selection reason, process-local completion count and interval. These rows form
+a trigger-selected diagnostic sample: their pool quantiles describe logged
+rows only and never replace or claim the full-population HTTP client metrics.
+
 The v2 SLO profile applies the supported-load contract: accepted request
 p50/p90/p95/p99 of 250/400/600/1000 ms, logical p95/p99 of 600/1000 ms,
 final logical failure below 0.5%, and effectively zero overload shedding. A

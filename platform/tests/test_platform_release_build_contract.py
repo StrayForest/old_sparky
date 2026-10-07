@@ -30,6 +30,7 @@ from tests.test_platform_validate_release_artifact import (
     VALIDATOR_SCRIPT,
 )
 from tools import platform_workflow_remote_dispatch
+from tools import platform_live_qa_runtime_install
 from tools.platform_ci_classifier import (
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
@@ -316,6 +317,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             '  "$STAGING_DIR/tools/platform_build_live_qa_runtime.py"',
             build_script,
         )
+        self.assertIn("--source-only", build_script)
         self.assertIn("importlib.util.spec_from_file_location", runtime_source)
         self.assertNotIn("sys.path.insert", runtime_source)
         self.assertNotIn("PYTHONPATH", runtime_source)
@@ -405,6 +407,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         cls._write_fixture_file(node_home / "bin/node", b"#!/bin/sh\n", mode=0o755)
         for relative in (
             "playwright.live.config.ts",
+            "tests/smoke/live-launch.spec.ts",
             "tests/smoke/live-user-journey.spec.ts",
             "tests/support/live-qa-origin.ts",
             "tests/support/live-qa-sandbox.ts",
@@ -491,6 +494,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         node_home: Path,
         output: Path,
         root: Path,
+        *,
+        source_only: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         decoy = root / "build-decoy"
         decoy.mkdir(mode=0o755)
@@ -505,8 +510,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "PATH": "/usr/bin:/bin",
             "PYTHONPATH": str(decoy),
         }
-        return subprocess.run(
-            [
+        command = [
                 "/usr/bin/python3",
                 "-I",
                 str(builder),
@@ -516,7 +520,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 str(node_home),
                 "--output",
                 str(output),
-            ],
+            ]
+        if source_only:
+            command.append("--source-only")
+        return subprocess.run(
+            command,
             cwd=decoy,
             env=environment,
             check=False,
@@ -524,6 +532,38 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             text=True,
             timeout=60,
         )
+
+    def test_staged_live_qa_source_only_keeps_suite_and_references_all_engines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder, platform_root, node_home, output, _sandbox = (
+                self._prepare_local_runtime_fixture(
+                    root,
+                    sandbox=chromium_sandbox_fixture.read_bytes(),
+                )
+            )
+            completed = self._run_staged_live_qa_build(
+                builder, platform_root, node_home, output, root, source_only=True
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            manifest = json.loads((output / "runtime-manifest.json").read_text())
+            self.assertEqual(manifest["version"], 2)
+            self.assertFalse((output / "node").exists())
+            self.assertFalse((output / "browsers").exists())
+            self.assertFalse((output / "web/node_modules").exists())
+            self.assertIn("web/tests/smoke/live-launch.spec.ts", manifest["suite_files"])
+            self.assertEqual(
+                platform_live_qa_runtime_install._validate_runtime_source(output)["version"],
+                2,
+            )
+            self.assertIn("node/bin/node", manifest["engine_files"])
+            self.assertIn(
+                "web/node_modules/playwright-core/package.json", manifest["engine_files"]
+            )
+            for browser in ("chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"):
+                self.assertTrue(
+                    any(path.startswith(f"browsers/{browser}/") for path in manifest["engine_files"])
+                )
 
     @staticmethod
     def _manifest_padding_entries(count: int) -> list[tuple[str, bytes, str]]:
@@ -1756,7 +1796,22 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             'bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"',
             workflow,
         )
-        self.assertIn('--extract-to "$bootstrap_dir"', workflow)
+        self.assertIn('--extract-bootstrap-to "$bootstrap_dir"', workflow)
+        self.assertIn('--expected-source-commit "$target_sha"', workflow)
+        bootstrap_validation_start = workflow.index(
+            '"$host_tools_dir/platform_validate_release_artifact.py"'
+        )
+        bootstrap_validation_end = workflow.index(
+            'if ! /usr/bin/python3 -I -B - "$artifact_path"',
+            bootstrap_validation_start,
+        )
+        bootstrap_validation = workflow[
+            bootstrap_validation_start:bootstrap_validation_end
+        ]
+        self.assertLess(
+            bootstrap_validation.index('--expected-source-commit "$target_sha"'),
+            bootstrap_validation.index('--extract-bootstrap-to "$bootstrap_dir"'),
+        )
         self.assertIn(
             'candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"',
             workflow,
@@ -5215,7 +5270,12 @@ cleanup
         self.assertNotIn("sha256sum -c", install)
         self.assertIn('/usr/bin/python3 -I -m venv "$NEW_VENV_DIR"', install)
         self.assertIn("--no-index", install)
-        self.assertIn('"$venv_dir/bin/python" -I -m pip check', install)
+        self.assertIn(
+            'run_isolated_python "$venv_dir/bin/python" -I -B -m pip check',
+            install,
+        )
+        self.assertIn("/usr/bin/env -i", install)
+        self.assertIn("PIP_CONFIG_FILE=/dev/null", install)
         self.assertIn(
             '--requirement "$RELEASE_DIR/requirements-platform.lock.txt"',
             install,

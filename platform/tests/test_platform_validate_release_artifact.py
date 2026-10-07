@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import tarfile
@@ -146,6 +147,7 @@ class ArchiveBuilder:
             "node/bin/node": b"node\n",
             "web/package-lock.json": b"{}\n",
             "web/playwright.live.config.ts": b"export default {};\n",
+            "web/tests/smoke/live-launch.spec.ts": b"test('launch', () => {});\n",
             "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
             "web/tests/support/live-qa-origin.ts": b"export {};\n",
             "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
@@ -327,6 +329,92 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
                     None if content is None else io.BytesIO(content),
                 )
 
+    def test_source_only_runtime_manifest_validates_component_reference(self) -> None:
+        artifact = self.root / "source-only.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        for browser, relative in (
+            ("chromium_headless_shell-1228", "chrome-headless-shell"),
+            ("webkit-2311", "browser"),
+            ("ffmpeg-1011", "ffmpeg"),
+        ):
+            builder.add_file(
+                f"{RELEASE_SLUG}/liveqa-runtime/browsers/{browser}/{relative}",
+                f"{browser}\n".encode(),
+                mode=0o555,
+            )
+        original = list(builder.entries)
+        runtime_prefix = f"{RELEASE_SLUG}/liveqa-runtime/"
+        engine_files: dict[str, str] = {}
+        suite_files: dict[str, str] = {}
+        retained: list[tuple[tarfile.TarInfo, bytes | None]] = []
+        for member, content in original:
+            if not member.name.startswith(runtime_prefix):
+                retained.append((member, content))
+                continue
+            relative = member.name.removeprefix(runtime_prefix)
+            if not relative or relative == "runtime-manifest.json":
+                if relative != "runtime-manifest.json":
+                    retained.append((member, content))
+                continue
+            engine_member = relative.startswith(("node/", "browsers/", "web/node_modules/"))
+            if engine_member:
+                if member.isfile():
+                    assert content is not None
+                    engine_files[relative] = hashlib.sha256(content).hexdigest()
+                continue
+            retained.append((member, content))
+            if member.isfile():
+                assert content is not None
+                suite_files[relative] = hashlib.sha256(content).hexdigest()
+
+        def map_digest(domain: bytes, files: dict[str, str]) -> str:
+            digest = hashlib.sha256(domain)
+            for relative, value in sorted(files.items()):
+                digest.update(relative.encode("utf-8") + b"\0f\0")
+                digest.update(bytes.fromhex(value))
+            return digest.hexdigest()
+
+        lock_sha = suite_files["web/package-lock.json"]
+        node_version = validator.PINNED_NODE_VERSION
+        manifest = {
+            "version": 2,
+            "node_version": node_version,
+            "package_lock_sha256": lock_sha,
+            "engine_tree_sha256": map_digest(
+                b"oldsparky-liveqa-engine-v1\0"
+                + node_version.encode("ascii")
+                + b"\0"
+                + lock_sha.encode("ascii")
+                + b"\0",
+                engine_files,
+            ),
+            "engine_files": engine_files,
+            "suite_tree_sha256": map_digest(b"oldsparky-liveqa-suite-v1\0", suite_files),
+            "suite_files": suite_files,
+        }
+        builder.entries = retained
+        builder.add_file(
+            f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json",
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n",
+            mode=0o444,
+        )
+        builder.write(regenerate_runtime_manifest=False)
+        validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
+
+        tampered = self.root / "source-only-bad-provider.tar.gz"
+        manifest["engine_files"]["web/node_modules/playwright-core/package.json"] = "0" * 64
+        self._rewrite_archive(
+            artifact,
+            tampered,
+            {
+                f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json": json.dumps(
+                    manifest, sort_keys=True, separators=(",", ":")
+                ).encode() + b"\n"
+            },
+        )
+        with self.assertRaises(validator.ArtifactError):
+            validator.validate_archive(tampered, release_slug=RELEASE_SLUG)
+
     def test_runtime_manifest_order_is_explicit_and_shared(self) -> None:
         names = ("resources/accessibility", "resources.pak")
         string_order = sorted(names)
@@ -445,6 +533,150 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
             release / "apps/platform_web/.next/standalone/server.js",
         )
         self.assertEqual((release / "server-link").read_text(), "console.log('ok');\n")
+
+    def test_bootstrap_extraction_omits_only_the_two_bulk_component_subtrees(
+        self,
+    ) -> None:
+        artifact = self.root / f"{RELEASE_SLUG}-bootstrap.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        builder.add_directory(f"{RELEASE_SLUG}/wheelhouseevil")
+        builder.add_file(f"{RELEASE_SLUG}/wheelhouseevil/keep.txt", b"keep\n")
+        builder.add_directory(
+            f"{RELEASE_SLUG}/apps/platform_web/.next/standaloneevil"
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/apps/platform_web/.next/standaloneevil/keep.js",
+            b"keep standalone prefix\n",
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/tools/platform_release_deploy.sh",
+            b"#!/bin/bash\nexit 0\n",
+            mode=0o755,
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/tools/platform_verify_venv_reuse.py",
+            b"print('verified')\n",
+            mode=0o444,
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/wheelhouse/extra.whl",
+            b"wheel bytes\n",
+            mode=0o444,
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/apps/platform_web/.next/standalone/.next/static/asset.js",
+            b"static bytes\n",
+        )
+        builder.write()
+
+        full_root = self.root / "full"
+        bootstrap_root = self.root / "bootstrap"
+        full_root.mkdir()
+        bootstrap_root.mkdir()
+        validator.validate_archive(
+            artifact, release_slug=RELEASE_SLUG, extract_to=full_root
+        )
+        payload = validator.validate_archive(
+            artifact,
+            release_slug=RELEASE_SLUG,
+            extract_bootstrap_to=bootstrap_root,
+            expected_source_commit="a" * 40,
+        )
+
+        self.assertEqual(payload["source_git_commit"], "a" * 40)
+        full_release = full_root / RELEASE_SLUG
+        bootstrap_release = bootstrap_root / RELEASE_SLUG
+        self.assertTrue((bootstrap_release / "RELEASE.json").is_file())
+        self.assertTrue(
+            (bootstrap_release / "tools/platform_verify_venv_reuse.py").is_file()
+        )
+        self.assertTrue((bootstrap_release / "wheelhouseevil/keep.txt").is_file())
+        self.assertTrue(
+            (
+                bootstrap_release
+                / "apps/platform_web/.next/standaloneevil/keep.js"
+            ).is_file()
+        )
+        self.assertFalse((bootstrap_release / "wheelhouse").exists())
+        self.assertFalse(
+            (bootstrap_release / "apps/platform_web/.next/standalone").exists()
+        )
+        self.assertTrue((full_release / "wheelhouse/extra.whl").is_file())
+        self.assertTrue(
+            (
+                full_release
+                / "apps/platform_web/.next/standalone/.next/static/asset.js"
+            ).is_file()
+        )
+
+        def retained_paths(root: Path) -> set[str]:
+            return {
+                path.relative_to(root).as_posix()
+                for path in root.rglob("*")
+                if not validator._is_bootstrap_excluded_member(
+                    f"{RELEASE_SLUG}/{path.relative_to(root).as_posix()}",
+                    release_slug=RELEASE_SLUG,
+                )
+            }
+
+        expected_paths = retained_paths(full_release)
+        actual_paths = retained_paths(bootstrap_release)
+        self.assertEqual(actual_paths, expected_paths)
+        for relative in sorted(expected_paths):
+            full_path = full_release / relative
+            bootstrap_path = bootstrap_release / relative
+            full_stat = full_path.lstat()
+            bootstrap_stat = bootstrap_path.lstat()
+            self.assertEqual(full_stat.st_mode & 0o7777, bootstrap_stat.st_mode & 0o7777)
+            self.assertEqual(
+                (full_stat.st_mode & 0o170000), (bootstrap_stat.st_mode & 0o170000)
+            )
+            if full_path.is_symlink():
+                self.assertEqual(os.readlink(full_path), os.readlink(bootstrap_path))
+            elif full_path.is_file():
+                self.assertEqual(full_path.read_bytes(), bootstrap_path.read_bytes())
+
+    def test_bootstrap_validation_rejects_wrong_source_before_extraction(self) -> None:
+        artifact = ArchiveBuilder(self.root / "wrong-source.tar.gz").write()
+        bootstrap_root = self.root / "bootstrap"
+        bootstrap_root.mkdir()
+
+        with self.assertRaisesRegex(
+            validator.ArtifactError, "source commit does not match"
+        ):
+            validator.validate_archive(
+                artifact,
+                release_slug=RELEASE_SLUG,
+                extract_bootstrap_to=bootstrap_root,
+                expected_source_commit="b" * 40,
+            )
+
+        self.assertFalse((bootstrap_root / RELEASE_SLUG).exists())
+
+    def test_bootstrap_mode_still_rejects_invalid_members_in_excluded_subtrees(
+        self,
+    ) -> None:
+        artifact = self.root / "unsafe-excluded-member.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        builder.add_file(
+            f"{RELEASE_SLUG}/wheelhouse/unchecked.whl",
+            b"invalid mode must be checked before bootstrap filtering\n",
+            mode=0o666,
+        )
+        builder.write()
+        bootstrap_root = self.root / "bootstrap"
+        bootstrap_root.mkdir()
+
+        with self.assertRaisesRegex(
+            validator.ArtifactError, "release archive contains unsafe permissions"
+        ):
+            validator.validate_archive(
+                artifact,
+                release_slug=RELEASE_SLUG,
+                extract_bootstrap_to=bootstrap_root,
+            )
+
+        self.assertFalse((bootstrap_root / RELEASE_SLUG).exists())
 
     def test_runtime_manifest_may_exceed_release_json_bound_within_runtime_bound(
         self,

@@ -37,8 +37,8 @@ Installs a verified, prebuilt platform release into the standard:
   <app_dir>/shared
 
 The default Python path builds and verifies a fresh offline venv before an
-atomic swap. --skip-python-deps is accepted only when the existing shared venv
-already passes pip check and exactly matches the artifact freeze.
+atomic swap. A venv is reused automatically only after a fail-closed proof of
+unchanged dependency inputs, runtime and installed-file integrity.
 
 --stage-only leaves a durable transaction at the staged candidate without
 changing current/previous. It is the only mode used by the end-to-end deploy
@@ -409,8 +409,8 @@ run_isolated_python() {
 verify_venv() {
   local venv_dir="$1"
   local freeze_output="$2"
-  run_isolated_python "$venv_dir/bin/python" -I -m pip check >/dev/null 2>/dev/null
-  run_isolated_python "$venv_dir/bin/python" -I -m pip freeze --all \
+  run_isolated_python "$venv_dir/bin/python" -I -B -m pip check >/dev/null 2>/dev/null
+  run_isolated_python "$venv_dir/bin/python" -I -B -m pip freeze --all \
     2>/dev/null | /usr/bin/sort >"$freeze_output"
   if ! /usr/bin/cmp -s \
     "$RELEASE_DIR/requirements-platform.freeze.txt" "$freeze_output"; then
@@ -420,16 +420,189 @@ verify_venv() {
 }
 
 relocate_venv_paths() {
-  /usr/bin/python3 -I - "$1" "$2" <<'PY'
+  /usr/bin/python3 -I -S -B - "$1" "$2" "$3" <<'PY'
+import base64
+import csv
+import hashlib
+import importlib.util
+import marshal
 import os
 from pathlib import Path
+import py_compile
+import re
 import stat
 import sys
+import zipfile
 
 source = Path(sys.argv[1])
 destination = Path(sys.argv[2])
+wheelhouse = Path(sys.argv[3])
 old_prefix = os.fsencode(source)
 new_prefix = os.fsencode(destination)
+cache_removals = []
+
+def safe_bytes(path, *, mode, max_size):
+    metadata = path.lstat()
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+            or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != mode
+            or metadata.st_size > max_size):
+        raise SystemExit(1)
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                         | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        current = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise SystemExit(1)
+        chunks = []
+        total = 0
+        while chunk := os.read(descriptor, 1024 * 1024):
+            total += len(chunk)
+            if total > max_size:
+                raise SystemExit(1)
+            chunks.append(chunk)
+        return b"".join(chunks), metadata
+    finally:
+        os.close(descriptor)
+
+if sys.implementation.name != "cpython" or not sys.implementation.cache_tag:
+    raise SystemExit(1)
+try:
+    stage_python = source / "bin" / "python"
+    stage_python_info = stage_python.lstat()
+    config, _ = safe_bytes(source / "pyvenv.cfg", mode=0o644, max_size=1024 * 1024)
+    version_match = re.search(rb"(?m)^version\s*=\s*([0-9]+\.[0-9]+\.[0-9]+)\s*$", config)
+    expected_version = ".".join(str(part) for part in sys.version_info[:3]).encode("ascii")
+    if (not stat.S_ISLNK(stage_python_info.st_mode)
+            or stage_python.resolve(strict=True) != Path(sys.executable).resolve(strict=True)
+            or version_match is None or version_match.group(1) != expected_version):
+        raise SystemExit(1)
+except (OSError, RuntimeError, ValueError):
+    raise SystemExit(1) from None
+
+def authenticate_wheel_script(script, installed_bytes):
+    directory = wheelhouse.lstat()
+    if (not stat.S_ISDIR(directory.st_mode) or stat.S_ISLNK(directory.st_mode)
+            or directory.st_uid != 0 or stat.S_IMODE(directory.st_mode) != 0o555):
+        raise SystemExit(1)
+    manifest_path = wheelhouse / "WHEELHOUSE.sha256"
+    manifest, _ = safe_bytes(manifest_path, mode=0o444, max_size=1024 * 1024)
+    hashes = {}
+    for line in manifest.decode("ascii").splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9_.+!-]+\.whl)", line)
+        if match is None or match.group(2) in hashes:
+            raise SystemExit(1)
+        hashes[match.group(2)] = match.group(1)
+    wheel_files = sorted(wheelhouse.glob("*.whl"), key=lambda path: path.name)
+    if not wheel_files or [path.name for path in wheel_files] != sorted(hashes):
+        raise SystemExit(1)
+    matches = []
+    for wheel in wheel_files:
+        wheel_bytes, wheel_info = safe_bytes(wheel, mode=0o444, max_size=256 * 1024 * 1024)
+        if hashlib.sha256(wheel_bytes).hexdigest() != hashes[wheel.name]:
+            raise SystemExit(1)
+        try:
+            with zipfile.ZipFile(wheel) as archive:
+                record_names = [name for name in archive.namelist()
+                                if name.endswith(".dist-info/RECORD")]
+                if len(record_names) != 1:
+                    raise SystemExit(1)
+                record_rows = {}
+                for row in csv.reader(archive.read(record_names[0]).decode("utf-8").splitlines()):
+                    if len(row) != 3:
+                        raise SystemExit(1)
+                    record_rows.setdefault(row[0], []).append((row[1], row[2]))
+                for member_name in archive.namelist():
+                    parts = Path(member_name).parts
+                    if (len(parts) < 3 or not parts[0].endswith(".data")
+                            or parts[1] != "scripts" or parts[-1] != script.name
+                            or ".." in parts):
+                        continue
+                    member = archive.read(member_name)
+                    row_values = record_rows.get(member_name, [])
+                    member_hash = base64.urlsafe_b64encode(
+                        hashlib.sha256(member).digest()
+                    ).rstrip(b"=").decode("ascii")
+                    expected_installed = (
+                        b"#!" + old_prefix + b"/bin/python"
+                        + member[len(b"#!python"):]
+                    ) if member.startswith(b"#!python") else b""
+                    if (len(row_values) == 1
+                            and row_values[0] == (f"sha256={member_hash}", str(len(member)))
+                            and installed_bytes == expected_installed):
+                        matches.append((wheel, member_name))
+        except (OSError, UnicodeError, zipfile.BadZipFile, KeyError):
+            raise SystemExit(1) from None
+    if len(matches) != 1:
+        raise SystemExit(1)
+    return matches[0]
+
+def cache_for_rewritten_script(script, installed_bytes):
+    cache = Path(importlib.util.cache_from_source(str(script)))
+    try:
+        cache_info = cache.lstat()
+    except FileNotFoundError:
+        return None
+    if (not stat.S_ISREG(cache_info.st_mode) or cache_info.st_uid != 0
+            or cache_info.st_nlink != 1 or stat.S_IMODE(cache_info.st_mode) != 0o644
+            or cache_info.st_size > 16 * 1024 * 1024):
+        raise SystemExit(1)
+    cache_directory = cache.parent.lstat()
+    if (not stat.S_ISDIR(cache_directory.st_mode) or stat.S_ISLNK(cache_directory.st_mode)
+            or cache.parent != source / "bin" / "__pycache__"
+            or cache_directory.st_uid != 0 or stat.S_IMODE(cache_directory.st_mode) != 0o755):
+        raise SystemExit(1)
+    cache_bytes, cache_info = safe_bytes(cache, mode=0o644, max_size=16 * 1024 * 1024)
+    authenticate_wheel_script(script, installed_bytes)
+    site_roots = sorted((source / "lib").glob("python*/site-packages"))
+    if len(site_roots) != 1:
+        raise SystemExit(1)
+    site_root = site_roots[0]
+    source_digest = base64.urlsafe_b64encode(
+        hashlib.sha256(installed_bytes).digest()
+    ).rstrip(b"=").decode("ascii")
+    source_row = (f"sha256={source_digest}", str(len(installed_bytes)))
+    cache_row = ("", "")
+    source_relative = os.path.relpath(script, site_root).replace(os.sep, "/")
+    cache_relative = os.path.relpath(cache, site_root).replace(os.sep, "/")
+    source_rows = []
+    cache_rows = []
+    for record in sorted(site_root.glob("*.dist-info/RECORD")):
+        raw_record, _ = safe_bytes(record, mode=0o644, max_size=16 * 1024 * 1024)
+        for row in csv.reader(raw_record.decode("utf-8").splitlines()):
+            if len(row) != 3:
+                raise SystemExit(1)
+            target = (site_root / row[0]).resolve(strict=False)
+            canonical = os.path.relpath(target, site_root).replace(os.sep, "/")
+            if row[0] != canonical:
+                raise SystemExit(1)
+            if target == script.resolve(strict=True):
+                source_rows.append((row[0], (row[1], row[2])))
+            if target == cache.resolve(strict=True):
+                cache_rows.append((row[0], (row[1], row[2])))
+    if (source_rows != [(source_relative, source_row)]
+            or cache_rows != [(cache_relative, cache_row)]):
+        raise SystemExit(1)
+    if len(cache_bytes) < 16 or cache_bytes[:4] != importlib.util.MAGIC_NUMBER:
+        raise SystemExit(1)
+    flags = int.from_bytes(cache_bytes[4:8], "little")
+    if flags == 0:
+        if (int.from_bytes(cache_bytes[8:12], "little") != int(script.stat().st_mtime)
+                or int.from_bytes(cache_bytes[12:16], "little") != len(installed_bytes)):
+            raise SystemExit(1)
+    elif flags == 3:
+        if cache_bytes[8:16] != importlib.util.source_hash(installed_bytes):
+            raise SystemExit(1)
+    else:
+        raise SystemExit(1)
+    try:
+        cached_code = marshal.loads(cache_bytes[16:])
+        expected_code = compile(installed_bytes, str(script), "exec", dont_inherit=True)
+    except (ValueError, EOFError, TypeError, SyntaxError):
+        raise SystemExit(1) from None
+    if cached_code != expected_code:
+        raise SystemExit(1)
+    return cache, cache_info, hashlib.sha256(cache_bytes).digest()
+
 paths = [source / "pyvenv.cfg"]
 try:
     paths.extend(sorted(source.joinpath("bin").iterdir()))
@@ -457,6 +630,10 @@ for path in paths:
             continue
         if b"\x00" in raw:
             raise SystemExit(1)
+        if path.parent == source / "bin" and path.suffix == ".py":
+            cache_proof = cache_for_rewritten_script(path, raw)
+            if cache_proof is not None:
+                cache_removals.append((path, raw, cache_proof))
         relocated = raw.replace(old_prefix, new_prefix)
         os.lseek(descriptor, 0, os.SEEK_SET)
         os.ftruncate(descriptor, 0)
@@ -469,8 +646,67 @@ for path in paths:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+for script, original, (cache, cache_info, cache_digest) in cache_removals:
+    expected_after = original.replace(old_prefix, new_prefix)
+    if script.read_bytes() != expected_after:
+        raise SystemExit(1)
+    current_cache = cache.lstat()
+    cache_bytes, checked = safe_bytes(cache, mode=0o644, max_size=16 * 1024 * 1024)
+    if ((current_cache.st_dev, current_cache.st_ino) != (cache_info.st_dev, cache_info.st_ino)
+            or (checked.st_dev, checked.st_ino) != (cache_info.st_dev, cache_info.st_ino)
+            or hashlib.sha256(cache_bytes).digest() != cache_digest):
+        raise SystemExit(1)
+    try:
+        py_compile.compile(
+            str(script), cfile=str(cache),
+            dfile=str(destination / script.relative_to(source)), doraise=True,
+            optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+        )
+    except (OSError, py_compile.PyCompileError):
+        raise SystemExit(1) from None
+    os.chmod(cache, 0o644)
+    regenerated, regenerated_info = safe_bytes(
+        cache, mode=0o644, max_size=16 * 1024 * 1024
+    )
+    if (regenerated_info.st_uid != 0 or regenerated_info.st_nlink != 1
+            or len(regenerated) < 16
+            or regenerated[:4] != importlib.util.MAGIC_NUMBER
+            or int.from_bytes(regenerated[4:8], "little") != 0
+            or int.from_bytes(regenerated[8:12], "little") != int(script.stat().st_mtime)
+            or int.from_bytes(regenerated[12:16], "little") != len(expected_after)):
+        raise SystemExit(1)
+    try:
+        regenerated_code = marshal.loads(regenerated[16:])
+        expected_code = compile(
+            expected_after, str(destination / script.relative_to(source)),
+            "exec", dont_inherit=True,
+        )
+    except (ValueError, EOFError, TypeError, SyntaxError):
+        raise SystemExit(1) from None
+    if regenerated_code != expected_code:
+        raise SystemExit(1)
 PY
 }
+
+# A prior successful transaction can prove the shared venv already contains
+# the exact immutable dependencies and runtime required by this candidate.
+# A proof miss deliberately follows the normal fresh-venv + full-snapshot path.
+if [[ "$SKIP_PYTHON_DEPS" -eq 0 && -n "$PREVIOUS_TARGET" \
+  && -x /usr/bin/python3.12 \
+  && -f "$TOOLS_DIR/platform_verify_venv_reuse.py" \
+  && ! -L "$TOOLS_DIR/platform_verify_venv_reuse.py" ]]; then
+  if /usr/bin/python3 -I -S -B "$TOOLS_DIR/platform_verify_venv_reuse.py" \
+    --app "$APP_DIR" \
+    --current "$PREVIOUS_TARGET" \
+    --candidate "$RELEASE_DIR" \
+    --venv "$SHARED_VENV_DIR" \
+    --python /usr/bin/python3.12 \
+    --transaction-state "$TRANSACTION_STATE" \
+    --quiesce-state "$SHARED_DIR/.release-quiesce.json" \
+    --previous-before "$ORIGINAL_PREVIOUS_TARGET" >/dev/null 2>/dev/null; then
+    SKIP_PYTHON_DEPS=1
+  fi
+fi
 
 FREEZE_CHECK_FILE="$(mktemp "$SHARED_DIR/.freeze-check-$RELEASE_SLUG.XXXXXX")"
 if [[ -e "$SHARED_VENV_DIR" || -L "$SHARED_VENV_DIR" ]]; then
@@ -522,7 +758,7 @@ else
       --require-hashes \
       --requirement "$RELEASE_DIR/requirements-platform.lock.txt" >/dev/null 2>/dev/null
   )
-  relocate_venv_paths "$NEW_VENV_DIR" "$SHARED_VENV_DIR" >/dev/null 2>/dev/null
+  relocate_venv_paths "$NEW_VENV_DIR" "$SHARED_VENV_DIR" "$RELEASE_DIR/wheelhouse" >/dev/null 2>/dev/null
   verify_venv "$NEW_VENV_DIR" "$FREEZE_CHECK_FILE"
   chmod 0755 "$NEW_VENV_DIR"
   rm -f -- "$FREEZE_CHECK_FILE"
