@@ -8,6 +8,7 @@ instead of relying on GitHub's implicit job conclusion propagation.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -271,7 +272,6 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
 
     def test_handoffs_bind_run_attempt_sha_and_archive_digest(self) -> None:
         self.assertIn("GITHUB_RUN_ATTEMPT", self.source)
-        self.assertIn("sha256sum -c", self.source)
         self.assertIn('workflow_run.get("id") != int(run_id)', self.source)
         self.assertIn('workflow_run.get("head_sha") != target_sha', self.source)
         for artifact in (
@@ -281,8 +281,78 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "platform-production-external-load-origin-${{ github.run_id }}-${{ github.run_attempt }}",
         ):
             self.assertIn(artifact, self.source)
-        self.assertIn("test -n \"$artifact_id\" && test -n \"$artifact_digest\"", self.source)
+        self.assertNotIn("ARTIFACT_DIGEST", self.source)
+        self.assertNotIn("artifact-digest", self.source)
+        self.assertNotIn("needs.fixture-setup.outputs.manifest_artifact_digest", self.source)
+        self.assertEqual(self.source.count('expected_digest = payload.get("digest")'), 4)
+        self.assertIn('re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest)', self.source)
+        self.assertIn('actual_digest != expected_digest.removeprefix("sha256:")', self.source)
         self.assertIn("if-no-files-found: error", self.source)
+
+    def test_metadata_digest_verifiers_accept_producer_metadata_and_reject_mismatches(self) -> None:
+        blocks = re.findall(
+            r"(?m)^[ \t]+import hashlib\n(?P<script>.*?)(?=^[ \t]+PY$)",
+            self.source,
+            re.DOTALL,
+        )
+        scripts = [
+            "import hashlib\n" + textwrap.dedent(block)
+            for block in blocks
+            if "metadata_path, archive_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]" in block
+        ]
+        self.assertEqual(len(scripts), 4)
+
+        archive_bytes = b"synthetic artifact bytes bound to the API metadata"
+        expected_digest = "sha256:" + hashlib.sha256(archive_bytes).hexdigest()
+        metadata = {
+            "id": 4815162342,
+            "name": "platform-production-external-load-manifest-123456789-3",
+            "expired": False,
+            "digest": expected_digest,
+            "workflow_run": {"id": 123456789, "head_sha": "a" * 40},
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            metadata_path = Path(temporary_dir) / "metadata.json"
+            archive_path = Path(temporary_dir) / "artifact.zip"
+
+            for index, script in enumerate(scripts):
+                with self.subTest(verifier_index=index):
+                    def run(payload: dict[str, object], archive: bytes = archive_bytes) -> subprocess.CompletedProcess[str]:
+                        metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+                        archive_path.write_bytes(archive)
+                        return subprocess.run(
+                            [
+                                sys.executable,
+                                "-c",
+                                script,
+                                str(metadata_path),
+                                str(archive_path),
+                                "4815162342",
+                                "platform-production-external-load-manifest-123456789-3",
+                                "123456789",
+                                "a" * 40,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+
+                    self.assertEqual(run(metadata).returncode, 0)
+                    mutations = (
+                        {"id": 4815162343},
+                        {"name": "platform-production-external-load-manifest-123456789-2"},
+                        {"expired": True},
+                        {"digest": "sha256:" + "A" * 64},
+                        {"digest": None},
+                        {"workflow_run": {"id": 123456788, "head_sha": "a" * 40}},
+                        {"workflow_run": {"id": 123456789, "head_sha": "b" * 40}},
+                    )
+                    for mutation in mutations:
+                        altered = copy.deepcopy(metadata)
+                        altered.update(mutation)
+                        self.assertNotEqual(run(altered).returncode, 0)
+                    self.assertNotEqual(run(metadata, archive_bytes + b"tampered").returncode, 0)
 
     def test_control_identity_is_masked_before_consuming_steps_and_never_becomes_env_or_argv(self) -> None:
         self.assertNotIn("${{ inputs.control_email }}", self.source)
