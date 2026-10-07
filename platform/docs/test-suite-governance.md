@@ -113,19 +113,11 @@ these five catalog contours:
 | Catalog contour | Timeout | Shared-resource execution | Ownership boundary |
 | --- | ---: | --- | --- |
 | `backend-unit` | 300s | not serial-resource constrained | unit/domain/backend tests with no external operator contour |
-| `backend-tool-contract` | 600s | not serial-resource constrained | repository tool and contract tests that are hermetic and do not require root-owned host metadata |
+| `backend-tool-contract` | 600s | not serial-resource constrained | repository tool and contract tests that are hermetic and do not require root-owned host metadata; privacy-safe sampling projections (`test_platform_evidence_privacy`) |
 | `backend-integration` | 1200s | serial | PostgreSQL/Redis integration tests and real workflow races |
 | `backend-privileged` | 1200s | serial | root/service-identity, media, release/install/systemd, root-owned artifact metadata and privileged wrapper tests |
-| `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts |
+| `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts, including request sampling (`test_platform_request_performance`) and production-QA summary (`test_platform_production_qa_write_burst_profile`) |
 | `backend` (aggregate) | 3600s | serial orchestration | disjoint union of the five contours |
-
-Request-performance sampling behavior and its production-QA summary are owned
-by the existing `performance-contract` tests in
-`test_platform_request_performance` and
-`test_platform_production_qa_write_burst_profile`. The sanitized projection
-of sampling metadata is owned by
-`test_platform_evidence_privacy` in `backend-tool-contract`; all three remain
-in their existing catalog contours.
 
 The timeout values are the catalog's executable contract, not a moving test
 count or an estimate derived from the current number of methods. The catalog
