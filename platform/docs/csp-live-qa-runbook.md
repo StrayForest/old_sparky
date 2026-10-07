@@ -204,8 +204,12 @@ with the canonical bounded-ASCII workflow-input parser before it creates any
 SSH key file or performs keyscan. It hands the accepted values to the remote
 host as private mode-0600 JSON on stdin; the SSH command contains only the
 literal `live-launch` dispatcher mode. The remote dispatcher and
-`platform_live_launch_supervisor.sh` validate the values again and pass them to
-the supervisor as fixed-argv data. Shell punctuation, quotes, newlines,
+the trusted launch wrapper pass the values as fixed argv in this order: base
+URL, provision flag, marker, and target SHA. The wrapper requires exactly four
+arguments, validates them, verifies the target, and invokes the release-locked
+dispatcher; the managed `platform_live_launch_supervisor.sh` validates them
+again. The wrapper does not depend on custom environment variables surviving
+`sudo`. Shell punctuation, quotes, newlines,
 command substitutions, option-like prefixes, Unicode/control/NUL-equivalent
 and overlong markers are rejected without reaching SSH, and rejected values
 are never printed in the browser report.

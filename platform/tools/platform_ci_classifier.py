@@ -67,6 +67,10 @@ RUNTIME_SENSITIVE_FILES = frozenset(
         "platform/tools/platform_build_release.sh",
         "platform/tools/platform_live_qa_guard.py",
         "platform/tools/platform_live_qa_runtime_install.py",
+        # The public live-launch workflow passes validated inputs as argv to
+        # this release-managed root entrypoint; changes require the active app
+        # release to install the corrected trusted helper.
+        "platform/tools/platform_live_launch_trusted.sh",
         "platform/tools/platform_validate_release_artifact.py",
         # The external-load workflow invokes this from the active app release;
         # changing its cleanup behavior requires a matching app deployment.

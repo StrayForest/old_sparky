@@ -12,10 +12,14 @@ TRUSTED_ROOT="/root/.oldsparky/liveqa"
 DISPATCHER="$TRUSTED_ROOT/platform_live_user_qa_dispatch.py"
 RELEASE_LOCK_EXEC="$TRUSTED_ROOT/platform_release_lock_exec.sh"
 APP_DIR="/opt/oldsparky/platform"
-TARGET_SHA="${PLATFORM_LIVE_QA_TARGET_SHA:-}"
-BASE_URL="${PLAYWRIGHT_LIVE_BASE_URL:-}"
-PROVISION="${PLATFORM_LIVE_PROVISION:-}"
-MARKER="${PLATFORM_LIVE_MARKER:-}"
+if (($# != 4)); then
+  echo "Trusted live-launch requires exactly four validated arguments." >&2
+  exit 2
+fi
+BASE_URL="$1"
+PROVISION="$2"
+MARKER="$3"
+TARGET_SHA="$4"
 
 if [[ "$EUID" -ne 0 || ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Trusted live-launch requires root and an exact target SHA." >&2

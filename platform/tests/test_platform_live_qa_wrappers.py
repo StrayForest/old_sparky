@@ -302,6 +302,92 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             source.index("platform_workflow_input_guard.py live"),
             source.index('printf \'%s\\n\' "$PROD_SSH_KEY"'),
         )
+        self.assertEqual(
+            os.geteuid(),
+            0,
+            "this wrapper execution contract belongs to backend-privileged",
+        )
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            fixture = Path(temporary)
+            trusted_root = fixture / "liveqa"
+            trusted_root.mkdir(mode=0o700)
+            app_dir = fixture / "platform"
+            app_dir.mkdir(mode=0o700)
+            dispatcher = trusted_root / "platform_live_user_qa_dispatch.py"
+            dispatcher.write_text(
+                "import json, sys\n"
+                "print(json.dumps(sys.argv[1:]))\n",
+                encoding="ascii",
+            )
+            os.chmod(dispatcher, 0o500)
+            release_lock_exec = trusted_root / "platform_release_lock_exec.sh"
+            release_lock_exec.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "[ \"$1\" = --app-dir ]\n"
+                "shift 2\n"
+                "[ \"$1\" = --expected-sha ]\n"
+                "shift 2\n"
+                "[ \"$1\" = -- ]\n"
+                "shift\n"
+                "exec \"$@\"\n",
+                encoding="ascii",
+            )
+            os.chmod(release_lock_exec, 0o500)
+            wrapper_source = (
+                TOOLS_ROOT / "platform_live_launch_trusted.sh"
+            ).read_text(encoding="utf-8")
+            wrapper_source = wrapper_source.replace(
+                'TRUSTED_ROOT="/root/.oldsparky/liveqa"',
+                f'TRUSTED_ROOT="{trusted_root}"',
+            ).replace(
+                'APP_DIR="/opt/oldsparky/platform"',
+                f'APP_DIR="{app_dir}"',
+            ).replace("/usr/bin/python3.12", sys.executable)
+            wrapper = fixture / "platform_live_launch_trusted.sh"
+            wrapper.write_text(wrapper_source, encoding="utf-8")
+            os.chmod(wrapper, 0o500)
+
+            target_sha = "a" * 40
+            base_url = "https://old-sparky.com"
+            marker = "liveqa-contract-test"
+            completed = subprocess.run(
+                [str(wrapper), base_url, "true", marker, target_sha],
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.stdout.splitlines(),
+                [
+                    json.dumps(["verify", target_sha]),
+                    json.dumps(
+                        [
+                            "run-launch",
+                            target_sha,
+                            base_url,
+                            "true",
+                            marker,
+                        ]
+                    ),
+                ],
+            )
+            self.assertEqual(completed.stderr, "")
+
+            malformed = subprocess.run(
+                [str(wrapper), base_url, "true", marker],
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(malformed.returncode, 2)
+            self.assertEqual(malformed.stdout, "")
+            self.assertIn("exactly four validated arguments", malformed.stderr)
         status_sha = "a" * 40
 
         identity_match = re.search(
