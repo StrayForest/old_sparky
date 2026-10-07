@@ -46,6 +46,14 @@ MAX_CONCURRENCY = 512
 MAX_PROFILE_BUDGET = 1_000_000_000_000.0
 DEFAULT_CLIENT_TRANSPORT = "urllib-http1-close"
 ALLOWED_PAGE_TRANSPORTS = {DEFAULT_CLIENT_TRANSPORT, "http1-keepalive"}
+WORKFLOW_PENDING_ORIGIN_EXIT = 3
+PENDING_ORIGIN_DECISIONS = frozenset(
+    {
+        "STRESS PENDING ORIGIN EVIDENCE",
+        "SPIKE PENDING ORIGIN EVIDENCE",
+        "CAPACITY PENDING ORIGIN EVIDENCE",
+    }
+)
 
 
 class LoadProfileError(ValueError):
@@ -1790,6 +1798,7 @@ def run_profile(
     report_path: Path,
     *,
     timeout_diagnostics_run_id: str | None = None,
+    defer_pending_origin: bool = False,
 ) -> int:
     """Run the external generator behind the mandatory PID-namespace guard.
 
@@ -1915,6 +1924,10 @@ def run_profile(
             ensure_ascii=False,
         )
     )
+    if defer_pending_origin and _is_closed_pending_origin_candidate(profile, result):
+        # This reserved code is an orchestration receipt, not acceptance.
+        # Direct callers retain the normal nonzero result for pending origin.
+        return WORKFLOW_PENDING_ORIGIN_EXIT
     return (
         0
         if isinstance(payload.get("acceptance"), Mapping)
@@ -1924,10 +1937,100 @@ def run_profile(
     )
 
 
+def _is_closed_pending_origin_candidate(
+    profile: Mapping[str, Any], result: Any
+) -> bool:
+    """Recognize only the fully reaped worker's exact deferred-origin result.
+
+    The external workflow may treat this as a completed candidate producer so
+    its independently bound origin observer can run.  It must never turn an
+    arbitrary child failure, partial report, or standalone pending result into
+    acceptance.
+    """
+
+    if (
+        getattr(result, "returncode", None) != 1
+        or getattr(result, "reason", None) != "none"
+        or getattr(result, "worker_started", None) is not True
+        or getattr(result, "worker_exited", None) is not True
+        or getattr(result, "killed", None) is not False
+        or getattr(result, "partial_work", None) is not False
+        or getattr(result, "inflight_unknown", None) is not False
+        or getattr(result, "descendants_reaped", None) is not True
+        or getattr(result, "namespace_closed", None) is not True
+    ):
+        return False
+    report = getattr(result, "report", None)
+    if not isinstance(report, Mapping):
+        return False
+    try:
+        from tools.platform_load_runtime import (
+            PID_NAMESPACE_ISOLATION,
+            WORKER_REPORT_SCHEMA,
+        )
+    except ModuleNotFoundError:  # Direct execution from platform/tools.
+        from platform_load_runtime import (  # type: ignore[no-redef]
+            PID_NAMESPACE_ISOLATION,
+            WORKER_REPORT_SCHEMA,
+        )
+    acceptance = report.get("acceptance")
+    supervisor = report.get("runtime_supervisor")
+    if not isinstance(acceptance, Mapping) or not isinstance(supervisor, Mapping):
+        return False
+    if (
+        report.get("worker_report_schema") != WORKER_REPORT_SCHEMA
+        or report.get("report_complete") is not True
+        or type(report.get("worker_exit_code")) is not int
+        or report.get("worker_exit_code") != 1
+        or report.get("namespace_closed") is not True
+        or report.get("authoritative") is not True
+        or report.get("dispatchable") is not True
+        or report.get("isolation") != PID_NAMESPACE_ISOLATION
+        or report.get("partial_work") is not False
+        or report.get("inflight_unknown") is not False
+        or getattr(result, "isolation", None) != PID_NAMESPACE_ISOLATION
+        or supervisor.get("reason") != "none"
+        or type(supervisor.get("returncode")) is not int
+        or supervisor.get("returncode") != 1
+        or supervisor.get("isolation") != PID_NAMESPACE_ISOLATION
+        or supervisor.get("namespace_closed") is not True
+        or supervisor.get("descendants_reaped") is not True
+        or supervisor.get("partial_work") is not False
+        or supervisor.get("inflight_unknown") is not False
+        or supervisor.get("report_error") is not None
+        or acceptance.get("passed") is not False
+        or acceptance.get("pending_origin_evidence") is not True
+        or acceptance.get("contract_ok") is not True
+    ):
+        return False
+    profile_acceptance = profile.get("acceptance")
+    profile_kind = (
+        profile_acceptance.get("kind")
+        if isinstance(profile_acceptance, Mapping)
+        else None
+    )
+    expected_decision = {
+        "stress": "STRESS PENDING ORIGIN EVIDENCE",
+        "spike": "SPIKE PENDING ORIGIN EVIDENCE",
+        "capacity": "CAPACITY PENDING ORIGIN EVIDENCE",
+    }.get(str(profile_kind), "SLO FAIL")
+    if (
+        acceptance.get("decision") != expected_decision
+        or expected_decision not in PENDING_ORIGIN_DECISIONS | {"SLO FAIL"}
+    ):
+        return False
+    acceptance_checks = acceptance.get("checks")
+    if not isinstance(acceptance_checks, Mapping) or not acceptance_checks:
+        return False
+    return _report_binding(profile, report).get("complete") is True
+
+
 def evaluate_report(
     profile: Mapping[str, Any],
     report_path: Path,
     server_observability_path: Path | None,
+    *,
+    defer_completed_slo_failure: bool = False,
 ) -> int:
     """Attach origin evidence and make the final profile-owned decision."""
 
@@ -2202,7 +2305,372 @@ def evaluate_report(
         "decision": result.get("decision"),
         "passed": result.get("passed", False),
     }, ensure_ascii=False))
+    if defer_completed_slo_failure and _is_complete_observer_bound_decision(
+        profile, report
+    ):
+        # The workflow records this as a completed measured SLO failure and
+        # publishes its sanitized evidence, then leaves the overall run red.
+        return WORKFLOW_PENDING_ORIGIN_EXIT
     return 0 if result.get("passed") is True else 1
+
+
+def _is_complete_observer_bound_decision(
+    profile: Mapping[str, Any], report: Mapping[str, Any]
+) -> bool:
+    """Return true for a completed measurement decision, including an SLO fail.
+
+    Binding, containment, origin safety, timing and population completeness
+    remain hard requirements.  Only the final behavior/target outcome may be
+    false for this workflow-only completion classification.
+    """
+
+    acceptance = report.get("acceptance")
+    binding = report.get("report_binding")
+    supervisor = report.get("runtime_supervisor")
+    observability = report.get("origin_observability")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (acceptance, binding, supervisor, observability)
+    ):
+        return False
+    assert isinstance(acceptance, Mapping)
+    assert isinstance(binding, Mapping)
+    assert isinstance(supervisor, Mapping)
+    assert isinstance(observability, Mapping)
+    origin_binding = observability.get("binding")
+    acceptance_binding = acceptance.get("observer_binding")
+    origin_safety = acceptance.get("origin_safety")
+    timing = acceptance.get("timing_evidence")
+    phase_plan = acceptance.get("phase_plan_evidence")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (origin_binding, acceptance_binding, timing)
+    ):
+        return False
+    assert isinstance(origin_binding, Mapping)
+    assert isinstance(acceptance_binding, Mapping)
+    assert isinstance(timing, Mapping)
+    profile_acceptance = profile.get("acceptance")
+    acceptance_checks = acceptance.get("checks")
+    has_resource_safety = (
+        isinstance(profile_acceptance, Mapping)
+        and isinstance(profile_acceptance.get("resource_safety"), Mapping)
+    )
+    if has_resource_safety:
+        safety_checks = (
+            origin_safety.get("checks")
+            if isinstance(origin_safety, Mapping)
+            else None
+        )
+        if (
+            not isinstance(origin_safety, Mapping)
+            or type(origin_safety.get("passed")) is not bool
+            or not isinstance(safety_checks, Mapping)
+            or not safety_checks
+            or any(type(value) is not bool for value in safety_checks.values())
+            or not (_ORIGIN_RESOURCE_BUDGET_CHECKS | _ORIGIN_RESOURCE_HARD_CHECKS).issubset(
+                safety_checks
+            )
+            or bool(
+                set(safety_checks)
+                - _ORIGIN_RESOURCE_BUDGET_CHECKS
+                - _ORIGIN_RESOURCE_HARD_CHECKS
+                - {"postgres_backend_ownership_consistent"}
+            )
+            or safety_checks.get("observer_completed") is not True
+            or safety_checks.get("required_diagnostics_present") is not True
+            or (
+                "postgres_backend_ownership_consistent" in safety_checks
+                and safety_checks["postgres_backend_ownership_consistent"] is not True
+            )
+            or origin_safety.get("passed") is not all(safety_checks.values())
+            or not isinstance(acceptance_checks, Mapping)
+            or acceptance_checks.get("origin_safety") is not origin_safety.get("passed")
+        ):
+            return False
+    elif origin_safety is not None or (
+        isinstance(acceptance_checks, Mapping)
+        and "origin_safety" in acceptance_checks
+    ):
+        return False
+    if (
+        report.get("authoritative") is not True
+        or report.get("dispatchable") is not True
+        or report.get("partial_work") is not False
+        or report.get("inflight_unknown") is not False
+        or binding.get("complete") is not True
+        or acceptance.get("contract_ok") is not True
+        or acceptance.get("pending_origin_evidence") is not False
+        or acceptance.get("passed") is not False
+        or supervisor.get("reason") != "none"
+        or supervisor.get("namespace_closed") is not True
+        or supervisor.get("descendants_reaped") is not True
+        or supervisor.get("partial_work") is not False
+        or supervisor.get("inflight_unknown") is not False
+        or supervisor.get("report_error") is not None
+        or origin_binding.get("complete") is not True
+        or acceptance_binding.get("complete") is not True
+        or timing.get("complete") is not True
+    ):
+        return False
+    for key in (
+        "phase_population_evidence",
+        "raw_logical_population_evidence",
+        "top_population_timing_evidence",
+    ):
+        evidence = acceptance.get(key)
+        if not isinstance(evidence, Mapping) or any(value is not True for value in evidence.values()):
+            return False
+    if not isinstance(phase_plan, Mapping) or phase_plan.get("complete") is not True:
+        return False
+    if acceptance.get("experiment_complete") is False:
+        return False
+    decision = acceptance.get("decision")
+    profile_kind = (profile.get("acceptance") or {}).get("kind", "slo")
+    expected_decision = {
+        "slo": "SLO FAIL",
+        "stress": "STRESS BEHAVIOR FAIL",
+        "spike": "SPIKE BEHAVIOR FAIL",
+        "capacity": "CAPACITY EXPERIMENT COMPLETE TARGET FAIL",
+    }.get(profile_kind)
+    if decision != expected_decision:
+        return False
+    if profile_kind == "capacity" and acceptance.get("experiment_complete") is not True:
+        return False
+    if profile_kind == "capacity" and acceptance.get("phase_completion") is not True:
+        return False
+    traffic = profile.get("traffic")
+    authored_stages = (
+        traffic.get("concurrency_stages") if isinstance(traffic, Mapping) else None
+    )
+    allowed_ramp_budget_checks = (
+        frozenset(f"ramp_{stage}_budgets" for stage in authored_stages)
+        if isinstance(authored_stages, list)
+        and authored_stages
+        and all(type(stage) is int and stage > 0 for stage in authored_stages)
+        else frozenset()
+    )
+    return _acceptance_failure_is_budget_only(
+        acceptance,
+        str(profile_kind),
+        allowed_ramp_budget_checks=allowed_ramp_budget_checks,
+    )
+
+
+_PROFILE_BUDGET_CHECKS: dict[str, frozenset[str]] = {
+    "slo": frozenset(
+        {
+            "logical_final_failure",
+            "logical_final_failure_budget",
+            "accepted_p50",
+            "accepted_p90",
+            "accepted_p95",
+            "accepted_p99",
+            "logical_p95",
+            "logical_p99",
+            "normal_overload_shedding",
+            "retry_amplification_percent",
+            "pool_checkout_p95_ms",
+            "pool_checkout_p99_ms",
+            "postgres_backend_connections",
+            "waiting_backends",
+            "lock_waiters",
+            "cpu_per_core",
+        }
+    ),
+    "stress": frozenset(
+        {
+            "logical_final_failure_budget",
+            "accepted_p95_ms",
+            "accepted_p99_ms",
+            "logical_p95_ms",
+            "logical_p99_ms",
+            "retry_amplification_percent",
+            "shed_percent",
+            "minimum_useful_goodput",
+            "recovery_goodput_positive",
+            "pool_checkout_p95_ms",
+            "pool_checkout_p99_ms",
+            "postgres_backend_connections",
+            "waiting_backends",
+            "lock_waiters",
+            "cpu_per_core",
+        }
+    ),
+    "spike": frozenset(
+        {
+            "logical_final_failure_budget",
+            "accepted_p95_ms",
+            "accepted_p99_ms",
+            "logical_p95_ms",
+            "logical_p99_ms",
+            "retry_amplification_percent",
+            "shed_percent",
+            "minimum_useful_goodput",
+            "recovery_goodput_positive",
+            "pool_checkout_p95_ms",
+            "pool_checkout_p99_ms",
+            "postgres_backend_connections",
+            "waiting_backends",
+            "lock_waiters",
+            "cpu_per_core",
+        }
+    ),
+    "capacity": frozenset(
+        {
+            "accepted_p50",
+            "logical_final_failure_budget",
+            "accepted_p90",
+            "accepted_p95",
+            "accepted_p99",
+            "logical_p95",
+            "logical_p99",
+            "logical_final_failure",
+            "normal_overload_shedding",
+            "retry_amplification_percent",
+            "shed_percent",
+            "minimum_useful_goodput",
+            "pool_checkout_p95_ms",
+            "pool_checkout_p99_ms",
+            "postgres_backend_connections",
+            "waiting_backends",
+            "lock_waiters",
+            "cpu_per_core",
+        }
+    ),
+}
+
+_ORIGIN_RESOURCE_BUDGET_CHECKS = frozenset(
+    {
+        "pool_checkout_p95_ms",
+        "pool_checkout_p99_ms",
+        "postgres_backend_connections",
+        "waiting_backends",
+        "lock_waiters",
+        "cpu_per_core",
+    }
+)
+_ORIGIN_RESOURCE_HARD_CHECKS = frozenset(
+    {"observer_completed", "required_diagnostics_present"}
+)
+_RAMP_STAGE_BUDGET_CHECKS = frozenset(
+    {
+        "logical_final_failure_budget",
+        "accepted_p95",
+        "accepted_p99",
+        "logical_p95",
+        "logical_p99",
+        "shed_percent",
+        "retry_amplification_percent",
+        "minimum_useful_goodput",
+    }
+)
+
+_BUDGET_AGGREGATE_CHECKS = frozenset(
+    {"phase_budgets", "capacity_ramp_evidence", "origin_safety"}
+)
+
+
+def _acceptance_failure_is_budget_only(
+    acceptance: Mapping[str, Any],
+    profile_kind: str,
+    *,
+    allowed_ramp_budget_checks: frozenset[str] = frozenset(),
+) -> bool:
+    """Reject an SLO-miss classification if any structural check failed.
+
+    The acceptance evaluator exposes leaf checks plus aggregate evidence
+    checks.  False budget leaves are allowed only when their matching nested
+    check tree is present; every other false leaf is an invalid measurement,
+    observer, population, or contract result and must remain a hard failure.
+    """
+
+    allowed = _PROFILE_BUDGET_CHECKS.get(profile_kind)
+    checks = acceptance.get("checks")
+    if allowed is None or not isinstance(checks, Mapping) or not checks:
+        return False
+
+    authored_ramp_stages = {
+        name.removeprefix("ramp_").removesuffix("_budgets")
+        for name in allowed_ramp_budget_checks
+    }
+    ramp_evidence = acceptance.get("capacity_ramp_evidence")
+    ramp_evidence_checks = (
+        ramp_evidence.get("checks") if isinstance(ramp_evidence, Mapping) else None
+    )
+    failed_ramp_stages = {
+        stage
+        for stage in authored_ramp_stages
+        if isinstance(ramp_evidence_checks, Mapping)
+        and ramp_evidence_checks.get(f"ramp_{stage}_budgets") is False
+    }
+
+    def check_tree(node: Any, path: tuple[str, ...] = ()) -> tuple[bool, bool]:
+        budget_failure = False
+        if isinstance(node, Mapping):
+            nested_checks = node.get("checks")
+            if nested_checks is not None:
+                if not isinstance(nested_checks, Mapping):
+                    return False, False
+                check_path = path + ("checks",)
+                for name, value in nested_checks.items():
+                    if value is False:
+                        ramp_stage_budget_check = (
+                            len(check_path) == 5
+                            and check_path[0] == "capacity_ramp_evidence"
+                            and check_path[1] == "stages"
+                            and check_path[2] in failed_ramp_stages
+                            and check_path[3] == "budget_evidence"
+                            and name in _RAMP_STAGE_BUDGET_CHECKS
+                        )
+                        if (
+                            name in allowed
+                            or name in allowed_ramp_budget_checks
+                            or ramp_stage_budget_check
+                        ):
+                            budget_failure = True
+                        elif name in _BUDGET_AGGREGATE_CHECKS:
+                            evidence_key = {
+                                "phase_budgets": "phase_budget_evidence",
+                                "capacity_ramp_evidence": "capacity_ramp_evidence",
+                                "origin_safety": "origin_safety",
+                            }[str(name)]
+                            evidence = node.get(evidence_key)
+                            if not isinstance(evidence, Mapping):
+                                return False, False
+                            valid, nested_budget_failure = check_tree(
+                                evidence, path + (evidence_key,)
+                            )
+                            if not valid or not nested_budget_failure:
+                                return False, False
+                            budget_failure = True
+                        else:
+                            return False, False
+                    elif value is not True:
+                        return False, False
+            for key, value in node.items():
+                if key in {"checks", "passed", "complete", "target_passed"}:
+                    continue
+                if isinstance(value, Mapping):
+                    children = [(str(key), value)]
+                elif isinstance(value, (list, tuple)):
+                    children = [(str(key), child) for child in value]
+                else:
+                    children = []
+                for child_key, child in children:
+                    valid, child_budget_failure = check_tree(
+                        child, path + (child_key,)
+                    )
+                    if not valid:
+                        return False, False
+                    budget_failure = budget_failure or child_budget_failure
+            return True, budget_failure
+        return True, False
+
+    valid, false_budget_seen = check_tree(acceptance)
+    if not valid:
+        return False
+    return false_budget_seen
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -2238,11 +2706,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "page-load run; value must be the numeric external workflow run id."
         ),
     )
+    run_parser.add_argument(
+        "--defer-pending-origin",
+        action="store_true",
+        help=(
+            "external-workflow orchestration only: return reserved exit 3 for a "
+            "fully closed, exact-bound candidate awaiting origin evidence; this "
+            "is not an acceptance pass"
+        ),
+    )
 
     evaluate_parser = subparsers.add_parser("evaluate")
     evaluate_parser.add_argument("--profile", dest="profile_id", required=True)
     evaluate_parser.add_argument("--report", type=Path, required=True)
     evaluate_parser.add_argument("--server-observability", type=Path)
+    evaluate_parser.add_argument(
+        "--defer-completed-slo-failure",
+        action="store_true",
+        help=(
+            "external-workflow orchestration only: return reserved exit 3 for a "
+            "fully complete observer-bound SLO failure so sanitized evidence can "
+            "be published before the final workflow gate fails"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -2288,12 +2774,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"{key}={value}")
         return 0
     if args.command == "evaluate":
-        return evaluate_report(profile, args.report, args.server_observability)
+        return evaluate_report(
+            profile,
+            args.report,
+            args.server_observability,
+            defer_completed_slo_failure=args.defer_completed_slo_failure,
+        )
     return run_profile(
         profile,
         args.manifest,
         args.report_path,
         timeout_diagnostics_run_id=args.timeout_diagnostics_run_id,
+        defer_pending_origin=args.defer_pending_origin,
     )
 
 

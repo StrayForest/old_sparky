@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
+from tools.platform_load import (
+    _is_closed_pending_origin_candidate,
+    _is_complete_observer_bound_decision,
+    get_profile,
+    profile_contract,
+)
+from tools.platform_load_runtime import PID_NAMESPACE_ISOLATION, WORKER_REPORT_SCHEMA
 from tools.platform_load_acceptance import (
+    _capacity_ramp_evidence,
     evaluate_acceptance,
     observer_evidence_required,
     phase_plan_completeness,
@@ -203,6 +214,155 @@ SLO = {
 
 
 class LoadAcceptanceTests(unittest.TestCase):
+    @staticmethod
+    def _closed_pending_candidate() -> tuple[dict[str, object], SimpleNamespace]:
+        profile = get_profile("ready-vote-slo-v2")
+        contract = profile_contract(profile)
+        planned = contract["planned_work"]
+        logical_actions = int(planned["logical_actions"])
+        primary_actions = int(planned["primary_logical_actions"])
+        state_reads = int(planned["state_read_requests"])
+        actual_requests = logical_actions + state_reads
+        max_http_attempts = int(profile["portfolio"]["request_budget"]["max_http_attempts"])
+        contract.update(
+            {
+                "offered_logical_actions": logical_actions,
+                "primary_http_attempts": primary_actions,
+                "http_attempts": actual_requests,
+                "total_http_attempts": actual_requests,
+                "runtime_http_budget": {
+                    "planned_worst_case": planned["http_attempts"],
+                    "max_http_attempts": max_http_attempts,
+                    "actual_http_attempts": actual_requests,
+                    "within_budget": actual_requests <= max_http_attempts,
+                },
+            }
+        )
+        report: dict[str, object] = {
+            "schema": 1,
+            "measurement_schema": 2,
+            "timing_schema": 1,
+            "profile_id": profile["profile_id"],
+            "profile_version": profile["profile_version"],
+            "profile_digest": contract["profile_digest"],
+            "mode": profile["mode"],
+            "environment": profile["portfolio"]["environment"],
+            "source_git_sha": "a" * 40,
+            "external_run_id": "123",
+            "fixture_marker": "preprod202610070000abcd",
+            "scope": "full_population",
+            "load_contract": contract,
+            "authoritative": True,
+            "dispatchable": True,
+            "phases": {"primary": {}, "duplicate": {}, "state": {}},
+            "overall": {
+                "scope": "full_population",
+                "requests": actual_requests,
+                "errors": 0,
+                "successful_responses": actual_requests,
+            },
+            "raw_http": {
+                "scope": "full_population",
+                "requests": logical_actions,
+                "state_read_requests": state_reads,
+                "total_requests_including_state": actual_requests,
+            },
+            "logical": {
+                "scope": "logical_user_actions",
+                "actions": logical_actions,
+            },
+            "acceptance": {
+                "passed": False,
+                "decision": "SLO FAIL",
+                "pending_origin_evidence": True,
+                "contract_ok": True,
+                "checks": {"timing_complete": True},
+            },
+            "worker_report_schema": WORKER_REPORT_SCHEMA,
+            "report_complete": True,
+            "namespace_closed": True,
+            "isolation": PID_NAMESPACE_ISOLATION,
+            "partial_work": False,
+            "inflight_unknown": False,
+            "worker_exit_code": 1,
+            "runtime_supervisor": {
+                "reason": "none",
+                "returncode": 1,
+                "isolation": PID_NAMESPACE_ISOLATION,
+                "namespace_closed": True,
+                "descendants_reaped": True,
+                "partial_work": False,
+                "inflight_unknown": False,
+                "report_error": None,
+            },
+        }
+        result = SimpleNamespace(
+            returncode=1,
+            report=report,
+            worker_started=True,
+            worker_exited=True,
+            killed=False,
+            signal=None,
+            reason="none",
+            partial_work=False,
+            inflight_unknown=False,
+            descendants_reaped=True,
+            isolation=PID_NAMESPACE_ISOLATION,
+            namespace_closed=True,
+        )
+        return profile, result
+
+    @staticmethod
+    def _complete_observer_bound_budget_miss() -> tuple[dict[str, object], dict[str, object]]:
+        profile = get_profile("ready-vote-slo-v2")
+        report: dict[str, object] = {
+            "authoritative": True,
+            "dispatchable": True,
+            "partial_work": False,
+            "inflight_unknown": False,
+            "report_binding": {"complete": True},
+            "runtime_supervisor": {
+                "reason": "none",
+                "namespace_closed": True,
+                "descendants_reaped": True,
+                "partial_work": False,
+                "inflight_unknown": False,
+                "report_error": None,
+            },
+            "origin_observability": {"binding": {"complete": True}},
+            "acceptance": {
+                "decision": "SLO FAIL",
+                "passed": False,
+                "pending_origin_evidence": False,
+                "contract_ok": True,
+                "observer_binding": {"complete": True},
+                "origin_safety": {
+                    "passed": True,
+                    "checks": {
+                        "observer_completed": True,
+                        "required_diagnostics_present": True,
+                        "pool_checkout_p95_ms": True,
+                        "pool_checkout_p99_ms": True,
+                        "postgres_backend_connections": True,
+                        "waiting_backends": True,
+                        "lock_waiters": True,
+                        "cpu_per_core": True,
+                    },
+                },
+                "timing_evidence": {"complete": True},
+                "phase_plan_evidence": {"complete": True},
+                "phase_population_evidence": {"all_phases": True},
+                "raw_logical_population_evidence": {"all_populations": True},
+                "top_population_timing_evidence": {"all_populations": True},
+                "checks": {
+                    "accepted_p95": False,
+                    "timing_complete": True,
+                    "origin_safety": True,
+                },
+            },
+        }
+        return profile, report
+
     def test_partial_timing_population_fails_closed(self) -> None:
         result = evaluate_acceptance(
             contract_ok=True,
@@ -393,6 +553,215 @@ class LoadAcceptanceTests(unittest.TestCase):
 
         self.assertFalse(result["passed"])
         self.assertTrue(result["pending_origin_evidence"])
+
+        profile, candidate = self._closed_pending_candidate()
+        with patch.dict(
+            os.environ,
+            {"SOURCE_GIT_SHA": "a" * 40, "GITHUB_RUN_ID": "123"},
+            clear=False,
+        ):
+            self.assertTrue(_is_closed_pending_origin_candidate(profile, candidate))
+        mutations = (
+            ("worker return code", lambda result: setattr(result, "returncode", 2)),
+            ("worker crashed", lambda result: setattr(result, "reason", "worker-exit")),
+            ("worker killed", lambda result: setattr(result, "killed", True)),
+            ("worker not exited", lambda result: setattr(result, "worker_exited", False)),
+            ("namespace open", lambda result: setattr(result, "namespace_closed", False)),
+            ("descendants not reaped", lambda result: setattr(result, "descendants_reaped", False)),
+            ("partial work", lambda result: setattr(result, "partial_work", True)),
+            ("inflight work unknown", lambda result: setattr(result, "inflight_unknown", True)),
+            ("wrong worker isolation", lambda result: setattr(result, "isolation", "untrusted")),
+            ("malformed worker report", lambda result: setattr(result, "report", [])),
+            ("worker report incomplete", lambda result: result.report.update({"report_complete": False})),
+            ("report namespace open", lambda result: result.report.update({"namespace_closed": False})),
+            ("report SHA source mismatch", lambda result: result.report.update({"source_git_sha": "b" * 40})),
+            ("report run mismatch", lambda result: result.report.update({"external_run_id": "124"})),
+            ("worker and supervisor exit mismatch", lambda result: result.report.update({"worker_exit_code": 0})),
+            ("unexpected pending decision", lambda result: result.report["acceptance"].update({"decision": "LOAD RUN FAILED"})),
+            ("supervisor failed", lambda result: result.report["runtime_supervisor"].update({"reason": "worker-exit"})),
+            ("supervisor report error", lambda result: result.report["runtime_supervisor"].update({"report_error": "invalid"})),
+            ("supervisor descendants not reaped", lambda result: result.report["runtime_supervisor"].update({"descendants_reaped": False})),
+            ("supervisor partial work", lambda result: result.report["runtime_supervisor"].update({"partial_work": True})),
+            ("supervisor inflight unknown", lambda result: result.report["runtime_supervisor"].update({"inflight_unknown": True})),
+        )
+        with patch.dict(
+            os.environ,
+            {"SOURCE_GIT_SHA": "a" * 40, "GITHUB_RUN_ID": "123"},
+            clear=False,
+        ):
+            for label, mutate in mutations:
+                with self.subTest(failure=label):
+                    invalid = deepcopy(candidate)
+                    mutate(invalid)
+                    self.assertFalse(_is_closed_pending_origin_candidate(profile, invalid))
+        profile, report = self._complete_observer_bound_budget_miss()
+        self.assertTrue(_is_complete_observer_bound_decision(profile, report))
+
+        resource_budget_miss = deepcopy(report)
+        resource_budget_miss["acceptance"]["origin_safety"] = {
+            "passed": False,
+            "checks": {
+                "observer_completed": True,
+                "required_diagnostics_present": True,
+                "pool_checkout_p95_ms": True,
+                "pool_checkout_p99_ms": True,
+                "postgres_backend_connections": True,
+                "waiting_backends": True,
+                "lock_waiters": True,
+                "cpu_per_core": False,
+            },
+        }
+        resource_budget_miss["acceptance"]["checks"]["origin_safety"] = False
+        self.assertTrue(
+            _is_complete_observer_bound_decision(profile, resource_budget_miss)
+        )
+
+        ramp_profile = get_profile("read-mix-concurrency-ramp-v1")
+        ramp_contract = profile_contract(ramp_profile)
+        authored_stages = ramp_profile["traffic"]["concurrency_stages"]
+        stage_counts = ramp_contract["planned_work"]["stage_logical_actions"]
+
+        def ramp_evidence(*, population_mismatch: bool = False) -> dict[str, object]:
+            stages = {
+                str(stage): canonical_raw(stage_counts[str(stage)])
+                for stage in authored_stages
+            }
+            for stage in stages.values():
+                stage["latency"] = latency(1, 1, 1, 1)
+            first_stage = stages[str(authored_stages[0])]
+            first_stage["latency"] = latency(1, 1, 9000, 12000)
+            if population_mismatch:
+                first_stage["requests"] = int(first_stage["requests"]) - 1
+            return _capacity_ramp_evidence(
+                {"concurrency_stages": authored_stages, "stages": stages},
+                stage_counts,
+                canonical=True,
+                expected_statuses=frozenset(
+                    ramp_profile["acceptance"]["expected_statuses"]
+                ),
+                acceptance_contract=ramp_profile["acceptance"],
+                max_retries=0,
+            )
+
+        def ramp_decision(evidence: dict[str, object]) -> dict[str, object]:
+            return {
+                "authoritative": True,
+                "dispatchable": True,
+                "partial_work": False,
+                "inflight_unknown": False,
+                "report_binding": {"complete": True},
+                "runtime_supervisor": {
+                    "reason": "none",
+                    "namespace_closed": True,
+                    "descendants_reaped": True,
+                    "partial_work": False,
+                    "inflight_unknown": False,
+                    "report_error": None,
+                },
+                "origin_observability": {"binding": {"complete": True}},
+                "acceptance": {
+                    "decision": "STRESS BEHAVIOR FAIL",
+                    "passed": False,
+                    "pending_origin_evidence": False,
+                    "contract_ok": True,
+                    "observer_binding": {"complete": True},
+                    "timing_evidence": {"complete": True},
+                    "phase_plan_evidence": {"complete": True},
+                    "phase_population_evidence": {"all_phases": True},
+                    "raw_logical_population_evidence": {"all_populations": True},
+                    "top_population_timing_evidence": {"all_populations": True},
+                    "capacity_ramp_evidence": evidence,
+                    "checks": {
+                        "accepted_p95_ms": True,
+                        "timing_complete": True,
+                        "capacity_ramp_evidence": evidence["complete"],
+                    },
+                },
+            }
+
+        complete_ramp_budget_miss = ramp_evidence()
+        self.assertFalse(complete_ramp_budget_miss["complete"])
+        self.assertTrue(
+            all(
+                value is True
+                for name, value in complete_ramp_budget_miss["checks"].items()
+                if name.endswith("_population") or name.startswith("ramp_")
+                if not name.endswith("_budgets")
+            )
+        )
+        self.assertTrue(
+            _is_complete_observer_bound_decision(
+                ramp_profile,
+                ramp_decision(complete_ramp_budget_miss),
+            )
+        )
+
+        incomplete_ramp_population = ramp_evidence(population_mismatch=True)
+        self.assertFalse(incomplete_ramp_population["complete"])
+        self.assertFalse(incomplete_ramp_population["checks"][f"ramp_{authored_stages[0]}_population"])
+        self.assertFalse(
+            _is_complete_observer_bound_decision(
+                ramp_profile,
+                ramp_decision(incomplete_ramp_population),
+            )
+        )
+
+        structural_failures = (
+            ("observer binding", "observer_binding", {"complete": False}),
+            ("timing completeness", "timing_evidence", {"complete": False}),
+        )
+        for label, field, replacement in structural_failures:
+            with self.subTest(failure=label):
+                invalid = deepcopy(report)
+                invalid["acceptance"][field] = replacement
+                self.assertFalse(_is_complete_observer_bound_decision(profile, invalid))
+
+        incomplete_origin_safety = deepcopy(report)
+        incomplete_origin_safety["acceptance"].pop("origin_safety")
+        self.assertFalse(
+            _is_complete_observer_bound_decision(profile, incomplete_origin_safety)
+        )
+
+        hard_origin_failure = deepcopy(report)
+        hard_origin_failure["acceptance"]["origin_safety"] = {
+            "passed": False,
+            "checks": {
+                "observer_completed": False,
+                "required_diagnostics_present": True,
+                "pool_checkout_p95_ms": True,
+                "pool_checkout_p99_ms": True,
+                "postgres_backend_connections": True,
+                "waiting_backends": True,
+                "lock_waiters": True,
+                "cpu_per_core": True,
+            },
+        }
+        hard_origin_failure["acceptance"]["checks"]["origin_safety"] = False
+        self.assertFalse(
+            _is_complete_observer_bound_decision(profile, hard_origin_failure)
+        )
+
+        unknown_origin_check = deepcopy(report)
+        unknown_origin_check["acceptance"]["origin_safety"]["checks"][
+            "unrecognized_check"
+        ] = True
+        self.assertFalse(
+            _is_complete_observer_bound_decision(profile, unknown_origin_check)
+        )
+
+        ownership_mismatch = deepcopy(report)
+        ownership_mismatch["acceptance"]["origin_safety"]["checks"][
+            "postgres_backend_ownership_consistent"
+        ] = False
+        ownership_mismatch["acceptance"]["origin_safety"]["passed"] = False
+        ownership_mismatch["acceptance"]["checks"]["origin_safety"] = False
+        self.assertFalse(
+            _is_complete_observer_bound_decision(profile, ownership_mismatch)
+        )
+
+        invalid_check = deepcopy(report)
+        invalid_check["acceptance"]["checks"]["timing_complete"] = False
+        self.assertFalse(_is_complete_observer_bound_decision(profile, invalid_check))
 
     def test_exact_observer_binding_mismatch_fails_closed(self) -> None:
         result = evaluate_acceptance(

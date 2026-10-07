@@ -463,6 +463,29 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertNotIn("actual", public_report["report_binding"])
         self.assertNotIn("unknown", public_report)
 
+        for completed_decision in (
+            "STRESS BEHAVIOR FAIL",
+            "SPIKE BEHAVIOR FAIL",
+            "CAPACITY EXPERIMENT COMPLETE TARGET FAIL",
+        ):
+            projected = project_public_artifact(
+                "external_load",
+                {
+                    "acceptance": {
+                        "passed": False,
+                        "decision": completed_decision,
+                        "pending_origin_evidence": False,
+                        "checks": {"contract": True},
+                    }
+                },
+            )
+            self.assertEqual(projected["acceptance"]["decision"], completed_decision)
+        unknown_decision = project_public_artifact(
+            "external_load",
+            {"acceptance": {"passed": False, "decision": "operator text secret"}},
+        )
+        self.assertEqual(unknown_decision["acceptance"]["decision"], "other")
+
         invalid_types = project_public_artifact(
             "external_load",
             {
