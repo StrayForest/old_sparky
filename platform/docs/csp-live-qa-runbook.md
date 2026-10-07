@@ -167,6 +167,11 @@ interrupted installation fails closed. The host still needs the dedicated
 account/AppArmor profile. Run as root and first create the root-only bundle
 through the public shell wrapper:
 
+The generation manifest includes the launch supervisor's direct script and
+data dependencies, including the provisioning shell wrapper, its Python
+implementation and the reviewed AppArmor profile. Reconciliation rejects a
+payload whose required-member set is incomplete.
+
 ```bash
 cd /root/old_sparky
 install -d -o root -g root -m 0700 /root/.oldsparky/liveqa
