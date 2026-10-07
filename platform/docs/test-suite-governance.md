@@ -119,6 +119,14 @@ these five catalog contours:
 | `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts |
 | `backend` (aggregate) | 3600s | serial orchestration | disjoint union of the five contours |
 
+Request-performance sampling behavior and its production-QA summary are owned
+by the existing `performance-contract` tests in
+`test_platform_request_performance` and
+`test_platform_production_qa_write_burst_profile`. The sanitized projection
+of sampling metadata is owned by
+`test_platform_evidence_privacy` in `backend-tool-contract`; all three remain
+in their existing catalog contours.
+
 The timeout values are the catalog's executable contract, not a moving test
 count or an estimate derived from the current number of methods. The catalog
 rejects unknown, duplicate, overlapping or unowned IDs and detects its
