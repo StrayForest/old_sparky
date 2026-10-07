@@ -1796,7 +1796,22 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             'bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"',
             workflow,
         )
-        self.assertIn('--extract-to "$bootstrap_dir"', workflow)
+        self.assertIn('--extract-bootstrap-to "$bootstrap_dir"', workflow)
+        self.assertIn('--expected-source-commit "$target_sha"', workflow)
+        bootstrap_validation_start = workflow.index(
+            '"$host_tools_dir/platform_validate_release_artifact.py"'
+        )
+        bootstrap_validation_end = workflow.index(
+            'if ! /usr/bin/python3 -I -B - "$artifact_path"',
+            bootstrap_validation_start,
+        )
+        bootstrap_validation = workflow[
+            bootstrap_validation_start:bootstrap_validation_end
+        ]
+        self.assertLess(
+            bootstrap_validation.index('--expected-source-commit "$target_sha"'),
+            bootstrap_validation.index('--extract-bootstrap-to "$bootstrap_dir"'),
+        )
         self.assertIn(
             'candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"',
             workflow,

@@ -277,8 +277,8 @@ checks the helper preserves reconcile stderr. Its companion
 capture and closed stdout/public markers; the executable catalog snapshot tracks these IDs.
 Privileged release tests prove promoted dependencies stay readable, relocation removes only wheel/RECORD-bound generated caches, cleanup is receipt/readiness/cgroup-bound, and runtime summaries stay out of deployment markers.
 Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused.
-A proof miss uses the existing fresh-venv snapshot path.
-These root-owned cases remain in `backend-privileged`.
+A proof miss uses the existing fresh-venv snapshot path. These root-owned cases remain in `backend-privileged`; bootstrap extraction tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
+The canonical AST snapshot is 1,718 tests (1,646 backend, including 555 privileged) across 162 modules, with every ID assigned exactly once.
 Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
 

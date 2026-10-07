@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import tarfile
@@ -532,6 +533,150 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
             release / "apps/platform_web/.next/standalone/server.js",
         )
         self.assertEqual((release / "server-link").read_text(), "console.log('ok');\n")
+
+    def test_bootstrap_extraction_omits_only_the_two_bulk_component_subtrees(
+        self,
+    ) -> None:
+        artifact = self.root / f"{RELEASE_SLUG}-bootstrap.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        builder.add_directory(f"{RELEASE_SLUG}/wheelhouseevil")
+        builder.add_file(f"{RELEASE_SLUG}/wheelhouseevil/keep.txt", b"keep\n")
+        builder.add_directory(
+            f"{RELEASE_SLUG}/apps/platform_web/.next/standaloneevil"
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/apps/platform_web/.next/standaloneevil/keep.js",
+            b"keep standalone prefix\n",
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/tools/platform_release_deploy.sh",
+            b"#!/bin/bash\nexit 0\n",
+            mode=0o755,
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/tools/platform_verify_venv_reuse.py",
+            b"print('verified')\n",
+            mode=0o444,
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/wheelhouse/extra.whl",
+            b"wheel bytes\n",
+            mode=0o444,
+        )
+        builder.add_file(
+            f"{RELEASE_SLUG}/apps/platform_web/.next/standalone/.next/static/asset.js",
+            b"static bytes\n",
+        )
+        builder.write()
+
+        full_root = self.root / "full"
+        bootstrap_root = self.root / "bootstrap"
+        full_root.mkdir()
+        bootstrap_root.mkdir()
+        validator.validate_archive(
+            artifact, release_slug=RELEASE_SLUG, extract_to=full_root
+        )
+        payload = validator.validate_archive(
+            artifact,
+            release_slug=RELEASE_SLUG,
+            extract_bootstrap_to=bootstrap_root,
+            expected_source_commit="a" * 40,
+        )
+
+        self.assertEqual(payload["source_git_commit"], "a" * 40)
+        full_release = full_root / RELEASE_SLUG
+        bootstrap_release = bootstrap_root / RELEASE_SLUG
+        self.assertTrue((bootstrap_release / "RELEASE.json").is_file())
+        self.assertTrue(
+            (bootstrap_release / "tools/platform_verify_venv_reuse.py").is_file()
+        )
+        self.assertTrue((bootstrap_release / "wheelhouseevil/keep.txt").is_file())
+        self.assertTrue(
+            (
+                bootstrap_release
+                / "apps/platform_web/.next/standaloneevil/keep.js"
+            ).is_file()
+        )
+        self.assertFalse((bootstrap_release / "wheelhouse").exists())
+        self.assertFalse(
+            (bootstrap_release / "apps/platform_web/.next/standalone").exists()
+        )
+        self.assertTrue((full_release / "wheelhouse/extra.whl").is_file())
+        self.assertTrue(
+            (
+                full_release
+                / "apps/platform_web/.next/standalone/.next/static/asset.js"
+            ).is_file()
+        )
+
+        def retained_paths(root: Path) -> set[str]:
+            return {
+                path.relative_to(root).as_posix()
+                for path in root.rglob("*")
+                if not validator._is_bootstrap_excluded_member(
+                    f"{RELEASE_SLUG}/{path.relative_to(root).as_posix()}",
+                    release_slug=RELEASE_SLUG,
+                )
+            }
+
+        expected_paths = retained_paths(full_release)
+        actual_paths = retained_paths(bootstrap_release)
+        self.assertEqual(actual_paths, expected_paths)
+        for relative in sorted(expected_paths):
+            full_path = full_release / relative
+            bootstrap_path = bootstrap_release / relative
+            full_stat = full_path.lstat()
+            bootstrap_stat = bootstrap_path.lstat()
+            self.assertEqual(full_stat.st_mode & 0o7777, bootstrap_stat.st_mode & 0o7777)
+            self.assertEqual(
+                (full_stat.st_mode & 0o170000), (bootstrap_stat.st_mode & 0o170000)
+            )
+            if full_path.is_symlink():
+                self.assertEqual(os.readlink(full_path), os.readlink(bootstrap_path))
+            elif full_path.is_file():
+                self.assertEqual(full_path.read_bytes(), bootstrap_path.read_bytes())
+
+    def test_bootstrap_validation_rejects_wrong_source_before_extraction(self) -> None:
+        artifact = ArchiveBuilder(self.root / "wrong-source.tar.gz").write()
+        bootstrap_root = self.root / "bootstrap"
+        bootstrap_root.mkdir()
+
+        with self.assertRaisesRegex(
+            validator.ArtifactError, "source commit does not match"
+        ):
+            validator.validate_archive(
+                artifact,
+                release_slug=RELEASE_SLUG,
+                extract_bootstrap_to=bootstrap_root,
+                expected_source_commit="b" * 40,
+            )
+
+        self.assertFalse((bootstrap_root / RELEASE_SLUG).exists())
+
+    def test_bootstrap_mode_still_rejects_invalid_members_in_excluded_subtrees(
+        self,
+    ) -> None:
+        artifact = self.root / "unsafe-excluded-member.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        builder.add_file(
+            f"{RELEASE_SLUG}/wheelhouse/unchecked.whl",
+            b"invalid mode must be checked before bootstrap filtering\n",
+            mode=0o666,
+        )
+        builder.write()
+        bootstrap_root = self.root / "bootstrap"
+        bootstrap_root.mkdir()
+
+        with self.assertRaisesRegex(
+            validator.ArtifactError, "release archive contains unsafe permissions"
+        ):
+            validator.validate_archive(
+                artifact,
+                release_slug=RELEASE_SLUG,
+                extract_bootstrap_to=bootstrap_root,
+            )
+
+        self.assertFalse((bootstrap_root / RELEASE_SLUG).exists())
 
     def test_runtime_manifest_may_exceed_release_json_bound_within_runtime_bound(
         self,

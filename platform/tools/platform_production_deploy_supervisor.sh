@@ -580,7 +580,8 @@ fi
   --artifact "$artifact_path" \
   --checksum "$artifact_checksum" \
   --release-slug "$artifact_slug" \
-  --extract-to "$bootstrap_dir" \
+  --expected-source-commit "$target_sha" \
+  --extract-bootstrap-to "$bootstrap_dir" \
   >/dev/null 2>/dev/null \
   || {
     set_failure_context artifact artifact validation_failed

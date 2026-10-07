@@ -778,12 +778,28 @@ def _copy_regular_member(
         source.close()
 
 
+def _is_bootstrap_excluded_member(name: str, *, release_slug: str) -> bool:
+    """Return whether a validated member belongs to one of the two bulk trees."""
+
+    parts = PurePosixPath(name).parts
+    if not parts or parts[0] != release_slug:
+        return False
+    relative = parts[1:]
+    return relative[:1] == ("wheelhouse",) or relative[:4] == (
+        "apps",
+        "platform_web",
+        ".next",
+        "standalone",
+    )
+
+
 def _extract_validated_archive(
     archive: tarfile.TarFile,
     members: list[tarfile.TarInfo],
     *,
     release_slug: str,
     extract_to: Path,
+    bootstrap_only: bool = False,
 ) -> None:
     destination_root = _safe_root_directory(
         extract_to, label="release extraction directory", writable=True
@@ -792,13 +808,26 @@ def _extract_validated_archive(
     if os.path.lexists(release_root):
         raise ArtifactError("release extraction target already exists")
 
+    selected_members = (
+        [
+            member
+            for member in members
+            if not _is_bootstrap_excluded_member(
+                member.name, release_slug=release_slug
+            )
+        ]
+        if bootstrap_only
+        else members
+    )
     directories = sorted(
-        (member for member in members if member.isdir()),
+        (member for member in selected_members if member.isdir()),
         key=lambda member: len(PurePosixPath(member.name).parts),
     )
-    regular_files = sorted(member.name for member in members if member.isfile())
-    symlinks = sorted(member.name for member in members if member.issym())
-    by_name = {member.name: member for member in members}
+    regular_files = sorted(
+        member.name for member in selected_members if member.isfile()
+    )
+    symlinks = sorted(member.name for member in selected_members if member.issym())
+    by_name = {member.name: member for member in selected_members}
     try:
         for member in directories:
             (destination_root / member.name).mkdir(mode=0o700)
@@ -829,9 +858,13 @@ def validate_archive(
     *,
     release_slug: str,
     extract_to: Path | None = None,
+    extract_bootstrap_to: Path | None = None,
+    expected_source_commit: str | None = None,
 ) -> dict[str, object]:
     if SLUG_PATTERN.fullmatch(release_slug) is None:
         raise ArtifactError("release slug is invalid")
+    if extract_to is not None and extract_bootstrap_to is not None:
+        raise ArtifactError("release extraction modes are mutually exclusive")
     try:
         with tarfile.open(artifact, mode="r:gz") as archive:
             members: list[tarfile.TarInfo] = []
@@ -860,12 +893,25 @@ def validate_archive(
             if len(raw) > MAX_RELEASE_JSON_BYTES:
                 raise ArtifactError("RELEASE.json is too large")
             release_payload = _parse_release_json(raw, release_slug=release_slug)
+            if expected_source_commit is not None:
+                if COMMIT_PATTERN.fullmatch(expected_source_commit) is None:
+                    raise ArtifactError("expected source commit is invalid")
+                if release_payload.get("source_git_commit") != expected_source_commit:
+                    raise ArtifactError("release source commit does not match expected commit")
             if extract_to is not None:
                 _extract_validated_archive(
                     archive,
                     members,
                     release_slug=release_slug,
                     extract_to=extract_to,
+                )
+            elif extract_bootstrap_to is not None:
+                _extract_validated_archive(
+                    archive,
+                    members,
+                    release_slug=release_slug,
+                    extract_to=extract_bootstrap_to,
+                    bootstrap_only=True,
                 )
             return release_payload
     except ArtifactError:
@@ -882,23 +928,28 @@ def main() -> int:
     parser.add_argument("--checksum", type=Path, required=True)
     parser.add_argument("--release-slug", required=True)
     parser.add_argument("--expected-source-commit")
-    parser.add_argument("--extract-to", type=Path)
+    extraction = parser.add_mutually_exclusive_group()
+    extraction.add_argument("--extract-to", type=Path)
+    extraction.add_argument("--extract-bootstrap-to", type=Path)
     args = parser.parse_args()
     try:
         if os.geteuid() != 0:
             raise ArtifactError("release artifact validation requires root")
         _checksum_contract(args.artifact, args.checksum)
-        release_payload = validate_archive(
+        validate_archive(
             args.artifact,
             release_slug=args.release_slug,
             extract_to=args.extract_to,
+            extract_bootstrap_to=args.extract_bootstrap_to,
+            expected_source_commit=args.expected_source_commit,
         )
-        if args.expected_source_commit is not None:
-            if not COMMIT_PATTERN.fullmatch(args.expected_source_commit):
-                raise ArtifactError("expected source commit is invalid")
-            if release_payload.get("source_git_commit") != args.expected_source_commit:
-                raise ArtifactError("release source commit does not match expected commit")
-        action = "extracted" if args.extract_to is not None else "validated"
+        action = (
+            "bootstrap-extracted"
+            if args.extract_bootstrap_to is not None
+            else "extracted"
+            if args.extract_to is not None
+            else "validated"
+        )
         print(
             f"Release artifact checksum, layout, and metadata are valid; {action} safely."
         )
