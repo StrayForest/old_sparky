@@ -130,7 +130,6 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_verify_contract.py",
         "platform/tools/platform_test_catalog.py",
         "platform/tools/platform_workflow_input_guard.py",
-        "platform/tools/platform_workflow_remote_dispatch.py",
         "platform/tools/platform_host_tools_bundle.py",
         "platform/tools/platform_validate_release_artifact.py",
         "platform/tests/test_platform_host_tools_bundle.py",

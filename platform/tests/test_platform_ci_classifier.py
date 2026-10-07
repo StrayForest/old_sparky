@@ -1348,8 +1348,10 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "platform/docs/test-suite-governance.md",
             "platform/tests/test_platform_host_tools_bundle.py",
             "platform/tests/test_platform_ci_classifier.py",
+            "platform/tests/test_platform_recovery_bootstrap.py",
             "platform/tools/platform_test_catalog.py",
             "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_production_classifier_artifact.py",
             dispatcher,
         ]
         current_to_candidate = classify(
