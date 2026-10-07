@@ -127,6 +127,14 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             destination.write_bytes(source.read_bytes())
             os.chmod(destination, 0o555 if name.endswith(".sh") else 0o444)
 
+        source_files = runtime.SOURCE_FILES
+        for relative in source_files:
+            source = SCRIPT.parents[1] / relative
+            destination = release / relative
+            destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+            os.chmod(destination, 0o644)
+
         constants = {
             "TRUSTED_ROOT": trusted,
             "PAYLOAD_ROOT": payload_root,
@@ -141,7 +149,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             "RELEASE_LOCK_HELPER_PATH": trusted / "platform_release_lock.sh",
             "MAILBOX_HELPER_PATH": trusted / "platform_live_qa_mailbox_helper.py",
             "SOURCE_TREES": (),
-            "SOURCE_FILES": (),
+            "SOURCE_FILES": source_files,
         }
         with mock.patch.multiple(runtime, **constants), \
             mock.patch.object(runtime, "_require_release_lock"), \
@@ -302,6 +310,32 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         runtime._digest_regular(installed), manifest["files"][relative]
                     )
 
+                # Every direct supervisor/provisioning dependency must be
+                # copied into and recorded by the immutable runtime manifest.
+                launch_members = (
+                    "platform/tools/platform_live_launch_supervisor.sh",
+                    "platform/tools/platform_live_qa_guard.py",
+                    "platform/tools/platform_safe_env_exec.py",
+                    "platform/tools/platform_live_browser_qa.sh",
+                    "platform/tools/platform_provision_live_csp_qa.sh",
+                    "platform/tools/platform_provision_live_csp_qa.py",
+                    "platform/tools/platform_install_live_qa_user.sh",
+                    "platform/tools/platform_release_lock_exec.sh",
+                    "platform/tools/platform_release_lock.sh",
+                    "platform/deploy/apparmor/oldsparky-liveqa-chromium",
+                )
+                for relative in launch_members:
+                    installed = payload / relative
+                    self.assertIn(relative, manifest["files"])
+                    self.assertTrue(installed.is_file(), relative)
+                    expected_mode = 0o555 if relative.endswith(".sh") else 0o444
+                    self.assertEqual(
+                        stat.S_IMODE(installed.stat().st_mode), expected_mode
+                    )
+                    self.assertEqual(
+                        runtime._digest_regular(installed), manifest["files"][relative]
+                    )
+
                 fake_python_target = Path(temporary) / "trusted-python-target"
                 fake_python_target.write_bytes(b"#!/bin/sh\nexit 0\n")
                 os.chmod(fake_python_target, 0o755)
@@ -395,7 +429,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         self.assertEqual(execute_selected(), 2)
                     execve.assert_not_called()
 
-                    # A self-consistent tree with a required member removed
+                    # A self-consistent tree missing the provision wrapper
                     # still fails the installer's required-entrypoint check;
                     # the active safe-env manifest also rejects the changed
                     # generation digest.
@@ -408,7 +442,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         encoding="ascii",
                     )
                     release_json.chmod(0o444)
-                    selected_tool.unlink()
+                    (payload / "platform/tools/platform_provision_live_csp_qa.sh").unlink()
                     changed_digest, changed_files = runtime._tree_digest(payload)
                     changed_manifest = dict(manifest)
                     changed_manifest["payload_tree_sha256"] = changed_digest
