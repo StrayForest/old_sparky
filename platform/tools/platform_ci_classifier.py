@@ -68,6 +68,9 @@ RUNTIME_SENSITIVE_FILES = frozenset(
         "platform/tools/platform_live_qa_guard.py",
         "platform/tools/platform_live_qa_runtime_install.py",
         "platform/tools/platform_validate_release_artifact.py",
+        # The external-load workflow invokes this from the active app release;
+        # changing its cleanup behavior requires a matching app deployment.
+        "platform/tools/platform_workflow_remote_dispatch.py",
         "platform/tests/test_platform_release_build_contract.py",
         "platform/tests/test_platform_live_qa_guard.py",
         "platform/tests/test_platform_live_qa_runtime_install.py",
@@ -192,7 +195,6 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_verify_contract.py",
         "platform/tools/platform_test_catalog.py",
         "platform/tools/platform_workflow_input_guard.py",
-        "platform/tools/platform_workflow_remote_dispatch.py",
         "platform/tools/platform_host_tools_bundle.py",
         "platform/tools/platform_validate_release_artifact.py",
         "platform/tests/test_platform_host_tools_bundle.py",

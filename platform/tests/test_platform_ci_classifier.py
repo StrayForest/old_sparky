@@ -1298,7 +1298,10 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_live_qa_runtime_installer_change_is_deployable_and_runtime_sensitive(self) -> None:
         installer = "platform/tools/platform_live_qa_runtime_install.py"
+        dispatcher = "platform/tools/platform_workflow_remote_dispatch.py"
         self.assertNotIn(installer, RECOVERY_BOOTSTRAP_FILES)
+        self.assertNotIn(dispatcher, RECOVERY_BOOTSTRAP_FILES)
+        self.assertIn(dispatcher, RUNTIME_SENSITIVE_FILES)
 
         manifest = classify(
             [installer],
@@ -1311,6 +1314,75 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertTrue(manifest["deployable"])
         self.assertFalse(manifest["fallback"])
         self.assertTrue(manifest["runtime_sensitive"])
+
+        dispatcher_only = classify(
+            [dispatcher],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(dispatcher_only["class"], "full")
+        self.assertTrue(dispatcher_only["deployable"])
+        self.assertTrue(dispatcher_only["runtime_sensitive"])
+        self.assertEqual(
+            self._run_auto_deploy_manifest_contract(dispatcher_only)[
+                "route_recovery_bootstrap_only"
+            ],
+            "false",
+        )
+
+        dispatcher_and_pin = classify(
+            [dispatcher, "platform/contracts/host_tools_pin.json"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(dispatcher_and_pin["class"], "full")
+        self.assertTrue(dispatcher_and_pin["deployable"])
+        self.assertTrue(dispatcher_and_pin["runtime_sensitive"])
+
+        actual_current_to_candidate = [
+            ".github/workflows/platform-production-autodeploy.yml",
+            "platform/contracts/host_tools_pin.json",
+            "platform/docs/adr/production-host-tools-provisioning.md",
+            "platform/docs/test-suite-governance.md",
+            "platform/tests/test_platform_host_tools_bundle.py",
+            "platform/tests/test_platform_ci_classifier.py",
+            "platform/tools/platform_test_catalog.py",
+            "platform/tools/platform_ci_classifier.py",
+            dispatcher,
+        ]
+        current_to_candidate = classify(
+            actual_current_to_candidate,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(current_to_candidate["class"], "full")
+        self.assertTrue(current_to_candidate["deployable"])
+        self.assertTrue(current_to_candidate["runtime_sensitive"])
+        self.assertEqual(
+            self._run_auto_deploy_manifest_contract(current_to_candidate)[
+                "route_deployable"
+            ],
+            "true",
+        )
+
+        host_only = classify(
+            [
+                "platform/contracts/host_tools_pin.json",
+                "platform/docs/adr/production-host-tools-provisioning.md",
+                "platform/tests/test_platform_host_tools_bundle.py",
+                "platform/tools/platform_test_catalog.py",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(host_only["class"], "full")
+        self.assertFalse(host_only["deployable"])
+        self.assertFalse(host_only["runtime_sensitive"])
+        self.assertEqual(host_only["reason"], RECOVERY_BOOTSTRAP_REASON)
 
     def test_deploy_consumers_validate_the_exact_classifier_artifact(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")

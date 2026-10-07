@@ -246,12 +246,12 @@ trusted-push authority. The exact candidate allowlist is owned by the
 | known `out-of-scope` | `verification-contract` | `false` | never deployable; auto-deploy is a successful no-op |
 | known full candidate-packaging-only path set (candidate workflow/helper, contract test/catalog/verification updates and platform docs) | all first eight gates | `false` | never deployable; trusted pushes are successful CI-only no-ops |
 | exact storage-operations family (diagnostics/maintenance workflow or exact storage-retention skill, plus only its closed classifier/AUTO/recovery-workflow/tests/catalog set and docs) | all first eight gates plus runtime-sensitive gates | `false` | full verification, non-deployable; AUTO takes no-deploy; producer uploads an attested skip receipt; publisher checks exact producer/parent CI evidence and performs no host-bundle or marker action |
-| known `full` application/runtime/migration/release path | all first eight gates | `false` | deployable only for a non-fallback push to current `dev` |
+| known `full` application/runtime/migration/release path (including `platform/tools/platform_workflow_remote_dispatch.py`, invoked by external-load from the active app) | all first eight gates | `false` | deployable only for a non-fallback push to current `dev`; dispatcher changes are runtime-sensitive |
 | unknown or malformed full fallback | all first eight gates | `true` | never deployable; fail-closed verification only |
 
-Host-tools lifecycle files use full-route verification. Candidate-packaging-
-only changes remain non-deployable; a mixed application change follows its
-application path and may deploy on a trusted push.
+Host-tools lifecycle files use full-route verification. Candidate-packaging-only
+changes remain non-deployable; a mixed application change follows its app path
+and may deploy on a trusted push. Host-only pin/bundle/bootstrap remain no-op.
 `platform/contracts/host_tools_pin.json` is the
 single bounded pin contract: application-only changes keep the reviewed
 `HOST_TOOLS_SHA`, while a host-control closure edit must update the pin and its
