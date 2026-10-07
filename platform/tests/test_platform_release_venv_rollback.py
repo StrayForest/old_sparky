@@ -558,149 +558,187 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         (dist_info / "RECORD").write_bytes(record_bytes(payloads, (installed_extra,)))
         (venv / "bin").chmod(0o755)
         temporary_name = ".venv-install-proof-current.A1b2C3"
-        activation = platform_verify_venv_reuse._render_activation_scripts(
-            venv, temporary_name
+        trusted_python = Path("/usr/bin/python3.12")
+        self.assertTrue(trusted_python.is_file())
+        trusted_fixture_script = """
+import importlib.util
+import importlib.machinery
+import marshal
+from pathlib import Path
+import stat
+import sys
+
+module_path = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("platform_verify_venv_reuse", module_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+operation = sys.argv[2]
+if operation == "render":
+    venv = Path(sys.argv[3])
+    activation = module._render_activation_scripts(venv, sys.argv[4])
+    for path, (content, mode) in activation.items():
+        path.write_bytes(content)
+        path.chmod(mode)
+elif operation in {"verify", "verify-no-pip"}:
+    if operation == "verify-no-pip":
+        module._expected_console_scripts = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("unverified pip must not execute")
         )
-        for path, (content, mode) in activation.items():
-            path.write_bytes(content)
-            path.chmod(mode)
+    else:
+        module._expected_console_scripts = lambda *_args: {}
+    try:
+        module._venv_integrity(Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5])
+    except module.ReuseRefused as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(42)
+elif operation in {"timestamp-cache", "hash-cache"}:
+    source = Path(sys.argv[3])
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    source_bytes = source.read_bytes()
+    code = marshal.dumps(module._compile_source(source_bytes, str(source)))
+    if operation == "timestamp-cache":
+        header = (importlib.util.MAGIC_NUMBER + (0).to_bytes(4, "little")
+                  + int(source.stat().st_mtime).to_bytes(4, "little")
+                  + len(source_bytes).to_bytes(4, "little"))
+    else:
+        header = (importlib.util.MAGIC_NUMBER + (3).to_bytes(4, "little")
+                  + importlib.util.source_hash(source_bytes))
+    cache.write_bytes(header + code)
+    cache.chmod(0o644)
+else:
+    raise SystemExit(f"unknown fixture operation: {operation}")
+"""
+        verifier_path = Path(platform_verify_venv_reuse.__file__)
+
+        def run_trusted_fixture(operation: str, *arguments: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    str(trusted_python),
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    trusted_fixture_script,
+                    str(verifier_path),
+                    operation,
+                    *(str(argument) for argument in arguments),
+                ],
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": "/nonexistent",
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8",
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        def assert_reuse_refused(*, no_pip: bool = False) -> None:
+            operation = "verify-no-pip" if no_pip else "verify"
+            result = run_trusted_fixture(operation, venv, wheelhouse, "proof-current")
+            self.assertEqual(result.returncode, 42, result.stderr)
+
+        rendered = run_trusted_fixture("render", venv, temporary_name)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
         for name in ("python", "python3", "python3.12"):
             (venv / "bin" / name).symlink_to("/usr/bin/python3.12")
-        with mock.patch.object(platform_verify_venv_reuse, "_expected_console_scripts", return_value={}):
-            platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
+        verified = run_trusted_fixture("verify", venv, wheelhouse, "proof-current")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
 
-            import importlib.util
-            import marshal
+        import importlib.util
 
-            cache = Path(importlib.util.cache_from_source(str(script_target)))
-            cache.parent.mkdir()
-            cache_source = script_target.read_bytes()
-            cache_header = (
-                importlib.util.MAGIC_NUMBER
-                + (0).to_bytes(4, "little")
-                + int(script_target.stat().st_mtime).to_bytes(4, "little")
-                + len(cache_source).to_bytes(4, "little")
-            )
-            cache.write_bytes(
-                cache_header
-                + marshal.dumps(
-                    platform_verify_venv_reuse._compile_source(
-                        cache_source, str(script_target)
-                    )
-                )
-            )
-            cache.chmod(0o644)
-            platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            cache_bytes = cache.read_bytes()
-            hash_header = (
-                importlib.util.MAGIC_NUMBER
-                + (3).to_bytes(4, "little")
-                + importlib.util.source_hash(cache_source)
-            )
-            cache.write_bytes(
-                hash_header
-                + marshal.dumps(
-                    platform_verify_venv_reuse._compile_source(
-                        cache_source, str(script_target)
-                    )
-                )
-            )
-            platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            cache.write_bytes(cache_bytes)
-            cache.write_bytes(
-                cache_bytes[:12]
-                + (len(cache_source) + 1).to_bytes(4, "little")
-                + cache_bytes[16:]
-            )
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            cache.unlink()
-            cache.parent.rmdir()
+        cache = Path(importlib.util.cache_from_source(str(script_target)))
+        cache_source = script_target.read_bytes()
+        timestamp_cache = run_trusted_fixture("timestamp-cache", script_target)
+        self.assertEqual(timestamp_cache.returncode, 0, timestamp_cache.stderr)
+        verified = run_trusted_fixture("verify", venv, wheelhouse, "proof-current")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        cache_bytes = cache.read_bytes()
+        hash_cache = run_trusted_fixture("hash-cache", script_target)
+        self.assertEqual(hash_cache.returncode, 0, hash_cache.stderr)
+        verified = run_trusted_fixture("verify", venv, wheelhouse, "proof-current")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        cache.write_bytes(cache_bytes)
+        cache.write_bytes(
+            cache_bytes[:12]
+            + (len(cache_source) + 1).to_bytes(4, "little")
+            + cache_bytes[16:]
+        )
+        assert_reuse_refused()
+        cache.unlink()
+        cache.parent.rmdir()
 
-            activation_file = venv / "bin" / "activate"
-            activation_file.write_bytes(activation_file.read_bytes() + b"# changed\n")
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            activation_file.write_bytes(activation[activation_file][0])
+        activation_file = venv / "bin" / "activate"
+        activation_file.write_bytes(activation_file.read_bytes() + b"# changed\n")
+        assert_reuse_refused()
+        restored_activation = run_trusted_fixture("render", venv, temporary_name)
+        self.assertEqual(restored_activation.returncode, 0, restored_activation.stderr)
 
-            rogue_script = venv / "bin" / "unrecorded-script"
-            rogue_script.write_text("#!/bin/sh\nexit 0\n")
-            rogue_script.chmod(0o755)
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            rogue_script.unlink()
+        rogue_script = venv / "bin" / "unrecorded-script"
+        rogue_script.write_text("#!/bin/sh\nexit 0\n")
+        rogue_script.chmod(0o755)
+        assert_reuse_refused()
+        rogue_script.unlink()
 
-            package_dir.chmod(0o700)
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            package_dir.chmod(0o755)
-            source = package_dir / "__init__.py"
-            source.chmod(0o600)
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            source.chmod(0o644)
-            script_target.chmod(0o700)
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            script_target.chmod(0o755)
+        package_dir.chmod(0o700)
+        assert_reuse_refused()
+        package_dir.chmod(0o755)
+        source = package_dir / "__init__.py"
+        source.chmod(0o600)
+        assert_reuse_refused()
+        source.chmod(0o644)
+        script_target.chmod(0o700)
+        assert_reuse_refused()
+        script_target.chmod(0o755)
 
-            alternate_spelling = (
-                "lib/python3.12/site-packages/../../../bin/proof.py",
-                installed_extra[1],
-                installed_extra[2],
-            )
-            (dist_info / "RECORD").write_bytes(record_bytes(payloads, (alternate_spelling,)))
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            duplicate_rows = (installed_extra, alternate_spelling)
-            (dist_info / "RECORD").write_bytes(record_bytes(payloads, duplicate_rows))
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            (dist_info / "RECORD").write_bytes(record_bytes(payloads, (installed_extra,)))
+        alternate_spelling = (
+            "lib/python3.12/site-packages/../../../bin/proof.py",
+            installed_extra[1],
+            installed_extra[2],
+        )
+        (dist_info / "RECORD").write_bytes(record_bytes(payloads, (alternate_spelling,)))
+        assert_reuse_refused()
+        duplicate_rows = (installed_extra, alternate_spelling)
+        (dist_info / "RECORD").write_bytes(record_bytes(payloads, duplicate_rows))
+        assert_reuse_refused()
+        (dist_info / "RECORD").write_bytes(record_bytes(payloads, (installed_extra,)))
 
-            script_target.write_bytes(b"#!" + str(venv / "bin/python").encode() + b"\nprint('changed')\n")
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            script_target.write_bytes(transformed_script)
+        script_target.write_bytes(b"#!" + str(venv / "bin/python").encode() + b"\nprint('changed')\n")
+        assert_reuse_refused()
+        script_target.write_bytes(transformed_script)
 
-            changed = b"VALUE = 'changed'\n"
-            source.write_bytes(changed)
-            record_path = dist_info / "RECORD"
-            changed_files = {**payloads, "proof_pkg/__init__.py": changed}
-            record_path.write_bytes(record_bytes(changed_files))
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
+        changed = b"VALUE = 'changed'\n"
+        source.write_bytes(changed)
+        record_path = dist_info / "RECORD"
+        changed_files = {**payloads, "proof_pkg/__init__.py": changed}
+        record_path.write_bytes(record_bytes(changed_files))
+        assert_reuse_refused()
 
-            source.write_bytes(payloads["proof_pkg/__init__.py"])
-            marker = self.root / "pth-side-effect"
-            malicious_pth = (
-                "import pathlib; pathlib.Path(" + repr(str(marker)) + ").write_text('executed')\n"
-            ).encode()
-            (site / "proof_hook.pth").write_bytes(malicious_pth)
-            changed_files = {**payloads, "proof_hook.pth": malicious_pth}
-            record_path.write_bytes(record_bytes(changed_files))
-            with mock.patch.object(
-                platform_verify_venv_reuse,
-                "_expected_console_scripts",
-                side_effect=AssertionError("unverified pip must not execute"),
-            ):
-                with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                    platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
-            self.assertFalse(marker.exists())
+        source.write_bytes(payloads["proof_pkg/__init__.py"])
+        marker = self.root / "pth-side-effect"
+        malicious_pth = (
+            "import pathlib; pathlib.Path(" + repr(str(marker)) + ").write_text('executed')\n"
+        ).encode()
+        (site / "proof_hook.pth").write_bytes(malicious_pth)
+        changed_files = {**payloads, "proof_hook.pth": malicious_pth}
+        record_path.write_bytes(record_bytes(changed_files))
+        assert_reuse_refused(no_pip=True)
+        self.assertFalse(marker.exists())
 
-            (site / "proof_hook.pth").write_bytes(payloads["proof_hook.pth"])
-            record_path.write_bytes(record_bytes(payloads))
-            source.unlink()
-            source.symlink_to(self.root / "trusted-source.py")
-            (self.root / "trusted-source.py").write_bytes(payloads["proof_pkg/__init__.py"])
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
+        (site / "proof_hook.pth").write_bytes(payloads["proof_hook.pth"])
+        record_path.write_bytes(record_bytes(payloads))
+        source.unlink()
+        source.symlink_to(self.root / "trusted-source.py")
+        (self.root / "trusted-source.py").write_bytes(payloads["proof_pkg/__init__.py"])
+        assert_reuse_refused()
 
-            source.unlink()
-            source.write_bytes(payloads["proof_pkg/__init__.py"])
-            source.chmod(0o4755)
-            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
-                platform_verify_venv_reuse._venv_integrity(venv, wheelhouse, "proof-current")
+        source.unlink()
+        source.write_bytes(payloads["proof_pkg/__init__.py"])
+        source.chmod(0o4755)
+        assert_reuse_refused()
 
     def test_skip_python_deps_publishes_receipt_and_default_rollback_preserves_venv(
         self,

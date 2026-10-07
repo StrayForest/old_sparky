@@ -5255,7 +5255,12 @@ cleanup
         self.assertNotIn("sha256sum -c", install)
         self.assertIn('/usr/bin/python3 -I -m venv "$NEW_VENV_DIR"', install)
         self.assertIn("--no-index", install)
-        self.assertIn('"$venv_dir/bin/python" -I -m pip check', install)
+        self.assertIn(
+            'run_isolated_python "$venv_dir/bin/python" -I -B -m pip check',
+            install,
+        )
+        self.assertIn("/usr/bin/env -i", install)
+        self.assertIn("PIP_CONFIG_FILE=/dev/null", install)
         self.assertIn(
             '--requirement "$RELEASE_DIR/requirements-platform.lock.txt"',
             install,
