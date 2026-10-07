@@ -8,11 +8,13 @@ instead of relying on GitHub's implicit job conclusion propagation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -45,6 +47,7 @@ def _pass_truth_table(state: dict[str, object]) -> bool:
             state["setup_ssh_cleanup_status"] == "0",
             state["load_result"] == "success",
             state["load_status"] == "0",
+            state["candidate_state"] in {"produced", "pending_origin", "timeout_diagnostics"},
             state["report_ready"] == "1",
             state["namespace_barrier_result"] == "success",
             state["namespace_closed_status"] == "0",
@@ -62,6 +65,40 @@ def _pass_truth_table(state: dict[str, object]) -> bool:
             state["candidate_artifact_status"] == "0",
             state["origin_artifact_status"] == "0",
             state["evaluation_status"] == "0",
+            state["acceptance_status"] in {"accepted", "diagnostic_complete"},
+            state["sanitizer_status"] == "0",
+        )
+    )
+
+
+def _evidence_publish_truth_table(state: dict[str, object]) -> bool:
+    return all(
+        (
+            state["validate_result"] == "success",
+            state["setup_result"] == "success",
+            state["setup_status"] == "0",
+            state["setup_ssh_cleanup_status"] == "0",
+            state["load_result"] == "success",
+            state["load_status"] == "0",
+            state["candidate_state"] in {"produced", "pending_origin"},
+            state["report_ready"] == "1",
+            state["namespace_barrier_result"] == "success",
+            state["namespace_closed_status"] == "0",
+            state["manual_barrier_result"] == "success",
+            state["manual_required"] == "0",
+            state["finalize_result"] == "success",
+            state["remote_status"] == "0",
+            state["observer_ready"] == "1",
+            state["finalize_status"] == "0",
+            state["cleanup_status"] == "0",
+            state["cleanup_exports_status"] == "0",
+            state["ssh_cleanup_status"] == "0",
+            state["cleanup_identity_status"] == "0",
+            state["handoff_status"] == "0",
+            state["candidate_artifact_status"] == "0",
+            state["origin_artifact_status"] == "0",
+            state["evaluation_status"] == "0",
+            state["acceptance_status"] in {"accepted", "slo_failed"},
             state["sanitizer_status"] == "0",
         )
     )
@@ -117,6 +154,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "needs.fixture-setup.outputs.ssh_cleanup_status",
             "needs.load-client.result",
             "needs.load-client.outputs.load_status",
+            "needs.load-client.outputs.candidate_state",
             "needs.load-client.outputs.report_ready",
             "needs.namespace-containment-barrier.result",
             "needs.namespace-containment-barrier.outputs.namespace_closed_status",
@@ -135,6 +173,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "steps.verify-evaluator-artifacts.outputs.candidate_artifact_status",
             "steps.verify-evaluator-artifacts.outputs.origin_artifact_status",
             "steps.evaluate-load.outputs.evaluation_status",
+            "steps.evaluate-load.outputs.acceptance_status",
             "steps.sanitize.outputs.sanitizer_status",
         )
         for status in statuses:
@@ -149,6 +188,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "setup_ssh_cleanup_status": "0",
             "load_result": "success",
             "load_status": "0",
+            "candidate_state": "produced",
             "report_ready": "1",
             "namespace_barrier_result": "success",
             "namespace_closed_status": "0",
@@ -166,6 +206,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "candidate_artifact_status": "0",
             "origin_artifact_status": "0",
             "evaluation_status": "0",
+            "acceptance_status": "accepted",
             "sanitizer_status": "0",
         }
         self.assertTrue(_pass_truth_table(passing))
@@ -187,6 +228,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "setup_ssh_cleanup_status": "0",
             "load_result": "success",
             "load_status": "0",
+            "candidate_state": "produced",
             "report_ready": "1",
             "namespace_barrier_result": "success",
             "namespace_closed_status": "0",
@@ -204,6 +246,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "candidate_artifact_status": "0",
             "origin_artifact_status": "0",
             "evaluation_status": "0",
+            "acceptance_status": "accepted",
             "sanitizer_status": "0",
         }
         failed_handoff = dict(passing)
@@ -668,12 +711,125 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         evaluator = self.jobs["evaluate-load"]
         self.assertIn("upstream_ready=0", evaluator)
         self.assertIn('needs.load-client.outputs.report_ready }}\" == 1', evaluator)
-        self.assertNotIn('needs.load-client.outputs.load_status }}\" == 0', evaluator)
+        self.assertIn('payload.get("status") != 0', evaluator)
+        self.assertIn('payload.get("schema") != 2', evaluator)
+        self.assertIn('state == "pending_origin" and raw_status == 3 and timeout_diagnostics == "false"', evaluator)
+        self.assertIn('state == "produced" and raw_status == 0', evaluator)
+        self.assertIn('TIMEOUT_DIAGNOSTICS" != true && "$load_status" == 3', self.jobs["load-client"])
+        self.assertIn('hashlib.sha256(report_file.read_bytes()).hexdigest()', evaluator)
+        self.assertIn("--defer-completed-slo-failure", evaluator)
+        self.assertIn('status == 3', evaluator)
         self.assertIn('needs.fixture-finalize.outputs.cleanup_exports_status }}\" == 0', evaluator)
         publish = evaluator.split("- name: Publish external load evidence", 1)[1]
         self.assertIn("needs.load-client.result == 'success'", publish)
         self.assertIn("steps.evaluate-load.outputs.evaluation_status == '0'", publish)
+        self.assertIn("steps.evaluate-load.outputs.acceptance_status == 'slo_failed'", publish)
         self.assertIn("steps.sanitize.outputs.sanitizer_status == '0'", publish)
+        final_gate = evaluator.split(
+            "- name: Enforce external load and exact cleanup gates", 1
+        )[1]
+        self.assertIn('if [[ "$acceptance_status" == slo_failed ]]', final_gate)
+        self.assertIn("sanitized evidence was published", final_gate)
+
+        completed_slo_miss = {
+            "validate_result": "success",
+            "setup_result": "success",
+            "setup_status": "0",
+            "setup_ssh_cleanup_status": "0",
+            "load_result": "success",
+            "load_status": "0",
+            "candidate_state": "pending_origin",
+            "report_ready": "1",
+            "namespace_barrier_result": "success",
+            "namespace_closed_status": "0",
+            "manual_barrier_result": "success",
+            "manual_required": "0",
+            "finalize_result": "success",
+            "remote_status": "0",
+            "observer_ready": "1",
+            "finalize_status": "0",
+            "cleanup_status": "0",
+            "cleanup_exports_status": "0",
+            "ssh_cleanup_status": "0",
+            "cleanup_identity_status": "0",
+            "handoff_status": "0",
+            "candidate_artifact_status": "0",
+            "origin_artifact_status": "0",
+            "evaluation_status": "0",
+            "acceptance_status": "slo_failed",
+            "sanitizer_status": "0",
+        }
+        # A completed budget miss is publishable evidence, but the final
+        # enforcement truth table remains red after publication.
+        self.assertFalse(_pass_truth_table(completed_slo_miss))
+        self.assertTrue(_evidence_publish_truth_table(completed_slo_miss))
+        self.assertEqual(completed_slo_miss["acceptance_status"], "slo_failed")
+        failed_cleanup = dict(completed_slo_miss)
+        failed_cleanup["cleanup_status"] = "1"
+        self.assertFalse(_evidence_publish_truth_table(failed_cleanup))
+
+        evaluate_script = _step_script(
+            self.jobs["evaluate-load"], "Evaluate checked-out load report"
+        )
+        receipt_verifier = re.search(
+            r"<<'PY'\n(.*?)\nPY", evaluate_script, re.DOTALL
+        )
+        self.assertIsNotNone(receipt_verifier)
+        assert receipt_verifier is not None
+        with tempfile.TemporaryDirectory(prefix="load-receipt-contract-") as temp:
+            root = Path(temp)
+            report = root / "report.json"
+            receipt = root / "load-status.json"
+            report_bytes = b'{"schema":2,"candidate":true}\n'
+            report.write_bytes(report_bytes)
+            payload = {
+                "schema": 2,
+                "status": 0,
+                "client_exit_status": 3,
+                "candidate_state": "pending_origin",
+                "report_ready": True,
+                "target_sha": "a" * 40,
+                "run_id": "12345",
+                "run_attempt": "1",
+                "profile_id": "authenticated-page-load-v1",
+                "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+            }
+
+            def verify(*, timeout: str = "false", text: str | None = None) -> subprocess.CompletedProcess[str]:
+                receipt.write_text(
+                    text if text is not None else json.dumps(payload),
+                    encoding="utf-8",
+                )
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        receipt_verifier.group(1),
+                        str(receipt),
+                        str(report),
+                        payload["target_sha"],
+                        payload["run_id"],
+                        payload["run_attempt"],
+                        payload["profile_id"],
+                        timeout,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            self.assertEqual(verify().returncode, 0)
+            self.assertNotEqual(verify(timeout="true").returncode, 0)
+            self.assertNotEqual(
+                verify(text=json.dumps({**payload, "client_exit_status": 1})).returncode,
+                0,
+            )
+            self.assertNotEqual(
+                verify(text=json.dumps(payload)[:-1] + ',"schema":2}').returncode,
+                0,
+            )
+            report.write_bytes(report_bytes + b"tampered")
+            self.assertNotEqual(verify().returncode, 0)
 
     def test_cleanup_exports_and_projection_are_failure_bearing(self) -> None:
         finalizer = self.jobs["fixture-finalize"]

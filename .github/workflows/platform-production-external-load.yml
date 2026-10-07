@@ -694,6 +694,7 @@ jobs:
       contents: read
     outputs:
       load_status: ${{ steps.external-evaluate.outputs.load_status }}
+      candidate_state: ${{ steps.external-evaluate.outputs.candidate_state }}
       report_ready: ${{ steps.external-evaluate.outputs.report_ready }}
       candidate_artifact_id: ${{ steps.publish-candidate.outputs.artifact-id }}
       candidate_artifact_digest: ${{ steps.publish-candidate.outputs.artifact-digest }}
@@ -916,6 +917,7 @@ jobs:
           load_log="$artifact_dir/client-raw.log"
           load_args=(/usr/bin/python3 platform/tools/platform_load.py run --profile "$PROFILE_ID" --manifest "$RUNNER_TEMP/external-manifest/manifest.json" --report-path "$load_report")
           if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then load_args+=(--timeout-diagnostics-run-id "$GITHUB_RUN_ID"); fi
+          if [[ "$TIMEOUT_DIAGNOSTICS" != true ]]; then load_args+=(--defer-pending-origin); fi
           if [[ "$profile_status" == 0 ]]; then
             set +e
             run_checked_out_client "${load_args[@]}" > "$load_log" 2>&1
@@ -929,7 +931,16 @@ jobs:
           # never coupled to the client exit code.
           if [[ -s "$load_report" ]]; then report_ready=1; fi
           chmod 600 "$load_report" "$load_log" 2>/dev/null || true
-          printf '%s\n' "$load_status" > "$artifact_dir/load-status"
+          client_exit_status="$load_status"
+          candidate_state=failed
+          if [[ "$TIMEOUT_DIAGNOSTICS" == true && "$load_status" == 0 ]]; then
+            candidate_state=timeout_diagnostics
+          elif [[ "$load_status" == 0 ]]; then
+            candidate_state=produced
+          elif [[ "$TIMEOUT_DIAGNOSTICS" != true && "$load_status" == 3 && "$report_ready" == 1 ]]; then
+            candidate_state=pending_origin
+            load_status=0
+          fi
           if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then
             if [[ ! -s "$load_report" ]]; then
               load_status=1
@@ -958,21 +969,28 @@ jobs:
           else
             printf '%s\n' "{\"schema\":1,\"target_sha\":\"$TARGET_SHA\",\"run_id\":\"$GITHUB_RUN_ID\",\"ids\":[]}" > "$artifact_dir/timeout-diagnostic-ids.json"
           fi
-          /usr/bin/python3 - "$artifact_dir/load-status.json" "$load_status" "$report_ready" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          /usr/bin/python3 - "$artifact_dir/load-status.json" "$load_status" "$client_exit_status" "$candidate_state" "$report_ready" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$load_report" <<'PY'
           import json
+          import hashlib
           from pathlib import Path
           import sys
 
-          destination, status, report_ready, target_sha, run_id, attempt = sys.argv[1:]
+          destination, status, client_exit, state, report_ready, target_sha, run_id, attempt, profile_id, report_path = sys.argv[1:]
+          report = Path(report_path)
+          report_digest = hashlib.sha256(report.read_bytes()).hexdigest() if report_ready == "1" and report.is_file() and not report.is_symlink() else None
           Path(destination).write_text(
               json.dumps(
                   {
-                      "schema": 1,
+                      "schema": 2,
                       "status": int(status),
+                      "client_exit_status": int(client_exit),
+                      "candidate_state": state,
                       "report_ready": report_ready == "1",
                       "target_sha": target_sha,
                       "run_id": run_id,
                       "run_attempt": attempt,
+                      "profile_id": profile_id,
+                      "report_sha256": report_digest,
                   },
                   sort_keys=True,
               )
@@ -982,6 +1000,7 @@ jobs:
           PY
           chmod 600 "$artifact_dir/load-status.json"
           echo "load_status=$load_status" >> "$GITHUB_OUTPUT"
+          echo "candidate_state=$candidate_state" >> "$GITHUB_OUTPUT"
           echo "report_ready=$report_ready" >> "$GITHUB_OUTPUT"
           exit "$load_status"
       - name: Publish candidate load data
@@ -2015,6 +2034,7 @@ jobs:
           load_status_file="$RUNNER_TEMP/external-client/load-status.json"
           observer="$RUNNER_TEMP/external-evidence/server-observability.json"
           status=1
+          acceptance_status=invalid
           upstream_ready=0
           if [[ "${{ needs.validate-external-inputs.result }}" == success \
             && "${{ needs.fixture-setup.result }}" == success \
@@ -2036,15 +2056,59 @@ jobs:
             && "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" == 0 \
             && "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" == 0 \
             && -s "$report" && -s "$load_status_file" && -s "$observer" ]]; then
-            if /usr/bin/python3 - "$load_status_file" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+            if /usr/bin/python3 - "$load_status_file" "$report" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$TIMEOUT_DIAGNOSTICS" <<'PY'
+          import hashlib
           import json
+          import os
           from pathlib import Path
+          import re
           import sys
 
-          path, target_sha, run_id, attempt = sys.argv[1:]
-          payload = json.loads(Path(path).read_text(encoding="utf-8"))
-          expected = {"schema", "status", "report_ready", "target_sha", "run_id", "run_attempt"}
-          if set(payload) != expected or payload.get("schema") != 1 or payload.get("report_ready") is not True or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id or payload.get("run_attempt") != attempt:
+          class DuplicateKey(ValueError):
+              pass
+          def closed_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise DuplicateKey("duplicate receipt field")
+                  result[key] = value
+              return result
+
+          path, report_path, target_sha, run_id, attempt, profile_id, timeout_diagnostics = sys.argv[1:]
+          receipt_path = Path(path)
+          report_file = Path(report_path)
+          receipt_stat = receipt_path.lstat()
+          report_stat = report_file.lstat()
+          if not os.path.isfile(receipt_path) or receipt_path.is_symlink() or not os.path.isfile(report_file) or report_file.is_symlink():
+              raise SystemExit("candidate receipt or report is not a regular file")
+          if receipt_stat.st_nlink != 1 or report_stat.st_nlink != 1:
+              raise SystemExit("candidate receipt or report link count is invalid")
+          payload = json.loads(receipt_path.read_text(encoding="utf-8"), object_pairs_hook=closed_object)
+          expected = {"schema", "status", "client_exit_status", "candidate_state", "report_ready", "target_sha", "run_id", "run_attempt", "profile_id", "report_sha256"}
+          if (
+              not isinstance(payload, dict)
+              or set(payload) != expected
+              or type(payload.get("schema")) is not int or payload.get("schema") != 2
+              or type(payload.get("status")) is not int or payload.get("status") != 0
+              or type(payload.get("client_exit_status")) is not int
+              or payload.get("report_ready") is not True
+              or payload.get("target_sha") != target_sha
+              or payload.get("run_id") != run_id
+              or payload.get("run_attempt") != attempt
+              or payload.get("profile_id") != profile_id
+              or not isinstance(payload.get("report_sha256"), str)
+              or re.fullmatch(r"[0-9a-f]{64}", payload["report_sha256"]) is None
+          ):
+              raise SystemExit("authoritative load-status is not bound to this run")
+          if hashlib.sha256(report_file.read_bytes()).hexdigest() != payload["report_sha256"]:
+              raise SystemExit("candidate report digest does not match its receipt")
+          state, raw_status = payload["candidate_state"], payload["client_exit_status"]
+          valid_state = (
+              (state == "pending_origin" and raw_status == 3 and timeout_diagnostics == "false")
+              or (state == "produced" and raw_status == 0 and timeout_diagnostics == "false")
+              or (state == "timeout_diagnostics" and raw_status == 0 and timeout_diagnostics == "true")
+          )
+          if not valid_state:
               raise SystemExit("authoritative load-status is not bound to this run")
           PY
             then upstream_ready=1; fi
@@ -2055,12 +2119,22 @@ jobs:
               /usr/bin/python3 platform/tools/platform_timeout_diagnostics.py --client-report "$report" --server-observability "$observer" --output "$RUNNER_TEMP/external-evidence/timeout-diagnostics.json"
               status="$?"
             else
-              /usr/bin/python3 platform/tools/platform_load.py evaluate --profile "$PROFILE_ID" --report "$report" --server-observability "$observer"
+              /usr/bin/python3 platform/tools/platform_load.py evaluate --profile "$PROFILE_ID" --report "$report" --server-observability "$observer" --defer-completed-slo-failure
               status="$?"
             fi
             set -e
+            if [[ "$TIMEOUT_DIAGNOSTICS" == true && "$status" == 0 ]]; then
+              acceptance_status=diagnostic_complete
+            elif [[ "$TIMEOUT_DIAGNOSTICS" != true && "$status" == 0 ]]; then
+              acceptance_status=accepted
+            elif [[ "$TIMEOUT_DIAGNOSTICS" != true && "$status" == 3 ]]; then
+              status=0
+              acceptance_status=slo_failed
+            fi
           fi
+          if [[ "$upstream_ready" != 1 ]]; then acceptance_status=invalid; fi
           echo "evaluation_status=$status" >> "$GITHUB_OUTPUT"
+          echo "acceptance_status=$acceptance_status" >> "$GITHUB_OUTPUT"
           exit 0
       - name: Sanitize external evidence
         id: sanitize
@@ -2155,6 +2229,7 @@ jobs:
           steps.verify-evaluator-artifacts.outputs.candidate_artifact_status == '0' &&
           steps.verify-evaluator-artifacts.outputs.origin_artifact_status == '0' &&
           steps.evaluate-load.outputs.evaluation_status == '0' &&
+          (steps.evaluate-load.outputs.acceptance_status == 'accepted' || steps.evaluate-load.outputs.acceptance_status == 'slo_failed' || steps.evaluate-load.outputs.acceptance_status == 'diagnostic_complete') &&
           steps.sanitize.outputs.sanitizer_status == '0'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -2181,6 +2256,8 @@ jobs:
           test "${{ needs.fixture-setup.outputs.ssh_cleanup_status }}" = 0 || { echo "Fixture-setup SSH cleanup failed." >&2; exit 1; }
           test "${{ needs.load-client.result }}" = success || { echo "External load-client job failed." >&2; exit 1; }
           test "${{ needs.load-client.outputs.load_status }}" = 0 || { echo "Authoritative external load-status failed." >&2; exit 1; }
+          candidate_state="${{ needs.load-client.outputs.candidate_state }}"
+          case "$candidate_state" in produced|pending_origin|timeout_diagnostics) ;; *) echo "Candidate-production state is invalid." >&2; exit 1 ;; esac
           test "${{ needs.load-client.outputs.report_ready }}" = 1 || { echo "External load report is missing." >&2; exit 1; }
           test "${{ needs.namespace-containment-barrier.result }}" = success || { echo "Namespace containment barrier job failed." >&2; exit 1; }
           test "${{ needs.namespace-containment-barrier.outputs.namespace_closed_status }}" = 0 || { echo "namespace_closed is not proven; cleanup is blocked and manual emergency handling is required." >&2; exit 1; }
@@ -2200,3 +2277,9 @@ jobs:
           test "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" = 0 || { echo "Evaluator origin artifact identity/digest failed." >&2; exit 1; }
           test "${{ steps.evaluate-load.outputs.evaluation_status }}" = 0 || { echo "External load acceptance failed." >&2; exit 1; }
           test "${{ steps.sanitize.outputs.sanitizer_status }}" = 0 || { echo "External evidence projection/sanitizer failed." >&2; exit 1; }
+          acceptance_status="${{ steps.evaluate-load.outputs.acceptance_status }}"
+          if [[ "$acceptance_status" == slo_failed ]]; then
+            echo "External load completed with a profile-budget SLO miss; sanitized evidence was published." >&2
+            exit 1
+          fi
+          case "$acceptance_status" in accepted|diagnostic_complete) ;; *) echo "External-load final acceptance state is invalid." >&2; exit 1 ;; esac

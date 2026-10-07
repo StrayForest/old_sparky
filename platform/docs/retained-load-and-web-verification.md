@@ -47,15 +47,19 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | Boundary | Passing value |
 | --- | --- |
 | dispatch, setup and load-client jobs | job result `success`; setup `setup_status=0` |
-| measured load | closed report present; a non-zero client status is retained as failed evidence and cannot pass evaluation |
+| candidate production | schema-2 receipt binds source/run/attempt/profile and exact report digest; `pending_origin` is accepted only for the load tool's reserved exit 3 after closed worker/namespace/binding checks |
 | remote/finalization | `remote_status=0`, `observer_ready=1`, `finalize_status=0` |
 | cleanup/export cleanup | `cleanup_status=0`, `cleanup_exports_status=0` |
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
-| evaluation/projection | `evaluation_status=0`, `sanitizer_status=0` |
+| evaluation/projection | observer-bound accepted result or a structurally complete profile-budget miss; `sanitizer_status=0` |
 
-The evidence artifact is published only after every row passes; missing or
-mismatched artifacts and remote, projection, sanitizer or cleanup failures
-cannot be hidden by the evaluator.
+The candidate receipt is not an acceptance result. The independent evaluator
+validates its exact schema and report digest, then binds the origin observer and
+decides the measured profile. A complete result whose only failures are
+profile-owned budgets publishes the sanitized measurement artifact and leaves
+the overall workflow failed. Missing or mismatched receipts, invalid or
+incomplete measurements, observer failures, and remote, projection, sanitizer
+or cleanup failures remain hard failures and cannot be hidden by the evaluator.
 
 The measured client is supervised in a mandatory Linux PID namespace. The only
 privileged chain is the absolute system path `/usr/bin/sudo -n
