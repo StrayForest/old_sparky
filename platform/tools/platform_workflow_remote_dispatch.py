@@ -1663,15 +1663,15 @@ def main(argv: list[str] | None = None) -> int:
                 [
                     DELETE_CONFIRMATION,
                     payload["target_sha"],
-                    payload["run_id"],
-                    payload["run_id"],
+                    payload["load_run_id"],
+                    payload["cleanup_run_id"],
                 ],
                 control_email=payload["control_email"],
             )
         if arguments == ["external-cleanup-exports"]:
             return _remove_exports(
-                load_run_id=payload["run_id"],
-                cleanup_run_id=payload["run_id"],
+                load_run_id=payload["load_run_id"],
+                cleanup_run_id=payload["cleanup_run_id"],
                 target_sha=payload["target_sha"],
             )
         if arguments == ["production-prepare-artifact"]:
