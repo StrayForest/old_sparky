@@ -1594,7 +1594,7 @@ jobs:
           projection_status=1
           install -d -m 700 "$artifact_dir"
           cleanup_summary="$artifact_dir/cleanup-summary.json"
-          canonical_raw="$artifact_dir/cleanup-canonical.raw"
+          cleanup_canonical="$artifact_dir/cleanup-canonical.log"
           ssh_output_file="$artifact_dir/cleanup-ssh-output"
 
           project_cleanup_summary() {
@@ -1712,13 +1712,13 @@ jobs:
               chmod 600 "$cleanup_summary"
             fi
 
-            rm -f -- "$canonical_raw"
+            rm -f -- "$cleanup_canonical"
             scp -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes \
               -i "$ssh_dir/id_ed25519" \
               "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/canonical.log" \
-              "$canonical_raw" >/dev/null 2>&1
+              "$cleanup_canonical" >/dev/null 2>&1
             canonical_copy_status="$?"
-            [[ "$canonical_copy_status" == 0 && -s "$canonical_raw" ]] || canonical_copy_status=1
+            [[ "$canonical_copy_status" == 0 && -s "$cleanup_canonical" ]] || canonical_copy_status=1
             if [[ "$summary_copy_status" == 0 && "$projection_status" == 0 \
               && "$canonical_copy_status" == 0 && -s "$cleanup_summary" ]]; then
               cleanup_artifact_status=0
