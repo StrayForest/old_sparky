@@ -23,13 +23,11 @@ release-root `wheelhouse/` tree and
 extraction. The complete archive and checksum remain unchanged; the candidate
 deploy helper performs the normal full release extraction later.
 
-The reviewed generation is **C2**
-[`382e2b93a69e0352a70feea474f33559f34d28b0`](https://github.com/StrayForest/old_sparky/commit/382e2b93a69e0352a70feea474f33559f34d28b0).
-Pin-only **P3**
-[`13e635a7d8cb1c5d5c00bbcffca34af1f547e28f`](https://github.com/StrayForest/old_sparky/commit/13e635a7d8cb1c5d00bbcffca34af1f547e28f)
-binds the exact ordered 14-member host-tools closure to C2, including the
-validator and supervisor digests. The canonical resolver proves that C2 is an
-ancestor of P3 and verifies the closure paths, source modes and hashes.
+The [host-tools provisioning ADR](production-host-tools-provisioning.md)
+records the current C2/P3 generation and owns its pin, exact closure and
+provisioning history. The canonical resolver verifies the closure paths,
+source modes, hashes and ancestry; this decision record owns only the
+bootstrap extraction behavior.
 
 ## Consequences
 
