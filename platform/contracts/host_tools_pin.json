@@ -16,11 +16,6 @@
       "sha256": "19ed032a7924144a40f7c40f494810ce6ea7b823cd510c4f568c1d0de3c38e45"
     },
     {
-      "mode": 420,
-      "path": "platform/tools/platform_retained_load_export_executor.py",
-      "sha256": "2d499f8cd41939f7664c17119391447595ee6cdd2960a183735b991ee09a75e0"
-    },
-    {
       "mode": 493,
       "path": "platform/tools/platform_production_deploy_supervisor.sh",
       "sha256": "6910e024ee041f2a2f0675bcd7315661a8555e673c7bd1556a05dfa4ab0d7834"
@@ -56,19 +51,24 @@
       "sha256": "21fbb3154982cf508df6974c40323ac44f044e1ea20f022b94a151d613ab82cf"
     },
     {
+      "mode": 420,
+      "path": "platform/tools/platform_configure_shared_env.py",
+      "sha256": "c7f263b5973fb22fa56f5b15dc957fb1bfa90c9d9155e04492e16d3b668784b3"
+    },
+    {
       "mode": 493,
       "path": "platform/tools/platform_update_cloudflare_ips.py",
       "sha256": "41b68ecdb58e767554483c9db4032a7d8b150861d32d1cbed7a2afb3f57c3e4e"
     },
     {
       "mode": 420,
-      "path": "platform/tools/platform_configure_shared_env.py",
-      "sha256": "c7f263b5973fb22fa56f5b15dc957fb1bfa90c9d9155e04492e16d3b668784b3"
+      "path": "platform/tools/platform_storage_evidence_summary.py",
+      "sha256": "2fe2c8ebfdea6f24ee6d7c7e1a4539a88fdc70449c66cc50eedf9caab3ae2ebf"
     },
     {
       "mode": 420,
-      "path": "platform/tools/platform_storage_evidence_summary.py",
-      "sha256": "2fe2c8ebfdea6f24ee6d7c7e1a4539a88fdc70449c66cc50eedf9caab3ae2ebf"
+      "path": "platform/tools/platform_retained_load_export_executor.py",
+      "sha256": "2d499f8cd41939f7664c17119391447595ee6cdd2960a183735b991ee09a75e0"
     }
   ],
   "host_tools_sha": "032f3879876ab9501b36336219e4d09b95db26b0",
