@@ -73,6 +73,10 @@ tools/platform_release_preflight.sh \
 
 Do not print the shared environment. Use `--skip-python-deps` only after
 dependency compatibility has been verified against the existing shared venv.
+Normal installs reuse it only after the root verifier proves release and
+transaction identities, dependency and wheelhouse bytes, interpreter ABI,
+installed records/scripts/bytecode, `pip check` and exact freeze; any mismatch
+uses the offline rebuild and full rollback snapshot.
 That mode now publishes a root-only rollback receipt containing the exact
 pre-install release target, an `unchanged` transition marker and the accepted
 artifact-freeze digest. A normal rollback then proves the shared venv still

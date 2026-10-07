@@ -104,31 +104,7 @@ to `dev`. The chain is:
    `workflow_run.run_attempt` may be absent, the secret-free builder resolves
    the exact attempt through GitHub's authoritative attempt endpoint.
    The one-time out-of-band provisioning and rollback procedure is the owner of
-   [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
-
-### Shared Python environment and managed LiveQA runtime
-
-The installer may reuse the current shared Python environment only when its
-root-only verifier proves the exact current, previous, candidate and active
-install-transaction identities; unchanged requirements, lock, freeze and
-wheelhouse bytes; the pinned interpreter and ABI; wheel `RECORD` contents,
-generated scripts and bytecode; and successful `pip check` plus exact freeze.
-The verifier runs in the normal install path. Any missing or mismatched proof
-falls through to the existing offline venv build and full rollback snapshot.
-The operator-only `--skip-python-deps` option remains a separate explicit
-path and must not be used to bypass a failed proof.
-
-The managed LiveQA artifact contains its source suite and an exact reference
-to an immutable engine provider already protected by a current, previous or
-transitively referenced release. Provider validation checks the recorded
-file map and digest; retention follows those references before removing a
-generation. For a trusted browser run, the runner exposes the validated suite
-and engine through fixed read-only bind paths private to the collected
-transient systemd unit. It leaves host permissions and the root-private source
-tree unchanged. After collection and process-idle checks, cleanup removes only
-the exact empty aliases created for that unit; an unproven cleanup leaves the
-aliases for recovery. The [CSP and live-QA runbook](csp-live-qa-runbook.md)
-owns the browser and user-QA procedures.
+   [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md). Shared-venv reuse and managed LiveQA runtime procedures are in the [CSP and live-QA runbook](csp-live-qa-runbook.md).
 
 ### Recovery-bootstrap baseline reconciliation
 

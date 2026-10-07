@@ -90,6 +90,11 @@ limits both retained status bytes and total stream bytes, and verifies process
 group closure before reporting completion. Signed provisioning and the
 installed-generation self-test for C are required before this generation is
 used.
+The compact Live QA runtime and shared-venv verifier candidate uses **C**
+`032f3879876ab9501b36336219e4d09b95db26b0` and pin-only **P**
+`55f52c871055b75847b9b884e168d01c8385b5bc` with the exact canonical 14-member closure. Exact-P full CI and
+out-of-band provisioning remain pending; this source pin does not establish
+that the generation is installed or active in production.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable

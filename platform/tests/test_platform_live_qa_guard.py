@@ -1227,7 +1227,7 @@ class LiveQaGuardTests(unittest.TestCase):
                 self.assertEqual(values[:3], (source_sha, provider_sha, "abcdefgh"))
                 suite = cache / f"runtime-suite-{source_sha}-abcdefgh"
                 engine = cache / f"runtime-engine-{provider_sha}-abcdefgh"
-                for target, identity in zip(suite_engine := (suite, engine), values[3:], strict=True):
+                for target, identity in zip((suite, engine), values[3:], strict=True):
                     metadata = target.lstat()
                     self.assertTrue(stat.S_ISDIR(metadata.st_mode))
                     self.assertEqual((metadata.st_uid, metadata.st_gid), (0, 0))
