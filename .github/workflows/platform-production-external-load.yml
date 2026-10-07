@@ -1899,7 +1899,7 @@ jobs:
           retention-days: 1
 
       - name: Publish closed cleanup failure diagnostic
-        if: ${{ always() && steps.diagnose-origin.outcome == 'success' && steps.diagnose-origin.outputs.explicit_conditions_met == 'no' }}
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.diagnose-origin.outcome == 'success' && steps.diagnose-origin.outputs.explicit_conditions_met == 'no' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-production-external-load-cleanup-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}

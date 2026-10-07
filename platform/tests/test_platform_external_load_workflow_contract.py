@@ -771,6 +771,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             if step.get("name") == "Publish closed cleanup failure diagnostic"
         )
         self.assertIn("always()", diagnostic_upload["if"])
+        self.assertIn("steps.cleanup_ssh.outcome == 'success'", diagnostic_upload["if"])
         self.assertIn("explicit_conditions_met == 'no'", diagnostic_upload["if"])
         self.assertIn("cleanup-diagnostic.json", diagnostic_upload["with"]["path"])
         self.assertIn("retention-days: 1", self.source)
