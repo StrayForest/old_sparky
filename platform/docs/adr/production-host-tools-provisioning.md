@@ -95,6 +95,12 @@ The compact Live QA runtime and shared-venv verifier candidate uses **C**
 `55f52c871055b75847b9b884e168d01c8385b5bc` with the exact canonical 14-member closure. Exact-P full CI and
 out-of-band provisioning remain pending; this source pin does not establish
 that the generation is installed or active in production.
+The complete-archive, space-bounded bootstrap extraction follow-up uses **C2**
+`382e2b93a69e0352a70feea474f33559f34d28b0` and pin-only **P3**
+`13e635a7d8cb1c5d5c00bbcffca34af1f547e28f`, with the exact ordered
+14-member closure. Exact-P full CI, signed provisioning and the installed
+self-test remain required; these source commits do not establish production
+installation or activation.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
