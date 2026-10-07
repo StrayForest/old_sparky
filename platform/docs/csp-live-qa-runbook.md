@@ -227,11 +227,21 @@ gh workflow run platform-live-launch.yml \
 
 The dedicated `oldsparky-liveqa` system account has `/nonexistent` as its home,
 `/usr/sbin/nologin` as its shell, its same-named non-root primary group and no
-supplementary groups. Never substitute `oldsparky` or `oldsparky-platform`:
-those identities own deployment or production-runtime paths. The trusted
-supervisor consumes only the active release-bound generation; it checks the
-active `current/RELEASE.json` source commit before starting and refuses any
-candidate-provided path that is not digest-bound by the installed manifest.
+supplementary groups. `oldsparky-platform` must exist because it owns platform
+runtime paths. The legacy `oldsparky` identity may be absent; when present, it
+remains reserved and must not collide with the dedicated LiveQA UID or GID.
+The trusted supervisor consumes only the active release-bound generation; it
+checks the active `current/RELEASE.json` source commit before starting and
+refuses any candidate-provided path that is not digest-bound by the installed
+manifest.
+
+The supervisor suppresses ordinary installer, identity and browser output.
+Its only protocol output is one fixed `LIVE_LAUNCH_STATUS` line bound to the
+requested source SHA and the supervisor exit status. The dispatcher accepts
+success only for a complete browser run with exit status zero; an absent,
+duplicate, malformed or mismatched line fails closed. The workflow publishes
+only the closed stage/status projection and never persists SSH stderr or raw
+child output as the browser report.
 
 The same installer loads two named AppArmor profiles granting `userns` only to
 the checksum-pinned Chromium and headless-shell revision paths below the

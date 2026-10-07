@@ -18,6 +18,29 @@ base_url="$1"
 provision="$2"
 marker="$3"
 target_sha="$4"
+launch_stage="validation"
+# Keep the remote protocol on a dedicated descriptor.  Every ordinary
+# diagnostic and child output is discarded; the dispatcher accepts only this
+# one fixed, source-bound line.
+exec 3>&1
+exec >/dev/null 2>&1
+emit_launch_status() {
+  local exit_code="$1"
+  local status="failed"
+  local stage="$launch_stage"
+  if [[ "$exit_code" == "0" ]]; then
+    status="passed"
+    stage="complete"
+  fi
+  if [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] \
+    && [[ "$exit_code" =~ ^[0-9]{1,3}$ ]] \
+    && (( exit_code <= 255 )); then
+    printf 'LIVE_LAUNCH_STATUS schema=1 status=%s stage=%s child_exit=%s source_sha=%s\n' \
+      "$status" "$stage" "$exit_code" "$target_sha" >&3 || true
+  fi
+}
+trap 'launch_exit=$?; trap - EXIT; emit_launch_status "$launch_exit"' EXIT
+
 EXPECTED_ORIGIN="https://old-sparky.com"
 INSTALL_ROOT="${PLATFORM_LIVE_QA_INSTALL_ROOT:-}"
 TOOLS_DIR="$INSTALL_ROOT/platform/tools"
@@ -51,6 +74,7 @@ case "$provision" in
     ;;
 esac
 
+launch_stage="trusted_generation"
 for path in \
   "$INSTALL_ROOT" \
   "$INSTALL_ROOT/platform" \
@@ -113,7 +137,7 @@ if qa_user is None:
     failures.append("user_missing")
 if qa_group is None:
     failures.append("group_missing")
-required = ("oldsparky", "oldsparky-platform")
+required = ("oldsparky-platform",)
 for name in required:
     if users.get(name) is None:
         failures.append(f"{name}_user_missing")
@@ -166,9 +190,11 @@ if failures:
 PY
 }
 
+launch_stage="identity"
 identity_report
 
 if [[ "$provision" == "true" ]]; then
+  launch_stage="account_install"
   # Account/profile installation is idempotent and is part of the launch
   # signal.  The profile is copied into the generation as a reviewed source.
   env -i \
@@ -190,6 +216,7 @@ if [[ "$provision" == "true" ]]; then
     fi
   done
 
+  launch_stage="provision"
   env -i \
     HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     PLATFORM_APP_DIR=/opt/oldsparky/platform \
@@ -205,6 +232,7 @@ fi
 # Browser QA receives only the fixed public origin and installed generation
 # identity. It reads the root-only bundle through the reviewed guard and does
 # not receive credentials in its environment or command line.
+launch_stage="browser_qa"
 env -i \
   HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
   PLATFORM_APP_DIR=/opt/oldsparky/platform \
@@ -213,5 +241,3 @@ env -i \
   PLATFORM_LIVE_QA_TARGET_SHA="$target_sha" \
   PLAYWRIGHT_LIVE_BASE_URL="$base_url" \
   "$TOOLS_DIR/platform_live_browser_qa.sh" public
-
-echo "LIVE_BROWSER_QA_SUCCESS source_commit=$target_sha"
