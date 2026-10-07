@@ -60,7 +60,9 @@ workflow run ID and source SHA. The metadata's `sha256:` digest must be exactly
 64 lowercase hexadecimal characters and must match the downloaded ZIP bytes;
 missing metadata or any mismatch fails closed. Consumers do not depend on
 cross-job digest outputs, which Actions may suppress when a value is treated as
-secret-like.
+secret-like. Every verifier receives its SHA from that job's declared source
+identity; the evaluator uses `SOURCE_GIT_SHA` for both artifact metadata and
+the candidate receipt binding.
 
 The candidate receipt is not an acceptance result. The independent evaluator
 validates its exact schema and report digest, then binds the origin observer and
