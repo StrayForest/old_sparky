@@ -127,6 +127,8 @@ WORKER_SCRIPT = textwrap.dedent(
         time.sleep(60)
     if mode == 'hang':
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if 'started_file' in config:
+            Path(config['started_file']).write_text('started', encoding='ascii')
     if mode == 'external-term':
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         time.sleep(60)
@@ -650,19 +652,38 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             root = Path(directory)
             script = root / 'worker.py'
             script.write_text(WORKER_SCRIPT)
+            # These historical phase labels provide separate report paths only;
+            # WORKER_SCRIPT is a synthetic sleeper, not a DNS/connect/header/body
+            # integration fixture. The test-only deadline leaves room for the
+            # five-second namespace probe, worker startup, and bounded teardown.
             for phase in ('dns', 'connect', 'header', 'body', 'future'):
                 report = root / f'{phase}.json'
+                worker_started = root / f'{phase}.started'
                 result = self._supervise(
                     script,
                     report,
                     root / f'{phase}.child.json',
                     mode='hang',
-                    duration=0.5,
+                    started_file=str(worker_started),
+                    duration=10.0,
                 )
-                self.assertEqual(result.reason, 'max_duration_seconds', phase)
-                self.assertLess(result.returncode or 0, 0, phase)
-                self.assertTrue(result.report['partial_work'], phase)
-                self.assertTrue(result.report['inflight_unknown'], phase)
+                diagnostic = (
+                    f"{phase}: reason={result.reason!r}, "
+                    f"worker_started={result.worker_started!r}, "
+                    f"returncode={result.returncode!r}, "
+                    f"runtime_phase={result.report.get('runtime_budget', {}).get('phase')!r}"
+                )
+                self.assertTrue(worker_started.is_file(), diagnostic)
+                self.assertTrue(result.worker_started, diagnostic)
+                self.assertEqual(result.reason, 'max_duration_seconds', diagnostic)
+                self.assertIsNotNone(result.returncode, diagnostic)
+                self.assertLess(result.returncode, 0, diagnostic)
+                self.assertTrue(result.report['partial_work'], diagnostic)
+                self.assertTrue(result.report['inflight_unknown'], diagnostic)
+                self.assertTrue(result.namespace_closed, diagnostic)
+                self.assertTrue(
+                    result.report['runtime_supervisor']['descendants_reaped'], diagnostic
+                )
 
     def test_whole_runner_deadline_is_reachable_independently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -861,7 +882,13 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
 
     def test_namespace_probe_is_explicit_and_has_no_unsafe_fallback(self) -> None:
         with patch.dict('os.environ', {'PLATFORM_LOAD_UNSHARE': '/definitely/missing'}, clear=False):
-            result = probe_pid_namespace_capability(timeout_seconds=0.2)
+            result = probe_pid_namespace_capability()
+        reason = result.get('reason')
+        returncode = result.get('returncode')
+        diagnostic = (
+            f"mandatory PID namespace probe unavailable: reason={reason!r}, "
+            f"returncode={returncode!r}"
+        )
         # The path override is intentionally ignored. Root callers fail closed
         # before probing, while supported hosted non-root runners prove the
         # exact sudo/setpriv/unshare chain and return the canonical contract.
@@ -869,7 +896,7 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             self.assertFalse(result['available'])
             self.assertEqual(result['reason'], 'runner_must_be_nonroot')
         else:
-            self.assertTrue(result['available'])
+            self.assertTrue(result['available'], diagnostic)
             self.assertEqual(result['protocol'], 'stdio')
             self.assertEqual(result['unshare'], '/usr/bin/unshare')
 
