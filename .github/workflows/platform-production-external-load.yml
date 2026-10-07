@@ -54,7 +54,6 @@ jobs:
       contents: read
     outputs:
       input_artifact_id: ${{ steps.publish-input.outputs.artifact-id }}
-      input_artifact_digest: ${{ steps.publish-input.outputs.artifact-digest }}
     env:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       PROFILE_ID: ${{ inputs.profile_id }}
@@ -368,13 +367,11 @@ jobs:
       setup_status: ${{ steps.fixture-setup.outputs.setup_status }}
       manifest_ready: ${{ steps.fixture-setup.outputs.manifest_ready }}
       manifest_artifact_id: ${{ steps.publish-manifest.outputs.artifact-id }}
-      manifest_artifact_digest: ${{ steps.publish-manifest.outputs.artifact-digest }}
       ssh_cleanup_status: ${{ steps.cleanup-setup-ssh.outputs.ssh_cleanup_status }}
     env:
       TARGET_SHA: ${{ github.sha }}
       RUN_ID: ${{ github.run_id }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
-      INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
     steps:
       - name: Mask the control identity before reading the handoff
         shell: bash
@@ -458,10 +455,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test -n "$INPUT_ARTIFACT_ID" && test -n "$INPUT_ARTIFACT_DIGEST"
+          test -n "$INPUT_ARTIFACT_ID"
           [[ "$INPUT_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
-          artifact_digest="${INPUT_ARTIFACT_DIGEST#sha256:}"
-          [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]]
           metadata="$RUNNER_TEMP/external-input-artifact-metadata.json"
           archive="$RUNNER_TEMP/external-input-artifact.zip"
           curl --fail-with-body --silent --show-error \
@@ -470,27 +465,49 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID" \
             --output "$metadata"
-          /usr/bin/python3 - "$metadata" "$INPUT_ARTIFACT_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          metadata_path, artifact_id, run_id, attempt, target_sha = sys.argv[1:]
-          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-          expected_name = f"platform-production-external-load-input-{run_id}-{attempt}"
-          if payload.get("id") != int(artifact_id) or payload.get("name") != expected_name or payload.get("expired") is not False:
-              raise SystemExit("external-load handoff artifact metadata is not exact")
-          workflow_run = payload.get("workflow_run")
-          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
-              raise SystemExit("external-load handoff artifact is not bound to this run and SHA")
-          PY
           curl --fail-with-body --silent --show-error --location \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID/zip" \
             --output "$archive"
-          printf '%s  %s\n' "$artifact_digest" "$archive" | sha256sum -c - >/dev/null
+          /usr/bin/python3 - "$metadata" "$archive" "$INPUT_ARTIFACT_ID" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          metadata_path, archive_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
+          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          if type(payload.get("id")) is not int or payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
+              raise SystemExit("external-load handoff artifact metadata is not exact")
+          workflow_run = payload.get("workflow_run")
+          if not isinstance(workflow_run, dict) or type(workflow_run.get("id")) is not int or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("external-load handoff artifact is not bound to this run and SHA")
+          expected_digest = payload.get("digest")
+          if not isinstance(expected_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest) is None:
+              raise SystemExit("external-load handoff artifact digest metadata is invalid")
+          flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+          try:
+              descriptor = os.open(archive_path, flags)
+          except OSError:
+              raise SystemExit("external-load handoff archive is unavailable")
+          try:
+              if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                  raise SystemExit("external-load handoff archive is not a regular file")
+              with os.fdopen(descriptor, "rb", closefd=False) as archive:
+                  digest = hashlib.sha256()
+                  while chunk := archive.read(1024 * 1024):
+                      digest.update(chunk)
+                  actual_digest = digest.hexdigest()
+          finally:
+              os.close(descriptor)
+          if actual_digest != expected_digest.removeprefix("sha256:"):
+              raise SystemExit("external-load handoff archive digest does not match metadata")
+          PY
 
       - name: Revalidate external handoff and exact target SHA
         shell: bash
@@ -697,16 +714,13 @@ jobs:
       candidate_state: ${{ steps.external-evaluate.outputs.candidate_state }}
       report_ready: ${{ steps.external-evaluate.outputs.report_ready }}
       candidate_artifact_id: ${{ steps.publish-candidate.outputs.artifact-id }}
-      candidate_artifact_digest: ${{ steps.publish-candidate.outputs.artifact-digest }}
     env:
       TARGET_SHA: ${{ github.sha }}
       PROFILE_ID: ${{ inputs.profile_id }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       SOURCE_GIT_SHA: ${{ github.sha }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
-      INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
       MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
-      MANIFEST_ARTIFACT_DIGEST: ${{ needs.fixture-setup.outputs.manifest_artifact_digest }}
     steps:
       - name: Mask the control identity before reading the handoff
         shell: bash
@@ -796,11 +810,9 @@ jobs:
         run: |
           set -euo pipefail
           verify_artifact() {
-            local artifact_id="$1" artifact_digest="$2" artifact_name="$3" prefix="$4"
-            test -n "$artifact_id" && test -n "$artifact_digest"
+            local artifact_id="$1" artifact_name="$2" prefix="$3"
+            test -n "$artifact_id"
             [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
-            artifact_digest="${artifact_digest#sha256:}"
-            [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]]
             local metadata="$RUNNER_TEMP/${prefix}-metadata.json" archive="$RUNNER_TEMP/${prefix}.zip"
             curl --fail-with-body --silent --show-error \
               --header "Authorization: Bearer $GH_TOKEN" \
@@ -808,29 +820,51 @@ jobs:
               --header "X-GitHub-Api-Version: 2022-11-28" \
               "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" \
               --output "$metadata"
-            /usr/bin/python3 - "$metadata" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          metadata_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
-          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-          if payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
-              raise SystemExit("load handoff artifact metadata is not exact")
-          workflow_run = payload.get("workflow_run")
-          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
-              raise SystemExit("load handoff artifact is not bound to this run and SHA")
-          PY
             curl --fail-with-body --silent --show-error --location \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
               "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
               --output "$archive"
-            printf '%s  %s\n' "$artifact_digest" "$archive" | sha256sum -c - >/dev/null
+            /usr/bin/python3 - "$metadata" "$archive" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          metadata_path, archive_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
+          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          if type(payload.get("id")) is not int or payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
+              raise SystemExit("load handoff artifact metadata is not exact")
+          workflow_run = payload.get("workflow_run")
+          if not isinstance(workflow_run, dict) or type(workflow_run.get("id")) is not int or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("load handoff artifact is not bound to this run and SHA")
+          expected_digest = payload.get("digest")
+          if not isinstance(expected_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest) is None:
+              raise SystemExit("load handoff artifact digest metadata is invalid")
+          try:
+              descriptor = os.open(archive_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          except OSError:
+              raise SystemExit("load handoff archive is unavailable")
+          try:
+              if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                  raise SystemExit("load handoff archive is not a regular file")
+              with os.fdopen(descriptor, "rb", closefd=False) as archive:
+                  digest = hashlib.sha256()
+                  while chunk := archive.read(1024 * 1024):
+                      digest.update(chunk)
+                  actual_digest = digest.hexdigest()
+          finally:
+              os.close(descriptor)
+          if actual_digest != expected_digest.removeprefix("sha256:"):
+              raise SystemExit("load handoff archive digest does not match metadata")
+          PY
           }
-          verify_artifact "$INPUT_ARTIFACT_ID" "$INPUT_ARTIFACT_DIGEST" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-input
-          verify_artifact "$MANIFEST_ARTIFACT_ID" "$MANIFEST_ARTIFACT_DIGEST" "platform-production-external-load-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-manifest
+          verify_artifact "$INPUT_ARTIFACT_ID" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-input
+          verify_artifact "$MANIFEST_ARTIFACT_ID" "platform-production-external-load-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-manifest
       - name: Checkout reviewed load client
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -1138,14 +1172,11 @@ jobs:
       candidate_artifact_status: ${{ steps.revalidate-finalizer.outputs.candidate_artifact_status }}
       namespace_closed_status: ${{ needs.namespace-containment-barrier.outputs.namespace_closed_status }}
       origin_artifact_id: ${{ steps.publish-origin.outputs.artifact-id }}
-      origin_artifact_digest: ${{ steps.publish-origin.outputs.artifact-digest }}
     env:
       TARGET_SHA: ${{ github.sha }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
-      INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
       CANDIDATE_ARTIFACT_ID: ${{ needs.load-client.outputs.candidate_artifact_id }}
-      CANDIDATE_ARTIFACT_DIGEST: ${{ needs.load-client.outputs.candidate_artifact_digest }}
       HOST_TOOLS_SHA: ${{ needs.resolve-host-tools-pin.outputs.host_tools_sha }}
     steps:
       - name: Mask and stage the control identity from the event file
@@ -1361,11 +1392,9 @@ jobs:
             cleanup_identity_status=0
           fi
           verify_artifact() {
-            local artifact_id="$1" artifact_digest="$2" artifact_name="$3" prefix="$4"
-            test -n "$artifact_id" && test -n "$artifact_digest" || return 1
+            local artifact_id="$1" artifact_name="$2" prefix="$3"
+            test -n "$artifact_id" || return 1
             [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || return 1
-            artifact_digest="${artifact_digest#sha256:}"
-            [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
             local metadata="$RUNNER_TEMP/${prefix}-metadata.json" archive="$RUNNER_TEMP/${prefix}.zip"
             curl --fail-with-body --silent --show-error \
               --header "Authorization: Bearer $GH_TOKEN" \
@@ -1373,35 +1402,57 @@ jobs:
               --header "X-GitHub-Api-Version: 2022-11-28" \
               "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" \
               --output "$metadata" || return 1
-            /usr/bin/python3 - "$metadata" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          metadata_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
-          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-          if payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
-              raise SystemExit("finalizer artifact metadata is not exact")
-          workflow_run = payload.get("workflow_run")
-          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
-              raise SystemExit("finalizer artifact is not bound to this run and SHA")
-          PY
             curl --fail-with-body --silent --show-error --location \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
               "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
               --output "$archive" || return 1
-            printf '%s  %s\n' "$artifact_digest" "$archive" | sha256sum -c - >/dev/null || return 1
+            /usr/bin/python3 - "$metadata" "$archive" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY' || return 1
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          metadata_path, archive_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
+          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          if type(payload.get("id")) is not int or payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
+              raise SystemExit("finalizer artifact metadata is not exact")
+          workflow_run = payload.get("workflow_run")
+          if not isinstance(workflow_run, dict) or type(workflow_run.get("id")) is not int or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("finalizer artifact is not bound to this run and SHA")
+          expected_digest = payload.get("digest")
+          if not isinstance(expected_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest) is None:
+              raise SystemExit("finalizer artifact digest metadata is invalid")
+          try:
+              descriptor = os.open(archive_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          except OSError:
+              raise SystemExit("finalizer archive is unavailable")
+          try:
+              if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                  raise SystemExit("finalizer archive is not a regular file")
+              with os.fdopen(descriptor, "rb", closefd=False) as archive:
+                  digest = hashlib.sha256()
+                  while chunk := archive.read(1024 * 1024):
+                      digest.update(chunk)
+                  actual_digest = digest.hexdigest()
+          finally:
+              os.close(descriptor)
+          if actual_digest != expected_digest.removeprefix("sha256:"):
+              raise SystemExit("finalizer archive digest does not match metadata")
+          PY
           }
           if [[ ! -s "$input_path" || -L "$input_path" ]]; then
             handoff_status=1
-          elif ! verify_artifact "$INPUT_ARTIFACT_ID" "$INPUT_ARTIFACT_DIGEST" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-finalizer-input; then
+          elif ! verify_artifact "$INPUT_ARTIFACT_ID" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-finalizer-input; then
             handoff_status=1
           fi
           install -d -m 700 "$candidate_dir"
-          if [[ -z "$CANDIDATE_ARTIFACT_ID" || -z "$CANDIDATE_ARTIFACT_DIGEST" ]] \
-            || ! verify_artifact "$CANDIDATE_ARTIFACT_ID" "$CANDIDATE_ARTIFACT_DIGEST" "platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-finalizer-candidate; then
+          if [[ -z "$CANDIDATE_ARTIFACT_ID" ]] \
+            || ! verify_artifact "$CANDIDATE_ARTIFACT_ID" "platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-finalizer-candidate; then
             candidate_artifact_status=1
           fi
           if [[ "$handoff_status" == 0 ]]; then
@@ -1948,11 +1999,8 @@ jobs:
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       SOURCE_GIT_SHA: ${{ github.sha }}
       INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
-      INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
       CANDIDATE_ARTIFACT_ID: ${{ needs.load-client.outputs.candidate_artifact_id }}
-      CANDIDATE_ARTIFACT_DIGEST: ${{ needs.load-client.outputs.candidate_artifact_digest }}
       ORIGIN_ARTIFACT_ID: ${{ needs.fixture-finalize.outputs.origin_artifact_id }}
-      ORIGIN_ARTIFACT_DIGEST: ${{ needs.fixture-finalize.outputs.origin_artifact_digest }}
     steps:
       - name: Checkout reviewed load evaluator
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -1986,11 +2034,9 @@ jobs:
         run: |
           set +e
           verify_artifact() {
-            local artifact_id="$1" artifact_digest="$2" artifact_name="$3" prefix="$4"
-            test -n "$artifact_id" && test -n "$artifact_digest" || return 1
+            local artifact_id="$1" artifact_name="$2" prefix="$3"
+            test -n "$artifact_id" || return 1
             [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || return 1
-            artifact_digest="${artifact_digest#sha256:}"
-            [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
             local metadata="$RUNNER_TEMP/${prefix}-metadata.json" archive="$RUNNER_TEMP/${prefix}.zip"
             curl --fail-with-body --silent --show-error \
               --header "Authorization: Bearer $GH_TOKEN" \
@@ -1998,31 +2044,53 @@ jobs:
               --header "X-GitHub-Api-Version: 2022-11-28" \
               "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" \
               --output "$metadata" || return 1
-            /usr/bin/python3 - "$metadata" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          metadata_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
-          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-          if payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
-              raise SystemExit("evaluator artifact metadata is not exact")
-          workflow_run = payload.get("workflow_run")
-          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
-              raise SystemExit("evaluator artifact is not bound to this run and SHA")
-          PY
             curl --fail-with-body --silent --show-error --location \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
               "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
               --output "$archive" || return 1
-            printf '%s  %s\n' "$artifact_digest" "$archive" | sha256sum -c - >/dev/null || return 1
+            /usr/bin/python3 - "$metadata" "$archive" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY' || return 1
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          metadata_path, archive_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
+          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          if type(payload.get("id")) is not int or payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
+              raise SystemExit("evaluator artifact metadata is not exact")
+          workflow_run = payload.get("workflow_run")
+          if not isinstance(workflow_run, dict) or type(workflow_run.get("id")) is not int or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("evaluator artifact is not bound to this run and SHA")
+          expected_digest = payload.get("digest")
+          if not isinstance(expected_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest) is None:
+              raise SystemExit("evaluator artifact digest metadata is invalid")
+          try:
+              descriptor = os.open(archive_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          except OSError:
+              raise SystemExit("evaluator archive is unavailable")
+          try:
+              if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                  raise SystemExit("evaluator archive is not a regular file")
+              with os.fdopen(descriptor, "rb", closefd=False) as archive:
+                  digest = hashlib.sha256()
+                  while chunk := archive.read(1024 * 1024):
+                      digest.update(chunk)
+                  actual_digest = digest.hexdigest()
+          finally:
+              os.close(descriptor)
+          if actual_digest != expected_digest.removeprefix("sha256:"):
+              raise SystemExit("evaluator archive digest does not match metadata")
+          PY
           }
           candidate_status=0
           origin_status=0
-          verify_artifact "$CANDIDATE_ARTIFACT_ID" "$CANDIDATE_ARTIFACT_DIGEST" "platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-candidate || candidate_status=1
-          verify_artifact "$ORIGIN_ARTIFACT_ID" "$ORIGIN_ARTIFACT_DIGEST" "platform-production-external-load-origin-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-origin || origin_status=1
+          verify_artifact "$CANDIDATE_ARTIFACT_ID" "platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-candidate || candidate_status=1
+          verify_artifact "$ORIGIN_ARTIFACT_ID" "platform-production-external-load-origin-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-origin || origin_status=1
           echo "candidate_artifact_status=$candidate_status" >> "$GITHUB_OUTPUT"
           echo "origin_artifact_status=$origin_status" >> "$GITHUB_OUTPUT"
           exit 0

@@ -53,6 +53,15 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
 | evaluation/projection | observer-bound accepted result or a structurally complete profile-budget miss; `sanitizer_status=0` |
 
+Artifact handoffs carry the exact artifact ID across jobs. Each consumer then
+reads the authenticated Actions artifact metadata and requires the expected
+run-derived name (including the run attempt), artifact ID, unexpired state,
+workflow run ID and source SHA. The metadata's `sha256:` digest must be exactly
+64 lowercase hexadecimal characters and must match the downloaded ZIP bytes;
+missing metadata or any mismatch fails closed. Consumers do not depend on
+cross-job digest outputs, which Actions may suppress when a value is treated as
+secret-like.
+
 The candidate receipt is not an acceptance result. The independent evaluator
 validates its exact schema and report digest, then binds the origin observer and
 decides the measured profile. A complete result whose only failures are
