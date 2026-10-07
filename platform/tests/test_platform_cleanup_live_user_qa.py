@@ -26,6 +26,24 @@ ORIGINAL_LSTAT = Path.lstat
 
 
 class CleanupLiveUserQaTests(unittest.TestCase):
+    def test_platform_import_root_comes_from_installed_helper_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            platform_root = Path(temporary) / "release" / "platform"
+            tools = platform_root / "tools"
+            tools.mkdir(parents=True)
+            helper = tools / "platform_cleanup_live_user_qa.py"
+            helper.write_text("# installed helper\n", encoding="ascii")
+            import_root = str(platform_root)
+            prior_path = list(sys.path)
+            try:
+                sys.path[:] = [entry for entry in sys.path if entry != import_root]
+                self.assertEqual(
+                    MODULE._configure_platform_import_root(helper), platform_root
+                )
+                self.assertEqual(sys.path[0], import_root)
+            finally:
+                sys.path[:] = prior_path
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.path = Path(self.temporary.name) / "inventory.json"

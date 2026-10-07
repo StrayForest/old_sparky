@@ -157,6 +157,12 @@ PASSTHROUGH_ENV = frozenset(
         "CI",
         "PLATFORM_APP_DIR",
         "PLATFORM_LIVE_CSP_QA_BUNDLE",
+        # These values are checked against the active immutable payload
+        # before a trusted wrapper is re-executed under the machine lock.
+        # Keep them across that one re-exec so installed helpers do not fall
+        # back to the source checkout or lose their target binding.
+        "PLATFORM_LIVE_QA_INSTALL_ROOT",
+        "PLATFORM_LIVE_QA_TARGET_SHA",
         "PLATFORM_LIVE_USER_QA_MARKER",
         "PLAYWRIGHT_LIVE_BASE_URL",
     }

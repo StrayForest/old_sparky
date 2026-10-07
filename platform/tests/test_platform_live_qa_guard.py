@@ -320,6 +320,84 @@ class LiveQaGuardTests(unittest.TestCase):
                 recovery=False,
             )
 
+    def test_locked_exec_preserves_only_validated_payload_identity(self) -> None:
+        source_sha = "a" * 40
+        installed_root = f"/root/.oldsparky/liveqa/releases/{source_sha}"
+        wrapper = (
+            f"{installed_root}/platform/tools/platform_live_user_qa.sh"
+        )
+        descriptor = os.open(os.devnull, os.O_RDONLY)
+        captured: dict[str, object] = {}
+
+        def validate_payload(root: Path, *, target_sha: str | None = None) -> str:
+            self.assertEqual(str(root), installed_root)
+            self.assertEqual(target_sha, source_sha)
+            return source_sha
+
+        def capture_exec(
+            _path: str, _argv: list[str], child_env: dict[str, str]
+        ) -> None:
+            captured.update(child_env)
+            raise OSError("stop after inspecting locked child environment")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_LIVE_QA_INSTALL_ROOT": installed_root,
+                    "PLATFORM_LIVE_QA_TARGET_SHA": source_sha,
+                    "UNTRUSTED_TEST_VALUE": "must-not-cross-lock-exec",
+                },
+                clear=True,
+            ),
+            mock.patch.object(
+                guard,
+                "_validate_installed_payload_root",
+                side_effect=validate_payload,
+            ),
+            mock.patch.object(guard, "_assert_root_controlled_path"),
+            mock.patch.object(guard, "_open_bundle_lock", return_value=descriptor),
+            mock.patch.object(guard.os, "execve", side_effect=capture_exec),
+            self.assertRaisesRegex(OSError, "stop after inspecting"),
+        ):
+            guard.locked_exec(Path("/root/csp-live-qa.json"), [wrapper])
+
+        self.assertEqual(
+            set(captured),
+            {
+                "LANG",
+                "PATH",
+                guard.LOCK_ENV_NAME,
+                "PLATFORM_LIVE_QA_INSTALL_ROOT",
+                "PLATFORM_LIVE_QA_TARGET_SHA",
+            },
+        )
+        self.assertEqual(captured["PLATFORM_LIVE_QA_INSTALL_ROOT"], installed_root)
+        self.assertEqual(captured["PLATFORM_LIVE_QA_TARGET_SHA"], source_sha)
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+
+    def test_locked_exec_rejects_mismatched_target_before_lock_or_exec(self) -> None:
+        source_sha = "a" * 40
+        installed_root = f"/root/.oldsparky/liveqa/releases/{source_sha}"
+        wrapper = f"{installed_root}/platform/tools/platform_live_user_qa.sh"
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PLATFORM_LIVE_QA_INSTALL_ROOT": installed_root,
+                    "PLATFORM_LIVE_QA_TARGET_SHA": "b" * 40,
+                },
+                clear=True,
+            ),
+            mock.patch.object(guard, "_open_bundle_lock") as open_lock,
+            mock.patch.object(guard.os, "execve") as execve,
+            self.assertRaisesRegex(guard.GuardError, "wrapper root is invalid"),
+        ):
+            guard.locked_exec(Path("/root/csp-live-qa.json"), [wrapper])
+        open_lock.assert_not_called()
+        execve.assert_not_called()
+
     def test_recovery_exec_requires_an_exact_recovery_command(self) -> None:
         with synthetic_trusted_tools() as tools_root:
             wrapper = tools_root / "platform_live_user_qa.sh"

@@ -1803,6 +1803,18 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertIn('SYSTEM_PYTHON="/usr/bin/python3.12"', source)
                 self.assertIn("platform_safe_env_exec.py", source)
 
+    def test_trusted_database_callers_use_manifest_pythonpath(self) -> None:
+        for wrapper_name in (
+            "platform_provision_live_csp_qa.sh",
+            "platform_live_user_qa.sh",
+        ):
+            with self.subTest(wrapper=wrapper_name):
+                source = (TOOLS_ROOT / wrapper_name).read_text(encoding="utf-8")
+                self.assertIn('SAFE_PYTHONPATH="$PLATFORM_ROOT"', source)
+                self.assertIn('SAFE_PYTHONPATH="$TRUSTED_INSTALL_ROOT"', source)
+                self.assertIn('--pythonpath "$SAFE_PYTHONPATH"', source)
+                self.assertNotIn('--pythonpath "$PLATFORM_ROOT"', source)
+
     def test_all_live_operations_enter_the_machine_lock_guard(self) -> None:
         for wrapper in SUPERVISORS:
             with self.subTest(wrapper=wrapper.name):

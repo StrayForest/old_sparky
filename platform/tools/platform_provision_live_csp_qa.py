@@ -16,6 +16,23 @@ import tempfile
 from typing import Callable
 from uuid import UUID
 
+
+def _configure_platform_import_root(script_file: Path) -> Path:
+    """Add this immutable payload's platform directory for package imports."""
+
+    resolved_script = script_file.resolve(strict=True)
+    tools_dir = resolved_script.parent
+    platform_root = tools_dir.parent
+    if tools_dir.name != "tools" or platform_root.name != "platform":
+        raise RuntimeError("live-QA provision helper is outside its platform payload")
+    import_root = str(platform_root)
+    if import_root not in sys.path:
+        sys.path.insert(0, import_root)
+    return platform_root
+
+
+_configure_platform_import_root(Path(__file__))
+
 from pydantic import EmailStr, TypeAdapter
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession

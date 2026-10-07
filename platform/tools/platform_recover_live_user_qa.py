@@ -15,6 +15,21 @@ import os
 from pathlib import Path
 import sys
 
+
+def _configure_platform_import_root(script_file: Path) -> Path:
+    resolved_script = script_file.resolve(strict=True)
+    tools_dir = resolved_script.parent
+    platform_root = tools_dir.parent
+    if tools_dir.name != "tools" or platform_root.name != "platform":
+        raise RuntimeError("live-QA recovery helper is outside its platform payload")
+    import_root = str(platform_root)
+    if import_root not in sys.path:
+        sys.path.insert(0, import_root)
+    return platform_root
+
+
+_configure_platform_import_root(Path(__file__))
+
 from sqlalchemy import select
 
 import platform_cleanup_live_user_qa as cleanup_tool

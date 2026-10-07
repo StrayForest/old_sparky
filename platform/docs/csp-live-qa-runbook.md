@@ -265,7 +265,10 @@ profile with a global sysctl change.
 do not invoke it directly or print/load the production environment in the
 interactive shell. The provisioner writes only to `platformdb`, schema
 `platform`, and success output contains only the marker, bundle path and account
-count. It never prints generated credentials.
+count. It never prints generated credentials. In trusted runs, safe-env binds
+the interpreter's Python path to the complete immutable QA payload root; each
+database helper derives its nested `platform` package directory from its own
+installed file path before importing platform packages.
 
 The bundle is an exact v1 object:
 

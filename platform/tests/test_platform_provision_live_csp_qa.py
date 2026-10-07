@@ -34,6 +34,39 @@ from tools import platform_provision_live_csp_qa as provisioner
 
 
 class LiveCspQaProvisionerUnitTests(unittest.TestCase):
+    def test_platform_import_root_is_derived_from_helper_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            payload_platform = Path(temporary) / "release" / "platform"
+            tools = payload_platform / "tools"
+            tools.mkdir(parents=True)
+            helper = tools / "platform_provision_live_csp_qa.py"
+            helper.write_text("# installed payload helper\n", encoding="ascii")
+            import_root = str(payload_platform)
+            prior_path = list(provisioner.sys.path)
+            try:
+                provisioner.sys.path[:] = [
+                    entry for entry in provisioner.sys.path if entry != import_root
+                ]
+                self.assertEqual(
+                    provisioner._configure_platform_import_root(helper),
+                    payload_platform,
+                )
+                self.assertEqual(provisioner.sys.path[0], import_root)
+                self.assertEqual(
+                    provisioner._configure_platform_import_root(helper),
+                    payload_platform,
+                )
+                self.assertEqual(provisioner.sys.path.count(import_root), 1)
+            finally:
+                provisioner.sys.path[:] = prior_path
+
+            wrong_layout = Path(temporary) / "release" / "tools"
+            wrong_layout.mkdir(parents=True)
+            wrong_helper = wrong_layout / "provision.py"
+            wrong_helper.write_text("# wrong layout\n", encoding="ascii")
+            with self.assertRaisesRegex(RuntimeError, "outside its platform payload"):
+                provisioner._configure_platform_import_root(wrong_helper)
+
     def test_runtime_target_requires_production_without_internal_test_override(self) -> None:
         settings = SimpleNamespace(platform_environment="test")
         with patch.object(provisioner, "validate_platform_settings", return_value=None):
