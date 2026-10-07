@@ -1298,9 +1298,12 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_live_qa_runtime_installer_change_is_deployable_and_runtime_sensitive(self) -> None:
         installer = "platform/tools/platform_live_qa_runtime_install.py"
+        launch_helper = "platform/tools/platform_live_launch_trusted.sh"
         dispatcher = "platform/tools/platform_workflow_remote_dispatch.py"
         self.assertNotIn(installer, RECOVERY_BOOTSTRAP_FILES)
+        self.assertNotIn(launch_helper, RECOVERY_BOOTSTRAP_FILES)
         self.assertNotIn(dispatcher, RECOVERY_BOOTSTRAP_FILES)
+        self.assertIn(launch_helper, RUNTIME_SENSITIVE_FILES)
         self.assertIn(dispatcher, RUNTIME_SENSITIVE_FILES)
 
         manifest = classify(
@@ -1314,6 +1317,23 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertTrue(manifest["deployable"])
         self.assertFalse(manifest["fallback"])
         self.assertTrue(manifest["runtime_sensitive"])
+
+        launch_helper_manifest = classify(
+            [launch_helper],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(launch_helper_manifest["class"], "full")
+        self.assertTrue(launch_helper_manifest["deployable"])
+        self.assertFalse(launch_helper_manifest["fallback"])
+        self.assertTrue(launch_helper_manifest["runtime_sensitive"])
+        self.assertEqual(
+            self._run_auto_deploy_manifest_contract(launch_helper_manifest)[
+                "route_deployable"
+            ],
+            "true",
+        )
 
         dispatcher_only = classify(
             [dispatcher],
