@@ -219,6 +219,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     else ("0" if passing[key] == "1" else "1")
                 )
                 self.assertFalse(_pass_truth_table(faulted))
+        missing_finalizer_cleanup = dict(passing)
+        missing_finalizer_cleanup["ssh_cleanup_status"] = ""
+        self.assertFalse(_pass_truth_table(missing_finalizer_cleanup))
 
     def test_failed_handoff_still_requires_cleanup_and_cleanup_failure_dominates(self) -> None:
         passing = {
@@ -907,6 +910,63 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertEqual(output_path.read_text(encoding="ascii"), "")
 
+        finalizer_cleanup = _step_script(finalizer, "Remove finalizer SSH material")
+        self.assertLess(
+            finalizer_cleanup.index('test -z "${SSH_DIR:-}"'),
+            finalizer_cleanup.index("ssh_cleanup_status=0"),
+        )
+        with tempfile.TemporaryDirectory(prefix="external-load-finalizer-ssh-cleanup-") as temp:
+            runner_temp = Path(temp)
+            ssh_dir = runner_temp / "production-external-load-ssh-finalize"
+            ssh_dir.mkdir()
+            (ssh_dir / "id_ed25519").write_text("test key material", encoding="ascii")
+            (ssh_dir / "config").write_text("test config", encoding="ascii")
+            output_path = runner_temp / "github-output"
+            output_path.touch()
+            env_file = runner_temp / "github-env"
+            env_file.touch()
+            finalizer_env = {
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_RUN_ID": f"codex-finalizer-test-{os.getpid()}",
+                "GITHUB_OUTPUT": str(output_path),
+                "GITHUB_ENV": str(env_file),
+            }
+            completed = subprocess.run(
+                ["/bin/bash", "-c", finalizer_cleanup],
+                capture_output=True,
+                text=True,
+                env=finalizer_env,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(ssh_dir.exists())
+            self.assertEqual(output_path.read_text(encoding="ascii"), "ssh_cleanup_status=0\n")
+
+        with tempfile.TemporaryDirectory(prefix="external-load-finalizer-ssh-cleanup-fail-") as temp:
+            runner_temp = Path(temp)
+            target = runner_temp / "unexpected-target"
+            target.mkdir()
+            ssh_dir = runner_temp / "production-external-load-ssh-finalize"
+            ssh_dir.symlink_to(target, target_is_directory=True)
+            output_path = runner_temp / "github-output"
+            output_path.touch()
+            env_file = runner_temp / "github-env"
+            env_file.touch()
+            completed = subprocess.run(
+                ["/bin/bash", "-c", finalizer_cleanup],
+                capture_output=True,
+                text=True,
+                env={
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_RUN_ID": f"codex-finalizer-fail-{os.getpid()}",
+                    "GITHUB_OUTPUT": str(output_path),
+                    "GITHUB_ENV": str(env_file),
+                },
+                timeout=10,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(output_path.read_text(encoding="ascii"), "")
+
         pin_job = self.jobs["resolve-host-tools-pin"]
         self.assertIn("Checkout exact target as untrusted source data", pin_job)
         self.assertIn("platform_host_tools_pin.py resolve", pin_job)
@@ -1085,12 +1145,34 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "steps.cleanup.outputs.cleanup_remote_stage == 'complete'",
             "steps.cleanup.outputs.cleanup_remote_child_exit == '0'",
             "steps.cleanup.outputs.cleanup_exports_status == '0'",
+            "steps.cleanup_ssh.outputs.ssh_cleanup_status != ''",
             "steps.cleanup_ssh.outputs.ssh_cleanup_status == '0'",
             "steps.revalidate-finalizer.outputs.cleanup_identity_status == '0'",
         ):
             with self.subTest(gate_input=gate_input):
                 self.assertIn(gate_input, publish)
         self.assertNotIn("success()", publish)
+
+        evaluator_steps = yaml.safe_load(self.source)["jobs"]["evaluate-load"]["steps"]
+        evidence_upload = next(
+            step for step in evaluator_steps if step.get("name") == "Publish external load evidence"
+        )
+        self.assertIn(
+            "needs.fixture-finalize.outputs.ssh_cleanup_status != ''",
+            evidence_upload["if"],
+        )
+        self.assertIn(
+            "needs.fixture-finalize.outputs.ssh_cleanup_status == '0'",
+            evidence_upload["if"],
+        )
+        self.assertIn(
+            "needs.fixture-setup.outputs.ssh_cleanup_status != ''",
+            evidence_upload["if"],
+        )
+        self.assertIn(
+            "needs.fixture-setup.outputs.ssh_cleanup_status == '0'",
+            evidence_upload["if"],
+        )
 
         evaluator = self.jobs["evaluate-load"]
         self.assertIn("sanitizer_status=0", evaluator)
