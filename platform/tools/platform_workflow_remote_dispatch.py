@@ -137,6 +137,32 @@ ARTIFACT_PREP_OPERATION_TIMEOUT_SECONDS = 120.0
 LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS = 300.0
 LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0
 CHILD_TERMINATION_GRACE_SECONDS = 5.0
+LIVE_LAUNCH_STATUS_MAX_BYTES = 256
+LIVE_LAUNCH_STREAM_MAX_BYTES = 4096
+LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES = frozenset(
+    {
+        "validation",
+        "trusted_generation",
+        "identity",
+        "account_install",
+        "provision",
+        "browser_qa",
+    }
+)
+LIVE_LAUNCH_FAILURE_STAGES = LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES | frozenset(
+    {
+        "dispatch",
+        "trusted_entry",
+        "timeout",
+    }
+)
+LIVE_LAUNCH_STATUS_RE = re.compile(
+    rb"LIVE_LAUNCH_STATUS schema=1 status=(?P<status>passed|failed) "
+    rb"stage=(?P<stage>validation|trusted_generation|identity|account_install|"
+    rb"provision|browser_qa|dispatch|trusted_entry|timeout|complete) "
+    rb"child_exit=(?P<child_exit>0|[1-9][0-9]{0,2}) "
+    rb"source_sha=(?P<source_sha>[0-9a-f]{40})\n"
+)
 RELEASE_MARKER_MAX_BYTES = 512
 RELEASE_MARKER_OBSERVED_BYTES_MAX = RELEASE_MARKER_MAX_BYTES + 1
 RETAINED_CLEANUP_MARKER_MAX_BYTES = 256
@@ -680,28 +706,56 @@ def _run_retained_cleanup_sudo(
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     """Terminate a timed-out dispatcher child and every process it spawned."""
 
+    process_group = process.pid
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
-        return
-    except OSError:
-        process.terminate()
-    try:
-        process.wait(timeout=CHILD_TERMINATION_GRACE_SECONDS)
-        return
-    except subprocess.TimeoutExpired:
         pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
     except OSError:
-        process.kill()
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
+    def group_exists() -> bool:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    deadline = time.monotonic() + CHILD_TERMINATION_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        process.poll()  # Reap the leader when it exits; descendants may remain.
+        if not group_exists():
+            return
+        time.sleep(0.05)
+
     try:
-        process.wait(timeout=CHILD_TERMINATION_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        # The caller still returns failure.  Do not turn a timeout into a
-        # false success merely because a hostile child ignored both signals.
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    deadline = time.monotonic() + CHILD_TERMINATION_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        process.poll()
+        if not group_exists():
+            return
+        time.sleep(0.05)
+    # The caller remains on a failure path if a hostile process group cannot
+    # be proven gone within the bounded termination window.
+    try:
+        process.wait(timeout=0)
+    except (subprocess.TimeoutExpired, ChildProcessError):
         pass
 
 
@@ -710,6 +764,7 @@ def _run_bounded_child(
     *,
     timeout_seconds: float,
     expected_release_marker: tuple[str, str, str] | None = None,
+    expected_live_launch_sha: str | None = None,
 ) -> int:
     """Run one synchronous privileged child with process-group cleanup."""
 
@@ -720,6 +775,7 @@ def _run_bounded_child(
             stdout=(
                 subprocess.PIPE
                 if expected_release_marker is not None
+                or expected_live_launch_sha is not None
                 else subprocess.DEVNULL
             ),
             stderr=subprocess.DEVNULL,
@@ -727,12 +783,25 @@ def _run_bounded_child(
             close_fds=True,
         )
     except OSError:
+        if expected_live_launch_sha is not None:
+            _emit_live_launch_status(
+                status="failed",
+                stage="dispatch",
+                child_exit=2,
+                source_sha=expected_live_launch_sha,
+            )
         return 2
     if expected_release_marker is not None:
         return _wait_for_release_marker(
             process,
             timeout_seconds=timeout_seconds,
             expected=expected_release_marker,
+        )
+    if expected_live_launch_sha is not None:
+        return _wait_for_live_launch_status(
+            process,
+            timeout_seconds=timeout_seconds,
+            expected_sha=expected_live_launch_sha,
         )
     try:
         return process.wait(timeout=timeout_seconds)
@@ -895,15 +964,186 @@ def _wait_for_release_marker(
         stdout.close()
 
 
+def _emit_live_launch_status(
+    *, status: str, stage: str, child_exit: int, source_sha: str
+) -> None:
+    """Write one closed live-launch result without forwarding child output."""
+
+    if (
+        status not in {"passed", "failed"}
+        or stage not in LIVE_LAUNCH_FAILURE_STAGES | {"complete"}
+        or not 0 <= child_exit <= 255
+        or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+    ):
+        return
+    print(
+        "LIVE_LAUNCH_STATUS schema=1 "
+        f"status={status} stage={stage} child_exit={child_exit} "
+        f"source_sha={source_sha}"
+    )
+
+
+def _parse_live_launch_status(
+    output: bytes, *, child_status: int, expected_sha: str
+) -> tuple[str, str, int] | None:
+    """Accept only the exact status marker emitted by the trusted supervisor."""
+
+    if len(output) > LIVE_LAUNCH_STATUS_MAX_BYTES:
+        return None
+    match = LIVE_LAUNCH_STATUS_RE.fullmatch(output)
+    if match is None or match.group("source_sha").decode("ascii") != expected_sha:
+        return None
+    status = match.group("status").decode("ascii")
+    stage = match.group("stage").decode("ascii")
+    child_exit = int(match.group("child_exit"))
+    if child_status < 0:
+        return None
+    if status == "passed":
+        if stage != "complete" or child_exit != 0 or child_status != 0:
+            return None
+    elif (
+        stage not in LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES
+        or child_exit == 0
+        or child_status != child_exit
+    ):
+        return None
+    return status, stage, child_exit
+
+
+def _wait_for_live_launch_status(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: float,
+    expected_sha: str,
+) -> int:
+    """Drain all child bytes while retaining only one bounded status marker."""
+
+    stdout = process.stdout
+    if stdout is None:
+        _terminate_process_group(process)
+        _emit_live_launch_status(
+            status="failed", stage="dispatch", child_exit=2, source_sha=expected_sha
+        )
+        return 2
+    output = bytearray()
+    oversized = False
+    drained_bytes = 0
+    eof = False
+    try:
+        descriptor = stdout.fileno()
+        os.set_blocking(descriptor, False)
+    except (OSError, ValueError):
+        _terminate_process_group(process)
+        _emit_live_launch_status(
+            status="failed", stage="dispatch", child_exit=2, source_sha=expected_sha
+        )
+        stdout.close()
+        return 2
+
+    selector: selectors.BaseSelector | None = None
+    try:
+        selector = selectors.DefaultSelector()
+        selector.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            child_status = process.poll()
+            if child_status is not None and eof:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process_group(process)
+                _emit_live_launch_status(
+                    status="failed",
+                    stage="timeout",
+                    child_exit=124,
+                    source_sha=expected_sha,
+                )
+                return 124
+            events = selector.select(min(remaining, 0.1))
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fd, 4096)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    raise
+                if not chunk:
+                    try:
+                        selector.unregister(key.fd)
+                    except (KeyError, ValueError):
+                        pass
+                    eof = True
+                    continue
+                drained_bytes += len(chunk)
+                if drained_bytes > LIVE_LAUNCH_STREAM_MAX_BYTES:
+                    oversized = True
+                    _terminate_process_group(process)
+                    _emit_live_launch_status(
+                        status="failed",
+                        stage="trusted_entry",
+                        child_exit=2,
+                        source_sha=expected_sha,
+                    )
+                    return 2
+                if not oversized:
+                    if len(output) + len(chunk) > LIVE_LAUNCH_STATUS_MAX_BYTES:
+                        output.clear()
+                        oversized = True
+                    else:
+                        output.extend(chunk)
+        child_status = process.returncode
+        if child_status is None:
+            _emit_live_launch_status(
+                status="failed", stage="dispatch", child_exit=2, source_sha=expected_sha
+            )
+            return 2
+        parsed = (
+            None
+            if oversized
+            else _parse_live_launch_status(
+                bytes(output), child_status=child_status, expected_sha=expected_sha
+            )
+        )
+        if parsed is None:
+            safe_exit = child_status if 0 < child_status <= 255 else 2
+            _emit_live_launch_status(
+                status="failed",
+                stage="trusted_entry",
+                child_exit=safe_exit,
+                source_sha=expected_sha,
+            )
+            return safe_exit
+        status, stage, child_exit = parsed
+        _emit_live_launch_status(
+            status=status, stage=stage, child_exit=child_exit, source_sha=expected_sha
+        )
+        return child_status
+    except (OSError, ValueError):
+        _terminate_process_group(process)
+        _emit_live_launch_status(
+            status="failed", stage="dispatch", child_exit=2, source_sha=expected_sha
+        )
+        return 2
+    finally:
+        if selector is not None:
+            selector.close()
+        stdout.close()
+
+
 def _run_trusted_live_launch(arguments: list[str]) -> int:
     if not _trusted_live_launch_helper():
+        _emit_live_launch_status(
+            status="failed", stage="dispatch", child_exit=2, source_sha=arguments[-1]
+        )
         return 2
     command = [SUDO, "-n", "--", str(TRUSTED_LIVE_LAUNCH), *arguments]
-    # The trusted helper performs the synchronous handoff to its supervisor;
-    # bound that handoff while retaining the supervisor's own detached work.
+    # The trusted helper performs the synchronous handoff to its supervisor.
+    # Its only output allowed across this boundary is the bounded, source-bound
+    # live-launch status marker; all ordinary stdout/stderr stays discarded.
     return _run_bounded_child(
         command,
         timeout_seconds=LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS,
+        expected_live_launch_sha=arguments[-1],
     )
 
 
