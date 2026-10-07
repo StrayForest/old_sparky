@@ -561,6 +561,98 @@ class LoadAcceptanceTests(unittest.TestCase):
             clear=False,
         ):
             self.assertTrue(_is_closed_pending_origin_candidate(profile, candidate))
+
+        # A complete transport population with an authenticated-page-load
+        # status-contract miss is not a deferred-origin candidate.  The raw
+        # arithmetic reconciles, but the profile only accepts HTTP 200 and
+        # the 316 HTTP 500 responses keep the report non-green.
+        page_profile = get_profile("authenticated-page-load-v1")
+        page_contract = profile_contract(page_profile)
+        page_contract["offered_logical_actions"] = 20_000
+        page_contract["primary_http_attempts"] = 20_000
+        page_contract["http_attempts"] = 20_000
+        page_contract["total_http_attempts"] = 20_000
+        page_contract["runtime_http_budget"] = {
+            "planned_worst_case": page_contract["planned_work"]["http_attempts"],
+            "max_http_attempts": 20_000,
+            "actual_http_attempts": 20_000,
+            "within_budget": True,
+        }
+        mixed_status_summary: dict[str, object] = {
+            "scope": "full_population",
+            "requests": 20_000,
+            "errors": 316,
+            "successful_responses": 19_684,
+            "final_failure_rate_percent": 1.58,
+            "status_counts": {"200": 19_684, "500": 316},
+            "unexpected_statuses": 316,
+            "temporary_overload_responses": 0,
+            "temporary_overload_rate_percent": 0.0,
+            "retry_attempts": 0,
+            "total_retries": 0,
+            "wall_seconds": 575.291,
+            "successful_goodput_actions_per_second": 19_684 / 575.291,
+            "timing": {
+                "timing_schema": 2,
+                "expected_count": 20_000,
+                "submitted_count": 20_000,
+                "completed_count": 20_000,
+                "scheduled_count": 20_000,
+                "partial": False,
+                "dropped_work": 0,
+                "missing_schedule_context": 0,
+                "missing_timing_context": 0,
+                "invalid_timing_context": 0,
+                "user_observed_latency": {
+                    "p50_ms": 1_000,
+                    "p90_ms": 2_000,
+                    "p95_ms": 2_890.052,
+                    "p99_ms": 3_576.125,
+                },
+            },
+        }
+        mixed_acceptance = evaluate_acceptance(
+            contract_ok=False,
+            logical_summary=mixed_status_summary,
+            raw_http_summary=mixed_status_summary,
+            acceptance_contract=page_contract["acceptance"],
+            canonical_evidence=True,
+            require_exact_observer_binding=True,
+        )
+        self.assertEqual(mixed_acceptance["decision"], "STRESS PENDING ORIGIN EVIDENCE")
+        self.assertTrue(mixed_acceptance["pending_origin_evidence"])
+        self.assertFalse(mixed_acceptance["contract_ok"])
+        self.assertTrue(mixed_acceptance["outcome_evidence"]["raw_http"]["complete"])
+        self.assertFalse(mixed_acceptance["checks"]["unexpected_statuses"])
+
+        page_report = deepcopy(candidate.report)
+        page_report.update(
+            {
+                "profile_id": page_profile["profile_id"],
+                "profile_version": page_profile["profile_version"],
+                "profile_digest": page_contract["profile_digest"],
+                "mode": page_profile["mode"],
+                "environment": page_profile["portfolio"]["environment"],
+                "scope": "full_population",
+                "load_contract": page_contract,
+                "phases": {"authenticated_page_load": {}},
+                "overall": mixed_status_summary,
+                "raw_http": mixed_status_summary,
+                "logical": mixed_status_summary,
+                "acceptance": mixed_acceptance,
+            }
+        )
+        page_candidate = SimpleNamespace(**vars(candidate))
+        page_candidate.report = page_report
+        with patch.dict(
+            os.environ,
+            {"SOURCE_GIT_SHA": "a" * 40, "GITHUB_RUN_ID": "123"},
+            clear=False,
+        ):
+            self.assertFalse(
+                _is_closed_pending_origin_candidate(page_profile, page_candidate)
+            )
+
         mutations = (
             ("worker return code", lambda result: setattr(result, "returncode", 2)),
             ("worker crashed", lambda result: setattr(result, "reason", "worker-exit")),
