@@ -154,18 +154,37 @@ until the automated inventory, users, sessions, tournament and media have all
 been confirmed absent.
 
 The credential-bearing automated journey never runs a candidate checkout or an
-unverified mailbox helper. Every release artifact must contain the reviewed,
-minimal `liveqa-runtime` member: pinned Node, the three Playwright packages,
-the reviewed journey/configuration, checksum-pinned browser archives and a
-content manifest. Release activation reconciles that member under the
-canonical release lock into the digest-bound generation at
-`/root/.oldsparky/liveqa/releases/<source-sha>` and atomically switches the
-active pointer. The fixed root-owned supervisor at
+unverified mailbox helper. New release artifacts carry a source-only
+`liveqa-runtime` member: the reviewed journey/configuration, package lock and a
+closed manifest containing the exact file map and digest of the required Node,
+Playwright and browser engine. The engine bytes are supplied by a previously
+verified immutable runtime provider; the manifest fixes Node 26.3.1, the
+package-lock digest, required Playwright packages, browser roots and the
+Chromium sandbox digest. During activation, the installer validates the
+candidate suite and its engine map against the protected provider under the
+canonical release lock, then records the provider generation in the new
+digest-bound payload at `/root/.oldsparky/liveqa/releases/<source-sha>` before
+atomically switching the active pointer. A missing, stale or incompatible
+provider fails closed; it is not replaced by a path from the environment or
+candidate checkout. Existing complete v1 generations remain immutable and may
+serve as the provider only when their exact engine file map and package-lock
+digest match the candidate manifest. The fixed root-owned supervisor at
 `/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh` (mode `0755`) then
 dispatches only that active generation; a missing, stale, symlinked or
 interrupted installation fails closed. The host still needs the dedicated
 account/AppArmor profile. Run as root and first create the root-only bundle
 through the public shell wrapper:
+
+The root-only generation remains under `/root`, which the dedicated browser
+identity cannot traverse. The trusted runner therefore binds the validated
+suite and engine directories read-only into unique
+`/var/lib/oldsparky-liveqa/runtime-suite-<source-sha>-<gate-nonce>` and
+`runtime-engine-<provider-sha>-<gate-nonce>` paths in the transient systemd
+unit's private mount namespace. The aliases exist only for that collected
+unit and are removed after its processes have exited; the host mount table and
+generation ownership do not change. The browser's preseeded input, home,
+temporary files and test results remain in its dedicated writable
+`/run/oldsparky-liveqa` gate.
 
 The generation manifest includes the launch supervisor's direct script and
 data dependencies, including the provisioning shell wrapper, its Python

@@ -90,6 +90,9 @@ CHROMIUM_SANDBOX_SIZE = 15232
 CHROMIUM_SANDBOX_SHA256 = (
     "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
 )
+LIVE_QA_BROWSER_ROOTS = frozenset(
+    {"chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"}
+)
 STATE_NAME_PATTERN = re.compile(r"^live-user-qa\.[A-Za-z0-9]{6}$")
 SETUP_NAME_PATTERN = re.compile(r"^\.live-user-qa\.setup-[0-9a-f]{32}$")
 PUBLIC_GATE_NAME_PATTERN = re.compile(r"^public-live-qa\.[a-z0-9_]{8}$")
@@ -2485,6 +2488,346 @@ def _sandbox_path(runtime_cache: Path) -> Path:
     return sandbox
 
 
+def _trusted_runtime_root() -> Path:
+    """Resolve the fixed immutable engine provider referenced by active QA."""
+
+    try:
+        active_payload = TRUSTED_ACTIVE_POINTER.resolve(strict=True)
+    except OSError as exc:
+        raise GuardError("active live-QA generation pointer is unavailable") from exc
+    source_sha = _validate_installed_payload_root(active_payload)
+    # _validate_installed_payload_root accepts only the fixed active generation;
+    # use its verified manifest to locate the compact suite payload.
+    payload_root = TRUSTED_PAYLOAD_ROOT / source_sha
+    try:
+        provider_path = payload_root / "runtime-provider.json"
+        provider_meta = provider_path.lstat()
+        if provider_meta.st_size > MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES:
+            raise GuardError("active live-QA engine provider manifest is too large")
+        provider_raw = provider_path.read_bytes()
+        provider = json.loads(provider_raw.decode("ascii"), object_pairs_hook=_strict_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise GuardError("active live-QA engine provider is unavailable") from exc
+    required = {
+        "version", "source_sha", "provider_sha", "engine_tree_sha256",
+        "node_version", "package_lock_sha256", "engine_files",
+    }
+    if (
+        stat.S_ISLNK(provider_meta.st_mode)
+        or not stat.S_ISREG(provider_meta.st_mode)
+        or provider_meta.st_uid != 0
+        or provider_meta.st_gid != 0
+        or provider_meta.st_nlink != 1
+        or stat.S_IMODE(provider_meta.st_mode) != 0o444
+        or not isinstance(provider, dict)
+        or set(provider) != required
+        or provider.get("version") != 1
+        or provider.get("source_sha") != source_sha
+        or not isinstance(provider.get("provider_sha"), str)
+        or not COMMIT_PATTERN.fullmatch(provider["provider_sha"])
+        or provider.get("node_version") != NODE_VERSION
+        or not isinstance(provider.get("package_lock_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(provider["package_lock_sha256"])
+        or not isinstance(provider.get("engine_tree_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(provider["engine_tree_sha256"])
+        or not isinstance(provider.get("engine_files"), dict)
+    ):
+        raise GuardError("active live-QA engine provider identity is invalid")
+    try:
+        suite_manifest = json.loads(
+            (payload_root / "runtime/runtime-manifest.json").read_text(encoding="ascii"),
+            object_pairs_hook=_strict_object,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise GuardError("active live-QA suite manifest is unavailable") from exc
+    if (
+        not isinstance(suite_manifest, dict)
+        or suite_manifest.get("version") != 2
+        or suite_manifest.get("node_version") != provider.get("node_version")
+        or suite_manifest.get("package_lock_sha256") != provider.get("package_lock_sha256")
+        or suite_manifest.get("engine_tree_sha256") != provider.get("engine_tree_sha256")
+        or suite_manifest.get("engine_files") != provider.get("engine_files")
+    ):
+        raise GuardError("active live-QA suite and engine provider disagree")
+    provider_sha = provider["provider_sha"]
+    provider_payload = TRUSTED_PAYLOAD_ROOT / provider_sha
+    provider_root = provider_payload / "runtime"
+    try:
+        payload_meta = provider_payload.lstat()
+        root_meta = provider_root.lstat()
+        source_meta = (provider_payload / "source-sha").lstat()
+        recorded_source = (provider_payload / "source-sha").read_text(encoding="ascii")
+    except OSError as exc:
+        raise GuardError("referenced live-QA engine provider is unavailable") from exc
+    if (
+        stat.S_ISLNK(payload_meta.st_mode)
+        or not stat.S_ISDIR(payload_meta.st_mode)
+        or payload_meta.st_uid != 0 or payload_meta.st_gid != 0
+        or payload_meta.st_nlink < 2 or stat.S_IMODE(payload_meta.st_mode) != 0o555
+        or stat.S_ISLNK(root_meta.st_mode)
+        or not stat.S_ISDIR(root_meta.st_mode)
+        or root_meta.st_uid != 0 or root_meta.st_gid != 0
+        or root_meta.st_nlink < 2 or stat.S_IMODE(root_meta.st_mode) != 0o555
+        or stat.S_ISLNK(source_meta.st_mode)
+        or not stat.S_ISREG(source_meta.st_mode)
+        or source_meta.st_uid != 0 or source_meta.st_gid != 0
+        or source_meta.st_nlink != 1 or stat.S_IMODE(source_meta.st_mode) != 0o444
+        or recorded_source != provider_sha + "\n"
+    ):
+        raise GuardError("referenced live-QA engine provider metadata is unsafe")
+    expected_files = provider["engine_files"]
+    if any(
+        not isinstance(path, str)
+        or path.startswith("/")
+        or "\\" in path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+        or not (path == "node/bin/node" or path.startswith("browsers/") or path.startswith("web/node_modules/"))
+        or not isinstance(digest, str)
+        or not DIGEST_PATTERN.fullmatch(digest)
+        for path, digest in expected_files.items()
+    ):
+        raise GuardError("active live-QA engine file map is invalid")
+    actual_files: dict[str, str] = {}
+    for path in sorted(provider_root.rglob("*")):
+        relative = path.relative_to(provider_root).as_posix()
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+            raise GuardError("referenced live-QA engine provider contains unsafe metadata")
+        if stat.S_ISDIR(metadata.st_mode):
+            if stat.S_IMODE(metadata.st_mode) != 0o555 or metadata.st_nlink < 2:
+                raise GuardError("referenced live-QA engine provider directory is unsafe")
+            if relative.split("/", 1)[0] not in {"node", "browsers", "web"}:
+                raise GuardError("referenced live-QA engine provider has an unreviewed directory")
+            if relative.startswith("web/") and relative not in {
+                "web/tests", "web/tests/smoke", "web/tests/support",
+                "web/node_modules", "web/node_modules/@playwright",
+                "web/node_modules/@playwright/test", "web/node_modules/playwright",
+                "web/node_modules/playwright-core",
+            } and not any(relative.startswith(prefix) for prefix in (
+                "web/node_modules/@playwright/test/",
+                "web/node_modules/playwright/",
+                "web/node_modules/playwright-core/",
+            )):
+                raise GuardError("referenced live-QA engine provider has an unreviewed directory")
+            continue
+        allowed_modes = {0o4755} if relative == CHROMIUM_SANDBOX_RELATIVE.as_posix() else {0o444, 0o555}
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) not in allowed_modes
+        ):
+            raise GuardError("referenced live-QA engine provider file is unsafe")
+        if relative.startswith(("node/", "browsers/", "web/node_modules/")):
+            actual_files[relative] = _sha256_regular(path, expected_uid=0)
+        elif relative not in {
+            "web/package-lock.json", "web/playwright.live.config.ts",
+            "web/tests/smoke/live-launch.spec.ts",
+            "web/tests/smoke/live-user-journey.spec.ts",
+            "web/tests/support/live-qa-origin.ts", "web/tests/support/live-qa-sandbox.ts",
+            "runtime-manifest.json",
+        } and not any(relative.startswith(prefix) for prefix in (
+                "web/node_modules/@playwright/test/",
+                "web/node_modules/playwright/",
+                "web/node_modules/playwright-core/",
+        )):
+            raise GuardError("referenced live-QA engine provider contains an unreviewed file")
+    if (
+        actual_files != expected_files
+        or expected_files.get(CHROMIUM_SANDBOX_RELATIVE.as_posix()) != CHROMIUM_SANDBOX_SHA256
+        or not {"node/bin/node"}.issubset(expected_files)
+        or not all(any(path.startswith(f"browsers/{browser}/") for path in expected_files) for browser in LIVE_QA_BROWSER_ROOTS)
+        or hashlib.sha256((provider_root / "web/package-lock.json").read_bytes()).hexdigest()
+        != provider["package_lock_sha256"]
+    ):
+        raise GuardError("referenced live-QA engine provider digest does not match")
+    digest = hashlib.sha256(
+        b"oldsparky-liveqa-engine-v1\0" + NODE_VERSION.encode("ascii") + b"\0"
+        + provider["package_lock_sha256"].encode("ascii") + b"\0"
+    )
+    for relative, file_digest in sorted(actual_files.items()):
+        digest.update(relative.encode("utf-8") + b"\0f\0")
+        digest.update(bytes.fromhex(file_digest))
+    if digest.hexdigest() != provider["engine_tree_sha256"]:
+        raise GuardError("referenced live-QA engine provider digest does not match")
+    return provider_root
+
+
+def _runtime_mount_aliases(gate_path: Path) -> tuple[str, str, str, str, str]:
+    """Create empty root-owned mount targets for one validated QA gate."""
+
+    if gate_path.parent != RUN_GATE_ROOT or not PUBLIC_GATE_NAME_PATTERN.fullmatch(gate_path.name):
+        raise GuardError("public browser gate path is unsafe for runtime mapping")
+    suffix = gate_path.name.removeprefix("public-live-qa.")
+    if re.fullmatch(r"[a-z0-9_]{8}", suffix) is None:
+        raise GuardError("public browser gate nonce is invalid")
+    uid, gid = liveqa_identity()
+    try:
+        gate_metadata = gate_path.lstat()
+        gate_resolved = gate_path.resolve(strict=True)
+    except OSError as exc:
+        raise GuardError("public browser gate is unavailable for runtime mapping") from exc
+    if (
+        gate_resolved != gate_path
+        or stat.S_ISLNK(gate_metadata.st_mode)
+        or not stat.S_ISDIR(gate_metadata.st_mode)
+        or gate_metadata.st_uid != uid
+        or gate_metadata.st_gid != gid
+        or gate_metadata.st_nlink < 2
+        or stat.S_IMODE(gate_metadata.st_mode) != 0o700
+    ):
+        raise GuardError("public browser gate metadata is unsafe for runtime mapping")
+
+    try:
+        active_payload = TRUSTED_ACTIVE_POINTER.resolve(strict=True)
+    except OSError as exc:
+        raise GuardError("active live-QA generation pointer is unavailable") from exc
+    source_sha = _validate_installed_payload_root(active_payload)
+    engine_root = _trusted_runtime_root()
+    provider_sha = engine_root.parent.name
+    if COMMIT_PATTERN.fullmatch(source_sha) is None or COMMIT_PATTERN.fullmatch(provider_sha) is None:
+        raise GuardError("validated live-QA runtime identity is invalid")
+
+    _ensure_root_directory(RUNNER_CACHE_ROOT, 0o755)
+    _assert_root_controlled_path(RUNNER_CACHE_ROOT, directory=True)
+    base_metadata = RUNNER_CACHE_ROOT.lstat()
+    if (
+        base_metadata.st_gid != 0
+        or base_metadata.st_nlink < 2
+        or stat.S_IMODE(base_metadata.st_mode) != 0o755
+    ):
+        raise GuardError("runtime mapping parent directory is unsafe")
+    suite_target = RUNNER_CACHE_ROOT / f"runtime-suite-{source_sha}-{suffix}"
+    engine_target = RUNNER_CACHE_ROOT / f"runtime-engine-{provider_sha}-{suffix}"
+    if suite_target == engine_target or suite_target.parent != RUNNER_CACHE_ROOT or engine_target.parent != RUNNER_CACHE_ROOT:
+        raise GuardError("runtime mapping target identity is invalid")
+
+    created: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        for target in (suite_target, engine_target):
+            if os.path.lexists(target):
+                raise GuardError("runtime mapping target already exists")
+            os.mkdir(target, 0o555)
+            created_metadata = target.lstat()
+            created.append((target, (created_metadata.st_dev, created_metadata.st_ino)))
+            os.chown(target, 0, 0)
+            os.chmod(target, 0o555)
+            metadata = target.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_nlink != 2
+                or stat.S_IMODE(metadata.st_mode) != 0o555
+                or target.resolve(strict=True) != target
+                or any(target.iterdir())
+            ):
+                raise GuardError("runtime mapping target metadata is unsafe")
+        _sync_directory(RUNNER_CACHE_ROOT)
+    except BaseException:
+        for target, identity in reversed(created):
+            try:
+                metadata = target.lstat()
+                if (
+                    stat.S_ISDIR(metadata.st_mode)
+                    and not stat.S_ISLNK(metadata.st_mode)
+                    and metadata.st_uid == 0
+                    and metadata.st_gid == 0
+                    and (metadata.st_dev, metadata.st_ino) == identity
+                    and not any(target.iterdir())
+                ):
+                    os.chmod(target, 0o700)
+                    target.rmdir()
+            except OSError:
+                pass
+        raise
+    suite_metadata = suite_target.lstat()
+    engine_metadata = engine_target.lstat()
+    return (
+        source_sha,
+        provider_sha,
+        suffix,
+        f"{suite_metadata.st_dev}:{suite_metadata.st_ino}",
+        f"{engine_metadata.st_dev}:{engine_metadata.st_ino}",
+    )
+
+
+def _cleanup_runtime_mount_aliases(
+    source_sha: str,
+    provider_sha: str,
+    suffix: str,
+    suite_identity: str,
+    engine_identity: str,
+) -> None:
+    """Remove only the exact empty mount targets created for this gate."""
+
+    if (
+        COMMIT_PATTERN.fullmatch(source_sha) is None
+        or COMMIT_PATTERN.fullmatch(provider_sha) is None
+        or re.fullmatch(r"[a-z0-9_]{8}", suffix) is None
+    ):
+        raise GuardError("runtime mapping cleanup identity is invalid")
+    identities: list[tuple[int, int]] = []
+    for value in (suite_identity, engine_identity):
+        if re.fullmatch(r"[0-9]+:[0-9]+", value) is None:
+            raise GuardError("runtime mapping cleanup inode identity is invalid")
+        device, inode = value.split(":", 1)
+        identities.append((int(device), int(inode)))
+    targets = (
+        RUNNER_CACHE_ROOT / f"runtime-suite-{source_sha}-{suffix}",
+        RUNNER_CACHE_ROOT / f"runtime-engine-{provider_sha}-{suffix}",
+    )
+    _assert_root_controlled_path(RUNNER_CACHE_ROOT, directory=True)
+    for target, identity in zip(targets, identities, strict=True):
+        try:
+            metadata = target.lstat()
+            resolved = target.resolve(strict=True)
+        except OSError as exc:
+            raise GuardError("runtime mapping cleanup target is unavailable") from exc
+        if (
+            resolved != target
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 2
+            or stat.S_IMODE(metadata.st_mode) != 0o555
+            or (metadata.st_dev, metadata.st_ino) != identity
+            or any(target.iterdir())
+        ):
+            raise GuardError("runtime mapping cleanup target is unsafe")
+    for target in targets:
+        os.chmod(target, 0o700)
+        target.rmdir()
+    _sync_directory(RUNNER_CACHE_ROOT)
+
+
+def _assert_runtime_unit_collected() -> None:
+    """Require the transient browser unit to be gone before mountpoint cleanup."""
+
+    assert_liveqa_idle()
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "show",
+                LIVE_QA_SYSTEMD_UNIT,
+                "--property=LoadState",
+                "--value",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GuardError("transient live QA unit collection could not be verified") from exc
+    if result.returncode != 0 or result.stdout.strip() != "not-found":
+        raise GuardError("transient live QA unit has not been collected")
+
+
 def prepare_runtime_cache(platform_root: Path, commit: str) -> Path:
     if not COMMIT_PATTERN.fullmatch(commit):
         raise GuardError("runtime cache commit is invalid")
@@ -3013,6 +3356,15 @@ def _parser() -> argparse.ArgumentParser:
     runtime = commands.add_parser("prepare-runtime-cache")
     runtime.add_argument("--platform-root", type=Path, required=True)
     runtime.add_argument("--commit", required=True)
+    commands.add_parser("runtime-root")
+    prepare_mounts = commands.add_parser("prepare-runtime-mounts")
+    prepare_mounts.add_argument("--gate-path", type=Path, required=True)
+    cleanup_mounts = commands.add_parser("cleanup-runtime-mounts")
+    cleanup_mounts.add_argument("--source-sha", required=True)
+    cleanup_mounts.add_argument("--provider-sha", required=True)
+    cleanup_mounts.add_argument("--suffix", required=True)
+    cleanup_mounts.add_argument("--suite-identity", required=True)
+    cleanup_mounts.add_argument("--engine-identity", required=True)
     prune_runtime = commands.add_parser(
         "prune-runtime-cache",
         description=(
@@ -3097,6 +3449,20 @@ def main(argv: Iterable[str] | None = None) -> int:
             remove_setup_state(args.bundle_path, args.setup_dir)
         elif args.command == "prepare-runtime-cache":
             print(prepare_runtime_cache(args.platform_root, args.commit))
+        elif args.command == "runtime-root":
+            print(_trusted_runtime_root())
+        elif args.command == "prepare-runtime-mounts":
+            values = _runtime_mount_aliases(args.gate_path)
+            print("\t".join(values))
+        elif args.command == "cleanup-runtime-mounts":
+            _assert_runtime_unit_collected()
+            _cleanup_runtime_mount_aliases(
+                args.source_sha,
+                args.provider_sha,
+                args.suffix,
+                args.suite_identity,
+                args.engine_identity,
+            )
         elif args.command == "prune-runtime-cache":
             plan = prune_runtime_cache(
                 apply=args.apply,

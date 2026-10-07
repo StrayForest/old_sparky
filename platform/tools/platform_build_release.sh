@@ -527,6 +527,7 @@ CURRENT_PHASE="live-qa-runtime"
   "$STAGING_DIR/tools/platform_build_live_qa_runtime.py" \
   --platform-root "$STAGING_DIR" \
   --node-home "$PINNED_NODE_HOME" \
+  --source-only \
   --output "$STAGING_DIR/liveqa-runtime"
 if [[ ! -d "$STAGING_DIR/liveqa-runtime" || -L "$STAGING_DIR/liveqa-runtime" \
   || ! -f "$STAGING_DIR/liveqa-runtime/runtime-manifest.json" \

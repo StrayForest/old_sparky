@@ -146,6 +146,7 @@ class ArchiveBuilder:
             "node/bin/node": b"node\n",
             "web/package-lock.json": b"{}\n",
             "web/playwright.live.config.ts": b"export default {};\n",
+            "web/tests/smoke/live-launch.spec.ts": b"test('launch', () => {});\n",
             "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
             "web/tests/support/live-qa-origin.ts": b"export {};\n",
             "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
@@ -326,6 +327,92 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
                     member,
                     None if content is None else io.BytesIO(content),
                 )
+
+    def test_source_only_runtime_manifest_validates_component_reference(self) -> None:
+        artifact = self.root / "source-only.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        for browser, relative in (
+            ("chromium_headless_shell-1228", "chrome-headless-shell"),
+            ("webkit-2311", "browser"),
+            ("ffmpeg-1011", "ffmpeg"),
+        ):
+            builder.add_file(
+                f"{RELEASE_SLUG}/liveqa-runtime/browsers/{browser}/{relative}",
+                f"{browser}\n".encode(),
+                mode=0o555,
+            )
+        original = list(builder.entries)
+        runtime_prefix = f"{RELEASE_SLUG}/liveqa-runtime/"
+        engine_files: dict[str, str] = {}
+        suite_files: dict[str, str] = {}
+        retained: list[tuple[tarfile.TarInfo, bytes | None]] = []
+        for member, content in original:
+            if not member.name.startswith(runtime_prefix):
+                retained.append((member, content))
+                continue
+            relative = member.name.removeprefix(runtime_prefix)
+            if not relative or relative == "runtime-manifest.json":
+                if relative != "runtime-manifest.json":
+                    retained.append((member, content))
+                continue
+            engine_member = relative.startswith(("node/", "browsers/", "web/node_modules/"))
+            if engine_member:
+                if member.isfile():
+                    assert content is not None
+                    engine_files[relative] = hashlib.sha256(content).hexdigest()
+                continue
+            retained.append((member, content))
+            if member.isfile():
+                assert content is not None
+                suite_files[relative] = hashlib.sha256(content).hexdigest()
+
+        def map_digest(domain: bytes, files: dict[str, str]) -> str:
+            digest = hashlib.sha256(domain)
+            for relative, value in sorted(files.items()):
+                digest.update(relative.encode("utf-8") + b"\0f\0")
+                digest.update(bytes.fromhex(value))
+            return digest.hexdigest()
+
+        lock_sha = suite_files["web/package-lock.json"]
+        node_version = validator.PINNED_NODE_VERSION
+        manifest = {
+            "version": 2,
+            "node_version": node_version,
+            "package_lock_sha256": lock_sha,
+            "engine_tree_sha256": map_digest(
+                b"oldsparky-liveqa-engine-v1\0"
+                + node_version.encode("ascii")
+                + b"\0"
+                + lock_sha.encode("ascii")
+                + b"\0",
+                engine_files,
+            ),
+            "engine_files": engine_files,
+            "suite_tree_sha256": map_digest(b"oldsparky-liveqa-suite-v1\0", suite_files),
+            "suite_files": suite_files,
+        }
+        builder.entries = retained
+        builder.add_file(
+            f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json",
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n",
+            mode=0o444,
+        )
+        builder.write(regenerate_runtime_manifest=False)
+        validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
+
+        tampered = self.root / "source-only-bad-provider.tar.gz"
+        manifest["engine_files"]["web/node_modules/playwright-core/package.json"] = "0" * 64
+        self._rewrite_archive(
+            artifact,
+            tampered,
+            {
+                f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json": json.dumps(
+                    manifest, sort_keys=True, separators=(",", ":")
+                ).encode() + b"\n"
+            },
+        )
+        with self.assertRaises(validator.ArtifactError):
+            validator.validate_archive(tampered, release_slug=RELEASE_SLUG)
 
     def test_runtime_manifest_order_is_explicit_and_shared(self) -> None:
         names = ("resources/accessibility", "resources.pak")

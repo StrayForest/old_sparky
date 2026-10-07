@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, redirect_stderr
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -31,6 +32,145 @@ SAFE_ENV_SPEC.loader.exec_module(safe_env)
 
 @unittest.skipUnless(os.geteuid() == 0, "installer contract requires root-owned test paths")
 class LiveQaRuntimeInstallTests(unittest.TestCase):
+    def _engine_provider_fixture(self, root: Path) -> tuple[Path, dict[str, str], str]:
+        engine = root / "runtime"
+        paths = [
+            "node/bin",
+            "browsers/chromium-1228/chrome-linux64",
+            "browsers/chromium_headless_shell-1228",
+            "browsers/webkit-2311",
+            "browsers/ffmpeg-1011",
+            "web/tests/smoke",
+            "web/tests/support",
+            "web/node_modules/@playwright/test",
+            "web/node_modules/playwright",
+            "web/node_modules/playwright-core",
+        ]
+        for relative in paths:
+            (engine / relative).mkdir(mode=0o700, parents=True, exist_ok=True)
+        files = {
+            "node/bin/node": (b"node\n", 0o555),
+            "browsers/chromium-1228/chrome-linux64/chrome_sandbox": (b"sandbox\n", 0o4755),
+            "browsers/chromium_headless_shell-1228/shell": (b"headless\n", 0o555),
+            "browsers/webkit-2311/browser": (b"webkit\n", 0o555),
+            "browsers/ffmpeg-1011/ffmpeg": (b"ffmpeg\n", 0o555),
+            "web/package-lock.json": (b"lock\n", 0o444),
+            "web/playwright.live.config.ts": (b"config\n", 0o444),
+            "web/tests/smoke/live-launch.spec.ts": (b"launch\n", 0o444),
+            "web/tests/smoke/live-user-journey.spec.ts": (b"journey\n", 0o444),
+            "web/tests/support/live-qa-origin.ts": (b"origin\n", 0o444),
+            "web/tests/support/live-qa-sandbox.ts": (b"support\n", 0o444),
+            "web/node_modules/@playwright/test/package.json": (b'{"name":"test"}\n', 0o444),
+            "web/node_modules/@playwright/test/index.js": (b"test\n", 0o444),
+            "web/node_modules/playwright/package.json": (b'{"name":"playwright"}\n', 0o444),
+            "web/node_modules/playwright/index.js": (b"playwright\n", 0o444),
+            "web/node_modules/playwright-core/package.json": (b'{"name":"core"}\n', 0o444),
+            "web/node_modules/playwright-core/index.js": (b"core\n", 0o444),
+        }
+        for relative, (content, mode) in files.items():
+            path = engine / relative
+            path.write_bytes(content)
+            os.chmod(path, mode)
+        for path in sorted(engine.rglob("*"), reverse=True):
+            if path.is_dir():
+                os.chmod(path, 0o555)
+        os.chmod(engine, 0o555)
+        sandbox = engine / runtime.RUNTIME_SANDBOX_RELATIVE
+        with mock.patch.multiple(
+            runtime,
+            CHROMIUM_SANDBOX_SIZE=sandbox.stat().st_size,
+            CHROMIUM_SANDBOX_SHA256=hashlib.sha256(sandbox.read_bytes()).hexdigest(),
+        ):
+            file_map = runtime._runtime_file_map(
+                engine,
+                prefixes=("node/", "browsers/", "web/node_modules/"),
+            )
+        lock_sha = runtime._digest_regular(engine / "web/package-lock.json")
+        return engine, file_map, lock_sha
+
+    def test_changed_locked_dependency_bytes_fail_engine_provider_validation(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            engine, file_map, lock_sha = self._engine_provider_fixture(root)
+            sandbox_path = engine / runtime.RUNTIME_SANDBOX_RELATIVE
+            sandbox_sha = runtime._digest_regular(sandbox_path, allow_sandbox=True)
+            with mock.patch.multiple(
+                runtime,
+                CHROMIUM_SANDBOX_SIZE=sandbox_path.stat().st_size,
+                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+            ):
+                engine_sha = runtime._engine_digest(
+                    file_map, node_version="26.3.1", package_lock_sha256=lock_sha
+                )
+                runtime._validate_engine_root(
+                    engine,
+                    expected_files=file_map,
+                    engine_sha256=engine_sha,
+                    node_version="26.3.1",
+                    package_lock_sha256=lock_sha,
+                )
+                dependency = engine / "web/node_modules/playwright-core/index.js"
+                os.chmod(dependency, 0o644)
+                dependency.write_bytes(b"changed dependency bytes\n")
+                os.chmod(dependency, 0o444)
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._validate_engine_root(
+                        engine,
+                        expected_files=file_map,
+                        engine_sha256=engine_sha,
+                        node_version="26.3.1",
+                        package_lock_sha256=lock_sha,
+                    )
+
+    def test_retention_protects_transitively_referenced_provider(self) -> None:
+        source_shas = ["a" * 40, "b" * 40, "c" * 40, "d" * 40, "e" * 40]
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            app_dir = root / "platform"
+            releases = app_dir / "releases"
+            releases.mkdir(mode=0o755, parents=True)
+            payloads = root / "liveqa" / "releases"
+            payloads.mkdir(mode=0o755, parents=True)
+            for source_sha in source_shas[:2]:
+                release = releases / f"release-{source_sha[:8]}"
+                release.mkdir(mode=0o555)
+                record = {"source_git_commit": source_sha, "release_slug": release.name}
+                (release / "RELEASE.json").write_text(json.dumps(record), encoding="ascii")
+                os.chmod(release / "RELEASE.json", 0o444)
+            (app_dir / "current").symlink_to(releases / f"release-{source_shas[0][:8]}")
+            (app_dir / "previous").symlink_to(releases / f"release-{source_shas[1][:8]}")
+            for source_sha in source_shas[1:]:
+                payload = payloads / source_sha
+                payload.mkdir(mode=0o555)
+            provider = {
+                "version": 1,
+                "source_sha": source_shas[1],
+                "provider_sha": source_shas[2],
+                "engine_tree_sha256": "f" * 64,
+                "node_version": "26.3.1",
+                "package_lock_sha256": "e" * 64,
+                "engine_files": {"node/bin/node": "d" * 64},
+            }
+            provider_path = payloads / source_shas[1] / "runtime-provider.json"
+            provider_path.write_text(json.dumps(provider), encoding="ascii")
+            os.chmod(provider_path, 0o444)
+            trusted = root / "liveqa"
+            (trusted / "active").symlink_to(f"releases/{source_shas[1]}")
+            with mock.patch.multiple(
+                runtime,
+                PAYLOAD_ROOT=payloads,
+                ACTIVE_POINTER=trusted / "active",
+            ):
+                protected = runtime._protected_shas(app_dir)
+                self.assertIn(source_shas[2], protected)
+                runtime._retention(app_dir, apply=True)
+                self.assertTrue((payloads / source_shas[2]).exists())
+                os.chmod(provider_path, 0o644)
+                provider_path.write_text("{}\n", encoding="ascii")
+                os.chmod(provider_path, 0o444)
+                with self.assertRaises(runtime.InstallerError):
+                    runtime._protected_shas(app_dir)
+
     @contextmanager
     def runtime_tree(self, root: Path, source_sha: str):
         trusted = root / "liveqa"
