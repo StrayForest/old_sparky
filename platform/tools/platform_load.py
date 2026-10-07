@@ -2439,7 +2439,22 @@ def _is_complete_observer_bound_decision(
         return False
     if profile_kind == "capacity" and acceptance.get("phase_completion") is not True:
         return False
-    return _acceptance_failure_is_budget_only(acceptance, str(profile_kind))
+    traffic = profile.get("traffic")
+    authored_stages = (
+        traffic.get("concurrency_stages") if isinstance(traffic, Mapping) else None
+    )
+    allowed_ramp_budget_checks = (
+        frozenset(f"ramp_{stage}_budgets" for stage in authored_stages)
+        if isinstance(authored_stages, list)
+        and authored_stages
+        and all(type(stage) is int and stage > 0 for stage in authored_stages)
+        else frozenset()
+    )
+    return _acceptance_failure_is_budget_only(
+        acceptance,
+        str(profile_kind),
+        allowed_ramp_budget_checks=allowed_ramp_budget_checks,
+    )
 
 
 _PROFILE_BUDGET_CHECKS: dict[str, frozenset[str]] = {
@@ -2538,6 +2553,18 @@ _ORIGIN_RESOURCE_BUDGET_CHECKS = frozenset(
 _ORIGIN_RESOURCE_HARD_CHECKS = frozenset(
     {"observer_completed", "required_diagnostics_present"}
 )
+_RAMP_STAGE_BUDGET_CHECKS = frozenset(
+    {
+        "logical_final_failure_budget",
+        "accepted_p95",
+        "accepted_p99",
+        "logical_p95",
+        "logical_p99",
+        "shed_percent",
+        "retry_amplification_percent",
+        "minimum_useful_goodput",
+    }
+)
 
 _BUDGET_AGGREGATE_CHECKS = frozenset(
     {"phase_budgets", "capacity_ramp_evidence", "origin_safety"}
@@ -2545,7 +2572,10 @@ _BUDGET_AGGREGATE_CHECKS = frozenset(
 
 
 def _acceptance_failure_is_budget_only(
-    acceptance: Mapping[str, Any], profile_kind: str
+    acceptance: Mapping[str, Any],
+    profile_kind: str,
+    *,
+    allowed_ramp_budget_checks: frozenset[str] = frozenset(),
 ) -> bool:
     """Reject an SLO-miss classification if any structural check failed.
 
@@ -2560,19 +2590,43 @@ def _acceptance_failure_is_budget_only(
     if allowed is None or not isinstance(checks, Mapping) or not checks:
         return False
 
-    def check_tree(node: Any) -> tuple[bool, bool]:
+    authored_ramp_stages = {
+        name.removeprefix("ramp_").removesuffix("_budgets")
+        for name in allowed_ramp_budget_checks
+    }
+    ramp_evidence = acceptance.get("capacity_ramp_evidence")
+    ramp_evidence_checks = (
+        ramp_evidence.get("checks") if isinstance(ramp_evidence, Mapping) else None
+    )
+    failed_ramp_stages = {
+        stage
+        for stage in authored_ramp_stages
+        if isinstance(ramp_evidence_checks, Mapping)
+        and ramp_evidence_checks.get(f"ramp_{stage}_budgets") is False
+    }
+
+    def check_tree(node: Any, path: tuple[str, ...] = ()) -> tuple[bool, bool]:
         budget_failure = False
         if isinstance(node, Mapping):
             nested_checks = node.get("checks")
             if nested_checks is not None:
                 if not isinstance(nested_checks, Mapping):
                     return False, False
+                check_path = path + ("checks",)
                 for name, value in nested_checks.items():
                     if value is False:
-                        if name in allowed or (
-                            profile_kind == "capacity"
-                            and str(name).startswith("ramp_")
-                            and str(name).endswith("_budgets")
+                        ramp_stage_budget_check = (
+                            len(check_path) == 5
+                            and check_path[0] == "capacity_ramp_evidence"
+                            and check_path[1] == "stages"
+                            and check_path[2] in failed_ramp_stages
+                            and check_path[3] == "budget_evidence"
+                            and name in _RAMP_STAGE_BUDGET_CHECKS
+                        )
+                        if (
+                            name in allowed
+                            or name in allowed_ramp_budget_checks
+                            or ramp_stage_budget_check
                         ):
                             budget_failure = True
                         elif name in _BUDGET_AGGREGATE_CHECKS:
@@ -2584,7 +2638,9 @@ def _acceptance_failure_is_budget_only(
                             evidence = node.get(evidence_key)
                             if not isinstance(evidence, Mapping):
                                 return False, False
-                            valid, nested_budget_failure = check_tree(evidence)
+                            valid, nested_budget_failure = check_tree(
+                                evidence, path + (evidence_key,)
+                            )
                             if not valid or not nested_budget_failure:
                                 return False, False
                             budget_failure = True
@@ -2595,15 +2651,16 @@ def _acceptance_failure_is_budget_only(
             for key, value in node.items():
                 if key in {"checks", "passed", "complete", "target_passed"}:
                     continue
-                children = (
-                    list(value)
-                    if isinstance(value, (list, tuple))
-                    else [value]
-                    if isinstance(value, Mapping)
-                    else []
-                )
-                for child in children:
-                    valid, child_budget_failure = check_tree(child)
+                if isinstance(value, Mapping):
+                    children = [(str(key), value)]
+                elif isinstance(value, (list, tuple)):
+                    children = [(str(key), child) for child in value]
+                else:
+                    children = []
+                for child_key, child in children:
+                    valid, child_budget_failure = check_tree(
+                        child, path + (child_key,)
+                    )
                     if not valid:
                         return False, False
                     budget_failure = budget_failure or child_budget_failure

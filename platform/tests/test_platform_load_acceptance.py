@@ -14,6 +14,7 @@ from tools.platform_load import (
 )
 from tools.platform_load_runtime import PID_NAMESPACE_ISOLATION, WORKER_REPORT_SCHEMA
 from tools.platform_load_acceptance import (
+    _capacity_ramp_evidence,
     evaluate_acceptance,
     observer_evidence_required,
     phase_plan_completeness,
@@ -613,6 +614,96 @@ class LoadAcceptanceTests(unittest.TestCase):
         resource_budget_miss["acceptance"]["checks"]["origin_safety"] = False
         self.assertTrue(
             _is_complete_observer_bound_decision(profile, resource_budget_miss)
+        )
+
+        ramp_profile = get_profile("read-mix-concurrency-ramp-v1")
+        ramp_contract = profile_contract(ramp_profile)
+        authored_stages = ramp_profile["traffic"]["concurrency_stages"]
+        stage_counts = ramp_contract["planned_work"]["stage_logical_actions"]
+
+        def ramp_evidence(*, population_mismatch: bool = False) -> dict[str, object]:
+            stages = {
+                str(stage): canonical_raw(stage_counts[str(stage)])
+                for stage in authored_stages
+            }
+            for stage in stages.values():
+                stage["latency"] = latency(1, 1, 1, 1)
+            first_stage = stages[str(authored_stages[0])]
+            first_stage["latency"] = latency(1, 1, 9000, 12000)
+            if population_mismatch:
+                first_stage["requests"] = int(first_stage["requests"]) - 1
+            return _capacity_ramp_evidence(
+                {"concurrency_stages": authored_stages, "stages": stages},
+                stage_counts,
+                canonical=True,
+                expected_statuses=frozenset(
+                    ramp_profile["acceptance"]["expected_statuses"]
+                ),
+                acceptance_contract=ramp_profile["acceptance"],
+                max_retries=0,
+            )
+
+        def ramp_decision(evidence: dict[str, object]) -> dict[str, object]:
+            return {
+                "authoritative": True,
+                "dispatchable": True,
+                "partial_work": False,
+                "inflight_unknown": False,
+                "report_binding": {"complete": True},
+                "runtime_supervisor": {
+                    "reason": "none",
+                    "namespace_closed": True,
+                    "descendants_reaped": True,
+                    "partial_work": False,
+                    "inflight_unknown": False,
+                    "report_error": None,
+                },
+                "origin_observability": {"binding": {"complete": True}},
+                "acceptance": {
+                    "decision": "STRESS BEHAVIOR FAIL",
+                    "passed": False,
+                    "pending_origin_evidence": False,
+                    "contract_ok": True,
+                    "observer_binding": {"complete": True},
+                    "timing_evidence": {"complete": True},
+                    "phase_plan_evidence": {"complete": True},
+                    "phase_population_evidence": {"all_phases": True},
+                    "raw_logical_population_evidence": {"all_populations": True},
+                    "top_population_timing_evidence": {"all_populations": True},
+                    "capacity_ramp_evidence": evidence,
+                    "checks": {
+                        "accepted_p95_ms": True,
+                        "timing_complete": True,
+                        "capacity_ramp_evidence": evidence["complete"],
+                    },
+                },
+            }
+
+        complete_ramp_budget_miss = ramp_evidence()
+        self.assertFalse(complete_ramp_budget_miss["complete"])
+        self.assertTrue(
+            all(
+                value is True
+                for name, value in complete_ramp_budget_miss["checks"].items()
+                if name.endswith("_population") or name.startswith("ramp_")
+                if not name.endswith("_budgets")
+            )
+        )
+        self.assertTrue(
+            _is_complete_observer_bound_decision(
+                ramp_profile,
+                ramp_decision(complete_ramp_budget_miss),
+            )
+        )
+
+        incomplete_ramp_population = ramp_evidence(population_mismatch=True)
+        self.assertFalse(incomplete_ramp_population["complete"])
+        self.assertFalse(incomplete_ramp_population["checks"][f"ramp_{authored_stages[0]}_population"])
+        self.assertFalse(
+            _is_complete_observer_bound_decision(
+                ramp_profile,
+                ramp_decision(incomplete_ramp_population),
+            )
         )
 
         structural_failures = (
