@@ -197,7 +197,7 @@ jobs:
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B \
             /root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py \
-            live-launch < "$input_path" > "$raw_report" 2>&1
+            live-launch < "$input_path" > "$raw_report" 2>/dev/null
           ssh_status="$?"
           set -e
           echo "ssh_status=$ssh_status" >> "$GITHUB_OUTPUT"
@@ -265,9 +265,10 @@ jobs:
             rm -f -- "$raw_report"
           }
           trap cleanup_raw_report EXIT
-          /usr/bin/python3 - "$raw_report" "$safe_report" "$SUPERVISOR_STATUS" <<'PY'
+          /usr/bin/python3 - "$raw_report" "$safe_report" "$SUPERVISOR_STATUS" "$GITHUB_SHA" <<'PY'
           import json
           from pathlib import Path
+          import re
           import sys
 
           source = Path(sys.argv[1])
@@ -276,44 +277,64 @@ jobs:
               process_status = int(sys.argv[3])
           except ValueError:
               process_status = 1
-          raw = source.read_bytes()[:262144]
-          truncated = len(raw) == 262144
-          text = raw.decode("utf-8", errors="replace")
-          lines = text.splitlines()[:1000]
-          lower = text.lower()
-          if process_status != 0:
-              status = "failed"
-              success = False
-              errors = {"transport": 1}
-          elif "live_browser_qa_success" in lower:
-              status = "passed"
-              success = True
-              errors = {"none": 1}
-          elif any(word in lower for word in ("error", "failed", "failure", "timeout")):
-              status = "failed"
-              success = False
-              errors = {"other": 1}
-          elif lines:
-              status = "unknown"
-              success = False
-              errors = {"none": 1}
-          else:
-              status = "unavailable"
-              success = False
-              errors = {"none": 1}
+          expected_sha = sys.argv[4]
+          raw_size = source.stat().st_size
+          raw = source.read_bytes() if raw_size <= 256 else b""
+          marker_pattern = re.compile(
+              rb"LIVE_LAUNCH_STATUS schema=1 status=(passed|failed) "
+              rb"stage=(validation|trusted_generation|identity|account_install|"
+              rb"provision|browser_qa|dispatch|trusted_entry|timeout|complete) "
+              rb"child_exit=(0|[1-9][0-9]{0,2}) "
+              rb"source_sha=([0-9a-f]{40})\n"
+          )
+          match = marker_pattern.fullmatch(raw) if raw_size <= 256 else None
+          marker = None
+          if match is not None and match.group(4).decode("ascii") == expected_sha:
+              marker = (
+                  match.group(1).decode("ascii"),
+                  match.group(2).decode("ascii"),
+                  int(match.group(3)),
+              )
+          marker_ok = False
+          if marker is not None:
+              marker_status, stage, child_status = marker
+              if marker_status == "passed":
+                  marker_ok = (
+                      stage == "complete"
+                      and child_status == 0
+                      and process_status == 0
+                  )
+              else:
+                  marker_ok = (
+                      stage in {
+                          "validation", "trusted_generation", "identity",
+                          "account_install", "provision", "browser_qa",
+                          "dispatch", "trusted_entry", "timeout",
+                      }
+                      and child_status > 0
+                      and process_status == child_status
+                  )
+          success = bool(marker_ok and marker is not None and marker[0] == "passed")
+          status = "passed" if success else ("failed" if marker_ok else "unavailable")
+          errors = {"none": 1} if success else ({"other": 1} if marker_ok else {"transport": 1})
+          stage = marker[1] if marker_ok and marker is not None else "unknown"
+          child_status = marker[2] if marker_ok and marker is not None else 1
           report = {
               "schema": 1,
               "status": status,
               "success": success,
               "process_exit_code": process_status if 0 <= process_status <= 255 else 1,
-              "line_count": len(lines),
-              "retained_line_count": len(lines),
-              "truncated": truncated,
-              "test_count": 1 if "live_browser_qa_success" in lower else 0,
-              "failed_test_count": 0 if success else (1 if lines else 0),
+              "stage": stage,
+              "child_exit_code": child_status,
+              "source_sha": expected_sha,
+              "line_count": 1 if marker_ok else 0,
+              "retained_line_count": 1 if marker_ok else 0,
+              "truncated": False,
+              "test_count": 1 if success else 0,
+              "failed_test_count": 0 if success else (1 if marker_ok else 0),
               "tests": ([{"name": "browser_public", "status": "passed", "route_class": "other", "http_status": 0, "error_class": "none"}] if success else []),
               "class_counts": {"success": 1} if success else {"failure": 1},
-              "route_class_counts": {"other": len(lines)},
+              "route_class_counts": {"other": 1} if marker_ok else {},
               "status_counts": {},
               "error_class_counts": errors,
           }

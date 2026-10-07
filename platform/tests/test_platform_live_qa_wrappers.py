@@ -11,6 +11,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -254,7 +257,18 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         )
         self.assertIn("live-launch < \"$input_path\"", source)
         self.assertIn("platform_live_browser_qa.sh\" public", supervisor)
-        self.assertIn("LIVE_BROWSER_QA_SUCCESS", supervisor)
+        self.assertIn("LIVE_LAUNCH_STATUS schema=1", supervisor)
+        self.assertIn('required = ("oldsparky-platform",)', supervisor)
+        self.assertIn('exec 3>&1', supervisor)
+        self.assertIn('exec >/dev/null 2>&1', supervisor)
+        self.assertLess(
+            supervisor.index('launch_stage="account_install"'),
+            supervisor.index('"$TOOLS_DIR/platform_install_live_qa_user.sh" --apply'),
+        )
+        self.assertGreater(
+            supervisor.index('launch_stage="provision"'),
+            supervisor.index('"$TOOLS_DIR/platform_install_live_qa_user.sh" --apply'),
+        )
         self.assertIn("type: boolean", source)
         self.assertIn("LIVE_PROVISION", source)
         self.assertIn("LIVE_MARKER", source)
@@ -280,10 +294,135 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertNotIn("npm ci", source)
         self.assertNotIn("npm run test:live", source)
         self.assertNotIn('bash -s -- "$LIVE_BASE_URL"', source)
+        self.assertNotIn("live_browser_qa_success", source.lower())
+        self.assertIn('rb"LIVE_LAUNCH_STATUS schema=1 status=(passed|failed) "', source)
+        self.assertIn('stage == "complete"', source)
+        self.assertIn('child_status == 0', source)
         self.assertLess(
             source.index("platform_workflow_input_guard.py live"),
             source.index('printf \'%s\\n\' "$PROD_SSH_KEY"'),
         )
+        status_sha = "a" * 40
+
+        identity_match = re.search(
+            r"/usr/bin/python3\.12 -I -B - <<'PY'\n(.*?)\nPY",
+            supervisor,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(identity_match)
+        assert identity_match is not None
+
+        def run_identity_report(
+            users: dict[str, SimpleNamespace],
+            groups: dict[str, SimpleNamespace],
+        ) -> tuple[int, dict[str, object]]:
+            fake_pwd = SimpleNamespace(
+                getpwnam=lambda name: users[name],
+                getpwall=lambda: list(users.values()),
+            )
+            fake_grp = SimpleNamespace(
+                getgrnam=lambda name: groups[name],
+                getgrall=lambda: list(groups.values()),
+            )
+            output = StringIO()
+            with patch.dict(sys.modules, {"pwd": fake_pwd, "grp": fake_grp}), redirect_stdout(output):
+                try:
+                    exec(compile(identity_match.group(1), "supervisor-identity", "exec"), {})
+                except SystemExit as error:
+                    status = int(error.code)
+                else:
+                    status = 0
+            return status, json.loads(output.getvalue().removeprefix("LIVE_QA_IDENTITY "))
+
+        def identity_fixture(*, legacy: bool = False, platform: bool = True):
+            users = {
+                "oldsparky-liveqa": SimpleNamespace(
+                    pw_name="oldsparky-liveqa", pw_uid=998, pw_gid=998,
+                    pw_dir="/nonexistent", pw_shell="/usr/sbin/nologin",
+                ),
+            }
+            groups = {"oldsparky-liveqa": SimpleNamespace(gr_name="oldsparky-liveqa", gr_gid=998, gr_mem=[])}
+            if platform:
+                users["oldsparky-platform"] = SimpleNamespace(
+                    pw_name="oldsparky-platform", pw_uid=992, pw_gid=992,
+                    pw_dir="/srv/oldsparky", pw_shell="/usr/sbin/nologin",
+                )
+                groups["oldsparky-platform"] = SimpleNamespace(
+                    gr_name="oldsparky-platform", gr_gid=992, gr_mem=[]
+                )
+            if legacy:
+                users["oldsparky"] = SimpleNamespace(
+                    pw_name="oldsparky", pw_uid=991, pw_gid=991,
+                    pw_dir="/srv/oldsparky-legacy", pw_shell="/usr/sbin/nologin",
+                )
+                groups["oldsparky"] = SimpleNamespace(
+                    gr_name="oldsparky", gr_gid=991, gr_mem=[]
+                )
+            return users, groups
+
+        absent_users, absent_groups = identity_fixture()
+        status, identity = run_identity_report(absent_users, absent_groups)
+        self.assertEqual(status, 0)
+        self.assertEqual(identity["status"], "valid")
+        self.assertEqual(identity["required_identities_present"], True)
+
+        present_users, present_groups = identity_fixture(legacy=True)
+        status, identity = run_identity_report(present_users, present_groups)
+        self.assertEqual(status, 0)
+        self.assertEqual(identity["status"], "valid")
+
+        collision_users, collision_groups = identity_fixture(legacy=True)
+        collision_users["oldsparky"] = SimpleNamespace(
+            pw_name="oldsparky", pw_uid=998, pw_gid=998,
+            pw_dir="/srv/oldsparky-legacy", pw_shell="/usr/sbin/nologin",
+        )
+        status, identity = run_identity_report(collision_users, collision_groups)
+        self.assertEqual(status, 1)
+        self.assertIn("uid_collision", identity["reasons"])
+
+        group_collision_users, group_collision_groups = identity_fixture(legacy=True)
+        group_collision_users["oldsparky"] = SimpleNamespace(
+            pw_name="oldsparky", pw_uid=991, pw_gid=998,
+            pw_dir="/srv/oldsparky-legacy", pw_shell="/usr/sbin/nologin",
+        )
+        group_collision_groups["oldsparky"] = SimpleNamespace(
+            gr_name="oldsparky", gr_gid=998, gr_mem=[]
+        )
+        status, identity = run_identity_report(group_collision_users, group_collision_groups)
+        self.assertEqual(status, 1)
+        self.assertIn("gid_collision", identity["reasons"])
+
+        missing_users, missing_groups = identity_fixture(platform=False)
+        status, identity = run_identity_report(missing_users, missing_groups)
+        self.assertEqual(status, 1)
+        self.assertEqual(identity["required_identities_present"], False)
+        self.assertIn("oldsparky-platform_user_missing", identity["reasons"])
+
+        missing_group_users, missing_group_groups = identity_fixture()
+        missing_group_groups.pop("oldsparky-liveqa")
+        status, identity = run_identity_report(missing_group_users, missing_group_groups)
+        self.assertEqual(status, 1)
+        self.assertIn("group_missing", identity["reasons"])
+
+        emitter_prologue = supervisor.split('EXPECTED_ORIGIN="https://old-sparky.com"', 1)[0]
+        emitter_script = emitter_prologue + 'launch_stage="identity"\nexit 1\n'
+        emitter = subprocess.run(
+            [
+                "/bin/bash", "-c", emitter_script, "live-launch-test",
+                "https://old-sparky.com", "true", "liveqa-test-marker", status_sha,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        self.assertEqual(emitter.returncode, 1)
+        self.assertEqual(
+            emitter.stdout,
+            "LIVE_LAUNCH_STATUS schema=1 status=failed stage=identity "
+            f"child_exit=1 source_sha={status_sha}\n",
+        )
+        self.assertEqual(emitter.stderr, "")
 
         # OpenSSH concatenates command arguments into a remote shell command,
         # so every workflow SSH command must end at a fixed dispatcher mode.
@@ -493,20 +632,20 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 BytesIO((json.dumps(valid_live) + "\n").encode("utf-8")),
                 encoding="utf-8",
             )
-            child = Mock(pid=1234)
-            child.wait.return_value = 0
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_ROOT", root), \
                 patch.object(platform_workflow_remote_dispatch, "TRUSTED_LIVE_LAUNCH", helper), \
                 patch.object(
-                    platform_workflow_remote_dispatch.subprocess, "Popen", return_value=child
-                ) as popen:
+                    platform_workflow_remote_dispatch,
+                    "_run_bounded_child",
+                    return_value=0,
+                ) as run_child:
                 self.assertEqual(
                     platform_workflow_remote_dispatch.main(["live-launch"]),
                     0,
                 )
             self.assertEqual(
-                popen.call_args.args[0],
+                run_child.call_args.args[0],
                 [
                     "/usr/bin/sudo",
                     "-n",
@@ -518,7 +657,148 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     valid_live["target_sha"],
                 ],
             )
-            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertEqual(
+                run_child.call_args.kwargs,
+                {
+                    "timeout_seconds": platform_workflow_remote_dispatch.LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS,
+                    "expected_live_launch_sha": valid_live["target_sha"],
+                },
+            )
+
+        def run_status_child(lines: tuple[str, ...], exit_code: int) -> tuple[int, str]:
+            script = "import sys; " + "".join(
+                f"print({line!r})\n" for line in lines
+            ) + f"raise SystemExit({exit_code})"
+            output = StringIO()
+            with redirect_stdout(output):
+                child_status = platform_workflow_remote_dispatch._run_bounded_child(
+                    [sys.executable, "-c", script],
+                    timeout_seconds=2,
+                    expected_live_launch_sha=status_sha,
+                )
+            return child_status, output.getvalue()
+
+        good_status = (
+            "LIVE_LAUNCH_STATUS schema=1 status=passed stage=complete "
+            f"child_exit=0 source_sha={status_sha}"
+        )
+        failed_status = (
+            "LIVE_LAUNCH_STATUS schema=1 status=failed stage=identity "
+            f"child_exit=1 source_sha={status_sha}"
+        )
+        with self.subTest(live_status="success"):
+            self.assertEqual(
+                run_status_child((good_status,), 0), (0, good_status + "\n")
+            )
+        with self.subTest(live_status="fixed_failure"):
+            self.assertEqual(
+                run_status_child((failed_status,), 1), (1, failed_status + "\n")
+            )
+        for lines, child_exit in (
+            (("PRIVATE_CHILD_OUTPUT", good_status), 0),
+            ((good_status,), 1),
+            ((good_status.replace(status_sha, "b" * 40),), 0),
+            (("x" * 300, good_status), 0),
+        ):
+            with self.subTest(live_status="invalid", child_exit=child_exit):
+                result, sanitized = run_status_child(lines, child_exit)
+                self.assertEqual(result, child_exit or 2)
+                self.assertIn("stage=trusted_entry", sanitized)
+                self.assertNotIn("PRIVATE_CHILD_OUTPUT", sanitized)
+                self.assertNotIn("x" * 300, sanitized)
+
+        with tempfile.TemporaryDirectory() as directory:
+            heartbeat = Path(directory) / "heartbeat"
+            child_pid = Path(directory) / "child-pid"
+            fork_script = textwrap.dedent(
+                f"""
+                import os, signal, sys, time
+                child = os.fork()
+                if child == 0:
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    with open({str(child_pid)!r}, "w", encoding="ascii") as stream:
+                        stream.write(str(os.getpid()))
+                    while True:
+                        with open({str(heartbeat)!r}, "a", encoding="ascii") as stream:
+                            stream.write("x")
+                        time.sleep(0.005)
+                signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+                time.sleep(0.03)
+                print("x" * 8192, flush=True)
+                while True:
+                    time.sleep(1)
+                """
+            )
+            output = StringIO()
+            with patch.object(
+                platform_workflow_remote_dispatch,
+                "CHILD_TERMINATION_GRACE_SECONDS",
+                0.1,
+            ), patch.object(
+                platform_workflow_remote_dispatch,
+                "LIVE_LAUNCH_STREAM_MAX_BYTES",
+                1024,
+            ), redirect_stdout(output):
+                result = platform_workflow_remote_dispatch._run_bounded_child(
+                    [sys.executable, "-c", fork_script],
+                    timeout_seconds=2,
+                    expected_live_launch_sha=status_sha,
+                )
+            self.assertEqual(result, 2)
+            self.assertIn("stage=trusted_entry", output.getvalue())
+            self.assertTrue(child_pid.exists())
+            heartbeat_size = heartbeat.stat().st_size
+            time.sleep(0.05)
+            self.assertEqual(heartbeat.stat().st_size, heartbeat_size)
+
+        sanitizer_match = re.search(
+            r'/usr/bin/python3 - "\$raw_report" "\$safe_report" '
+            r'"\$SUPERVISOR_STATUS" "\$GITHUB_SHA" <<\'PY\'\n(.*?)\n          PY',
+            source,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(sanitizer_match)
+        assert sanitizer_match is not None
+        sanitizer = textwrap.dedent(sanitizer_match.group(1))
+
+        def sanitize_status(line: bytes, ssh_status: int, *, sha: str = status_sha):
+            with tempfile.TemporaryDirectory() as directory:
+                raw_path = Path(directory) / "raw.log"
+                safe_path = Path(directory) / "safe.json"
+                raw_path.write_bytes(line)
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        sanitizer,
+                        str(raw_path),
+                        str(safe_path),
+                        str(ssh_status),
+                        sha,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                return json.loads(safe_path.read_text(encoding="utf-8"))
+
+        passed_report = sanitize_status((good_status + "\n").encode(), 0)
+        self.assertEqual(passed_report["status"], "passed")
+        self.assertEqual(passed_report["test_count"], 1)
+        self.assertEqual(passed_report["stage"], "complete")
+        failed_report = sanitize_status((failed_status + "\n").encode(), 1)
+        self.assertEqual(failed_report["status"], "failed")
+        self.assertEqual(failed_report["stage"], "identity")
+        for malformed in (
+            (good_status.replace(status_sha, "b" * 40) + "\n").encode(),
+            (good_status + "\nPRIVATE_OUTPUT\n").encode(),
+            b"x" * 300,
+        ):
+            report = sanitize_status(malformed, 0)
+            self.assertEqual(report["status"], "unavailable")
+            self.assertEqual(report["test_count"], 0)
+            self.assertNotIn("PRIVATE_OUTPUT", json.dumps(report))
 
         # The local handoff is an atomic private file, not a shell fragment or
         # an Actions artifact.
@@ -1223,20 +1503,34 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             subprocess.TimeoutExpired(["helper"], 1),
             None,
         ]
+        killpg_calls = 0
+
+        def kill_group(_pgid: int, sig: int) -> None:
+            nonlocal killpg_calls
+            killpg_calls += 1
+            if sig == 0:
+                raise ProcessLookupError
+
         with (
             patch.object(
                 platform_workflow_remote_dispatch.subprocess,
                 "Popen",
                 return_value=child,
             ) as popen,
-            patch.object(platform_workflow_remote_dispatch.os, "killpg") as killpg,
+            patch.object(
+                platform_workflow_remote_dispatch.os,
+                "killpg",
+                side_effect=kill_group,
+            ) as killpg,
         ):
             result = platform_workflow_remote_dispatch._run_bounded_child(
                 ["helper"], timeout_seconds=1
             )
         self.assertEqual(result, 124)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        killpg.assert_called_once_with(9876, platform_workflow_remote_dispatch.signal.SIGTERM)
+        self.assertEqual(killpg_calls, 2)
+        self.assertEqual(killpg.call_args_list[0].args, (9876, platform_workflow_remote_dispatch.signal.SIGTERM))
+        self.assertEqual(killpg.call_args_list[1].args, (9876, 0))
 
     def test_cleanup_export_inventory_is_closed_and_idempotent(self) -> None:
         # The app-release dispatcher is deliberately not a privileged export
