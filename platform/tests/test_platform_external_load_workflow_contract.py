@@ -19,6 +19,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import zipfile
 
 import yaml
 
@@ -269,6 +270,208 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("external-cleanup <", cleanup)
         self.assertIn("external-cleanup-exports <", cleanup)
         self.assertIn("cleanup_status=1", cleanup)
+
+    def test_cleanup_evidence_flows_through_origin_archive_and_sanitizer(self) -> None:
+        workflow = yaml.safe_load(self.source)
+        finalizer = workflow["jobs"]["fixture-finalize"]
+        cleanup_step = next(
+            step for step in finalizer["steps"]
+            if step.get("name") == "Exact cleanup of external fixture"
+        )
+        publish_step = next(
+            step for step in finalizer["steps"]
+            if step.get("name") == "Publish origin evidence"
+        )
+        evaluator = workflow["jobs"]["evaluate-load"]
+        sanitize_step = next(
+            step for step in evaluator["steps"]
+            if step.get("name") == "Sanitize external evidence"
+        )
+        enforce_step = next(
+            step for step in evaluator["steps"]
+            if step.get("name") == "Enforce external load and exact cleanup gates"
+        )
+
+        with tempfile.TemporaryDirectory(prefix="external-load-cleanup-evidence-") as temporary:
+            root = Path(temporary)
+            runner_temp = root / "runner"
+            evidence = runner_temp / "external-evidence"
+            client = runner_temp / "external-client"
+            external_input = runner_temp / "external-input"
+            ssh_dir = runner_temp / "ssh"
+            fake_bin = root / "bin"
+            for directory in (evidence, client, external_input, ssh_dir, fake_bin):
+                directory.mkdir(parents=True, exist_ok=True)
+            (external_input / "platform-production-external-load-cleanup.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            (ssh_dir / "config").write_text("Host fixture\n", encoding="ascii")
+            (ssh_dir / "id_ed25519").write_text("synthetic key placeholder\n", encoding="ascii")
+            for name, payload in {
+                "matrix-summary.json": {"schema": 1, "passed": True},
+                "server-observability.json": {"schema": 1},
+                "timeout-diagnostics.json": {"schema": 1},
+            }.items():
+                (evidence / name).write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            (evidence / "canonical.log").write_text(
+                "ORIGIN_FINALIZE status=success\n", encoding="utf-8"
+            )
+
+            (fake_bin / "ssh").write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                "if any('external-cleanup-exports' in arg for arg in sys.argv):\n"
+                "    raise SystemExit(0)\n"
+                "if any('external-cleanup' in arg for arg in sys.argv):\n"
+                "    print('RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=complete child_exit=0')\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(91)\n",
+                encoding="ascii",
+            )
+            (fake_bin / "scp").write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "source, destination = sys.argv[-2:]\n"
+                "target = Path(destination)\n"
+                "if source.endswith('/cleanup-summary.json'):\n"
+                "    target.write_text(json.dumps({'schema':1,'ok':True,'markers':1,'users_deleted':2,'tournaments_deleted':1,'control_account_preserved':True}) + '\\n')\n"
+                "elif source.endswith('/canonical.log') and os.environ.get('OMIT_CLEANUP_LOG') != '1':\n"
+                "    target.write_text('EXTERNAL_CLEANUP status=success\\n')\n"
+                "else:\n"
+                "    raise SystemExit(1)\n",
+                encoding="ascii",
+            )
+            (fake_bin / "ssh").chmod(0o755)
+            (fake_bin / "scp").chmod(0o755)
+            cleanup_output = root / "cleanup-output"
+            cleanup_output.touch()
+            summary = root / "step-summary"
+            summary.touch()
+            cleanup_env = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_OUTPUT": str(cleanup_output),
+                "GITHUB_STEP_SUMMARY": str(summary),
+                "GITHUB_RUN_ID": "123456789",
+                "HOST_TOOLS_SHA": "a" * 40,
+                "CLEANUP_IDENTITY_STATUS": "0",
+                "PROD_SSH_USER": "fixture-user",
+                "PROD_SSH_HOST": "fixture-host",
+                "SSH_DIR": str(ssh_dir),
+            }
+            cleanup_result = subprocess.run(
+                ["/bin/bash", "-e", "-o", "pipefail", "-c", cleanup_step["run"]],
+                cwd=REPO_ROOT,
+                env=cleanup_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(cleanup_result.returncode, 0, cleanup_result.stderr)
+            cleanup_outputs = cleanup_output.read_text(encoding="utf-8")
+            self.assertIn("cleanup_status=0", cleanup_outputs)
+            self.assertIn("cleanup_exports_status=0", cleanup_outputs)
+            self.assertTrue((evidence / "cleanup-canonical.log").is_file())
+            self.assertFalse((evidence / "cleanup-canonical.raw").exists())
+
+            # Build a synthetic origin ZIP from the exact paths declared by the
+            # upload step, then consume that transport as the evaluator does.
+            upload_paths = publish_step["with"]["path"].splitlines()
+            artifact_names = [
+                Path(path.replace("${{ runner.temp }}/external-evidence/", "")).as_posix()
+                for path in upload_paths
+            ]
+            self.assertIn("cleanup-canonical.log", artifact_names)
+            for name in artifact_names:
+                self.assertTrue((evidence / name).is_file(), name)
+            self.assertEqual(publish_step["with"]["if-no-files-found"], "error")
+            origin_zip = root / "origin.zip"
+            with zipfile.ZipFile(origin_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for name in artifact_names:
+                    archive.write(evidence / name, name)
+
+            def run_evaluator(evaluator_root: Path, *, omit_cleanup: bool) -> tuple[int, str]:
+                evaluator_temp = evaluator_root / "runner"
+                evaluator_evidence = evaluator_temp / "external-evidence"
+                evaluator_client = evaluator_temp / "external-client"
+                evaluator_evidence.mkdir(parents=True)
+                evaluator_client.mkdir(parents=True)
+                with zipfile.ZipFile(origin_zip) as archive:
+                    archive.extractall(evaluator_evidence)
+                (evaluator_client / "external-load.json").write_text("{}\n", encoding="utf-8")
+                (evaluator_client / "client-raw.log").write_text(
+                    "CLIENT_RESULT status=success\n", encoding="utf-8"
+                )
+                if omit_cleanup:
+                    (evaluator_evidence / "cleanup-canonical.log").unlink()
+                github_output = evaluator_root / "github-output"
+                github_output.touch()
+                result = subprocess.run(
+                    ["/bin/bash", "-e", "-o", "pipefail", "-c", sanitize_step["run"]],
+                    cwd=REPO_ROOT,
+                    env={
+                        **os.environ,
+                        "RUNNER_TEMP": str(evaluator_temp),
+                        "GITHUB_OUTPUT": str(github_output),
+                        "TIMEOUT_DIAGNOSTICS": "false",
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = github_output.read_text(encoding="utf-8")
+                status_match = re.findall(r"(?m)^sanitizer_status=(\d+)$", output)
+                self.assertTrue(status_match, output)
+                return int(status_match[-1]), output
+
+            success_root = root / "success-evaluator"
+            success_root.mkdir()
+            sanitizer_status, _ = run_evaluator(success_root, omit_cleanup=False)
+            self.assertEqual(sanitizer_status, 0)
+            public_cleanup = success_root / "runner/external-evidence/cleanup-canonical.log"
+            self.assertTrue(public_cleanup.is_file())
+            self.assertNotIn("EXTERNAL_CLEANUP", public_cleanup.read_text(encoding="utf-8"))
+
+            def enforce_with_sanitizer_status(status: int, cwd: Path) -> subprocess.CompletedProcess[str]:
+                script = re.sub(
+                    r"\$\{\{\s*(.*?)\s*\}\}",
+                    lambda match: (
+                        "accepted"
+                        if match.group(1).endswith("acceptance_status")
+                        else "pending_origin"
+                        if match.group(1).endswith("candidate_state")
+                        else "1"
+                        if match.group(1).endswith(("report_ready", "observer_ready"))
+                        else "success"
+                        if match.group(1).endswith(".result")
+                        else str(status)
+                        if match.group(1).endswith("sanitizer_status")
+                        else "0"
+                    ),
+                    enforce_step["run"],
+                )
+                return subprocess.run(
+                    ["/bin/bash", "-euo", "pipefail", "-c", script],
+                    cwd=cwd,
+                    env={**os.environ, "BASH_ENV": "/dev/null"},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            passing_gate = enforce_with_sanitizer_status(0, REPO_ROOT)
+            self.assertEqual(passing_gate.returncode, 0, passing_gate.stderr)
+
+            missing_root = root / "missing-evaluator"
+            missing_root.mkdir()
+            missing_status, _ = run_evaluator(missing_root, omit_cleanup=True)
+            self.assertEqual(missing_status, 1)
+            failed_gate = enforce_with_sanitizer_status(1, REPO_ROOT)
+            self.assertNotEqual(failed_gate.returncode, 0)
+            self.assertIn("External evidence projection/sanitizer failed.", failed_gate.stderr)
 
     def test_handoffs_bind_run_attempt_sha_and_archive_digest(self) -> None:
         self.assertIn("GITHUB_RUN_ATTEMPT", self.source)

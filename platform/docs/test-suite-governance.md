@@ -538,7 +538,7 @@ observer and exact-cleanup work; it never generates the measured client load.
 Production SSH secrets are scoped only to trusted fixture, finalization and
 cleanup steps: checkout persists no credentials, and each checked-out client
 or evaluator runs with an explicit allowlist while private keys, SSH auth
-sockets and control paths are absent from the runner.
+sockets and control paths are absent from the runner. The external-load workflow contract executes cleanup-evidence handoff from finalizer copy through origin artifact and evaluator sanitization; missing transcripts fail projection and final acceptance.
 The same contract applies to every production workflow: SSH secret expressions
 are step-local only, and checkout, artifact upload/download and checked-out
 client steps must not inherit them. Read-only web-runtime diagnostics upload
