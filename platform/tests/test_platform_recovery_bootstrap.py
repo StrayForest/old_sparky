@@ -30,8 +30,9 @@ SOURCE_SHA = "a" * 40
 # patch at the reviewed merge base. Keep the real set here so the route test
 # exercises the exact pull-request and trusted-dev-push inputs, including the
 # host-key scan contract that is easy to omit from one of the independent
-# consumers. The patch also touched the candidate-owned live-QA installer;
-# that file now correctly promotes a dev push to an ordinary deployable route.
+# consumers. The patch also touched the candidate-owned live-QA installer and
+# the app-owned external-load dispatcher; either now promotes a dev push to a
+# deployable app route.
 # The digest assertion below makes this a static merge-base contract: a
 # missing owner/test path cannot be hidden by changing the fixture's count or
 # by consulting the mutable checkout's git state at test time.
@@ -135,9 +136,8 @@ RECOVERY_BOOTSTRAP_PATCH_DOCS = frozenset(
 )
 
 # This is the exact topology/recovery patch delta reviewed independently from
-# the complete 62-file merge-base fixture above.  Keep it separate: the
-# classifier must make both the full PR and this smaller simulated dev push a
-# non-deployable full route with no fallback.
+# the complete merge-base fixture above. Keep it separate: the host-only subset
+# remains a no-op, but the complete delta with the app dispatcher deploys.
 RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
     {
         ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
@@ -3033,7 +3033,10 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         paths = sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)
         pure_bootstrap_paths = sorted(
             RECOVERY_BOOTSTRAP_PATCH_FILES
-            - {"platform/tools/platform_live_qa_runtime_install.py"}
+            - {
+                "platform/tools/platform_live_qa_runtime_install.py",
+                "platform/tools/platform_workflow_remote_dispatch.py",
+            }
         )
         for event, branch in (
             ("pull_request", "feature/recovery-bootstrap"),
@@ -3065,22 +3068,41 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         classifier.validate_manifest(candidate_route, expected_target_sha="a" * 40)
 
         delta_paths = sorted(RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)
+        pure_delta_paths = sorted(
+            RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES
+            - {"platform/tools/platform_workflow_remote_dispatch.py"}
+        )
         for event, branch in (
             ("pull_request", "feature/recovery-bootstrap-delta"),
             ("push", "dev"),
         ):
             with self.subTest(delta_event=event):
                 manifest = classifier.classify(
-                    delta_paths,
+                    pure_delta_paths,
                     event=event,
                     target_sha="a" * 40,
                     branch=branch,
                 )
-                self.assertEqual(set(manifest["files"]), RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)
+                self.assertEqual(set(manifest["files"]), set(pure_delta_paths))
                 self.assertEqual(manifest["class"], "full")
                 self.assertFalse(manifest["deployable"])
                 self.assertFalse(manifest["fallback"])
                 classifier.validate_manifest(manifest, expected_target_sha="a" * 40)
+
+        mixed_delta = classifier.classify(
+            delta_paths,
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        self.assertEqual(
+            set(mixed_delta["files"]), RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES
+        )
+        self.assertEqual(mixed_delta["class"], "full")
+        self.assertTrue(mixed_delta["deployable"])
+        self.assertTrue(mixed_delta["runtime_sensitive"])
+        self.assertFalse(mixed_delta["fallback"])
+        classifier.validate_manifest(mixed_delta, expected_target_sha="a" * 40)
 
         mixed = classifier.classify(
             paths + ["platform/apps/platform_api/app/main.py"],
@@ -3109,12 +3131,13 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
         ).read_text(encoding="utf-8")
         canonical = frozenset(classifier.RECOVERY_BOOTSTRAP_FILES)
-        # Keep the exact historical fixture intact while recording that this
-        # candidate-owned runtime file now promotes the trusted dev push.
+        # Keep the exact historical fixture intact while recording that both
+        # candidate-owned runtime changes promote the trusted dev push.
         derived_patch_files = (
             canonical - RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES
         ) | RECOVERY_BOOTSTRAP_PATCH_DOCS | {
-            "platform/tools/platform_live_qa_runtime_install.py"
+            "platform/tools/platform_live_qa_runtime_install.py",
+            "platform/tools/platform_workflow_remote_dispatch.py",
         }
         self.assertEqual(derived_patch_files, RECOVERY_BOOTSTRAP_PATCH_FILES)
         classifier_files = self._set_assignment(
