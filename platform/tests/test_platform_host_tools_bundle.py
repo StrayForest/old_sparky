@@ -83,6 +83,182 @@ def _release_receipt(
 
 
 class HostToolsBundleTests(unittest.TestCase):
+    def test_external_cleanup_dispatch_uses_validated_equal_run_ids(self) -> None:
+        target_sha = "a" * 40
+        load_run_id = "37556438370"
+        cleanup_run_id = "37560000001"
+        control_email = "synthetic-control@example.test"
+
+        class FakeChild:
+            def __init__(self, returncode: int, marker: bytes | None) -> None:
+                self.returncode = returncode
+                self.pid = 2_000_000_000
+                stdin_read, stdin_write = os.pipe()
+                stdout_read, stdout_write = os.pipe()
+                self._stdin_read = stdin_read
+                self.stdin = os.fdopen(stdin_write, "wb", buffering=0)
+                self.stdout = os.fdopen(stdout_read, "rb", buffering=0)
+                if marker is not None:
+                    os.write(stdout_write, marker)
+                os.close(stdout_write)
+                self.input_bytes: bytes | None = None
+
+            def poll(self) -> int:
+                if self.input_bytes is None:
+                    chunks: list[bytes] = []
+                    while True:
+                        chunk = os.read(self._stdin_read, 4096)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    os.close(self._stdin_read)
+                    self.input_bytes = b"".join(chunks)
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                return self.returncode
+
+        def invoke(
+            command: str,
+            payload: dict[str, object],
+            *,
+            returncode: int = 0,
+            marker: bytes | None = None,
+        ) -> tuple[int, str, list[str], bytes | None]:
+            raw = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+            child_args: list[str] = []
+            child = FakeChild(
+                returncode,
+                marker
+                if marker is not None
+                else f"RETAINED_CLEANUP_STAGE schema=1 stage=complete exit_code={returncode}\n".encode()
+                if returncode == 0
+                else None,
+            )
+
+            def spawn(arguments: list[str], **_kwargs: object) -> FakeChild:
+                child_args.extend(arguments)
+                return child
+
+            output = StringIO()
+            with (
+                patch.object(dispatcher.sys, "stdin", SimpleNamespace(buffer=BytesIO(raw))),
+                patch.object(dispatcher, "_trusted_helper", return_value=True),
+                patch.object(dispatcher.subprocess, "Popen", side_effect=spawn),
+                redirect_stdout(output),
+            ):
+                result = dispatcher.main([command])
+            return result, output.getvalue(), child_args, child.input_bytes
+
+        common = {
+            "schema": 1,
+            "target_sha": target_sha,
+            "control_email": control_email,
+            "load_run_id": load_run_id,
+        }
+        external = {**common, "cleanup_run_id": load_run_id}
+        retained = {**common, "cleanup_run_id": cleanup_run_id}
+        expected_control_stdin = (
+            json.dumps(
+                {"schema": 1, "control_email": control_email},
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+
+        for command, payload, expected_cleanup_id in (
+            ("external-cleanup", external, load_run_id),
+            ("retained-cleanup", retained, cleanup_run_id),
+        ):
+            with self.subTest(command=command):
+                result, output, child_args, child_stdin = invoke(command, payload)
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    output,
+                    "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=complete child_exit=0\n",
+                )
+                self.assertEqual(
+                    child_args,
+                    [
+                        dispatcher.SUDO,
+                        "-n",
+                        "--",
+                        str(dispatcher.CLEANUP_HELPER),
+                        dispatcher.DELETE_CONFIRMATION,
+                        target_sha,
+                        load_run_id,
+                        expected_cleanup_id,
+                    ],
+                )
+                self.assertEqual(child_stdin, expected_control_stdin)
+                self.assertNotIn(control_email, child_args)
+
+        for command, payload, expected_cleanup_id in (
+            ("external-cleanup-exports", external, load_run_id),
+            ("retained-cleanup-exports", retained, cleanup_run_id),
+        ):
+            with self.subTest(command=command):
+                raw = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+                executor_calls: list[tuple[str, dict[str, object]]] = []
+
+                def run_executor(
+                    operation: str, executor_payload: dict[str, object]
+                ) -> int:
+                    executor_calls.append((operation, executor_payload))
+                    return 0
+
+                with (
+                    patch.object(
+                        dispatcher.sys,
+                        "stdin",
+                        SimpleNamespace(buffer=BytesIO(raw)),
+                    ),
+                    patch.object(
+                        dispatcher, "_current_pin_matches_host_generation", return_value=True
+                    ),
+                    patch.object(
+                        dispatcher, "_run_retained_export_executor", side_effect=run_executor
+                    ),
+                    redirect_stdout(StringIO()),
+                ):
+                    result = dispatcher.main([command])
+
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    executor_calls,
+                    [
+                        (
+                            "remove",
+                            {
+                                "schema": 1,
+                                "load_run_id": load_run_id,
+                                "cleanup_run_id": expected_cleanup_id,
+                            },
+                        )
+                    ],
+                )
+
+        failed_marker = (
+            b"RETAINED_CLEANUP_STAGE schema=1 stage=matrix_cleanup exit_code=1\n"
+        )
+        result, output, _, _ = invoke(
+            "external-cleanup", external, returncode=1, marker=failed_marker
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            output,
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 "
+            "stage=matrix_cleanup child_exit=1\n",
+        )
+        result, output, _, _ = invoke(
+            "external-cleanup", external, returncode=1, marker=b"invalid marker\n"
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            output,
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=unknown child_exit=1\n",
+        )
+
     def test_active_release_baseline_reader_returns_stable_closed_tuple(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = Path(temporary) / "runtime"

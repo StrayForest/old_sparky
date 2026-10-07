@@ -69,11 +69,16 @@ closure. The pin records source Git modes (`0644` or `0755`); the builder
 normalizes installed tool files to `0555`, with `capabilities.txt` and
 `manifest.json` at `0444`. Compare the closed path set and each digest by exact
 relative path, and validate source and installed modes against their separate
-contracts instead of comparing those mode values directly. The reviewed
-source pin is not proof of installation: the verified production app remains
-`f0c5f9bcf7ae7389ec2bf347fd0209ced3273961` with the previous host generation
-`b186fbd177ab82330c1ec001d96a2d40474f9552` until the approved signed-artifact
-provisioning and self-test complete.
+contracts instead of comparing those mode values directly. The next dispatcher
+correction uses **C** `bc1c731454f9f34c1fac8d50ba66960cfe1bf1b7` and pin-only
+**P** `a0a3390e9d52c5080c9c4d46fba4643e0201f08b`. P records C's exact
+14-member closure; the external cleanup and export-removal branches forward
+the validated `load_run_id` and `cleanup_run_id` fields instead of reading an
+absent `run_id`. The reviewed source pin is not proof of installation: the
+verified production app is `01bde73dffe2c7532be97f6c14c07f32e0f41b90` and the
+installed host generation remains
+`b186fbd177ab82330c1ec001d96a2d40474f9552` until signed-artifact provisioning
+and the installed-generation self-test for C complete.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
