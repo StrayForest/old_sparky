@@ -27,6 +27,7 @@ placement rules; it does not repeat tool arguments.
 | `live-public` | production operators | canonical public origin and dedicated QA identity | explicit/release workflow |
 | `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
 | `external-load` | performance operators | external generator to production origin | explicit operator workflow |
+| `synthetic-ssr-heap` | web/performance owners | exact checked-out standalone app, loopback-only synthetic API, hosted 1 GiB container | PR and explicit synthetic diagnostic dispatch |
 
 The `web-quality` gate runs the runtime shutdown-signal, SSR stream diagnostics
 and Next root-directory glob contracts,
@@ -98,8 +99,16 @@ only with the bounded reason enum `oversized`, `metadata`, `control`,
 `encoding`, `marker`, `sequence` or `missing`.
 `platform_verify.py ci` can execute only the always-on deterministic gates and
 never connects to production, creates production fixtures, opens a production
-browser or starts a load generator. The latter four remain discoverable
-governance groups but are workflow-only.
+browser or starts a load generator. Production live QA and external load remain
+workflow-only contours. The separate `synthetic-ssr-heap` PR/diagnostic
+workflow builds the
+exact pull-request source, runs a bounded contract self-test, then exercises
+20,000 synthetic authenticated SSR requests against an in-process loopback API
+inside a networkless container capped at 1 GiB. It has no production
+credentials, database, external API access, or deployment authority; output is
+restricted to aggregate memory/GC/event-loop, response counts and closed
+process-failure enums. Its synthetic load is diagnostic evidence, not a
+production load-test result or release gate.
 
 ## Backend catalog and contours
 
