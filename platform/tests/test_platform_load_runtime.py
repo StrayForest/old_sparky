@@ -177,7 +177,13 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
     ):
         config.setdefault(
             "binding",
-            {"source_git_sha": "a" * 40, "external_run_id": "1"},
+            {
+                "source_git_sha": "a" * 40,
+                "app_target_sha": "a" * 40,
+                "source_binding": None,
+                "source_binding_sha256": None,
+                "external_run_id": "1",
+            },
         )
         return run_supervised(
             worker_command=(sys.executable, str(worker_script)),
@@ -227,17 +233,35 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
         from contextlib import redirect_stdout
         from io import StringIO
         from types import SimpleNamespace
+        import base64
+        import hashlib
+        from tests.test_platform_noop_source_binding import _validated_source_binding_handoff
 
         source_sha = "a" * 40
         external_run_id = "123456789"
+        source_binding = _validated_source_binding_handoff()
+        app_target_sha = str(source_binding["app_target_sha"])
+        binding_bytes = json.dumps(
+            source_binding,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        binding_base64 = base64.b64encode(binding_bytes).decode("ascii")
+        binding_sha256 = hashlib.sha256(binding_bytes).hexdigest()
+        worker_binding = {
+            "source_git_sha": source_sha,
+            "app_target_sha": app_target_sha,
+            "source_binding": source_binding,
+            "source_binding_sha256": binding_sha256,
+            "external_run_id": external_run_id,
+        }
         valid_payload: dict[str, object] = {
             "worker_command": ["/usr/bin/python3", "/checkout/worker.py"],
             "runner_uid": os.getuid(),
             "runner_gid": os.getgid(),
-            "binding": {
-                "source_git_sha": source_sha,
-                "external_run_id": external_run_id,
-            },
+            "binding": worker_binding,
             # A config must never act as a general environment restoration
             # channel across sudo's deliberate environment reset.
             "environment": {"UNRELATED_SENTINEL": "must-not-be-restored"},
@@ -267,6 +291,9 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                         "PLATFORM_LOAD_WORKER_CONFIG": str(config_path),
                         "SOURCE_GIT_SHA": source_sha,
                         "GITHUB_RUN_ID": external_run_id,
+                        "APP_TARGET_SHA": app_target_sha,
+                        "SOURCE_BINDING_BASE64": binding_base64,
+                        "SOURCE_BINDING_SHA256": binding_sha256,
                     },
                 )
                 raise WorkerExecReached
@@ -287,8 +314,8 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 ["/usr/bin/python3", "/checkout/worker.py"],
             )
 
-            # Prove that run_profile puts exactly its already-validated caller
-            # bindings into the private supervisor config passed to the helper.
+            # Prove run_profile validates the receipt-derived runner/app pair
+            # before the namespace helper receives the closed private config.
             expected_supervisor_result = SimpleNamespace(
                 report={"acceptance": {"decision": "TEST ONLY", "passed": False}},
                 reason="worker_failed",
@@ -305,6 +332,9 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                         {
                             "SOURCE_GIT_SHA": source_sha,
                             "GITHUB_RUN_ID": external_run_id,
+                            "APP_TARGET_SHA": app_target_sha,
+                            "SOURCE_BINDING_BASE64": binding_base64,
+                            "SOURCE_BINDING_SHA256": binding_sha256,
                         },
                         clear=True,
                     ),
@@ -325,10 +355,7 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 self.assertEqual(status, 1)
                 self.assertEqual(
                     supervised.call_args.kwargs["worker_config"]["binding"],
-                    {
-                        "source_git_sha": source_sha,
-                        "external_run_id": external_run_id,
-                    },
+                    worker_binding,
                 )
 
             invalid_payloads: list[dict[str, object]] = []
@@ -342,18 +369,42 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             }
             invalid_payloads.append(invalid_sha)
             invalid_run_id = dict(valid_payload)
-            invalid_run_id["binding"] = {
-                "source_git_sha": source_sha,
-                "external_run_id": "0",
-            }
+            invalid_run_id["binding"] = {**worker_binding, "external_run_id": "0"}
             invalid_payloads.append(invalid_run_id)
             extra_binding = dict(valid_payload)
             extra_binding["binding"] = {
-                "source_git_sha": source_sha,
-                "external_run_id": external_run_id,
+                **worker_binding,
                 "arbitrary_environment": {"UNRELATED_SENTINEL": "restore-me"},
             }
             invalid_payloads.append(extra_binding)
+            missing_binding_digest = dict(valid_payload)
+            missing_binding_digest["binding"] = {
+                key: value for key, value in worker_binding.items()
+                if key != "source_binding_sha256"
+            }
+            invalid_payloads.append(missing_binding_digest)
+            mismatched_app = dict(valid_payload)
+            mismatched_app["binding"] = {
+                **worker_binding,
+                "app_target_sha": "d" * 40,
+            }
+            invalid_payloads.append(mismatched_app)
+            forged_nested_binding = dict(valid_payload)
+            forged_nested_binding["binding"] = {
+                **worker_binding,
+                "source_binding": {**source_binding, "unexpected": "extra"},
+            }
+            forged_bytes = json.dumps(
+                forged_nested_binding["binding"]["source_binding"],
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            forged_nested_binding["binding"]["source_binding_sha256"] = hashlib.sha256(
+                forged_bytes
+            ).hexdigest()
+            invalid_payloads.append(forged_nested_binding)
 
             for payload in invalid_payloads:
                 with self.subTest(binding=payload.get("binding")):
@@ -397,6 +448,49 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             write.assert_not_called()
             rejected_exec.assert_not_called()
             config_path.with_name("worker.config.link").unlink()
+
+            # A same-source run carries no receipt; stale binding variables
+            # are explicitly removed after sudo's environment reset.
+            same_source_payload = dict(valid_payload)
+            same_source_payload["binding"] = {
+                "source_git_sha": source_sha,
+                "app_target_sha": source_sha,
+                "source_binding": None,
+                "source_binding_sha256": None,
+                "external_run_id": external_run_id,
+            }
+            write_config(same_source_payload)
+
+            def capture_same_source_exec(_path: str, _argv: list[str]) -> None:
+                self.assertEqual(
+                    dict(os.environ),
+                    {
+                        "PLATFORM_LOAD_WORKER_CONFIG": str(config_path),
+                        "SOURCE_GIT_SHA": source_sha,
+                        "GITHUB_RUN_ID": external_run_id,
+                        "APP_TARGET_SHA": source_sha,
+                    },
+                )
+                raise WorkerExecReached
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "SOURCE_BINDING_BASE64": "stale-untrusted-value",
+                        "SOURCE_BINDING_SHA256": "stale-untrusted-value",
+                    },
+                    clear=True,
+                ),
+                patch.object(namespace, "_set_parent_death_signal"),
+                patch.object(namespace, "_assert_namespace_worker_identity"),
+                patch.object(namespace.os, "write"),
+                patch.object(namespace.os, "read", return_value=b"ACK\n"),
+                patch.object(namespace.os, "dup2"),
+                patch.object(namespace.os, "execv", side_effect=capture_same_source_exec),
+            ):
+                with self.assertRaises(WorkerExecReached):
+                    namespace._namespace_worker(config_path)
 
             config_path.unlink()
             config_path.symlink_to(Path(directory) / "regular-target")
@@ -562,6 +656,9 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                     worker_config={
                         "binding": {
                             "source_git_sha": "a" * 40,
+                            "app_target_sha": "a" * 40,
+                            "source_binding": None,
+                            "source_binding_sha256": None,
                             "external_run_id": "1",
                         },
                     },
@@ -838,7 +935,13 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                         max_duration_seconds=30,
                         max_runner_minutes=1,
                         worker_config={{
-                            'binding': {{'source_git_sha': 'a' * 40, 'external_run_id': '1'}},
+                            'binding': {{
+                                'source_git_sha': 'a' * 40,
+                                'app_target_sha': 'a' * 40,
+                                'source_binding': None,
+                                'source_binding_sha256': None,
+                                'external_run_id': '1',
+                            }},
                             'mode': 'pdeath-heartbeat',
                             'started_file': {str(root / 'worker.started')!r},
                             'heartbeat_file': {str(root / 'pdeath.heartbeat')!r},
@@ -1275,7 +1378,13 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                         max_duration_seconds=10,
                         max_runner_minutes=1,
                         worker_config={{
-                            'binding': {{'source_git_sha': 'a' * 40, 'external_run_id': '1'}},
+                            'binding': {{
+                                'source_git_sha': 'a' * 40,
+                                'app_target_sha': 'a' * 40,
+                                'source_binding': None,
+                                'source_binding_sha256': None,
+                                'external_run_id': '1',
+                            }},
                             'mode': 'external-term',
                         }},
                         term_grace_seconds=0.05,

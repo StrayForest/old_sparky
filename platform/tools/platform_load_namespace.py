@@ -11,7 +11,9 @@ bootstrap.
 from __future__ import annotations
 
 import argparse
+import base64
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -49,8 +51,105 @@ except ModuleNotFoundError:  # Direct execution from platform/tools.
 
 _SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _EXTERNAL_RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
-_WORKER_BINDING_KEYS = frozenset({"source_git_sha", "external_run_id"})
+_WORKER_BINDING_KEYS = frozenset(
+    {
+        "source_git_sha",
+        "app_target_sha",
+        "source_binding",
+        "source_binding_sha256",
+        "external_run_id",
+    }
+)
+_SOURCE_BINDING_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MAX_SOURCE_BINDING_BYTES = 16 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
+
+
+def _validated_worker_binding(
+    payload: dict[str, object],
+) -> tuple[str, str, dict[str, object] | None, str | None, str]:
+    """Return only the exact runner/app identity validated in the private config."""
+
+    binding = payload.get("binding")
+    if not isinstance(binding, dict) or set(binding) != _WORKER_BINDING_KEYS:
+        raise NamespaceIntegrityError("namespace worker binding is invalid")
+    source_git_sha = binding.get("source_git_sha")
+    app_target_sha = binding.get("app_target_sha")
+    external_run_id = binding.get("external_run_id")
+    source_binding = binding.get("source_binding")
+    source_binding_sha256 = binding.get("source_binding_sha256")
+    if (
+        not isinstance(source_git_sha, str)
+        or _SOURCE_SHA_RE.fullmatch(source_git_sha) is None
+        or not isinstance(app_target_sha, str)
+        or _SOURCE_SHA_RE.fullmatch(app_target_sha) is None
+        or not isinstance(external_run_id, str)
+        or _EXTERNAL_RUN_ID_RE.fullmatch(external_run_id) is None
+    ):
+        raise NamespaceIntegrityError("namespace worker binding is invalid")
+
+    if source_binding is None:
+        if app_target_sha != source_git_sha or source_binding_sha256 is not None:
+            raise NamespaceIntegrityError("namespace worker source binding is invalid")
+        return source_git_sha, app_target_sha, None, None, external_run_id
+
+    if (
+        not isinstance(source_binding, dict)
+        or app_target_sha == source_git_sha
+        or not isinstance(source_binding_sha256, str)
+        or _SOURCE_BINDING_SHA256_RE.fullmatch(source_binding_sha256) is None
+    ):
+        raise NamespaceIntegrityError("namespace worker source binding is invalid")
+    try:
+        canonical = json.dumps(
+            source_binding,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        if (
+            len(canonical) > _MAX_SOURCE_BINDING_BYTES
+            or hashlib.sha256(canonical).hexdigest() != source_binding_sha256
+            or source_binding.get("runner_sha") != source_git_sha
+            or source_binding.get("app_target_sha") != app_target_sha
+        ):
+            raise ValueError("worker source binding does not match its digest or identities")
+        try:
+            from tools.platform_noop_source_binding import (
+                validate_source_binding_handoff,
+            )
+        except ModuleNotFoundError:  # Direct execution from platform/tools.
+            from platform_noop_source_binding import validate_source_binding_handoff
+        validate_source_binding_handoff(
+            source_binding,
+            expected_runner_sha=source_git_sha,
+            expected_app_target_sha=app_target_sha,
+            expected_security_run_id=source_binding.get("source_security_run_id"),
+            expected_security_attempt=source_binding.get(
+                "source_security_run_attempt"
+            ),
+            expected_autodeploy_run_id=source_binding.get("autodeploy_run_id"),
+            expected_autodeploy_attempt=source_binding.get(
+                "autodeploy_run_attempt"
+            ),
+            expected_deploy_run_id=source_binding.get("production_deploy_run_id"),
+            expected_deploy_attempt=source_binding.get(
+                "production_deploy_run_attempt"
+            ),
+            expected_artifact_id=source_binding.get("receipt_artifact_id"),
+            expected_artifact_name=source_binding.get("receipt_artifact_name"),
+            expected_artifact_digest=source_binding.get("receipt_artifact_digest"),
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, RecursionError) as exc:
+        raise NamespaceIntegrityError("namespace worker source binding is invalid") from exc
+    return (
+        source_git_sha,
+        app_target_sha,
+        source_binding,
+        source_binding_sha256,
+        external_run_id,
+    )
 
 
 def _config(path: Path, *, verify_worker_identity: bool = True) -> dict[str, object]:
@@ -92,40 +191,43 @@ def _config(path: Path, *, verify_worker_identity: bool = True) -> dict[str, obj
         raise NamespaceIntegrityError("namespace runner identity is missing") from exc
     if expected_uid != os.getuid():
         raise NamespaceIntegrityError("namespace config owner does not match runner")
-    binding = payload.get("binding")
-    if not isinstance(binding, dict) or set(binding) != _WORKER_BINDING_KEYS:
-        raise NamespaceIntegrityError("namespace worker binding is invalid")
-    source_git_sha = binding.get("source_git_sha")
-    external_run_id = binding.get("external_run_id")
-    if (
-        not isinstance(source_git_sha, str)
-        or _SOURCE_SHA_RE.fullmatch(source_git_sha) is None
-        or not isinstance(external_run_id, str)
-        or _EXTERNAL_RUN_ID_RE.fullmatch(external_run_id) is None
-    ):
-        raise NamespaceIntegrityError("namespace worker binding is invalid")
+    _validated_worker_binding(payload)
     if verify_worker_identity:
         _assert_namespace_worker_identity(expected_uid, expected_gid)
     return payload
 
 
 def _restore_worker_binding_environment(payload: dict[str, object]) -> None:
-    """Restore only the validated source/run binding after sudo resets env."""
+    """Restore only the validated runner/app binding after sudo resets env."""
 
-    binding = payload.get("binding")
-    if not isinstance(binding, dict) or set(binding) != _WORKER_BINDING_KEYS:
-        raise NamespaceIntegrityError("namespace worker binding is invalid")
-    source_git_sha = binding.get("source_git_sha")
-    external_run_id = binding.get("external_run_id")
-    if (
-        not isinstance(source_git_sha, str)
-        or _SOURCE_SHA_RE.fullmatch(source_git_sha) is None
-        or not isinstance(external_run_id, str)
-        or _EXTERNAL_RUN_ID_RE.fullmatch(external_run_id) is None
-    ):
-        raise NamespaceIntegrityError("namespace worker binding is invalid")
+    (
+        source_git_sha,
+        app_target_sha,
+        source_binding,
+        source_binding_sha256,
+        external_run_id,
+    ) = _validated_worker_binding(payload)
     os.environ["SOURCE_GIT_SHA"] = source_git_sha
     os.environ["GITHUB_RUN_ID"] = external_run_id
+    os.environ["APP_TARGET_SHA"] = app_target_sha
+    if source_binding is None:
+        os.environ.pop("SOURCE_BINDING_BASE64", None)
+        os.environ.pop("SOURCE_BINDING_SHA256", None)
+        return
+    canonical = json.dumps(
+        source_binding,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    if source_binding_sha256 is None:
+        raise NamespaceIntegrityError("namespace worker source binding is invalid")
+    # The canonical bytes and digest were checked above before any environment
+    # variable is restored. The child consumes this value through the same
+    # closed parser used by the parent, never as a general environment map.
+    os.environ["SOURCE_BINDING_BASE64"] = base64.b64encode(canonical).decode("ascii")
+    os.environ["SOURCE_BINDING_SHA256"] = source_binding_sha256
 
 
 _TRUSTED_ROOT_MEDIATOR_NAMES = frozenset({"sudo", "setpriv", "unshare"})
