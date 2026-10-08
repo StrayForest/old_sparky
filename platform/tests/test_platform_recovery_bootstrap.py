@@ -2809,6 +2809,435 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     expected_workflow_sha="c" * 40,
                 )
 
+    def test_publisher_artifact_run_identity_rejects_boolean_or_noninteger_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory) / "publisher-artifacts.json"
+
+            def name(attempt: str) -> str:
+                return recovery.publisher_bundle_artifact_name(
+                    source_sha="a" * 40,
+                    security_run_id="101",
+                    security_run_attempt="2",
+                    producer_run_id="202",
+                    producer_run_attempt="3",
+                    publisher_run_id="1",
+                    publisher_run_attempt=attempt,
+                )
+
+            def write(rows: list[object]) -> None:
+                metadata.write_text(
+                    json.dumps({"total_count": len(rows), "artifacts": rows}),
+                    encoding="ascii",
+                )
+
+            exact_name = name("1")
+            exact_row = {
+                "id": 404,
+                "name": exact_name,
+                "expired": False,
+                "digest": "sha256:" + "e" * 64,
+                "workflow_run": {
+                    "id": 1,
+                    "head_sha": "c" * 40,
+                    "run_attempt": 1,
+                },
+            }
+            write([exact_row])
+            selected = recovery.validate_publisher_artifact_metadata(
+                metadata,
+                expected_name=exact_name,
+                expected_run_id="1",
+                expected_run_attempt="1",
+                expected_workflow_sha="c" * 40,
+            )
+            self.assertEqual(selected["publisher_bundle_artifact_id"], 404)
+
+            for field, invalid_value in (
+                ("id", True),
+                ("id", "1"),
+                ("id", 1.0),
+                ("run_attempt", True),
+                ("run_attempt", "1"),
+                ("run_attempt", 1.0),
+            ):
+                with self.subTest(exact_field=field, value=repr(invalid_value)):
+                    row = json.loads(json.dumps(exact_row))
+                    row["workflow_run"][field] = invalid_value
+                    write([row])
+                    with self.assertRaises(recovery.RecoveryBootstrapError):
+                        recovery.validate_publisher_artifact_metadata(
+                            metadata,
+                            expected_name=exact_name,
+                            expected_run_id="1",
+                            expected_run_attempt="1",
+                            expected_workflow_sha="c" * 40,
+                        )
+
+            stale_name = name("1")
+            expected_name = name("2")
+            valid_stale_row = {
+                "id": 405,
+                "name": stale_name,
+                "expired": False,
+                "digest": "sha256:" + "f" * 64,
+                "workflow_run": {
+                    "id": 1,
+                    "head_sha": "c" * 40,
+                    "run_attempt": 1,
+                },
+            }
+            write([valid_stale_row])
+            with self.assertRaises(recovery.RecoveryArtifactMetadataPending):
+                recovery.validate_publisher_artifact_metadata(
+                    metadata,
+                    expected_name=expected_name,
+                    expected_run_id="1",
+                    expected_run_attempt="2",
+                    expected_workflow_sha="c" * 40,
+                )
+
+            for location, field, invalid_value in (
+                ("workflow_run", "id", True),
+                ("workflow_run", "id", "1"),
+                ("workflow_run", "run_attempt", True),
+                ("workflow_run", "run_attempt", "1"),
+                ("row", "id", False),
+                ("row", "id", "405"),
+                ("row", "expired", True),
+                ("row", "digest", "sha256:invalid"),
+            ):
+                with self.subTest(
+                    stale_location=location,
+                    field=field,
+                    value=repr(invalid_value),
+                ):
+                    stale_row = json.loads(json.dumps(valid_stale_row))
+                    target = (
+                        stale_row["workflow_run"] if location == "workflow_run" else stale_row
+                    )
+                    target[field] = invalid_value
+                    write([stale_row])
+                    try:
+                        recovery.validate_publisher_artifact_metadata(
+                            metadata,
+                            expected_name=expected_name,
+                            expected_run_id="1",
+                            expected_run_attempt="2",
+                            expected_workflow_sha="c" * 40,
+                        )
+                    except recovery.RecoveryBootstrapError as exc:
+                        self.assertIs(type(exc), recovery.RecoveryBootstrapError)
+                    else:
+                        self.fail("malformed stale-attempt identity was not rejected")
+
+    def test_publisher_artifact_visibility_wait_is_bounded_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / "publisher-artifacts.json"
+            github_output = root / "github-output.txt"
+            name = recovery.publisher_bundle_artifact_name(
+                source_sha="a" * 40,
+                security_run_id="101",
+                security_run_attempt="2",
+                producer_run_id="202",
+                producer_run_attempt="3",
+                publisher_run_id="303",
+                publisher_run_attempt="4",
+            )
+            row = {
+                "id": 404,
+                "name": name,
+                "expired": False,
+                "digest": "sha256:" + "e" * 64,
+                "workflow_run": {"id": 303, "head_sha": "c" * 40},
+            }
+
+            def invoke(payload: object, *, attempt: int) -> tuple[int, str]:
+                if isinstance(payload, str):
+                    metadata.write_text(payload, encoding="ascii")
+                else:
+                    metadata.write_text(json.dumps(payload), encoding="ascii")
+                github_output.unlink(missing_ok=True)
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", new=stderr):
+                    status = recovery.main(
+                        [
+                            "publisher-artifact",
+                            "--metadata",
+                            str(metadata),
+                            "--artifact-name",
+                            name,
+                            "--publisher-run-id",
+                            "303",
+                            "--publisher-run-attempt",
+                            "4",
+                            "--publisher-workflow-sha",
+                            "c" * 40,
+                            "--github-output",
+                            str(github_output),
+                            "--metadata-poll-attempt",
+                            str(attempt),
+                            "--metadata-poll-max-attempts",
+                            str(recovery.PUBLISHER_ARTIFACT_METADATA_MAX_ATTEMPTS),
+                        ]
+                    )
+                return status, stderr.getvalue()
+
+            def page(rows: list[object]) -> dict[str, object]:
+                return {"total_count": len(rows), "artifacts": rows}
+
+            status, stderr = invoke(page([]), attempt=1)
+            self.assertEqual(status, 3)
+            self.assertIn("RECOVERY_BOOTSTRAP_WAIT", stderr)
+            self.assertFalse(github_output.exists())
+
+            status, stderr = invoke(page([row]), attempt=2)
+            self.assertEqual(status, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("publisher_bundle_artifact_id=404", github_output.read_text())
+            self.assertIn("publisher_bundle_artifact_sha256=" + "e" * 64, github_output.read_text())
+
+            status, stderr = invoke(page([]), attempt=recovery.PUBLISHER_ARTIFACT_METADATA_MAX_ATTEMPTS)
+            self.assertEqual(status, 2)
+            self.assertIn("metadata_not_visible_within_poll_limit", stderr)
+            self.assertNotIn("RECOVERY_BOOTSTRAP_WAIT", stderr)
+            self.assertFalse(github_output.exists())
+
+            invalid_rows: list[tuple[str, list[object]]] = []
+            wrong_name = json.loads(json.dumps(row))
+            wrong_name["name"] = name.replace("-303-4.zip", "-303-5.zip")
+            invalid_rows.append(("wrong_name", [wrong_name]))
+            for field, value in (
+                ("id", 0),
+                ("expired", True),
+                ("digest", "sha256:invalid"),
+                ("workflow_run", {"id": 304, "head_sha": "c" * 40}),
+                ("workflow_run", {"id": 303, "head_sha": "d" * 40}),
+                (
+                    "workflow_run",
+                    {"id": 303, "head_sha": "c" * 40, "run_attempt": 5},
+                ),
+            ):
+                invalid = json.loads(json.dumps(row))
+                invalid[field] = value
+                invalid_rows.append((f"{field}:{value!r}", [invalid]))
+            invalid_rows.extend(
+                (
+                    ("duplicate", [row, row]),
+                    ("malformed_row", [None]),
+                )
+            )
+            invalid_pages: list[tuple[str, object]] = [
+                (name, page(rows)) for name, rows in invalid_rows
+            ]
+            invalid_pages.extend(
+                (
+                    ("incomplete_page", {"total_count": 1, "artifacts": []}),
+                    ("invalid_json", "{"),
+                )
+            )
+            for label, invalid_page in invalid_pages:
+                with self.subTest(case=label):
+                    status, stderr = invoke(invalid_page, attempt=1)
+                    self.assertEqual(status, 2)
+                    self.assertNotIn("RECOVERY_BOOTSTRAP_WAIT", stderr)
+
+            workflow = (
+                REPO_ROOT
+                / ".github/workflows/platform-production-recovery-bootstrap-publish.yml"
+            ).read_text(encoding="utf-8")
+            start = workflow.index("- name: Fetch exact C bundle artifact metadata")
+            end = workflow.index("- name: Build closed publisher evidence after C upload", start)
+            metadata_step = workflow[start:end]
+            self.assertIn("poll_max_attempts=6", metadata_step)
+            self.assertIn("sleep 2", metadata_step)
+            self.assertIn("--fail-with-body", metadata_step)
+            self.assertNotIn("--retry", metadata_step)
+            self.assertIn('if [[ "$status" -ne 3 ]]; then', metadata_step)
+
+    def test_publisher_artifact_visibility_workflow_polls_only_valid_empty_pages(self) -> None:
+        workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-recovery-bootstrap-publish.yml"
+        ).read_text(encoding="utf-8")
+        lines = workflow.splitlines()
+        step_start = lines.index("      - name: Fetch exact C bundle artifact metadata")
+        run_line = next(
+            index
+            for index in range(step_start, len(lines))
+            if lines[index] == "        run: |"
+        )
+        script_lines: list[str] = []
+        for line in lines[run_line + 1 :]:
+            if line and not line.startswith("          "):
+                break
+            script_lines.append(line[10:] if line else "")
+        publisher_step = textwrap.dedent("\n".join(script_lines))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trusted_tools = root / "trusted-source/platform/tools"
+            trusted_tools.mkdir(parents=True)
+            for filename in (
+                "platform_recovery_bootstrap.py",
+                "platform_release_systemd_state.py",
+                "platform_release_transaction.py",
+            ):
+                shutil.copyfile(TOOLS / filename, trusted_tools / filename)
+
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_curl = bin_dir / "curl"
+            fake_curl.write_text(
+                "#!/bin/bash\n"
+                "set -euo pipefail\n"
+                "count=0\n"
+                "if [[ -f $CURL_COUNT_FILE ]]; then count=$(<\"$CURL_COUNT_FILE\"); fi\n"
+                "count=$((count + 1))\n"
+                "printf '%s' \"$count\" > \"$CURL_COUNT_FILE\"\n"
+                "output=''\n"
+                "has_fail_with_body=0\n"
+                "while (($#)); do\n"
+                "  if [[ $1 == --output ]]; then output=$2; shift 2; continue; fi\n"
+                "  if [[ $1 == --fail-with-body ]]; then has_fail_with_body=1; fi\n"
+                "  shift\n"
+                "done\n"
+                "[[ $has_fail_with_body == 1 ]] || exit 64\n"
+                "if [[ ${CURL_STATUS:-0} != 0 ]]; then exit \"$CURL_STATUS\"; fi\n"
+                "cp \"$CURL_RESPONSE_DIR/$count.json\" \"$output\"\n",
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+            fake_sleep = bin_dir / "sleep"
+            fake_sleep.write_text(
+                "#!/bin/bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"$SLEEP_LOG\"\n",
+                encoding="utf-8",
+            )
+            fake_sleep.chmod(0o755)
+
+            name = recovery.publisher_bundle_artifact_name(
+                source_sha="a" * 40,
+                security_run_id="101",
+                security_run_attempt="2",
+                producer_run_id="202",
+                producer_run_attempt="3",
+                publisher_run_id="303",
+                publisher_run_attempt="4",
+            )
+            row = {
+                "id": 404,
+                "name": name,
+                "expired": False,
+                "digest": "sha256:" + "e" * 64,
+                "workflow_run": {"id": 303, "head_sha": "c" * 40},
+            }
+
+            def page(rows: list[object]) -> dict[str, object]:
+                return {"total_count": len(rows), "artifacts": rows}
+
+            def run_step(
+                responses: list[object], *, curl_status: int = 0
+            ) -> tuple[subprocess.CompletedProcess[str], int, list[str], str]:
+                runner_temp = root / "runner-temp"
+                metadata_dir = runner_temp / "platform-recovery-publisher"
+                metadata_dir.mkdir(parents=True, exist_ok=True)
+                response_dir = root / "responses"
+                response_dir.mkdir(exist_ok=True)
+                for previous in response_dir.iterdir():
+                    previous.unlink()
+                for index, response in enumerate(responses, start=1):
+                    payload = response if isinstance(response, str) else json.dumps(response)
+                    (response_dir / f"{index}.json").write_text(payload, encoding="ascii")
+                count_file = root / "curl-count"
+                count_file.unlink(missing_ok=True)
+                sleep_log = root / "sleep-log"
+                sleep_log.unlink(missing_ok=True)
+                github_output = root / "github-output"
+                github_output.unlink(missing_ok=True)
+                github_output.touch(mode=0o600)
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "PATH": f"{bin_dir}:/usr/bin:/bin",
+                        "RUNNER_TEMP": str(runner_temp),
+                        "GITHUB_API_URL": "https://api.example.invalid",
+                        "REPOSITORY": "StrayForest/old_sparky",
+                        "GH_TOKEN": "test-token",
+                        "PUBLISHER_RUN_ID": "303",
+                        "PUBLISHER_RUN_ATTEMPT": "4",
+                        "PUBLISHER_WORKFLOW_SHA": "c" * 40,
+                        "PUBLISHER_BUNDLE_NAME": name,
+                        "GITHUB_OUTPUT": str(github_output),
+                        "CURL_RESPONSE_DIR": str(response_dir),
+                        "CURL_COUNT_FILE": str(count_file),
+                        "SLEEP_LOG": str(sleep_log),
+                        "CURL_STATUS": str(curl_status),
+                    }
+                )
+                result = subprocess.run(
+                    ["/bin/bash", "-c", publisher_step],
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                count = int(count_file.read_text(encoding="ascii")) if count_file.exists() else 0
+                sleeps = (
+                    sleep_log.read_text(encoding="ascii").splitlines()
+                    if sleep_log.exists()
+                    else []
+                )
+                return result, count, sleeps, github_output.read_text(encoding="ascii")
+
+            result, calls, sleeps, output = run_step([page([]), page([row])])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((calls, sleeps), (2, ["2"]))
+            self.assertIn("publisher_bundle_artifact_id=404", output)
+            self.assertIn("publisher_bundle_artifact_sha256=" + "e" * 64, output)
+
+            result, calls, sleeps, output = run_step(
+                [page([]) for _ in range(recovery.PUBLISHER_ARTIFACT_METADATA_MAX_ATTEMPTS)]
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(calls, recovery.PUBLISHER_ARTIFACT_METADATA_MAX_ATTEMPTS)
+            self.assertEqual(sleeps, ["2"] * (calls - 1))
+            self.assertEqual(output, "")
+            self.assertIn("metadata_not_visible_within_poll_limit", result.stderr)
+
+            invalid_pages: list[tuple[str, object]] = []
+            wrong_name = json.loads(json.dumps(row))
+            wrong_name["name"] = name.replace("-303-4.zip", "-303-5.zip")
+            invalid_pages.append(("wrong_name", page([wrong_name])))
+            wrong_run = json.loads(json.dumps(row))
+            wrong_run["workflow_run"]["id"] = 304
+            invalid_pages.append(("wrong_run", page([wrong_run])))
+            wrong_sha = json.loads(json.dumps(row))
+            wrong_sha["workflow_run"]["head_sha"] = "d" * 40
+            invalid_pages.append(("wrong_sha", page([wrong_sha])))
+            invalid_pages.extend(
+                (
+                    ("malformed_json", "{"),
+                    ("malformed_page", {"total_count": 1, "artifacts": []}),
+                    ("duplicate", page([row, row])),
+                )
+            )
+            for label, payload in invalid_pages:
+                with self.subTest(immediate_rejection=label):
+                    result, calls, sleeps, output = run_step([payload])
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual((calls, sleeps, output), (1, [], ""))
+                    self.assertNotIn("RECOVERY_BOOTSTRAP_WAIT", result.stderr)
+
+            for label, curl_status in (("api_or_auth", 22), ("network", 28)):
+                with self.subTest(immediate_transport_failure=label):
+                    result, calls, sleeps, output = run_step(
+                        [], curl_status=curl_status
+                    )
+                    self.assertEqual(result.returncode, curl_status, result.stderr)
+                    self.assertEqual((calls, sleeps, output), (1, [], ""))
+                    self.assertNotIn("RECOVERY_BOOTSTRAP_WAIT", result.stderr)
+
     def test_completed_publisher_event_identity_is_exact_and_rerun_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             metadata = Path(directory)

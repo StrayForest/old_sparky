@@ -80,6 +80,7 @@ MAX_FILES = 32
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_PROVENANCE_BYTES = 64 * 1024
 MAX_PUBLISH_PAGE_ROWS = 100
+PUBLISHER_ARTIFACT_METADATA_MAX_ATTEMPTS = 6
 RECOVERY_SUBPROCESS_TIMEOUT_SECONDS = 120.0
 RECOVERY_CHILD_TERMINATION_GRACE_SECONDS = 5.0
 RECOVERY_CHILD_STAGES = frozenset(
@@ -129,6 +130,10 @@ RECOVERY_FILES = (
 
 class RecoveryBootstrapError(ValueError):
     """The recovery bootstrap archive or host state is not safe."""
+
+
+class RecoveryArtifactMetadataPending(RecoveryBootstrapError):
+    """A complete artifact listing does not show the just-uploaded C artifact yet."""
 
 
 class RecoveryChildError(RecoveryBootstrapError):
@@ -882,30 +887,86 @@ def validate_publisher_artifact_metadata(
         label="publisher artifacts",
     )
     matches: list[dict[str, object]] = []
+    stale_attempt_names: set[str] = set()
+    prior_attempt_prefix = expected_name.rsplit("-", 1)[0] + "-"
+    prior_attempt_pattern = re.compile(
+        rf"^{re.escape(prior_attempt_prefix)}([1-9][0-9]{{0,31}})\.zip$"
+    )
     for row in rows:
         if not isinstance(row, dict):
+            raise RecoveryBootstrapError("publisher artifact row is malformed")
+        row_name = row.get("name")
+        if not isinstance(row_name, str):
+            raise RecoveryBootstrapError("publisher artifact name is malformed")
+        if row_name != expected_name:
+            if row_name.startswith("platform-recovery-bootstrap-publisher-"):
+                prior_attempt = prior_attempt_pattern.fullmatch(row_name)
+                workflow_run = row.get("workflow_run")
+                prior_attempt_number = (
+                    int(prior_attempt.group(1)) if prior_attempt is not None else None
+                )
+                digest = row.get("digest")
+                if (
+                    prior_attempt is not None
+                    and prior_attempt_number < expected_attempt
+                    and row.get("expired") is False
+                    and type(row.get("id")) is int
+                    and row["id"] > 0
+                    and isinstance(workflow_run, dict)
+                    and type(workflow_run.get("id")) is int
+                    and workflow_run.get("id") == expected_run
+                    and workflow_run.get("head_sha") == expected_workflow_sha
+                    and (
+                        "run_attempt" not in workflow_run
+                        or (
+                            type(workflow_run.get("run_attempt")) is int
+                            and workflow_run.get("run_attempt")
+                            == prior_attempt_number
+                        )
+                    )
+                    and isinstance(digest, str)
+                    and re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is not None
+                ):
+                    if row_name in stale_attempt_names:
+                        raise RecoveryBootstrapError(
+                            "previous publisher artifact attempt is duplicated"
+                        )
+                    stale_attempt_names.add(row_name)
+                    continue
+                raise RecoveryBootstrapError(
+                    "publisher artifact name does not bind the exact attempt"
+                )
             continue
         workflow_run = row.get("workflow_run")
         digest = row.get("digest")
         if (
-            row.get("name") != expected_name
-            or row.get("expired") is not False
+            row.get("expired") is not False
             or type(row.get("id")) is not int
             or row["id"] <= 0
             or not isinstance(workflow_run, dict)
+            or type(workflow_run.get("id")) is not int
             or workflow_run.get("id") != expected_run
             or workflow_run.get("head_sha") != expected_workflow_sha
             or (
                 "run_attempt" in workflow_run
-                and workflow_run.get("run_attempt") != expected_attempt
+                and (
+                    type(workflow_run.get("run_attempt")) is not int
+                    or workflow_run.get("run_attempt") != expected_attempt
+                )
             )
             or not isinstance(digest, str)
             or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
         ):
-            continue
+            raise RecoveryBootstrapError(
+                "exact publisher artifact metadata is inconsistent"
+            )
         matches.append(row)
-    if len(matches) != 1:
-        raise RecoveryBootstrapError("exact publisher bundle artifact is missing")
+    if len(matches) > 1:
+        raise RecoveryBootstrapError("exact publisher bundle artifact is duplicated")
+    if not matches:
+        raise RecoveryArtifactMetadataPending(
+            "exact publisher bundle artifact is not visible yet"
+        )
     row = matches[0]
     return {
         "publisher_bundle_name": expected_name,
@@ -2727,6 +2788,10 @@ def _parser() -> argparse.ArgumentParser:
     publisher_artifact.add_argument("--publisher-run-attempt", required=True)
     publisher_artifact.add_argument("--publisher-workflow-sha", required=True)
     publisher_artifact.add_argument("--github-output", type=Path, required=True)
+    publisher_artifact.add_argument("--metadata-poll-attempt", type=int, default=1)
+    publisher_artifact.add_argument(
+        "--metadata-poll-max-attempts", type=int, default=1
+    )
     publish_bundle = commands.add_parser("publish-bundle")
     publish_bundle.add_argument("--archive", type=Path, required=True)
     publish_bundle.add_argument("--output", type=Path, required=True)
@@ -2903,13 +2968,38 @@ def main(argv: list[str] | None = None) -> int:
             args.artifact_id_output.write_text(f"{artifact_id}\n", encoding="ascii")
             args.artifact_id_output.chmod(0o600)
         elif args.command == "publisher-artifact":
-            result = validate_publisher_artifact_metadata(
-                args.metadata,
-                expected_name=args.artifact_name,
-                expected_run_id=args.publisher_run_id,
-                expected_run_attempt=args.publisher_run_attempt,
-                expected_workflow_sha=args.publisher_workflow_sha,
-            )
+            if (
+                not 1 <= args.metadata_poll_max_attempts
+                <= PUBLISHER_ARTIFACT_METADATA_MAX_ATTEMPTS
+                or not 1 <= args.metadata_poll_attempt
+                <= args.metadata_poll_max_attempts
+            ):
+                raise RecoveryBootstrapError(
+                    "publisher artifact metadata poll bounds are invalid"
+                )
+            try:
+                result = validate_publisher_artifact_metadata(
+                    args.metadata,
+                    expected_name=args.artifact_name,
+                    expected_run_id=args.publisher_run_id,
+                    expected_run_attempt=args.publisher_run_attempt,
+                    expected_workflow_sha=args.publisher_workflow_sha,
+                )
+            except RecoveryArtifactMetadataPending:
+                if args.metadata_poll_attempt < args.metadata_poll_max_attempts:
+                    print(
+                        "RECOVERY_BOOTSTRAP_WAIT schema=1 "
+                        "stage=publisher_artifact outcome=metadata_pending",
+                        file=sys.stderr,
+                    )
+                    return 3
+                print(
+                    "RECOVERY_BOOTSTRAP_DIAGNOSTIC schema=1 "
+                    "stage=publisher_artifact "
+                    "outcome=metadata_not_visible_within_poll_limit",
+                    file=sys.stderr,
+                )
+                raise
             with args.github_output.open("a", encoding="ascii") as stream:
                 for key in (
                     "publisher_bundle_name",

@@ -474,6 +474,7 @@ no source checkout to the host. GitHub's certificate
 workflow therefore binds the numeric producer and publisher job IDs selected
 from their exact attempt jobs APIs into the closed evidence artifact and
 rejects any evidence/API pairing drift before accepting the attestation.
+After upload, publisher C reads the complete artifact inventory at most six times (two-second intervals; five-second request cap), waiting only for a valid complete page without the exact C artifact; HTTP/auth, malformed/incomplete, duplicate/expired, and name/run/SHA/digest failures reject immediately, while final absence fails closed before evidence or host changes.
 
 The complete recovery handoff is the six exact operator inputs `security_run_id/security_run_attempt`, `recovery_run_id/recovery_run_attempt`, and `publisher_run_id/publisher_run_attempt`. Corresponding security, producer and publisher job IDs are selected exactly once from each attempt-jobs API and carried into the closed evidence. The handoff binds source **A**, producer workflow/run/job **B/P**, publisher workflow/run/job **C**, route and producer-artifact digests, publisher outer artifact name/ID/digest, and bundle-member digest. Missing, duplicate, over-100, expired or mismatched API rows fail before SSH or host mutation.
 
