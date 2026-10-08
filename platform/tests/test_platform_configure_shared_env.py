@@ -100,6 +100,7 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         )
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_POOL_PRE_PING"], "true")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_LOG_ENABLED"], "false")
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_HEAP_METRICS_ENABLED"], "false")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_SAMPLE_RATE"], "0.01")
         self.assertEqual(
             configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS"],
@@ -148,14 +149,14 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         )
         for limit in expected_limits:
             profile = configure.RUNTIME_PROFILES[f"ready-vote-static-{limit}"]
-            self.assertEqual(
-                profile,
-                {
-                    "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": str(limit),
-                    "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": str(limit),
-                    "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": str(limit),
-                },
-            )
+            expected = {
+                "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": str(limit),
+                "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": str(limit),
+                "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": str(limit),
+            }
+            if limit == 8:
+                expected["PLATFORM_SSR_HEAP_METRICS_ENABLED"] = "true"
+            self.assertEqual(profile, expected)
 
     def test_ready_vote_adaptive_v2_preserves_worker_and_database_envelope(self) -> None:
         profile = configure.RUNTIME_PROFILES["ready-vote-adaptive-v2"]

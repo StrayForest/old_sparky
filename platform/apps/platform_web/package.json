@@ -18,6 +18,7 @@
     "test:hermetic": "../../tools/platform_web_hermetic.sh",
     "test:shutdown-guard": "../../tools/platform_node.sh tests/shutdown-guard-contract.cjs",
     "test:ssr-stream-diagnostics": "../../tools/platform_node.sh tests/ssr-stream-diagnostics-contract.cjs",
+    "test:ssr-heap-metrics": "../../tools/platform_node.sh tests/ssr-heap-metrics-contract.mjs",
     "test:next-rootdir-glob": "../../tools/platform_node.sh tests/next-rootdir-glob-contract.mjs",
     "test:participant-progressive": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.participant.config.ts",
     "test:live": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-launch.spec.ts",

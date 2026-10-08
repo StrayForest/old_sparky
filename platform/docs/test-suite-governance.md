@@ -28,11 +28,9 @@ placement rules; it does not repeat tool arguments.
 | `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
 | `external-load` | performance operators | external generator to production origin | explicit operator workflow |
 
-The `web-quality` gate runs the runtime shutdown-signal, SSR stream diagnostics
-and Next root-directory glob contracts,
-`apps/platform_web/tests/shutdown-guard-contract.cjs`,
-`apps/platform_web/tests/ssr-stream-diagnostics-contract.cjs` and
-`apps/platform_web/tests/next-rootdir-glob-contract.mjs`, through the locked
+The `web-quality` gate runs shutdown, SSR stream/heap and Next root-directory
+contracts from `shutdown-guard-contract.cjs`, `ssr-stream-diagnostics-contract.cjs`,
+`ssr-heap-metrics-contract.mjs` and `next-rootdir-glob-contract.mjs` through the locked
 `platform_node.sh` helper after CI provisions Node 26.3.1. The shutdown
 contract self-signals only after the guard preload, has a bounded in-child
 watchdog, and cleans up its detached process group on failure. The SSR
@@ -40,17 +38,14 @@ contract bounds both enabled and disabled fixtures and cleans up their
 detached process groups on failure. The backend tool contour keeps
 source/ownership assertions for these contracts but does not execute their
 Node processes; this prevents an unpinned backend runner from duplicating the
-web runtime checks. The Next contract configures a patterned `next.rootDir`
+web runtime checks. The heap contract injects a fake clock, process memory and
+GC entries, verifying numeric-only output, 5,760-sample/eight-hour limits and
+timer disposal without a server or browser. The Next contract configures a patterned `next.rootDir`
 with a Pages route and verifies `@next/next/no-html-link-for-pages` still
 reports an internal navigation link. This guards the scoped glob compatibility
 override for `@next/eslint-plugin-next`; remove that override after upstream
-releases a patched `braces` dependency. The focused local commands are
-`tools/platform_web_npm.sh --prefix apps/platform_web run test:shutdown-guard`
-and
-`tools/platform_web_npm.sh --prefix apps/platform_web run test:ssr-stream-diagnostics`
-and
-`tools/platform_web_npm.sh --prefix apps/platform_web run test:next-rootdir-glob`
-from `platform/`; the helper fails closed unless Node 26.3.1 is selected.
+releases a patched `braces` dependency. Run `tools/platform_verify.py
+web-quality` from `platform/`; the helper requires Node 26.3.1.
 
 The first eight gates are deterministic and always part of the normal CI
 aggregate. The conditional `release-runtime` gate is deterministic as well,

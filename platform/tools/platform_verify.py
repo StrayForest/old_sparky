@@ -649,6 +649,16 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
                 ],
             ),
             (
+                "web-quality/ssr-heap-metrics",
+                [
+                    _tool("platform_web_npm.sh"),
+                    "--prefix",
+                    "apps/platform_web",
+                    "run",
+                    "test:ssr-heap-metrics",
+                ],
+            ),
+            (
                 "web-quality/next-rootdir-glob",
                 [
                     _tool("platform_web_npm.sh"),
