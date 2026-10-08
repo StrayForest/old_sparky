@@ -1,11 +1,6 @@
 name: Platform synthetic SSR heap reproduction
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/platform-ssr-heap-repro.yml"
-      - "platform/apps/platform_web/**"
-      - "platform/tools/ssr_heap_repro*"
   workflow_dispatch:
     inputs:
       regime:
@@ -16,6 +11,7 @@ on:
           - baseline
           - slow_bootstrap_1pct
           - workspace_500_230
+          - workspace_residence_proxy_25pct_2_7s
         default: baseline
       auth_transport:
         description: Existing server-auth transport branch

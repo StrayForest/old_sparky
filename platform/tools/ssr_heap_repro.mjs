@@ -63,6 +63,13 @@ function addCount(counts, key, amount = 1) {
   counts[key] = (counts[key] ?? 0) + amount;
 }
 
+function sameCounterObject(left, right) {
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) => key === rightKeys[index] && left[key] === right[key]);
+}
+
 export function fixedFixture(kind, targetBytes, slug = "synthetic-tournament", userId = "synthetic-user", organizerId = userId) {
   const now = "2026-10-08T00:00:00.000Z";
   const syntheticUser = {
@@ -180,7 +187,9 @@ function classifyAuthSeedOutcome(regime, matched, missing, delayedBootstraps, de
   if (![matched, missing, delayedBootstraps, delayedResponseClosed].every(Number.isSafeInteger) || [matched, missing, delayedBootstraps, delayedResponseClosed].some((value) => value < 0)) {
     return "invalid_counts";
   }
-  if (regime === "baseline") return missing === 0 && matched === MAX_REQUESTS ? "pass" : "auth_seed_missing";
+  if (["baseline", "workspace_residence_proxy_25pct_2_7s"].includes(regime)) {
+    return missing === 0 && matched === MAX_REQUESTS ? "pass" : "auth_seed_missing";
+  }
   if (regime === "workspace_500_230") return matched + missing === MAX_REQUESTS ? "observed_counts_only" : "invalid_counts";
   if (regime !== "slow_bootstrap_1pct") return "unknown_regime";
   if (missing === 0) return "slow_delay_preserved_auth";
@@ -212,6 +221,24 @@ function syntheticCookies(index) {
 
 function expectedWorkspace500Count(limit) {
   return Math.floor((limit - 1) / 87) + 1;
+}
+
+function workspaceResidenceDelayMs(index) {
+  if (index % 4 !== 0) return 0;
+  return 2_000 + (Math.floor(index / 4) % 6) * 1_000;
+}
+
+function expectedWorkspaceResidenceCounts(limit) {
+  const bins = counterObject();
+  let total = 0;
+  for (let index = 0; index < limit; index += 1) {
+    const delayMs = workspaceResidenceDelayMs(index);
+    if (delayMs > 0) {
+      addCount(bins, String(delayMs));
+      total += 1;
+    }
+  }
+  return { total, bins };
 }
 
 function requestAuthenticatedPage(index, slug, controller) {
@@ -293,6 +320,14 @@ export function contractSelfTest() {
   assert(classifyAuthSeedOutcome("slow_bootstrap_1pct", MAX_REQUESTS - 200, 200, 200, 200) === "expected_slow_auth_fallback", "slow_auth_seed");
   assert(expectedWorkspace500Count(MAX_REQUESTS) === 230 && expectedWorkspace500Count(100) === 2, "workspace_error_hypothesis_counts");
   assert(classifyAuthSeedOutcome("workspace_500_230", MAX_REQUESTS - 230, 230, 0, 0) === "observed_counts_only", "workspace_error_seed_observation");
+  const expectedResidence = expectedWorkspaceResidenceCounts(MAX_REQUESTS);
+  assert(expectedResidence.total === 5_000, "workspace_residence_count");
+  assert(expectedWorkspaceResidenceCounts(100).total === 25, "workspace_residence_first_hundred");
+  assert(JSON.stringify(expectedResidence.bins) === JSON.stringify({ "2000": 834, "3000": 834, "4000": 833, "5000": 833, "6000": 833, "7000": 833 }), "workspace_residence_bins");
+  assert(sameCounterObject({ "3000": 1, "2000": 2 }, { "2000": 2, "3000": 1 }), "counter_order_independent");
+  assert(workspaceResidenceDelayMs(0) === 2_000 && workspaceResidenceDelayMs(1) === 0, "residence_cohort_selection");
+  assert([0, 4, 8, 12, 16, 20, 24].map(workspaceResidenceDelayMs).join(",") === "2000,3000,4000,5000,6000,7000,2000", "residence_delay_cycle");
+  assert(classifyAuthSeedOutcome("workspace_residence_proxy_25pct_2_7s", MAX_REQUESTS, 0, 0, 0) === "pass", "residence_auth_seed");
   assert(workspace.tournament.slug === "synthetic-00001", "unique_workspace_slug");
   assert(workspace.tournament.participant_count === 500, "synthetic_population");
   assert(workspace.ready_check.active_round.status === "active", "active_ready_check");
@@ -305,9 +340,9 @@ export function contractSelfTest() {
   assert(classifyFatal("synthetic unknown failure") === null, "unknown_fatal");
   assert(MAX_REQUESTS === 20_000 && MAX_CONCURRENCY === 64, "population_contract");
   assert(STOP_RATIO === 0.90, "bounded_workload_contract");
-  assert(["baseline", "slow_bootstrap_1pct", "workspace_500_230"].includes(LOAD_REGIME), "load_regime");
+  assert(["baseline", "slow_bootstrap_1pct", "workspace_500_230", "workspace_residence_proxy_25pct_2_7s"].includes(LOAD_REGIME), "load_regime");
   assert(["fetch", "node"].includes(AUTH_TRANSPORT), "auth_transport");
-  return { schema: SCHEMA, contract_checks: 28 };
+  return { schema: SCHEMA, contract_checks: 36 };
 }
 
 function makeApiServer(stats) {
@@ -356,6 +391,13 @@ function makeApiServer(stats) {
       && LOAD_REGIME === "workspace_500_230"
       && userIndex % 87 === 0;
     if (workspaceInjectedError) addCount(stats.api_workspace_500_injections, endpoint);
+    const residenceDelayMs = endpoint === "workspace" && LOAD_REGIME === "workspace_residence_proxy_25pct_2_7s"
+      ? workspaceResidenceDelayMs(userIndex)
+      : 0;
+    if (residenceDelayMs > 0) {
+      addCount(stats.api_workspace_residence_injections, endpoint);
+      addCount(stats.api_workspace_residence_delay_ms, String(residenceDelayMs));
+    }
     const delayedBootstrap = endpoint === "bootstrap"
       && LOAD_REGIME === "slow_bootstrap_1pct"
       && userIndex >= 0
@@ -366,6 +408,7 @@ function makeApiServer(stats) {
       if (!response.writableEnded) {
         closedBeforeEnd = true;
         if (delayedBootstrap) addCount(stats.api_delayed_response_closed, endpoint);
+        if (residenceDelayMs > 0) addCount(stats.api_workspace_residence_client_closed, endpoint);
       }
     });
     // Deterministically approximate the captured request-latency quantiles
@@ -374,7 +417,7 @@ function makeApiServer(stats) {
     const baselineDelay = endpoint === "bootstrap"
       ? quantileIndex === 99 ? 1750 : quantileIndex >= 90 ? 900 : 350
       : quantileIndex === 99 ? 2100 : quantileIndex >= 90 ? 1100 : 450;
-    await delay(delayedBootstrap ? 2200 : baselineDelay);
+    await delay((delayedBootstrap ? 2200 : baselineDelay) + residenceDelayMs);
     if (closedBeforeEnd || response.destroyed) return;
     if (workspaceInjectedError) {
       response.writeHead(500, { "content-length": "0", "cache-control": "no-store" });
@@ -387,7 +430,9 @@ function makeApiServer(stats) {
       "content-length": String(body.length),
       "cache-control": "no-store",
     });
-    response.end(body);
+    response.end(body, () => {
+      if (residenceDelayMs > 0) addCount(stats.api_workspace_residence_completed, endpoint);
+    });
   });
   return server;
 }
@@ -467,7 +512,7 @@ async function main() {
   assert(process.env.SSR_HEAP_APP_SOURCE_COMMIT === APP_SOURCE_COMMIT, "app_source_commit");
   assert(WEB_WORKERS === "1", "web_worker_count");
   assert(["true", "false"].includes(SSR_PERF_LOG_ENABLED), "ssr_perf_log_enabled");
-  assert(["baseline", "slow_bootstrap_1pct", "workspace_500_230"].includes(LOAD_REGIME), "load_regime");
+  assert(["baseline", "slow_bootstrap_1pct", "workspace_500_230", "workspace_residence_proxy_25pct_2_7s"].includes(LOAD_REGIME), "load_regime");
   assert(["fetch", "node"].includes(AUTH_TRANSPORT), "auth_transport");
   const cap = await readCgroupMemory();
   assert(cap.limit === MEMORY_LIMIT_BYTES, "memory_cap");
@@ -505,6 +550,10 @@ async function main() {
     api_slow_bootstrap_injections: counterObject(),
     api_workspace_500_injections: counterObject(),
     api_delayed_response_closed: counterObject(),
+    api_workspace_residence_injections: counterObject(),
+    api_workspace_residence_completed: counterObject(),
+    api_workspace_residence_client_closed: counterObject(),
+    api_workspace_residence_delay_ms: counterObject(),
     workspace_slug_counts: counterObject(),
     api_bytes: 0,
     non_loopback: false,
@@ -720,6 +769,7 @@ async function main() {
   const memoryFinal = await readCgroupMemory();
   recordFatal(classifyFatal(stderrTail));
   const expectedWorkspace500Total = expectedWorkspace500Count(MAX_REQUESTS);
+  const expectedResidence = expectedWorkspaceResidenceCounts(MAX_REQUESTS);
   const workspaceStatusKeys = Object.keys(statuses);
   const first100WorkspaceStatusKeys = Object.keys(first100Statuses);
   const expectedWorkspaceError = LOAD_REGIME === "workspace_500_230"
@@ -728,6 +778,22 @@ async function main() {
     && (first100Statuses["200"] ?? 0) + (first100Statuses["500"] ?? 0) === 100
     && first100WorkspaceStatusKeys.every((key) => ["200", "500"].includes(key))
     && stats.api_workspace_500_injections.workspace === expectedWorkspace500Total
+    && stats.api_counts.bootstrap === MAX_REQUESTS
+    && stats.api_counts.workspace === MAX_REQUESTS
+    && Object.keys(stats.api_unexpected).length === 0
+    && !stats.non_loopback
+    && !oversizedTelemetry;
+  const expectedWorkspaceResidence = LOAD_REGIME === "workspace_residence_proxy_25pct_2_7s"
+    && statuses["200"] === MAX_REQUESTS
+    && Object.keys(statuses).length === 1
+    && first100Statuses["200"] === 100
+    && Object.keys(first100Statuses).length === 1
+    && authSeedCounts.matched === MAX_REQUESTS
+    && !authSeedCounts.missing
+    && stats.api_workspace_residence_injections.workspace === expectedResidence.total
+    && stats.api_workspace_residence_completed.workspace === expectedResidence.total
+    && !stats.api_workspace_residence_client_closed.workspace
+    && sameCounterObject(stats.api_workspace_residence_delay_ms, expectedResidence.bins)
     && stats.api_counts.bootstrap === MAX_REQUESTS
     && stats.api_counts.workspace === MAX_REQUESTS
     && Object.keys(stats.api_unexpected).length === 0
@@ -747,6 +813,8 @@ async function main() {
           ? "workspace_population"
         : LOAD_REGIME === "workspace_500_230"
           ? expectedWorkspaceError ? "workspace_500_hypothesis_complete" : "workspace_500_hypothesis_mismatch"
+        : LOAD_REGIME === "workspace_residence_proxy_25pct_2_7s"
+          ? expectedWorkspaceResidence ? "workspace_residence_hypothesis_complete" : "workspace_residence_hypothesis_mismatch"
         : statuses["200"] !== MAX_REQUESTS
           ? "http_status"
         : first100Statuses["200"] !== 100
@@ -824,6 +892,15 @@ async function main() {
     fake_api_slow_bootstrap_injections: stats.api_slow_bootstrap_injections,
     fake_api_workspace_500_injections: stats.api_workspace_500_injections,
     fake_api_workspace_500_expected_count: LOAD_REGIME === "workspace_500_230" ? expectedWorkspace500Total : 0,
+    workspace_residence_proxy: LOAD_REGIME === "workspace_residence_proxy_25pct_2_7s",
+    workspace_residence_proxy_scope: LOAD_REGIME === "workspace_residence_proxy_25pct_2_7s" ? "workspace_api_wait_only" : null,
+    workspace_residence_proxy_delay_min_ms: LOAD_REGIME === "workspace_residence_proxy_25pct_2_7s" ? 2_000 : 0,
+    workspace_residence_proxy_delay_max_ms: LOAD_REGIME === "workspace_residence_proxy_25pct_2_7s" ? 7_000 : 0,
+    workspace_residence_proxy_expected_count: LOAD_REGIME === "workspace_residence_proxy_25pct_2_7s" ? expectedResidence.total : 0,
+    fake_api_workspace_residence_injections: stats.api_workspace_residence_injections,
+    fake_api_workspace_residence_completed: stats.api_workspace_residence_completed,
+    fake_api_workspace_residence_client_closed: stats.api_workspace_residence_client_closed,
+    fake_api_workspace_residence_delay_ms: stats.api_workspace_residence_delay_ms,
     page_http_200_count: statuses["200"] ?? 0,
     page_http_500_count: statuses["500"] ?? 0,
     workspace_http_status_presentation_is_observed: LOAD_REGIME === "workspace_500_230",
@@ -838,7 +915,8 @@ async function main() {
     fatal_enums: fatalEnums,
   };
   process.stdout.write(JSON.stringify(output) + "\n");
-  if (result !== "pass" && result !== "workspace_500_hypothesis_complete") process.exitCode = 1;
+  if (result !== "pass" && result !== "workspace_500_hypothesis_complete"
+    && result !== "workspace_residence_hypothesis_complete") process.exitCode = 1;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
