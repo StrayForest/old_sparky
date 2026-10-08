@@ -28,14 +28,30 @@ jobs:
           set -euo pipefail
           cd platform
           env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            SOURCE_GIT_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
             /usr/bin/python3 - <<'PY'
           import json
           import os
           from pathlib import Path
+          import re
           import tempfile
           import time
 
           from tools.platform_load_runtime import probe_pid_namespace_capability, run_supervised
+
+          source_git_sha = os.environ.get("SOURCE_GIT_SHA", "")
+          external_run_id = os.environ.get("GITHUB_RUN_ID", "")
+          if re.fullmatch(r"[0-9a-f]{40}", source_git_sha) is None:
+              raise SystemExit("canary source SHA is invalid")
+          if re.fullmatch(r"[1-9][0-9]{0,31}", external_run_id) is None:
+              raise SystemExit("canary workflow run ID is invalid")
+          worker_binding = {
+              "source_git_sha": source_git_sha,
+              "app_target_sha": source_git_sha,
+              "source_binding": None,
+              "source_binding_sha256": None,
+              "external_run_id": external_run_id,
+          }
 
           probe = probe_pid_namespace_capability(timeout_seconds=5)
           if probe.get("available") is not True:
@@ -116,12 +132,14 @@ jobs:
                   worker_report_path=root / "child.json",
                   max_duration_seconds=8.0,
                   max_runner_minutes=1.0,
-                  worker_config={"heartbeat": str(heartbeat), "identities": str(identities)},
+                  worker_config={
+                      "heartbeat": str(heartbeat),
+                      "identities": str(identities),
+                      "binding": worker_binding,
+                  },
                   term_grace_seconds=0.5,
                   poll_seconds=0.01,
               )
-              if result.reason != "max_duration_seconds":
-                  raise SystemExit(f"unexpected canary reason: {result.reason}")
               final_report = root / "final.json"
               records = []
               identity_parse_errors = []
@@ -135,8 +153,12 @@ jobs:
                           records.append(json.loads(line))
                       except json.JSONDecodeError:
                           identity_parse_errors.append(line_number)
-              if result.namespace_closed is not True:
+              if (
+                  result.reason != "max_duration_seconds"
+                  or result.namespace_closed is not True
+              ):
                   diagnostics = {
+                      "probe": probe,
                       "reason": result.reason,
                       "returncode": result.returncode,
                       "namespace_closed": result.namespace_closed,
