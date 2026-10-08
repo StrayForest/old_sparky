@@ -1903,8 +1903,14 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
         ).read_text()
         self.assertIn(
-            '"runtime_profile":"ready-vote-static-8"',
+            '"runtime_profile":"authenticated-read-admission-24x8"',
             workflow,
+        )
+        self.assertEqual(
+            platform_configure_shared_env.RUNTIME_PROFILES[
+                "ready-vote-static-8"
+            ]["PLATFORM_SSR_HEAP_METRICS_ENABLED"],
+            "true",
         )
 
     def test_production_preflight_requires_edge_parity_before_preflight_exit(self) -> None:
@@ -2406,6 +2412,22 @@ fail 'private lock detail must not cross the public channel'
         static_api_env = render_service_env("api", static_values)
         self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true", static_web_env)
         self.assertNotIn("PLATFORM_SSR_HEAP_METRICS_ENABLED", static_api_env)
+
+        admission_content = apply_profile_selection("authenticated-read-admission-24x8")
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true\n", admission_content)
+        admission_values = {
+            key: f"{key}={value}"
+            for key, value in (
+                line.split("=", 1)
+                for line in admission_content.splitlines()
+                if "=" in line
+            )
+        }
+        admission_web_env = render_service_env("web", admission_values)
+        admission_api_env = render_service_env("api", admission_values)
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true", admission_web_env)
+        self.assertNotIn("PLATFORM_SSR_HEAP_METRICS_ENABLED", admission_api_env)
+        current_lines = admission_content.splitlines()
 
         baseline_content = apply_profile_selection("baseline")
         self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=false\n", baseline_content)

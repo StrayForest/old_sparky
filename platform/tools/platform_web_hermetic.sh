@@ -11,6 +11,11 @@ cleanup() {
 trap cleanup EXIT
 
 cd "$WEB_ROOT"
+# The public live-QA count reporter is privacy-sensitive contract code.  Run
+# its pure Node contract in the existing web-hermetic gate without starting a
+# browser, server, API or database.
+"$TOOLS_DIR/platform_node.sh" \
+  "$WEB_ROOT/tests/support/live-count-reporter-contract.cjs"
 # Both isolated Playwright contours use the same localhost API destination in
 # the standalone artifact.  The participant contour owns a fresh server on
 # this port after smoke exits; no server or database state is shared.

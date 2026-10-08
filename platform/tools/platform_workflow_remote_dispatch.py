@@ -139,6 +139,58 @@ LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS = 300.0
 CHILD_TERMINATION_GRACE_SECONDS = 5.0
 LIVE_LAUNCH_STATUS_MAX_BYTES = 256
 LIVE_LAUNCH_STREAM_MAX_BYTES = 4096
+LIVE_LAUNCH_PROTOCOL_MAX_BYTES = 1024
+LIVE_LAUNCH_CHECK_IDS = frozenset(
+    {
+        "none",
+        "input_shape",
+        "input_validation",
+        "source_binding",
+        "source_binding_io",
+        "source_binding_schema",
+        "source_binding_recheck",
+        "root_uid",
+        "source_identity",
+        "install_root_format",
+        "origin",
+        "install_root_target",
+        "provision_mode",
+        "provision_marker",
+        "marker_absent",
+        "marker_digest",
+        "generation_members",
+        "generation_supervisor_path",
+        "generation_supervisor_metadata",
+        "generation_manifest",
+        "identity",
+        "account_install",
+        "provision",
+        "browser_qa",
+        "release_lock",
+        "trusted_entry",
+        "supervisor_exec",
+        "dispatch",
+        "timeout",
+        "stream_limit",
+        "protocol",
+    }
+)
+LIVE_BROWSER_COUNTS_MAX_BYTES = 768
+LIVE_BROWSER_COUNT_FIELDS = (
+    "logical_total",
+    "logical_pass",
+    "logical_fail",
+    "logical_expected_fail",
+    "logical_flaky",
+    "logical_skip",
+    "logical_interrupted",
+    "attempt_total",
+    "attempt_pass",
+    "attempt_fail",
+    "attempt_skip",
+    "attempt_interrupted",
+    "attempt_timedout",
+)
 LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES = frozenset(
     {
         "validation",
@@ -158,11 +210,30 @@ LIVE_LAUNCH_FAILURE_STAGES = LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES | frozenset(
     }
 )
 LIVE_LAUNCH_STATUS_RE = re.compile(
-    rb"LIVE_LAUNCH_STATUS schema=1 status=(?P<status>passed|failed) "
+    rb"LIVE_LAUNCH_STATUS schema=2 status=(?P<status>passed|failed) "
     rb"stage=(?P<stage>validation|trusted_generation|identity|account_install|"
     rb"provision|browser_qa|dispatch|trusted_entry|timeout|complete) "
+    rb"check=(?P<check>none|input_shape|input_validation|source_binding|"
+    rb"source_binding_io|source_binding_schema|source_binding_recheck|root_uid|"
+    rb"source_identity|install_root_format|origin|install_root_target|"
+    rb"provision_mode|provision_marker|marker_absent|marker_digest|"
+    rb"generation_members|generation_supervisor_path|"
+    rb"generation_supervisor_metadata|generation_manifest|identity|"
+    rb"account_install|provision|browser_qa|release_lock|trusted_entry|"
+    rb"supervisor_exec|dispatch|timeout|stream_limit|protocol) "
     rb"child_exit=(?P<child_exit>0|[1-9][0-9]{0,2}) "
     rb"source_sha=(?P<source_sha>[0-9a-f]{40})\n"
+)
+LIVE_BROWSER_COUNTS_RE = re.compile(
+    rb"LIVE_BROWSER_COUNTS schema=1 run_status="
+    rb"(?P<run_status>passed|failed|timedout|interrupted) "
+    + b" ".join(
+        rf"{field}=(?P<{field}>(?:0|[1-9][0-9]{{0,4}}))".encode("ascii")
+        for field in LIVE_BROWSER_COUNT_FIELDS
+    )
+    + rb" source_sha=(?P<source_sha>[0-9a-f]{40}) "
+    + rb"app_sha=(?P<app_sha>[0-9a-f]{40}) "
+    + rb"marker_sha256=(?P<marker_sha256>[0-9a-f]{64})\n"
 )
 RELEASE_MARKER_MAX_BYTES = 512
 RELEASE_MARKER_OBSERVED_BYTES_MAX = RELEASE_MARKER_MAX_BYTES + 1
@@ -767,6 +838,8 @@ def _run_bounded_child(
     timeout_seconds: float,
     expected_release_marker: tuple[str, str, str] | None = None,
     expected_live_launch_sha: str | None = None,
+    expected_live_app_sha: str | None = None,
+    expected_live_marker_sha256: str | None = None,
 ) -> int:
     """Run one synchronous privileged child with process-group cleanup."""
 
@@ -804,6 +877,8 @@ def _run_bounded_child(
             process,
             timeout_seconds=timeout_seconds,
             expected_sha=expected_live_launch_sha,
+            expected_app_sha=expected_live_app_sha,
+            expected_marker_sha256=expected_live_marker_sha256,
         )
     try:
         return process.wait(timeout=timeout_seconds)
@@ -967,27 +1042,28 @@ def _wait_for_release_marker(
 
 
 def _emit_live_launch_status(
-    *, status: str, stage: str, child_exit: int, source_sha: str
+    *, status: str, stage: str, child_exit: int, source_sha: str, check: str = "none"
 ) -> None:
     """Write one closed live-launch result without forwarding child output."""
 
     if (
         status not in {"passed", "failed"}
         or stage not in LIVE_LAUNCH_FAILURE_STAGES | {"complete"}
+        or check not in LIVE_LAUNCH_CHECK_IDS
         or not 0 <= child_exit <= 255
         or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
     ):
         return
     print(
-        "LIVE_LAUNCH_STATUS schema=1 "
-        f"status={status} stage={stage} child_exit={child_exit} "
+        "LIVE_LAUNCH_STATUS schema=2 "
+        f"status={status} stage={stage} check={check} child_exit={child_exit} "
         f"source_sha={source_sha}"
     )
 
 
 def _parse_live_launch_status(
     output: bytes, *, child_status: int, expected_sha: str
-) -> tuple[str, str, int] | None:
+) -> tuple[str, str, str, int] | None:
     """Accept only the exact status marker emitted by the trusted supervisor."""
 
     if len(output) > LIVE_LAUNCH_STATUS_MAX_BYTES:
@@ -997,6 +1073,7 @@ def _parse_live_launch_status(
         return None
     status = match.group("status").decode("ascii")
     stage = match.group("stage").decode("ascii")
+    check = match.group("check").decode("ascii")
     child_exit = int(match.group("child_exit"))
     if child_status < 0:
         return None
@@ -1013,7 +1090,118 @@ def _parse_live_launch_status(
         or child_status != child_exit
     ):
         return None
-    return status, stage, child_exit
+    return status, stage, check, child_exit
+
+
+def _parse_live_browser_counts(
+    line: bytes,
+    *,
+    expected_sha: str,
+    expected_app_sha: str | None,
+    expected_marker_sha256: str | None,
+) -> dict[str, object] | None:
+    if len(line) > LIVE_BROWSER_COUNTS_MAX_BYTES:
+        return None
+    match = LIVE_BROWSER_COUNTS_RE.fullmatch(line)
+    if match is None:
+        return None
+    if (
+        match.group("source_sha").decode("ascii") != expected_sha
+        or expected_app_sha is None
+        or match.group("app_sha").decode("ascii") != expected_app_sha
+        or expected_marker_sha256 is None
+        or match.group("marker_sha256").decode("ascii") != expected_marker_sha256
+    ):
+        return None
+    counts: dict[str, object] = {
+        "run_status": match.group("run_status").decode("ascii"),
+        "source_sha": expected_sha,
+        "app_sha": expected_app_sha,
+        "marker_sha256": expected_marker_sha256,
+    }
+    counts.update(
+        {
+            field: int(match.group(field))
+            for field in LIVE_BROWSER_COUNT_FIELDS
+        }
+    )
+    if (
+        any(counts[field] > 32768 for field in LIVE_BROWSER_COUNT_FIELDS)
+        or
+        counts["logical_total"] > 4096
+        or sum(
+            counts[field]
+            for field in (
+                "logical_pass",
+                "logical_fail",
+                "logical_expected_fail",
+                "logical_flaky",
+                "logical_skip",
+                "logical_interrupted",
+            )
+        )
+        != counts["logical_total"]
+        or sum(
+            counts[field]
+            for field in (
+                "attempt_pass",
+                "attempt_fail",
+                "attempt_skip",
+                "attempt_interrupted",
+                "attempt_timedout",
+            )
+        )
+        != counts["attempt_total"]
+    ):
+        return None
+    return counts
+
+
+def _parse_live_launch_protocol(
+    output: bytes,
+    *,
+    child_status: int,
+    expected_sha: str,
+    expected_app_sha: str | None = None,
+    expected_marker_sha256: str | None = None,
+) -> tuple[tuple[str, str, str, int], dict[str, object] | None] | None:
+    if len(output) > LIVE_LAUNCH_PROTOCOL_MAX_BYTES:
+        return None
+    lines = output.splitlines(keepends=True)
+    if len(lines) == 1:
+        status_line = lines[0]
+        counts = None
+    elif len(lines) == 2:
+        if not lines[0].startswith(b"LIVE_BROWSER_COUNTS schema=1 "):
+            return None
+        counts = _parse_live_browser_counts(
+            lines[0],
+            expected_sha=expected_sha,
+            expected_app_sha=expected_app_sha,
+            expected_marker_sha256=expected_marker_sha256,
+        )
+        status_line = lines[1]
+    else:
+        return None
+    status = _parse_live_launch_status(
+        status_line,
+        child_status=child_status,
+        expected_sha=expected_sha,
+    )
+    if status is None:
+        return None
+    return status, counts
+
+
+def _emit_live_browser_counts(counts: dict[str, object]) -> None:
+    fields = [
+        f"run_status={counts['run_status']}",
+        *(f"{field}={counts[field]}" for field in LIVE_BROWSER_COUNT_FIELDS),
+        f"source_sha={counts['source_sha']}",
+        f"app_sha={counts['app_sha']}",
+        f"marker_sha256={counts['marker_sha256']}",
+    ]
+    print("LIVE_BROWSER_COUNTS schema=1 " + " ".join(fields))
 
 
 def _wait_for_live_launch_status(
@@ -1021,14 +1209,17 @@ def _wait_for_live_launch_status(
     *,
     timeout_seconds: float,
     expected_sha: str,
+    expected_app_sha: str | None = None,
+    expected_marker_sha256: str | None = None,
 ) -> int:
-    """Drain all child bytes while retaining only one bounded status marker."""
+    """Drain output while retaining only one status and an optional count line."""
 
     stdout = process.stdout
     if stdout is None:
         _terminate_process_group(process)
         _emit_live_launch_status(
-            status="failed", stage="dispatch", child_exit=2, source_sha=expected_sha
+            status="failed", stage="dispatch", child_exit=2,
+            source_sha=expected_sha, check="protocol",
         )
         return 2
     output = bytearray()
@@ -1041,7 +1232,8 @@ def _wait_for_live_launch_status(
     except (OSError, ValueError):
         _terminate_process_group(process)
         _emit_live_launch_status(
-            status="failed", stage="dispatch", child_exit=2, source_sha=expected_sha
+            status="failed", stage="dispatch", child_exit=2,
+            source_sha=expected_sha, check="dispatch",
         )
         stdout.close()
         return 2
@@ -1063,6 +1255,7 @@ def _wait_for_live_launch_status(
                     stage="timeout",
                     child_exit=124,
                     source_sha=expected_sha,
+                    check="timeout",
                 )
                 return 124
             events = selector.select(min(remaining, 0.1))
@@ -1089,10 +1282,11 @@ def _wait_for_live_launch_status(
                         stage="trusted_entry",
                         child_exit=2,
                         source_sha=expected_sha,
+                        check="stream_limit",
                     )
                     return 2
                 if not oversized:
-                    if len(output) + len(chunk) > LIVE_LAUNCH_STATUS_MAX_BYTES:
+                    if len(output) + len(chunk) > LIVE_LAUNCH_PROTOCOL_MAX_BYTES:
                         output.clear()
                         oversized = True
                     else:
@@ -1100,14 +1294,19 @@ def _wait_for_live_launch_status(
         child_status = process.returncode
         if child_status is None:
             _emit_live_launch_status(
-                status="failed", stage="dispatch", child_exit=2, source_sha=expected_sha
+                status="failed", stage="dispatch", child_exit=2,
+                source_sha=expected_sha, check="dispatch",
             )
             return 2
         parsed = (
             None
             if oversized
-            else _parse_live_launch_status(
-                bytes(output), child_status=child_status, expected_sha=expected_sha
+            else _parse_live_launch_protocol(
+                bytes(output),
+                child_status=child_status,
+                expected_sha=expected_sha,
+                expected_app_sha=expected_app_sha,
+                expected_marker_sha256=expected_marker_sha256,
             )
         )
         if parsed is None:
@@ -1117,17 +1316,25 @@ def _wait_for_live_launch_status(
                 stage="trusted_entry",
                 child_exit=safe_exit,
                 source_sha=expected_sha,
+                check="protocol",
             )
             return safe_exit
-        status, stage, child_exit = parsed
+        (status, stage, check, child_exit), counts = parsed
+        if counts is not None:
+            _emit_live_browser_counts(counts)
         _emit_live_launch_status(
-            status=status, stage=stage, child_exit=child_exit, source_sha=expected_sha
+            status=status,
+            stage=stage,
+            check=check,
+            child_exit=child_exit,
+            source_sha=expected_sha,
         )
         return child_status
     except (OSError, ValueError):
         _terminate_process_group(process)
         _emit_live_launch_status(
-            status="failed", stage="dispatch", child_exit=2, source_sha=expected_sha
+            status="failed", stage="dispatch", child_exit=2,
+            source_sha=expected_sha, check="dispatch",
         )
         return 2
     finally:
@@ -1136,10 +1343,13 @@ def _wait_for_live_launch_status(
         stdout.close()
 
 
-def _run_trusted_live_launch(arguments: list[str]) -> int:
+def _run_trusted_live_launch(
+    arguments: list[str], *, expected_app_sha: str, expected_marker_sha256: str
+) -> int:
     if not _trusted_live_launch_helper():
         _emit_live_launch_status(
-            status="failed", stage="dispatch", child_exit=2, source_sha=arguments[-1]
+            status="failed", stage="dispatch", child_exit=2,
+            source_sha=arguments[-1], check="trusted_entry",
         )
         return 2
     command = [SUDO, "-n", "--", str(TRUSTED_LIVE_LAUNCH), *arguments]
@@ -1150,6 +1360,8 @@ def _run_trusted_live_launch(arguments: list[str]) -> int:
         command,
         timeout_seconds=LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS,
         expected_live_launch_sha=arguments[-1],
+        expected_live_app_sha=expected_app_sha,
+        expected_live_marker_sha256=expected_marker_sha256,
     )
 
 
@@ -2076,7 +2288,7 @@ def main(argv: list[str] | None = None) -> int:
                 [payload["target_sha"], *_source_binding_arguments(payload)],
                 timeout_seconds=LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS,
             )
-        source_arguments = _source_binding_arguments(payload)
+        app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
         return _run_trusted_live_launch(
             [
                 payload["base_url"],
@@ -2085,6 +2297,10 @@ def main(argv: list[str] | None = None) -> int:
                 *source_arguments,
                 payload["target_sha"],
             ],
+            expected_app_sha=app_target_sha,
+            expected_marker_sha256=hashlib.sha256(
+                payload["marker"].encode("ascii")
+            ).hexdigest(),
         )
     except (WorkflowInputError, OSError, ValueError, subprocess.SubprocessError):
         return _fail()

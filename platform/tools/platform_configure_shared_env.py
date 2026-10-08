@@ -217,6 +217,9 @@ RUNTIME_PROFILES = {
         "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "24",
         "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "8",
         "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "250",
+        # Temporary bounded heap diagnostics stay independent of request-level
+        # SSR tracing and are removed from this profile with the final QA fix.
+        "PLATFORM_SSR_HEAP_METRICS_ENABLED": "true",
     },
     "pool-pre-ping-off": {
         "PLATFORM_DB_POOL_PRE_PING": "false",

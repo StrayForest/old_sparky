@@ -272,10 +272,11 @@ The browser-workspace candidate is archived in
 [`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
 and the avatar candidate is archived in
 [`performance-authenticated-html-ttfb-avatar-defer-2026-09-08.md`](archive/performance-authenticated-html-ttfb-avatar-defer-2026-09-08.md).
-The bounded admission/pool-contention candidate was rejected after exact A/B
-run `34137667234`: TTFB p95 was `2356.822 ms` with all 20,000 HTTP responses
-successful and exact cleanup. Production is restored to
-`authenticated-read-admission-32`. The first overlap candidate was deployed in
+Exact A/B run `34137667234` rejected `authenticated-read-admission-24x8` as a
+TTFB optimization (`2356.822 ms` p95, 20,000 HTTP 200, exact cleanup). Production
+remains on `authenticated-read-admission-32`; this normal auto-deploy candidate
+tests the existing 24x8 profile at the same 32-request envelope, without
+raising workers, pool size or connection budget. The first overlap candidate was deployed in
 release `4db0079fcddba6fa37bd089d2a96599c04d02768` and measured by exact
 external run `34145804669`: `20,000/20,000` HTTP 200, exact cleanup, but HTML
 TTFB p95 `2527.624 ms`, only `1.605%` below baseline, so it was not accepted
@@ -441,12 +442,11 @@ column-oriented workspace snapshots, explicit Nginx upstream keepalive and
 selectable `uvloop`/`httptools`, pool-pre-ping and authenticated-read-admission
 experiments. The `read-mix-concurrency-ramp-v1` run measured the full
 20,000-user read mix at c16/c32/c48/c64/c80/c96/c112/c128: c32 was the stable
-latency knee and c48 the first queued stage. The operator-selected
-`authenticated-read-admission-32` profile is now active in production; the
-API remains at two workers with pool size `24`, `max_overflow=0`,
-`pool_pre_ping=true`, and the PostgreSQL safety budget remains `52`.
-The ramp is operator-only and requires the existing exact fixture
-cleanup/abort procedure.
+latency knee and c48 the first queued stage. Production remains on
+`authenticated-read-admission-32` until the normal-release candidate above is
+deployed; the API has two workers, pool size `24`, `max_overflow=0`,
+`pool_pre_ping=true`; the PostgreSQL safety budget remains `52`. The ramp is
+operator-only and requires the existing exact fixture cleanup/abort procedure.
 The current dev candidate also removes the three tournament router-level
 policies from public catalog and `/mine` resolution. Private child GETs,
 invite claims and the affected roster/join mutations declare only the policy

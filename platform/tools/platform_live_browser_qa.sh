@@ -66,6 +66,14 @@ else
     --platform-root "$PLATFORM_ROOT" \
     --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE")"
 fi
+LIVE_QA_RUNNER_SHA="${PLATFORM_LIVE_QA_RUNNER_SHA:-$SOURCE_COMMIT}"
+LIVE_QA_TARGET_SHA="${PLATFORM_LIVE_QA_TARGET_SHA:-$SOURCE_COMMIT}"
+LIVE_QA_MARKER_SHA256="${PLATFORM_LIVE_QA_MARKER_SHA256:-$(printf '%s' '' | /usr/bin/sha256sum)}"
+LIVE_QA_MARKER_SHA256="${LIVE_QA_MARKER_SHA256%% *}"
+[[ "$LIVE_QA_RUNNER_SHA" =~ ^[0-9a-f]{40}$ \
+  && "$LIVE_QA_TARGET_SHA" == "$SOURCE_COMMIT" \
+  && "$LIVE_QA_MARKER_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "Public browser QA source binding is invalid." >&2; exit 1; }
 if (( $# == 2 )); then
   "${GUARD[@]}" remove-public-browser-gate --gate "$2"
   echo "Interrupted public browser gate was removed exactly."
@@ -183,7 +191,8 @@ if (( TRUSTED_MODE == 1 )); then
   )
 fi
 
-/usr/bin/systemd-run \
+browser_status=0
+if /usr/bin/systemd-run \
   --no-ask-password \
   --quiet \
   --wait \
@@ -212,6 +221,9 @@ fi
     PLATFORM_LIVE_EXPECTED_ORIGIN="$EXPECTED_LIVE_ORIGIN" \
     PLATFORM_LIVE_USER_QA_UID="$LIVE_QA_UID" \
     PLATFORM_QA_BROWSER_GATE_DIR="$BROWSER_GATE" \
+    PLATFORM_LIVE_QA_RUNNER_SHA="$LIVE_QA_RUNNER_SHA" \
+    PLATFORM_LIVE_QA_TARGET_SHA="$LIVE_QA_TARGET_SHA" \
+    PLATFORM_LIVE_QA_MARKER_SHA256="$LIVE_QA_MARKER_SHA256" \
     PLAYWRIGHT_BROWSERS_PATH="$RUNTIME_CACHE/browsers" \
     PLAYWRIGHT_LIVE_BASE_URL="$EXPECTED_LIVE_ORIGIN" \
     TMPDIR="$BROWSER_GATE/tmp" \
@@ -221,5 +233,28 @@ fi
       test \
       --config="$RUNTIME_SUITE/web/playwright.live.config.ts" \
       "$RUNTIME_SUITE/web/tests/smoke/live-launch.spec.ts"
+then
+  browser_status=0
+else
+  browser_status=$?
+fi
+
+count_status=0
+if "${GUARD[@]}" emit-public-browser-counts \
+  --gate "$BROWSER_GATE" \
+  --source-sha "$LIVE_QA_RUNNER_SHA" \
+  --app-sha "$LIVE_QA_TARGET_SHA" \
+  --marker-sha256 "$LIVE_QA_MARKER_SHA256" >&3; then
+  count_status=0
+else
+  count_status=$?
+fi
+if (( browser_status != 0 )); then
+  exit "$browser_status"
+fi
+if (( count_status != 0 )); then
+  echo "Public browser QA count record is unavailable." >&2
+  exit 1
+fi
 
 printf 'LIVE_BROWSER_QA_SUCCESS source_commit=%s\n' "$SOURCE_COMMIT"
