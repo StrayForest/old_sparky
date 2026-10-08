@@ -870,6 +870,13 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertNotIn("/opt/oldsparky/platform/shared/host-tools/${{ github.sha }}", workflow)
         self.assertIn("source_sha=$HOST_TOOLS_SHA", host_preflight)
         self.assertIn("generation=$HOST_TOOLS_SHA", host_preflight)
+        artifact_validation = host_preflight.split(
+            "      - name: Validate host-tools artifact envelope and bundle", 1
+        )[1].split("      - name: Validate root SSH identity and installed generation", 1)[0]
+        self.assertIn(
+            'grep -Fqx "capability=retained_load_source_binding" "$inner_root/capabilities.txt"',
+            artifact_validation,
+        )
         self.assertIn("needs.host-capability-preflight.outputs.host_tools_sha", preflight)
         self.assertIn("needs.host-capability-preflight.outputs.host_tools_sha", production)
 
@@ -1441,8 +1448,9 @@ raise SystemExit(module.main(["host-capabilities"]))
 
             expected = (
                 f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
-                "dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 "
+                "dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 "
                 "release_baseline=1 retained_load_export_cleanup=1 "
+                "retained_load_source_binding=1 "
                 "python_isolated=1 python_bytecode_disabled=1\n"
             )
             bounded = limited_run("-I", "-B")
@@ -2378,8 +2386,9 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
         self.assertIn("/usr/bin/head -c 512", probe)
         self.assertIn(
             'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA '
-            'generation=$HOST_TOOLS_SHA dispatcher=3 artifact_prepare=2 supervisor=3 '
-            'input_guard=1 release_baseline=1 retained_load_export_cleanup=1 '
+            'generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 '
+            'input_guard=2 release_baseline=1 retained_load_export_cleanup=1 '
+            'retained_load_source_binding=1 '
             'python_isolated=1 python_bytecode_disabled=1"',
             probe,
         )
@@ -2528,8 +2537,9 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
 
         expected_line = (
             f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
-            "dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 "
-            "retained_load_export_cleanup=1 python_isolated=1 python_bytecode_disabled=1"
+            "dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 "
+            "retained_load_export_cleanup=1 retained_load_source_binding=1 "
+            "python_isolated=1 python_bytecode_disabled=1"
         )
         expected_payload = (expected_line + "\n").encode("ascii")
         expected_sha256 = hashlib.sha256(expected_payload).hexdigest()

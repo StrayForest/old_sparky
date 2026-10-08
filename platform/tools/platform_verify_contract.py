@@ -589,6 +589,8 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host capability preflight must not execute dynamic or self-installing code")
         if "platform/tools/platform_workflow_remote_dispatch.py" in host_preflight:
             issues.append("host capability preflight must not execute repository checkout source")
+        if 'grep -Fqx "capability=retained_load_source_binding" "$inner_root/capabilities.txt"' not in host_preflight:
+            issues.append("host-tools artifact validation must require the retained-load source-binding capability")
         if "scp " in host_preflight or "platform-production-deploy-remote" in host_preflight:
             issues.append("host capability preflight must not upload a bundle or deploy artifact")
         if (
@@ -636,8 +638,9 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
                 "< /dev/null",
                 ") 2>/dev/null < /dev/null | /usr/bin/head -c 512 > \"$probe_output\"",
                 'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
-                'dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 '
-                'retained_load_export_cleanup=1 python_isolated=1 python_bytecode_disabled=1"',
+                'dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 '
+                'retained_load_export_cleanup=1 retained_load_source_binding=1 '
+                'python_isolated=1 python_bytecode_disabled=1"',
                 'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
                 "command_rc=",
                 "expected_bytes=",

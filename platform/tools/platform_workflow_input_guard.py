@@ -283,11 +283,107 @@ def _validate_schema(value: object) -> None:
         raise _invalid()
 
 
-def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, str]:
+def _validate_source_binding_payload(value: object) -> dict[str, Any]:
+    """Validate the closed authenticated binding used only by schema 2."""
+
+    payload = _require_mapping(value)
+    keys = {
+        "schema",
+        "binding_mode",
+        "runner_sha",
+        "app_target_sha",
+        "baseline_identity",
+        "receipt_document_sha256",
+        "receipt_artifact_id",
+        "receipt_artifact_name",
+        "receipt_artifact_digest",
+        "receipt_archive_sha256",
+        "cumulative_manifest_sha256",
+        "source_security_run_id",
+        "source_security_run_attempt",
+        "autodeploy_run_id",
+        "autodeploy_run_attempt",
+        "production_deploy_run_id",
+        "production_deploy_run_attempt",
+    }
+    _require_exact_keys(payload, keys)
+    if type(payload.get("schema")) is not int or payload["schema"] != 1:
+        raise _invalid()
+    runner_sha = _require_string(payload, "runner_sha")
+    app_target_sha = _require_string(payload, "app_target_sha")
+    if (
+        SHA_RE.fullmatch(runner_sha) is None
+        or SHA_RE.fullmatch(app_target_sha) is None
+        or runner_sha == app_target_sha
+        or payload.get("binding_mode") != "verified-noop"
+    ):
+        raise _invalid()
+    baseline = validate_release_baseline_payload(payload.get("baseline_identity"))
+    if baseline["source_sha"] != app_target_sha:
+        raise _invalid()
+    for field in (
+        "receipt_document_sha256",
+        "receipt_archive_sha256",
+        "cumulative_manifest_sha256",
+    ):
+        if HEX_DIGEST_RE.fullmatch(_require_string(payload, field)) is None:
+            raise _invalid()
+    artifact_id = _validate_run_id(payload.get("receipt_artifact_id"))
+    deploy_id = _validate_run_id(payload.get("production_deploy_run_id"))
+    deploy_attempt = _validate_run_id(payload.get("production_deploy_run_attempt"))
+    artifact_name = _require_string(payload, "receipt_artifact_name")
+    if artifact_name != f"platform-production-noop-source-receipt-{deploy_id}-{deploy_attempt}":
+        raise _invalid()
+    artifact_digest = _require_string(payload, "receipt_artifact_digest")
+    if not artifact_digest.startswith("sha256:") or HEX_DIGEST_RE.fullmatch(
+        artifact_digest.removeprefix("sha256:")
+    ) is None:
+        raise _invalid()
+    if artifact_digest.removeprefix("sha256:") != payload["receipt_archive_sha256"]:
+        raise _invalid()
+    return {
+        "schema": 1,
+        "binding_mode": "verified-noop",
+        "runner_sha": runner_sha,
+        "app_target_sha": app_target_sha,
+        "baseline_identity": baseline,
+        "receipt_document_sha256": payload["receipt_document_sha256"],
+        "receipt_artifact_id": artifact_id,
+        "receipt_artifact_name": artifact_name,
+        "receipt_artifact_digest": artifact_digest,
+        "receipt_archive_sha256": payload["receipt_archive_sha256"],
+        "cumulative_manifest_sha256": payload["cumulative_manifest_sha256"],
+        "source_security_run_id": _validate_run_id(payload.get("source_security_run_id")),
+        "source_security_run_attempt": _validate_run_id(payload.get("source_security_run_attempt")),
+        "autodeploy_run_id": _validate_run_id(payload.get("autodeploy_run_id")),
+        "autodeploy_run_attempt": _validate_run_id(payload.get("autodeploy_run_attempt")),
+        "production_deploy_run_id": deploy_id,
+        "production_deploy_run_attempt": deploy_attempt,
+    }
+
+
+def _validate_source_binding_schema(payload: Mapping[str, Any]) -> tuple[int, dict[str, Any] | None]:
+    """Accept the legacy schema1 shape or schema2 with one binding object."""
+
+    value = payload.get("schema")
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise _invalid()
+    if value == 1 or value == "1":
+        if "source_binding" in payload:
+            raise _invalid()
+        return 1, None
+    if value == 2 or value == "2":
+        if "source_binding" not in payload:
+            raise _invalid()
+        return 2, _validate_source_binding_payload(payload.get("source_binding"))
+    raise _invalid()
+
+
+def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the complete external-load dispatch object."""
 
     payload = _require_mapping(payload)
-    keys = {
+    base_keys = {
         "schema",
         "confirmation",
         "target_sha",
@@ -299,8 +395,9 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, str]:
         "users_per_tournament",
         "timeout_diagnostics",
     }
+    schema, source_binding = _validate_source_binding_schema(payload)
+    keys = base_keys if schema == 1 else base_keys | {"source_binding"}
     _require_exact_keys(payload, keys)
-    _validate_schema(payload.get("schema"))
     confirmation = _require_string(payload, "confirmation")
     target_sha = _require_string(payload, "target_sha")
     control_email = validate_control_email(payload.get("control_email"))
@@ -329,8 +426,10 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, str]:
         raise _invalid()
     if SHA_RE.fullmatch(target_sha) is None:
         raise _invalid()
-    return {
-        "schema": "1",
+    if source_binding is not None and source_binding.get("runner_sha") != target_sha:
+        raise _invalid()
+    result: dict[str, Any] = {
+        "schema": str(schema),
         "confirmation": confirmation,
         "target_sha": target_sha,
         "control_email": control_email,
@@ -341,15 +440,20 @@ def validate_external_payload(payload: Mapping[str, Any]) -> dict[str, str]:
         "users_per_tournament": users_per_tournament,
         "timeout_diagnostics": timeout_diagnostics,
     }
+    if source_binding is not None:
+        result["source_binding"] = source_binding
+    return result
 
 
-def validate_live_payload(payload: Mapping[str, Any]) -> dict[str, str]:
+def validate_live_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the complete live-launch dispatch object."""
 
     payload = _require_mapping(payload)
+    schema, source_binding = _validate_source_binding_schema(payload)
     keys = {"schema", "base_url", "provision", "marker", "target_sha"}
+    if schema == 2:
+        keys.add("source_binding")
     _require_exact_keys(payload, keys)
-    _validate_schema(payload.get("schema"))
     base_url = _require_string(payload, "base_url")
     if base_url != EXPECTED_ORIGIN:
         raise _invalid()
@@ -362,38 +466,49 @@ def validate_live_payload(payload: Mapping[str, Any]) -> dict[str, str]:
     target_sha = _require_string(payload, "target_sha")
     if SHA_RE.fullmatch(target_sha) is None:
         raise _invalid()
-    return {
-        "schema": "1",
+    if source_binding is not None and source_binding.get("runner_sha") != target_sha:
+        raise _invalid()
+    result: dict[str, Any] = {
+        "schema": str(schema),
         "base_url": base_url,
         "provision": provision,
         "marker": marker,
         "target_sha": target_sha,
     }
+    if source_binding is not None:
+        result["source_binding"] = source_binding
+    return result
 
 
-def validate_cleanup_payload(payload: Mapping[str, Any]) -> dict[str, str]:
+def validate_cleanup_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate values used by exact retained-load cleanup."""
 
     payload = _require_mapping(payload)
-    keys = {
+    base_keys = {
         "schema",
         "target_sha",
         "control_email",
         "load_run_id",
         "cleanup_run_id",
     }
+    schema, source_binding = _validate_source_binding_schema(payload)
+    keys = base_keys if schema == 1 else base_keys | {"source_binding"}
     _require_exact_keys(payload, keys)
-    _validate_schema(payload.get("schema"))
     target_sha = _require_string(payload, "target_sha")
     if SHA_RE.fullmatch(target_sha) is None:
         raise _invalid()
-    return {
-        "schema": "1",
+    if source_binding is not None and source_binding.get("runner_sha") != target_sha:
+        raise _invalid()
+    result: dict[str, Any] = {
+        "schema": str(schema),
         "target_sha": target_sha,
         "control_email": validate_control_email(payload.get("control_email")),
         "load_run_id": _validate_run_id(payload.get("load_run_id")),
         "cleanup_run_id": _validate_run_id(payload.get("cleanup_run_id")),
     }
+    if source_binding is not None:
+        result["source_binding"] = source_binding
+    return result
 
 
 def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -677,7 +792,7 @@ def _reject_symlink_components(path: Path) -> None:
             raise _invalid()
 
 
-def load_payload(path: Path, *, mode: str) -> dict[str, str]:
+def load_payload(path: Path, *, mode: str) -> dict[str, Any]:
     try:
         _reject_symlink_components(path)
     except WorkflowInputError:
@@ -702,7 +817,7 @@ def load_payload(path: Path, *, mode: str) -> dict[str, str]:
     raise _invalid()
 
 
-def load_stdin_payload(*, mode: str) -> dict[str, str]:
+def load_stdin_payload(*, mode: str) -> dict[str, Any]:
     try:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
     except OSError as exc:
