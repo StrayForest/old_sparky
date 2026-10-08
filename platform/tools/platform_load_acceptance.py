@@ -1438,9 +1438,13 @@ def _capacity_ramp_evidence(
             isinstance(stages, Mapping) and set(str(key) for key in stages) == expected_keys
         ),
         "ramp_stage_order": (
-            isinstance(stages, Mapping)
-            and list(str(key) for key in stages)
-            == list(str(key) for key in expected_stage_counts)
+            isinstance(authored_stages, list)
+            and all(
+                isinstance(stage, int) and not isinstance(stage, bool)
+                for stage in authored_stages
+            )
+            and [str(stage) for stage in authored_stages]
+            == [str(key) for key in expected_stage_counts]
         ),
     }
     stage_results: dict[str, Any] = {}
