@@ -31,6 +31,7 @@ from tests.test_platform_validate_release_artifact import (
 )
 from tools import platform_workflow_remote_dispatch
 from tools import platform_live_qa_runtime_install
+from tools import platform_fetch_artifact_metadata
 from tools.platform_ci_classifier import (
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
@@ -999,6 +1000,26 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("platform/tools/platform_host_tools_bundle.py", host_build)
         self.assertIn("verify-artifact-metadata", host_build)
         self.assertIn("--max-filesize 524288", host_build)
+        self.assertIn("platform_fetch_artifact_metadata.py", host_build)
+        metadata_fetch_source = (
+            TOOLS_DIR / "platform_fetch_artifact_metadata.py"
+        ).read_text()
+        self.assertIn(
+            "TRANSIENT_HTTP_STATUSES = frozenset({404, 408, 425, 429, 500, 502, 503, 504})",
+            metadata_fetch_source,
+        )
+        self.assertIn("TOTAL_DEADLINE_SECONDS = 50.0", metadata_fetch_source)
+        self.assertIn("MAX_ATTEMPTS = 4", metadata_fetch_source)
+        self.assertIn(
+            "/usr/bin/timeout --signal=TERM --kill-after=5s 55s",
+            host_build,
+        )
+        metadata_call = host_build[
+            host_build.index("platform_fetch_artifact_metadata.py") : host_build.index(
+                "api_zip=\"$RUNNER_TEMP/platform-host-tools-artifact.zip\""
+            )
+        ]
+        self.assertNotIn("GH_TOKEN", metadata_call)
         self.assertIn('--archive "$api_zip"', host_build)
         self.assertNotIn("--jq", host_build)
         self.assertNotIn("@tsv", host_build)
@@ -1017,6 +1038,173 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("object_pairs_hook=_strict_object", host_tool_source)
         self.assertIn("host-tools workflow attempt provenance is invalid", host_tool_source)
         self.assertNotIn('payload.get("ref") != "refs/heads/dev"', host_tool_source)
+
+        class FakeResponse:
+            def __init__(self, body: bytes, *, status: int = 200, url: str) -> None:
+                self.body = body
+                self.status = status
+                self.url = url
+
+            def __enter__(self) -> FakeResponse:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def geturl(self) -> str:
+                return self.url
+
+            def getcode(self) -> int:
+                return self.status
+
+            def read(self, limit: int) -> bytes:
+                return self.body[:limit]
+
+        metadata_url = (
+            "https://api.github.com/repos/StrayForest/old_sparky/actions/artifacts/42"
+        )
+
+        def metadata_http_error(status: int) -> Exception:
+            from urllib.error import HTTPError
+
+            return HTTPError(metadata_url, status, "failure", None, None)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "metadata.json"
+            results: list[object] = [metadata_http_error(404), FakeResponse(b'{"id":42}', url=metadata_url)]
+            calls: list[float] = []
+
+            def open_after_visibility(request: object, *, timeout: float) -> object:
+                calls.append(timeout)
+                result = results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            delays: list[float] = []
+            attempts, size = platform_fetch_artifact_metadata.fetch_metadata(
+                api_url="https://api.github.com",
+                repository="StrayForest/old_sparky",
+                artifact_id="42",
+                token="test-token",
+                output_path=output,
+                opener=open_after_visibility,
+                monotonic=lambda: 0.0,
+                sleep=delays.append,
+            )
+            self.assertEqual((attempts, size), (2, 9))
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(delays, [1.0])
+            self.assertEqual(output.read_bytes(), b'{"id":42}')
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "metadata.json"
+            calls = 0
+
+            def forbidden_response(request: object, *, timeout: float) -> object:
+                nonlocal calls
+                calls += 1
+                raise metadata_http_error(403)
+
+            with self.assertRaises(platform_fetch_artifact_metadata.MetadataFetchError) as rejected:
+                platform_fetch_artifact_metadata.fetch_metadata(
+                    api_url="https://api.github.com",
+                    repository="StrayForest/old_sparky",
+                    artifact_id="42",
+                    token="test-token",
+                    output_path=output,
+                    opener=forbidden_response,
+                    monotonic=lambda: 0.0,
+                    sleep=lambda _: self.fail("authorization failure must not retry"),
+                )
+            self.assertEqual(
+                (rejected.exception.failure_class, rejected.exception.status, rejected.exception.attempts),
+                ("http_rejected", 403, 1),
+            )
+            self.assertEqual(calls, 1)
+            self.assertFalse(output.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "metadata.json"
+            calls = 0
+
+            def never_visible(request: object, *, timeout: float) -> object:
+                nonlocal calls
+                calls += 1
+                raise metadata_http_error(404)
+
+            with self.assertRaises(platform_fetch_artifact_metadata.MetadataFetchError) as exhausted:
+                platform_fetch_artifact_metadata.fetch_metadata(
+                    api_url="https://api.github.com",
+                    repository="StrayForest/old_sparky",
+                    artifact_id="42",
+                    token="test-token",
+                    output_path=output,
+                    opener=never_visible,
+                    monotonic=lambda: 0.0,
+                    sleep=lambda _: None,
+                )
+            self.assertEqual(
+                (exhausted.exception.failure_class, exhausted.exception.status, exhausted.exception.attempts),
+                ("transient_http_exhausted", 404, 4),
+            )
+            self.assertEqual(calls, 4)
+            self.assertFalse(output.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "metadata.json"
+            clock_values = iter((0.0, 0.0, 49.5))
+            calls = 0
+
+            def transient_until_deadline(
+                request: object, *, timeout: float
+            ) -> object:
+                nonlocal calls
+                calls += 1
+                raise metadata_http_error(404)
+
+            with self.assertRaises(
+                platform_fetch_artifact_metadata.MetadataFetchError
+            ) as deadline:
+                platform_fetch_artifact_metadata.fetch_metadata(
+                    api_url="https://api.github.com",
+                    repository="StrayForest/old_sparky",
+                    artifact_id="42",
+                    token="test-token",
+                    output_path=output,
+                    opener=transient_until_deadline,
+                    monotonic=lambda: next(clock_values),
+                    sleep=lambda _: self.fail(
+                        "deadline must stop before waiting past the remaining budget"
+                    ),
+                )
+            self.assertEqual(
+                (
+                    deadline.exception.failure_class,
+                    deadline.exception.status,
+                    deadline.exception.attempts,
+                ),
+                ("deadline_exhausted", 404, 1),
+            )
+            self.assertEqual(calls, 1)
+            self.assertFalse(output.exists())
+
+        with self.assertRaises(platform_fetch_artifact_metadata.MetadataFetchError) as invalid_port:
+            platform_fetch_artifact_metadata._validate_inputs(
+                "https://api.github.com:invalid",
+                "StrayForest/old_sparky",
+                "42",
+                "test-token",
+            )
+        self.assertEqual(
+            (
+                invalid_port.exception.failure_class,
+                invalid_port.exception.status,
+                invalid_port.exception.attempts,
+            ),
+            ("invalid_input", 0, 0),
+        )
 
         target_sha = "a" * 40
         expected_name = "platform-ci-route-123-1"
