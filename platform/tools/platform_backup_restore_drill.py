@@ -5,6 +5,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -13,14 +14,64 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from typing import Any
+
+
+def _load_staged_disk_policy() -> Any:
+    helper_path = pathlib.Path(__file__).resolve().with_name("platform_disk_policy.py")
+    spec = importlib.util.spec_from_file_location(
+        "_oldsparky_backup_restore_disk_policy", helper_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("platform disk policy helper is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    from .platform_disk_policy import (
+        DEFAULT_MIN_FREE_GIB,
+        minimum_free_bytes,
+        snapshot_for_path,
+    )
+except ImportError:  # Direct execution from the tools directory.
+    _disk_policy = _load_staged_disk_policy()
+    DEFAULT_MIN_FREE_GIB = _disk_policy.DEFAULT_MIN_FREE_GIB
+    minimum_free_bytes = _disk_policy.minimum_free_bytes
+    snapshot_for_path = _disk_policy.snapshot_for_path
 
 
 DEFAULT_ENV_FILE = pathlib.Path("/opt/oldsparky/platform/shared/.env.platform")
 DEFAULT_OUTPUT_DIR = pathlib.Path("/opt/oldsparky/platform/shared/backups")
 LOCAL_DATABASE_HOSTS = {None, "", "127.0.0.1", "localhost", "::1"}
 REQUIRED_PLATFORM_EXTENSIONS = ("pg_trgm",)
+RESTORE_DISK_LEAD_BYTES = 256 * 1024**2
+RESTORE_DISK_SAMPLE_SECONDS = 0.25
+RESTORE_TERMINATE_TIMEOUT_SECONDS = 1.0
+RESTORE_DISK_MINIMUM_BYTES = minimum_free_bytes(DEFAULT_MIN_FREE_GIB)
+
+
+class RestoreGuardStop(RuntimeError):
+    """A fixed, non-sensitive reason for stopping an owned restore child."""
+
+    def __init__(self, reason: str) -> None:
+        if reason not in _RESTORE_GUARD_MESSAGES:
+            raise ValueError("unknown restore guard reason")
+        self.reason = reason
+        super().__init__(_RESTORE_GUARD_MESSAGES[reason])
+
+
+_RESTORE_GUARD_MESSAGES = {
+    "disk_floor": "Restore drill stopped by the low-disk safety guard.",
+    "disk_unavailable": "Restore drill stopped because disk space could not be verified.",
+    "child_unstopped": "Backup or restore command could not be confirmed stopped.",
+    "command_start_failed": "Backup or restore command could not be started.",
+    "command_failed": "Backup or restore command exited unsuccessfully.",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,6 +211,105 @@ def run_command(
         capture_output=capture_output,
         env=command_env(target) if target is not None else None,
     )
+
+
+def _required_disk_floor(total_bytes: int) -> int:
+    if type(total_bytes) is not int or total_bytes <= 0:
+        raise RestoreGuardStop("disk_unavailable")
+    fifteen_percent_ceil = (total_bytes * 15 + 99) // 100
+    return max(RESTORE_DISK_MINIMUM_BYTES, fifteen_percent_ceil)
+
+
+def require_restore_headroom(*paths: pathlib.Path) -> None:
+    """Fail closed unless every affected filesystem has policy floor plus lead."""
+
+    checked_paths = paths or (pathlib.Path("/"),)
+    try:
+        snapshots = [snapshot_for_path(path) for path in checked_paths]
+    except OSError as exc:
+        raise RestoreGuardStop("disk_unavailable") from exc
+    for snapshot in snapshots:
+        if not snapshot.valid:
+            raise RestoreGuardStop("disk_unavailable")
+        floor = _required_disk_floor(snapshot.total_bytes)
+        if snapshot.free_bytes < floor + RESTORE_DISK_LEAD_BYTES:
+            raise RestoreGuardStop("disk_floor")
+
+
+def _stop_owned_child(process: subprocess.Popen[bytes]) -> None:
+    """Stop and reap only the child process started by this call."""
+
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=RESTORE_TERMINATE_TIMEOUT_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        # Do not let finally/dropdb race a child that is still writing. SIGKILL
+        # is followed by a wait on this exact Popen until it has been reaped.
+        process.wait()
+    except OSError as exc:
+        raise RestoreGuardStop("child_unstopped") from exc
+
+
+def run_disk_guarded_command(
+    command: list[str],
+    *,
+    target: DatabaseTarget,
+    stage: str,
+    disk_paths: tuple[pathlib.Path, ...] = (pathlib.Path("/"),),
+) -> None:
+    """Run one owned dump/restore child under bounded disk monitoring."""
+
+    if stage not in {"pg_dump", "pg_restore"}:
+        raise ValueError("unknown disk-guarded command stage")
+    require_restore_headroom(*disk_paths)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=command_env(target),
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise RestoreGuardStop("command_start_failed") from exc
+
+    try:
+        # Always take a post-start sample, including when pg_restore is short.
+        require_restore_headroom(*disk_paths)
+        while process.poll() is None:
+            time.sleep(RESTORE_DISK_SAMPLE_SECONDS)
+            if process.poll() is not None:
+                break
+            require_restore_headroom(*disk_paths)
+        return_code = process.wait()
+        # Catch a floor crossing between the final sample and child exit.
+        require_restore_headroom(*disk_paths)
+    except BaseException:
+        if process.poll() is None:
+            _stop_owned_child(process)
+        raise
+    if return_code != 0:
+        raise RestoreGuardStop("command_failed")
+
+
+def run_restore_command(
+    command: list[str], *, target: DatabaseTarget
+) -> None:
+    run_disk_guarded_command(command, target=target, stage="pg_restore")
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -377,6 +527,7 @@ def perform_restore_drill(
 
     created = False
     try:
+        require_restore_headroom()
         run_command(create_command, target=admin_command_target)
         created = True
         restore_target = app_target.with_database(drill_database)
@@ -407,7 +558,7 @@ def perform_restore_drill(
             ("--schema=platform",),
             ("--schema=public",),
         ):
-            run_command(
+            run_restore_command(
                 [
                     "pg_restore",
                     "--exit-on-error",
@@ -517,6 +668,10 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     if os.path.lexists(dump_path) or os.path.lexists(metadata_path):
         raise RuntimeError("Backup destination already exists; refusing to replace it.")
 
+    # Check before creating the temporary output file; the child monitor then
+    # guards the actual archive write against the same filesystem policy.
+    require_restore_headroom(pathlib.Path("/"), output_dir)
+
     required = ["pg_dump", "pg_restore"]
     if not args.dump_only:
         required.extend(["createdb", "dropdb", "psql"])
@@ -538,7 +693,7 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
     restore_error: str | None = None
 
     try:
-        run_command(
+        run_disk_guarded_command(
             [
                 "pg_dump",
                 "--format=custom",
@@ -551,6 +706,8 @@ def create_backup(args: argparse.Namespace) -> dict[str, Any]:
                 str(temporary_dump_path),
             ],
             target=app_target,
+            stage="pg_dump",
+            disk_paths=(pathlib.Path("/"), output_dir),
         )
         if not temporary_dump_path.is_file() or temporary_dump_path.stat().st_size <= 0:
             raise RuntimeError("pg_dump did not produce a non-empty archive.")
