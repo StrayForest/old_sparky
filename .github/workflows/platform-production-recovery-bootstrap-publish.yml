@@ -454,18 +454,34 @@ jobs:
           set -euo pipefail
           metadata="$RUNNER_TEMP/platform-recovery-publisher"
           api="$GITHUB_API_URL/repos/$REPOSITORY"
-          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 --retry-all-errors \
-            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "$api/actions/runs/$PUBLISHER_RUN_ID/artifacts?per_page=100&page=1" \
-            --output "$metadata/publisher-artifacts.json"
-          /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publisher-artifact \
-            --metadata "$metadata/publisher-artifacts.json" \
-            --artifact-name "$PUBLISHER_BUNDLE_NAME" \
-            --publisher-run-id "$PUBLISHER_RUN_ID" \
-            --publisher-run-attempt "$PUBLISHER_RUN_ATTEMPT" \
-            --publisher-workflow-sha "$PUBLISHER_WORKFLOW_SHA" \
-            --github-output "$GITHUB_OUTPUT"
+          poll_max_attempts=6
+          for ((poll_attempt = 1; poll_attempt <= poll_max_attempts; poll_attempt++)); do
+            curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 5 \
+              --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "$api/actions/runs/$PUBLISHER_RUN_ID/artifacts?per_page=100&page=1" \
+              --output "$metadata/publisher-artifacts.json"
+            if /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py publisher-artifact \
+              --metadata "$metadata/publisher-artifacts.json" \
+              --artifact-name "$PUBLISHER_BUNDLE_NAME" \
+              --publisher-run-id "$PUBLISHER_RUN_ID" \
+              --publisher-run-attempt "$PUBLISHER_RUN_ATTEMPT" \
+              --publisher-workflow-sha "$PUBLISHER_WORKFLOW_SHA" \
+              --github-output "$GITHUB_OUTPUT" \
+              --metadata-poll-attempt "$poll_attempt" \
+              --metadata-poll-max-attempts "$poll_max_attempts"; then
+              exit 0
+            else
+              status=$?
+            fi
+            if [[ "$status" -ne 3 ]]; then
+              exit "$status"
+            fi
+            printf 'Exact publisher artifact metadata is not visible yet (poll %s/%s); waiting 2 seconds.\n' \
+              "$poll_attempt" "$poll_max_attempts"
+            sleep 2
+          done
+          exit 2
 
       - name: Build closed publisher evidence after C upload
         id: evidence
