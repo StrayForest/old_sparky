@@ -225,6 +225,83 @@ def _validated_source_binding_handoff() -> dict[str, object]:
 
 
 class NoopSourceBindingTests(unittest.TestCase):
+    def test_command_line_entrypoint_rejects_help_with_nonzero_status(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(PLATFORM_ROOT / "tools" / "platform_noop_source_binding.py"),
+                "--help",
+            ],
+            cwd=PLATFORM_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stderr.strip(), "SOURCE_BINDING_OPERATION status=invalid"
+        )
+
+    def test_incomplete_resolver_cli_fails_before_creating_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_directory = Path(temporary_directory) / "source-binding"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(PLATFORM_ROOT / "tools" / "platform_noop_source_binding.py"),
+                    "resolve-workflow-source-binding",
+                    RUNNER_SHA,
+                    "example/repository",
+                    "https://api.github.com",
+                    str(output_directory),
+                ],
+                cwd=PLATFORM_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertEqual(
+                completed.stderr.strip(), "SOURCE_BINDING_OPERATION status=invalid"
+            )
+            self.assertFalse(output_directory.exists())
+
+    def test_workflow_shaped_resolver_cli_fails_closed_without_token_or_outputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_directory = Path(temporary_directory) / "source-binding"
+            workflow_output = Path(temporary_directory) / "github-output"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(PLATFORM_ROOT / "tools" / "platform_noop_source_binding.py"),
+                    "resolve-workflow-source-binding",
+                    RUNNER_SHA,
+                    "example/repository",
+                    "https://api.github.com",
+                    str(output_directory),
+                    str(workflow_output),
+                ],
+                cwd=PLATFORM_ROOT,
+                env={"PATH": os.environ.get("PATH", "")},
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            self.assertEqual(
+                completed.stderr.strip(), "SOURCE_BINDING_RESOLUTION status=failed"
+            )
+            self.assertFalse(output_directory.exists())
+            self.assertFalse(workflow_output.exists())
+
     def test_exact_noop_receipt_derives_app_sha_without_replacing_runner_sha(self) -> None:
         document = _receipt_document()
         binding = validate_noop_receipt_document(

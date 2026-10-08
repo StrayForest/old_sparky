@@ -1438,3 +1438,7 @@ def write_receipt_artifact_file(path: Path, document: Mapping[str, Any]) -> str:
     finally:
         os.close(descriptor)
     return hashlib.sha256(raw).hexdigest()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
