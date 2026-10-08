@@ -11,6 +11,7 @@ trying to redact arbitrary input after it has already become evidence.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
