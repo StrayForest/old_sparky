@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import os
+import signal
 import unittest
 from unittest import mock
 
@@ -67,8 +68,6 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, "CREATE EXTENSION\n", ""),
             subprocess.CompletedProcess([], 0, "CREATE SCHEMA\n", ""),
-            subprocess.CompletedProcess([], 0, "", ""),
-            subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, "22\n", ""),
             subprocess.CompletedProcess([], 0, "1\n", ""),
             subprocess.CompletedProcess([], 0, "20260801_0036\n", ""),
@@ -78,7 +77,11 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_dir, mock.patch.object(
             backup_drill, "run_command", side_effect=responses
-        ) as run_command:
+        ) as run_command, mock.patch.object(
+            backup_drill, "run_restore_command", return_value=None
+        ) as run_restore_command, mock.patch.object(
+            backup_drill, "require_restore_headroom"
+        ):
             table_count = backup_drill.perform_restore_drill(
                 pathlib.Path(temporary_dir) / "backup.dump",
                 app_target=target,
@@ -90,8 +93,223 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertTrue(run_command.call_args_list[1].kwargs["capture_output"])
         self.assertTrue(run_command.call_args_list[2].kwargs["capture_output"])
         self.assertIn("CREATE SCHEMA platform", run_command.call_args_list[2].args[0][-1])
-        self.assertIn("--schema=platform", run_command.call_args_list[3].args[0])
-        self.assertIn("--schema=public", run_command.call_args_list[4].args[0])
+        self.assertEqual(run_restore_command.call_count, 2)
+        self.assertIn("--schema=platform", run_restore_command.call_args_list[0].args[0])
+        self.assertIn("--schema=public", run_restore_command.call_args_list[1].args[0])
+
+        self._assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db()
+
+    def _assert_low_space_abort_kills_owned_restore_and_drops_only_drill_db(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", "synthetic-secret", "platformdb"
+        )
+        total_bytes = 100 * 1024**3
+        floor = backup_drill._required_disk_floor(total_bytes)
+        self.assertEqual(floor, 15 * 1024**3)
+        self.assertEqual(
+            backup_drill._required_disk_floor(20 * 1024**3), 5 * 1024**3
+        )
+        self.assertEqual(
+            backup_drill._required_disk_floor(40 * 1024**3 + 1),
+            6 * 1024**3 + 1,
+        )
+        high = type(
+            "Disk",
+            (),
+            {
+                "valid": True,
+                "total_bytes": total_bytes,
+                "free_bytes": floor + backup_drill.RESTORE_DISK_LEAD_BYTES,
+            },
+        )()
+        low = type(
+            "Disk",
+            (),
+            {
+                "valid": True,
+                "total_bytes": total_bytes,
+                "free_bytes": floor + backup_drill.RESTORE_DISK_LEAD_BYTES - 1,
+            },
+        )()
+
+        class RestoreChild:
+            def __init__(self) -> None:
+                self.stopped = False
+                self.wait_calls = 0
+                self.wait_timeouts: list[float | None] = []
+                self.terminated = False
+                self.killed = False
+
+            def poll(self) -> int | None:
+                return -signal.SIGKILL if self.stopped else None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                self.killed = True
+                self.stopped = True
+
+            def wait(self, *, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                self.wait_timeouts.append(timeout)
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired("pg_restore", timeout)
+                self.stopped = True
+                return -signal.SIGKILL
+
+        child = RestoreChild()
+        command_results = [subprocess.CompletedProcess([], 0, "", "") for _ in range(4)]
+        with (
+            tempfile.TemporaryDirectory() as temporary_dir,
+            mock.patch.object(backup_drill, "snapshot_for_path", side_effect=(high, high, low)),
+            mock.patch.object(backup_drill.subprocess, "Popen", return_value=child) as popen,
+            mock.patch.object(backup_drill.time, "sleep"),
+            mock.patch.object(
+                backup_drill, "run_command", side_effect=command_results
+            ) as run_command,
+        ):
+            with self.assertRaisesRegex(backup_drill.RestoreGuardStop, "low-disk safety guard"):
+                backup_drill.perform_restore_drill(
+                    pathlib.Path(temporary_dir) / "backup.dump",
+                    app_target=target,
+                    admin_target=None,
+                    timestamp_slug="20260720T120000Z",
+                )
+
+        popen.assert_called_once()
+        self.assertIs(popen.call_args.kwargs["stdout"], backup_drill.subprocess.DEVNULL)
+        self.assertIs(popen.call_args.kwargs["stderr"], backup_drill.subprocess.DEVNULL)
+        self.assertTrue(child.terminated)
+        self.assertTrue(child.killed)
+        self.assertEqual(child.wait_calls, 2)
+        self.assertEqual(child.wait_timeouts, [1.0, None])
+        drop_command = run_command.call_args_list[-1].args[0]
+        self.assertIn("dropdb", drop_command)
+        self.assertEqual(
+            drop_command[-1],
+            f"platform_restore_drill_20260720t120000z_{os.getpid()}",
+        )
+        self._assert_unavailable_disk_fails_before_child_start(target)
+        self._assert_normal_guarded_child_completes(target, high)
+        self._assert_low_space_abort_stops_only_owned_dump()
+
+    def _assert_unavailable_disk_fails_before_child_start(
+        self, target: backup_drill.DatabaseTarget
+    ) -> None:
+        invalid = type(
+            "Disk", (), {"valid": False, "total_bytes": 0, "free_bytes": 0}
+        )()
+        with (
+            mock.patch.object(backup_drill, "snapshot_for_path", return_value=invalid),
+            mock.patch.object(backup_drill.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(
+                backup_drill.RestoreGuardStop, "disk space could not be verified"
+            ):
+                backup_drill.run_disk_guarded_command(
+                    ["pg_dump", "--file", "/private/temp.dump"],
+                    target=target,
+                    stage="pg_dump",
+                )
+        popen.assert_not_called()
+
+    def _assert_normal_guarded_child_completes(
+        self, target: backup_drill.DatabaseTarget, disk_snapshot: object
+    ) -> None:
+        class CompletedChild:
+            def __init__(self) -> None:
+                self.poll_calls = 0
+
+            def poll(self) -> int | None:
+                self.poll_calls += 1
+                return None if self.poll_calls == 1 else 0
+
+            def wait(self, *, timeout: float | None = None) -> int:
+                return 0
+
+        child = CompletedChild()
+        with (
+            mock.patch.object(
+                backup_drill,
+                "snapshot_for_path",
+                return_value=disk_snapshot,
+            ),
+            mock.patch.object(backup_drill.subprocess, "Popen", return_value=child) as popen,
+            mock.patch.object(backup_drill.time, "sleep"),
+        ):
+            backup_drill.run_disk_guarded_command(
+                ["pg_dump", "--file", "/private/temp.dump"],
+                target=target,
+                stage="pg_dump",
+            )
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.kwargs["stdout"], backup_drill.subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stderr"], backup_drill.subprocess.DEVNULL)
+
+    def _assert_low_space_abort_stops_only_owned_dump(self) -> None:
+        target = backup_drill.DatabaseTarget(
+            "127.0.0.1", 5432, "platform_user", "synthetic-secret", "platformdb"
+        )
+        total_bytes = 100 * 1024**3
+        floor = backup_drill._required_disk_floor(total_bytes)
+        high = type(
+            "Disk",
+            (),
+            {
+                "valid": True,
+                "total_bytes": total_bytes,
+                "free_bytes": floor + backup_drill.RESTORE_DISK_LEAD_BYTES,
+            },
+        )()
+        low = type(
+            "Disk",
+            (),
+            {
+                "valid": True,
+                "total_bytes": total_bytes,
+                "free_bytes": floor + backup_drill.RESTORE_DISK_LEAD_BYTES - 1,
+            },
+        )()
+
+        class DumpChild:
+            def __init__(self) -> None:
+                self.stopped = False
+                self.terminated = False
+                self.wait_calls = 0
+
+            def poll(self) -> int | None:
+                return 0 if self.stopped else None
+
+            def terminate(self) -> None:
+                self.terminated = True
+                self.stopped = True
+
+            def kill(self) -> None:
+                raise AssertionError("graceful TERM should stop the fake pg_dump child")
+
+            def wait(self, *, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                return 0
+
+        child = DumpChild()
+        with (
+            mock.patch.object(backup_drill, "snapshot_for_path", side_effect=(high, high, low)),
+            mock.patch.object(backup_drill.subprocess, "Popen", return_value=child) as popen,
+            mock.patch.object(backup_drill.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(backup_drill.RestoreGuardStop, "low-disk safety guard"):
+                backup_drill.run_disk_guarded_command(
+                    ["pg_dump", "--file", "/private/temp.dump"],
+                    target=target,
+                    stage="pg_dump",
+                )
+
+        popen.assert_called_once()
+        self.assertIs(popen.call_args.kwargs["stdout"], backup_drill.subprocess.DEVNULL)
+        self.assertIs(popen.call_args.kwargs["stderr"], backup_drill.subprocess.DEVNULL)
+        self.assertTrue(child.terminated)
+        self.assertEqual(child.wait_calls, 1)
 
     def test_check_latest_validates_restore_age_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -275,6 +493,17 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
+                mock.patch.object(
+                    backup_drill,
+                    "run_restore_command",
+                    side_effect=RuntimeError("restore failed"),
+                ),
+                mock.patch.object(
+                    backup_drill,
                     "backup_inventory",
                     side_effect=(initial_inventory, initial_inventory, changed_inventory),
                 ),
@@ -365,6 +594,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(backup_drill, "load_env", return_value={}),
                 mock.patch.object(backup_drill, "require_commands"),
                 mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(backup_drill, "perform_restore_drill", return_value=16),
                 mock.patch.object(
                     backup_drill,
@@ -491,6 +726,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(backup_drill, "require_commands"),
                 mock.patch.object(backup_drill, "utc_now", return_value=timestamp),
                 mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(backup_drill.os, "link", side_effect=race_sidecar_collision),
             ):
                 with self.assertRaisesRegex(RuntimeError, "destination already exists") as raised:
@@ -551,6 +792,12 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 mock.patch.object(backup_drill, "load_env", return_value={}),
                 mock.patch.object(backup_drill, "require_commands"),
                 mock.patch.object(backup_drill, "run_command", side_effect=fake_run_command),
+                mock.patch.object(
+                    backup_drill,
+                    "run_disk_guarded_command",
+                    side_effect=self._fake_guarded_dump,
+                ),
+                mock.patch.object(backup_drill, "require_restore_headroom"),
                 mock.patch.object(backup_drill, "perform_restore_drill", return_value=20),
             ):
                 result = backup_drill.create_backup(args)
@@ -567,6 +814,16 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 len(tuple(output_dir.glob("platformdb-*.dump"))),
                 14,
             )
+
+    @staticmethod
+    def _fake_guarded_dump(
+        command: list[str], *, target: object, stage: str, disk_paths: tuple[pathlib.Path, ...]
+    ) -> None:
+        del target, disk_paths
+        if stage != "pg_dump":
+            raise AssertionError("unexpected guarded command in backup unit test")
+        dump_path = pathlib.Path(command[command.index("--file") + 1])
+        dump_path.write_bytes(b"new-archive")
 
 
 if __name__ == "__main__":

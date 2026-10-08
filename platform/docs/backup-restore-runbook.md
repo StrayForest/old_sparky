@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-29
+- Last reviewed: 2026-10-08
 
 ## Local verified backup
 
@@ -25,6 +25,15 @@ cd /opt/oldsparky/platform/current
   --backup-max-age-hours 24 \
   --backup-only --apply --json
 ```
+
+The drill checks disk availability before starting `pg_dump` and before each
+`pg_restore`, then samples the relevant filesystem while each child runs. Its
+stop threshold is the larger of 5 GiB or 15% of filesystem capacity, with a
+256 MiB lead margin; on a low-space result it terminates and reaps only that
+owned child before the existing `finally` path drops the exact temporary drill
+database. The monitor is sampled, so the lead is an early-stop margin rather
+than a guarantee against a single write burst. A failed or unavailable disk
+sample stops the drill; it does not rotate or remove any retained backup.
 
 Backup-only preserves every archive and metadata sidecar that exists before
 the run; it does not apply the 14-copy rotation limit. The backup operation
