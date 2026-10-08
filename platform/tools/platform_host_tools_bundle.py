@@ -73,6 +73,7 @@ CAPABILITIES = (
     "production_deploy_control",
     "release_baseline",
     "retained_load_export_cleanup",
+    "retained_load_source_binding",
     "python_isolated",
     "python_bytecode_disabled",
 )

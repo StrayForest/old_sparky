@@ -101,6 +101,21 @@ The complete-archive, space-bounded bootstrap extraction follow-up uses **C2**
 14-member closure. Exact-P full CI, signed provisioning and the installed
 self-test remain required; these source commits do not establish production
 installation or activation.
+The current repository pin selects host-control source **C**
+`f5365c6a56a7e8dad21054e8ae69e0001914adae`, with the exact ordered
+14-member closure recorded in `platform/contracts/host_tools_pin.json`. This
+generation adds the manifest-bound `retained_load_source_binding` capability
+to the existing dispatcher/input-guard and retained-load export-cleanup
+closure. Its bounded `host-capabilities` self-test must include
+`release_baseline=1`, `retained_load_export_cleanup=1`,
+`retained_load_source_binding=1`, and `python_bytecode_disabled=1` before the
+active app may accept a runner/app source mismatch. This pin is source
+provenance, not installation evidence: C still requires the ordinary exact-P
+full-CI/preflight attestation and approved out-of-band root provisioning and
+self-test at
+`/opt/oldsparky/platform/shared/host-tools/f5365c6a56a7e8dad21054e8ae69e0001914adae`.
+Do not infer that the host generation or final pin-bearing application SHA is
+installed from this repository value.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
@@ -463,6 +478,38 @@ copy a generation, upload an installer, self-install from CI, bypass the
 baseline proof or manually dispatch normal deployment to repair a missing
 generation. Repeat **C → P**, signed provisioning and automatic reconcile for
 the next intentional bump.
+
+## Runner and active-application source binding
+
+A successful cumulative baseline-reconcile may be a verified no-op when the
+new runner commit changes only an explicitly approved, non-deployable
+host-tools or recovery-evidence path family. Such a run must not create an
+application release just to make the runner SHA equal the already-active
+application SHA. Instead, the normal deploy workflow publishes one
+authenticated no-op source receipt. It binds the runner SHA and exact deploy,
+security and auto-deploy run/attempts to the canonical cumulative no-op
+manifest, artifact ID/name/digest, and the complete active-release baseline
+tuple. The receipt is evidence of the already-active source; it grants no
+provisioning or deployment authority.
+
+Load and live-QA workflows keep the checked-out runner SHA as their source and
+`target_sha`. They derive a separate application target only from the
+validated receipt’s `baseline_identity.source_sha`; there is no caller-supplied
+target override. Same-source runs continue to use the existing schema without
+a receipt. For a verified no-op mismatch, C2 receives the runner SHA plus one
+closed nested `source_binding` object. The immutable C2 guard validates that
+object and the source relationship, and the active fixture/cleanup helper
+re-reads the complete nine-field release tuple while holding the retained-load
+lock. It refuses before publishing readiness or performing database/browser
+work if the tuple or installed capability differs. Finalization and export
+cleanup repeat the tuple check before touching release state. Reports retain
+both runner and application identities and the canonical binding digest, so
+candidate, origin, evaluator and sanitized evidence cannot conflate them.
+
+This delegated binding does not weaken the immutable host-tools generation
+pin: the provider remains separately verified against its manifest and
+provenance, and the app-side binding capability must be present in the
+installed C2/P generation before a runner/application mismatch is accepted.
 
 ## Consequences
 

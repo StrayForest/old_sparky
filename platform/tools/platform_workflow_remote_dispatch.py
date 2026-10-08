@@ -255,6 +255,7 @@ HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RELEASE_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 MAX_RELEASE_JSON_BYTES = 64 * 1024
+SOURCE_BINDING_ARGUMENT_MAX_BYTES = 16 * 1024
 
 
 def _parse_active_release_receipt(raw: bytes, *, release_slug: str) -> dict[str, object]:
@@ -1398,8 +1399,9 @@ def _host_capabilities() -> int:
     print(
         "HOST_TOOLS schema=1 "
         f"source_sha={ACTIVE_TOOLS_DIR.name} generation={ACTIVE_TOOLS_DIR.name} "
-        "dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 "
+        "dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 "
         "release_baseline=1 retained_load_export_cleanup=1 "
+        "retained_load_source_binding=1 "
         "python_isolated=1 python_bytecode_disabled=1"
     )
     return 0
@@ -1427,7 +1429,54 @@ def _host_baseline_generation_ready() -> bool:
     ) and {
         b"capability=release_baseline",
         b"capability=retained_load_export_cleanup",
+        b"capability=retained_load_source_binding",
     } <= set(capability_bytes.splitlines())
+
+
+def _source_binding_context(
+    payload: dict[str, object],
+) -> tuple[str, dict[str, object] | None, list[str]]:
+    """Return the verified app target, tuple, and fixed helper argv suffix."""
+
+    runner_sha = payload.get("target_sha")
+    if not isinstance(runner_sha, str) or SOURCE_SHA_RE.fullmatch(runner_sha) is None:
+        raise ValueError("runner source identity is invalid")
+    binding = payload.get("source_binding")
+    if binding is None:
+        return runner_sha, None, []
+    if (
+        not isinstance(binding, dict)
+        or binding.get("binding_mode") != "verified-noop"
+        or binding.get("runner_sha") != runner_sha
+        or not isinstance(binding.get("app_target_sha"), str)
+        or SOURCE_SHA_RE.fullmatch(binding["app_target_sha"]) is None
+        or binding["app_target_sha"] == runner_sha
+    ):
+        raise ValueError("verified no-op source identity is invalid")
+    baseline = binding.get("baseline_identity")
+    if (
+        not _baseline_identity_matches(baseline, baseline)
+        or baseline.get("source_sha") != binding["app_target_sha"]
+    ):
+        raise ValueError("verified no-op baseline tuple is invalid")
+    raw = json.dumps(
+        binding,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    if not raw or len(raw) > SOURCE_BINDING_ARGUMENT_MAX_BYTES:
+        raise ValueError("verified no-op binding exceeds its fixed argument bound")
+    encoded = base64.b64encode(raw).decode("ascii")
+    return binding["app_target_sha"], baseline, ["--source-binding-base64", encoded]
+
+
+def _source_binding_arguments(payload: dict[str, object]) -> list[str]:
+    """Build the fixed helper suffix after revalidating the closed binding."""
+
+    _target_sha, _baseline, arguments = _source_binding_context(payload)
+    return arguments
 
 
 def _trusted_live_launch_helper() -> bool:
@@ -1451,7 +1500,11 @@ def _trusted_live_launch_helper() -> bool:
     )
 
 
-def _external_fixture(payload: dict[str, str]) -> int:
+def _external_fixture(payload: dict[str, object]) -> int:
+    try:
+        source_arguments = _source_binding_arguments(payload)
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return 2
     arguments = [
         payload["confirmation"],
         payload["target_sha"],
@@ -1461,6 +1514,7 @@ def _external_fixture(payload: dict[str, str]) -> int:
         payload["tournament_count"],
         payload["users_per_tournament"],
         payload["timeout_diagnostics"],
+        *source_arguments,
     ]
     if (
         EXTERNAL_HELPER.parent != ACTIVE_TOOLS_DIR
@@ -1589,14 +1643,22 @@ def _pin_closure_matches_generation(
     )
 
 
-def _current_pin_matches_host_generation(*, target_sha: str) -> bool:
+def _current_pin_matches_host_generation(
+    *, target_sha: str, expected_baseline_identity: object | None = None
+) -> bool:
     """Bind cleanup authority to the active release's exact C6 pin."""
 
     if SOURCE_SHA_RE.fullmatch(target_sha) is None or not _host_baseline_generation_ready():
         return False
     try:
         baseline = _release_baseline()
-        if baseline.get("source_sha") != target_sha:
+        if (
+            baseline.get("source_sha") != target_sha
+            or (
+                expected_baseline_identity is not None
+                and not _baseline_identity_matches(expected_baseline_identity, baseline)
+            )
+        ):
             return False
         release_slug = baseline.get("release_slug")
         if not isinstance(release_slug, str) or RELEASE_SLUG_RE.fullmatch(release_slug) is None:
@@ -1725,8 +1787,15 @@ def _run_retained_export_executor(operation: str, payload: dict[str, object]) ->
     return 0 if process.returncode == 0 else 1
 
 
-def _touch_complete(payload: dict[str, str]) -> int:
-    if not _current_pin_matches_host_generation(target_sha=payload["target_sha"]):
+def _touch_complete(payload: dict[str, object]) -> int:
+    try:
+        app_target_sha, expected_baseline, _source_arguments = _source_binding_context(payload)
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return 1
+    if not _current_pin_matches_host_generation(
+        target_sha=app_target_sha,
+        expected_baseline_identity=expected_baseline,
+    ):
         return 1
     return _run_retained_export_executor(
         "touch-complete", {"schema": 1, "load_run_id": payload["run_id"]}
@@ -1734,12 +1803,19 @@ def _touch_complete(payload: dict[str, str]) -> int:
 
 
 def _remove_exports(
-    *, load_run_id: str, cleanup_run_id: str, target_sha: str
+    *,
+    load_run_id: str,
+    cleanup_run_id: str,
+    target_sha: str,
+    expected_baseline_identity: object | None = None,
 ) -> int:
     if (
         RUN_ID_RE.fullmatch(load_run_id) is None
         or RUN_ID_RE.fullmatch(cleanup_run_id) is None
-        or not _current_pin_matches_host_generation(target_sha=target_sha)
+        or not _current_pin_matches_host_generation(
+            target_sha=target_sha,
+            expected_baseline_identity=expected_baseline_identity,
+        )
     ):
         return 1
     return _run_retained_export_executor(
@@ -1898,6 +1974,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments == ["external-finalize"]:
             return _touch_complete(payload)
         if arguments == ["external-cleanup"]:
+            _app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
             return _run_retained_cleanup_sudo(
                 CLEANUP_HELPER,
                 [
@@ -1905,20 +1982,24 @@ def main(argv: list[str] | None = None) -> int:
                     payload["target_sha"],
                     payload["load_run_id"],
                     payload["cleanup_run_id"],
+                    *source_arguments,
                 ],
                 control_email=payload["control_email"],
             )
         if arguments == ["external-cleanup-exports"]:
+            app_target_sha, expected_baseline, _source_arguments = _source_binding_context(payload)
             return _remove_exports(
                 load_run_id=payload["load_run_id"],
                 cleanup_run_id=payload["cleanup_run_id"],
-                target_sha=payload["target_sha"],
+                target_sha=app_target_sha,
+                expected_baseline_identity=expected_baseline,
             )
         if arguments == ["production-prepare-artifact"]:
             if payload["mode"] != "deploy":
                 return _fail()
             return _prepare_deployment(payload)
         if arguments == ["retained-cleanup"]:
+            _app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
             return _run_retained_cleanup_sudo(
                 CLEANUP_HELPER,
                 [
@@ -1926,14 +2007,17 @@ def main(argv: list[str] | None = None) -> int:
                     payload["target_sha"],
                     payload["load_run_id"],
                     payload["cleanup_run_id"],
+                    *source_arguments,
                 ],
                 control_email=payload["control_email"],
             )
         if arguments == ["retained-cleanup-exports"]:
+            app_target_sha, expected_baseline, _source_arguments = _source_binding_context(payload)
             return _remove_exports(
                 load_run_id=payload["load_run_id"],
                 cleanup_run_id=payload["cleanup_run_id"],
-                target_sha=payload["target_sha"],
+                target_sha=app_target_sha,
+                expected_baseline_identity=expected_baseline,
             )
         if arguments == ["production-deploy"]:
             if payload["mode"] == "deploy" and not _verify_host_tools_contract(payload):
@@ -1984,14 +2068,16 @@ def main(argv: list[str] | None = None) -> int:
                 return _fail()
             return _run_sudo(
                 LIVE_USER_QA_HELPER,
-                [payload["target_sha"]],
+                [payload["target_sha"], *_source_binding_arguments(payload)],
                 timeout_seconds=LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS,
             )
+        source_arguments = _source_binding_arguments(payload)
         return _run_trusted_live_launch(
             [
                 payload["base_url"],
                 payload["provision"],
                 payload["marker"],
+                *source_arguments,
                 payload["target_sha"],
             ],
         )

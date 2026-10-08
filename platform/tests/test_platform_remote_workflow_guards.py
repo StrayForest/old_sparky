@@ -145,10 +145,31 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
                 job = _job_block(self._source(key), job_name)
                 self.assertIn("environment: production", job)
                 self.assertNotIn("actions/checkout@", job)
-                self.assertIn("actions/download-artifact@", job)
                 self.assertIn("closed", job.lower())
                 self.assertNotIn("platform_live_launch_report.py", job)
                 self.assertNotIn("platform/tools/platform_workflow_input_guard.py", job)
+                if key == "live":
+                    # The secret consumer authenticates the exact current-run
+                    # artifact through the API and hashes the downloaded ZIP
+                    # itself. It must not execute candidate code or rely on
+                    # download-artifact's weaker action-side digest output.
+                    self.assertNotIn("actions/download-artifact@", job)
+                    self.assertIn("HANDOFF_ARTIFACT_ID", job)
+                    self.assertIn("/actions/runs/", job)
+                    self.assertIn("/actions/artifacts/", job)
+                    self.assertIn("metadata.get(\"digest\")", job)
+                    self.assertIn("hashlib.sha256(archive_bytes).hexdigest()", job)
+                    self.assertIn("len(matches) != 1", job)
+                    self.assertIn(
+                        'entries[0].filename != "live-user-qa-input.json"', job
+                    )
+                    self.assertIn("os.O_EXCL", job)
+                    self.assertIn(
+                        "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
+                        job,
+                    )
+                else:
+                    self.assertIn("actions/download-artifact@", job)
 
         for key, validator_job in {
             "as12": "validate-proof-inputs",
@@ -175,6 +196,19 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
                 if key == "runtime":
                     self.assertIn("utc-timestamp", source)
                     self.assertIn("timestamp_re", source)
+                elif key == "live":
+                    # The live handoff has both a legacy same-source schema
+                    # and the exact receipt-backed no-op schema. Require the
+                    # closed key sets, canonical JSON, bounded member, and
+                    # exclusive private-file creation in the inline verifier.
+                    self.assertIn("base_keys = {", source)
+                    self.assertIn("set(payload) != base_keys", source)
+                    self.assertIn("binding_keys = {", source)
+                    self.assertIn("set(binding) != binding_keys", source)
+                    self.assertIn("raw[:-1] != canonical(payload)", source)
+                    self.assertIn("len(binding_bytes) > MAX_BINDING", source)
+                    self.assertIn("archive.open(info)", source)
+                    self.assertIn("os.O_EXCL", source)
                 else:
                     self.assertIn("handoff schema is invalid", source)
 
@@ -183,25 +217,40 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
             with self.subTest(workflow=key):
                 source = self._source(key)
                 if key == "live":
-                    # Live-user QA enters through the fixed root-owned helper.
-                    # That helper verifies the installed generation and its
-                    # manifest before acquiring the canonical release lock;
-                    # the generic current-release dispatcher is intentionally
-                    # not the secret-bearing entrypoint for this contour.
+                    # The secret workflow enters through the fixed C2 remote
+                    # dispatcher. Its manifest-bound app helper verifies the
+                    # installed app payload before re-entering under the
+                    # canonical lock, then compares the receipt tuple before
+                    # starting any browser/mailbox helper.
                     self.assertIn(
-                        "/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh",
+                        "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
                         source,
                     )
-                    trusted_helper = (
-                        PLATFORM_ROOT / "tools/platform_live_user_qa_trusted.sh"
+                    remote_dispatcher = (
+                        PLATFORM_ROOT / "tools/platform_workflow_remote_dispatch.py"
                     ).read_text(encoding="utf-8")
-                    verify_position = trusted_helper.index(
-                        '/usr/bin/python3.12 -I -B "$DISPATCHER" verify "$TARGET_SHA"'
+                    self.assertIn(
+                        'LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"',
+                        remote_dispatcher,
                     )
-                    lock_position = trusted_helper.index(
-                        'exec "$RELEASE_LOCK_EXEC" --expected-sha "$TARGET_SHA"'
-                    )
+                    self.assertIn('if arguments == ["live-user-qa"]:', remote_dispatcher)
+                    self.assertIn("return _run_sudo(\n                LIVE_USER_QA_HELPER,", remote_dispatcher)
+                    trusted_helper = (
+                        PLATFORM_ROOT / "tools/platform_live_user_qa_dispatch.py"
+                    ).read_text(encoding="utf-8")
+                    main = trusted_helper[trusted_helper.index("def main(") :]
+                    verify_position = main.index("manifest = _verify_install(app_target_sha)")
+                    lock_position = main.index("str(RELEASE_LOCK_EXEC)")
                     self.assertLess(verify_position, lock_position)
+                    self.assertLess(
+                        main.index("_validate_source_binding_schema("), lock_position
+                    )
+                    supervisor_position = main.index("_require_release_lock_supervisor()")
+                    tuple_position = main.index("_validate_source_binding_under_lock(")
+                    helper_exec_position = main.index('wrapper = payload / "platform/tools/platform_live_user_qa.sh"')
+                    self.assertLess(lock_position, supervisor_position)
+                    self.assertLess(supervisor_position, tuple_position)
+                    self.assertLess(tuple_position, helper_exec_position)
                     continue
                 guard_positions = [
                     position
@@ -236,10 +285,26 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
                 source = self._source(key)
                 if key == "live":
                     self.assertIn(
-                        "/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh",
+                        "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
                         source,
                     )
                     self.assertNotIn("/opt/oldsparky/platform/current/tools/", source)
+                    remote_dispatcher = (
+                        PLATFORM_ROOT / "tools/platform_workflow_remote_dispatch.py"
+                    ).read_text(encoding="utf-8")
+                    self.assertIn(
+                        'LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"',
+                        remote_dispatcher,
+                    )
+                    installed_dispatcher = (
+                        PLATFORM_ROOT / "tools/platform_live_user_qa_dispatch.py"
+                    ).read_text(encoding="utf-8")
+                    self.assertIn(
+                        '(QA_HELPER, 0o755, "platform/tools/platform_live_user_qa_trusted.sh")',
+                        installed_dispatcher,
+                    )
+                    self.assertIn("for path, mode, relative in bound_paths", installed_dispatcher)
+                    self.assertIn("_regular(path, mode=mode", installed_dispatcher)
                     continue
                 for path in paths:
                     self.assertIn(f'test -f "{path}"', source, path)
@@ -290,8 +355,25 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
             with self.subTest(workflow=key):
                 source = self._source(key)
                 if key == "live":
-                    self.assertIn("/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh", source)
+                    self.assertIn(
+                        "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
+                        source,
+                    )
                     self.assertNotIn("bash -s", source)
+                    remote_dispatcher = (
+                        PLATFORM_ROOT / "tools/platform_workflow_remote_dispatch.py"
+                    ).read_text(encoding="utf-8")
+                    self.assertIn(
+                        'LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"',
+                        remote_dispatcher,
+                    )
+                    installed_dispatcher = (
+                        PLATFORM_ROOT / "tools/platform_live_user_qa_dispatch.py"
+                    ).read_text(encoding="utf-8")
+                    self.assertIn(
+                        "installed live-QA trusted entrypoint is not bound to the manifest",
+                        installed_dispatcher,
+                    )
                     continue
                 self.assertRegex(
                     source,

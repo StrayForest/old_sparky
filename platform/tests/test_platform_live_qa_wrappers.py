@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO, TextIOWrapper
 import json
+import hashlib
+import io
 import os
 from pathlib import Path
 import pwd
@@ -16,8 +18,11 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+import urllib.request
+import zipfile
 
 from tools import platform_workflow_input_guard, platform_workflow_remote_dispatch
+from tools import platform_live_user_qa_dispatch
 from tools.platform_workflow_input_guard import (
     WorkflowInputError,
     validate_confirmation,
@@ -55,6 +60,93 @@ BROWSER_WRAPPERS = WRAPPERS[1:3]
 
 
 class LiveQaWrapperContractTests(unittest.TestCase):
+    def test_live_dispatcher_lock_capability_uses_manifest_bound_canonical_helper(self) -> None:
+        successful = SimpleNamespace(returncode=0)
+        with patch.object(platform_live_user_qa_dispatch, "_trusted_directory_chain") as chain, \
+            patch.object(
+                platform_live_user_qa_dispatch,
+                "_regular",
+                return_value=SimpleNamespace(st_nlink=1),
+            ), \
+            patch.object(
+                platform_live_user_qa_dispatch.subprocess,
+                "run",
+                return_value=successful,
+            ) as run:
+            platform_live_user_qa_dispatch._require_release_lock_supervisor()
+
+        chain.assert_called_once_with(platform_live_user_qa_dispatch.TRUSTED_LIVE_QA_ROOT)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ["/usr/bin/bash", "-c"])
+        self.assertEqual(argv[3], "platform-release-lock-check")
+        self.assertEqual(argv[4], str(platform_live_user_qa_dispatch.RELEASE_LOCK))
+        self.assertIn("platform_release_lock_supervisor_holds", argv[2])
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+        self.assertNotIn("flock", argv)
+        self.assertEqual(
+            run.call_args.kwargs["env"],
+            {"HOME": "/root", "LANG": "C.UTF-8", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+        )
+
+        with patch.object(platform_live_user_qa_dispatch, "_trusted_directory_chain"), \
+            patch.object(
+                platform_live_user_qa_dispatch,
+                "_regular",
+                return_value=SimpleNamespace(st_nlink=1),
+            ), \
+            patch.object(
+                platform_live_user_qa_dispatch.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=1),
+            ):
+            with self.assertRaisesRegex(RuntimeError, "canonical release lock is not held"):
+                platform_live_user_qa_dispatch._require_release_lock_supervisor()
+
+    def test_direct_run_locked_marker_cannot_bypass_canonical_lock_check(self) -> None:
+        sha = "a" * 40
+        manifest = {
+            "files": {
+                "platform/tools/platform_workflow_remote_dispatch.py": "b" * 64,
+            }
+        }
+        for arguments in (
+            ["run-locked", sha],
+            ["run-launch", sha, "https://old-sparky.com", "false", ""],
+        ):
+            with self.subTest(mode=arguments[0]):
+                with patch.object(platform_live_user_qa_dispatch.os, "geteuid", return_value=0), \
+                    patch.object(platform_live_user_qa_dispatch, "_verify_install", return_value=manifest), \
+                    patch.object(platform_live_user_qa_dispatch, "_load_verified_remote_dispatcher", return_value=object()), \
+                    patch.object(platform_live_user_qa_dispatch, "_validate_source_binding_schema"), \
+                    patch.object(platform_live_user_qa_dispatch, "_require_release_lock_supervisor", side_effect=RuntimeError("no lock")) as lock_check, \
+                    patch.object(platform_live_user_qa_dispatch, "_validate_source_binding_under_lock") as tuple_check, \
+                    patch.dict(os.environ, {"PLATFORM_RELEASE_LOCK_SUPERVISED": "1"}, clear=True):
+                    self.assertEqual(
+                        platform_live_user_qa_dispatch.main(arguments),
+                        1,
+                    )
+                lock_check.assert_called_once_with()
+                tuple_check.assert_not_called()
+
+    def test_live_dispatcher_imports_under_isolated_no_bytecode_python(self) -> None:
+        result = subprocess.run(
+            [
+                "/usr/bin/python3.12",
+                "-I",
+                "-B",
+                str(TOOLS_ROOT / "platform_live_user_qa_dispatch.py"),
+                "invalid-mode",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+            env={"HOME": "/root", "LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+        )
+        self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+        self.assertEqual(result.stderr, b"")
+
     def test_control_email_json_stdin_is_closed_bounded_and_redacted(self) -> None:
         valid = '{"schema":1,"control_email":"Control+qa@example.invalid"}\n'
         stdout = StringIO()
@@ -273,7 +365,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("LIVE_PROVISION", source)
         self.assertIn("LIVE_MARKER", source)
         self.assertIn("live-launch-input.json", source)
-        self.assertIn("workflow_input_guard.py live", source)
+        self.assertIn("resolve-workflow-source-binding", source)
+        self.assertIn("create-live-handoff", source)
+        self.assertIn("SameOriginRedirect", source)
+        self.assertIn("ArtifactRedirect", source)
+        self.assertIn("HANDOFF_ARTIFACT_ID", source)
+        self.assertIn('LIVE_HANDOFF status=verified', source)
+        self.assertIn("APP_TARGET_SHA", source)
+        self.assertNotIn("platform_workflow_input_guard.py live", source)
         self.assertIn('stat -c \'%a\' "$RUNNER_TEMP/live-launch-input.json"', source)
         self.assertIn("LIVE_QA_IDENTITY", supervisor)
         self.assertIn("LIVE_QA_ENV_PATH", supervisor)
@@ -299,7 +398,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn('stage == "complete"', source)
         self.assertIn('child_status == 0', source)
         self.assertLess(
-            source.index("platform_workflow_input_guard.py live"),
+            source.index('LIVE_HANDOFF status=verified'),
             source.index('printf \'%s\\n\' "$PROD_SSH_KEY"'),
         )
         self.assertEqual(
@@ -387,7 +486,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             )
             self.assertEqual(malformed.returncode, 2)
             self.assertEqual(malformed.stdout, "")
-            self.assertIn("exactly four validated arguments", malformed.stderr)
+            self.assertIn("invalid argument count", malformed.stderr)
         status_sha = "a" * 40
 
         identity_match = re.search(
@@ -839,7 +938,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
         sanitizer_match = re.search(
             r'/usr/bin/python3 - "\$raw_report" "\$safe_report" '
-            r'"\$SUPERVISOR_STATUS" "\$GITHUB_SHA" <<\'PY\'\n(.*?)\n          PY',
+            r'"\$SUPERVISOR_STATUS" \\\s*'
+            r'"\$GITHUB_SHA" "\$APP_TARGET_SHA" "\$SOURCE_BINDING_SHA256" '
+            r'<<\'PY\'\n(.*?)\n          PY',
             source,
             flags=re.DOTALL,
         )
@@ -861,6 +962,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         str(safe_path),
                         str(ssh_status),
                         sha,
+                        sha,
+                        "",
                     ],
                     check=False,
                     capture_output=True,
@@ -873,6 +976,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(passed_report["status"], "passed")
         self.assertEqual(passed_report["test_count"], 1)
         self.assertEqual(passed_report["stage"], "complete")
+        self.assertEqual(passed_report["source_git_sha"], status_sha)
+        self.assertEqual(passed_report["app_target_sha"], status_sha)
+        self.assertIsNone(passed_report["source_binding_sha256"])
         failed_report = sanitize_status((failed_status + "\n").encode(), 1)
         self.assertEqual(failed_report["status"], "failed")
         self.assertEqual(failed_report["stage"], "identity")
@@ -1050,10 +1156,19 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             with self.subTest(workflow=filename, input="remote-revalidation"):
                 if filename == "platform-live-user-qa.yml":
                     self.assertIn(
-                        "/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh",
+                        "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
                         source,
                     )
-                    self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", source)
+                    self.assertIn("TARGET_SHA", source)
+                    self.assertIn("APP_TARGET_SHA", source)
+                    self.assertIn("HANDOFF_ARTIFACT_ID", source)
+                    self.assertIn('metadata.get("digest")', source)
+                    self.assertIn('hashlib.sha256(binding_bytes).hexdigest()', source)
+                    self.assertIn("LIVE_USER_HANDOFF_VERIFIED", source)
+                    self.assertNotIn("download-live-handoff", source)
+                    secret_job = source.split("  live-user-qa:\n", 1)[1]
+                    self.assertNotIn("actions/checkout", secret_job)
+                    self.assertNotIn("platform_noop_source_binding.py", secret_job)
                     self.assertNotIn("bash -s", source)
                     continue
                 self.assertIn('input_guard="$runtime/current/tools/platform_workflow_input_guard.py"', source)
@@ -1072,10 +1187,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             with self.subTest(workflow=filename, input="helper-failure"):
                 if filename == "platform-live-user-qa.yml":
                     self.assertIn(
-                        "/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh",
+                        "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
                         source,
                     )
-                    self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", source)
+                    self.assertIn("TARGET_SHA", source)
+                    self.assertIn("APP_TARGET_SHA", source)
+                    self.assertIn("HANDOFF_ARTIFACT_ID", source)
+                    self.assertIn('metadata.get("digest")', source)
+                    self.assertNotIn("download-live-handoff", source)
+                    secret_job = source.split("  live-user-qa:\n", 1)[1]
+                    self.assertNotIn("actions/checkout", secret_job)
+                    self.assertNotIn("platform_noop_source_binding.py", secret_job)
                     continue
                 self.assertIn(
                     'test -f "$input_guard" && test ! -L "$input_guard"',
@@ -1743,6 +1865,258 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             retained,
         )
 
+    def test_live_launch_inline_handoff_verifier_uses_api_digest_and_exact_run(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(
+            encoding="utf-8"
+        )
+        step = workflow.split(
+            "      - name: Authenticate and validate live-launch handoff artifact\n", 1
+        )[1].split("      - name: Configure SSH\n", 1)[0]
+        run_block = step.split("        run: |\n", 1)[1]
+        inline = run_block.split("/usr/bin/python3 - <<'PY'\n", 1)[1].split(
+            "\n          PY\n", 1
+        )[0]
+        inline = textwrap.dedent(inline)
+        runner_sha = "a" * 40
+
+        class Response:
+            status = 200
+
+            def __init__(self, content: bytes):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, maximum: int) -> bytes:
+                return self.content[:maximum]
+
+        def canonical(value: object) -> bytes:
+            return json.dumps(
+                value,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+
+        def run_case(case: str) -> bool:
+            payload = {
+                "schema": "3" if case == "wrong-schema" else (
+                    "2" if case in {"valid-noop", "wrong-binding"} else "1"
+                ),
+                "base_url": "https://old-sparky.com",
+                "provision": "false",
+                "marker": "",
+                "target_sha": runner_sha,
+            }
+            app_sha = "b" * 40
+            if payload["schema"] == "2":
+                source_binding = {
+                    "schema": 1,
+                    "binding_mode": "verified-noop",
+                    "runner_sha": runner_sha,
+                    "app_target_sha": app_sha,
+                    "baseline_identity": {
+                        "schema": 1,
+                        "source_sha": app_sha,
+                        "release_slug": "gha-123456-1-bbbbbbbbbbbb",
+                        "release_json_sha256": "c" * 64,
+                        "current_link_dev": 100,
+                        "current_link_ino": 101,
+                        "release_dev": 100,
+                        "release_ino": 102,
+                        "pending_operation": False,
+                    },
+                    "receipt_document_sha256": "d" * 64,
+                    "receipt_artifact_id": "456789",
+                    "receipt_artifact_name": "platform-production-noop-source-receipt-123456-2",
+                    "receipt_artifact_digest": "sha256:" + "e" * 64,
+                    "receipt_archive_sha256": "e" * 64,
+                    "cumulative_manifest_sha256": "f" * 64,
+                    "source_security_run_id": "234567",
+                    "source_security_run_attempt": "1",
+                    "autodeploy_run_id": "345678",
+                    "autodeploy_run_attempt": "3",
+                    "production_deploy_run_id": "123456",
+                    "production_deploy_run_attempt": "2",
+                }
+                if case == "wrong-binding":
+                    source_binding["app_target_sha"] = "c" * 40
+                payload["source_binding"] = source_binding
+            member_name = "other.json" if case == "wrong-member" else "live-launch-input.json"
+            raw = canonical(payload) + b"\n"
+            if case == "oversized-member":
+                raw = b"x" * (20 * 1024 + 1)
+            archive_buffer = io.BytesIO()
+            with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
+                zipped.writestr(member_name, raw)
+            archive_bytes = archive_buffer.getvalue()
+            real_digest = "sha256:" + hashlib.sha256(archive_bytes).hexdigest()
+            api_digest = "missing" if case == "missing-api-digest" else (
+                "sha256:invalid" if case == "invalid-api-digest" else real_digest
+            )
+            metadata_run = {"id": 123456, "head_sha": runner_sha}
+            if case == "wrong-present-attempt":
+                metadata_run["run_attempt"] = 2
+            elif case != "missing-metadata-attempt":
+                metadata_run["run_attempt"] = 1
+            run_record = {
+                "id": 123456,
+                "run_attempt": 1,
+                "workflow_id": 88,
+                "head_sha": runner_sha,
+                "head_branch": "dev",
+                "event": "workflow_dispatch",
+                "status": "in_progress",
+            }
+            if case == "wrong-run-attempt":
+                run_record["run_attempt"] = True
+            workflow_record = {
+                "id": 88,
+                "path": ".github/workflows/platform-live-launch.yml",
+                "state": "active",
+            }
+            name = "platform-live-launch-input-123456-1"
+            row_name = "wrong-name" if case == "wrong-artifact-name" else name
+            row_id = 457 if case == "wrong-artifact-id" else 456
+            listing_row = {"id": row_id, "name": row_name, "size_in_bytes": len(archive_bytes),
+                           "digest": real_digest, "expired": False}
+            metadata = {
+                "id": 456,
+                "name": name,
+                "expired": False,
+                "size_in_bytes": len(archive_bytes),
+                "digest": ("sha256:" + "0" * 64) if case == "zip-digest-mismatch" else api_digest,
+                "workflow_run": metadata_run,
+            }
+            if case == "wrong-size":
+                metadata["size_in_bytes"] = len(archive_bytes) + 1
+            base = "https://api.github.com/repos/example/repo/"
+            responses = {
+                base + "actions/workflows/platform-live-launch.yml": workflow_record,
+                base + "actions/runs/123456": run_record,
+                base + "actions/runs/123456/artifacts?per_page=100&page=1": {
+                    "total_count": 1,
+                    "artifacts": [listing_row],
+                },
+                base + "actions/artifacts/456": metadata,
+            }
+
+            class FakeOpener:
+                def open(self, request, timeout=30):
+                    if request.full_url.endswith("/actions/artifacts/456/zip"):
+                        return Response(archive_bytes)
+                    value = responses.get(request.full_url)
+                    if value is None:
+                        raise AssertionError(f"unexpected test URL {request.full_url}")
+                    return Response(json.dumps(value).encode("ascii"))
+
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "live-launch-input.json"
+                github_env = Path(directory) / "github-env"
+                github_env.write_text("", encoding="ascii")
+                expected_app_sha = app_sha if payload.get("schema") == "2" else runner_sha
+                expected_binding_digest = (
+                    hashlib.sha256(canonical(payload["source_binding"])).hexdigest()
+                    if payload.get("schema") == "2"
+                    else ""
+                )
+                env = {
+                    "TARGET_SHA": runner_sha,
+                    "GITHUB_RUN_ID": "123456",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_REPOSITORY": "example/repo",
+                    "GITHUB_API_URL": "https://api.github.com",
+                    "GITHUB_REF": "refs/heads/dev",
+                    "GITHUB_EVENT_NAME": "workflow_dispatch",
+                    "HANDOFF_ARTIFACT_ID": "456",
+                    "HANDOFF_ARTIFACT_NAME": name,
+                    "HANDOFF_MEMBER_NAME": "live-launch-input.json",
+                    "HANDOFF_OUTPUT_PATH": str(output),
+                    "GITHUB_ENV": str(github_env),
+                    "GH_TOKEN": "test-only-token",
+                }
+                success = False
+                verifier_namespace = {"__name__": "__main__"}
+                with patch.dict(os.environ, env, clear=False), \
+                    patch("urllib.request.build_opener", side_effect=lambda *_handlers: FakeOpener()), \
+                    redirect_stderr(StringIO()), redirect_stdout(StringIO()):
+                    try:
+                        exec(compile(inline, "live-launch-inline-verifier", "exec"), verifier_namespace)
+                    except SystemExit:
+                        success = False
+                    else:
+                        success = True
+                if success:
+                    self.assertTrue(output.is_file())
+                    self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(output.read_bytes(), raw)
+                    environment = github_env.read_text(encoding="ascii")
+                    self.assertIn(f"APP_TARGET_SHA={expected_app_sha}\n", environment)
+                    self.assertIn(f"SOURCE_BINDING_SHA256={expected_binding_digest}\n", environment)
+                    api_handler = verifier_namespace["SameOriginRedirect"]()
+                    request = urllib.request.Request(
+                        "https://api.github.com/repos/example/repo/x",
+                        headers={"Authorization": "Bearer test-only", "Cookie": "session=test-only"},
+                    )
+                    self.assertIsNotNone(
+                        api_handler.redirect_request(
+                            request, None, 302, "Found", {},
+                            "https://api.github.com/repos/example/repo/next",
+                        )
+                    )
+                    self.assertIsNone(
+                        api_handler.redirect_request(
+                            request, None, 302, "Found", {}, "https://blob.example/file",
+                        )
+                    )
+                    artifact_handler = verifier_namespace["ArtifactRedirect"]()
+                    cross_host = artifact_handler.redirect_request(
+                        request, None, 302, "Found", {}, "https://blob.example/file",
+                    )
+                    self.assertIsNotNone(cross_host)
+                    forwarded = {
+                        key.casefold()
+                        for collection in (cross_host.headers, cross_host.unredirected_hdrs)
+                        for key in collection
+                    }
+                    self.assertTrue(
+                        {"authorization", "cookie", "proxy-authorization", "cookie2"}.isdisjoint(forwarded)
+                    )
+                    self.assertIsNone(
+                        artifact_handler.redirect_request(
+                            request, None, 302, "Found", {}, "http://blob.example/file",
+                        )
+                    )
+                else:
+                    self.assertFalse(output.exists())
+                return success
+
+        self.assertNotIn("HANDOFF_ARTIFACT_DIGEST", step)
+        self.assertTrue(run_case("valid"))
+        self.assertTrue(run_case("valid-noop"))
+        self.assertTrue(run_case("missing-metadata-attempt"))
+        for invalid in (
+            "wrong-present-attempt",
+            "wrong-run-attempt",
+            "missing-api-digest",
+            "invalid-api-digest",
+            "wrong-size",
+            "wrong-artifact-id",
+            "wrong-artifact-name",
+            "zip-digest-mismatch",
+            "wrong-member",
+            "oversized-member",
+            "wrong-schema",
+            "wrong-binding",
+        ):
+            with self.subTest(case=invalid):
+                self.assertFalse(run_case(invalid))
+
     def test_live_user_qa_is_dispatchable_and_runs_on_the_server(self) -> None:
         source = (REPO_ROOT / ".github/workflows/platform-live-user-qa.yml").read_text(
             encoding="utf-8"
@@ -1756,19 +2130,389 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("ssh", source)
         self.assertIn("live_user_qa_success", source)
         self.assertIn(
-            "/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh",
+            "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
             source,
         )
+        self.assertIn("HANDOFF_ARTIFACT_ID", source)
+        self.assertIn('metadata.get("digest")', source)
+        self.assertIn("hashlib.sha256(archive_bytes)", source)
+        self.assertIn('stream.write(f"APP_TARGET_SHA={app}\\n")', source)
+        self.assertIn("SameOriginHTTPS", source)
+        self.assertIn("SafeArtifactHTTPS", source)
+        self.assertIn("LIVE_USER_HANDOFF_VERIFIED", source)
+        self.assertIn("APP_TARGET_SHA", source)
         self.assertIn(
             "live-user-qa",
             source,
         )
         self.assertNotIn("bash -s", source)
         self.assertNotIn("/root/old_sparky", source)
+        secret_job = source.split("  live-user-qa:\n", 1)[1]
+        validator_outputs = source.split("    outputs:\n", 1)[1].split(
+            "    permissions:\n", 1
+        )[0]
+        self.assertEqual(
+            [line.strip().split(":", 1)[0] for line in validator_outputs.splitlines() if line.strip()],
+            ["handoff_artifact_id"],
+        )
+        self.assertNotIn("actions/checkout", secret_job)
+        self.assertNotIn("platform_noop_source_binding.py", secret_job)
+        self.assertIn("contents: none", secret_job)
+        self.assertLess(
+            secret_job.index("LIVE_USER_HANDOFF_VERIFIED"),
+            secret_job.index("- name: Configure SSH"),
+        )
         self.assertIn("TRUSTED_LIVE_QA_ROOT", dispatcher)
         self.assertIn("platform_live_user_qa_trusted.sh", dispatcher)
         self.assertIn("platform_live_qa_mailbox_helper.py", dispatcher)
         self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", dispatcher)
+
+    def test_live_user_inline_handoff_verifier_authenticates_and_fails_closed(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-live-user-qa.yml").read_text(
+            encoding="utf-8"
+        )
+        step = workflow.split(
+            "      - name: Authenticate and install closed live-user QA handoff\n", 1
+        )[1].split("      - name: Configure SSH\n", 1)[0]
+        run_block = step.split("        run: |\n", 1)[1]
+        inline = run_block.split("/usr/bin/python3 - <<'PY'\n", 1)[1].split(
+            "\n          PY\n", 1
+        )[0]
+        inline = textwrap.dedent(inline)
+
+        runner_sha = "a" * 40
+        app_sha = "b" * 40
+        binding = {
+            "schema": 1,
+            "binding_mode": "verified-noop",
+            "runner_sha": runner_sha,
+            "app_target_sha": app_sha,
+            "baseline_identity": {
+                "schema": 1,
+                "source_sha": app_sha,
+                "release_slug": "gha-123456-1-bbbbbbbbbbbb",
+                "release_json_sha256": "c" * 64,
+                "current_link_dev": 100,
+                "current_link_ino": 101,
+                "release_dev": 100,
+                "release_ino": 102,
+                "pending_operation": False,
+            },
+            "receipt_document_sha256": "d" * 64,
+            "receipt_artifact_id": "456789",
+            "receipt_artifact_name": "platform-production-noop-source-receipt-123456-2",
+            "receipt_artifact_digest": "sha256:" + "e" * 64,
+            "receipt_archive_sha256": "e" * 64,
+            "cumulative_manifest_sha256": "f" * 64,
+            "source_security_run_id": "234567",
+            "source_security_run_attempt": "1",
+            "autodeploy_run_id": "345678",
+            "autodeploy_run_attempt": "3",
+            "production_deploy_run_id": "123456",
+            "production_deploy_run_attempt": "2",
+        }
+
+        def canonical(value: object) -> bytes:
+            return json.dumps(
+                value,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+
+        class Response:
+            status = 200
+
+            def __init__(self, content: bytes):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, maximum: int) -> bytes:
+                return self.content[:maximum]
+
+        def run_case(case: str) -> tuple[bool, str | None, int | None]:
+            case_app_sha = runner_sha if case == "same-source" else app_sha
+            payload: dict[str, object] = {
+                "schema": "1" if case == "same-source" else "2",
+                "base_url": "https://old-sparky.com",
+                "provision": "false",
+                "marker": "",
+                "target_sha": runner_sha,
+            }
+            if case != "same-source":
+                payload["source_binding"] = dict(binding)
+            current_binding = payload.get("source_binding")
+            assert current_binding is None or isinstance(current_binding, dict)
+            expected_binding_digest = (
+                hashlib.sha256(canonical(current_binding)).hexdigest()
+                if isinstance(current_binding, dict)
+                else ""
+            )
+            run_record: dict[str, object] = {
+                "id": 123456,
+                "run_attempt": 1,
+                "workflow_id": 88,
+                "head_sha": runner_sha,
+                "head_branch": "dev",
+                "event": "workflow_dispatch",
+                "status": "in_progress",
+            }
+            if case == "wrong-run":
+                run_record["id"] = 123457
+            elif case == "boolean-attempt":
+                run_record["run_attempt"] = True
+            elif case == "wrong-schema":
+                payload["schema"] = "3"
+            elif case == "wrong-binding-digest":
+                assert isinstance(current_binding, dict)
+                current_binding["receipt_document_sha256"] = "z" * 64
+            elif case == "wrong-binding-source":
+                assert isinstance(current_binding, dict)
+                current_binding["app_target_sha"] = "c" * 40
+            expected_binding_digest = (
+                hashlib.sha256(canonical(current_binding)).hexdigest()
+                if isinstance(current_binding, dict)
+                else ""
+            )
+            member_name = "unexpected.json" if case == "wrong-member" else "live-user-qa-input.json"
+            member_raw = canonical(payload) + b"\n"
+            if case == "oversized-member":
+                member_raw = b"x" * (20 * 1024 + 1)
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(member_name, member_raw)
+            archive_bytes = zip_buffer.getvalue()
+            artifact_digest = "sha256:" + hashlib.sha256(archive_bytes).hexdigest()
+            artifact_name = "wrong-name" if case == "wrong-name" else "platform-live-user-qa-input-123456-1"
+            metadata_digest = "sha256:" + "0" * 64 if case == "wrong-digest" else artifact_digest
+            metadata_size = len(archive_bytes) + 1 if case == "wrong-size" else len(archive_bytes)
+            workflow_record = {"id": 88, "path": ".github/workflows/platform-live-user-qa.yml", "state": "active"}
+            artifact_row = {"id": 456, "name": artifact_name, "size_in_bytes": len(archive_bytes),
+                            "digest": artifact_digest, "expired": False}
+            workflow_run = {"id": 123456, "run_attempt": 1, "head_sha": runner_sha}
+            if case == "missing-metadata-attempt":
+                workflow_run.pop("run_attempt")
+            elif case == "wrong-metadata-attempt":
+                workflow_run["run_attempt"] = 2
+            artifact_metadata = {
+                "id": 456,
+                "name": artifact_name,
+                "size_in_bytes": metadata_size,
+                "digest": metadata_digest,
+                "expired": False,
+                "workflow_run": workflow_run,
+            }
+            prefix = "https://api.github.com/repos/example/repo"
+            responses = {
+                prefix + "/actions/workflows/platform-live-user-qa.yml": workflow_record,
+                prefix + "/actions/runs/123456": run_record,
+                prefix + "/actions/runs/123456/artifacts?per_page=100&page=1": {
+                    "total_count": 1,
+                    "artifacts": [artifact_row],
+                },
+                prefix + "/actions/artifacts/456": artifact_metadata,
+            }
+
+            class FakeOpener:
+                def open(self, request, timeout=30):
+                    self.last_timeout = timeout
+                    if request.full_url.endswith("/actions/artifacts/456/zip"):
+                        return Response(archive_bytes)
+                    value = responses.get(request.full_url)
+                    if value is None:
+                        raise AssertionError(f"unexpected test URL {request.full_url}")
+                    return Response(json.dumps(value).encode("ascii"))
+
+            env_base = {
+                "TARGET_SHA": runner_sha,
+                "GITHUB_SHA": runner_sha,
+                "APP_TARGET_SHA": case_app_sha,
+                "SOURCE_BINDING_SHA256": expected_binding_digest,
+                "HANDOFF_ARTIFACT_ID": "456",
+                "HANDOFF_ARTIFACT_NAME": "platform-live-user-qa-input-123456-1",
+                "HANDOFF_MEMBER_NAME": "live-user-qa-input.json",
+                "GITHUB_API_URL": "https://api.github.com",
+                "GITHUB_REPOSITORY": "example/repo",
+                "GITHUB_RUN_ID": "123456",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_OUTPUT": "",
+                "RUNNER_TEMP": "",
+                "GH_TOKEN": "test-only-token",
+            }
+            with tempfile.TemporaryDirectory() as directory:
+                env_base["GITHUB_OUTPUT"] = str(Path(directory) / "output.txt")
+                env_base["GITHUB_ENV"] = str(Path(directory) / "environment.txt")
+                env_base["RUNNER_TEMP"] = directory
+                Path(env_base["GITHUB_OUTPUT"]).write_text("", encoding="ascii")
+                Path(env_base["GITHUB_ENV"]).write_text("", encoding="ascii")
+                output = Path(directory) / "live-user-qa-input.json"
+                stdout = StringIO()
+                success = False
+                verifier_namespace = {"__name__": "__main__"}
+                with patch.dict(os.environ, env_base, clear=False), \
+                    patch("urllib.request.build_opener", side_effect=lambda *_handlers: FakeOpener()), \
+                    redirect_stdout(stdout):
+                    try:
+                        exec(compile(inline, "live-user-inline-verifier", "exec"), verifier_namespace)
+                    except SystemExit:
+                        success = False
+                    else:
+                        success = True
+                if success:
+                    self.assertTrue(output.is_file())
+                    self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(output.read_bytes(), member_raw)
+                    self.assertEqual(
+                        Path(env_base["GITHUB_OUTPUT"]).read_text(encoding="ascii"),
+                        f"source_binding_sha256={expected_binding_digest}\n",
+                    )
+                    self.assertEqual(
+                        Path(env_base["GITHUB_ENV"]).read_text(encoding="ascii"),
+                        f"APP_TARGET_SHA={case_app_sha}\nSOURCE_BINDING_SHA256={expected_binding_digest}\n",
+                    )
+                    self.assertEqual(stdout.getvalue(), "LIVE_USER_HANDOFF_VERIFIED\n")
+                    api_handler = verifier_namespace["SameOriginHTTPS"]()
+                    api_request = urllib.request.Request(
+                        "https://api.github.com/repos/example/repo/x",
+                        headers={"Authorization": "Bearer test-only", "Cookie": "session=test-only"},
+                    )
+                    self.assertIsNotNone(
+                        api_handler.redirect_request(
+                            api_request, None, 302, "Found", {},
+                            "https://api.github.com/repos/example/repo/next",
+                        )
+                    )
+                    self.assertIsNone(
+                        api_handler.redirect_request(
+                            api_request, None, 302, "Found", {}, "https://blob.example/file",
+                        )
+                    )
+                    artifact_handler = verifier_namespace["SafeArtifactHTTPS"]()
+                    artifact_request = urllib.request.Request(
+                        "https://api.github.com/repos/example/repo/zip",
+                        headers={"Authorization": "Bearer test-only", "Cookie": "session=test-only"},
+                    )
+                    same_host = artifact_handler.redirect_request(
+                        artifact_request, None, 302, "Found", {},
+                        "https://api.github.com/repos/example/repo/zip-next",
+                    )
+                    self.assertIsNotNone(same_host)
+                    cross_host = artifact_handler.redirect_request(
+                        artifact_request, None, 302, "Found", {}, "https://blob.example/file",
+                    )
+                    self.assertIsNotNone(cross_host)
+                    forwarded = {
+                        key.casefold()
+                        for collection in (cross_host.headers, cross_host.unredirected_hdrs)
+                        for key in collection
+                    }
+                    self.assertTrue(
+                        {"authorization", "cookie", "proxy-authorization", "cookie2"}.isdisjoint(forwarded)
+                    )
+                    self.assertIsNone(
+                        artifact_handler.redirect_request(
+                            artifact_request, None, 302, "Found", {}, "http://blob.example/file",
+                        )
+                    )
+                else:
+                    self.assertFalse(output.exists())
+                return success, stdout.getvalue(), output.stat().st_mode & 0o777 if output.exists() else None
+
+        self.assertTrue(run_case("same-source")[0])
+        self.assertTrue(run_case("missing-metadata-attempt")[0])
+        self.assertTrue(run_case("valid-schema2")[0])
+        for invalid_case in (
+            "wrong-run",
+            "boolean-attempt",
+            "wrong-metadata-attempt",
+            "wrong-name",
+            "wrong-digest",
+            "wrong-size",
+            "wrong-member",
+            "oversized-member",
+            "wrong-schema",
+            "wrong-binding-digest",
+            "wrong-binding-source",
+        ):
+            with self.subTest(case=invalid_case):
+                self.assertFalse(run_case(invalid_case)[0])
+
+    def test_live_user_report_preserves_required_source_binding_identity(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-live-user-qa.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            'steps.authenticate_live_user_handoff.outputs.source_binding_sha256', workflow
+        )
+        self.assertIn('binding_digest="${SOURCE_BINDING_SHA256:-}"', workflow)
+
+        sanitizer_step = workflow.split(
+            "      - name: Sanitize live-user QA report\n", 1
+        )[1].split("      - name: Remove production SSH material\n", 1)[0]
+        sanitizer = textwrap.dedent(
+            sanitizer_step.split("<<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+        )
+        validator_step = workflow.split(
+            "      - name: Reject incomplete live-user QA report\n", 1
+        )[1].split("      - name: QA summary\n", 1)[0]
+        validator = textwrap.dedent(
+            validator_step.split("<<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+        )
+        runner_sha = "a" * 40
+        app_sha = "b" * 40
+        binding_digest = "c" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "raw.log"
+            report = root / "report.json"
+            raw.write_text("LIVE_USER_QA_SUCCESS\n", encoding="utf-8")
+            valid = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, binding_digest],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertEqual(
+                json.loads(report.read_text(encoding="utf-8"))["source_binding_sha256"],
+                binding_digest,
+            )
+            accepted = subprocess.run(
+                [sys.executable, "-c", validator, str(report), runner_sha, app_sha, binding_digest],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+            missing_binding = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, app_sha, ""],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_binding.returncode, 0)
+
+            same_source = subprocess.run(
+                [sys.executable, "-c", sanitizer, str(raw), str(report), "0", runner_sha, runner_sha, ""],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(same_source.returncode, 0, same_source.stderr)
+            same_source_valid = subprocess.run(
+                [sys.executable, "-c", validator, str(report), runner_sha, runner_sha, ""],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(same_source_valid.returncode, 0, same_source_valid.stderr)
 
     def test_all_wrappers_disable_xtrace_before_any_work(self) -> None:
         for wrapper in WRAPPERS:

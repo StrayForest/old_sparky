@@ -76,11 +76,22 @@ run_external_vote_recovery() {
   "$SYSTEM_PYTHON" -I -B \
     "$TOOLS_DIR/platform_capture_retained_recovery_stderr.py" \
     >/dev/null 2>&1 <<EOF
-{"schema":1,"target_sha":"$target_sha","load_run_id":"$load_run_id","cleanup_run_id":"$cleanup_run_id","control_email":"$control_email","mode":"$recovery_profile"}
+{"schema":1,"target_sha":"$app_target_sha","load_run_id":"$load_run_id","cleanup_run_id":"$cleanup_run_id","control_email":"$control_email","mode":"$recovery_profile"}
 EOF
 }
-if (( $# != 4 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <load-run-id> <cleanup-run-id>" >&2
+source_binding_b64=""
+if (( $# == 6 )); then
+  [[ "${5}" == "--source-binding-base64" ]] || {
+    echo "Source-binding option is invalid." >&2
+    exit 2
+  }
+  source_binding_b64="${6}"
+elif (( $# != 4 )); then
+  echo "Usage: $0 $CONFIRMATION <runner-sha> <load-run-id> <cleanup-run-id> [--source-binding-base64 <binding>]" >&2
+  exit 2
+fi
+if [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Cleanup confirmation is invalid." >&2
   exit 2
 fi
 
@@ -91,9 +102,24 @@ cleanup_run_id="$4"
 
 [[ "$confirmation" == "$CONFIRMATION" ]]
 [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || {
-  echo "Target SHA must be a lowercase 40-character commit SHA." >&2
+  echo "Runner SHA must be a lowercase 40-character commit SHA." >&2
   exit 1
 }
+app_target_sha="$target_sha"
+if [[ -n "$source_binding_b64" ]]; then
+  binding_marker="$("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_noop_source_binding.py" \
+    validate-active-runtime-binding "$target_sha" "$source_binding_b64")" || {
+    echo "Active source-binding tuple does not match retained cleanup." >&2
+    exit 1
+  }
+  if [[ "$binding_marker" =~ ^ACTIVE_RUNTIME_BINDING\ schema=1\ status=matched\ runner_sha=([0-9a-f]{40})\ app_target_sha=([0-9a-f]{40})$ ]] \
+    && [[ "${BASH_REMATCH[1]}" == "$target_sha" ]]; then
+    app_target_sha="${BASH_REMATCH[2]}"
+  else
+    echo "Active source-binding response is invalid." >&2
+    exit 1
+  fi
+fi
 [[ "$load_run_id" =~ ^[1-9][0-9]{0,31}$ && "$cleanup_run_id" =~ ^[1-9][0-9]{0,31}$ ]] || {
   echo "GitHub run ids must be numeric." >&2
   exit 1
@@ -183,11 +209,11 @@ payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 print(payload.get("source_git_commit", ""))
 PY
 )"
-test "$release_sha" = "$target_sha" || {
-  echo "Active production release does not match the cleanup workflow SHA." >&2
+test "$release_sha" = "$app_target_sha" || {
+  echo "Active production release does not match the authenticated app target SHA." >&2
   exit 1
 }
-LIVE_QA_PAYLOAD_ROOT="$LIVE_QA_RELEASE_ROOT/$target_sha"
+LIVE_QA_PAYLOAD_ROOT="$LIVE_QA_RELEASE_ROOT/$app_target_sha"
 platform_environment="$($SYSTEM_PYTHON -I -B "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_ENVIRONMENT)"
 test "$platform_environment" = "production" || {
   echo "Production retained cleanup requires PLATFORM_ENVIRONMENT=production." >&2

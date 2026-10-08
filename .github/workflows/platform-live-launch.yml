@@ -19,6 +19,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -27,7 +28,10 @@ jobs:
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      handoff_artifact_id: ${{ steps.upload_live_handoff.outputs.artifact-id }}
     permissions:
+      actions: read
       contents: read
     env:
       LIVE_BASE_URL: ${{ inputs.base_url }}
@@ -40,6 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = workflow_dispatch || { echo "Live launch accepts workflow_dispatch only." >&2; exit 1; }
+          test "$GITHUB_REF" = refs/heads/dev || { echo "Live launch accepts the reviewed dev ref only." >&2; exit 1; }
           test "$LIVE_BASE_URL" = "https://old-sparky.com" || { echo "Live launch requires the canonical origin." >&2; exit 1; }
           case "$LIVE_PROVISION" in true|false) ;; *) echo "Live provision mode is invalid." >&2; exit 1 ;; esac
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Live launch requires an exact target SHA." >&2; exit 1; }
@@ -54,18 +59,29 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+      - name: Resolve authenticated app source binding
+        id: resolve-source-binding
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_noop_source_binding.py \
+            resolve-workflow-source-binding "$TARGET_SHA" "$GITHUB_REPOSITORY" \
+            "${GITHUB_API_URL:-https://api.github.com}" \
+            "$RUNNER_TEMP/live-source-binding" "$GITHUB_OUTPUT"
       - name: Validate live-launch dispatch and publish handoff
         shell: bash
         run: |
           set -euo pipefail
-          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py live \
-            --output "$RUNNER_TEMP/live-launch-input.json" \
-            --base-url "$LIVE_BASE_URL" \
-            --provision "$LIVE_PROVISION" \
-            --marker "$LIVE_MARKER" \
-            --target-sha "$TARGET_SHA"
+          /usr/bin/python3 platform/tools/platform_noop_source_binding.py \
+            create-live-handoff "$TARGET_SHA" "$LIVE_BASE_URL" \
+            "$LIVE_PROVISION" "$LIVE_MARKER" \
+            "$RUNNER_TEMP/live-source-binding/source-binding.json" \
+            "$RUNNER_TEMP/live-launch-input.json"
           test "$(stat -c '%a' "$RUNNER_TEMP/live-launch-input.json")" = 600
       - name: Upload closed live-launch handoff
+        id: upload_live_handoff
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-live-launch-input-${{ github.run_id }}-${{ github.run_attempt }}
@@ -75,60 +91,356 @@ jobs:
       - name: Remove validator handoff
         if: ${{ always() }}
         shell: bash
-        run: rm -f -- "$RUNNER_TEMP/live-launch-input.json"
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/live-launch-input.json"
+          source_binding_dir="$RUNNER_TEMP/live-source-binding"
+          if [[ -e "$source_binding_dir" || -L "$source_binding_dir" ]]; then
+            test -d "$source_binding_dir" && test ! -L "$source_binding_dir"
+            rm -f -- "$source_binding_dir/source-binding.json"
+            rmdir -- "$source_binding_dir"
+          fi
+          test ! -e "$source_binding_dir" && test ! -L "$source_binding_dir"
 
   live-sanity:
     needs: validate-live-inputs
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production
+    permissions:
+      actions: read
+      contents: none
     env:
       LIVE_BASE_URL: ${{ inputs.base_url }}
       LIVE_PROVISION: ${{ inputs.provision }}
       LIVE_MARKER: ${{ inputs.marker }}
       TARGET_SHA: ${{ github.sha }}
     steps:
-      - name: Download validated live-launch handoff
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
-        with:
-          name: platform-live-launch-input-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/live-launch-input
-      - name: Install private live-launch handoff
+      - name: Authenticate and validate live-launch handoff artifact
+        id: authenticate_live_launch_handoff
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HANDOFF_ARTIFACT_ID: ${{ needs.validate-live-inputs.outputs.handoff_artifact_id }}
+          HANDOFF_ARTIFACT_NAME: platform-live-launch-input-${{ github.run_id }}-${{ github.run_attempt }}
+          HANDOFF_MEMBER_NAME: live-launch-input.json
+          HANDOFF_OUTPUT_PATH: ${{ runner.temp }}/live-launch-input.json
         run: |
           set -euo pipefail
-          source_path="$RUNNER_TEMP/live-launch-input/live-launch-input.json"
-          test -f "$source_path" && test ! -L "$source_path"
-          install -m 600 "$source_path" "$RUNNER_TEMP/live-launch-input.json"
-          test "$(stat -c '%a' "$RUNNER_TEMP/live-launch-input.json")" = 600
-
-      - name: Revalidate closed live handoff and exact target SHA
-        shell: bash
-        run: |
-          set -euo pipefail
-          /usr/bin/python3 - "$RUNNER_TEMP/live-launch-input.json" "$TARGET_SHA" <<'PY'
+          /usr/bin/python3 - <<'PY'
+          import hashlib
+          import io
           import json
+          import os
           from pathlib import Path
           import re
-          import sys
+          import stat
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
 
-          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected = {"schema", "base_url", "provision", "marker", "target_sha"}
-          if set(payload) != expected:
-              raise SystemExit("live handoff schema is not closed")
-          if payload.get("schema") not in (1, "1") or payload.get("base_url") != "https://old-sparky.com":
-              raise SystemExit("live handoff origin is invalid")
-          if payload.get("provision") not in {"true", "false"}:
-              raise SystemExit("live handoff provision mode is invalid")
-          if payload.get("target_sha") != sys.argv[2] or re.fullmatch(r"[0-9a-f]{40}", sys.argv[2]) is None:
-              raise SystemExit("live handoff exact target SHA mismatch")
-          marker = payload.get("marker")
-          if payload["provision"] == "true" and re.fullmatch(r"liveqa-[a-z0-9-]{6,56}", str(marker)) is None:
-              raise SystemExit("live handoff marker is invalid")
-          if payload["provision"] == "false" and marker != "":
-              raise SystemExit("live handoff marker must be empty without provisioning")
-          print("closed live handoff accepted for exact target SHA")
+          SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+          HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
+          RUN_RE = re.compile(r"[1-9][0-9]{0,31}\Z")
+          MAX_API_BYTES = 8 * 1024 * 1024
+          MAX_ARCHIVE_BYTES = 2 * 1024 * 1024
+          MAX_HANDOFF_BYTES = 20 * 1024
+          EXPECTED_WORKFLOW = ".github/workflows/platform-live-launch.yml"
+          EXPECTED_ORIGIN = "https://old-sparky.com"
+          BASE_KEYS = {"schema", "base_url", "provision", "marker", "target_sha"}
+          BINDING_KEYS = {
+              "schema", "binding_mode", "runner_sha", "app_target_sha", "baseline_identity",
+              "receipt_document_sha256", "receipt_artifact_id", "receipt_artifact_name",
+              "receipt_artifact_digest", "receipt_archive_sha256", "cumulative_manifest_sha256",
+              "source_security_run_id", "source_security_run_attempt", "autodeploy_run_id",
+              "autodeploy_run_attempt", "production_deploy_run_id", "production_deploy_run_attempt",
+          }
+          BASELINE_KEYS = {
+              "schema", "source_sha", "release_slug", "release_json_sha256", "current_link_dev",
+              "current_link_ino", "release_dev", "release_ino", "pending_operation",
+          }
+
+          def fail():
+              raise SystemExit("live handoff artifact is invalid")
+
+          def no_duplicates(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail()
+                  result[key] = value
+              return result
+
+          def canonical(value):
+              return json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True,
+                                separators=(",", ":")).encode("ascii")
+
+          class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, msg, headers, new_url):
+                  old = urllib.parse.urlsplit(request.full_url)
+                  new = urllib.parse.urlsplit(new_url)
+                  if (old.scheme != "https" or new.scheme != "https" or
+                      old.hostname != new.hostname or old.port != new.port or
+                      new.username is not None or new.password is not None):
+                      return None
+                  return super().redirect_request(request, fp, code, msg, headers, new_url)
+
+          class ArtifactRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, msg, headers, new_url):
+                  old = urllib.parse.urlsplit(request.full_url)
+                  new = urllib.parse.urlsplit(new_url)
+                  if new.scheme != "https" or not new.netloc or new.username is not None or new.password is not None:
+                      return None
+                  redirected = super().redirect_request(request, fp, code, msg, headers, new_url)
+                  if redirected is None:
+                      return None
+                  if (old.scheme, old.hostname, old.port) != (new.scheme, new.hostname, new.port):
+                      sensitive = {"authorization", "proxy-authorization", "cookie", "cookie2"}
+                      for collection in (redirected.headers, redirected.unredirected_hdrs):
+                          for key in tuple(collection):
+                              if key.casefold() in sensitive:
+                                  collection.pop(key, None)
+                  return redirected
+
+          def exact_origin(url):
+              parsed = urllib.parse.urlsplit(url)
+              if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or
+                  parsed.password is not None or parsed.fragment):
+                  fail()
+              return parsed
+
+          def api_json(opener, url, headers):
+              exact_origin(url)
+              request = urllib.request.Request(url, headers=headers)
+              try:
+                  with opener.open(request, timeout=30) as response:
+                      if response.status != 200:
+                          fail()
+                      raw = response.read(MAX_API_BYTES + 1)
+              except (OSError, urllib.error.URLError, urllib.error.HTTPError):
+                  fail()
+              if not raw or len(raw) > MAX_API_BYTES:
+                  fail()
+              try:
+                  value = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates)
+              except (UnicodeError, json.JSONDecodeError, ValueError):
+                  fail()
+              if not isinstance(value, dict):
+                  fail()
+              return value
+
+          def positive_int(value):
+              if type(value) is not int or value <= 0 or value > 2**63 - 1:
+                  fail()
+              return value
+
+          def read_bounded_member(archive, entry):
+              if (entry.file_size < 0 or entry.file_size > MAX_HANDOFF_BYTES or
+                  entry.flag_bits & 1 or entry.is_dir()):
+                  fail()
+              chunks = []
+              total = 0
+              with archive.open(entry, "r") as member:
+                  while True:
+                      chunk = member.read(min(32768, MAX_HANDOFF_BYTES + 1 - total))
+                      if not chunk:
+                          break
+                      chunks.append(chunk)
+                      total += len(chunk)
+                      if total > MAX_HANDOFF_BYTES:
+                          fail()
+              raw = b"".join(chunks)
+              if len(raw) != entry.file_size:
+                  fail()
+              return raw
+
+          def validate_binding(binding, runner_sha):
+              if (not isinstance(binding, dict) or set(binding) != BINDING_KEYS or
+                  type(binding.get("schema")) is not int or binding["schema"] != 1 or
+                  binding.get("binding_mode") != "verified-noop" or
+                  binding.get("runner_sha") != runner_sha or
+                  not isinstance(binding.get("app_target_sha"), str) or
+                  SHA_RE.fullmatch(binding["app_target_sha"]) is None):
+                  fail()
+              bound_app_sha = binding["app_target_sha"]
+              baseline = binding.get("baseline_identity")
+              if (not isinstance(baseline, dict) or set(baseline) != BASELINE_KEYS or
+                  type(baseline.get("schema")) is not int or baseline["schema"] != 1 or
+                  baseline.get("source_sha") != bound_app_sha or baseline.get("pending_operation") is not False or
+                  not isinstance(baseline.get("release_slug"), str) or
+                  re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", baseline["release_slug"]) is None or
+                  not isinstance(baseline.get("release_json_sha256"), str) or
+                  HEX_RE.fullmatch(baseline["release_json_sha256"]) is None):
+                  fail()
+              for field in ("current_link_dev", "release_dev"):
+                  if type(baseline.get(field)) is not int or baseline[field] < 0 or baseline[field] > 2**63 - 1:
+                      fail()
+              for field in ("current_link_ino", "release_ino"):
+                  if type(baseline.get(field)) is not int or baseline[field] <= 0 or baseline[field] > 2**63 - 1:
+                      fail()
+              for field in ("receipt_document_sha256", "receipt_archive_sha256", "cumulative_manifest_sha256"):
+                  if not isinstance(binding.get(field), str) or HEX_RE.fullmatch(binding[field]) is None:
+                      fail()
+              for field in ("receipt_artifact_id", "source_security_run_id", "source_security_run_attempt",
+                            "autodeploy_run_id", "autodeploy_run_attempt", "production_deploy_run_id",
+                            "production_deploy_run_attempt"):
+                  if not isinstance(binding.get(field), str) or RUN_RE.fullmatch(binding[field]) is None:
+                      fail()
+              if (binding.get("receipt_artifact_name") !=
+                  f"platform-production-noop-source-receipt-{binding['production_deploy_run_id']}-{binding['production_deploy_run_attempt']}"):
+                  fail()
+              artifact_digest = binding.get("receipt_artifact_digest")
+              if (not isinstance(artifact_digest, str) or
+                  re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_digest) is None or
+                  artifact_digest.removeprefix("sha256:") != binding["receipt_archive_sha256"]):
+                  fail()
+              digest = hashlib.sha256(canonical(binding)).hexdigest()
+              return digest
+
+          try:
+              runner_sha = os.environ["TARGET_SHA"]
+              run_id = os.environ["GITHUB_RUN_ID"]
+              attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+              repository = os.environ["GITHUB_REPOSITORY"]
+              api_base = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+              artifact_id_text = os.environ["HANDOFF_ARTIFACT_ID"]
+              artifact_name = os.environ["HANDOFF_ARTIFACT_NAME"]
+              member_name = os.environ["HANDOFF_MEMBER_NAME"]
+              output_path = Path(os.environ["HANDOFF_OUTPUT_PATH"])
+              if (SHA_RE.fullmatch(runner_sha) is None or
+                  RUN_RE.fullmatch(run_id) is None or RUN_RE.fullmatch(attempt) is None or
+                  not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or
+                  not re.fullmatch(r"[1-9][0-9]{0,31}", artifact_id_text) or
+                  os.environ.get("GITHUB_REF") != "refs/heads/dev" or
+                  os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch" or
+                  artifact_name != f"platform-live-launch-input-{run_id}-{attempt}" or
+                  member_name != "live-launch-input.json"):
+                  fail()
+              api = urllib.parse.urljoin(api_base + "/", f"repos/{repository}/")
+              api_parts = exact_origin(api)
+              token = os.environ["GH_TOKEN"]
+              if not token or not api_parts.hostname:
+                  fail()
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "OldSparky-live-handoff-inline-verifier",
+              }
+              api_opener = urllib.request.build_opener(SameOriginRedirect())
+              zip_opener = urllib.request.build_opener(ArtifactRedirect())
+              workflow = api_json(api_opener, api + "actions/workflows/platform-live-launch.yml", headers)
+              workflow_id = positive_int(workflow.get("id"))
+              if workflow.get("path") != EXPECTED_WORKFLOW or workflow.get("state") != "active":
+                  fail()
+              run = api_json(api_opener, api + f"actions/runs/{run_id}", headers)
+              if (type(run.get("id")) is not int or run["id"] != int(run_id) or
+                  type(run.get("run_attempt")) is not int or run["run_attempt"] != int(attempt) or
+                  type(run.get("workflow_id")) is not int or run["workflow_id"] != workflow_id or
+                  run.get("head_sha") != runner_sha or run.get("head_branch") != "dev" or
+                  run.get("event") != "workflow_dispatch" or run.get("status") != "in_progress"):
+                  fail()
+              listed = api_json(api_opener, api + f"actions/runs/{run_id}/artifacts?per_page=100&page=1", headers)
+              rows, total = listed.get("artifacts"), listed.get("total_count")
+              if not isinstance(rows, list) or type(total) is not int or total != len(rows) or any(not isinstance(row, dict) for row in rows):
+                  fail()
+              matches = [row for row in rows if row.get("name") == artifact_name]
+              if len(matches) != 1 or type(matches[0].get("id")) is not int or matches[0]["id"] != int(artifact_id_text):
+                  fail()
+              metadata = api_json(api_opener, api + f"actions/artifacts/{artifact_id_text}", headers)
+              size = metadata.get("size_in_bytes")
+              expected_artifact_digest = metadata.get("digest")
+              if (type(metadata.get("id")) is not int or metadata["id"] != int(artifact_id_text) or
+                  metadata.get("name") != artifact_name or metadata.get("expired") is not False or
+                  type(size) is not int or size <= 0 or size > MAX_ARCHIVE_BYTES or
+                  not isinstance(expected_artifact_digest, str) or
+                  re.fullmatch(r"sha256:[0-9a-f]{64}", expected_artifact_digest) is None or
+                  ("size_in_bytes" in matches[0] and matches[0]["size_in_bytes"] != size) or
+                  ("digest" in matches[0] and matches[0]["digest"] != expected_artifact_digest) or
+                  ("expired" in matches[0] and matches[0]["expired"] is not False)):
+                  fail()
+              metadata_run = metadata.get("workflow_run")
+              if (not isinstance(metadata_run, dict) or type(metadata_run.get("id")) is not int or
+                  metadata_run["id"] != int(run_id) or metadata_run.get("head_sha") != runner_sha or
+                  ("run_attempt" in metadata_run and
+                   (type(metadata_run.get("run_attempt")) is not int or metadata_run["run_attempt"] != int(attempt)))):
+                  fail()
+              archive_request = urllib.request.Request(api + f"actions/artifacts/{artifact_id_text}/zip", headers=headers)
+              try:
+                  with zip_opener.open(archive_request, timeout=30) as response:
+                      if response.status != 200:
+                          fail()
+                      archive_bytes = response.read(MAX_ARCHIVE_BYTES + 1)
+              except (OSError, urllib.error.URLError, urllib.error.HTTPError):
+                  fail()
+              if (not archive_bytes or len(archive_bytes) > MAX_ARCHIVE_BYTES or len(archive_bytes) != size or
+                  hashlib.sha256(archive_bytes).hexdigest() != expected_artifact_digest.removeprefix("sha256:")):
+                  fail()
+              try:
+                  with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                      entries = archive.infolist()
+                      if len(entries) != 1 or entries[0].filename != member_name:
+                          fail()
+                      raw = read_bounded_member(archive, entries[0])
+              except (OSError, EOFError, ValueError, zipfile.BadZipFile):
+                  fail()
+              if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+                  fail()
+              try:
+                  payload = json.loads(raw[:-1].decode("ascii"), object_pairs_hook=no_duplicates)
+              except (UnicodeError, json.JSONDecodeError, ValueError):
+                  fail()
+              if not isinstance(payload, dict) or raw != canonical(payload) + b"\n":
+                  fail()
+              schema = payload.get("schema")
+              expected_keys = BASE_KEYS if schema == "1" else BASE_KEYS | {"source_binding"} if schema == "2" else set()
+              if (type(schema) is not str or set(payload) != expected_keys or payload.get("target_sha") != runner_sha or
+                  not SHA_RE.fullmatch(runner_sha) or payload.get("base_url") != EXPECTED_ORIGIN or
+                  payload.get("provision") not in {"true", "false"} or not isinstance(payload.get("marker"), str) or
+                  len(payload["marker"]) > 63 or payload["marker"] != payload["marker"].strip() or
+                  (payload["provision"] == "true" and re.fullmatch(r"liveqa-[a-z0-9-]{6,56}", payload["marker"]) is None) or
+                  (payload["marker"] and re.fullmatch(r"liveqa-[a-z0-9-]{6,56}", payload["marker"]) is None)):
+                  fail()
+              if schema == "1":
+                  app_sha = runner_sha
+                  binding_digest = ""
+              else:
+                  binding = payload.get("source_binding")
+                  binding_digest = validate_binding(binding, runner_sha)
+                  app_sha = binding["app_target_sha"]
+                  if app_sha == runner_sha:
+                      fail()
+              if not SHA_RE.fullmatch(app_sha):
+                  fail()
+              parent = output_path.parent
+              parent_meta = parent.lstat()
+              if (not stat.S_ISDIR(parent_meta.st_mode) or stat.S_ISLNK(parent_meta.st_mode) or
+                  parent.resolve(strict=True) != parent):
+                  fail()
+              fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+              try:
+                  opened = os.fstat(fd)
+                  if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or stat.S_IMODE(opened.st_mode) != 0o600:
+                      fail()
+                  view = memoryview(raw)
+                  while view:
+                      written = os.write(fd, view)
+                      view = view[written:]
+                  os.fsync(fd)
+              finally:
+                  os.close(fd)
+              with open(os.environ["GITHUB_ENV"], "a", encoding="ascii") as output:
+                  output.write(f"APP_TARGET_SHA={app_sha}\nSOURCE_BINDING_SHA256={binding_digest}\n")
+          except SystemExit:
+              print("LIVE_HANDOFF status=failed", file=__import__("sys").stderr)
+              raise
+          except Exception:
+              print("LIVE_HANDOFF status=failed", file=__import__("sys").stderr)
+              raise SystemExit(1)
+          print("LIVE_HANDOFF status=verified")
           PY
+
 
       - name: Configure SSH
         shell: bash
@@ -212,18 +524,6 @@ jobs:
           input_path="$RUNNER_TEMP/live-launch-input.json"
           rm -f -- "$input_path"
           test ! -e "$input_path"
-          handoff_dir="$RUNNER_TEMP/live-launch-input"
-          if [[ -e "$handoff_dir" || -L "$handoff_dir" ]]; then
-            test -d "$handoff_dir" && test ! -L "$handoff_dir"
-            handoff_file="$handoff_dir/live-launch-input.json"
-            if [[ -e "$handoff_file" || -L "$handoff_file" ]]; then
-              test -f "$handoff_file" && test ! -L "$handoff_file"
-              rm -f -- "$handoff_file"
-              test ! -e "$handoff_file" && test ! -L "$handoff_file"
-            fi
-            rmdir -- "$handoff_dir"
-          fi
-          test ! -e "$handoff_dir" && test ! -L "$handoff_dir"
           ssh_dir="$RUNNER_TEMP/platform-live-launch-ssh"
           test "$ssh_dir" = "$RUNNER_TEMP/platform-live-launch-ssh"
           if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
@@ -253,7 +553,7 @@ jobs:
           test -z "${SSH_DIR:-}"
 
       - name: Sanitize live-launch output before artifact publication
-        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' }}
+        if: ${{ always() && steps.authenticate_live_launch_handoff.outcome == 'success' && steps.cleanup_ssh.outcome == 'success' }}
         shell: bash
         env:
           SUPERVISOR_STATUS: ${{ steps.run_live_supervisor.outputs.ssh_status || '1' }}
@@ -265,7 +565,8 @@ jobs:
             rm -f -- "$raw_report"
           }
           trap cleanup_raw_report EXIT
-          /usr/bin/python3 - "$raw_report" "$safe_report" "$SUPERVISOR_STATUS" "$GITHUB_SHA" <<'PY'
+          /usr/bin/python3 - "$raw_report" "$safe_report" "$SUPERVISOR_STATUS" \
+            "$GITHUB_SHA" "$APP_TARGET_SHA" "$SOURCE_BINDING_SHA256" <<'PY'
           import json
           from pathlib import Path
           import re
@@ -277,7 +578,7 @@ jobs:
               process_status = int(sys.argv[3])
           except ValueError:
               process_status = 1
-          expected_sha = sys.argv[4]
+          expected_sha, app_sha, binding_digest = sys.argv[4:]
           raw_size = source.stat().st_size
           raw = source.read_bytes() if raw_size <= 256 else b""
           marker_pattern = re.compile(
@@ -321,6 +622,9 @@ jobs:
           child_status = marker[2] if marker_ok and marker is not None else 1
           report = {
               "schema": 1,
+              "source_git_sha": expected_sha,
+              "app_target_sha": app_sha,
+              "source_binding_sha256": binding_digest or None,
               "status": status,
               "success": success,
               "process_exit_code": process_status if 0 <= process_status <= 255 else 1,
@@ -344,7 +648,7 @@ jobs:
           rm -f -- "$raw_report"
           test ! -e "$raw_report"
       - name: Upload sanitized live-launch report
-        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' }}
+        if: ${{ always() && steps.authenticate_live_launch_handoff.outcome == 'success' && steps.cleanup_ssh.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-live-launch-sanitized-${{ github.run_id }}-${{ github.run_attempt }}
@@ -359,7 +663,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      actions: read
+      contents: none
     steps:
       - name: Download sanitized live-launch report
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -373,13 +678,27 @@ jobs:
           install -m 600 \
             "$RUNNER_TEMP/live-launch-sanitized/live-launch-sanitized.json" \
             "$RUNNER_TEMP/live-launch-report.json"
-          /usr/bin/python3 - "$RUNNER_TEMP/live-launch-report.json" <<'PY'
+          /usr/bin/python3 - "$RUNNER_TEMP/live-launch-report.json" \
+            "$GITHUB_SHA" <<'PY'
           import json
           from pathlib import Path
+          import re
           import sys
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          runner_sha = sys.argv[2]
+          app_sha = report.get("app_target_sha") if isinstance(report, dict) else None
+          binding_digest = report.get("source_binding_sha256") if isinstance(report, dict) else None
           if report.get("truncated") is not False or report.get("status") in {"truncated", "error", "unavailable"}:
               raise SystemExit("required live-launch report is incomplete")
+          if (
+              report.get("source_git_sha") != runner_sha
+              or re.fullmatch(r"[0-9a-f]{40}", runner_sha) is None
+              or re.fullmatch(r"[0-9a-f]{40}", app_sha) is None
+              or (app_sha == runner_sha and binding_digest is not None)
+              or (app_sha != runner_sha and
+                  (not isinstance(binding_digest, str) or re.fullmatch(r"[0-9a-f]{64}", binding_digest) is None))
+          ):
+              raise SystemExit("required live-launch source binding is invalid")
           if report.get("success") is not True:
               raise SystemExit("Live browser QA did not pass; see fixed report classes.")
           PY

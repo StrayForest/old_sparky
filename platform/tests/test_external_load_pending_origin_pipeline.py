@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import ExitStack, redirect_stdout
 from copy import deepcopy
 import hashlib
+import base64
 import io
 import json
 import os
@@ -793,7 +794,8 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
         transport_failure: bool = False,
         candidate_mutation: str | None = None,
         expected_candidate_exit: int = 3,
-    ) -> None:
+        source_binding: dict[str, object] | None = None,
+    ) -> dict[str, object] | None:
         profile = _hermetic_profile(profile_id)
         profile, manifest, users = _small_profile(profile)
         if transport_failure:
@@ -814,6 +816,32 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     )
                 )
         report_marker = str(manifest["marker"])
+        app_target_sha = SOURCE_SHA
+        source_binding_digest: str | None = None
+        source_binding_b64 = ""
+        if source_binding is not None:
+            app_value = source_binding.get("app_target_sha")
+            if not isinstance(app_value, str):
+                raise AssertionError("source-binding test fixture lacks app target SHA")
+            app_target_sha = app_value
+            canonical_binding = json.dumps(
+                source_binding,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            source_binding_digest = hashlib.sha256(canonical_binding).hexdigest()
+            source_binding_b64 = base64.b64encode(canonical_binding).decode("ascii")
+            manifest.update(
+                {
+                    "schema": 2,
+                    "runner_sha": SOURCE_SHA,
+                    "app_target_sha": app_target_sha,
+                    "source_binding": source_binding,
+                    "source_binding_sha256": source_binding_digest,
+                }
+            )
         candidate_debug: dict[str, object] = {}
 
         def request(origin: str, user: VirtualUser, **kwargs: object) -> RequestResult:
@@ -1064,6 +1092,9 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             manifest_path.write_text("{}\n", encoding="utf-8")
             os_env = {
                 "SOURCE_GIT_SHA": SOURCE_SHA,
+                "APP_TARGET_SHA": app_target_sha,
+                "SOURCE_BINDING_BASE64": source_binding_b64,
+                "SOURCE_BINDING_SHA256": source_binding_digest or "",
                 "GITHUB_RUN_ID": RUN_ID,
                 "GITHUB_RUN_ATTEMPT": "1",
             }
@@ -1111,7 +1142,21 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 ),
             )
             if candidate_mutation is not None:
-                return
+                return None
+            if source_binding is not None:
+                canonical_digest = hashlib.sha256(
+                    json.dumps(
+                        source_binding,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("ascii")
+                ).hexdigest()
+                self.assertEqual(candidate["source_git_sha"], SOURCE_SHA)
+                self.assertEqual(candidate["app_target_sha"], app_target_sha)
+                self.assertEqual(candidate["source_binding"], source_binding)
+                self.assertEqual(candidate["source_binding_sha256"], canonical_digest)
             self.assertTrue(candidate["acceptance"]["pending_origin_evidence"])
             self.assertFalse(candidate["acceptance"]["passed"])
             if transport_failure:
@@ -1144,6 +1189,14 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             artifact_dir = root / "candidate-artifacts"
             artifact_dir.mkdir()
             receipt_path = artifact_dir / "load-status.json"
+            input_path = root / "external-input.json"
+            input_payload: dict[str, object] = {
+                "schema": 2 if source_binding is not None else 1,
+                "target_sha": SOURCE_SHA,
+            }
+            if source_binding is not None:
+                input_payload["source_binding"] = source_binding
+            input_path.write_text(json.dumps(input_payload) + "\n", encoding="ascii")
             receipt_script = _python_block(
                 load_step,
                 '/usr/bin/python3 - "$artifact_dir/load-status.json"',
@@ -1152,13 +1205,18 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 [
                     sys.executable, "-c", receipt_script,
                     str(receipt_path), "0", "3", "pending_origin", "1",
-                    SOURCE_SHA, RUN_ID, "1", str(profile["profile_id"]), str(report_path),
+                    SOURCE_SHA, app_target_sha, source_binding_digest or "", RUN_ID, "1",
+                    str(profile["profile_id"]), str(report_path), str(input_path),
                 ],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(receipt_write.returncode, 0, receipt_write.stderr)
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             self.assertEqual(receipt["report_sha256"], hashlib.sha256(report_path.read_bytes()).hexdigest())
+            self.assertEqual(receipt["runner_sha"], SOURCE_SHA)
+            self.assertEqual(receipt["app_target_sha"], app_target_sha)
+            self.assertEqual(receipt["source_binding"], source_binding)
+            self.assertEqual(receipt["source_binding_sha256"], source_binding_digest)
             receipt_script = _python_block(
                 evaluate_step,
                 'if /usr/bin/python3 - "$load_status_file"',
@@ -1166,8 +1224,9 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             receipt_check = subprocess.run(
                 [
                     sys.executable, "-c", receipt_script,
-                    str(receipt_path), str(report_path), SOURCE_SHA, RUN_ID,
-                    "1", str(profile["profile_id"]), "false",
+                    str(receipt_path), str(report_path), str(input_path),
+                    SOURCE_SHA, app_target_sha, RUN_ID, "1",
+                    str(profile["profile_id"]), "false",
                 ],
                 capture_output=True, text=True, check=False,
             )
@@ -1201,6 +1260,12 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             }[profile["acceptance"]["kind"]]
             self.assertEqual(evaluated["acceptance"]["decision"], expected_decision)
             self.assertTrue(evaluated["report_binding"]["complete"])
+            self.assertEqual(evaluated["source_git_sha"], SOURCE_SHA)
+            self.assertEqual(evaluated["app_target_sha"], app_target_sha)
+            self.assertEqual(evaluated["source_binding"], source_binding)
+            self.assertEqual(
+                evaluated["source_binding_sha256"], source_binding_digest
+            )
 
             # Run the actual YAML sanitizer over the exact public evidence set.
             runner_temp = root / "runner"
@@ -1262,6 +1327,17 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             self.assertEqual(final_gate.returncode, 1)
             self.assertIn("profile-budget", final_gate.stderr)
 
+            sanitized_report = json.loads(
+                (client / "external-load.json").read_text(encoding="utf-8")
+            )
+            if source_binding is not None:
+                self.assertEqual(sanitized_report["source_git_sha"], SOURCE_SHA)
+                self.assertEqual(sanitized_report["app_target_sha"], app_target_sha)
+                self.assertEqual(sanitized_report["source_binding"], source_binding)
+                self.assertEqual(
+                    sanitized_report["source_binding_sha256"], source_binding_digest
+                )
+
             # The actual evaluator stays fail-closed for a forged source or
             # incomplete origin, despite the workflow-only completion mode.
             forged = deepcopy(evaluated)
@@ -1279,6 +1355,13 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                         ),
                         1,
                     )
+            return {
+                "candidate": candidate,
+                "receipt": receipt,
+                "evaluated": evaluated,
+                "sanitized": sanitized_report,
+                "final_gate_exit": final_gate.returncode,
+            }
 
 
 if __name__ == "__main__":

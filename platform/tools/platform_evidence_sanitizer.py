@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -987,6 +988,9 @@ PUBLIC_BINDING_CHECK_KEYS = frozenset(
         "mode",
         "environment",
         "source_git_sha",
+        "app_target_sha",
+        "source_binding",
+        "source_binding_sha256",
         "run_identity",
         "authoritative",
         "dispatchable",
@@ -1720,6 +1724,156 @@ def _safe_profile_digest(value: Any) -> str | None:
     return None
 
 
+_SOURCE_BINDING_KEYS = frozenset(
+    {
+        "schema",
+        "binding_mode",
+        "runner_sha",
+        "app_target_sha",
+        "baseline_identity",
+        "receipt_document_sha256",
+        "receipt_artifact_id",
+        "receipt_artifact_name",
+        "receipt_artifact_digest",
+        "receipt_archive_sha256",
+        "cumulative_manifest_sha256",
+        "source_security_run_id",
+        "source_security_run_attempt",
+        "autodeploy_run_id",
+        "autodeploy_run_attempt",
+        "production_deploy_run_id",
+        "production_deploy_run_attempt",
+    }
+)
+_SOURCE_BASELINE_KEYS = frozenset(
+    {
+        "schema",
+        "source_sha",
+        "release_slug",
+        "release_json_sha256",
+        "current_link_dev",
+        "current_link_ino",
+        "release_dev",
+        "release_ino",
+        "pending_operation",
+    }
+)
+
+
+def _project_source_identity(source: dict[str, Any], output: dict[str, Any]) -> None:
+    """Preserve only a closed, digest-bound runner/app identity tuple."""
+
+    runner_sha = source.get("source_git_sha")
+    app_target_sha = source.get("app_target_sha")
+    binding = source.get("source_binding")
+    binding_digest = source.get("source_binding_sha256")
+    if runner_sha is None and app_target_sha is None and binding is None and binding_digest is None:
+        return
+    report_binding = _mapping(source.get("report_binding"))
+    binding_checks = _mapping(report_binding.get("checks"))
+    required_checks = (
+        "source_git_sha",
+        "app_target_sha",
+        "source_binding",
+        "source_binding_sha256",
+    )
+    if (
+        runner_sha is not None
+        and app_target_sha is None
+        and binding is None
+        and binding_digest is None
+        and not any(key in binding_checks for key in required_checks[1:])
+    ):
+        # Older, same-source diagnostic reports exposed only a runner SHA.
+        # Keep that legacy value private; canonical reports use the complete
+        # four-check identity contract below.
+        return
+    if not all(binding_checks.get(key) is True for key in required_checks):
+        raise ValueError("external load source binding checks are missing")
+    if not isinstance(runner_sha, str) or re.fullmatch(r"[0-9a-f]{40}", runner_sha) is None:
+        raise ValueError("external load runner source identity is malformed")
+    if not isinstance(app_target_sha, str) or re.fullmatch(r"[0-9a-f]{40}", app_target_sha) is None:
+        raise ValueError("external load app target identity is malformed")
+    if binding is None:
+        if app_target_sha != runner_sha or binding_digest is not None:
+            raise ValueError("external load same-source binding is inconsistent")
+        output["source_git_sha"] = runner_sha
+        output["app_target_sha"] = app_target_sha
+        output["source_binding"] = None
+        output["source_binding_sha256"] = None
+        return
+    if not isinstance(binding, dict) or set(binding) != _SOURCE_BINDING_KEYS:
+        raise ValueError("external load no-op source binding schema is malformed")
+    if (
+        type(binding.get("schema")) is not int
+        or binding.get("schema") != 1
+        or binding.get("binding_mode") != "verified-noop"
+        or binding.get("runner_sha") != runner_sha
+        or binding.get("app_target_sha") != app_target_sha
+        or runner_sha == app_target_sha
+    ):
+        raise ValueError("external load no-op source identity is inconsistent")
+    baseline = binding.get("baseline_identity")
+    if (
+        not isinstance(baseline, dict)
+        or set(baseline) != _SOURCE_BASELINE_KEYS
+        or type(baseline.get("schema")) is not int
+        or baseline.get("schema") != 1
+        or baseline.get("source_sha") != app_target_sha
+        or not isinstance(baseline.get("release_slug"), str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", baseline["release_slug"]) is None
+        or not isinstance(baseline.get("release_json_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", baseline["release_json_sha256"]) is None
+        or baseline.get("pending_operation") is not False
+    ):
+        raise ValueError("external load active release tuple is malformed")
+    for key in ("current_link_dev", "release_dev"):
+        if type(baseline.get(key)) is not int or baseline[key] < 0:
+            raise ValueError("external load active release device is malformed")
+    for key in ("current_link_ino", "release_ino"):
+        if type(baseline.get(key)) is not int or baseline[key] <= 0:
+            raise ValueError("external load active release inode is malformed")
+    run_values = (
+        binding.get("receipt_artifact_id"),
+        binding.get("source_security_run_id"),
+        binding.get("source_security_run_attempt"),
+        binding.get("autodeploy_run_id"),
+        binding.get("autodeploy_run_attempt"),
+        binding.get("production_deploy_run_id"),
+        binding.get("production_deploy_run_attempt"),
+    )
+    if any(not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,31}", value) is None for value in run_values):
+        raise ValueError("external load source run identity is malformed")
+    deploy_id = binding["production_deploy_run_id"]
+    deploy_attempt = binding["production_deploy_run_attempt"]
+    if binding.get("receipt_artifact_name") != f"platform-production-noop-source-receipt-{deploy_id}-{deploy_attempt}":
+        raise ValueError("external load source receipt artifact name is malformed")
+    if (
+        not isinstance(binding.get("receipt_document_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding["receipt_document_sha256"]) is None
+        or not isinstance(binding.get("cumulative_manifest_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding["cumulative_manifest_sha256"]) is None
+        or not isinstance(binding.get("receipt_archive_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding["receipt_archive_sha256"]) is None
+        or not isinstance(binding.get("receipt_artifact_digest"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", binding["receipt_artifact_digest"]) is None
+        or binding["receipt_artifact_digest"].removeprefix("sha256:") != binding["receipt_archive_sha256"]
+    ):
+        raise ValueError("external load source receipt digest is malformed")
+    try:
+        canonical = json.dumps(
+            binding, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("external load source binding is not canonical JSON") from exc
+    if not isinstance(binding_digest, str) or hashlib.sha256(canonical).hexdigest() != binding_digest:
+        raise ValueError("external load source binding digest does not match")
+    output["source_git_sha"] = runner_sha
+    output["app_target_sha"] = app_target_sha
+    output["source_binding"] = dict(binding)
+    output["source_binding_sha256"] = binding_digest
+
+
 def _safe_queryid(value: Any) -> str | None:
     """Keep PostgreSQL's numeric query identifier without an unbounded echo."""
 
@@ -1747,6 +1901,7 @@ def _project_external_load(value: Any) -> dict[str, Any]:
         "public_projection": True,
         "authoritative": False,
     }
+    _project_source_identity(source, output)
     passed = _copy_bool(source, "passed")
     if passed is not None:
         output["passed"] = passed

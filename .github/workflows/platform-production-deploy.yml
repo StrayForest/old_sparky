@@ -1153,6 +1153,7 @@ jobs:
           grep -Fqx "source_sha=$HOST_TOOLS_SHA" "$inner_root/capabilities.txt"
           grep -Fqx "capability=production_deploy_control" "$inner_root/capabilities.txt"
           grep -Fqx "capability=retained_load_export_cleanup" "$inner_root/capabilities.txt"
+          grep -Fqx "capability=retained_load_source_binding" "$inner_root/capabilities.txt"
           grep -Fqx "capability=python_isolated" "$inner_root/capabilities.txt"
           grep -Fqx "capability=python_bytecode_disabled" "$inner_root/capabilities.txt"
           grep -Fqx '"schema":1,' "$inner_root/manifest.json" || grep -Fq '"schema":1' "$inner_root/manifest.json"
@@ -1473,7 +1474,7 @@ jobs:
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
           remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
-          expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=3 artifact_prepare=2 supervisor=3 input_guard=1 release_baseline=1 retained_load_export_cleanup=1 python_isolated=1 python_bytecode_disabled=1"
+          expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 retained_load_export_cleanup=1 retained_load_source_binding=1 python_isolated=1 python_bytecode_disabled=1"
           expected_bytes="$(printf '%s\n' "$expected_output" | wc -c | tr -d '[:space:]')"
           expected_sha256="$(printf '%s\n' "$expected_output" | sha256sum | cut -d' ' -f1)"
           # The file-size limit bounds the remote process, while ``head`` caps
@@ -1950,6 +1951,174 @@ jobs:
           target_source="$GITHUB_WORKSPACE"
           test "$(git -C "$target_source" rev-parse HEAD)" = "$TARGET_SHA"
           git -C "$target_source" status --porcelain=v1 --untracked-files=all -- platform
+
+  publish-noop-source-receipt:
+    name: Publish exact non-runtime no-op source receipt
+    needs:
+      - validate-dispatch
+      - validate-classifier
+      - host-capability-preflight
+      - validate-active-baseline
+    if: >-
+      !cancelled() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'baseline-reconcile' &&
+      needs.validate-dispatch.result == 'success' &&
+      needs.validate-classifier.result == 'success' &&
+      needs.host-capability-preflight.result == 'success' &&
+      needs.validate-active-baseline.result == 'success' &&
+      needs.validate-active-baseline.outputs.cumulative_no_op == 'true' &&
+      needs.validate-active-baseline.outputs.runtime_required == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      ACTIVE_BASELINE_JSON: ${{ needs.host-capability-preflight.outputs.baseline_identity }}
+      INCREMENTAL_MANIFEST_B64: ${{ needs.validate-classifier.outputs.incremental_manifest_b64 }}
+      EXPECTED_CUMULATIVE_SHA256: ${{ needs.validate-active-baseline.outputs.cumulative_manifest_sha256 }}
+      SOURCE_SECURITY_RUN_ID: ${{ inputs.classifier_run_id }}
+      SOURCE_SECURITY_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt }}
+      AUTODEPLOY_RUN_ID: ${{ inputs.autodeploy_run_id }}
+      AUTODEPLOY_RUN_ATTEMPT: ${{ inputs.autodeploy_run_attempt }}
+    steps:
+      - name: Checkout exact reviewed runner source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build the exact no-op receipt document
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          receipt_dir="$RUNNER_TEMP/platform-noop-source-receipt"
+          mkdir -m 700 -- "$receipt_dir"
+          /usr/bin/python3 - "$receipt_dir/platform-production-noop-source-receipt.json" "$GITHUB_OUTPUT" <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          sys.path.insert(0, str(Path.cwd() / "platform"))
+          from tools.platform_deploy_baseline import (
+              classify_cumulative_baseline,
+              validate_cumulative_reconcile_route,
+          )
+          from tools.platform_noop_source_binding import (
+              build_noop_receipt_document,
+              write_receipt_artifact_file,
+          )
+
+          receipt_path, output_path = map(Path, sys.argv[1:])
+          runner_sha = os.environ.get("TARGET_SHA", "")
+          if re.fullmatch(r"[0-9a-f]{40}", runner_sha) is None:
+              raise SystemExit("no-op receipt runner SHA is malformed")
+          decimal = re.compile(r"[1-9][0-9]{0,31}\Z")
+          identities = {
+              "production_deploy_run_id": os.environ.get("GITHUB_RUN_ID", ""),
+              "production_deploy_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+              "source_security_run_id": os.environ.get("SOURCE_SECURITY_RUN_ID", ""),
+              "source_security_run_attempt": os.environ.get("SOURCE_SECURITY_RUN_ATTEMPT", ""),
+              "autodeploy_run_id": os.environ.get("AUTODEPLOY_RUN_ID", ""),
+              "autodeploy_run_attempt": os.environ.get("AUTODEPLOY_RUN_ATTEMPT", ""),
+          }
+          if any(decimal.fullmatch(value) is None for value in identities.values()):
+              raise SystemExit("no-op receipt run identity is malformed")
+          try:
+              baseline = json.loads(os.environ["ACTIVE_BASELINE_JSON"])
+              incremental = json.loads(
+                  base64.b64decode(os.environ["INCREMENTAL_MANIFEST_B64"], validate=True)
+              )
+          except (KeyError, UnicodeError, json.JSONDecodeError, ValueError):
+              raise SystemExit("no-op receipt provenance input is malformed") from None
+          if not isinstance(baseline, dict) or not isinstance(incremental, dict):
+              raise SystemExit("no-op receipt provenance input is malformed")
+          baseline_sha = baseline.get("source_sha")
+          if not isinstance(baseline_sha, str) or re.fullmatch(r"[0-9a-f]{40}", baseline_sha) is None:
+              raise SystemExit("no-op receipt active baseline source is malformed")
+          first_parent = subprocess.run(
+              ["git", "rev-list", "--first-parent", "--max-count=8193", runner_sha],
+              check=True,
+              capture_output=True,
+              text=True,
+              encoding="ascii",
+          ).stdout.splitlines()
+          if len(first_parent) > 8192 or baseline_sha not in first_parent:
+              raise SystemExit("no-op receipt baseline is not a bounded first-parent ancestor")
+          raw_paths = subprocess.run(
+              ["git", "diff", "--name-only", "-z", "--no-renames", baseline_sha, runner_sha],
+              check=True,
+              capture_output=True,
+          ).stdout
+          try:
+              cumulative_paths = [
+                  item.decode("utf-8", "strict")
+                  for item in raw_paths.split(b"\0")
+                  if item
+              ]
+          except UnicodeDecodeError:
+              raise SystemExit("no-op receipt changed-file list is invalid UTF-8") from None
+          cumulative_result = classify_cumulative_baseline(
+              incremental,
+              cumulative_paths,
+              expected_target_sha=runner_sha,
+          )
+          if not isinstance(cumulative_result, dict) or set(cumulative_result) != {"manifest", "no_op"}:
+              raise SystemExit("no-op receipt cumulative classification is malformed")
+          route = validate_cumulative_reconcile_route(cumulative_result)
+          if route != {"no_op": True, "runtime_required": False}:
+              raise SystemExit("no-op receipt route is not the exact non-runtime route")
+          manifest_bytes = json.dumps(
+              cumulative_result["manifest"], sort_keys=True, separators=(",", ":")
+          ).encode("utf-8")
+          cumulative_digest = hashlib.sha256(manifest_bytes).hexdigest()
+          if cumulative_digest != os.environ.get("EXPECTED_CUMULATIVE_SHA256"):
+              raise SystemExit("no-op receipt cumulative manifest differs from the authorized route")
+          document = build_noop_receipt_document(
+              runner_sha=runner_sha,
+              production_deploy_run_id=identities["production_deploy_run_id"],
+              production_deploy_run_attempt=identities["production_deploy_run_attempt"],
+              source_security_run_id=identities["source_security_run_id"],
+              source_security_run_attempt=identities["source_security_run_attempt"],
+              autodeploy_run_id=identities["autodeploy_run_id"],
+              autodeploy_run_attempt=identities["autodeploy_run_attempt"],
+              baseline_identity=baseline,
+              incremental_manifest=incremental,
+              cumulative_result=cumulative_result,
+          )
+          digest = write_receipt_artifact_file(receipt_path, document)
+          metadata = receipt_path.lstat()
+          if metadata.st_nlink != 1 or metadata.st_size > 1024 * 1024:
+              raise SystemExit("no-op receipt artifact metadata is unsafe")
+          with output_path.open("a", encoding="utf-8") as output:
+              output.write(f"receipt_sha256={digest}\n")
+          print("exact non-runtime no-op receipt prepared")
+          PY
+      - name: Publish exact no-op source receipt
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-noop-source-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-noop-source-receipt/platform-production-noop-source-receipt.json
+          if-no-files-found: error
+          retention-days: 2
+      - name: Remove private no-op receipt source
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f -- "$RUNNER_TEMP/platform-noop-source-receipt/platform-production-noop-source-receipt.json"
 
   validate-recovery-baseline:
     name: Authenticate exact report-only failed release and active baseline

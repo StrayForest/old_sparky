@@ -9,6 +9,7 @@ existing external client.  It never runs the measured generator on the origin.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Iterator, Mapping
 import hashlib
 import json
@@ -1316,6 +1317,35 @@ def _report_binding(profile: Mapping[str, Any], report: Mapping[str, Any]) -> di
         and SOURCE_SHA_RE.fullmatch(expected_source) is not None
         and actual_source == expected_source
     )
+    try:
+        expected_app_target, expected_source_binding, expected_binding_digest = (
+            _source_binding_identity()
+        )
+        app_identity_valid = True
+    except LoadProfileError:
+        expected_app_target = ""
+        expected_source_binding = None
+        expected_binding_digest = None
+        app_identity_valid = False
+    actual_app_target = report.get("app_target_sha")
+    if actual_app_target is None and expected_source_binding is None:
+        # Preserve the historical same-source report path: with no receipt,
+        # the checked-out runner SHA itself is the only permitted app target.
+        actual_app_target = actual_source
+    app_source_ok = (
+        app_identity_valid
+        and isinstance(actual_app_target, str)
+        and SOURCE_SHA_RE.fullmatch(actual_app_target) is not None
+        and actual_app_target == expected_app_target
+    )
+    source_binding_ok = (
+        report.get("source_binding") == expected_source_binding
+        and (
+            report.get("source_binding") is None
+            or isinstance(report.get("source_binding"), Mapping)
+        )
+    )
+    binding_digest_ok = report.get("source_binding_sha256") == expected_binding_digest
 
     expected_run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
     actual_run_id = report.get("external_run_id")
@@ -1359,6 +1389,9 @@ def _report_binding(profile: Mapping[str, Any], report: Mapping[str, Any]) -> di
         and _exact_value(actual_contract_mapping.get("environment"), expected_environment)
         and _exact_value(contract_environment, expected_environment),
         "source_git_sha": source_ok,
+        "app_target_sha": app_source_ok,
+        "source_binding": source_binding_ok,
+        "source_binding_sha256": binding_digest_ok,
         "run_identity": run_identity_ok,
         "authoritative": report.get("authoritative") is True,
         "dispatchable": report.get("dispatchable") is True,
@@ -1376,6 +1409,8 @@ def _report_binding(profile: Mapping[str, Any], report: Mapping[str, Any]) -> di
             "mode": expected_mode,
             "environment": expected_environment,
             "source_git_sha": expected_source or None,
+            "app_target_sha": expected_app_target or None,
+            "source_binding_sha256": expected_binding_digest,
             "external_run_id": expected_run_id or None,
         },
         "actual": {
@@ -1387,6 +1422,8 @@ def _report_binding(profile: Mapping[str, Any], report: Mapping[str, Any]) -> di
             "environment": report.get("environment"),
             "contract_environment": contract_environment,
             "source_git_sha": actual_source,
+            "app_target_sha": actual_app_target,
+            "source_binding_sha256": report.get("source_binding_sha256"),
             "external_run_id": actual_run_id,
         },
         "unexpected_contract_fields": unexpected_contract_fields,
@@ -1525,6 +1562,62 @@ def _source_git_sha() -> str:
     return candidate
 
 
+def _source_binding_identity() -> tuple[str, dict[str, Any] | None, str | None]:
+    """Validate the workflow-provided runner/app source handoff.
+
+    The resolver validates the API artifact and receipt before creating the
+    private input. This runner-side check binds the same canonical bytes to
+    the fixture and report; it never accepts an app target from a user input.
+    """
+
+    runner_sha = _source_git_sha()
+    app_target_sha = os.environ.get("APP_TARGET_SHA", "").strip() or runner_sha
+    if SOURCE_SHA_RE.fullmatch(app_target_sha) is None:
+        raise LoadProfileError("APP_TARGET_SHA must be a lowercase 40-character SHA")
+    encoded = os.environ.get("SOURCE_BINDING_BASE64", "")
+    expected_digest = os.environ.get("SOURCE_BINDING_SHA256", "")
+    if not encoded:
+        if app_target_sha != runner_sha or expected_digest:
+            raise LoadProfileError("mismatched app source lacks a verified source binding")
+        return app_target_sha, None, None
+    if not expected_digest or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+        raise LoadProfileError("SOURCE_BINDING_SHA256 is malformed")
+    try:
+        try:
+            from tools.platform_noop_source_binding import (
+                parse_source_binding_argument,
+                validate_active_runtime_tuple,
+            )
+        except ModuleNotFoundError:  # Direct execution from platform/tools.
+            from platform_noop_source_binding import (
+                parse_source_binding_argument,
+                validate_active_runtime_tuple,
+            )
+        binding = parse_source_binding_argument(encoded)
+        canonical = json.dumps(
+            binding,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        if (
+            base64.b64encode(canonical).decode("ascii") != encoded
+            or hashlib.sha256(canonical).hexdigest() != expected_digest
+            or binding.get("runner_sha") != runner_sha
+            or binding.get("app_target_sha") != app_target_sha
+        ):
+            raise ValueError("source binding does not match the workflow identities")
+        validate_active_runtime_tuple(
+            binding,
+            binding.get("baseline_identity"),
+            expected_runner_sha=runner_sha,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise LoadProfileError("SOURCE_BINDING_BASE64 failed closed validation") from exc
+    return app_target_sha, binding, expected_digest
+
+
 def _external_run_id() -> str:
     """Return the explicit GitHub workflow run identity."""
 
@@ -1568,6 +1661,9 @@ def run_profile_worker(
     try:
         source_git_sha = _source_git_sha()
         external_run_id = _external_run_id()
+        app_target_sha, source_binding, source_binding_sha256 = (
+            _source_binding_identity()
+        )
     except LoadProfileError as exc:
         _write_failed_report(
             profile,
@@ -1590,6 +1686,15 @@ def run_profile_worker(
         return 1
     try:
         manifest, users = load_manifest(manifest_path)
+        manifest_app_target = manifest.get("app_target_sha", source_git_sha)
+        manifest_binding = manifest.get("source_binding")
+        manifest_binding_digest = manifest.get("source_binding_sha256")
+        if (
+            manifest_app_target != app_target_sha
+            or manifest_binding != source_binding
+            or manifest_binding_digest != source_binding_sha256
+        ):
+            raise ExternalLoadError("fixture manifest source binding differs from workflow")
     except ExternalLoadError as exc:
         _write_failed_report(profile, contract, report_path, exc)
         print(
@@ -1659,6 +1764,9 @@ def run_profile_worker(
                 "profile_version": contract["profile_version"],
                 "profile_digest": contract["profile_digest"],
                 "source_git_sha": source_git_sha,
+                "app_target_sha": app_target_sha,
+                "source_binding": source_binding,
+                "source_binding_sha256": source_binding_sha256,
                 "external_run_id": external_run_id,
             },
             expected_profile_id=str(contract["profile_id"]),
@@ -1703,6 +1811,9 @@ def run_profile_worker(
     if report is None:
         return 1
     report["source_git_sha"] = source_git_sha
+    report["app_target_sha"] = app_target_sha
+    report["source_binding"] = source_binding
+    report["source_binding_sha256"] = source_binding_sha256
     report["external_run_id"] = external_run_id
     report["schema"] = REPORT_SCHEMA
     report["measurement_schema"] = MEASUREMENT_SCHEMA
@@ -1846,6 +1957,9 @@ def run_profile(
     try:
         source_git_sha = _source_git_sha()
         external_run_id = _external_run_id()
+        app_target_sha, source_binding, source_binding_sha256 = (
+            _source_binding_identity()
+        )
     except LoadProfileError as exc:
         _write_failed_report(
             profile,
@@ -1888,6 +2002,9 @@ def run_profile(
             "timeout_diagnostics_run_id": timeout_diagnostics_run_id,
             "binding": {
                 "source_git_sha": source_git_sha,
+                "app_target_sha": app_target_sha,
+                "source_binding": source_binding,
+                "source_binding_sha256": source_binding_sha256,
                 "external_run_id": external_run_id,
             },
         }

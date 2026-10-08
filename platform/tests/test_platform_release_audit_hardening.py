@@ -2476,6 +2476,23 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 workflow += "\n" + (
                     PLATFORM_ROOT / "tools/platform_live_launch_supervisor.sh"
                 ).read_text(encoding="utf-8")
+            elif name == "platform-live-user-qa.yml":
+                workflow += "\n" + (
+                    PLATFORM_ROOT / "tools/platform_workflow_remote_dispatch.py"
+                ).read_text(encoding="utf-8")
+                workflow += "\n" + (
+                    PLATFORM_ROOT / "tools/platform_live_user_qa_trusted.sh"
+                ).read_text(encoding="utf-8")
+                workflow += "\n" + (
+                    PLATFORM_ROOT / "tools/platform_live_user_qa_dispatch.py"
+                ).read_text(encoding="utf-8")
+                self.assertIn(
+                    "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
+                    workflow,
+                    name,
+                )
+                self.assertIn('"--expected-sha",', workflow, name)
+                self.assertIn('str(RELEASE_LOCK_EXEC)', workflow, name)
             self.assertIn("platform_release_lock_exec.sh", workflow, name)
             self.assertIn("--expected-sha", workflow, name)
 
