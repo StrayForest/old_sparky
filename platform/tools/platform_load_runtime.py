@@ -67,19 +67,6 @@ _WORKER_FAILURE_STAGES = frozenset(
         "other",
     }
 )
-_WORKER_EXCEPTION_CLASSES = {
-    AssertionError: "assertion_error",
-    KeyError: "key_error",
-    json.JSONDecodeError: "json_decode_error",
-    NamespaceIntegrityError: "namespace_integrity_error",
-    OSError: "os_error",
-    OverflowError: "overflow_error",
-    RuntimeError: "runtime_error",
-    TimeoutError: "timeout_error",
-    TypeError: "type_error",
-    UnicodeDecodeError: "unicode_decode_error",
-    ValueError: "value_error",
-}
 _WORKER_FAILURE_MODULE_FILES = {
     "platform_load_runtime.py": "load_runtime",
     "platform_load_worker.py": "load_worker",
@@ -124,6 +111,21 @@ class NamespaceCapabilityError(RuntimeError):
 
 class NamespaceIntegrityError(RuntimeError):
     """The trusted namespace bootstrap observed an identity/race violation."""
+
+
+_WORKER_EXCEPTION_CLASSES = {
+    AssertionError: "assertion_error",
+    KeyError: "key_error",
+    json.JSONDecodeError: "json_decode_error",
+    NamespaceIntegrityError: "namespace_integrity_error",
+    OSError: "os_error",
+    OverflowError: "overflow_error",
+    RuntimeError: "runtime_error",
+    TimeoutError: "timeout_error",
+    TypeError: "type_error",
+    UnicodeDecodeError: "unicode_decode_error",
+    ValueError: "value_error",
+}
 
 
 class LoadRuntimeBudgetExceeded(RuntimeError):
