@@ -1,5 +1,12 @@
+import asyncio
 import unittest
+from pathlib import Path
+import shutil
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+from tools import platform_production_qa
 from tools.platform_production_qa import (
     HttpMetricsRecorder,
     HttpSample,
@@ -86,6 +93,284 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
         )
         self.assertEqual(result["postgres_backend_ownership"]["other"]["max"], 1)
         self.assertTrue(result["postgres_backend_ownership_consistency"]["all_match"])
+
+    def test_scoped_process_resources_preserve_reported_groups_and_skip_unclassified_io(self) -> None:
+        labels = {
+            "deadlock-api": (
+                "python3",
+                "gunicorn apps.platform_api.app.main:app",
+            ),
+            "deadlock-web": (
+                "node",
+                "node /platform/apps/platform_web/server.js",
+            ),
+            "deadlock-worker": (
+                "celery",
+                "celery -A apps.platform_worker.worker:celery_app worker",
+            ),
+            "postgresql": ("postgres", "postgres: platformdb idle"),
+            "redis-server": ("redis-server", "redis-server 127.0.0.1:6379"),
+            "nginx": ("nginx", "nginx: worker process"),
+            "load-generator": (
+                "python3",
+                "python platform_production_qa.py --profile write-burst",
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fake_proc = Path(temporary_directory) / "proc"
+            fake_proc.mkdir()
+            (fake_proc / "loadavg").write_text(
+                "0.10 0.20 0.30 1/1 1\n", encoding="utf-8"
+            )
+            process_count = 189
+            entries = list(labels.values()) + [
+                ("python3", f"unrelated-task-{index}")
+                for index in range(process_count - len(labels))
+            ]
+
+            def write_process(
+                root: Path,
+                pid: int,
+                comm: str,
+                cmdline: str,
+                offset: int,
+            ) -> None:
+                child = root / str(pid)
+                child.mkdir()
+                stat_columns = ["S", "1"] + ["0"] * 9 + [str(min(10 + offset, 20)), "3"] + [
+                    "0"
+                ] * 6 + [str(100 + offset)]
+                (child / "stat").write_text(
+                    f"{pid} ({comm}) {' '.join(stat_columns)}\n",
+                    encoding="utf-8",
+                )
+                (child / "comm").write_text(comm + "\n", encoding="utf-8")
+                (child / "cmdline").write_bytes(cmdline.encode() + b"\0")
+                (child / "io").write_text(
+                    f"read_bytes: {100 + offset}\nwrite_bytes: {200 + offset}\n",
+                    encoding="utf-8",
+                )
+                (child / "status").write_text(
+                    f"Name:\t{comm}\nVmRSS:\t{10 + offset} kB\n",
+                    encoding="utf-8",
+                )
+
+            for offset, (comm, cmdline) in enumerate(entries):
+                pid = 1000 + offset
+                write_process(fake_proc, pid, comm, cmdline, offset)
+
+            original_path = Path
+            def path_factory(value: str | Path) -> Path:
+                raw_path = str(value)
+                if raw_path == "/proc":
+                    return fake_proc
+                if raw_path.startswith("/proc/"):
+                    return fake_proc / raw_path.removeprefix("/proc/")
+                return original_path(value)
+            with (
+                patch.object(platform_production_qa, "Path", new=path_factory),
+                patch.object(platform_production_qa, "read_boot_time_epoch", return_value=1_000.0),
+                patch.object(
+                    platform_production_qa,
+                    "read_process_io",
+                    wraps=platform_production_qa.read_process_io,
+                ) as read_io,
+                patch.object(
+                    platform_production_qa,
+                    "read_process_rss_bytes",
+                    wraps=platform_production_qa.read_process_rss_bytes,
+                ) as read_rss,
+            ):
+                full = platform_production_qa.iter_processes()
+                self.assertEqual(read_io.call_count, process_count)
+                self.assertEqual(read_rss.call_count, process_count)
+
+                read_io.reset_mock()
+                read_rss.reset_mock()
+                scoped = platform_production_qa.iter_processes(
+                    resource_metrics_for_labels=frozenset(
+                        platform_production_qa.PROCESS_LABELS
+                    )
+                )
+                self.assertEqual(read_io.call_count, len(labels))
+                self.assertEqual(read_rss.call_count, len(labels))
+
+                original_iter_processes = platform_production_qa.iter_processes
+
+                def sample_twice(*, collect_all_process_resources: bool) -> list[dict[str, object]]:
+                    original_api_process = fake_proc / "1000"
+                    replacement_api_process = fake_proc / "2000"
+                    if replacement_api_process.exists():
+                        shutil.rmtree(replacement_api_process)
+                    if not original_api_process.exists():
+                        write_process(
+                            fake_proc,
+                            1000,
+                            *labels["deadlock-api"],
+                            0,
+                        )
+                    reads = 0
+
+                    def sample_iter_processes(**kwargs: object) -> list[dict[str, object]]:
+                        nonlocal reads
+                        reads += 1
+                        if reads == 2:
+                            shutil.rmtree(original_api_process)
+                            write_process(
+                                fake_proc,
+                                2000,
+                                *labels["deadlock-api"],
+                                2000,
+                            )
+                        if collect_all_process_resources:
+                            return original_iter_processes()
+                        return original_iter_processes(
+                            resource_metrics_for_labels=frozenset(
+                                platform_production_qa.PROCESS_LABELS
+                            )
+                        )
+
+                    sampler = SystemSampler.__new__(SystemSampler)
+                    sampler.interval_seconds = 1.0
+                    sampler.samples = []
+                    sampler._task = None
+                    sampler._previous_cpu = None
+                    sampler._previous_cpu_steal = None
+                    sampler._previous_postgres_ticks = None
+                    sampler._previous_process_groups = None
+                    sampler._previous_monotonic = None
+                    sampler._api_port = 8010
+                    sampler._celery_redis = None
+
+                    async def sample_twice_async() -> None:
+                        await sampler.sample()
+                        await sampler.sample()
+
+                    with (
+                        patch.object(
+                            platform_production_qa,
+                            "iter_processes",
+                            side_effect=sample_iter_processes,
+                        ),
+                        patch.object(
+                            platform_production_qa,
+                            "time",
+                            new=SimpleNamespace(monotonic=iter((10.0, 11.0)).__next__),
+                        ),
+                        patch.object(
+                            platform_production_qa,
+                            "read_cpu_totals",
+                            side_effect=(
+                                {"cpu0": (100, 20)},
+                                {"cpu0": (120, 22)},
+                            ),
+                        ),
+                        patch.object(
+                            platform_production_qa,
+                            "read_cpu_steal_ticks",
+                            side_effect=({"cpu0": 1}, {"cpu0": 2}),
+                        ),
+                        patch.object(
+                            platform_production_qa,
+                            "read_meminfo",
+                            return_value={
+                                "MemTotal": 1_000_000,
+                                "MemAvailable": 400_000,
+                                "SwapTotal": 100_000,
+                                "SwapFree": 80_000,
+                            },
+                        ),
+                        patch.object(
+                            platform_production_qa,
+                            "read_tcp_connection_counts",
+                            side_effect=lambda _port: {"total": 3, "established": 2},
+                        ),
+                        patch.object(
+                            platform_production_qa,
+                            "read_tcp_socket_states",
+                            return_value={"established": 2, "listen": 1},
+                        ),
+                        patch.object(
+                            platform_production_qa,
+                            "read_tcp_listen_counters",
+                            return_value={"ListenOverflows": 0, "ListenDrops": 0},
+                        ),
+                        patch.object(
+                            platform_production_qa,
+                            "read_conntrack_utilization",
+                            return_value={"available": True, "current": 2, "max": 10, "percent": 20.0},
+                        ),
+                        patch.object(
+                            platform_production_qa,
+                            "sample_postgres_waits",
+                            new=AsyncMock(return_value={"lock_waiters": 0}),
+                        ),
+                        patch.object(
+                            SystemSampler,
+                            "celery_backlog",
+                            new=AsyncMock(return_value={"deadlock-platform-default": 0}),
+                        ),
+                    ):
+                        asyncio.run(sample_twice_async())
+                    return sampler.samples
+
+                full_sampler_samples = sample_twice(collect_all_process_resources=True)
+                scoped_sampler_samples = sample_twice(collect_all_process_resources=False)
+
+            self.assertEqual(len(full), process_count)
+            self.assertEqual(len(scoped), process_count)
+            self.assertEqual(
+                platform_production_qa.process_group_snapshot(full),
+                platform_production_qa.process_group_snapshot(scoped),
+            )
+            self.assertEqual(
+                platform_production_qa.process_cpu_total(
+                    full, platform_production_qa.is_postgres_process
+                ),
+                platform_production_qa.process_cpu_total(
+                    scoped, platform_production_qa.is_postgres_process
+                ),
+            )
+            self.assertEqual(
+                platform_production_qa.gunicorn_counts(full),
+                platform_production_qa.gunicorn_counts(scoped),
+            )
+            self.assertEqual(len(full_sampler_samples), 2)
+            self.assertEqual(len(scoped_sampler_samples), 2)
+            for full_sample, scoped_sample in zip(
+                full_sampler_samples, scoped_sampler_samples, strict=True
+            ):
+                self.assertEqual(
+                    {key: value for key, value in full_sample.items() if key != "timestamp"},
+                    {key: value for key, value in scoped_sample.items() if key != "timestamp"},
+                )
+            api_lifecycle = scoped_sampler_samples[1]["process_lifecycle"]["deadlock-api"]
+            self.assertEqual(api_lifecycle["new_processes"], [2000])
+            self.assertEqual(api_lifecycle["missing_processes"], [1000])
+            self.assertEqual(api_lifecycle["new_process_starts"][0]["pid"], 2000)
+            for process in scoped:
+                self.assertEqual(
+                    set(process),
+                    {
+                        "pid",
+                        "ppid",
+                        "comm",
+                        "cmdline",
+                        "utime",
+                        "stime",
+                        "start_time_ticks",
+                        "start_time",
+                        "rss_bytes",
+                        "read_bytes",
+                        "write_bytes",
+                    },
+                )
+                if platform_production_qa.process_label(process) is None:
+                    self.assertEqual(
+                        (process["rss_bytes"], process["read_bytes"], process["write_bytes"]),
+                        (0, 0, 0),
+                    )
 
     def test_burst_offsets_are_even_and_do_not_exceed_window(self) -> None:
         offsets = burst_offsets(count=5, spread_seconds=10)

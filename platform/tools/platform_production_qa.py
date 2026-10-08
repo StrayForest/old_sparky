@@ -979,7 +979,17 @@ def read_boot_time_epoch() -> float | None:
     return None
 
 
-def iter_processes() -> list[dict[str, Any]]:
+def iter_processes(
+    *, resource_metrics_for_labels: frozenset[str] | None = None
+) -> list[dict[str, Any]]:
+    """Read procfs process details, with optional scoped IO/RSS collection.
+
+    The default remains the full process record for callers that need generic
+    process telemetry. The system sampler opts into the seven labeled groups
+    it reports, avoiding per-process IO and status reads for unrelated host
+    processes while retaining their identity and CPU counters.
+    """
+
     processes: list[dict[str, Any]] = []
     proc_root = Path("/proc")
     boot_time = read_boot_time_epoch()
@@ -995,29 +1005,40 @@ def iter_processes() -> list[dict[str, Any]]:
                 "utf-8",
                 errors="replace",
             )
-            io_values = read_process_io(child)
-            processes.append(
-                {
-                    "pid": int(child.name),
-                    "ppid": ppid,
-                    "comm": comm,
-                    "cmdline": cmdline,
-                    "utime": utime,
-                    "stime": stime,
-                    "start_time_ticks": start_time_ticks,
-                    "start_time": (
-                        datetime.fromtimestamp(
-                            (boot_time or 0) + start_time_ticks / PROCESS_CLK_TCK,
-                            UTC,
-                        ).isoformat()
-                        if boot_time is not None
-                        else None
-                    ),
-                    "rss_bytes": read_process_rss_bytes(child),
-                    "read_bytes": io_values["read_bytes"],
-                    "write_bytes": io_values["write_bytes"],
-                }
+            process = {
+                "pid": int(child.name),
+                "ppid": ppid,
+                "comm": comm,
+                "cmdline": cmdline,
+                "utime": utime,
+                "stime": stime,
+                "start_time_ticks": start_time_ticks,
+                "start_time": (
+                    datetime.fromtimestamp(
+                        (boot_time or 0) + start_time_ticks / PROCESS_CLK_TCK,
+                        UTC,
+                    ).isoformat()
+                    if boot_time is not None
+                    else None
+                ),
+            }
+            collect_resource_metrics = (
+                resource_metrics_for_labels is None
+                or process_label(process) in resource_metrics_for_labels
             )
+            if collect_resource_metrics:
+                io_values = read_process_io(child)
+                process.update(
+                    {
+                        "rss_bytes": read_process_rss_bytes(child),
+                        "read_bytes": io_values["read_bytes"],
+                        "write_bytes": io_values["write_bytes"],
+                    }
+                )
+            else:
+                # Keep the generic row shape stable for every caller.
+                process.update({"rss_bytes": 0, "read_bytes": 0, "write_bytes": 0})
+            processes.append(process)
     return processes
 
 
@@ -1338,7 +1359,7 @@ class SystemSampler:
         swap_total = meminfo.get("SwapTotal", 0)
         swap_free = meminfo.get("SwapFree", 0)
         load_columns = Path("/proc/loadavg").read_text(encoding="utf-8").split()
-        processes = iter_processes()
+        processes = iter_processes(resource_metrics_for_labels=frozenset(PROCESS_LABELS))
         postgres_ticks = process_cpu_total(processes, is_postgres_process)
         process_groups = process_group_snapshot(processes)
         process_lifecycle: dict[str, dict[str, Any]] = {}

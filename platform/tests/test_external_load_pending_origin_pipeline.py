@@ -7,7 +7,7 @@ no database, remote origin, credentials, or live workflow is used.
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from copy import deepcopy
 import hashlib
 import io
@@ -18,15 +18,17 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
 import unittest
 import zipfile
 from unittest.mock import patch
 
 import yaml
 
-from tools import platform_load
+from tools import platform_external_load, platform_load
 from tools.platform_external_load import RequestResult, VirtualUser
 from tools.platform_load_runtime import PID_NAMESPACE_ISOLATION, WORKER_REPORT_SCHEMA
 from tools.platform_load_acceptance import _acceptance_budget_evidence
@@ -166,6 +168,69 @@ def _false_paths(value: object, prefix: tuple[str, ...] = ()) -> list[str]:
     if value is False:
         return [".".join(prefix)]
     return []
+
+
+def _replace_status(value: object, old_status: str, new_status: str) -> None:
+    if isinstance(value, dict):
+        for key, child in tuple(value.items()):
+            if key in {"status_counts", "final_status_counts"} and isinstance(child, dict):
+                if old_status in child:
+                    child[new_status] = child.pop(old_status)
+            elif key == "status" and child == int(old_status):
+                value[key] = int(new_status)
+            else:
+                _replace_status(child, old_status, new_status)
+    elif isinstance(value, list):
+        for child in value:
+            _replace_status(child, old_status, new_status)
+
+
+def _replace_error_class(value: object, old_class: str, new_class: str) -> None:
+    if isinstance(value, dict):
+        for key, child in tuple(value.items()):
+            if key == "error_kinds" and isinstance(child, dict) and old_class in child:
+                child[new_class] = child.pop(old_class)
+            elif key == "error_class" and child == old_class:
+                value[key] = new_class
+            else:
+                _replace_error_class(child, old_class, new_class)
+    elif isinstance(value, list):
+        for child in value:
+            _replace_error_class(child, old_class, new_class)
+
+
+def _mutate_first_failure_rate(value: object, replacement: object) -> bool:
+    if isinstance(value, dict):
+        if "final_failure_rate_percent" in value:
+            value["final_failure_rate_percent"] = replacement
+            return True
+        return any(_mutate_first_failure_rate(child, replacement) for child in value.values())
+    if isinstance(value, list):
+        return any(_mutate_first_failure_rate(child, replacement) for child in value)
+    return False
+
+
+def _remove_first_timing_marker(value: object, marker: str) -> bool:
+    if isinstance(value, dict):
+        timing = value.get("timing")
+        if isinstance(timing, dict) and marker in timing:
+            timing.pop(marker)
+            return True
+        return any(_remove_first_timing_marker(child, marker) for child in value.values())
+    if isinstance(value, list):
+        return any(_remove_first_timing_marker(child, marker) for child in value)
+    return False
+
+
+def _add_explicit_child_to_first_raw_summary(value: object) -> bool:
+    if isinstance(value, dict):
+        if "requests" in value and "status_counts" in value:
+            value["logical"] = {}
+            return True
+        return any(_add_explicit_child_to_first_raw_summary(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_add_explicit_child_to_first_raw_summary(child) for child in value)
+    return False
 
 
 class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
@@ -367,14 +432,387 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     scenario["acceptance"]["kind"], profile["acceptance"]["kind"]
                 )
 
+    def test_all_authored_builders_close_transport_and_server_failures(self) -> None:
+        for profile_id in platform_load.load_profiles():
+            profile = platform_load.get_profile(profile_id)
+            for failure_kind, expected_status, expected_error in (
+                ("transport", 0, "transport"),
+                ("http_error", 500, "server_error"),
+            ):
+                if (
+                    profile.get("client_transport") == "http1-keepalive"
+                    and failure_kind == "transport"
+                ):
+                    expected_error = "other"
+                with self.subTest(profile=profile_id, failure=failure_kind):
+                    self._exercise_closed_failure_builder(
+                        profile_id, failure_kind, expected_status, expected_error
+                    )
+
+    def test_explicit_child_boundary_disables_non_ready_raw_alias(self) -> None:
+        self._exercise_closed_failure_builder(
+            "read-mix-stress-v2",
+            "transport",
+            0,
+            "transport",
+            add_explicit_child=True,
+        )
+
+    def _exercise_closed_failure_builder(
+        self,
+        profile_id: str,
+        failure_kind: str,
+        expected_status: int,
+        expected_error: str,
+        *,
+        add_explicit_child: bool = False,
+    ) -> None:
+        profile = deepcopy(platform_load.get_profile(profile_id))
+        profile, manifest, users = _small_profile(profile)
+        if (
+            profile.get("mode") == "read-mix"
+            and profile.get("traffic", {}).get("concurrency_stages") is not None
+        ):
+            target_users = len(users)
+        elif profile.get("acceptance", {}).get("kind") == "capacity":
+            profile["traffic"]["phases"][0]["logical_actions"] = 2
+            profile["traffic"]["phases"][0]["target_logical_actions_per_second"] = 2
+            target_users = 2
+        else:
+            target_users = max(2, len(users))
+        while len(users) < target_users:
+            index = len(users) + 1
+            users.append(
+                VirtualUser(
+                    user_id=f"user-{index:08d}",
+                    tournament_slug="qa-tournament",
+                    session_token=chr(ord("s") + index) * 64,
+                    csrf_token=chr(ord("c") + index) * 64,
+                )
+            )
+        profile["fixture"]["users_per_tournament"] = target_users
+        profile["fixture"]["max_total_users"] = target_users
+        manifest["tournaments"][0]["user_count"] = target_users
+        users = [
+            VirtualUser(
+                user_id=user.user_id,
+                tournament_slug=user.tournament_slug,
+                session_token=(
+                    user.session_token
+                    if index == 0
+                    else chr(ord("s") + index) * 64
+                ),
+                csrf_token=(
+                    user.csrf_token
+                    if index == 0
+                    else chr(ord("c") + index) * 64
+                ),
+            )
+            for index, user in enumerate(users)
+        ]
+        failure_lock = threading.Lock()
+        failing_session_token = users[0].session_token
+        failing_attempts = 0
+        failed_once = False
+
+        class FakeResponse:
+            status = 200
+            headers = {"etag": '"fixture-etag"', "cf-ray": "fixture-ray"}
+
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+                self._offset = 0
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                if size is None or size < 0:
+                    size = len(self._body) - self._offset
+                chunk = self._body[self._offset : self._offset + size]
+                self._offset += len(chunk)
+                return chunk
+
+        class FakeHTTP11Response:
+            version = 11
+            reason = "synthetic"
+            will_close = False
+
+            def __init__(self, status: int) -> None:
+                self.status = status
+                self.headers = {"etag": '"fixture-etag"', "cf-ray": "fixture-ray"}
+
+            def read(self, _size: int = -1) -> bytes:
+                return b'<!doctype html><html><body>synthetic</body></html>'
+
+        def urlopen(request_object: object, *, timeout: float) -> FakeResponse:
+            nonlocal failing_attempts, failed_once
+            del timeout
+            method = request_object.get_method()
+            path = request_object.full_url
+            cookie = request_object.get_header("Cookie") or ""
+            failure_eligible = (
+                method == "POST"
+                if profile.get("mode") == "ready-vote"
+                else not path.endswith("/deadlock/ready-check")
+            )
+            with failure_lock:
+                inject_failure = (
+                    failing_session_token in cookie and failure_eligible
+                )
+                if inject_failure and profile.get("mode") != "ready-vote":
+                    inject_failure = not failed_once
+                    failed_once = True
+                if inject_failure:
+                    failing_attempts += 1
+            if inject_failure:
+                if failure_kind == "transport":
+                    raise URLError("synthetic bounded transport failure")
+                raise HTTPError(
+                    path,
+                    500,
+                    "synthetic bounded server failure",
+                    {},
+                    io.BytesIO(b'{"error":"synthetic"}'),
+                )
+            body = (
+                json.dumps(
+                    {"active_round": {"ready_count": max(0, len(users) - 1)}}
+                ).encode("ascii")
+                if path.endswith("/deadlock/ready-check")
+                else b'{"changed":true}'
+                if method == "POST"
+                else b"<!doctype html><html><body>ok</body></html>"
+            )
+            return FakeResponse(body)
+
+        def http11_request(
+            connection: object, *_args: object, **kwargs: object
+        ) -> None:
+            headers = kwargs.get("headers")
+            cookie = headers.get("Cookie", "") if isinstance(headers, dict) else ""
+            setattr(connection, "_terminal_test_cookie", cookie)
+
+        def http11_response(connection: object) -> FakeHTTP11Response:
+            nonlocal failing_attempts
+            cookie = getattr(connection, "_terminal_test_cookie", "")
+            with failure_lock:
+                inject_failure = failing_session_token in cookie
+                if inject_failure:
+                    failing_attempts += 1
+            if inject_failure and failure_kind == "transport":
+                raise OSError("synthetic bounded HTTP/1.1 transport failure")
+            return FakeHTTP11Response(
+                500 if inject_failure and failure_kind == "http_error" else 200
+            )
+
+        with tempfile.TemporaryDirectory(prefix="terminal-failure-builder-") as temporary:
+            report_path = Path(temporary) / "report.json"
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch("tools.platform_external_load.load_manifest", return_value=(manifest, users))
+                )
+                stack.enter_context(
+                    patch("tools.platform_external_load._trace", return_value={"status": "200", "ip": "192.0.2.10", "colo": "TEST"})
+                )
+                if profile.get("client_transport") == "http1-keepalive":
+                    stack.enter_context(
+                        patch("tools.platform_http_transport._TimedHTTPConnection.request", autospec=True, side_effect=http11_request)
+                    )
+                    stack.enter_context(
+                        patch("tools.platform_http_transport._TimedHTTPConnection.getresponse", autospec=True, side_effect=http11_response)
+                    )
+                else:
+                    stack.enter_context(
+                        patch("tools.platform_external_load.urlopen", side_effect=urlopen)
+                    )
+                stack.enter_context(
+                    patch("socket.socket.connect", side_effect=AssertionError("network access is forbidden in this test"))
+                )
+                stack.enter_context(
+                    patch.dict(os.environ, {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID}, clear=False)
+                )
+                with redirect_stdout(io.StringIO()):
+                    worker_exit = platform_load.run_profile_worker(
+                        profile, Path(temporary) / "manifest.json", report_path
+                    )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        report.update(
+            {
+                "worker_report_schema": WORKER_REPORT_SCHEMA,
+                "report_complete": True,
+                "namespace_closed": True,
+                "isolation": PID_NAMESPACE_ISOLATION,
+                "partial_work": False,
+                "inflight_unknown": False,
+                "worker_exit_code": worker_exit,
+                "runtime_supervisor": {
+                    "reason": "none",
+                    "returncode": worker_exit,
+                    "isolation": PID_NAMESPACE_ISOLATION,
+                    "namespace_closed": True,
+                    "descendants_reaped": True,
+                    "partial_work": False,
+                    "inflight_unknown": False,
+                    "report_error": None,
+                },
+            }
+        )
+        if add_explicit_child:
+            self.assertTrue(
+                _add_explicit_child_to_first_raw_summary(report.get("phases"))
+            )
+        result = SimpleNamespace(
+            returncode=worker_exit,
+            report=report,
+            worker_started=True,
+            worker_exited=True,
+            killed=False,
+            signal=None,
+            reason="none",
+            partial_work=False,
+            inflight_unknown=False,
+            descendants_reaped=True,
+            isolation=PID_NAMESPACE_ISOLATION,
+            namespace_closed=True,
+        )
+        with patch.dict(
+            os.environ,
+            {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID},
+            clear=False,
+        ):
+            closed_failure = platform_load._closed_terminal_status_failure(profile, report)
+            if add_explicit_child:
+                self.assertFalse(closed_failure)
+            else:
+                self.assertTrue(
+                    closed_failure,
+                    {
+                        "profile": profile_id,
+                        "failure": failure_kind,
+                        "status_counts": report.get("raw_http", {}).get("status_counts"),
+                        "error_kinds": report.get("raw_http", {}).get("error_kinds"),
+                        "contract_ok": report.get("acceptance", {}).get("contract_ok"),
+                        "passed": report.get("acceptance", {}).get("passed"),
+                        "failed_checks": {
+                            key: value
+                            for key, value in (
+                                report.get("acceptance", {}).get("checks") or {}
+                            ).items()
+                            if value is False
+                        },
+                        "raw_http": {
+                            key: report.get("raw_http", {}).get(key)
+                            for key in (
+                                "requests", "successful_responses", "errors",
+                                "unexpected_statuses", "status_counts", "error_kinds",
+                                "temporary_overload_responses",
+                            )
+                        },
+                        "summary_keys": {
+                            key: sorted(report.get(key, {}).keys())
+                            for key in ("raw_http", "overall", "logical")
+                            if isinstance(report.get(key), dict)
+                        },
+                        "logical_status_counts": report.get("logical", {}).get(
+                            "final_status_counts",
+                            report.get("logical", {}).get("status_counts"),
+                        ),
+                        "overall_status_counts": report.get("overall", {}).get(
+                            "status_counts"
+                        ),
+                    },
+                )
+            if not add_explicit_child:
+                self.assertTrue(
+                    platform_load._is_closed_pending_origin_candidate(profile, result)
+                )
+        self.assertFalse(report["acceptance"]["contract_ok"])
+        self.assertFalse(report["acceptance"]["passed"])
+        observed_failures = report["raw_http"]["status_counts"].get(
+            str(expected_status), 0
+        )
+        self.assertGreaterEqual(observed_failures, 1)
+        self.assertEqual(
+            report["raw_http"]["error_kinds"].get(expected_error),
+            observed_failures,
+        )
+
     def test_cli_pending_then_origin_budget_failure_reaches_yaml_publish_and_final_fail(self) -> None:
         for profile_id in ("read-mix-human-v2", "ready-vote-capacity-ramp-v2"):
             with self.subTest(profile=profile_id):
                 self._exercise_deferred_pipeline(profile_id)
 
-    def _exercise_deferred_pipeline(self, profile_id: str) -> None:
+    def test_cli_completed_transport_failure_reaches_origin_bound_red_gate(self) -> None:
+        self._exercise_deferred_pipeline(
+            "ready-vote-slo-v2", transport_failure=True
+        )
+
+    def test_terminal_status_failure_classifier_rejects_unclosed_mutations(self) -> None:
+        for mutation in (
+            "status_418",
+            "unknown_error_class",
+            "nonbudget_false_leaf",
+            "partial_work",
+            "inflight_unknown",
+            "forged_source",
+            "forged_run",
+            "forged_profile",
+            "forged_digest",
+            "missing_counts",
+            "unrecognized_status1",
+            "forged_logical_failure_rate",
+            "forged_raw_failure_rate",
+            "forged_phase_failure_rate",
+            "boolean_failure_rate",
+            "nonfinite_failure_rate",
+            "missing_raw_timing_schema",
+            "missing_logical_partial_marker",
+            "missing_phase_timing_schema",
+            "missing_phase_partial_marker",
+            "unrelated_phase_budget",
+        ):
+            with self.subTest(mutation=mutation):
+                self._exercise_deferred_pipeline(
+                    "ready-vote-spike-v1"
+                    if mutation == "unrelated_phase_budget"
+                    else "ready-vote-slo-v2",
+                    transport_failure=True,
+                    candidate_mutation=mutation,
+                    expected_candidate_exit=1,
+                )
+
+    def _exercise_deferred_pipeline(
+        self,
+        profile_id: str,
+        *,
+        transport_failure: bool = False,
+        candidate_mutation: str | None = None,
+        expected_candidate_exit: int = 3,
+    ) -> None:
         profile = _hermetic_profile(profile_id)
         profile, manifest, users = _small_profile(profile)
+        if transport_failure:
+            # Preserve one real successful mutation before the typed transport
+            # failure so the producer still performs its final state read.
+            target_users = max(2, len(users))
+            profile["fixture"]["users_per_tournament"] = target_users
+            profile["fixture"]["max_total_users"] = target_users
+            manifest["tournaments"][0]["user_count"] = target_users
+            while len(users) < target_users:
+                index = len(users) + 1
+                users.append(
+                    VirtualUser(
+                        user_id=f"user-{index:08d}",
+                        tournament_slug="qa-tournament",
+                        session_token=chr(ord("s") + index) * 64,
+                        csrf_token=chr(ord("c") + index) * 64,
+                    )
+                )
         report_marker = str(manifest["marker"])
         candidate_debug: dict[str, object] = {}
 
@@ -402,6 +840,52 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 started_at_monotonic=started,
                 finished_at_monotonic=started + 10,
             )
+
+        transport_failures = 0
+        post_requests = 0
+
+        class FakeResponse:
+            status = 200
+            headers = {
+                "etag": '"fixture-etag"',
+                "cf-ray": "fixture-ray",
+            }
+
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+                self._offset = 0
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                if size is None or size < 0:
+                    size = len(self._body) - self._offset
+                chunk = self._body[self._offset : self._offset + size]
+                self._offset += len(chunk)
+                return chunk
+
+        def urlopen(request_object: object, *, timeout: float) -> FakeResponse:
+            nonlocal post_requests, transport_failures
+            del timeout
+            method = request_object.get_method()
+            path = request_object.full_url
+            if method == "POST":
+                post_requests += 1
+                if post_requests == 2:
+                    transport_failures += 1
+                    raise URLError("synthetic bounded transport failure")
+            body = (
+                b'{"changed":true}'
+                if method == "POST"
+                else b'{"active_round":{"ready_count":1}}'
+                if path.endswith("/deadlock/ready-check")
+                else b"{}"
+            )
+            return FakeResponse(body)
 
         def supervised_worker(
             *, worker_config: dict[str, object], report_path: Path,
@@ -435,9 +919,79 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     },
                 }
             )
+            supervisor_reason = "none"
+            if candidate_mutation == "status_418":
+                _replace_status(report, "0", "418")
+            elif candidate_mutation == "unknown_error_class":
+                _replace_error_class(report, "transport", "unrecognized")
+            elif candidate_mutation == "nonbudget_false_leaf":
+                population = report["acceptance"]["phase_plan_evidence"]["state_evidence"]["population"]
+                population["timing"]["partial"] = True
+            elif candidate_mutation == "partial_work":
+                report["partial_work"] = True
+                report["runtime_supervisor"]["partial_work"] = True
+            elif candidate_mutation == "inflight_unknown":
+                report["inflight_unknown"] = True
+                report["runtime_supervisor"]["inflight_unknown"] = True
+            elif candidate_mutation == "forged_source":
+                report["source_git_sha"] = "b" * 40
+            elif candidate_mutation == "forged_run":
+                report["external_run_id"] = "987654321"
+            elif candidate_mutation == "forged_profile":
+                report["profile_id"] = "ready-vote-capacity-ramp-v2"
+            elif candidate_mutation == "forged_digest":
+                report["profile_digest"] = "f" * 64
+            elif candidate_mutation == "missing_counts":
+                report["raw_http"].pop("status_counts", None)
+            elif candidate_mutation == "unrecognized_status1":
+                supervisor_reason = "worker_error"
+                report["runtime_supervisor"]["reason"] = supervisor_reason
+            elif candidate_mutation == "forged_logical_failure_rate":
+                report["logical"]["final_failure_rate_percent"] += 1.0
+            elif candidate_mutation == "forged_raw_failure_rate":
+                report["raw_http"]["final_failure_rate_percent"] += 1.0
+            elif candidate_mutation == "forged_phase_failure_rate":
+                phase_summaries = report.get("phases")
+                self.assertTrue(_mutate_first_failure_rate(phase_summaries, 99.0))
+            elif candidate_mutation == "boolean_failure_rate":
+                report["logical"]["final_failure_rate_percent"] = True
+            elif candidate_mutation == "nonfinite_failure_rate":
+                report["raw_http"]["final_failure_rate_percent"] = float("inf")
+            elif candidate_mutation == "missing_raw_timing_schema":
+                report["raw_http"]["timing"].pop("timing_schema", None)
+            elif candidate_mutation == "missing_logical_partial_marker":
+                report["logical"]["timing"].pop("partial", None)
+            elif candidate_mutation == "missing_phase_timing_schema":
+                self.assertTrue(
+                    _remove_first_timing_marker(report.get("phases"), "timing_schema")
+                )
+            elif candidate_mutation == "missing_phase_partial_marker":
+                self.assertTrue(
+                    _remove_first_timing_marker(report.get("phases"), "partial")
+                )
+            elif candidate_mutation == "unrelated_phase_budget":
+                raw_phases = report.get("phases", {})
+                status_phases = {
+                    name
+                    for name, phase in raw_phases.items()
+                    if isinstance(phase, dict)
+                    and isinstance(phase.get("raw_http"), dict)
+                    and phase["raw_http"].get("status_counts", {}).get("0", 0)
+                }
+                target_phase = next(
+                    name for name in report["acceptance"]["phase_budget_evidence"]
+                    if name not in status_phases
+                )
+                for phase_mapping in (
+                    report["acceptance"]["phase_budget_evidence"],
+                    report["acceptance"]["phase_plan_evidence"]["phase_budgets"],
+                ):
+                    phase_mapping[target_phase]["checks"]["logical_timing_complete"] = False
+                    phase_mapping[target_phase]["passed"] = False
             report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
-            candidate_debug.update(
-                {
+            if not candidate_debug:
+                candidate_debug.update(
+                    {
                     "binding": platform_load._report_binding(profile, report),
                     "ramp": platform_load._authored_ramp_budget_checks(profile, report["acceptance"]),
                     "observer_closed": platform_load._closed_missing_observer_binding(
@@ -457,6 +1011,8 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     "phase_slo_names": sorted(
                         report["acceptance"].get("phase_slo", {})
                     ),
+                    "raw_http": report.get("raw_http"),
+                    "logical": report.get("logical"),
                     "acceptance_kind": profile.get("acceptance", {}).get("kind"),
                     "origin_observability_present": "origin_observability" in report,
                     "origin_safety": report["acceptance"].get("origin_safety"),
@@ -474,8 +1030,8 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                             isolation=PID_NAMESPACE_ISOLATION, namespace_closed=True,
                         ),
                     ),
-                }
-            )
+                    }
+                )
             return SimpleNamespace(
                 returncode=worker_exit,
                 report=report,
@@ -483,7 +1039,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 worker_exited=True,
                 killed=False,
                 signal=None,
-                reason="none",
+                reason=supervisor_reason,
                 partial_work=False,
                 inflight_unknown=False,
                 descendants_reaped=True,
@@ -511,13 +1067,18 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 "GITHUB_RUN_ID": RUN_ID,
                 "GITHUB_RUN_ATTEMPT": "1",
             }
+            request_transport = (
+                patch("tools.platform_external_load.urlopen", side_effect=urlopen)
+                if transport_failure
+                else patch("tools.platform_external_load._request", side_effect=request)
+            )
             with (
                 patch("tools.platform_load.get_profile", return_value=profile),
                 patch("tools.platform_load_runtime.require_pid_namespace_capability", return_value=None),
                 patch("tools.platform_load_runtime.run_supervised", side_effect=supervised_worker),
                 patch("tools.platform_external_load.load_manifest", return_value=(manifest, users)),
                 patch("tools.platform_external_load._trace", return_value={"status": "200", "ip": "192.0.2.10", "colo": "TEST"}),
-                patch("tools.platform_external_load._request", side_effect=request),
+                request_transport,
                 patch("socket.socket.connect", side_effect=AssertionError("network access is forbidden in this test")),
                 patch.dict(os.environ, os_env, clear=False),
             ):
@@ -540,7 +1101,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             candidate = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 candidate_exit,
-                3,
+                expected_candidate_exit,
                 json.dumps(
                     {
                         "debug": candidate_debug,
@@ -549,8 +1110,18 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                     default=repr,
                 ),
             )
+            if candidate_mutation is not None:
+                return
             self.assertTrue(candidate["acceptance"]["pending_origin_evidence"])
             self.assertFalse(candidate["acceptance"]["passed"])
+            if transport_failure:
+                self.assertEqual(transport_failures, 1)
+                self.assertFalse(candidate["acceptance"]["contract_ok"])
+                self.assertEqual(candidate["logical"]["actions"], 2)
+                self.assertEqual(candidate["raw_http"]["status_counts"].get("0"), 1)
+                self.assertEqual(
+                    candidate["raw_http"]["error_kinds"], {"transport": 1}
+                )
 
             # Execute the exact candidate-state Bash branch from the workflow.
             status_branch = load_step[load_step.index("client_exit_status=\"$load_status\""):load_step.index("if [[ \"$TIMEOUT_DIAGNOSTICS\" == true ]]; then", load_step.index("client_exit_status=\"$load_status\""))]
