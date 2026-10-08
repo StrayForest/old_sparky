@@ -1820,7 +1820,7 @@ class NoopSourceBindingTests(unittest.TestCase):
             for item in workflow["jobs"]["evaluate-load"]["steps"]
             if item.get("id") == "evaluate-load"
         )
-        evaluator_marker = 'if /usr/bin/python3 - "$load_status_file"'
+        evaluator_marker = 'validation_kind="$(/usr/bin/python3 - "$load_status_file"'
         evaluator_begin = evaluator_step["run"].index(evaluator_marker)
         evaluator_heredoc = evaluator_step["run"].index("<<'PY'", evaluator_begin) + len("<<'PY'")
         evaluator_end = evaluator_step["run"].index("\nPY", evaluator_heredoc)

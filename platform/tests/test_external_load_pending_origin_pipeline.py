@@ -1219,7 +1219,7 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             self.assertEqual(receipt["source_binding_sha256"], source_binding_digest)
             receipt_script = _python_block(
                 evaluate_step,
-                'if /usr/bin/python3 - "$load_status_file"',
+                'validation_kind="$(/usr/bin/python3 - "$load_status_file"',
             )
             receipt_check = subprocess.run(
                 [

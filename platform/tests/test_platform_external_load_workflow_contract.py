@@ -766,7 +766,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 if step.get("name") == "Evaluate checked-out load report"
             )
             status_match = re.search(
-                r'if /usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$(?P<sha_env>[A-Z_]+)" "\$APP_TARGET_SHA" '
+                r'validation_kind="\$\(/usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$(?P<sha_env>[A-Z_]+)" "\$APP_TARGET_SHA" '
                 r'"\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
                 r"(?P<script>.*?)\nPY",
                 evaluate_step["run"],
