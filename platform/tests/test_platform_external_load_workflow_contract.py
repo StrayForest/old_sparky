@@ -503,7 +503,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             for block in blocks
             if "metadata_path, archive_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]" in block
         ]
-        self.assertEqual(len(scripts), 3)
+        self.assertEqual(len(scripts), 4)
 
         archive_bytes = b"synthetic artifact bytes bound to the API metadata"
         expected_digest = "sha256:" + hashlib.sha256(archive_bytes).hexdigest()
@@ -556,6 +556,57 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         altered.update(mutation)
                         self.assertNotEqual(run(altered).returncode, 0)
                     self.assertNotEqual(run(metadata, archive_bytes + b"tampered").returncode, 0)
+
+    def test_fixture_setup_handoff_verifier_executes_archive_digest_check(self) -> None:
+        step = _step_script(
+            self.jobs["fixture-setup"],
+            "Verify exact external-load handoff artifact",
+        )
+        match = re.search(
+            r'/usr/bin/python3 - .*?<<\'PY\'\n(?P<script>.*?)\nPY(?:\n|$)',
+            step,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match, "fixture setup has no exact artifact verifier")
+        script = textwrap.dedent(match.group("script"))
+        archive_bytes = b"synthetic exact external-load handoff archive"
+        digest = "sha256:" + hashlib.sha256(archive_bytes).hexdigest()
+        metadata = {
+            "id": 4815162342,
+            "name": "platform-production-external-load-input-123456789-3",
+            "expired": False,
+            "digest": digest,
+            "workflow_run": {"id": 123456789, "head_sha": "a" * 40},
+        }
+
+        with tempfile.TemporaryDirectory(prefix="external-load-input-digest-") as temporary:
+            root = Path(temporary)
+            metadata_path = root / "metadata.json"
+            archive_path = root / "handoff.zip"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            archive_path.write_bytes(archive_bytes)
+
+            def verify() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        str(metadata_path),
+                        str(archive_path),
+                        "4815162342",
+                        "platform-production-external-load-input-123456789-3",
+                        "123456789",
+                        "a" * 40,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            self.assertEqual(verify().returncode, 0)
+            archive_path.write_bytes(archive_bytes + b"tampered")
+            self.assertNotEqual(verify().returncode, 0)
 
     def test_evaluator_uses_declared_source_sha_for_artifact_and_candidate_binding(self) -> None:
         workflow = yaml.safe_load(self.source)

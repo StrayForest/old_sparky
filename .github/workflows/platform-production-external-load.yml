@@ -526,6 +526,7 @@ jobs:
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID/zip" \
             --output "$archive"
           /usr/bin/python3 - "$metadata" "$archive" "$INPUT_ARTIFACT_ID" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
+          import hashlib
           import json
           import os
           from pathlib import Path
