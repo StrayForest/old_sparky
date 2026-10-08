@@ -7,6 +7,18 @@ import unittest
 from unittest.mock import patch
 
 from tools.platform_load import (
+    _acceptance_failure_is_budget_only,
+    _acceptance_budget_check_names,
+    _authored_ramp_budget_checks,
+    _closed_capacity_completed_budget_failure,
+    _closed_capacity_pending_origin_acceptance,
+    _capacity_phase_budget_check_names,
+    _capacity_phase_plan_check_names,
+    _CAPACITY_LOGICAL_OUTCOME_CHECKS,
+    _CAPACITY_RAW_OUTCOME_CHECKS,
+    _CAPACITY_PHASE_RETRY_CHECKS,
+    _CAPACITY_EMPTY_PHASE_BUDGET_CHECKS,
+    _CAPACITY_PHASE_SLO_REQUIRED_CHECKS,
     _is_closed_pending_origin_candidate,
     _is_complete_observer_bound_decision,
     get_profile,
@@ -215,6 +227,276 @@ SLO = {
 
 class LoadAcceptanceTests(unittest.TestCase):
     @staticmethod
+    def _closed_cli_report(profile_id: str, *, budget_miss: bool) -> tuple[dict[str, object], dict[str, object]]:
+        profile = get_profile(profile_id)
+        contract = profile_contract(profile)
+        planned = contract["planned_work"]
+        total = int(planned["logical_actions"])
+        primary = int(planned["primary_logical_actions"])
+        state = int(planned["state_read_requests"])
+        actual = total + state
+        phases: dict[str, object] = {
+            "primary": {
+                "configured_actions": primary,
+                "submitted_actions": primary,
+                "missing_actions": 0,
+                "complete": True,
+                "logical": canonical_logical(primary),
+                "raw_http": canonical_raw(primary),
+            },
+            "duplicate": {
+                **empty_duplicate_phase(),
+                "candidate_actions": primary,
+                "completed_actions": 0,
+            },
+            "state": {"raw_http": canonical_raw(state)},
+        }
+        if profile["traffic"].get("phases"):
+            ramp_phases: dict[str, object] = {}
+            authored_phases = profile["traffic"]["phases"]
+            for index, authored in enumerate(authored_phases):
+                count = int(authored["logical_actions"])
+                logical = canonical_logical(count)
+                logical["target_logical_actions_per_second"] = authored[
+                    "target_logical_actions_per_second"
+                ]
+                if budget_miss and index == len(authored_phases) - 1:
+                    logical["accepted_request_latency"] = latency(1, 1, 5_000, 6_000)
+                    logical["timing"]["user_observed_latency"] = latency(
+                        1, 1, 5_000, 6_000
+                    )
+                ramp_phases[authored["name"]] = {
+                    "configured_actions": count,
+                    "submitted_actions": count,
+                    "missing_actions": 0,
+                    "complete": True,
+                    "target_logical_actions_per_second": authored[
+                        "target_logical_actions_per_second"
+                    ],
+                    "duration_seconds": authored["duration_seconds"],
+                    "logical": logical,
+                    "raw_http": canonical_raw(count),
+                }
+            phases["ramp"] = {"phases": ramp_phases}
+        logical = canonical_logical(total)
+        logical.update(
+            {
+                "primary_actions": primary,
+                "duplicate_actions": 0,
+                "configured_duplicate_actions": 0,
+                "state_read_requests": state,
+            }
+        )
+        if budget_miss and not profile["traffic"].get("phases"):
+            logical["accepted_request_latency"] = latency(1, 1, 5_000, 6_000)
+            logical["timing"]["user_observed_latency"] = latency(1, 1, 5_000, 6_000)
+        raw = canonical_raw(total)
+        raw.update(
+            {"state_read_requests": state, "total_requests_including_state": actual}
+        )
+        overall = canonical_raw(actual)
+        contract.update(
+            {
+                "offered_logical_actions": total,
+                "primary_http_attempts": primary,
+                "http_attempts": actual,
+                "total_http_attempts": actual,
+                "runtime_http_budget": {
+                    "planned_worst_case": planned["http_attempts"],
+                    "max_http_attempts": profile["portfolio"]["request_budget"][
+                        "max_http_attempts"
+                    ],
+                    "actual_http_attempts": actual,
+                    "within_budget": actual
+                    <= profile["portfolio"]["request_budget"]["max_http_attempts"],
+                },
+            }
+        )
+        marker = "preprod202610070000abcd"
+        run_id = "123"
+        report: dict[str, object] = {
+            "schema": 1,
+            "measurement_schema": 2,
+            "timing_schema": 1,
+            "profile_id": profile["profile_id"],
+            "profile_version": profile["profile_version"],
+            "profile_digest": contract["profile_digest"],
+            "mode": profile["mode"],
+            "environment": profile["portfolio"]["environment"],
+            "source_git_sha": "a" * 40,
+            "external_run_id": run_id,
+            "fixture_marker": marker,
+            "scope": "full_population",
+            "load_contract": contract,
+            "authoritative": True,
+            "dispatchable": True,
+            "phases": phases,
+            "overall": {**overall, "scope": "full_population"},
+            "raw_http": raw,
+            "logical": logical,
+            "acceptance": {"contract_ok": True},
+            "worker_report_schema": WORKER_REPORT_SCHEMA,
+            "report_complete": True,
+            "namespace_closed": True,
+            "isolation": PID_NAMESPACE_ISOLATION,
+            "partial_work": False,
+            "inflight_unknown": False,
+            "worker_exit_code": 1,
+            "runtime_supervisor": {
+                "reason": "none",
+                "returncode": 1,
+                "isolation": PID_NAMESPACE_ISOLATION,
+                "namespace_closed": True,
+                "descendants_reaped": True,
+                "partial_work": False,
+                "inflight_unknown": False,
+                "report_error": None,
+            },
+        }
+        return profile, report
+
+    @staticmethod
+    def _capacity_acceptance(*, pending: bool, budget_miss: bool) -> tuple[dict[str, object], dict[str, object]]:
+        profile = get_profile("ready-vote-capacity-ramp-v2")
+        phases = profile["traffic"]["phases"]
+        phase_names = [str(phase["name"]) for phase in phases]
+        phase_results: dict[str, object] = {}
+        phase_budgets: dict[str, object] = {}
+        for index, name in enumerate(phase_names):
+            failed = budget_miss and index == len(phase_names) - 1
+            phase_results[name] = {
+                "passed": False if pending or failed else True,
+                "pending_origin_evidence": pending,
+                "contract_ok": True,
+                "decision": "SLO FAIL" if pending or failed else "SLO PASS",
+                "observer_binding": {
+                    "complete": not pending,
+                    "fixture_marker": None if pending else "preprod202610070000abcd",
+                    "external_run_id": None if pending else "123",
+                    "expected_fixture_marker": None,
+                    "expected_external_run_id": None,
+                    "checks": {
+                        "fixture_marker": not pending,
+                        "external_run_id": not pending,
+                        "binding_complete": not pending,
+                        "observer_stop_file_seen": not pending,
+                        "observer_not_timed_out": not pending,
+                    },
+                },
+                "checks": {
+                    name: (
+                        False
+                        if (name == "accepted_p95" and failed)
+                        or (name == "observer_binding" and pending)
+                        else True
+                    )
+                    for name in _CAPACITY_PHASE_SLO_REQUIRED_CHECKS
+                },
+            }
+            budget_checks = {
+                name: not (failed and name == "accepted_p95")
+                for name in _capacity_phase_budget_check_names(profile)
+            }
+            phase_budgets[name] = {
+                "passed": all(budget_checks.values()),
+                "checks": budget_checks,
+            }
+        primary_checks = {
+            name: not (budget_miss and name == "accepted_p95")
+            for name in _capacity_phase_budget_check_names(profile)
+        }
+        phase_budgets["primary"] = {
+            "passed": all(primary_checks.values()),
+            "checks": primary_checks,
+        }
+        phase_budgets["duplicate"] = {
+            "passed": True,
+            "checks": {
+                name: True for name in _CAPACITY_EMPTY_PHASE_BUDGET_CHECKS
+            },
+        }
+        acceptance: dict[str, object] = {
+            "decision": "CAPACITY PENDING ORIGIN EVIDENCE" if pending else "CAPACITY EXPERIMENT COMPLETE TARGET FAIL",
+            "experiment_complete": not pending,
+            "target_passed": False,
+            "passed": False,
+            "contract_ok": True,
+            "phase_completion": True,
+            "pending_origin_evidence": pending,
+            "max_stable_goodput_actions_per_second": 0.0,
+            "slo_capacity_logical_actions_per_second": 0.0,
+            "note": "Capacity experiment completion is separate from target budgets.",
+            "origin_safety": None,
+            "observer_binding": {
+                "complete": False if pending else True,
+                "fixture_marker": None if pending else "preprod202610070000abcd",
+                "external_run_id": None if pending else "123",
+                "expected_fixture_marker": None,
+                "expected_external_run_id": None,
+                "checks": {
+                    "fixture_marker": not pending,
+                    "external_run_id": not pending,
+                    "binding_complete": not pending,
+                    "observer_stop_file_seen": not pending,
+                    "observer_not_timed_out": not pending,
+                },
+            },
+            "population_checks": {"all_phases": True},
+            "phase_population_evidence": {"all_phases": True},
+            "raw_logical_population_evidence": {"all_populations": True},
+            "top_population_timing_evidence": {"all_populations": True},
+            "timing_evidence": {"complete": True},
+            "phase_plan_evidence": {
+                "complete": True,
+                "checks": {
+                    name: True for name in _capacity_phase_plan_check_names(profile)
+                },
+                "phase_budgets": phase_budgets,
+            },
+            "outcome_evidence": {
+                "logical": {
+                    "present": True,
+                    "complete": True,
+                    "kind": "logical",
+                    "actions": 10,
+                    "final_successes": 10,
+                    "final_failures": 0,
+                    "expected_failure_rate_percent": 0.0,
+                    "actual_failure_rate_percent": 0.0,
+                    "checks": {
+                        name: True for name in _CAPACITY_LOGICAL_OUTCOME_CHECKS
+                    },
+                },
+                "raw_http": {
+                    "present": True,
+                    "complete": True,
+                    "kind": "raw_http",
+                    "requests": 10,
+                    "errors": 0,
+                    "successful_responses": 10,
+                    "expected_failure_rate_percent": 0.0,
+                    "actual_failure_rate_percent": 0.0,
+                    "checks": {
+                        name: True for name in _CAPACITY_RAW_OUTCOME_CHECKS
+                    },
+                },
+            },
+            "phase_slo": phase_results,
+            "phase_budget_evidence": phase_budgets,
+            "capacity_ramp_evidence": {"complete": True, "checks": {}, "stages": {}},
+            "phase_retry_evidence": {
+                name: True for name in _CAPACITY_PHASE_RETRY_CHECKS
+            },
+        }
+        acceptance["acceptance_budget_evidence"] = {
+            "complete": True,
+            "checks": {
+                name: True for name in _acceptance_budget_check_names(profile)
+            },
+        }
+        return profile, acceptance
+
+    @staticmethod
     def _closed_pending_candidate() -> tuple[dict[str, object], SimpleNamespace]:
         profile = get_profile("ready-vote-slo-v2")
         contract = profile_contract(profile)
@@ -277,6 +559,25 @@ class LoadAcceptanceTests(unittest.TestCase):
                 "pending_origin_evidence": True,
                 "contract_ok": True,
                 "checks": {"timing_complete": True},
+                "observer_binding": {
+                    "complete": False,
+                    "fixture_marker": None,
+                    "external_run_id": None,
+                    "expected_fixture_marker": None,
+                    "expected_external_run_id": None,
+                    "checks": {
+                        "fixture_marker": False,
+                        "external_run_id": False,
+                        "binding_complete": False,
+                        "observer_stop_file_seen": False,
+                        "observer_not_timed_out": False,
+                    },
+                },
+                "capacity_ramp_evidence": {
+                    "complete": True,
+                    "checks": {},
+                    "stages": {},
+                },
             },
             "worker_report_schema": WORKER_REPORT_SCHEMA,
             "report_complete": True,
@@ -561,6 +862,64 @@ class LoadAcceptanceTests(unittest.TestCase):
             clear=False,
         ):
             self.assertTrue(_is_closed_pending_origin_candidate(profile, candidate))
+
+            forged_budget_path = deepcopy(candidate)
+            forged_budget_path.report["acceptance"]["unrelated"] = {
+                "checks": {"accepted_p95": False}
+            }
+            self.assertFalse(
+                _is_closed_pending_origin_candidate(profile, forged_budget_path)
+            )
+
+            forged_observer_path = deepcopy(candidate)
+            forged_observer_path.report["acceptance"]["unrelated"] = {
+                "checks": {"observer_binding": False}
+            }
+            self.assertFalse(
+                _is_closed_pending_origin_candidate(profile, forged_observer_path)
+            )
+
+            forged_observer_leaf = deepcopy(candidate)
+            forged_observer_leaf.report["acceptance"]["observer_binding"]["checks"][
+                "unknown_observer_state"
+            ] = False
+            self.assertFalse(
+                _is_closed_pending_origin_candidate(profile, forged_observer_leaf)
+            )
+
+            for status_key in ("complete", "passed", "target_passed"):
+                with self.subTest(unexpected_status=status_key):
+                    forged_status = deepcopy(candidate)
+                    forged_status.report["acceptance"]["unexpected"] = {
+                        status_key: False
+                    }
+                    self.assertFalse(
+                        _is_closed_pending_origin_candidate(profile, forged_status)
+                    )
+
+            incomplete_phase = deepcopy(candidate)
+            incomplete_phase.report["acceptance"]["phase_completion"] = False
+            self.assertFalse(
+                _is_closed_pending_origin_candidate(profile, incomplete_phase)
+            )
+
+            present_but_invalid_origin = deepcopy(candidate)
+            present_but_invalid_origin.report["origin_observability"] = {
+                "binding": {"complete": False}
+            }
+            self.assertFalse(
+                _is_closed_pending_origin_candidate(profile, present_but_invalid_origin)
+            )
+
+            fabricated_origin_safety = deepcopy(candidate)
+            fabricated_origin_safety.report["acceptance"]["origin_safety"] = {
+                "passed": False,
+                "complete": False,
+                "checks": {"required_diagnostics_present": False},
+            }
+            self.assertFalse(
+                _is_closed_pending_origin_candidate(profile, fabricated_origin_safety)
+            )
 
         # A complete transport population with an authenticated-page-load
         # status-contract miss is not a deferred-origin candidate.  The raw
@@ -854,6 +1213,145 @@ class LoadAcceptanceTests(unittest.TestCase):
         invalid_check = deepcopy(report)
         invalid_check["acceptance"]["checks"]["timing_complete"] = False
         self.assertFalse(_is_complete_observer_bound_decision(profile, invalid_check))
+
+    def test_capacity_pending_and_completed_budget_miss_are_closed_world(self) -> None:
+        profile, pending = self._capacity_acceptance(pending=True, budget_miss=False)
+        self.assertTrue(_closed_capacity_pending_origin_acceptance(profile, pending))
+
+        budget_miss_profile, completed = self._capacity_acceptance(
+            pending=False, budget_miss=True
+        )
+        self.assertTrue(
+            _closed_capacity_completed_budget_failure(
+                budget_miss_profile,
+                completed,
+                origin_budget_failure=False,
+            )
+        )
+
+        malformed_cases = []
+        missing_phase = deepcopy(pending)
+        missing_phase["phase_budget_evidence"].pop("rate-80")
+        malformed_cases.append(missing_phase)
+        missing_population = deepcopy(pending)
+        missing_population["population_checks"] = {}
+        malformed_cases.append(missing_population)
+        nested_observer_failure = deepcopy(pending)
+        nested_observer_failure["phase_slo"]["rate-20"]["nested"] = {
+            "checks": {"observer_binding": False}
+        }
+        malformed_cases.append(nested_observer_failure)
+        unrelated_budget_name = deepcopy(pending)
+        unrelated_budget_name["unrelated_diagnostic"] = {
+            "checks": {"accepted_p95": False}
+        }
+        malformed_cases.append(unrelated_budget_name)
+        unknown_failure = deepcopy(pending)
+        unknown_failure["phase_slo"]["rate-20"]["checks"]["unclassified"] = False
+        malformed_cases.append(unknown_failure)
+        for malformed_value in (None, [], "invalid", 1):
+            malformed_outcome = deepcopy(pending)
+            malformed_outcome["outcome_evidence"]["logical"] = malformed_value
+            malformed_cases.append(malformed_outcome)
+            malformed_raw_outcome = deepcopy(pending)
+            malformed_raw_outcome["outcome_evidence"]["raw_http"] = malformed_value
+            malformed_cases.append(malformed_raw_outcome)
+        for invalid in malformed_cases:
+            with self.subTest(invalid=invalid):
+                self.assertFalse(
+                    _closed_capacity_pending_origin_acceptance(profile, invalid)
+                )
+
+        incomplete = deepcopy(completed)
+        incomplete["phase_plan_evidence"]["checks"] = {}
+        self.assertFalse(
+            _closed_capacity_completed_budget_failure(
+                budget_miss_profile,
+                incomplete,
+                origin_budget_failure=False,
+            )
+        )
+
+    def test_pending_read_mix_ramp_accepts_only_authored_budget_leaves(self) -> None:
+        profile = get_profile("read-mix-concurrency-ramp-v1")
+        stages = profile["traffic"]["concurrency_stages"]
+        failing_stage = stages[-1]
+        checks = {
+            "ramp_present": True,
+            "ramp_authored_stage_plan": True,
+            "ramp_stages_present": True,
+            "ramp_stage_names_closed": True,
+            "ramp_stage_order": True,
+        }
+        for stage in stages:
+            checks[f"ramp_{stage}_expected_count_typed"] = True
+            checks[f"ramp_{stage}_population"] = True
+            checks[f"ramp_{stage}_budgets"] = stage != failing_stage
+        evidence = {
+            "complete": False,
+            "checks": checks,
+            "stages": {
+                str(stage): (
+                    {"budget_evidence": {"checks": {"accepted_p95": False}}}
+                    if stage == failing_stage
+                    else {}
+                )
+                for stage in stages
+            },
+        }
+        acceptance = {
+            "checks": {
+                "capacity_ramp_evidence": False,
+                "observer_binding": False,
+                "timing_complete": True,
+            },
+            "observer_binding": {
+                "complete": False,
+                "fixture_marker": None,
+                "external_run_id": None,
+                "expected_fixture_marker": None,
+                "expected_external_run_id": None,
+                "checks": {
+                    "fixture_marker": False,
+                    "external_run_id": False,
+                    "binding_complete": False,
+                    "observer_stop_file_seen": False,
+                    "observer_not_timed_out": False,
+                },
+            },
+            "capacity_ramp_evidence": evidence,
+        }
+        allowed = _authored_ramp_budget_checks(profile, acceptance)
+        self.assertEqual(allowed, frozenset(f"ramp_{stage}_budgets" for stage in stages))
+        self.assertTrue(
+            _acceptance_failure_is_budget_only(
+                acceptance,
+                "stress",
+                allowed_ramp_budget_checks=allowed,
+                allow_no_budget_failure=True,
+                allow_pending_observer_binding=True,
+                allowed_phase_names=frozenset(
+                    profile_contract(profile)["planned_work"]["phase_logical_actions"]
+                ),
+            )
+        )
+
+        missing_structural = deepcopy(acceptance)
+        missing_structural["capacity_ramp_evidence"]["checks"].pop("ramp_stage_order")
+        self.assertIsNone(_authored_ramp_budget_checks(profile, missing_structural))
+        nested_observer = deepcopy(acceptance)
+        nested_observer["capacity_ramp_evidence"]["stages"][str(failing_stage)][
+            "budget_evidence"
+        ]["checks"]["observer_binding"] = False
+        self.assertFalse(
+            _acceptance_failure_is_budget_only(
+                nested_observer,
+                "stress",
+                allowed_ramp_budget_checks=allowed,
+                allow_no_budget_failure=True,
+                allow_pending_observer_binding=True,
+            )
+        )
 
     def test_exact_observer_binding_mismatch_fails_closed(self) -> None:
         result = evaluate_acceptance(

@@ -2010,19 +2010,580 @@ def _is_closed_pending_origin_candidate(
         else None
     )
     expected_decision = {
+        "slo": "SLO FAIL",
         "stress": "STRESS PENDING ORIGIN EVIDENCE",
         "spike": "SPIKE PENDING ORIGIN EVIDENCE",
         "capacity": "CAPACITY PENDING ORIGIN EVIDENCE",
-    }.get(str(profile_kind), "SLO FAIL")
+    }.get(str(profile_kind))
+    if expected_decision is None or acceptance.get("decision") != expected_decision:
+        return False
+    if _report_binding(profile, report).get("complete") is not True:
+        return False
+    observer_binding = acceptance.get("observer_binding")
     if (
-        acceptance.get("decision") != expected_decision
-        or expected_decision not in PENDING_ORIGIN_DECISIONS | {"SLO FAIL"}
+        "origin_observability" in report
+        or acceptance.get("origin_safety") is not None
+        or not _closed_missing_observer_binding(observer_binding)
     ):
         return False
-    acceptance_checks = acceptance.get("checks")
-    if not isinstance(acceptance_checks, Mapping) or not acceptance_checks:
+    if profile_kind == "capacity":
+        return _closed_capacity_pending_origin_acceptance(profile, acceptance)
+    allowed_ramp_budget_checks = _authored_ramp_budget_checks(profile, acceptance)
+    if allowed_ramp_budget_checks is None:
         return False
-    return _report_binding(profile, report).get("complete") is True
+    return _acceptance_failure_is_budget_only(
+        acceptance,
+        str(profile_kind),
+        allowed_ramp_budget_checks=allowed_ramp_budget_checks,
+        allow_no_budget_failure=True,
+        allow_pending_observer_binding=True,
+        allowed_phase_names=_profile_budget_phase_names(profile),
+    )
+
+
+def _all_true_boolean_mapping(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and bool(value)
+        and all(type(item) is bool and item is True for item in value.values())
+    )
+
+
+def _authored_ramp_budget_checks(
+    profile: Mapping[str, Any], acceptance: Mapping[str, Any]
+) -> frozenset[str] | None:
+    """Validate read-mix ramp evidence against its authored closed stage set."""
+
+    traffic = profile.get("traffic")
+    authored_stages = traffic.get("concurrency_stages") if isinstance(traffic, Mapping) else None
+    if authored_stages is None or authored_stages == []:
+        evidence = acceptance.get("capacity_ramp_evidence")
+        if evidence is None:
+            return frozenset()
+        if (
+            not isinstance(evidence, Mapping)
+            or evidence.get("complete") is not True
+            or evidence.get("checks") != {}
+            or evidence.get("stages") != {}
+        ):
+            return None
+        return frozenset()
+    if (
+        not isinstance(authored_stages, list)
+        or not authored_stages
+        or any(type(stage) is not int or stage <= 0 for stage in authored_stages)
+        or len(set(authored_stages)) != len(authored_stages)
+    ):
+        return None
+    evidence = acceptance.get("capacity_ramp_evidence")
+    checks = evidence.get("checks") if isinstance(evidence, Mapping) else None
+    if not isinstance(evidence, Mapping) or not isinstance(checks, Mapping):
+        return None
+    expected = {
+        "ramp_present",
+        "ramp_authored_stage_plan",
+        "ramp_stages_present",
+        "ramp_stage_names_closed",
+        "ramp_stage_order",
+    } | {
+        check
+        for stage in authored_stages
+        for check in (
+            f"ramp_{stage}_expected_count_typed",
+            f"ramp_{stage}_population",
+            f"ramp_{stage}_budgets",
+        )
+    }
+    if set(checks) != expected or any(type(value) is not bool for value in checks.values()):
+        return None
+    stages = evidence.get("stages")
+    if not isinstance(stages, Mapping) or set(stages) != {
+        str(stage) for stage in authored_stages
+    }:
+        return None
+    budget_keys = {f"ramp_{stage}_budgets" for stage in authored_stages}
+    if (
+        any(value is not True for name, value in checks.items() if name not in budget_keys)
+        or evidence.get("complete") is not all(value is True for value in checks.values())
+    ):
+        return None
+    return frozenset(budget_keys)
+
+
+def _capacity_phase_budget_check_names(profile: Mapping[str, Any]) -> frozenset[str]:
+    """Return the exact check keys emitted for an authored capacity phase."""
+
+    acceptance = profile.get("acceptance")
+    traffic = profile.get("traffic")
+    contract = acceptance.get("slo") if isinstance(acceptance, Mapping) else None
+    if not isinstance(contract, Mapping):
+        return frozenset()
+    if isinstance(acceptance, Mapping):
+        contract = {
+            **contract,
+            **{
+                key: acceptance[key]
+                for key in (
+                    "minimum_useful_goodput_actions_per_second",
+                    "expected_statuses",
+                )
+                if key in acceptance
+            },
+        }
+    names = {
+        "logical_timing_complete",
+        "raw_http_timing_complete",
+        "logical_outcome_consistent",
+        "raw_outcome_consistent",
+        "retry_population_reconciled",
+        "logical_actions_match_timing",
+        "raw_requests_match_timing",
+        "raw_requests_cover_logical_actions",
+    }
+    retry = traffic.get("retry") if isinstance(traffic, Mapping) else None
+    if isinstance(retry, Mapping) and "max_retries" in retry:
+        names.add("raw_requests_within_retry_bound")
+    if "logical_final_failure_percent" in contract:
+        names.add("logical_final_failure_budget")
+    for percentile in ("p95", "p99"):
+        if f"{percentile}_ms" in contract.get("accepted_request_latency", {}):
+            names.add(f"accepted_{percentile}")
+        if f"{percentile}_ms" in contract.get("logical_latency", {}):
+            names.add(f"logical_{percentile}")
+    if "max_shed_percent" in contract:
+        names.add("shed_percent")
+    if "max_retry_amplification_percent" in contract:
+        names.add("retry_amplification_percent")
+    if "minimum_useful_goodput_actions_per_second" in contract:
+        names.update({"successful_goodput_measured", "minimum_useful_goodput"})
+    return frozenset(names)
+
+
+def _capacity_phase_plan_check_names(profile: Mapping[str, Any]) -> frozenset[str]:
+    """Return the phase-plan check keys derived from the selected profile."""
+
+    traffic = profile.get("traffic")
+    phases = traffic.get("phases") if isinstance(traffic, Mapping) else None
+    planned = profile_contract(profile).get("planned_work")
+    phase_counts = planned.get("phase_logical_actions") if isinstance(planned, Mapping) else None
+    if not isinstance(phases, list) or not isinstance(phase_counts, Mapping):
+        return frozenset()
+    names = [phase.get("name") for phase in phases if isinstance(phase, Mapping)]
+    if len(names) != len(phases) or any(not isinstance(name, str) for name in names):
+        return frozenset()
+    expected = {
+        "phase_names_closed",
+        "phase_population_names_closed",
+        "auxiliary_phase_names_closed",
+        "expected_duplicate_count_typed",
+        "expected_state_read_count_typed",
+        "max_retries_typed",
+        "phase_names_and_order",
+        "duplicate_population",
+        "state_read_population",
+    }
+    expected.update(f"phase_{name}" for name in names)
+    expected.update(f"phase_population_{name}" for name in phase_counts)
+    return frozenset(expected)
+
+
+def _acceptance_budget_check_names(profile: Mapping[str, Any]) -> frozenset[str]:
+    """Derive the required contract-validation leaves from the trusted profile."""
+
+    contract = profile.get("acceptance")
+    if not isinstance(contract, Mapping):
+        return frozenset()
+    try:
+        from tools.platform_load_acceptance import _acceptance_budget_evidence
+    except ModuleNotFoundError:  # Direct execution from platform/tools.
+        from platform_load_acceptance import _acceptance_budget_evidence
+    evidence = _acceptance_budget_evidence(contract, require_statuses=True)
+    checks = evidence.get("checks") if isinstance(evidence, Mapping) else None
+    return frozenset(checks) if isinstance(checks, Mapping) else frozenset()
+
+
+def _profile_budget_phase_names(profile: Mapping[str, Any]) -> frozenset[str]:
+    """Return only the phase keys authorized to carry budget evidence."""
+
+    planned = profile_contract(profile).get("planned_work")
+    phases = planned.get("phase_logical_actions") if isinstance(planned, Mapping) else None
+    if not isinstance(phases, Mapping):
+        return frozenset()
+    return frozenset(str(name) for name, count in phases.items() if type(count) is int and count > 0)
+
+
+def _closed_missing_observer_binding(value: Any) -> bool:
+    """Accept only the evaluator's exact no-origin observer state."""
+
+    expected_checks = {
+        "fixture_marker",
+        "external_run_id",
+        "binding_complete",
+        "observer_stop_file_seen",
+        "observer_not_timed_out",
+    }
+    return (
+        isinstance(value, Mapping)
+        and set(value)
+        == {
+            "complete",
+            "fixture_marker",
+            "external_run_id",
+            "expected_fixture_marker",
+            "expected_external_run_id",
+            "checks",
+        }
+        and value.get("complete") is False
+        and value.get("fixture_marker") is None
+        and value.get("external_run_id") is None
+        and value.get("expected_fixture_marker") is None
+        and value.get("expected_external_run_id") is None
+        and isinstance(value.get("checks"), Mapping)
+        and set(value["checks"]) == expected_checks
+        and all(type(item) is bool and item is False for item in value["checks"].values())
+    )
+
+
+_CAPACITY_PHASE_SLO_REQUIRED_CHECKS = frozenset(
+    {
+        "contract",
+        "logical_final_failure",
+        "timing_complete",
+        "capacity_ramp_evidence",
+        "acceptance_budget_evidence",
+        "logical_outcome_consistency",
+        "raw_outcome_consistency",
+        "retry_population_reconciled",
+        "accepted_p50",
+        "accepted_p90",
+        "accepted_p95",
+        "accepted_p99",
+        "logical_p95",
+        "logical_p99",
+        "normal_overload_shedding",
+        "retry_amplification_percent",
+        "observer_binding",
+        "successful_goodput_measured",
+        "minimum_useful_goodput",
+    }
+)
+
+_CAPACITY_EMPTY_PHASE_BUDGET_CHECKS = frozenset(
+    {
+        "empty_phase",
+        "logical_actions_match_timing",
+        "logical_outcome_consistent",
+        "logical_timing_complete",
+        "raw_http_timing_complete",
+        "raw_outcome_consistent",
+        "raw_requests_cover_logical_actions",
+        "raw_requests_match_timing",
+        "retry_population_reconciled",
+    }
+)
+
+_CAPACITY_ACCEPTANCE_KEYS = frozenset(
+    {
+        "acceptance_budget_evidence",
+        "capacity_ramp_evidence",
+        "contract_ok",
+        "decision",
+        "experiment_complete",
+        "max_stable_goodput_actions_per_second",
+        "note",
+        "observer_binding",
+        "origin_safety",
+        "outcome_evidence",
+        "passed",
+        "pending_origin_evidence",
+        "phase_budget_evidence",
+        "phase_completion",
+        "phase_plan_evidence",
+        "phase_population_evidence",
+        "phase_retry_evidence",
+        "phase_slo",
+        "population_checks",
+        "raw_logical_population_evidence",
+        "slo_capacity_logical_actions_per_second",
+        "target_passed",
+        "timing_evidence",
+        "top_population_timing_evidence",
+    }
+)
+
+_CAPACITY_LOGICAL_OUTCOME_CHECKS = frozenset(
+    {
+        "typed_actions",
+        "typed_final_successes",
+        "typed_final_failures",
+        "outcomes_do_not_exceed_actions",
+        "outcomes_sum_to_actions",
+        "failure_rate_present",
+        "failure_rate_recomputed",
+    }
+)
+_CAPACITY_RAW_OUTCOME_CHECKS = frozenset(
+    {
+        "typed_requests",
+        "typed_errors",
+        "typed_successful_responses",
+        "responses_do_not_exceed_requests",
+        "responses_sum_to_requests",
+        "failure_rate_present",
+        "failure_rate_recomputed",
+    }
+)
+_CAPACITY_PHASE_RETRY_CHECKS = frozenset(
+    {
+        "complete",
+        "aggregate_retry_totals_present",
+        "phase_retry_totals_reconcilable",
+        "logical_retries_match_phase_totals",
+        "raw_retries_match_phase_totals",
+    }
+)
+
+
+def _capacity_outcome_evidence_is_closed(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {"logical", "raw_http"}:
+        return False
+    logical = value.get("logical")
+    raw_http = value.get("raw_http")
+    if not isinstance(logical, Mapping) or not isinstance(raw_http, Mapping):
+        return False
+    logical_checks = logical.get("checks")
+    raw_checks = raw_http.get("checks")
+    return (
+        set(logical) == {
+            "present", "complete", "kind", "actions", "final_successes",
+            "final_failures", "expected_failure_rate_percent",
+            "actual_failure_rate_percent", "checks",
+        }
+        and logical.get("present") is True
+        and logical.get("complete") is True
+        and logical.get("kind") == "logical"
+        and isinstance(logical_checks, Mapping)
+        and set(logical_checks) == _CAPACITY_LOGICAL_OUTCOME_CHECKS
+        and _all_true_boolean_mapping(logical_checks)
+        and set(raw_http) == {
+            "present", "complete", "kind", "requests", "errors",
+            "successful_responses", "expected_failure_rate_percent",
+            "actual_failure_rate_percent", "checks",
+        }
+        and raw_http.get("present") is True
+        and raw_http.get("complete") is True
+        and raw_http.get("kind") == "raw_http"
+        and isinstance(raw_checks, Mapping)
+        and set(raw_checks) == _CAPACITY_RAW_OUTCOME_CHECKS
+        and _all_true_boolean_mapping(raw_checks)
+    )
+
+
+def _capacity_phase_retry_evidence_is_closed(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == _CAPACITY_PHASE_RETRY_CHECKS
+        and _all_true_boolean_mapping(value)
+    )
+
+
+def _closed_capacity_pending_origin_acceptance(
+    profile: Mapping[str, Any], acceptance: Mapping[str, Any]
+) -> bool:
+    """Validate capacity's phase-nested candidate while origin is pending.
+
+    Capacity acceptance deliberately has no flat ``checks`` map. Completion,
+    population and timing evidence are separate from phase/ramp target
+    budgets; only known budget leaves and the expected pending observer
+    binding may be false here. Origin safety is evaluated after attachment.
+    """
+
+    traffic = profile.get("traffic")
+    if set(acceptance) != _CAPACITY_ACCEPTANCE_KEYS:
+        return False
+    phases = traffic.get("phases") if isinstance(traffic, Mapping) else None
+    if not isinstance(phases, list) or not phases:
+        return False
+    phase_names = [
+        str(phase.get("name"))
+        for phase in phases
+        if isinstance(phase, Mapping) and isinstance(phase.get("name"), str)
+    ]
+    if len(phase_names) != len(phases) or len(set(phase_names)) != len(phase_names):
+        return False
+    phase_slo = acceptance.get("phase_slo")
+    phase_budget_evidence = acceptance.get("phase_budget_evidence")
+    if (
+        not isinstance(phase_slo, Mapping)
+        or set(phase_slo) != set(phase_names)
+        or not isinstance(phase_budget_evidence, Mapping)
+        or set(phase_budget_evidence) != {*phase_names, "primary", "duplicate"}
+    ):
+        return False
+    for name in phase_names:
+        phase_result = phase_slo.get(name)
+        budget_result = phase_budget_evidence.get(name)
+        phase_checks = (
+            phase_result.get("checks") if isinstance(phase_result, Mapping) else None
+        )
+        budget_checks = (
+            budget_result.get("checks") if isinstance(budget_result, Mapping) else None
+        )
+        if (
+            not isinstance(phase_result, Mapping)
+            or phase_result.get("passed") is not False
+            or phase_result.get("pending_origin_evidence") is not True
+            or phase_result.get("contract_ok") is not True
+            or phase_result.get("decision") != "SLO FAIL"
+            or not isinstance(phase_checks, Mapping)
+            or not _CAPACITY_PHASE_SLO_REQUIRED_CHECKS.issubset(phase_checks)
+            or not _acceptance_failure_is_budget_only(
+                phase_result,
+                "slo",
+                allow_no_budget_failure=True,
+                allow_pending_observer_binding=True,
+            )
+            or not isinstance(budget_result, Mapping)
+            or not isinstance(budget_checks, Mapping)
+            or set(budget_checks) != _capacity_phase_budget_check_names(profile)
+            or any(type(value) is not bool for value in budget_checks.values())
+            or type(budget_result.get("passed")) is not bool
+            or budget_result.get("passed") is not all(
+                value is True for value in budget_checks.values()
+            )
+            or not _acceptance_failure_is_budget_only(
+                budget_result,
+                "capacity",
+                allow_no_budget_failure=True,
+            )
+        ):
+            return False
+
+    # The producer emits one additional primary aggregate budget alongside
+    # each authored traffic phase.  Bind that exact entry as well; it is a
+    # target budget, not a substitute for any authored phase population.
+    primary_budget = phase_budget_evidence.get("primary")
+    primary_checks = (
+        primary_budget.get("checks") if isinstance(primary_budget, Mapping) else None
+    )
+    if (
+        not isinstance(primary_budget, Mapping)
+        or not isinstance(primary_checks, Mapping)
+        or set(primary_checks) != _capacity_phase_budget_check_names(profile)
+        or any(type(value) is not bool for value in primary_checks.values())
+        or type(primary_budget.get("passed")) is not bool
+        or primary_budget.get("passed") is not all(
+            value is True for value in primary_checks.values()
+        )
+        or not _acceptance_failure_is_budget_only(
+            primary_budget,
+            "capacity",
+            allow_no_budget_failure=True,
+        )
+    ):
+        return False
+
+    duplicate_budget = phase_budget_evidence.get("duplicate")
+    duplicate_checks = (
+        duplicate_budget.get("checks") if isinstance(duplicate_budget, Mapping) else None
+    )
+    if (
+        not isinstance(duplicate_budget, Mapping)
+        or duplicate_budget.get("passed") is not True
+        or not isinstance(duplicate_checks, Mapping)
+        or set(duplicate_checks) != _CAPACITY_EMPTY_PHASE_BUDGET_CHECKS
+        or any(value is not True for value in duplicate_checks.values())
+    ):
+        return False
+
+    stage_evidence = acceptance.get("capacity_ramp_evidence")
+    if not isinstance(stage_evidence, Mapping):
+        return False
+    stage_checks = stage_evidence.get("checks")
+    if not isinstance(stage_checks, Mapping):
+        return False
+    if any(type(value) is not bool for value in stage_checks.values()):
+        return False
+    allowed_ramp_budget_checks = _authored_ramp_budget_checks(profile, acceptance)
+    if allowed_ramp_budget_checks is None:
+        return False
+    authored_stages = traffic.get("concurrency_stages")
+    if allowed_ramp_budget_checks:
+        expected_stage_checks = {
+            "ramp_present",
+            "ramp_authored_stage_plan",
+            "ramp_stages_present",
+            "ramp_stage_names_closed",
+            "ramp_stage_order",
+        } | {
+            check
+            for stage in authored_stages
+            for check in (
+                f"ramp_{stage}_expected_count_typed",
+                f"ramp_{stage}_population",
+                f"ramp_{stage}_budgets",
+            )
+        }
+        if set(stage_checks) != expected_stage_checks:
+            return False
+        if not _acceptance_failure_is_budget_only(
+            {"checks": stage_checks},
+            "capacity",
+            allow_no_budget_failure=True,
+            allowed_ramp_budget_checks=allowed_ramp_budget_checks,
+        ):
+            return False
+    elif stage_checks or stage_evidence.get("stages") != {}:
+        return False
+    elif stage_evidence.get("complete") is not True:
+        return False
+    if stage_evidence.get("complete") is not all(
+        value is True for value in stage_checks.values()
+    ):
+        return False
+
+    phase_plan = acceptance.get("phase_plan_evidence")
+    budget_contract = acceptance.get("acceptance_budget_evidence")
+    budget_contract_checks = (
+        budget_contract.get("checks") if isinstance(budget_contract, Mapping) else None
+    )
+    acceptance_checks = acceptance.get("checks")
+    if acceptance_checks is not None and (
+        not isinstance(acceptance_checks, Mapping)
+        or not acceptance_checks
+        or any(type(value) is not bool or value is not True for value in acceptance_checks.values())
+    ):
+        return False
+    if (
+        acceptance.get("experiment_complete") is not False
+        or acceptance.get("target_passed") is not False
+        or acceptance.get("phase_completion") is not True
+        or not _all_true_boolean_mapping(acceptance.get("population_checks"))
+        or not _all_true_boolean_mapping(acceptance.get("phase_population_evidence"))
+        or not _all_true_boolean_mapping(acceptance.get("raw_logical_population_evidence"))
+        or not _all_true_boolean_mapping(acceptance.get("top_population_timing_evidence"))
+        or not isinstance(acceptance.get("timing_evidence"), Mapping)
+        or acceptance["timing_evidence"].get("complete") is not True
+        or not isinstance(phase_plan, Mapping)
+        or phase_plan.get("complete") is not True
+        or phase_plan.get("phase_budgets") != phase_budget_evidence
+        or set(phase_plan.get("checks", {}))
+        != _capacity_phase_plan_check_names(profile)
+        or not _all_true_boolean_mapping(phase_plan.get("checks"))
+        or not isinstance(budget_contract, Mapping)
+        or budget_contract.get("complete") is not True
+        or not isinstance(budget_contract_checks, Mapping)
+        or set(budget_contract_checks) != _acceptance_budget_check_names(profile)
+        or not _all_true_boolean_mapping(budget_contract_checks)
+        or not _capacity_outcome_evidence_is_closed(
+            acceptance.get("outcome_evidence")
+        )
+        or not _capacity_phase_retry_evidence_is_closed(
+            acceptance.get("phase_retry_evidence")
+        )
+    ):
+        return False
+    return True
 
 
 def evaluate_report(
@@ -2351,11 +2912,17 @@ def _is_complete_observer_bound_decision(
     assert isinstance(acceptance_binding, Mapping)
     assert isinstance(timing, Mapping)
     profile_acceptance = profile.get("acceptance")
+    profile_kind = (
+        profile_acceptance.get("kind", "slo")
+        if isinstance(profile_acceptance, Mapping)
+        else "slo"
+    )
     acceptance_checks = acceptance.get("checks")
     has_resource_safety = (
         isinstance(profile_acceptance, Mapping)
         and isinstance(profile_acceptance.get("resource_safety"), Mapping)
     )
+    origin_budget_failure = False
     if has_resource_safety:
         safety_checks = (
             origin_safety.get("checks")
@@ -2384,10 +2951,35 @@ def _is_complete_observer_bound_decision(
                 and safety_checks["postgres_backend_ownership_consistent"] is not True
             )
             or origin_safety.get("passed") is not all(safety_checks.values())
-            or not isinstance(acceptance_checks, Mapping)
-            or acceptance_checks.get("origin_safety") is not origin_safety.get("passed")
+            or (
+                profile_kind == "capacity"
+                and (
+                    acceptance_checks is not None
+                    or not _closed_capacity_completed_budget_failure(
+                        profile,
+                        acceptance,
+                        origin_budget_failure=any(
+                            check_name in _ORIGIN_RESOURCE_BUDGET_CHECKS
+                            and check is False
+                            for check_name, check in safety_checks.items()
+                        ),
+                    )
+                )
+            )
+            or (
+                profile_kind != "capacity"
+                and (
+                    not isinstance(acceptance_checks, Mapping)
+                    or acceptance_checks.get("origin_safety")
+                    is not origin_safety.get("passed")
+                )
+            )
         ):
             return False
+        origin_budget_failure = any(
+            check_name in _ORIGIN_RESOURCE_BUDGET_CHECKS and check is False
+            for check_name, check in safety_checks.items()
+        )
     elif origin_safety is not None or (
         isinstance(acceptance_checks, Mapping)
         and "origin_safety" in acceptance_checks
@@ -2450,10 +3042,209 @@ def _is_complete_observer_bound_decision(
         and all(type(stage) is int and stage > 0 for stage in authored_stages)
         else frozenset()
     )
+    if profile_kind == "capacity":
+        return _closed_capacity_completed_budget_failure(
+            profile,
+            acceptance,
+            origin_budget_failure=origin_budget_failure,
+        )
     return _acceptance_failure_is_budget_only(
         acceptance,
         str(profile_kind),
         allowed_ramp_budget_checks=allowed_ramp_budget_checks,
+        allowed_phase_names=_profile_budget_phase_names(profile),
+    )
+
+
+def _closed_capacity_completed_budget_failure(
+    profile: Mapping[str, Any],
+    acceptance: Mapping[str, Any],
+    *,
+    origin_budget_failure: bool,
+) -> bool:
+    """Require capacity completion and permit only authored target misses."""
+
+    traffic = profile.get("traffic")
+    if set(acceptance) != _CAPACITY_ACCEPTANCE_KEYS:
+        return False
+    phases = traffic.get("phases") if isinstance(traffic, Mapping) else None
+    if not isinstance(phases, list) or not phases:
+        return False
+    phase_names = [
+        str(phase.get("name"))
+        for phase in phases
+        if isinstance(phase, Mapping) and isinstance(phase.get("name"), str)
+    ]
+    if len(phase_names) != len(phases) or len(set(phase_names)) != len(phase_names):
+        return False
+    phase_slo = acceptance.get("phase_slo")
+    phase_budget_evidence = acceptance.get("phase_budget_evidence")
+    if (
+        not isinstance(phase_slo, Mapping)
+        or set(phase_slo) != set(phase_names)
+        or not isinstance(phase_budget_evidence, Mapping)
+        or set(phase_budget_evidence) != {*phase_names, "primary", "duplicate"}
+    ):
+        return False
+    budget_failure_seen = origin_budget_failure
+    for name in phase_names:
+        phase_result = phase_slo.get(name)
+        budget_result = phase_budget_evidence.get(name)
+        phase_checks = (
+            phase_result.get("checks") if isinstance(phase_result, Mapping) else None
+        )
+        if (
+            not isinstance(phase_result, Mapping)
+            or type(phase_result.get("passed")) is not bool
+            or phase_result.get("pending_origin_evidence") is not False
+            or phase_result.get("contract_ok") is not True
+            or phase_result.get("decision") != (
+                "SLO PASS" if phase_result.get("passed") is True else "SLO FAIL"
+            )
+            or not isinstance(phase_checks, Mapping)
+            or not _CAPACITY_PHASE_SLO_REQUIRED_CHECKS.issubset(phase_checks)
+            or not isinstance(phase_result.get("observer_binding"), Mapping)
+            or phase_result["observer_binding"].get("complete") is not True
+            or not isinstance(budget_result, Mapping)
+            or not isinstance(budget_result.get("checks"), Mapping)
+            or type(budget_result.get("passed")) is not bool
+            or budget_result.get("passed") is not all(
+                value is True for value in budget_result["checks"].values()
+            )
+        ):
+            return False
+        if not _acceptance_failure_is_budget_only(
+            phase_result, "slo", allow_no_budget_failure=True
+        ) or not _acceptance_failure_is_budget_only(
+            budget_result, "capacity", allow_no_budget_failure=True
+        ):
+            return False
+        budget_failure_seen = (
+            _acceptance_failure_is_budget_only(phase_result, "slo")
+            or _acceptance_failure_is_budget_only(budget_result, "capacity")
+            or budget_failure_seen
+        )
+
+    primary_budget = phase_budget_evidence.get("primary")
+    primary_checks = (
+        primary_budget.get("checks") if isinstance(primary_budget, Mapping) else None
+    )
+    if (
+        not isinstance(primary_budget, Mapping)
+        or not isinstance(primary_checks, Mapping)
+        or set(primary_checks) != _capacity_phase_budget_check_names(profile)
+        or any(type(value) is not bool for value in primary_checks.values())
+        or type(primary_budget.get("passed")) is not bool
+        or primary_budget.get("passed") is not all(
+            value is True for value in primary_checks.values()
+        )
+        or not _acceptance_failure_is_budget_only(
+            primary_budget,
+            "capacity",
+            allow_no_budget_failure=True,
+        )
+    ):
+        return False
+    budget_failure_seen = (
+        _acceptance_failure_is_budget_only(primary_budget, "capacity")
+        or budget_failure_seen
+    )
+
+    duplicate_budget = phase_budget_evidence.get("duplicate")
+    duplicate_checks = (
+        duplicate_budget.get("checks") if isinstance(duplicate_budget, Mapping) else None
+    )
+    if (
+        not isinstance(duplicate_budget, Mapping)
+        or duplicate_budget.get("passed") is not True
+        or not isinstance(duplicate_checks, Mapping)
+        or set(duplicate_checks) != _CAPACITY_EMPTY_PHASE_BUDGET_CHECKS
+        or any(value is not True for value in duplicate_checks.values())
+    ):
+        return False
+
+    stage_evidence = acceptance.get("capacity_ramp_evidence")
+    stage_checks = (
+        stage_evidence.get("checks") if isinstance(stage_evidence, Mapping) else None
+    )
+    if not isinstance(stage_checks, Mapping) or any(
+        type(value) is not bool for value in stage_checks.values()
+    ):
+        return False
+    allowed_ramp_budget_checks = _authored_ramp_budget_checks(profile, acceptance)
+    if allowed_ramp_budget_checks is None:
+        return False
+    authored_stages = traffic.get("concurrency_stages")
+    ramp_acceptance = {"checks": stage_checks}
+    if allowed_ramp_budget_checks:
+        expected_stage_checks = {
+            "ramp_present",
+            "ramp_authored_stage_plan",
+            "ramp_stages_present",
+            "ramp_stage_names_closed",
+            "ramp_stage_order",
+        } | {
+            check
+            for stage in authored_stages
+            for check in (
+                f"ramp_{stage}_expected_count_typed",
+                f"ramp_{stage}_population",
+                f"ramp_{stage}_budgets",
+            )
+        }
+        if set(stage_checks) != expected_stage_checks:
+            return False
+        if not _acceptance_failure_is_budget_only(
+            ramp_acceptance,
+            "capacity",
+            allow_no_budget_failure=True,
+            allowed_ramp_budget_checks=allowed_ramp_budget_checks,
+        ):
+            return False
+    elif stage_checks or stage_evidence.get("stages") != {}:
+        return False
+    elif stage_evidence.get("complete") is not True:
+        return False
+    if stage_evidence.get("complete") is not all(
+        value is True for value in stage_checks.values()
+    ):
+        return False
+    budget_failure_seen = any(
+        name in allowed_ramp_budget_checks and value is False
+        for name, value in stage_checks.items()
+    ) or budget_failure_seen
+
+    budget_contract = acceptance.get("acceptance_budget_evidence")
+    budget_contract_checks = (
+        budget_contract.get("checks") if isinstance(budget_contract, Mapping) else None
+    )
+    return (
+        acceptance.get("experiment_complete") is True
+        and acceptance.get("target_passed") is False
+        and acceptance.get("phase_completion") is True
+        and _all_true_boolean_mapping(acceptance.get("population_checks"))
+        and _all_true_boolean_mapping(acceptance.get("phase_population_evidence"))
+        and _all_true_boolean_mapping(acceptance.get("raw_logical_population_evidence"))
+        and _all_true_boolean_mapping(acceptance.get("top_population_timing_evidence"))
+        and isinstance(acceptance.get("timing_evidence"), Mapping)
+        and acceptance["timing_evidence"].get("complete") is True
+        and isinstance(acceptance.get("phase_plan_evidence"), Mapping)
+        and acceptance["phase_plan_evidence"].get("complete") is True
+        and acceptance["phase_plan_evidence"].get("phase_budgets")
+        == phase_budget_evidence
+        and _all_true_boolean_mapping(acceptance["phase_plan_evidence"].get("checks"))
+        and isinstance(budget_contract, Mapping)
+        and budget_contract.get("complete") is True
+        and isinstance(budget_contract_checks, Mapping)
+        and set(budget_contract_checks) == _acceptance_budget_check_names(profile)
+        and _all_true_boolean_mapping(budget_contract_checks)
+        and _capacity_outcome_evidence_is_closed(
+            acceptance.get("outcome_evidence")
+        )
+        and _capacity_phase_retry_evidence_is_closed(
+            acceptance.get("phase_retry_evidence")
+        )
+        and budget_failure_seen
     )
 
 
@@ -2553,6 +3344,18 @@ _ORIGIN_RESOURCE_BUDGET_CHECKS = frozenset(
 _ORIGIN_RESOURCE_HARD_CHECKS = frozenset(
     {"observer_completed", "required_diagnostics_present"}
 )
+_PHASE_TARGET_BUDGET_CHECKS = frozenset(
+    {
+        "logical_final_failure_budget",
+        "accepted_p95",
+        "logical_p95",
+        "accepted_p99",
+        "logical_p99",
+        "shed_percent",
+        "retry_amplification_percent",
+        "minimum_useful_goodput",
+    }
+)
 _RAMP_STAGE_BUDGET_CHECKS = frozenset(
     {
         "logical_final_failure_budget",
@@ -2576,6 +3379,9 @@ def _acceptance_failure_is_budget_only(
     profile_kind: str,
     *,
     allowed_ramp_budget_checks: frozenset[str] = frozenset(),
+    allowed_phase_names: frozenset[str] = frozenset(),
+    allow_no_budget_failure: bool = False,
+    allow_pending_observer_binding: bool = False,
 ) -> bool:
     """Reject an SLO-miss classification if any structural check failed.
 
@@ -2589,6 +3395,34 @@ def _acceptance_failure_is_budget_only(
     checks = acceptance.get("checks")
     if allowed is None or not isinstance(checks, Mapping) or not checks:
         return False
+
+    pending_observer_checks = {
+        "fixture_marker",
+        "external_run_id",
+        "binding_complete",
+        "observer_stop_file_seen",
+        "observer_not_timed_out",
+    }
+    pending_observer_is_closed = _closed_missing_observer_binding(
+        acceptance.get("observer_binding")
+    )
+    phase_slo = acceptance.get("phase_slo")
+
+    def pending_phase_observer_is_closed(phase_name: str) -> bool:
+        phase = phase_slo.get(phase_name) if isinstance(phase_slo, Mapping) else None
+        return (
+            isinstance(phase, Mapping)
+            and phase.get("pending_origin_evidence") is True
+            and _closed_missing_observer_binding(phase.get("observer_binding"))
+        )
+
+    phase_budget_evidence = acceptance.get("phase_budget_evidence")
+    phase_plan_evidence = acceptance.get("phase_plan_evidence")
+    phase_budget_evidence_is_bound = (
+        isinstance(phase_budget_evidence, Mapping)
+        and isinstance(phase_plan_evidence, Mapping)
+        and phase_plan_evidence.get("phase_budgets") == phase_budget_evidence
+    )
 
     authored_ramp_stages = {
         name.removeprefix("ramp_").removesuffix("_budgets")
@@ -2623,13 +3457,82 @@ def _acceptance_failure_is_budget_only(
                             and check_path[3] == "budget_evidence"
                             and name in _RAMP_STAGE_BUDGET_CHECKS
                         )
+                        pending_observer_leaf = (
+                            allow_pending_observer_binding
+                            and (
+                                (
+                                    pending_observer_is_closed
+                                    and check_path == ("checks",)
+                                    and name == "observer_binding"
+                                )
+                                or (
+                                    pending_observer_is_closed
+                                    and
+                                    check_path == ("observer_binding", "checks")
+                                    and name in pending_observer_checks
+                                )
+                                or (
+                                    len(check_path) == 3
+                                    and check_path[0] == "phase_slo"
+                                    and check_path[1] in allowed_phase_names
+                                    and check_path[2] == "checks"
+                                    and name == "observer_binding"
+                                    and pending_phase_observer_is_closed(check_path[1])
+                                )
+                                or (
+                                    len(check_path) == 4
+                                    and check_path[0] == "phase_slo"
+                                    and check_path[1] in allowed_phase_names
+                                    and check_path[2:] == ("observer_binding", "checks")
+                                    and name in pending_observer_checks
+                                    and pending_phase_observer_is_closed(check_path[1])
+                                )
+                            )
+                        )
+                        if pending_observer_leaf:
+                            continue
+                        top_level_budget_leaf = (
+                            check_path == ("checks",)
+                            and (
+                                (
+                                    name in allowed
+                                    and name not in _ORIGIN_RESOURCE_BUDGET_CHECKS
+                                )
+                                or name in allowed_ramp_budget_checks
+                            )
+                        )
+                        phase_budget_leaf = (
+                            (
+                                len(check_path) == 3
+                                and check_path[0] == "phase_budget_evidence"
+                                and check_path[1] in allowed_phase_names
+                                and check_path[2] == "checks"
+                                or len(check_path) == 4
+                                and check_path[0:2]
+                                == ("phase_plan_evidence", "phase_budgets")
+                                and check_path[2] in allowed_phase_names
+                                and check_path[3] == "checks"
+                            )
+                            and name in _PHASE_TARGET_BUDGET_CHECKS
+                            and phase_budget_evidence_is_bound
+                        )
+                        origin_budget_leaf = (
+                            check_path == ("origin_safety", "checks")
+                            and name in _ORIGIN_RESOURCE_BUDGET_CHECKS
+                        )
+                        ramp_budget_leaf = (
+                            check_path == ("capacity_ramp_evidence", "checks")
+                            and name in allowed_ramp_budget_checks
+                        )
                         if (
-                            name in allowed
-                            or name in allowed_ramp_budget_checks
+                            top_level_budget_leaf
+                            or phase_budget_leaf
+                            or origin_budget_leaf
+                            or ramp_budget_leaf
                             or ramp_stage_budget_check
                         ):
                             budget_failure = True
-                        elif name in _BUDGET_AGGREGATE_CHECKS:
+                        elif check_path == ("checks",) and name in _BUDGET_AGGREGATE_CHECKS:
                             evidence_key = {
                                 "phase_budgets": "phase_budget_evidence",
                                 "capacity_ramp_evidence": "capacity_ramp_evidence",
@@ -2664,13 +3567,80 @@ def _acceptance_failure_is_budget_only(
                     if not valid:
                         return False, False
                     budget_failure = budget_failure or child_budget_failure
+            for status_key in (
+                "passed",
+                "complete",
+                "target_passed",
+                "experiment_complete",
+                "phase_completion",
+            ):
+                if status_key not in node:
+                    continue
+                status = node[status_key]
+                if type(status) is not bool:
+                    return False, False
+                if status is not False:
+                    continue
+                missing_observer_status = (
+                    status_key == "complete"
+                    and path == ("observer_binding",)
+                    and allow_pending_observer_binding
+                    and pending_observer_is_closed
+                )
+                ramp_budget_status = (
+                    status_key == "complete"
+                    and path == ("capacity_ramp_evidence",)
+                    and bool(failed_ramp_stages)
+                    and budget_failure
+                )
+                root_pending_status = (
+                    status_key == "passed"
+                    and path == ()
+                    and (budget_failure or allow_no_budget_failure)
+                )
+                phase_pending_status = (
+                    status_key == "passed"
+                    and len(path) == 2
+                    and path[0] == "phase_slo"
+                    and path[1] in allowed_phase_names
+                    and allow_pending_observer_binding
+                    and pending_phase_observer_is_closed(path[1])
+                    and (budget_failure or allow_no_budget_failure)
+                )
+                nested_budget_status = (
+                    status_key == "passed"
+                    and budget_failure
+                    and (
+                        (len(path) == 2 and path[0] == "phase_budget_evidence")
+                        or (
+                            len(path) == 3
+                            and path[:2]
+                            == ("phase_plan_evidence", "phase_budgets")
+                        )
+                        or (
+                            len(path) == 4
+                            and path[:2]
+                            == ("capacity_ramp_evidence", "stages")
+                            and path[3] == "budget_evidence"
+                        )
+                        or path == ("origin_safety",)
+                    )
+                )
+                if not (
+                    missing_observer_status
+                    or ramp_budget_status
+                    or root_pending_status
+                    or phase_pending_status
+                    or nested_budget_status
+                ):
+                    return False, False
             return True, budget_failure
         return True, False
 
     valid, false_budget_seen = check_tree(acceptance)
     if not valid:
         return False
-    return false_budget_seen
+    return false_budget_seen or allow_no_budget_failure
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
