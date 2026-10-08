@@ -700,6 +700,43 @@ class EvidencePrivacyTests(unittest.TestCase):
             "cpu_profile": {
                 "enabled": True,
                 "armed_worker_identities": [{"pid": 987654, "uid": 876543}],
+                "profiles": [
+                    {
+                        "profile_available": True,
+                        "filename": "/home/operator/private-profile.pstats",
+                        "pid": 987654,
+                        "functions": [
+                            {
+                                "function": "ReadyVoteService.cast_vote",
+                                "line": 42,
+                                "primitive_calls": 8,
+                                "calls": 12,
+                                "self_seconds": 0.125,
+                                "cumulative_seconds": 0.75,
+                                "filename": "/home/operator/private-source.py",
+                                "pid": 987654,
+                            },
+                            {
+                                "function": "<dynamic function at 0x1234>",
+                                "line": 3.0,
+                                "primitive_calls": "1",
+                                "calls": 1_000_000_000_001,
+                                "self_seconds": float("nan"),
+                                "cumulative_seconds": -1.0,
+                                "filename": "/home/operator/private-source.py",
+                            },
+                            {"function": "192.168.1.1"},
+                            {"function": "operator@example.test"},
+                            {"function": "/tmp/private.py"},
+                            {"function": "987654"},
+                            {
+                                "function": "<lambda>",
+                                "self_seconds": float("inf"),
+                                "cumulative_seconds": 0.0,
+                            },
+                        ],
+                    }
+                ],
                 "retention": {
                     "available_profiles": 1,
                     "ignored_stale_profiles": 2,
@@ -756,6 +793,40 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertNotIn("by_pid", public_observer["server_ssr_observability"]["event_loop"])
         self.assertNotIn("armed_worker_identities", public_observer["cpu_profile"])
         self.assertEqual(public_observer["cpu_profile"]["ignored_stale_profiles"], 2)
+        profile = public_observer["cpu_profile"]["profiles"][0]
+        self.assertEqual(profile["profile_available"], True)
+        self.assertEqual(
+            profile["functions"][0],
+            {
+                "function": "ReadyVoteService.cast_vote",
+                "line": 42,
+                "primitive_calls": 8,
+                "calls": 12,
+                "self_seconds": 0.125,
+                "cumulative_seconds": 0.75,
+            },
+        )
+        self.assertEqual(profile["functions"][1]["function"], "other")
+        self.assertNotIn("line", profile["functions"][1])
+        self.assertNotIn("primitive_calls", profile["functions"][1])
+        self.assertNotIn("calls", profile["functions"][1])
+        self.assertNotIn("self_seconds", profile["functions"][1])
+        self.assertNotIn("cumulative_seconds", profile["functions"][1])
+        self.assertEqual(
+            [row["function"] for row in profile["functions"][1:]],
+            ["other", "other", "other", "other", "<lambda>"],
+        )
+        self.assertNotIn("self_seconds", profile["functions"][5])
+        self.assertEqual(profile["functions"][5]["cumulative_seconds"], 0.0)
+        self.assertNotIn("filename", profile)
+        self.assertNotIn("pid", profile)
+        self.assertNotIn("private-profile", observer_output)
+        self.assertNotIn("private-source", observer_output)
+        self.assertNotIn("dynamic function", observer_output)
+        self.assertNotIn("192.168.1.1", observer_output)
+        self.assertNotIn("operator@example.test", observer_output)
+        self.assertNotIn("/tmp/private.py", observer_output)
+        self.assertNotIn("987654", observer_output)
         self.assertEqual(
             public_observer["cpu_profile"]["signal_delivery"]["arm"]["rejection_reasons"],
             {
@@ -769,6 +840,33 @@ class EvidencePrivacyTests(unittest.TestCase):
             "uid_unavailable",
         )
         self.assertEqual(public_observer["postgres_stat_statements"]["before"]["rows"][0]["queryid"], "42")
+
+        bounded_profiles = project_public_artifact(
+            "server_observability",
+            {
+                "cpu_profile": {
+                    "profiles": [
+                        {
+                            "profile_available": True,
+                            "functions": [
+                                {
+                                    "function": "f",
+                                    "line": 1,
+                                    "primitive_calls": 1,
+                                    "calls": 1,
+                                    "self_seconds": 0.1,
+                                    "cumulative_seconds": 0.2,
+                                }
+                            ]
+                            * 101,
+                        }
+                    ]
+                    * 33
+                }
+            },
+        )["cpu_profile"]["profiles"]
+        self.assertEqual(len(bounded_profiles), 32)
+        self.assertEqual(len(bounded_profiles[0]["functions"]), 100)
 
         timeout_source = {
             "schema": 1,

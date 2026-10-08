@@ -149,6 +149,7 @@ LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES = frozenset(
         "browser_qa",
     }
 )
+LIVE_LAUNCH_PRE_SUPERVISOR_FAILURE_STAGES = frozenset({"dispatch"})
 LIVE_LAUNCH_FAILURE_STAGES = LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES | frozenset(
     {
         "dispatch",
@@ -1003,7 +1004,11 @@ def _parse_live_launch_status(
         if stage != "complete" or child_exit != 0 or child_status != 0:
             return None
     elif (
-        stage not in LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES
+        stage
+        not in (
+            LIVE_LAUNCH_SUPERVISOR_FAILURE_STAGES
+            | LIVE_LAUNCH_PRE_SUPERVISOR_FAILURE_STAGES
+        )
         or child_exit == 0
         or child_status != child_exit
     ):

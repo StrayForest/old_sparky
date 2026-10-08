@@ -271,6 +271,7 @@ pin-bump lifecycle; it does not silently skip historical ancestry proof.
 
 Operation-bound legacy LiveQA fixtures in `test_platform_recovery_bootstrap` stay in `backend-privileged`; they cover receipt/pointer/venv identity, service/timer snapshot, bounded readiness retries, fixed child-stage/status diagnostics and receipt-last cleanup.
 `test_platform_release_recovery_boundaries` covers the candidate-deadline-clamped reconcile timeout, retained receipt, and idempotent retry after a simulated partial payload publish. `test_platform_live_qa_runtime_install` covers fixed stage diagnostics for a post-promotion retention failure. These remain in `backend-privileged` because they exercise release-state transitions and privileged payload ownership.
+`test_platform_live_qa_wrappers` also owns the source-bound fixed-stage status contract for public launch failures before the browser supervisor starts; its failure tests remain in `backend-privileged` and invoke no browser or database work.
 `test_liveqa_reconcile_stderr_is_available_only_to_private_candidate_capture`
 checks the helper preserves reconcile stderr. Its companion
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` verifies private
@@ -278,7 +279,7 @@ capture and closed stdout/public markers; the executable catalog snapshot tracks
 Privileged release tests prove promoted dependencies stay readable, relocation removes only wheel/RECORD-bound generated caches, cleanup is receipt/readiness/cgroup-bound, and runtime summaries stay out of deployment markers.
 Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused.
 A proof miss uses the existing fresh-venv snapshot path. These root-owned cases remain in `backend-privileged`; bootstrap extraction tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
-The canonical AST snapshot is 1,787 tests (1,715 backend, including 565 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 291, tool-contract 425, integration 255, privileged 565, and performance-contract 179.
+The canonical AST snapshot is 1,788 tests (1,716 backend, including 566 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 291, tool-contract 425, integration 255, privileged 566, and performance-contract 179.
 Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
 
