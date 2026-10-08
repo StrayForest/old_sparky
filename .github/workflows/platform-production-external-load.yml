@@ -2332,6 +2332,7 @@ jobs:
           status=1
           acceptance_status=invalid
           upstream_ready=0
+          failed_worker_report_ready=0
           if [[ "${{ needs.validate-external-inputs.result }}" == success \
             && "${{ needs.fixture-setup.result }}" == success \
             && "${{ needs.fixture-setup.outputs.setup_status }}" == 0 \
@@ -2353,7 +2354,7 @@ jobs:
             && "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" == 0 \
             && "${{ steps.verify-evaluator-artifacts.outputs.input_artifact_status }}" == 0 \
             && -s "$report" && -s "$load_status_file" && -s "$observer" ]]; then
-            if /usr/bin/python3 - "$load_status_file" "$report" "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$TIMEOUT_DIAGNOSTICS" <<'PY'
+          validation_kind="$(/usr/bin/python3 - "$load_status_file" "$report" "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$SOURCE_GIT_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PROFILE_ID" "$TIMEOUT_DIAGNOSTICS" <<'PY'
           import hashlib
           import json
           import os
@@ -2411,6 +2412,8 @@ jobs:
           if hashlib.sha256(report_file.read_bytes()).hexdigest() != payload["report_sha256"]:
               raise SystemExit("candidate report digest does not match its receipt")
           report_payload = json.loads(report_file.read_text(encoding="utf-8"), object_pairs_hook=closed_object)
+          if not isinstance(report_payload, dict):
+              raise SystemExit("candidate report is not a closed object")
           if (
               report_payload.get("source_git_sha") != target_sha
               or report_payload.get("app_target_sha") != app_target_sha
@@ -2419,15 +2422,98 @@ jobs:
           ):
               raise SystemExit("candidate report runner/app source binding is inconsistent")
           state, raw_status = payload["candidate_state"], payload["client_exit_status"]
+          worker_failure = report_payload.get("worker_failure")
+          worker_failure_keys = {
+              "schema", "stage", "exception_class", "module", "line", "traceback_truncated"
+          }
+          valid_worker_failure = (
+              isinstance(worker_failure, dict)
+              and set(worker_failure) == worker_failure_keys
+              and type(worker_failure.get("schema")) is int
+              and worker_failure.get("schema") == 1
+              and isinstance(worker_failure.get("stage"), str)
+              and worker_failure.get("stage") in {
+                  "worker_config_read", "worker_config_validate",
+                  "worker_identity", "worker_callback", "worker_report_write", "other"
+              }
+              and isinstance(worker_failure.get("exception_class"), str)
+              and worker_failure.get("exception_class") in {
+                  "assertion_error", "json_decode_error", "key_error",
+                  "namespace_integrity_error", "os_error", "other", "overflow_error",
+                  "runtime_error", "timeout_error", "type_error", "unicode_decode_error",
+                  "value_error"
+              }
+              and isinstance(worker_failure.get("module"), str)
+              and worker_failure.get("module") in {
+                  "external_load", "load", "load_acceptance", "load_runtime", "load_worker", "other"
+              }
+              and type(worker_failure.get("traceback_truncated")) is bool
+              and (
+                  worker_failure.get("line") is None
+                  or (type(worker_failure.get("line")) is int and 1 <= worker_failure["line"] <= 1000000)
+              )
+              and not (
+                  worker_failure.get("module") == "other" and worker_failure.get("line") is not None
+              )
+              and not (
+                  worker_failure.get("module") != "other" and worker_failure.get("line") is None
+              )
+              and not (
+                  worker_failure.get("traceback_truncated") is True
+                  and (worker_failure.get("module") != "other" or worker_failure.get("line") is not None)
+              )
+          )
+          supervisor = report_payload.get("runtime_supervisor")
+          valid_failed_worker = (
+              state == "failed"
+              and raw_status == 1
+              and timeout_diagnostics == "false"
+              and report_payload.get("worker_report_schema") == 2
+              and report_payload.get("report_complete") is True
+              and report_payload.get("passed") is False
+              and report_payload.get("authoritative") is False
+              and report_payload.get("dispatchable") is False
+              and report_payload.get("namespace_closed") is True
+              and report_payload.get("partial_work") is True
+              and report_payload.get("inflight_unknown") is True
+              and report_payload.get("isolation") == "pid_namespace"
+              and isinstance(report_payload.get("acceptance"), dict)
+              and report_payload["acceptance"].get("passed") is False
+              and report_payload["acceptance"].get("contract_ok") is False
+              and report_payload["acceptance"].get("decision") == "LOAD RUN FAILED"
+              and isinstance(supervisor, dict)
+              and type(supervisor.get("protocol")) is int
+              and supervisor.get("protocol") == 1
+              and supervisor.get("isolation") == "pid_namespace"
+              and supervisor.get("reason") == "none"
+              and supervisor.get("signal") is None
+              and supervisor.get("namespace_closed") is True
+              and supervisor.get("descendants_reaped") is True
+              and type(supervisor.get("returncode")) is int
+              and supervisor.get("returncode") == 1
+              and supervisor.get("partial_work") is True
+              and supervisor.get("inflight_unknown") is True
+              and supervisor.get("report_error") is None
+              and valid_worker_failure
+          )
           valid_state = (
               (state == "pending_origin" and raw_status == 3 and timeout_diagnostics == "false")
               or (state == "produced" and raw_status == 0 and timeout_diagnostics == "false")
               or (state == "timeout_diagnostics" and raw_status == 0 and timeout_diagnostics == "true")
           )
-          if not valid_state:
+          if valid_failed_worker:
+              print("worker_failure")
+          elif valid_state:
+              print("normal")
+          else:
               raise SystemExit("authoritative load-status is not bound to this run")
           PY
-            then upstream_ready=1; fi
+          )" || validation_kind=""
+          case "$validation_kind" in
+            normal) upstream_ready=1 ;;
+            worker_failure) failed_worker_report_ready=1 ;;
+            *) ;;
+          esac
           fi
           if [[ "$upstream_ready" == 1 ]]; then
             set +e
@@ -2451,6 +2537,7 @@ jobs:
           if [[ "$upstream_ready" != 1 ]]; then acceptance_status=invalid; fi
           echo "evaluation_status=$status" >> "$GITHUB_OUTPUT"
           echo "acceptance_status=$acceptance_status" >> "$GITHUB_OUTPUT"
+          echo "failed_worker_report_ready=$failed_worker_report_ready" >> "$GITHUB_OUTPUT"
           exit 0
       - name: Sanitize external evidence
         id: sanitize
@@ -2546,8 +2633,13 @@ jobs:
           needs.fixture-finalize.outputs.cleanup_identity_status == '0' &&
           steps.verify-evaluator-artifacts.outputs.candidate_artifact_status == '0' &&
           steps.verify-evaluator-artifacts.outputs.origin_artifact_status == '0' &&
-          steps.evaluate-load.outputs.evaluation_status == '0' &&
-          (steps.evaluate-load.outputs.acceptance_status == 'accepted' || steps.evaluate-load.outputs.acceptance_status == 'slo_failed' || steps.evaluate-load.outputs.acceptance_status == 'diagnostic_complete') &&
+          (
+            (
+              steps.evaluate-load.outputs.evaluation_status == '0' &&
+              (steps.evaluate-load.outputs.acceptance_status == 'accepted' || steps.evaluate-load.outputs.acceptance_status == 'slo_failed' || steps.evaluate-load.outputs.acceptance_status == 'diagnostic_complete')
+            ) ||
+            steps.evaluate-load.outputs.failed_worker_report_ready == '1'
+          ) &&
           steps.sanitize.outputs.sanitizer_status == '0'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:

@@ -183,6 +183,16 @@ evidence fails. Dispatch inputs use the canonical bounded-ASCII parser and
 private mode-0600 JSON stdin; SSH carries a fixed dispatcher mode and no raw
 input enters reports or artifacts.
 
+When the PID-namespace worker exits normally after catching an exception, the
+parent report retains a closed worker-failure discriminator (stage, exception
+class, allowlisted module, and numeric source line). The parent still records
+the worker's nonzero exit and partial/in-flight status; namespace closure does
+not convert that report into a pass. If the source-bound discriminator is
+valid and the existing fixture, observer, namespace, and cleanup gates pass,
+the failed report may be published for diagnosis while the workflow remains
+failed. Exception text, traceback text, paths, and local values are never part
+of the public projection.
+
 The origin observer is a supported integration of the
 [`platform_production_external_fixture_qa.sh`](../tools/platform_production_external_fixture_qa.sh)
 workflow. That workflow enters the canonical retained-load supervisor before

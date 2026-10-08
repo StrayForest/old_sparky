@@ -56,6 +56,27 @@ MIN_NAMESPACE_REAP_GRACE_SECONDS = 1.0
 MAX_CHILD_REPORT_BYTES = 16 * 1024 * 1024
 MAX_REASON_LENGTH = 96
 _SAFE_REASON = frozenset({"none", "max_duration_seconds", "max_runner_minutes"})
+WORKER_FAILURE_SCHEMA = 1
+_WORKER_FAILURE_STAGES = frozenset(
+    {
+        "worker_config_read",
+        "worker_config_validate",
+        "worker_identity",
+        "worker_callback",
+        "worker_report_write",
+        "other",
+    }
+)
+_WORKER_FAILURE_MODULE_FILES = {
+    "platform_load_runtime.py": "load_runtime",
+    "platform_load_worker.py": "load_worker",
+    "platform_load.py": "load",
+    "platform_external_load.py": "external_load",
+    "platform_load_acceptance.py": "load_acceptance",
+}
+_WORKER_FAILURE_MODULES = frozenset(_WORKER_FAILURE_MODULE_FILES.values()) | {"other"}
+_MAX_WORKER_TRACEBACK_FRAMES = 32
+_MAX_WORKER_FAILURE_LINE = 1_000_000
 
 
 def _deadline_reason_at(
@@ -90,6 +111,21 @@ class NamespaceCapabilityError(RuntimeError):
 
 class NamespaceIntegrityError(RuntimeError):
     """The trusted namespace bootstrap observed an identity/race violation."""
+
+
+_WORKER_EXCEPTION_CLASSES = {
+    AssertionError: "assertion_error",
+    KeyError: "key_error",
+    json.JSONDecodeError: "json_decode_error",
+    NamespaceIntegrityError: "namespace_integrity_error",
+    OSError: "os_error",
+    OverflowError: "overflow_error",
+    RuntimeError: "runtime_error",
+    TimeoutError: "timeout_error",
+    TypeError: "type_error",
+    UnicodeDecodeError: "unicode_decode_error",
+    ValueError: "value_error",
+}
 
 
 class LoadRuntimeBudgetExceeded(RuntimeError):
@@ -843,6 +879,7 @@ def _closed_failure_report(
     runtime_budget: Mapping[str, Any] | None = None,
     descendants_reaped: bool = True,
     namespace_closed: bool = False,
+    worker_failure: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     # A missing child report is evidence, not a replacement for the
     # supervisor's primary timeout/containment reason.  ``namespace_closed``
@@ -884,7 +921,112 @@ def _closed_failure_report(
     }
     if runtime_budget is not None:
         payload["runtime_budget"] = dict(runtime_budget)
+    if worker_failure is not None:
+        payload["worker_failure"] = dict(worker_failure)
     return payload
+
+
+def _closed_worker_failure(exc: BaseException, stage: str) -> dict[str, Any]:
+    """Project a worker exception to fixed diagnostic fields only."""
+
+    stage_value = stage if stage in _WORKER_FAILURE_STAGES else "other"
+    exception_class = _WORKER_EXCEPTION_CLASSES.get(type(exc), "other")
+    trusted_files = {
+        (Path(__file__).resolve().parent / filename).resolve(): module
+        for filename, module in _WORKER_FAILURE_MODULE_FILES.items()
+    }
+    selected_module = "other"
+    selected_line: int | None = None
+    traceback_item = exc.__traceback__
+    frames_seen = 0
+    while traceback_item is not None and frames_seen < _MAX_WORKER_TRACEBACK_FRAMES:
+        frame = traceback_item.tb_frame
+        try:
+            module = trusted_files.get(Path(frame.f_code.co_filename).resolve())
+        except (OSError, RuntimeError, ValueError):
+            module = None
+        line = traceback_item.tb_lineno
+        if module is not None and type(line) is int and 1 <= line <= _MAX_WORKER_FAILURE_LINE:
+            selected_module, selected_line = module, line
+        traceback_item = traceback_item.tb_next
+        frames_seen += 1
+    traceback_truncated = traceback_item is not None
+    if traceback_truncated:
+        # The bounded prefix cannot prove which frame is innermost.
+        selected_module, selected_line = "other", None
+    return {
+        "schema": WORKER_FAILURE_SCHEMA,
+        "stage": stage_value,
+        "exception_class": exception_class,
+        "module": selected_module,
+        "line": selected_line,
+        "traceback_truncated": traceback_truncated,
+    }
+
+
+def _is_closed_worker_failure(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "stage",
+        "exception_class",
+        "module",
+        "line",
+        "traceback_truncated",
+    }:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value.get("schema") != WORKER_FAILURE_SCHEMA
+        or not isinstance(value.get("stage"), str)
+        or value.get("stage") not in _WORKER_FAILURE_STAGES
+        or not isinstance(value.get("exception_class"), str)
+        or value.get("exception_class") not in set(_WORKER_EXCEPTION_CLASSES.values()) | {"other"}
+        or not isinstance(value.get("module"), str)
+        or value.get("module") not in _WORKER_FAILURE_MODULES
+        or type(value.get("traceback_truncated")) is not bool
+    ):
+        return False
+    line = value.get("line")
+    module = value.get("module")
+    if line is not None and (type(line) is not int or not 1 <= line <= _MAX_WORKER_FAILURE_LINE):
+        return False
+    return not (
+        value.get("traceback_truncated") is True and (module != "other" or line is not None)
+    ) and not (module == "other" and line is not None) and not (
+        module != "other" and line is None
+    )
+
+
+def _close_reaped_worker_report(
+    worker_report: Mapping[str, Any], *, returncode: int | None
+) -> dict[str, Any]:
+    """Apply parent-proven namespace closure without masking worker failure."""
+
+    final_payload = dict(worker_report)
+    final_payload["isolation"] = PID_NAMESPACE_ISOLATION
+    final_payload["namespace_closed"] = True
+    if _is_closed_worker_failure(final_payload.get("worker_failure")):
+        final_payload["passed"] = False
+        final_payload["authoritative"] = False
+        final_payload["dispatchable"] = False
+        final_payload["acceptance"] = {
+            "passed": False,
+            "decision": "LOAD RUN FAILED",
+            "contract_ok": False,
+        }
+    final_payload["runtime_supervisor"] = {
+        "protocol": RUNTIME_PROTOCOL_VERSION,
+        "isolation": PID_NAMESPACE_ISOLATION,
+        "namespace_closed": True,
+        "reason": "none",
+        "signal": None,
+        "returncode": returncode,
+        "partial_work": bool(final_payload.get("partial_work", False)),
+        "inflight_unknown": bool(final_payload.get("inflight_unknown", False)),
+        "descendants_reaped": True,
+        "report_error": None,
+    }
+    return final_payload
 
 
 def _read_process_children(pid: int) -> tuple[int, ...]:
@@ -1803,21 +1945,9 @@ def run_supervised(
         and acceptance_gate_reason is None
     )
     if successful_worker:
-        final_payload = dict(worker_report)
-        final_payload["isolation"] = PID_NAMESPACE_ISOLATION
-        final_payload["namespace_closed"] = True
-        final_payload["runtime_supervisor"] = {
-            "protocol": RUNTIME_PROTOCOL_VERSION,
-            "isolation": PID_NAMESPACE_ISOLATION,
-            "namespace_closed": True,
-            "reason": "none",
-            "signal": None,
-            "returncode": returncode,
-            "partial_work": bool(final_payload.get("partial_work", False)),
-            "inflight_unknown": bool(final_payload.get("inflight_unknown", False)),
-            "descendants_reaped": True,
-            "report_error": None,
-        }
+        final_payload = _close_reaped_worker_report(
+            worker_report, returncode=returncode
+        )
         # Final acceptance gate: this is intentionally adjacent to the
         # atomic publication.  A report parser or serializer that overruns
         # the one wall deadline is converted to a closed failure envelope.
@@ -1913,11 +2043,14 @@ def worker_entry(
 
     _set_parent_death_signal()
     selected = config_path or Path(os.environ["PLATFORM_LOAD_WORKER_CONFIG"])
+    stage = "worker_config_read"
     try:
         config_raw = json.loads(selected.read_text(encoding="utf-8"))
         if not isinstance(config_raw, dict):
+            stage = "worker_config_validate"
             raise ValueError("worker config must be an object")
         if config_raw.get("namespace_required") is True:
+            stage = "worker_identity"
             try:
                 _assert_namespace_worker_identity(
                     int(config_raw["runner_uid"]),
@@ -1925,6 +2058,7 @@ def worker_entry(
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise NamespaceIntegrityError("worker identity config is invalid") from exc
+        stage = "worker_callback"
         result = dict(worker(config_raw))
         result.setdefault("worker_report_schema", WORKER_REPORT_SCHEMA)
         result["report_complete"] = True
@@ -1933,6 +2067,7 @@ def worker_entry(
         result["namespace_closed"] = False
         result.setdefault("partial_work", False)
         result.setdefault("inflight_unknown", False)
+        stage = "worker_report_write"
         _write_json_atomic(Path(str(config_raw["worker_report_path"])), result)
         return 0 if result.get("passed") is True else 1
     except BaseException as exc:
@@ -1946,7 +2081,8 @@ def worker_entry(
             returncode=1,
             partial_work=True,
             inflight_unknown=True,
-            report_error=type(exc).__name__,
+            report_error="worker_exception",
+            worker_failure=_closed_worker_failure(exc, stage),
         )
         try:
             _write_json_atomic(destination, failed)
