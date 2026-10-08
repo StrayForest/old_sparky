@@ -102,20 +102,25 @@ The complete-archive, space-bounded bootstrap extraction follow-up uses **C2**
 self-test remain required; these source commits do not establish production
 installation or activation.
 The current repository pin selects host-control source **C**
-`f5365c6a56a7e8dad21054e8ae69e0001914adae`, with the exact ordered
+`4df5ec11cf8babbe2b17b1a4ec7e5187038d89e7`, with the exact ordered
 14-member closure recorded in `platform/contracts/host_tools_pin.json`. This
-generation adds the manifest-bound `retained_load_source_binding` capability
-to the existing dispatcher/input-guard and retained-load export-cleanup
-closure. Its bounded `host-capabilities` self-test must include
+generation adds a closed pre-supervisor `dispatch` result to the existing
+source-bound live-launch status parser; it does not loosen the supervisor's
+failure-stage allowlist. The earlier immutable generation
+`f5365c6a56a7e8dad21054e8ae69e0001914adae` remains a separate historical pin;
+this repository value does not establish its continued presence or which
+generation is active. Native installed-generation attestation and the
+production retention ledger are the authorities for that state. The
+bounded `host-capabilities` self-test for the new C must still include
 `release_baseline=1`, `retained_load_export_cleanup=1`,
 `retained_load_source_binding=1`, and `python_bytecode_disabled=1` before the
 active app may accept a runner/app source mismatch. This pin is source
-provenance, not installation evidence: C still requires the ordinary exact-P
-full-CI/preflight attestation and approved out-of-band root provisioning and
-self-test at
-`/opt/oldsparky/platform/shared/host-tools/f5365c6a56a7e8dad21054e8ae69e0001914adae`.
-Do not infer that the host generation or final pin-bearing application SHA is
-installed from this repository value.
+provenance, not installation evidence: new C still requires the ordinary
+exact-P full-CI/preflight attestation and approved out-of-band root
+provisioning and self-test at
+`/opt/oldsparky/platform/shared/host-tools/4df5ec11cf8babbe2b17b1a4ec7e5187038d89e7`.
+Do not infer that new C or the final pin-bearing application SHA is installed
+from this repository value.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable

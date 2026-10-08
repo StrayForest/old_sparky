@@ -814,7 +814,7 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertNotIn("cumulative_seconds", profile["functions"][1])
         self.assertEqual(
             [row["function"] for row in profile["functions"][1:]],
-            ["other", "other", "other", "other", "<lambda>"],
+            ["other", "other", "other", "other", "other", "<lambda>"],
         )
         self.assertNotIn("self_seconds", profile["functions"][5])
         self.assertEqual(profile["functions"][5]["cumulative_seconds"], 0.0)
