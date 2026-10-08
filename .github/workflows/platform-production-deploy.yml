@@ -750,18 +750,13 @@ jobs:
           HOST_TOOLS_ARTIFACT_DIGEST="${HOST_TOOLS_ARTIFACT_DIGEST#sha256:}"
           [[ "$HOST_TOOLS_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
           metadata_path="$RUNNER_TEMP/host-tools-artifact-metadata.json"
-          metadata_error="$RUNNER_TEMP/host-tools-artifact-metadata.error"
-          if ! curl --fail --silent --show-error --location --max-filesize 524288 \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}" \
-            --output "$metadata_path" 2> "$metadata_error"; then
-            rm -f -- "$metadata_path" "$metadata_error"
-            echo "host-tools artifact metadata request failed" >&2
-            exit 1
-          fi
-          rm -f -- "$metadata_error"
+          target_source="$GITHUB_WORKSPACE/target-source"
+          /usr/bin/timeout --signal=TERM --kill-after=5s 55s \
+            /usr/bin/python3 "$target_source/platform/tools/platform_fetch_artifact_metadata.py" \
+            --api-url "$GITHUB_API_URL" \
+            --repository "$GITHUB_REPOSITORY" \
+            --artifact-id "$HOST_TOOLS_ARTIFACT_ID" \
+            --output "$metadata_path"
           test "$(stat -c '%F:%a:%h' -- "$metadata_path")" = "regular file:600:1"
           api_zip="$RUNNER_TEMP/platform-host-tools-artifact.zip"
           curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
