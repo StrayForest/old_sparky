@@ -1,0 +1,714 @@
+"""End-to-end, hermetic tests for deferred external-load SLO decisions.
+
+The test keeps the production report builder/evaluator and workflow snippets
+real.  Only the supervised-worker boundary and HTTP transport are replaced;
+no database, remote origin, credentials, or live workflow is used.
+"""
+
+from __future__ import annotations
+
+from contextlib import redirect_stdout
+from copy import deepcopy
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from types import SimpleNamespace
+import unittest
+import zipfile
+from unittest.mock import patch
+
+import yaml
+
+from tools import platform_load
+from tools.platform_external_load import RequestResult, VirtualUser
+from tools.platform_load_runtime import PID_NAMESPACE_ISOLATION, WORKER_REPORT_SCHEMA
+from tools.platform_load_acceptance import _acceptance_budget_evidence
+
+
+PLATFORM_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = PLATFORM_ROOT.parent
+WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/platform-production-external-load.yml"
+SOURCE_SHA = "a" * 40
+RUN_ID = "123456789"
+
+
+def _run_step(job: str, step_name: str) -> str:
+    workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+    step = next(item for item in workflow["jobs"][job]["steps"] if item.get("name") == step_name)
+    return str(step["run"])
+
+
+def _python_block(script: str, command_marker: str) -> str:
+    start = script.index(command_marker)
+    heredoc = script.index("<<'PY'", start) + len("<<'PY'")
+    end = script.index("\nPY", heredoc)
+    return script[heredoc:end].lstrip("\n")
+
+
+def _hermetic_profile(profile_id: str) -> dict[str, object]:
+    """Keep the canonical mode/acceptance shape while shrinking fixture work."""
+
+    profile = deepcopy(platform_load.get_profile(profile_id))
+    fixture = profile["fixture"]
+    fixture["tournament_count"] = 1
+    fixture["users_per_tournament"] = 1
+    fixture["max_total_users"] = 1
+    profile["traffic"]["spread_seconds"] = 0
+    if profile["mode"] == "read-mix":
+        profile["traffic"]["manual_refresh_count"] = 0
+    return profile
+
+
+def _fake_manifest() -> tuple[dict[str, object], list[VirtualUser]]:
+    manifest: dict[str, object] = {
+        "origin": "https://old-sparky.com",
+        "session_cookie_name": "deadlock_platform_session",
+        "csrf_cookie_name": "deadlock_platform_session_csrf",
+        "marker": "preprod26082900000000ab",
+        "tournaments": [
+            {"id": "tournament-1", "slug": "qa-tournament", "user_count": 1}
+        ],
+    }
+    users = [
+        VirtualUser(
+            user_id="user-00000001",
+            tournament_slug="qa-tournament",
+            session_token="s" * 64,
+            csrf_token="c" * 64,
+        )
+    ]
+    return manifest, users
+
+
+def _small_profile(profile: dict[str, object]) -> tuple[dict[str, object], dict[str, object], list[VirtualUser]]:
+    scenario = deepcopy(profile)
+    fixture = scenario["fixture"]
+    traffic = scenario["traffic"]
+    phases = traffic.get("phases") or []
+    if phases:
+        if profile["acceptance"]["kind"] == "capacity":
+            phases = phases[:1]
+            traffic["phases"] = phases
+        for phase in phases:
+            phase["logical_actions"] = 1
+            phase["duration_seconds"] = 1
+            phase["target_logical_actions_per_second"] = 1
+        user_count = len(phases)
+    else:
+        user_count = 1
+    fixture["tournament_count"] = 1
+    fixture["users_per_tournament"] = user_count
+    fixture["max_total_users"] = user_count
+    traffic["spread_seconds"] = 0
+    traffic["duplicate_count"] = 0
+    traffic["manual_refresh_count"] = 0
+    manifest = {
+        "origin": "https://old-sparky.com",
+        "session_cookie_name": "deadlock_platform_session",
+        "csrf_cookie_name": "deadlock_platform_session_csrf",
+        "marker": "preprod26082900000000ab",
+        "tournaments": [
+            {"id": "tournament-1", "slug": "qa-tournament", "user_count": user_count}
+        ],
+    }
+    users = [
+        VirtualUser(
+            user_id=f"user-{index + 1:08d}",
+            tournament_slug="qa-tournament",
+            session_token="s" * 64,
+            csrf_token="c" * 64,
+        )
+        for index in range(user_count)
+    ]
+    return scenario, manifest, users
+
+
+def _observer(*, marker: str, run_id: str) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "stop_file_seen": True,
+        "timed_out": False,
+        "binding": {
+            "complete": True,
+            "fixture_marker": marker,
+            "external_run_id": run_id,
+        },
+        "system": {
+            "cpu_per_core": {"cpu0": {"max_percent": 0}},
+            "postgres_backend_connections": {"max": 0},
+            "postgres_waits": {
+                "max_waiting_backends": 0,
+                "max_lock_waiters": 0,
+            },
+        },
+        "server_request_perf_logs": {
+            "pool_checkout_wait_ms": {"p95_ms": 0, "p99_ms": 0}
+        },
+    }
+
+
+def _false_paths(value: object, prefix: tuple[str, ...] = ()) -> list[str]:
+    if isinstance(value, dict):
+        return [
+            path
+            for key, child in value.items()
+            for path in _false_paths(child, prefix + (str(key),))
+        ]
+    if isinstance(value, list):
+        return [path for index, child in enumerate(value) for path in _false_paths(child, prefix + (str(index),))]
+    if value is False:
+        return [".".join(prefix)]
+    return []
+
+
+class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
+    def test_all_authored_profiles_have_closed_budget_builder_contracts(self) -> None:
+        profiles = platform_load.load_profiles()
+        self.assertEqual(len(profiles), 11)
+        for profile_id, profile in profiles.items():
+            with self.subTest(profile=profile_id):
+                evidence = _acceptance_budget_evidence(
+                    profile["acceptance"], require_statuses=True
+                )
+                self.assertIs(evidence["complete"], True)
+                self.assertIsInstance(evidence["checks"], dict)
+                self.assertTrue(evidence["checks"])
+                self.assertTrue(
+                    all(type(value) is bool for value in evidence["checks"].values())
+                )
+                scenario, manifest, users = _small_profile(profile)
+
+                def request(origin: str, user: VirtualUser, phase: str | None = None, *_args: object, **kwargs: object) -> RequestResult:
+                    del origin, user
+                    effective_phase = kwargs.get("phase") or phase
+                    started = time.monotonic()
+                    response_json = (
+                        {"active_round": {"ready_count": len(users)}}
+                        if effective_phase == "read_external_vote_state"
+                        else {"changed": True}
+                        if kwargs.get("method") == "POST"
+                        else None
+                    )
+                    return RequestResult(
+                        phase=str(kwargs.get("phase") or phase or "primary"),
+                        method=str(kwargs.get("method") or "GET"),
+                        path=str(kwargs.get("path") or "/"),
+                        status=200,
+                        elapsed_ms=10_000,
+                        ok=True,
+                        response_bytes=128,
+                        response_etag='"fixture-etag"',
+                        response_json=response_json,
+                        started_at_monotonic=started,
+                        finished_at_monotonic=started + 10,
+                    )
+
+                with tempfile.TemporaryDirectory(prefix="pending-profile-builder-") as temporary:
+                    report_path = Path(temporary) / "report.json"
+                    with (
+                        patch("tools.platform_external_load.load_manifest", return_value=(manifest, users)),
+                        patch("tools.platform_external_load._trace", return_value={"status": "200", "ip": "192.0.2.10", "colo": "TEST"}),
+                        patch("tools.platform_external_load._request", side_effect=request),
+                        patch("tools.platform_external_load._page_request_http11_keepalive", side_effect=request),
+                        patch("socket.socket.connect", side_effect=AssertionError("network access is forbidden in this test")),
+                        patch.dict(os.environ, {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID}, clear=False),
+                    ):
+                        with redirect_stdout(io.StringIO()):
+                            worker_exit = platform_load.run_profile_worker(
+                                scenario, Path(temporary) / "manifest.json", report_path
+                            )
+                    report = json.loads(report_path.read_text(encoding="utf-8"))
+                self.assertEqual(worker_exit, 1)
+                self.assertTrue(report["acceptance"]["pending_origin_evidence"])
+                self.assertFalse(report["acceptance"]["passed"])
+                self.assertTrue(report["acceptance"]["timing_evidence"]["complete"])
+                report.update(
+                    {
+                        "worker_report_schema": WORKER_REPORT_SCHEMA,
+                        "report_complete": True,
+                        "namespace_closed": True,
+                        "isolation": PID_NAMESPACE_ISOLATION,
+                        "partial_work": False,
+                        "inflight_unknown": False,
+                        "worker_exit_code": 1,
+                        "runtime_supervisor": {
+                            "reason": "none",
+                            "returncode": 1,
+                            "isolation": PID_NAMESPACE_ISOLATION,
+                            "namespace_closed": True,
+                            "descendants_reaped": True,
+                            "partial_work": False,
+                            "inflight_unknown": False,
+                            "report_error": None,
+                        },
+                    }
+                )
+                result = SimpleNamespace(
+                    returncode=1, report=report, worker_started=True,
+                    worker_exited=True, killed=False, signal=None, reason="none",
+                    partial_work=False, inflight_unknown=False,
+                    descendants_reaped=True, isolation=PID_NAMESPACE_ISOLATION,
+                    namespace_closed=True,
+                )
+                false_budget_paths = [
+                    path for path in _false_paths(report["acceptance"])
+                    if "accepted_p95" in path or "accepted_p95_ms" in path or "logical_p95" in path
+                ]
+                self.assertTrue(false_budget_paths, false_budget_paths)
+                with patch.dict(
+                    os.environ,
+                    {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID},
+                    clear=False,
+                ):
+                    self.assertTrue(
+                        platform_load._is_closed_pending_origin_candidate(
+                            scenario, result
+                        ),
+                        {
+                            "profile": profile_id,
+                            "decision": report["acceptance"].get("decision"),
+                            "pending_origin_evidence": report["acceptance"].get(
+                                "pending_origin_evidence"
+                            ),
+                            "false_budget_paths": false_budget_paths,
+                            "budget_only": platform_load._acceptance_failure_is_budget_only(
+                                report["acceptance"],
+                                str(scenario["acceptance"]["kind"]),
+                                allowed_ramp_budget_checks=platform_load._authored_ramp_budget_checks(
+                                    scenario, report["acceptance"]
+                                ) or frozenset(),
+                                allow_no_budget_failure=True,
+                                allow_pending_observer_binding=True,
+                                allowed_phase_names=platform_load._profile_budget_phase_names(
+                                    scenario
+                                ),
+                            ),
+                            "observer_closed": platform_load._closed_missing_observer_binding(
+                                report["acceptance"].get("observer_binding")
+                            ),
+                            "phase_evidence_equal": report["acceptance"].get(
+                                "phase_plan_evidence", {}
+                            ).get("phase_budgets") == report["acceptance"].get(
+                                "phase_budget_evidence"
+                            ),
+                            "ramp_check": repr(
+                                platform_load._authored_ramp_budget_checks(
+                                    scenario, report["acceptance"]
+                                )
+                            ),
+                            "report_binding_complete": platform_load._report_binding(
+                                scenario, report
+                            ).get("complete"),
+                        },
+                    )
+                forged = deepcopy(result.report)
+                forged["acceptance"]["unrelated_diagnostic"] = {
+                    "checks": {"accepted_p95": False}
+                }
+                forged_result = SimpleNamespace(**vars(result))
+                forged_result.report = forged
+                with patch.dict(
+                    os.environ,
+                    {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID},
+                    clear=False,
+                ):
+                    self.assertFalse(
+                        platform_load._is_closed_pending_origin_candidate(
+                            scenario, forged_result
+                        ),
+                        "a budget-named false leaf outside the authored acceptance paths must be rejected",
+                    )
+                malformed = deepcopy(result.report)
+                acceptance_checks = malformed["acceptance"].get("checks")
+                if isinstance(acceptance_checks, dict):
+                    acceptance_checks["contract_ok"] = False
+                else:
+                    malformed["acceptance"]["unrelated_diagnostic"] = {
+                        "checks": {"contract": False}
+                    }
+                malformed_result = SimpleNamespace(**vars(result))
+                malformed_result.report = malformed
+                with patch.dict(
+                    os.environ,
+                    {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID},
+                    clear=False,
+                ):
+                    self.assertFalse(
+                        platform_load._is_closed_pending_origin_candidate(
+                            scenario, malformed_result
+                        ),
+                        "a non-budget acceptance failure must not be classified as pending-only",
+                    )
+                origin_attached = deepcopy(result.report)
+                origin_attached["origin_observability"] = {"complete": False}
+                origin_result = SimpleNamespace(**vars(result))
+                origin_result.report = origin_attached
+                with patch.dict(
+                    os.environ,
+                    {"SOURCE_GIT_SHA": SOURCE_SHA, "GITHUB_RUN_ID": RUN_ID},
+                    clear=False,
+                ):
+                    self.assertFalse(
+                        platform_load._is_closed_pending_origin_candidate(
+                            scenario, origin_result
+                        ),
+                        "a report with present but invalid origin evidence is not pending-origin",
+                    )
+                # The actual authored profile and its scaled hermetic clone
+                # retain the same acceptance kind and exact schema keys.
+                self.assertEqual(
+                    scenario["acceptance"]["kind"], profile["acceptance"]["kind"]
+                )
+
+    def test_cli_pending_then_origin_budget_failure_reaches_yaml_publish_and_final_fail(self) -> None:
+        for profile_id in ("read-mix-human-v2", "ready-vote-capacity-ramp-v2"):
+            with self.subTest(profile=profile_id):
+                self._exercise_deferred_pipeline(profile_id)
+
+    def _exercise_deferred_pipeline(self, profile_id: str) -> None:
+        profile = _hermetic_profile(profile_id)
+        profile, manifest, users = _small_profile(profile)
+        report_marker = str(manifest["marker"])
+        candidate_debug: dict[str, object] = {}
+
+        def request(origin: str, user: VirtualUser, **kwargs: object) -> RequestResult:
+            del origin, user
+            started = time.monotonic()
+            # A completed response outside the authored latency target creates
+            # a genuine evaluator-produced budget failure without wall delay.
+            return RequestResult(
+                phase=str(kwargs.get("phase") or "read_mix"),
+                method=str(kwargs.get("method") or "GET"),
+                path=str(kwargs.get("path") or "/"),
+                status=200,
+                elapsed_ms=10_000,
+                ok=True,
+                response_bytes=128,
+                response_etag='"fixture-etag"',
+                response_json=(
+                    {"active_round": {"ready_count": len(users)}}
+                    if kwargs.get("phase") == "read_external_vote_state"
+                    else {"changed": True}
+                    if kwargs.get("method") == "POST"
+                    else None
+                ),
+                started_at_monotonic=started,
+                finished_at_monotonic=started + 10,
+            )
+
+        def supervised_worker(
+            *, worker_config: dict[str, object], report_path: Path,
+            worker_report_path: Path, **_kwargs: object,
+        ) -> SimpleNamespace:
+            with redirect_stdout(io.StringIO()):
+                worker_exit = platform_load.run_profile_worker(
+                    profile,
+                    Path(str(worker_config["manifest_path"])),
+                    worker_report_path,
+                )
+            report = json.loads(worker_report_path.read_text(encoding="utf-8"))
+            report.update(
+                {
+                    "worker_report_schema": WORKER_REPORT_SCHEMA,
+                    "report_complete": True,
+                    "namespace_closed": True,
+                    "isolation": PID_NAMESPACE_ISOLATION,
+                    "partial_work": False,
+                    "inflight_unknown": False,
+                    "worker_exit_code": worker_exit,
+                    "runtime_supervisor": {
+                        "reason": "none",
+                        "returncode": worker_exit,
+                        "isolation": PID_NAMESPACE_ISOLATION,
+                        "namespace_closed": True,
+                        "descendants_reaped": True,
+                        "partial_work": False,
+                        "inflight_unknown": False,
+                        "report_error": None,
+                    },
+                }
+            )
+            report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+            candidate_debug.update(
+                {
+                    "binding": platform_load._report_binding(profile, report),
+                    "ramp": platform_load._authored_ramp_budget_checks(profile, report["acceptance"]),
+                    "observer_closed": platform_load._closed_missing_observer_binding(
+                        report["acceptance"].get("observer_binding")
+                    ),
+                    "observer_binding": report["acceptance"].get("observer_binding"),
+                    "phase_evidence_equal": report["acceptance"].get(
+                        "phase_plan_evidence", {}
+                    ).get("phase_budgets") == report["acceptance"].get(
+                        "phase_budget_evidence"
+                    ),
+                    "budget_phases": sorted(platform_load._profile_budget_phase_names(profile)),
+                    "scenario_phase_names": [
+                        phase.get("name")
+                        for phase in profile.get("traffic", {}).get("phases", [])
+                    ],
+                    "phase_slo_names": sorted(
+                        report["acceptance"].get("phase_slo", {})
+                    ),
+                    "acceptance_kind": profile.get("acceptance", {}).get("kind"),
+                    "origin_observability_present": "origin_observability" in report,
+                    "origin_safety": report["acceptance"].get("origin_safety"),
+                    "budget_only": platform_load._acceptance_failure_is_budget_only(
+                        report["acceptance"], "slo", allow_no_budget_failure=True,
+                        allow_pending_observer_binding=True,
+                    ),
+                    "false_paths": _false_paths(report["acceptance"]),
+                    "pending": platform_load._is_closed_pending_origin_candidate(
+                        profile,
+                        SimpleNamespace(
+                            returncode=worker_exit, report=report, worker_started=True,
+                            worker_exited=True, killed=False, signal=None, reason="none",
+                            partial_work=False, inflight_unknown=False, descendants_reaped=True,
+                            isolation=PID_NAMESPACE_ISOLATION, namespace_closed=True,
+                        ),
+                    ),
+                }
+            )
+            return SimpleNamespace(
+                returncode=worker_exit,
+                report=report,
+                worker_started=True,
+                worker_exited=True,
+                killed=False,
+                signal=None,
+                reason="none",
+                partial_work=False,
+                inflight_unknown=False,
+                descendants_reaped=True,
+                isolation=PID_NAMESPACE_ISOLATION,
+                namespace_closed=True,
+            )
+
+        load_step = _run_step("load-client", "Run checked-out external HTTP load client")
+        evaluate_step = _run_step("evaluate-load", "Evaluate checked-out load report")
+        sanitize_step = _run_step("evaluate-load", "Sanitize external evidence")
+        publish_step = next(
+            step
+            for step in yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))["jobs"]["evaluate-load"]["steps"]
+            if step.get("name") == "Publish external load evidence"
+        )
+        enforce_step = _run_step("evaluate-load", "Enforce external load and exact cleanup gates")
+
+        with tempfile.TemporaryDirectory(prefix="external-load-pending-origin-") as temporary:
+            root = Path(temporary)
+            report_path = root / "external-load.json"
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            os_env = {
+                "SOURCE_GIT_SHA": SOURCE_SHA,
+                "GITHUB_RUN_ID": RUN_ID,
+                "GITHUB_RUN_ATTEMPT": "1",
+            }
+            with (
+                patch("tools.platform_load.get_profile", return_value=profile),
+                patch("tools.platform_load_runtime.require_pid_namespace_capability", return_value=None),
+                patch("tools.platform_load_runtime.run_supervised", side_effect=supervised_worker),
+                patch("tools.platform_external_load.load_manifest", return_value=(manifest, users)),
+                patch("tools.platform_external_load._trace", return_value={"status": "200", "ip": "192.0.2.10", "colo": "TEST"}),
+                patch("tools.platform_external_load._request", side_effect=request),
+                patch("socket.socket.connect", side_effect=AssertionError("network access is forbidden in this test")),
+                patch.dict(os.environ, os_env, clear=False),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    candidate_exit = platform_load.main(
+                        [
+                            "run", "--profile", str(profile["profile_id"]),
+                            "--manifest", str(manifest_path), "--report-path", str(report_path),
+                            "--defer-pending-origin",
+                        ]
+                    )
+                    standalone_exit = platform_load.main(
+                        [
+                            "run", "--profile", str(profile["profile_id"]),
+                            "--manifest", str(manifest_path),
+                            "--report-path", str(root / "standalone.json"),
+                        ]
+                    )
+            self.assertEqual(standalone_exit, 1)
+            candidate = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                candidate_exit,
+                3,
+                json.dumps(
+                    {
+                        "debug": candidate_debug,
+                    },
+                    sort_keys=True,
+                    default=repr,
+                ),
+            )
+            self.assertTrue(candidate["acceptance"]["pending_origin_evidence"])
+            self.assertFalse(candidate["acceptance"]["passed"])
+
+            # Execute the exact candidate-state Bash branch from the workflow.
+            status_branch = load_step[load_step.index("client_exit_status=\"$load_status\""):load_step.index("if [[ \"$TIMEOUT_DIAGNOSTICS\" == true ]]; then", load_step.index("client_exit_status=\"$load_status\""))]
+            status_shell = "\n".join(
+                (
+                    'TIMEOUT_DIAGNOSTICS=false', 'load_status=3',
+                    'report_ready=1', status_branch,
+                    'printf "%s\\n" "$load_status:$client_exit_status:$candidate_state:$report_ready"',
+                )
+            )
+            state_result = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", status_shell],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(state_result.returncode, 0, state_result.stderr)
+            self.assertEqual(state_result.stdout.strip(), "0:3:pending_origin:1")
+
+            # Use the actual YAML receipt writer and downstream receipt
+            # verifier so exit 3 is bound to this report/run/source.
+            artifact_dir = root / "candidate-artifacts"
+            artifact_dir.mkdir()
+            receipt_path = artifact_dir / "load-status.json"
+            receipt_script = _python_block(
+                load_step,
+                '/usr/bin/python3 - "$artifact_dir/load-status.json"',
+            )
+            receipt_write = subprocess.run(
+                [
+                    sys.executable, "-c", receipt_script,
+                    str(receipt_path), "0", "3", "pending_origin", "1",
+                    SOURCE_SHA, RUN_ID, "1", str(profile["profile_id"]), str(report_path),
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(receipt_write.returncode, 0, receipt_write.stderr)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["report_sha256"], hashlib.sha256(report_path.read_bytes()).hexdigest())
+            receipt_script = _python_block(
+                evaluate_step,
+                'if /usr/bin/python3 - "$load_status_file"',
+            )
+            receipt_check = subprocess.run(
+                [
+                    sys.executable, "-c", receipt_script,
+                    str(receipt_path), str(report_path), SOURCE_SHA, RUN_ID,
+                    "1", str(profile["profile_id"]), "false",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(receipt_check.returncode, 0, receipt_check.stderr)
+
+            # Attach origin using the real evaluator CLI and require a reserved
+            # workflow-only exit for the completed SLO miss.
+            observer_path = root / "observer.json"
+            observer_path.write_text(
+                json.dumps(_observer(marker=report_marker, run_id=RUN_ID)) + "\n",
+                encoding="utf-8",
+            )
+            with (
+                patch("tools.platform_load.get_profile", return_value=profile),
+                patch.dict(os.environ, os_env, clear=False),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    evaluation_exit = platform_load.main(
+                        [
+                            "evaluate", "--profile", str(profile["profile_id"]),
+                            "--report", str(report_path), "--server-observability", str(observer_path),
+                            "--defer-completed-slo-failure",
+                        ]
+                    )
+            self.assertEqual(evaluation_exit, 3)
+            evaluated = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertFalse(evaluated["acceptance"]["passed"])
+            expected_decision = {
+                "slo": "SLO FAIL",
+                "capacity": "CAPACITY EXPERIMENT COMPLETE TARGET FAIL",
+            }[profile["acceptance"]["kind"]]
+            self.assertEqual(evaluated["acceptance"]["decision"], expected_decision)
+            self.assertTrue(evaluated["report_binding"]["complete"])
+
+            # Run the actual YAML sanitizer over the exact public evidence set.
+            runner_temp = root / "runner"
+            client = runner_temp / "external-client"
+            evidence = runner_temp / "external-evidence"
+            client.mkdir(parents=True)
+            evidence.mkdir(parents=True)
+            (client / "external-load.json").write_bytes(report_path.read_bytes())
+            (client / "client-raw.log").write_text("CLIENT_RESULT status=complete\n", encoding="utf-8")
+            (evidence / "server-observability.json").write_text(observer_path.read_text(encoding="utf-8"), encoding="utf-8")
+            (evidence / "timeout-diagnostics.json").write_text('{"schema":1,"enabled":false}\n', encoding="utf-8")
+            (evidence / "matrix-summary.json").write_text('{"schema":1,"passed":true}\n', encoding="utf-8")
+            (evidence / "cleanup-summary.json").write_text('{"schema":1,"ok":true}\n', encoding="utf-8")
+            (evidence / "canonical.log").write_text("FINALIZE status=success\n", encoding="utf-8")
+            (evidence / "cleanup-canonical.log").write_text("CLEANUP status=success\n", encoding="utf-8")
+            github_output = root / "github-output"
+            github_output.touch()
+            sanitized = subprocess.run(
+                ["/bin/bash", "-e", "-o", "pipefail", "-c", sanitize_step],
+                cwd=REPOSITORY_ROOT,
+                env={**os.environ, "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(github_output), "TIMEOUT_DIAGNOSTICS": "false"},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(sanitized.returncode, 0, sanitized.stderr)
+            self.assertIn("sanitizer_status=0", github_output.read_text(encoding="utf-8"))
+
+            upload_members = [
+                Path(value.replace("${{ runner.temp }}/", ""))
+                for value in publish_step["with"]["path"].splitlines()
+            ]
+            self.assertIn(Path("external-evidence/cleanup-canonical.log"), upload_members)
+            upload_zip = root / "public-evidence.zip"
+            with zipfile.ZipFile(upload_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for member in upload_members:
+                    source = runner_temp / member
+                    self.assertTrue(source.is_file(), str(member))
+                    archive.write(source, member.as_posix())
+            with zipfile.ZipFile(upload_zip) as archive:
+                self.assertEqual(set(archive.namelist()), {member.as_posix() for member in upload_members})
+
+            # The final gate must still fail on the completed budget miss.
+            gate = re.sub(
+                r"\$\{\{\s*(.*?)\s*\}\}",
+                lambda match: (
+                    "slo_failed" if match.group(1).endswith("acceptance_status")
+                    else "pending_origin" if match.group(1).endswith("candidate_state")
+                    else "1" if match.group(1).endswith(("report_ready", "observer_ready"))
+                    else "success" if match.group(1).endswith(".result")
+                    else "0"
+                ),
+                enforce_step,
+            )
+            final_gate = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", gate],
+                cwd=REPOSITORY_ROOT,
+                env={**os.environ, "BASH_ENV": "/dev/null"},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(final_gate.returncode, 1)
+            self.assertIn("profile-budget", final_gate.stderr)
+
+            # The actual evaluator stays fail-closed for a forged source or
+            # incomplete origin, despite the workflow-only completion mode.
+            forged = deepcopy(evaluated)
+            forged["source_git_sha"] = "b" * 40
+            forged_path = root / "forged.json"
+            forged_path.write_text(json.dumps(forged), encoding="utf-8")
+            with (
+                patch("tools.platform_load.get_profile", return_value=profile),
+                patch.dict(os.environ, os_env, clear=False),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        platform_load.main(
+                            ["evaluate", "--profile", str(profile["profile_id"]), "--report", str(forged_path), "--server-observability", str(observer_path), "--defer-completed-slo-failure"]
+                        ),
+                        1,
+                    )
+
+
+if __name__ == "__main__":
+    unittest.main()

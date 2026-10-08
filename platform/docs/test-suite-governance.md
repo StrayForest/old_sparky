@@ -278,7 +278,7 @@ capture and closed stdout/public markers; the executable catalog snapshot tracks
 Privileged release tests prove promoted dependencies stay readable, relocation removes only wheel/RECORD-bound generated caches, cleanup is receipt/readiness/cgroup-bound, and runtime summaries stay out of deployment markers.
 Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused.
 A proof miss uses the existing fresh-venv snapshot path. These root-owned cases remain in `backend-privileged`; bootstrap extraction tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
-The canonical AST snapshot is 1,718 tests (1,646 backend, including 555 privileged) across 162 modules, with every ID assigned exactly once.
+The canonical AST snapshot is 1,725 tests (1,653 backend, including 555 privileged) across 163 modules, with every ID assigned exactly once.
 Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
 
@@ -584,7 +584,7 @@ the exact run ID.
 The privileged contour owns immutable recovery-bootstrap tests
 (`tests.test_platform_recovery_bootstrap`); backend-tool-contract owns cumulative-baseline
 provenance tests in `tests.test_platform_workflow_provenance`. The
-verification-contract contour owns failed-report caller tests and the synthetic `unittest.subTest` accounting regression: multiple failures/errors count as one executed parent ID while native failure/error rows remain in the summary.
+verification-contract contour owns failed-report caller tests and the synthetic `unittest.subTest` accounting regression: multiple failures/errors count as one executed parent ID while native failure/error rows remain in the summary. Backend-tool-contract also owns the deferred-origin budget-failure pipeline in `tests.test_external_load_pending_origin_pipeline`.
 Together the contract tests cover closed bundles, exact manifest/provenance schemas, content-addressed installation, receipt identity, migration-uncertainty guards, and secret/SSH ordering. `tests.test_platform_release_systemd_state`
 adds subprocess coverage for operation-ID/path/inode mismatch, helper-manifest
 tampering and rollback-target retry binding; `tests.test_platform_release_recovery_boundaries`

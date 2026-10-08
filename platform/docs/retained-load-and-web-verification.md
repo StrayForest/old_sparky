@@ -53,6 +53,12 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
 | evaluation/projection | observer-bound accepted result or a structurally complete profile-budget miss; `sanitizer_status=0` |
 
+A structurally complete budget miss may pass through origin attachment and
+sanitization so its evidence is retained, but final workflow enforcement still
+fails the run. Missing population, timing, containment, observer, cleanup or
+artifact-identity evidence remains an invalid pipeline result and is never
+reclassified as a budget miss.
+
 Artifact handoffs carry the exact artifact ID across jobs. Each consumer then
 reads the authenticated Actions artifact metadata and requires the expected
 run-derived name (including the run attempt), artifact ID, unexpired state,

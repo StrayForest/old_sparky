@@ -2529,6 +2529,43 @@ def observer_evidence_required(
     )
 
 
+_PHASE_TARGET_BUDGET_CHECKS = frozenset(
+    {
+        "logical_final_failure_budget",
+        "accepted_p95",
+        "logical_p95",
+        "accepted_p99",
+        "logical_p99",
+        "shed_percent",
+        "retry_amplification_percent",
+        "minimum_useful_goodput",
+    }
+)
+
+
+def _phase_budget_evidence_is_structurally_complete(
+    phase_budget_results: Mapping[str, Any],
+) -> bool:
+    """Separate measured phase completeness from authored target budgets."""
+
+    if not phase_budget_results:
+        return False
+    for result in phase_budget_results.values():
+        checks = result.get("checks") if isinstance(result, Mapping) else None
+        if (
+            not isinstance(checks, Mapping)
+            or not checks
+            or any(type(value) is not bool for value in checks.values())
+            or any(
+                value is not True
+                for name, value in checks.items()
+                if name not in _PHASE_TARGET_BUDGET_CHECKS
+            )
+        ):
+            return False
+    return True
+
+
 def evaluate_acceptance(
     *,
     contract_ok: bool,
@@ -2788,8 +2825,26 @@ def evaluate_acceptance(
         isinstance(result, dict) and result.get("passed") is True
         for result in phase_budget_results.values()
     )
+    stage_checks = stage_evidence.get("checks") or {}
+    stage_structure_complete = (
+        isinstance(stage_checks, Mapping)
+        and all(
+            type(value) is bool and value is True
+            for name, value in stage_checks.items()
+            if not str(name).endswith("_budgets")
+        )
+    )
+    stage_budgets_ok = all(
+        value is True
+        for name, value in stage_checks.items()
+        if str(name).endswith("_budgets")
+    )
     require_phase_budgets = enforce_phase_contract or (
         canonical_evidence and bool(phase_budget_results)
+    )
+    phase_budget_structure_complete = (
+        not require_phase_budgets
+        or _phase_budget_evidence_is_structurally_complete(phase_budget_results)
     )
     population_checks: dict[str, bool] = {}
     if (
@@ -3009,6 +3064,7 @@ def evaluate_acceptance(
                 "spike_metrics": spike_metrics,
                 "observer_binding": binding,
                 "timing_evidence": timing_evidence,
+                "capacity_ramp_evidence": stage_evidence,
                 "phase_plan_evidence": phase_plan_evidence,
                 "phase_population_evidence": phase_population_checks,
                 "raw_logical_population_evidence": raw_logical_population_checks,
@@ -3051,6 +3107,7 @@ def evaluate_acceptance(
             "note": "Stress acceptance does not apply the normal-traffic final-failure SLO.",
             "spike_metrics": spike_metrics,
             "timing_evidence": timing_evidence,
+            "capacity_ramp_evidence": stage_evidence,
             "phase_plan_evidence": phase_plan_evidence,
             "phase_population_evidence": phase_population_checks,
             "raw_logical_population_evidence": raw_logical_population_checks,
@@ -3098,6 +3155,11 @@ def evaluate_acceptance(
                 expected_external_run_id=expected_external_run_id,
                 require_exact_observer_binding=require_exact_observer_binding,
             )
+            # The per-phase result is not itself a phase plan: it is evaluated
+            # with one phase's summaries and the canonical plan is validated
+            # once, on the enclosing capacity acceptance below. Retaining the
+            # nested diagnostic here emits a misleading phase-name failure.
+            phase_result.pop("phase_plan_evidence", None)
             rate = _number(phase_logical, "target_logical_actions_per_second") or 0.0
             goodput = _number(
                 phase_logical,
@@ -3174,11 +3236,27 @@ def evaluate_acceptance(
             )
         origin_ok = origin_safety is None or bool(origin_safety.get("passed"))
         binding_ok = binding is None or bool(binding.get("complete"))
+        origin_safety_checks = (
+            origin_safety.get("checks")
+            if isinstance(origin_safety, Mapping)
+            else None
+        )
+        origin_safety_complete = origin_safety is None or (
+            isinstance(origin_safety_checks, Mapping)
+            and all(type(value) is bool for value in origin_safety_checks.values())
+            and origin_safety_checks.get("observer_completed") is True
+            and origin_safety_checks.get("required_diagnostics_present") is True
+            and (
+                "postgres_backend_ownership_consistent" not in origin_safety_checks
+                or origin_safety_checks["postgres_backend_ownership_consistent"] is True
+            )
+            and origin_safety.get("passed") is all(origin_safety_checks.values())
+        )
         experiment_complete = (
             contract_ok is True
             and all(outcome_checks.values())
             and bool(timing_evidence["complete"])
-            and bool(stage_evidence["complete"])
+            and stage_structure_complete
             and bool(budget_evidence["complete"])
             and all(phase_population_checks.values())
             and all(raw_logical_population_checks.values())
@@ -3186,13 +3264,19 @@ def evaluate_acceptance(
             and all(population_checks.values())
             and phase_completion
             and (not require_phase_budgets or bool(phase_plan_evidence["complete"]))
-            and (not require_phase_budgets or phase_budgets_ok)
+            and phase_budget_structure_complete
             and not pending_origin
-            and origin_ok
+            and origin_safety_complete
             and binding_ok
         )
-        target_passed = experiment_complete and bool(phase_results) and all(
-            bool(phase.get("passed")) for phase in phase_results.values()
+        target_passed = (
+            experiment_complete
+            and bool(phase_results)
+            and all(bool(phase.get("passed")) for phase in phase_results.values())
+            and (not require_phase_budgets or phase_budgets_ok)
+            and stage_budgets_ok
+            and origin_ok
+            and binding_ok
         )
         return {
             "passed": target_passed,
