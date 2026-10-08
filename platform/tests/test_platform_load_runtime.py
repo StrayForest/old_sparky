@@ -32,6 +32,7 @@ from tools.platform_load_runtime import (
     _verify_expected_parent,
     probe_pid_namespace_capability,
     run_supervised,
+    worker_entry,
 )
 from tools.platform_load_namespace import _kill_tree
 
@@ -849,6 +850,52 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertEqual(result.report['acceptance']['decision'], 'LOAD RUN FAILED')
             self.assertTrue(result.report['partial_work'])
+
+            config_path = root / "worker-config.json"
+            child_report_path = root / "worker-exception-report.json"
+            config_path.write_text(
+                json.dumps({"worker_report_path": str(child_report_path)}),
+                encoding="utf-8",
+            )
+            trusted_module_path = Path(__file__).resolve().parents[1] / "tools/platform_load.py"
+            trusted_failure = compile(
+                "raise ValueError('private worker detail must not escape')\n",
+                str(trusted_module_path),
+                "exec",
+            )
+
+            def raising_worker(_config: object) -> dict[str, object]:
+                exec(trusted_failure, {})
+                return {}
+
+            with patch("tools.platform_load_runtime._set_parent_death_signal"):
+                worker_exit = worker_entry(raising_worker, config_path=config_path)
+            self.assertEqual(worker_exit, 1)
+            child_payload = json.loads(child_report_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                child_payload["worker_failure"],
+                {
+                    "schema": 1,
+                    "stage": "worker_callback",
+                    "exception_class": "value_error",
+                    "module": "load",
+                    "line": 1,
+                    "traceback_truncated": False,
+                },
+            )
+            self.assertNotIn("private worker detail", child_report_path.read_text(encoding="utf-8"))
+
+            from tools.platform_load_runtime import _close_reaped_worker_report
+
+            parent_payload = _close_reaped_worker_report(child_payload, returncode=1)
+            self.assertEqual(parent_payload["acceptance"]["decision"], "LOAD RUN FAILED")
+            self.assertFalse(parent_payload["acceptance"]["contract_ok"])
+            self.assertTrue(parent_payload["namespace_closed"])
+            self.assertTrue(parent_payload["partial_work"])
+            self.assertTrue(parent_payload["inflight_unknown"])
+            self.assertEqual(parent_payload["runtime_supervisor"]["reason"], "none")
+            self.assertEqual(parent_payload["runtime_supervisor"]["returncode"], 1)
+            self.assertEqual(parent_payload["worker_failure"], child_payload["worker_failure"])
 
     def test_malformed_child_report_becomes_closed_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

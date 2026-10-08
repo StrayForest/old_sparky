@@ -1898,6 +1898,78 @@ def _safe_queryid(value: Any) -> str | None:
     return str(number)
 
 
+_WORKER_FAILURE_FIELDS = frozenset(
+    {"schema", "stage", "exception_class", "module", "line", "traceback_truncated"}
+)
+_WORKER_FAILURE_STAGES = frozenset(
+    {
+        "worker_config_read",
+        "worker_config_validate",
+        "worker_identity",
+        "worker_callback",
+        "worker_report_write",
+        "other",
+    }
+)
+_WORKER_FAILURE_CLASSES = frozenset(
+    {
+        "assertion_error",
+        "json_decode_error",
+        "key_error",
+        "namespace_integrity_error",
+        "os_error",
+        "other",
+        "overflow_error",
+        "runtime_error",
+        "timeout_error",
+        "type_error",
+        "unicode_decode_error",
+        "value_error",
+    }
+)
+_WORKER_FAILURE_MODULES = frozenset(
+    {"external_load", "load", "load_acceptance", "load_runtime", "load_worker", "other"}
+)
+_WORKER_FAILURE_MAX_LINE = 1_000_000
+
+
+def _project_worker_failure(value: Any) -> dict[str, Any] | None:
+    """Retain only the worker's closed, path-free failure discriminator."""
+
+    if not isinstance(value, Mapping) or set(value) != _WORKER_FAILURE_FIELDS:
+        return None
+    schema = value.get("schema")
+    stage = value.get("stage")
+    exception_class = value.get("exception_class")
+    module = value.get("module")
+    line = value.get("line")
+    truncated = value.get("traceback_truncated")
+    if (
+        type(schema) is not int
+        or schema != 1
+        or not isinstance(stage, str)
+        or stage not in _WORKER_FAILURE_STAGES
+        or not isinstance(exception_class, str)
+        or exception_class not in _WORKER_FAILURE_CLASSES
+        or not isinstance(module, str)
+        or module not in _WORKER_FAILURE_MODULES
+        or type(truncated) is not bool
+        or (line is not None and (type(line) is not int or not 1 <= line <= _WORKER_FAILURE_MAX_LINE))
+        or (module == "other" and line is not None)
+        or (module != "other" and line is None)
+        or (truncated is True and (module != "other" or line is not None))
+    ):
+        return None
+    return {
+        "schema": schema,
+        "stage": stage,
+        "exception_class": exception_class,
+        "module": module,
+        "line": line,
+        "traceback_truncated": truncated,
+    }
+
+
 def _project_external_load(value: Any) -> dict[str, Any]:
     source = _mapping(value)
     output: dict[str, Any] = {
@@ -1906,6 +1978,9 @@ def _project_external_load(value: Any) -> dict[str, Any]:
         "authoritative": False,
     }
     _project_source_identity(source, output)
+    worker_failure = _project_worker_failure(source.get("worker_failure"))
+    if worker_failure is not None:
+        output["worker_failure"] = worker_failure
     passed = _copy_bool(source, "passed")
     if passed is not None:
         output["passed"] = passed

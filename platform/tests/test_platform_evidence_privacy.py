@@ -660,6 +660,42 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertNotIn("raw_http", invalid_types)
         self.assertNotIn("passed", invalid_types["acceptance"])
 
+        worker_failure = {
+            "schema": 1,
+            "stage": "worker_callback",
+            "exception_class": "value_error",
+            "module": "load",
+            "line": 123,
+            "traceback_truncated": False,
+        }
+        projected_failure = project_public_artifact(
+            "external_load", {"worker_failure": worker_failure}
+        )
+        self.assertEqual(
+            projected_failure["worker_failure"],
+            {
+                "schema": 1,
+                "stage": "worker_callback",
+                "exception_class": "value_error",
+                "module": "load",
+                "line": 123,
+                "traceback_truncated": False,
+            },
+        )
+        self.assertNotIn("private-report", serialized(projected_failure))
+        for invalid_worker_failure in (
+            {**worker_failure, "schema": True},
+            {**worker_failure, "line": 123.0},
+            {**worker_failure, "line": 0},
+            {**worker_failure, "line": 1_000_001},
+            {**worker_failure, "module": "other", "line": 123},
+            {**worker_failure, "raw_path": "/home/operator/private-report.json"},
+        ):
+            invalid_failure_projection = project_public_artifact(
+                "external_load", {"worker_failure": invalid_worker_failure}
+            )
+            self.assertNotIn("worker_failure", invalid_failure_projection)
+
         observer_source = {
             "schema": 1,
             "binding": {

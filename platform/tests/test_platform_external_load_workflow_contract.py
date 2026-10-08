@@ -74,7 +74,7 @@ def _pass_truth_table(state: dict[str, object]) -> bool:
 
 
 def _evidence_publish_truth_table(state: dict[str, object]) -> bool:
-    return all(
+    common = all(
         (
             state["validate_result"] == "success",
             state["setup_result"] == "success",
@@ -82,7 +82,7 @@ def _evidence_publish_truth_table(state: dict[str, object]) -> bool:
             state["setup_ssh_cleanup_status"] == "0",
             state["load_result"] == "success",
             state["load_status"] == "0",
-            state["candidate_state"] in {"produced", "pending_origin"},
+            state["candidate_state"] in {"produced", "pending_origin", "failed"},
             state["report_ready"] == "1",
             state["namespace_barrier_result"] == "success",
             state["namespace_closed_status"] == "0",
@@ -99,11 +99,19 @@ def _evidence_publish_truth_table(state: dict[str, object]) -> bool:
             state["handoff_status"] == "0",
             state["candidate_artifact_status"] == "0",
             state["origin_artifact_status"] == "0",
-            state["evaluation_status"] == "0",
-            state["acceptance_status"] in {"accepted", "slo_failed"},
             state["sanitizer_status"] == "0",
         )
     )
+    normal_candidate = (
+        state["evaluation_status"] == "0"
+        and state["acceptance_status"] in {"accepted", "slo_failed"}
+    )
+    closed_worker_failure = (
+        state["candidate_state"] == "failed"
+        and state["evaluation_status"] != "0"
+        and state.get("failed_worker_report_ready") == "1"
+    )
+    return common and (normal_candidate or closed_worker_failure)
 
 
 def _step_script(job: str, name: str) -> str:
@@ -1302,6 +1310,8 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("needs.load-client.result == 'success'", publish)
         self.assertIn("steps.evaluate-load.outputs.evaluation_status == '0'", publish)
         self.assertIn("steps.evaluate-load.outputs.acceptance_status == 'slo_failed'", publish)
+        self.assertIn("steps.evaluate-load.outputs.failed_worker_report_ready == '1'", publish)
+        self.assertIn('echo "failed_worker_report_ready=$failed_worker_report_ready"', evaluator)
         self.assertIn("steps.sanitize.outputs.sanitizer_status == '0'", publish)
         final_gate = evaluator.split(
             "- name: Enforce external load and exact cleanup gates", 1
@@ -1346,11 +1356,23 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         failed_cleanup["cleanup_status"] = "1"
         self.assertFalse(_evidence_publish_truth_table(failed_cleanup))
 
+        failed_worker_diagnostic = {
+            **completed_slo_miss,
+            "candidate_state": "failed",
+            "evaluation_status": "1",
+            "acceptance_status": "invalid",
+            "failed_worker_report_ready": "1",
+        }
+        self.assertFalse(_pass_truth_table(failed_worker_diagnostic))
+        self.assertTrue(_evidence_publish_truth_table(failed_worker_diagnostic))
+        failed_worker_diagnostic["cleanup_exports_status"] = "1"
+        self.assertFalse(_evidence_publish_truth_table(failed_worker_diagnostic))
+
         evaluate_script = _step_script(
             self.jobs["evaluate-load"], "Evaluate checked-out load report"
         )
         receipt_verifier = re.search(
-            r'if /usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$SOURCE_GIT_SHA" "\$APP_TARGET_SHA" "\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
+            r'validation_kind="\$\(/usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$SOURCE_GIT_SHA" "\$APP_TARGET_SHA" "\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
             r"(?P<script>.*?)\nPY",
             evaluate_script,
             re.DOTALL,
@@ -1430,6 +1452,81 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 0,
             )
             report.write_bytes(report_bytes + b"tampered")
+            self.assertNotEqual(verify().returncode, 0)
+
+            report_payload = {
+                "source_git_sha": target_sha,
+                "app_target_sha": target_sha,
+                "source_binding": None,
+                "source_binding_sha256": None,
+                "worker_report_schema": 2,
+                "report_complete": True,
+                "passed": False,
+                "authoritative": False,
+                "dispatchable": False,
+                "namespace_closed": True,
+                "isolation": "pid_namespace",
+                "partial_work": True,
+                "inflight_unknown": True,
+                "acceptance": {
+                    "passed": False,
+                    "decision": "LOAD RUN FAILED",
+                    "contract_ok": False,
+                },
+                "runtime_supervisor": {
+                    "protocol": 1,
+                    "isolation": "pid_namespace",
+                    "reason": "none",
+                    "signal": None,
+                    "namespace_closed": True,
+                    "descendants_reaped": True,
+                    "returncode": 1,
+                    "partial_work": True,
+                    "inflight_unknown": True,
+                    "report_error": None,
+                },
+                "worker_failure": {
+                    "schema": 1,
+                    "stage": "worker_callback",
+                    "exception_class": "value_error",
+                    "module": "load",
+                    "line": 123,
+                    "traceback_truncated": False,
+                },
+            }
+            report_bytes = json.dumps(report_payload, sort_keys=True).encode("ascii") + b"\n"
+            report.write_bytes(report_bytes)
+            payload.update(
+                {
+                    "client_exit_status": 1,
+                    "candidate_state": "failed",
+                    "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+                }
+            )
+            failed_diagnostic = verify()
+            self.assertEqual(failed_diagnostic.returncode, 0, failed_diagnostic.stderr)
+            self.assertEqual(failed_diagnostic.stdout.strip(), "worker_failure")
+            wrong_supervisor = {
+                **report_payload,
+                "runtime_supervisor": {
+                    **report_payload["runtime_supervisor"],
+                    "signal": 9,
+                },
+            }
+            report_bytes = json.dumps(wrong_supervisor, sort_keys=True).encode("ascii") + b"\n"
+            report.write_bytes(report_bytes)
+            payload["report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
+            self.assertNotEqual(verify().returncode, 0)
+            unknown_failure = {
+                **report_payload,
+                "worker_failure": {
+                    **report_payload["worker_failure"],
+                    "raw_error": "must be rejected",
+                },
+            }
+            report_bytes = json.dumps(unknown_failure, sort_keys=True).encode("ascii") + b"\n"
+            report.write_bytes(report_bytes)
+            payload["report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
             self.assertNotEqual(verify().returncode, 0)
 
     def test_cleanup_exports_and_projection_are_failure_bearing(self) -> None:
