@@ -69,7 +69,11 @@ logging selectors return to their baseline values
 The separate `PLATFORM_SSR_HEAP_METRICS_ENABLED` selector is false in the
 public baseline and is carried only to the web process. The reviewed
 `ready-vote-static-8` runtime profile enables it for process-level memory
-diagnosis without enabling request-level SSR tracing. It emits a fixed
+diagnosis without enabling request-level SSR tracing. The deployment
+supervisor selects this key whenever it applies a managed runtime profile, so
+baseline restoration also writes `false` instead of retaining a prior
+diagnostic value. The service-env renderer keeps the selector in `web.env` and
+omits it from `api.env`. It emits a fixed
 `ssr_heap schema=1` line every five seconds with RSS, V8 heap total/used/limit,
 external and array-buffer bytes, and interval GC count/duration. The stream
 contains no request, identity, route or URL fields and stops after 5,760

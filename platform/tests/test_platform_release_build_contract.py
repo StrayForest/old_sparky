@@ -19,6 +19,7 @@ import tempfile
 import stat
 import textwrap
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -32,6 +33,11 @@ from tests.test_platform_validate_release_artifact import (
 from tools import platform_workflow_remote_dispatch
 from tools import platform_live_qa_runtime_install
 from tools import platform_fetch_artifact_metadata
+from tools import platform_configure_shared_env
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from platform_render_service_envs import render_service_env  # noqa: E402
+sys.path.pop(0)
 from tools.platform_ci_classifier import (
     CANDIDATE_PACKAGING_FILES,
     CANDIDATE_PACKAGING_REASON,
@@ -2344,6 +2350,75 @@ fail 'private lock detail must not cross the public channel'
             '"$host_tools_dir/platform_configure_shared_env.py" ' + chr(92),
             supervisor,
         )
+        self.assertIn(
+            "--only PLATFORM_SSR_HEAP_METRICS_ENABLED",
+            match.group(0),
+            "every managed profile must select the heap flag so baseline restores it",
+        )
+
+        current_lines = ["PLATFORM_SSR_HEAP_METRICS_ENABLED=false"]
+        selected_content: dict[str, str] = {}
+        original_merge = platform_configure_shared_env.merge_baseline
+
+        def capture_selected_baseline(
+            lines: list[str], *, baseline: dict[str, str] | None = None
+        ) -> tuple[str, list[str]]:
+            content, changed = original_merge(lines, baseline=baseline)
+            selected_content["content"] = content
+            return content, changed
+
+        def apply_profile_selection(profile: str) -> str:
+            args = SimpleNamespace(
+                profile=profile,
+                only=["PLATFORM_SSR_HEAP_METRICS_ENABLED"],
+                env_file=Path("/unused/test-shared-env"),
+                apply=False,
+                confirm="",
+                as_json=False,
+            )
+            with (
+                patch.object(platform_configure_shared_env, "parse_args", return_value=args),
+                patch.object(
+                    platform_configure_shared_env,
+                    "read_env",
+                    side_effect=lambda _path: (current_lines, {}, None),
+                ),
+                patch.object(
+                    platform_configure_shared_env,
+                    "merge_baseline",
+                    side_effect=capture_selected_baseline,
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(platform_configure_shared_env.main(), 0)
+            return selected_content["content"]
+
+        static_content = apply_profile_selection("ready-vote-static-8")
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true\n", static_content)
+        current_lines = static_content.splitlines()
+        static_values = {
+            key: f"{key}={value}"
+            for key, value in (
+                line.split("=", 1) for line in static_content.splitlines() if "=" in line
+            )
+        }
+        static_web_env = render_service_env("web", static_values)
+        static_api_env = render_service_env("api", static_values)
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true", static_web_env)
+        self.assertNotIn("PLATFORM_SSR_HEAP_METRICS_ENABLED", static_api_env)
+
+        baseline_content = apply_profile_selection("baseline")
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=false\n", baseline_content)
+        baseline_values = {
+            key: f"{key}={value}"
+            for key, value in (
+                line.split("=", 1) for line in baseline_content.splitlines() if "=" in line
+            )
+        }
+        baseline_web_env = render_service_env("web", baseline_values)
+        baseline_api_env = render_service_env("api", baseline_values)
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=false", baseline_web_env)
+        self.assertNotIn("PLATFORM_SSR_HEAP_METRICS_ENABLED", baseline_api_env)
 
         marker = (
             "RELEASE_DEPLOY schema=1 status=passed class=deployment "

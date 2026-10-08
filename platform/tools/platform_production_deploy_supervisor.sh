@@ -77,9 +77,13 @@ set_lock_failure_context() {
 apply_shared_env_profile() {
   # The remote dispatcher accepts only the fixed RELEASE_DEPLOY marker on
   # stdout. Keep the helper's human-readable summary off that protocol stream;
-  # preserve stderr and its exit status for failure handling.
+  # preserve stderr and its exit status for failure handling. Always select
+  # the heap metrics key so static-8 activates it and every other profile,
+  # including baseline restoration, writes its reviewed value. The renderer
+  # keeps this web-only setting out of the API environment.
   "$runtime/shared/venv/bin/python" -B \
-    "$host_tools_dir/platform_configure_shared_env.py" "$@" >/dev/null
+    "$host_tools_dir/platform_configure_shared_env.py" "$@" \
+    --only PLATFORM_SSR_HEAP_METRICS_ENABLED >/dev/null
 }
 
 run_nginx_config_test() {
