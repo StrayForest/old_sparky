@@ -50,7 +50,7 @@ to `dev`. The chain is:
    runtime proof when sensitive. A storage no-op is allowed only for an
    authenticated recovery input and a range wholly in the closed recovery,
    storage and docs sets; it changes no classifier field and authorizes no app
-   work. Other ranges need normal release checks. The gate re-reads current `dev` HEAD and refuses a stale successful CI result.
+   work. Other ranges need normal release checks. Changes to `platform_production_deploy_supervisor.sh` require a deployable full route and exact-target release, not the recovery-bootstrap no-op. The gate re-reads current `dev` HEAD and refuses a stale successful CI result.
    The source run and both status snapshots are checked by the shared dependency-free [`platform_workflow_provenance.py`](../tools/platform_workflow_provenance.py)
    validator, including the exact repository/workflow/run attempt, SHA, event,
    branch, conclusion, trusted actor, description and attempt URL. The gate

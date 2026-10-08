@@ -96,7 +96,6 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_install_logging.sh",
         "platform/tools/platform_install_nginx.py",
         "platform/tools/platform_release_restore_runtime.sh",
-        "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tools/platform_update_cloudflare_ips.py",
         "platform/tools/platform_deploy_smoke_impl.py",
         "platform/tools/platform_validate_edge_policy.py",

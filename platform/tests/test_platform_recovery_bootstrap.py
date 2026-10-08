@@ -136,8 +136,8 @@ RECOVERY_BOOTSTRAP_PATCH_DOCS = frozenset(
 )
 
 # This is the exact topology/recovery patch delta reviewed independently from
-# the complete merge-base fixture above. Keep it separate: the host-only subset
-# remains a no-op, but the complete delta with the app dispatcher deploys.
+# the complete merge-base fixture above. Keep it separate: the pin-only subset
+# remains a no-op, while runtime supervisor/dispatcher changes deploy.
 RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES = frozenset(
     {
         ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
@@ -3465,6 +3465,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             - {
                 "platform/tools/platform_live_qa_runtime_install.py",
                 "platform/tools/platform_workflow_remote_dispatch.py",
+                "platform/tools/platform_production_deploy_supervisor.sh",
             }
         )
         for event, branch in (
@@ -3499,7 +3500,10 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         delta_paths = sorted(RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES)
         pure_delta_paths = sorted(
             RECOVERY_BOOTSTRAP_CURRENT_DELTA_FILES
-            - {"platform/tools/platform_workflow_remote_dispatch.py"}
+            - {
+                "platform/tools/platform_workflow_remote_dispatch.py",
+                "platform/tools/platform_production_deploy_supervisor.sh",
+            }
         )
         for event, branch in (
             ("pull_request", "feature/recovery-bootstrap-delta"),
@@ -3565,6 +3569,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         derived_patch_files = (
             canonical - RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES
         ) | RECOVERY_BOOTSTRAP_PATCH_DOCS | {
+            "platform/tools/platform_production_deploy_supervisor.sh",
             "platform/tools/platform_live_qa_runtime_install.py",
             "platform/tools/platform_workflow_remote_dispatch.py",
         }
