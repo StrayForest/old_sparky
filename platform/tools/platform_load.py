@@ -2589,12 +2589,14 @@ def _closed_terminal_status_failure(
             acceptance_checks = {}
         else:
             return False
-    if acceptance_checks.get("logical_outcome_consistency") is False and not (
-        "logical" in top_status_incomplete
+    if (
+        acceptance_checks.get("logical_outcome_consistency") is False
+        and "logical" not in top_status_incomplete
     ):
         return False
-    if acceptance_checks.get("raw_outcome_consistency") is False and not (
-        "raw_http" in top_status_incomplete
+    if (
+        acceptance_checks.get("raw_outcome_consistency") is False
+        and "raw_http" not in top_status_incomplete
     ):
         return False
     if (

@@ -28,7 +28,7 @@ from unittest.mock import patch
 
 import yaml
 
-from tools import platform_external_load, platform_load
+from tools import platform_load
 from tools.platform_external_load import RequestResult, VirtualUser
 from tools.platform_load_runtime import PID_NAMESPACE_ISOLATION, WORKER_REPORT_SCHEMA
 from tools.platform_load_acceptance import _acceptance_budget_evidence
