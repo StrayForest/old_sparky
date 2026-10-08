@@ -1,5 +1,7 @@
 "use strict";
 
+/* eslint @typescript-eslint/no-require-imports: "off" -- This contract runs as CommonJS. */
+
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -88,9 +90,35 @@ try {
   fs.mkdirSync(gate, { mode: 0o700 });
   fs.mkdirSync(path.join(gate, "test-results"), { mode: 0o700 });
   const writeBinding = { ...bindingsFromEnvironment(bindingEnv), gate };
-  assert.equal(writeBoundedSummary(writeBinding, summary, { gateRoot: temporary }), true);
-  assert.equal(writeBoundedSummary(writeBinding, summary, { gateRoot: temporary }), false, "O_EXCL rejects replacement");
   const reportPath = path.join(gate, "test-results", "live-counts-v1.json");
+  const rootMetadata = fs.lstatSync(temporary);
+  if (rootMetadata.uid !== 0) {
+    assert.equal(
+      writeBoundedSummary(writeBinding, summary, { gateRoot: temporary }),
+      false,
+      "a non-root-owned gate root is rejected",
+    );
+    assert.equal(fs.existsSync(reportPath), false);
+  }
+
+  const nativeLstatSync = fs.lstatSync;
+  try {
+    if (rootMetadata.uid !== 0) {
+      fs.lstatSync = function lstatWithRootOwnedGate(target, ...args) {
+        const metadata = nativeLstatSync.call(fs, target, ...args);
+        if (target !== temporary) return metadata;
+        return new Proxy(metadata, {
+          get(value, key, receiver) {
+            return key === "uid" ? 0 : Reflect.get(value, key, receiver);
+          },
+        });
+      };
+    }
+    assert.equal(writeBoundedSummary(writeBinding, summary, { gateRoot: temporary }), true);
+    assert.equal(writeBoundedSummary(writeBinding, summary, { gateRoot: temporary }), false, "O_EXCL rejects replacement");
+  } finally {
+    fs.lstatSync = nativeLstatSync;
+  }
   const metadata = fs.lstatSync(reportPath);
   assert.equal(metadata.isFile(), true);
   assert.equal(metadata.nlink, 1);

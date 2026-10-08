@@ -1,5 +1,7 @@
 "use strict";
 
+/* eslint @typescript-eslint/no-require-imports: "off" -- This helper is CommonJS. */
+
 const fs = require("node:fs");
 const path = require("node:path");
 
