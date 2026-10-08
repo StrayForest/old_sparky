@@ -75,6 +75,10 @@ RUNTIME_SENSITIVE_FILES = frozenset(
         # The external-load workflow invokes this from the active app release;
         # changing its cleanup behavior requires a matching app deployment.
         "platform/tools/platform_workflow_remote_dispatch.py",
+        # This supervisor selects and applies production runtime profiles. A
+        # change must pass through a deployable full route so AUTO builds and
+        # installs the exact target release instead of reconciling as a no-op.
+        "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tests/test_platform_release_build_contract.py",
         "platform/tests/test_platform_live_qa_guard.py",
         "platform/tests/test_platform_live_qa_runtime_install.py",
@@ -165,7 +169,6 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_install_logging.sh",
         "platform/tools/platform_install_nginx.py",
         "platform/tools/platform_release_restore_runtime.sh",
-        "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tools/platform_update_cloudflare_ips.py",
         "platform/tools/platform_deploy_smoke_impl.py",
         "platform/tools/platform_validate_edge_policy.py",

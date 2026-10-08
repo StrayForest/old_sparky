@@ -45,6 +45,10 @@ from tools.platform_production_classifier_artifact import (
     validate_manifest as validate_production_classifier_manifest,
 )
 from tools.platform_workflow_provenance import ProvenanceError, validate_security_marker
+from tools.platform_deploy_baseline import (
+    classify_cumulative_baseline,
+    validate_cumulative_reconcile_route,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1405,6 +1409,98 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertFalse(host_only["deployable"])
         self.assertFalse(host_only["runtime_sensitive"])
         self.assertEqual(host_only["reason"], RECOVERY_BOOTSTRAP_REASON)
+        host_only_route = classify_cumulative_baseline(
+            host_only,
+            host_only["files"],
+            expected_target_sha=self.TARGET_SHA,
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(host_only_route),
+            {"no_op": True, "runtime_required": False},
+        )
+
+        supervisor = "platform/tools/platform_production_deploy_supervisor.sh"
+        self.assertNotIn(supervisor, RECOVERY_BOOTSTRAP_FILES)
+        self.assertIn(supervisor, RUNTIME_SENSITIVE_FILES)
+
+        # Exact M2 -> S host-tools/runtime change set that was previously
+        # misclassified as recovery-bootstrap-only. Keep this path fixture
+        # explicit so an allowlist edit cannot silently restore the no-op.
+        m2_to_s_paths = [
+            "platform/contracts/host_tools_pin.json",
+            "platform/docs/adr/production-host-tools-provisioning.md",
+            "platform/docs/performance-transport-runbook.md",
+            "platform/tests/test_platform_release_build_contract.py",
+            supervisor,
+        ]
+        direct_m2_to_s = classify(
+            m2_to_s_paths,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertTrue(direct_m2_to_s["deployable"])
+        self.assertTrue(direct_m2_to_s["runtime_sensitive"])
+        self.assertEqual(
+            self._run_auto_deploy_manifest_contract(direct_m2_to_s)[
+                "route_deployable"
+            ],
+            "true",
+        )
+
+        # The classifier-only correction itself is a permitted bootstrap
+        # increment. Reconciliation must still classify the complete active
+        # M2 -> target range and notice the supervisor runtime change.
+        classifier_fix_paths = [
+            ".github/workflows/platform-production-autodeploy.yml",
+            "platform/docs/deployment-runbook.md",
+            "platform/tests/test_platform_ci_classifier.py",
+            "platform/tests/test_platform_recovery_bootstrap.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tools/platform_production_classifier_artifact.py",
+        ]
+        incremental = classify(
+            classifier_fix_paths,
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertFalse(incremental["deployable"])
+        self.assertEqual(incremental["reason"], RECOVERY_BOOTSTRAP_REASON)
+
+        cumulative = classify_cumulative_baseline(
+            incremental,
+            m2_to_s_paths + classifier_fix_paths,
+            expected_target_sha=self.TARGET_SHA,
+        )
+        decision = validate_cumulative_reconcile_route(cumulative)
+        self.assertEqual(decision, {"no_op": False, "runtime_required": True})
+        self.assertTrue(cumulative["manifest"]["deployable"])
+        self.assertTrue(cumulative["manifest"]["runtime_sensitive"])
+
+        incremental_auto = self._run_auto_deploy_manifest_contract(incremental)
+        self.assertEqual(incremental_auto["route_recovery_bootstrap_only"], "true")
+        deploy_auto = self._run_auto_deploy_manifest_contract(cumulative["manifest"])
+        self.assertEqual(deploy_auto["route_deployable"], "true")
+        self.assertEqual(deploy_auto["route_recovery_bootstrap_only"], "false")
+
+        genuine_bootstrap = classify(
+            ["platform/tools/platform_recovery_bootstrap.py"],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertFalse(genuine_bootstrap["deployable"])
+        self.assertEqual(genuine_bootstrap["reason"], RECOVERY_BOOTSTRAP_REASON)
+        bootstrap_route = classify_cumulative_baseline(
+            genuine_bootstrap,
+            genuine_bootstrap["files"],
+            expected_target_sha=self.TARGET_SHA,
+        )
+        self.assertEqual(
+            validate_cumulative_reconcile_route(bootstrap_route),
+            {"no_op": True, "runtime_required": False},
+        )
 
     def test_deploy_consumers_validate_the_exact_classifier_artifact(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
