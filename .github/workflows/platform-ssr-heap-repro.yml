@@ -15,6 +15,7 @@ on:
         options:
           - baseline
           - slow_bootstrap_1pct
+          - workspace_500_230
         default: baseline
       auth_transport:
         description: Existing server-auth transport branch
@@ -70,6 +71,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/ssr-heap-standalone/.next"
           cp -a .next/static "$RUNNER_TEMP/ssr-heap-standalone/.next/static"
           cp -a public "$RUNNER_TEMP/ssr-heap-standalone/public"
+          cp server-shutdown-guard.cjs "$RUNNER_TEMP/ssr-heap-standalone/server-shutdown-guard.cjs"
           tar -czf "$RUNNER_TEMP/ssr-heap-standalone.tar.gz" -C "$RUNNER_TEMP" ssr-heap-standalone
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -103,6 +105,8 @@ jobs:
           SSR_HEAP_REGIME: ${{ github.event.inputs.regime || 'baseline' }}
           SSR_HEAP_AUTH_TRANSPORT: ${{ github.event.inputs.auth_transport || 'fetch' }}
           SSR_HEAP_APP_SOURCE_COMMIT: 3367e50e347a70ef670a7d1a19091669b6a379e7
+          SSR_HEAP_WEB_WORKERS: "1"
+          SSR_HEAP_SSR_PERF_LOG_ENABLED: "false"
         run: |
           timeout --signal=TERM --kill-after=10s 18m docker run --rm --init \
             --platform linux/amd64 \
@@ -117,5 +121,7 @@ jobs:
             --env SSR_HEAP_REGIME="$SSR_HEAP_REGIME" \
             --env SSR_HEAP_AUTH_TRANSPORT="$SSR_HEAP_AUTH_TRANSPORT" \
             --env SSR_HEAP_APP_SOURCE_COMMIT="$SSR_HEAP_APP_SOURCE_COMMIT" \
+            --env SSR_HEAP_WEB_WORKERS="$SSR_HEAP_WEB_WORKERS" \
+            --env SSR_HEAP_SSR_PERF_LOG_ENABLED="$SSR_HEAP_SSR_PERF_LOG_ENABLED" \
             node:26.3.1-bookworm-slim@sha256:209558c3e5e40e8adff68959d3c2ba7cd73723e716d89196878a0c362fa1e109 \
             node /tools/ssr_heap_repro.mjs

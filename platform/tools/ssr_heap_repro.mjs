@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
@@ -10,6 +10,8 @@ import v8 from "node:v8";
 
 export const SCHEMA = 1;
 const APP_SOURCE_COMMIT = "3367e50e347a70ef670a7d1a19091669b6a379e7";
+const SESSION_COOKIE_NAME = "__Host-old_sparky_session";
+const CSRF_COOKIE_NAME = `${SESSION_COOKIE_NAME}_csrf`;
 const APP_ROOT = process.env.SSR_HEAP_APP_ROOT;
 const WORK_ROOT = process.env.SSR_HEAP_WORK_ROOT;
 const APP_PORT = 3100;
@@ -26,6 +28,8 @@ const SAMPLE_PREFIX = "SSR_HEAP_SAMPLE ";
 const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 const LOAD_REGIME = process.env.SSR_HEAP_REGIME ?? "baseline";
 const AUTH_TRANSPORT = process.env.SSR_HEAP_AUTH_TRANSPORT ?? "fetch";
+const WEB_WORKERS = process.env.SSR_HEAP_WEB_WORKERS ?? "1";
+const SSR_PERF_LOG_ENABLED = process.env.SSR_HEAP_SSR_PERF_LOG_ENABLED ?? "false";
 let apiForCleanup = null;
 let childForCleanup = null;
 let childClosedForCleanup = null;
@@ -162,6 +166,108 @@ export function fixedFixture(kind, targetBytes, slug = "synthetic-tournament", u
   return encoded;
 }
 
+function scanSentinel(carry, chunk, marker) {
+  const combined = carry.length === 0 ? chunk : Buffer.concat([carry, chunk]);
+  const found = combined.indexOf(marker) !== -1;
+  const retained = Math.min(marker.length - 1, combined.length);
+  return {
+    found,
+    carry: Buffer.from(combined.subarray(combined.length - retained)),
+  };
+}
+
+function classifyAuthSeedOutcome(regime, matched, missing, delayedBootstraps, delayedResponseClosed) {
+  if (![matched, missing, delayedBootstraps, delayedResponseClosed].every(Number.isSafeInteger) || [matched, missing, delayedBootstraps, delayedResponseClosed].some((value) => value < 0)) {
+    return "invalid_counts";
+  }
+  if (regime === "baseline") return missing === 0 && matched === MAX_REQUESTS ? "pass" : "auth_seed_missing";
+  if (regime === "workspace_500_230") return matched + missing === MAX_REQUESTS ? "observed_counts_only" : "invalid_counts";
+  if (regime !== "slow_bootstrap_1pct") return "unknown_regime";
+  if (missing === 0) return "slow_delay_preserved_auth";
+  if (delayedBootstraps > 0 && missing === delayedBootstraps && delayedResponseClosed === delayedBootstraps && matched + missing === MAX_REQUESTS) {
+    return "expected_slow_auth_fallback";
+  }
+  return "auth_seed_mismatch";
+}
+
+function syntheticUserIndex(cookie) {
+  const cookies = new Map(cookie.split(";").map((part) => {
+    const split = part.trim().indexOf("=");
+    return split < 0 ? ["", ""] : [part.trim().slice(0, split), part.trim().slice(split + 1)];
+  }));
+  const session = cookies.get(SESSION_COOKIE_NAME) ?? "";
+  const csrf = cookies.get(CSRF_COOKIE_NAME) ?? "";
+  const match = session.match(/^S([0-9]{5})[A-Za-z0-9_-]{58}$/u);
+  return match && /^[A-Za-z0-9_-]{43}\.[a-f0-9]{64}$/u.test(csrf) ? Number(match[1]) : -1;
+}
+
+function syntheticCookies(index) {
+  const sessionToken = `S${String(index).padStart(5, "0")}${"s".repeat(58)}`;
+  const csrfToken = `${"c".repeat(43)}.${"a".repeat(64)}`;
+  return {
+    cookie: `${SESSION_COOKIE_NAME}=${sessionToken}; ${CSRF_COOKIE_NAME}=${csrfToken}`,
+    csrfToken,
+  };
+}
+
+function expectedWorkspace500Count(limit) {
+  return Math.floor((limit - 1) / 87) + 1;
+}
+
+function requestAuthenticatedPage(index, slug, controller) {
+  return new Promise((resolve, reject) => {
+    const { cookie, csrfToken } = syntheticCookies(index);
+    let settled = false;
+    let bytes = 0;
+    let authSeeded = false;
+    let authSeedCarry = Buffer.alloc(0);
+    const marker = Buffer.from(`synthetic-user-${index}@example.invalid`);
+    const finish = (value, error = null) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const request = httpRequest({
+      host: "127.0.0.1",
+      port: APP_PORT,
+      method: "GET",
+      path: `/tournaments/${slug}`,
+      agent: false,
+      signal: controller.signal,
+      headers: {
+        Accept: "text/html",
+        "Accept-Encoding": "identity",
+        Origin: `http://127.0.0.1:${APP_PORT}`,
+        "User-Agent": "old-sparky-external-load/1",
+        Cookie: cookie,
+        "X-CSRF-Token": csrfToken,
+        "X-Platform-QA-Phase": "authenticated_page_load",
+        Connection: "close",
+      },
+    }, (response) => {
+      response.on("data", (chunk) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytes += buffer.length;
+        if (bytes > 2 * 1024 * 1024) {
+          response.destroy(new Error("response_limit"));
+          return;
+        }
+        if (!authSeeded) {
+          const scan = scanSentinel(authSeedCarry, buffer, marker);
+          authSeeded = scan.found;
+          authSeedCarry = scan.carry;
+        }
+      });
+      response.once("end", () => finish({ status: response.statusCode ?? 0, bytes, authSeeded }));
+      response.once("error", (error) => finish(null, error));
+      response.once("aborted", () => finish(null, new Error("response_aborted")));
+    });
+    request.once("error", (error) => finish(null, error));
+    request.end();
+  });
+}
+
 const bootstrapBody = fixedFixture("bootstrap", null);
 const workspaceBody = fixedFixture("workspace", 2800);
 const workspaceBodies = new Map();
@@ -174,6 +280,19 @@ export function contractSelfTest() {
   const workspace = JSON.parse(fixedFixture("workspace", 2800, "synthetic-00001").toString("utf8"));
   assert(bootstrap.id === "synthetic-user" && bootstrap.status === "active", "bootstrap_shape");
   assert(runtimeBootstrap.id === "synthetic-user-19" && runtimeBootstrap.email.endsWith("@example.invalid"), "bootstrap_runtime_shape");
+  const synthetic = syntheticCookies(19);
+  assert(syntheticUserIndex(synthetic.cookie) === 19, "synthetic_cookie_shape");
+  assert(synthetic.cookie.split(";")[0].split("=")[1].length === 64, "synthetic_session_token_length");
+  assert(synthetic.csrfToken.length === 108, "synthetic_csrf_token_length");
+  assert(syntheticUserIndex(`deadlock_platform_session=${synthetic.cookie.split("=")[1]}`) === -1, "wrong_cookie_rejected");
+  const marker = Buffer.from("synthetic-user-19@example.invalid");
+  const firstScan = scanSentinel(Buffer.alloc(0), Buffer.from("<email>synthetic-user-"), marker);
+  const secondScan = scanSentinel(firstScan.carry, Buffer.from("19@example.invalid</email>"), marker);
+  assert(!firstScan.found && secondScan.found, "auth_seed_chunk_boundary");
+  assert(classifyAuthSeedOutcome("baseline", MAX_REQUESTS, 0, 0, 0) === "pass", "baseline_auth_seed");
+  assert(classifyAuthSeedOutcome("slow_bootstrap_1pct", MAX_REQUESTS - 200, 200, 200, 200) === "expected_slow_auth_fallback", "slow_auth_seed");
+  assert(expectedWorkspace500Count(MAX_REQUESTS) === 230 && expectedWorkspace500Count(100) === 2, "workspace_error_hypothesis_counts");
+  assert(classifyAuthSeedOutcome("workspace_500_230", MAX_REQUESTS - 230, 230, 0, 0) === "observed_counts_only", "workspace_error_seed_observation");
   assert(workspace.tournament.slug === "synthetic-00001", "unique_workspace_slug");
   assert(workspace.tournament.participant_count === 500, "synthetic_population");
   assert(workspace.ready_check.active_round.status === "active", "active_ready_check");
@@ -186,9 +305,9 @@ export function contractSelfTest() {
   assert(classifyFatal("synthetic unknown failure") === null, "unknown_fatal");
   assert(MAX_REQUESTS === 20_000 && MAX_CONCURRENCY === 64, "population_contract");
   assert(STOP_RATIO === 0.90, "bounded_workload_contract");
-  assert(["baseline", "slow_bootstrap_1pct"].includes(LOAD_REGIME), "load_regime");
+  assert(["baseline", "slow_bootstrap_1pct", "workspace_500_230"].includes(LOAD_REGIME), "load_regime");
   assert(["fetch", "node"].includes(AUTH_TRANSPORT), "auth_transport");
-  return { schema: SCHEMA, contract_checks: 18 };
+  return { schema: SCHEMA, contract_checks: 28 };
 }
 
 function makeApiServer(stats) {
@@ -202,8 +321,7 @@ function makeApiServer(stats) {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     const workspaceMatch = url.pathname.match(/^\/api\/v1\/tournaments\/(synthetic-[0-9]{5})\/workspace$/u);
     const cookie = request.headers.cookie ?? "";
-    const userIndexMatch = cookie.match(/synthetic-session-([0-9]{1,5})$/u);
-    const userIndex = userIndexMatch ? Number(userIndexMatch[1]) : -1;
+    const userIndex = syntheticUserIndex(cookie);
     const userId = userIndex >= 0 ? `synthetic-user-${userIndex}` : "synthetic-user-invalid";
     const tournamentOrganizerId = userIndex >= 0
       ? `synthetic-user-${Math.floor(userIndex / USERS_PER_TOURNAMENT) * USERS_PER_TOURNAMENT}`
@@ -211,6 +329,7 @@ function makeApiServer(stats) {
     const isBootstrap = url.pathname === "/api/v1/auth/bootstrap";
     const workspaceQueryMatches = workspaceMatch
       && url.searchParams.get("participants_limit") === "0"
+      && url.searchParams.get("participants_offset") === "0"
       && url.searchParams.get("include_current_user") === "false"
       && url.searchParams.get("workspace_view") === "detail";
     let body = null;
@@ -233,12 +352,22 @@ function makeApiServer(stats) {
     const endpoint = isBootstrap ? "bootstrap" : "workspace";
     addCount(stats.api_counts, endpoint);
     if (workspaceMatch) addCount(stats.workspace_slug_counts, workspaceMatch[1]);
-    stats.api_bytes += body.length;
+    const workspaceInjectedError = endpoint === "workspace"
+      && LOAD_REGIME === "workspace_500_230"
+      && userIndex % 87 === 0;
+    if (workspaceInjectedError) addCount(stats.api_workspace_500_injections, endpoint);
     const delayedBootstrap = endpoint === "bootstrap"
       && LOAD_REGIME === "slow_bootstrap_1pct"
       && userIndex >= 0
       && userIndex % 100 === 99;
     if (delayedBootstrap) addCount(stats.api_slow_bootstrap_injections, endpoint);
+    let closedBeforeEnd = false;
+    response.once("close", () => {
+      if (!response.writableEnded) {
+        closedBeforeEnd = true;
+        if (delayedBootstrap) addCount(stats.api_delayed_response_closed, endpoint);
+      }
+    });
     // Deterministically approximate the captured request-latency quantiles
     // without request data: 90% median-like, 9% p95-like, 1% p99-like.
     const quantileIndex = userIndex >= 0 ? userIndex % 100 : 0;
@@ -246,6 +375,13 @@ function makeApiServer(stats) {
       ? quantileIndex === 99 ? 1750 : quantileIndex >= 90 ? 900 : 350
       : quantileIndex === 99 ? 2100 : quantileIndex >= 90 ? 1100 : 450;
     await delay(delayedBootstrap ? 2200 : baselineDelay);
+    if (closedBeforeEnd || response.destroyed) return;
+    if (workspaceInjectedError) {
+      response.writeHead(500, { "content-length": "0", "cache-control": "no-store" });
+      response.end();
+      return;
+    }
+    stats.api_bytes += body.length;
     response.writeHead(200, {
       "content-type": "application/json; charset=utf-8",
       "content-length": String(body.length),
@@ -329,7 +465,9 @@ async function main() {
   assert(typeof APP_ROOT === "string" && path.isAbsolute(APP_ROOT), "app_root");
   assert(typeof WORK_ROOT === "string" && path.isAbsolute(WORK_ROOT), "work_root");
   assert(process.env.SSR_HEAP_APP_SOURCE_COMMIT === APP_SOURCE_COMMIT, "app_source_commit");
-  assert(["baseline", "slow_bootstrap_1pct"].includes(LOAD_REGIME), "load_regime");
+  assert(WEB_WORKERS === "1", "web_worker_count");
+  assert(["true", "false"].includes(SSR_PERF_LOG_ENABLED), "ssr_perf_log_enabled");
+  assert(["baseline", "slow_bootstrap_1pct", "workspace_500_230"].includes(LOAD_REGIME), "load_regime");
   assert(["fetch", "node"].includes(AUTH_TRANSPORT), "auth_transport");
   const cap = await readCgroupMemory();
   assert(cap.limit === MEMORY_LIMIT_BYTES, "memory_cap");
@@ -342,6 +480,8 @@ async function main() {
   await mkdir("/tmp/ssr-heap-home", { recursive: true });
   const serverFile = path.join(APP_ROOT, "server.js");
   await stat(serverFile);
+  const shutdownGuardFile = path.join(APP_ROOT, "server-shutdown-guard.cjs");
+  await stat(shutdownGuardFile);
   const environment = {
     PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
     HOME: "/tmp/ssr-heap-home",
@@ -351,6 +491,10 @@ async function main() {
     PLATFORM_API_BASE_URL: `http://127.0.0.1:${API_PORT}/api/v1`,
     PLATFORM_API_INTERNAL_ORIGIN: `http://127.0.0.1:${API_PORT}`,
     NEXT_PUBLIC_PLATFORM_API_BASE_URL: `http://127.0.0.1:${API_PORT}/api/v1`,
+    PLATFORM_SESSION_COOKIE_NAME: SESSION_COOKIE_NAME,
+    PLATFORM_WEB_WORKERS: WEB_WORKERS,
+    PLATFORM_SSR_PERF_LOG_ENABLED: SSR_PERF_LOG_ENABLED,
+    PLATFORM_SSR_PERF_SAMPLE_RATE: "0.01",
     PLATFORM_ADSENSE_ENABLED: "false",
     SSR_HEAP_DIAGNOSTIC: "1",
     ...(AUTH_TRANSPORT === "node" ? { PLATFORM_WEB_SERVER_AUTH_TRANSPORT: "node" } : {}),
@@ -359,6 +503,8 @@ async function main() {
     api_counts: counterObject(),
     api_unexpected: counterObject(),
     api_slow_bootstrap_injections: counterObject(),
+    api_workspace_500_injections: counterObject(),
+    api_delayed_response_closed: counterObject(),
     workspace_slug_counts: counterObject(),
     api_bytes: 0,
     non_loopback: false,
@@ -386,6 +532,7 @@ async function main() {
   let latestHeapUsed = 0;
   let latestHeapLimit = 0;
   const child = spawn(process.execPath, [
+    `--require=${shutdownGuardFile}`,
     `--require=${path.join(WORK_ROOT, "ssr_heap_repro_preload.cjs")}`,
     serverFile,
   ], {
@@ -435,6 +582,8 @@ async function main() {
   let stoppingServer = false;
   const statuses = counterObject();
   const first100Statuses = counterObject();
+  const authSeedCounts = counterObject();
+  const first100AuthSeedCounts = counterObject();
   let responseBytes = 0;
   let started = 0;
   let completed = 0;
@@ -484,33 +633,24 @@ async function main() {
     const controller = new AbortController();
     controllers.add(controller);
     controllersForCleanup.add(controller);
-    const timeout = setTimeout(() => controller.abort(), 20_000);
+    const timeout = setTimeout(() => controller.abort(), 30_000);
     try {
-    const response = await fetch(`http://127.0.0.1:${APP_PORT}/tournaments/${slug}`, {
-      headers: { cookie: `deadlock_platform_session=synthetic-session-${index}` },
-      signal: controller.signal,
-    });
-    addCount(statuses, String(response.status));
-    if (index < 100) addCount(first100Statuses, String(response.status));
-    const reader = response.body?.getReader();
-    let bytes = 0;
-    if (reader) {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        bytes += value.byteLength;
-        if (bytes > 1_000_000) {
-          clientAbort = true;
-          addCount(statuses, "oversized_response");
-          await reader.cancel();
-          break;
-        }
+      const response = await requestAuthenticatedPage(index, slug, controller);
+      addCount(statuses, String(response.status));
+      if (index < 100) addCount(first100Statuses, String(response.status));
+      responseBytes += response.bytes;
+      addCount(authSeedCounts, response.authSeeded ? "matched" : "missing");
+      if (index < 100) addCount(first100AuthSeedCounts, response.authSeeded ? "matched" : "missing");
+    } catch (error) {
+      if (error instanceof Error && error.message === "response_limit") {
+        clientAbort = true;
+        for (const pending of controllers) pending.abort();
+        addCount(statuses, "oversized_response");
+        if (index < 100) addCount(first100Statuses, "oversized_response");
+      } else {
+        addCount(statuses, "transport_error");
+        if (index < 100) addCount(first100Statuses, "transport_error");
       }
-    }
-    responseBytes += bytes;
-    } catch {
-      addCount(statuses, "transport_error");
-      if (index < 100) addCount(first100Statuses, "transport_error");
     } finally {
       clearTimeout(timeout);
       completed += 1;
@@ -579,6 +719,20 @@ async function main() {
   const exit = exited ?? await childClosed;
   const memoryFinal = await readCgroupMemory();
   recordFatal(classifyFatal(stderrTail));
+  const expectedWorkspace500Total = expectedWorkspace500Count(MAX_REQUESTS);
+  const workspaceStatusKeys = Object.keys(statuses);
+  const first100WorkspaceStatusKeys = Object.keys(first100Statuses);
+  const expectedWorkspaceError = LOAD_REGIME === "workspace_500_230"
+    && (statuses["200"] ?? 0) + (statuses["500"] ?? 0) === MAX_REQUESTS
+    && workspaceStatusKeys.every((key) => ["200", "500"].includes(key))
+    && (first100Statuses["200"] ?? 0) + (first100Statuses["500"] ?? 0) === 100
+    && first100WorkspaceStatusKeys.every((key) => ["200", "500"].includes(key))
+    && stats.api_workspace_500_injections.workspace === expectedWorkspace500Total
+    && stats.api_counts.bootstrap === MAX_REQUESTS
+    && stats.api_counts.workspace === MAX_REQUESTS
+    && Object.keys(stats.api_unexpected).length === 0
+    && !stats.non_loopback
+    && !oversizedTelemetry;
   const result = serverDied
     ? "server_crash"
     : clientAbort
@@ -591,11 +745,27 @@ async function main() {
           ? "workload_shape"
         : Object.keys(stats.workspace_slug_counts).length !== FIXTURE_TOURNAMENTS
           ? "workspace_population"
+        : LOAD_REGIME === "workspace_500_230"
+          ? expectedWorkspaceError ? "workspace_500_hypothesis_complete" : "workspace_500_hypothesis_mismatch"
         : statuses["200"] !== MAX_REQUESTS
           ? "http_status"
-          : first100Statuses["200"] !== 100
-            ? "first_100_http_status"
-          : stats.api_counts.bootstrap !== MAX_REQUESTS || stats.api_counts.workspace !== MAX_REQUESTS
+        : first100Statuses["200"] !== 100
+          ? "first_100_http_status"
+        : classifyAuthSeedOutcome(
+          LOAD_REGIME,
+          authSeedCounts.matched ?? 0,
+          authSeedCounts.missing ?? 0,
+          stats.api_slow_bootstrap_injections.bootstrap ?? 0,
+          stats.api_delayed_response_closed.bootstrap ?? 0,
+        ) !== "pass"
+          ? classifyAuthSeedOutcome(
+            LOAD_REGIME,
+            authSeedCounts.matched ?? 0,
+            authSeedCounts.missing ?? 0,
+            stats.api_slow_bootstrap_injections.bootstrap ?? 0,
+            stats.api_delayed_response_closed.bootstrap ?? 0,
+          )
+        : stats.api_counts.bootstrap !== MAX_REQUESTS || stats.api_counts.workspace !== MAX_REQUESTS
             ? "fake_api_count"
             : Object.keys(stats.api_unexpected).length > 0
               ? "unexpected_api"
@@ -612,6 +782,15 @@ async function main() {
     react_version: "19.2.7",
     load_regime: LOAD_REGIME,
     auth_transport: AUTH_TRANSPORT,
+    client_request_transport: "node_http1_close",
+    client_request_timeout_ms: 30_000,
+    client_response_limit_bytes: 2 * 1024 * 1024,
+    client_origin_is_loopback_substitution: true,
+    synthetic_session_token_length: 64,
+    synthetic_csrf_token_length: 108,
+    web_workers: Number(WEB_WORKERS),
+    ssr_perf_log_enabled: SSR_PERF_LOG_ENABLED === "true",
+    shutdown_guard_loaded: true,
     source_kind: "exact_h_synthetic_only",
     app_source_commit: APP_SOURCE_COMMIT,
     memory_limit_bytes: cap.limit,
@@ -631,9 +810,24 @@ async function main() {
     max_inflight_observed: maxInflightObserved,
     status_counts: statuses,
     first_100_status_counts: first100Statuses,
+    auth_seed_counts: authSeedCounts,
+    first_100_auth_seed_counts: first100AuthSeedCounts,
+    auth_seed_outcome: classifyAuthSeedOutcome(
+      LOAD_REGIME,
+      authSeedCounts.matched ?? 0,
+      authSeedCounts.missing ?? 0,
+      stats.api_slow_bootstrap_injections.bootstrap ?? 0,
+      stats.api_delayed_response_closed.bootstrap ?? 0,
+    ),
     response_bytes: responseBytes,
     fake_api_counts: stats.api_counts,
     fake_api_slow_bootstrap_injections: stats.api_slow_bootstrap_injections,
+    fake_api_workspace_500_injections: stats.api_workspace_500_injections,
+    fake_api_workspace_500_expected_count: LOAD_REGIME === "workspace_500_230" ? expectedWorkspace500Total : 0,
+    page_http_200_count: statuses["200"] ?? 0,
+    page_http_500_count: statuses["500"] ?? 0,
+    workspace_http_status_presentation_is_observed: LOAD_REGIME === "workspace_500_230",
+    fake_api_delayed_response_closed: stats.api_delayed_response_closed,
     fake_api_bytes: stats.api_bytes,
     telemetry: metric.toJSON(),
     idle_observation_seconds: idleSeconds,
@@ -644,7 +838,7 @@ async function main() {
     fatal_enums: fatalEnums,
   };
   process.stdout.write(JSON.stringify(output) + "\n");
-  if (result !== "pass") process.exitCode = 1;
+  if (result !== "pass" && result !== "workspace_500_hypothesis_complete") process.exitCode = 1;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) {
