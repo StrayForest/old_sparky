@@ -102,8 +102,12 @@ The complete-archive, space-bounded bootstrap extraction follow-up uses **C2**
 self-test remain required; these source commits do not establish production
 installation or activation.
 The current repository pin selects host-control source **C**
-`4df5ec11cf8babbe2b17b1a4ec7e5187038d89e7`, with the exact ordered
+`532fd2ecefd53d19e7099f0cb9076c19fb0644dc`, with the exact ordered
 14-member closure recorded in `platform/contracts/host_tools_pin.json`. This
+generation adds the separate, disabled-by-default SSR heap metrics selector
+to web runtime rendering and the static-8 diagnostic profile. It emits only
+bounded numeric RSS/V8 heap/GC samples; it does not change request behavior,
+admission, resource budgets or production service state. The prior source
 generation adds a closed pre-supervisor `dispatch` result to the existing
 source-bound live-launch status parser; it does not loosen the supervisor's
 failure-stage allowlist. The earlier immutable generation
