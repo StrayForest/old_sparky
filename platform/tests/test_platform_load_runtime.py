@@ -510,6 +510,122 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
             write.assert_not_called()
             rejected_exec.assert_not_called()
 
+    def test_containment_canary_passes_validated_same_source_binding(self) -> None:
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from types import SimpleNamespace
+
+        workflow_path = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/platform-load-containment-canary.yml"
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+        self.assertIn('SOURCE_GIT_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID"', workflow)
+        step = workflow.split(
+            "      - name: Run capability probe and synthetic descendant canary\n", 1
+        )[1]
+        command = "/usr/bin/python3 - <<'PY'\n"
+        script = textwrap.dedent(step.split(command, 1)[1].split("\n          PY", 1)[0])
+        source_sha = "a" * 40
+        external_run_id = "123456789"
+        expected_binding = {
+            "source_git_sha": source_sha,
+            "app_target_sha": source_sha,
+            "source_binding": None,
+            "source_binding_sha256": None,
+            "external_run_id": external_run_id,
+        }
+        probe = {
+            "available": True,
+            "protocol": "stdio",
+            "unshare": "/usr/bin/unshare",
+        }
+        calls: list[dict[str, object]] = []
+
+        def run_supervised(**kwargs: object) -> SimpleNamespace:
+            worker_config = kwargs["worker_config"]
+            assert isinstance(worker_config, dict)
+            calls.append(worker_config)
+            heartbeat = Path(str(worker_config["heartbeat"]))
+            identities = Path(str(worker_config["identities"]))
+            heartbeat.write_text("stopped", encoding="ascii")
+            roles = (
+                "worker-pid1",
+                "setsid-intermediate",
+                "double-fork-grandchild",
+                "nested-descendant",
+            )
+            identities.write_text(
+                "".join(
+                    json.dumps({"role": role, "pid": 2147483647, "starttime": 1})
+                    + "\n"
+                    for role in roles
+                ),
+                encoding="ascii",
+            )
+            return SimpleNamespace(
+                reason="max_duration_seconds",
+                namespace_closed=True,
+                returncode=-15,
+                namespace_init_pid=2147483646,
+                descendants_reaped=True,
+                report={
+                    "runtime_supervisor": {"reason": "max_duration_seconds"},
+                    "runtime_budget": {"within_duration_budget": True},
+                },
+            )
+
+        def execute(
+            environment: dict[str, str],
+        ) -> tuple[int | None, str, list[dict[str, object]], int]:
+            calls.clear()
+            output = StringIO()
+            exit_code: int | None = None
+            namespace = {"__name__": "__main__"}
+            try:
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch(
+                        "tools.platform_load_runtime.probe_pid_namespace_capability",
+                        return_value=probe,
+                    ) as capability_probe,
+                    patch(
+                        "tools.platform_load_runtime.run_supervised",
+                        side_effect=run_supervised,
+                    ),
+                    redirect_stdout(output),
+                ):
+                    try:
+                        exec(compile(script, str(workflow_path), "exec"), namespace)
+                    except SystemExit as exc:
+                        exit_code = exc.code if isinstance(exc.code, int) else 1
+                return exit_code, output.getvalue(), list(calls), capability_probe.call_count
+            finally:
+                del namespace
+
+        code, stdout, configs, probe_calls = execute(
+            {"SOURCE_GIT_SHA": source_sha, "GITHUB_RUN_ID": external_run_id}
+        )
+        self.assertIsNone(code)
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0]["binding"], expected_binding)
+        self.assertEqual(probe_calls, 1)
+        result = json.loads(stdout)
+        self.assertEqual(result["reason"], "max_duration_seconds")
+        self.assertIs(result["namespace_closed"], True)
+
+        for invalid_environment in (
+            {"GITHUB_RUN_ID": external_run_id},
+            {"SOURCE_GIT_SHA": source_sha, "GITHUB_RUN_ID": "0"},
+            {"SOURCE_GIT_SHA": source_sha.upper(), "GITHUB_RUN_ID": external_run_id},
+        ):
+            with self.subTest(environment=invalid_environment):
+                code, stdout, configs, probe_calls = execute(invalid_environment)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(stdout, "")
+                self.assertEqual(configs, [])
+                self.assertEqual(probe_calls, 0)
+
     def test_run_profile_preflight_uses_pure_error_channel(self) -> None:
         from tools.platform_load import run_profile
 
