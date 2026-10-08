@@ -1,4 +1,7 @@
+import { startHeapMetrics } from "./lib/server-ssr-heap-metrics.mjs";
+
 const eventLoopLoggingEnabled = process.env.PLATFORM_SSR_PERF_LOG_ENABLED === "true";
+const heapMetricsLoggingEnabled = process.env.PLATFORM_SSR_HEAP_METRICS_ENABLED === "true";
 let eventLoopMonitorStarted = false;
 type NodePerfHooks = typeof import("node:perf_hooks");
 type NodeRuntimeProcess = typeof process & {
@@ -19,7 +22,7 @@ function milliseconds(value: number): string {
 
 export async function register(): Promise<void> {
   if (
-    !eventLoopLoggingEnabled
+    (!eventLoopLoggingEnabled && !heapMetricsLoggingEnabled)
     || process.env.NEXT_RUNTIME !== "nodejs"
     || eventLoopMonitorStarted
   ) {
@@ -33,6 +36,12 @@ export async function register(): Promise<void> {
   }).process;
   const perfHooks = nodeProcess?.getBuiltinModule?.("node:perf_hooks") as NodePerfHooks | undefined;
   if (!perfHooks) {
+    return;
+  }
+  if (heapMetricsLoggingEnabled) {
+    startHeapMetrics(nodeProcess, perfHooks);
+  }
+  if (!eventLoopLoggingEnabled) {
     return;
   }
   const { monitorEventLoopDelay } = perfHooks;

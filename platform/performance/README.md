@@ -276,9 +276,10 @@ window are ignored for the private authoritative summary, never deleted, and
 remain caller/host retention artifacts. The private observer reports that
 preservation explicitly; unbound profile files are not evidence for this run
 and are not a cleanup error by themselves. Before upload, the
-producer-specific public projection retains only enabled/profile-count and
-numeric aggregate fields, never worker PIDs or identities. Missing required
-observer evidence remains a hard failure.
+producer-specific public projection retains enabled/profile-count and numeric
+aggregate fields, plus a bounded function summary for each available CPU
+profile. It never retains worker PIDs or identities. Missing required observer
+evidence remains a hard failure.
 
 ### Evidence privacy boundary
 
@@ -291,6 +292,13 @@ tournament slugs, raw URLs/queries, request/diagnostic/correlation IDs, user
 digests, edge IP/location, Cloudflare ray values, cookies, authorization or
 SQL text. Unknown route/error/backend values collapse to `other`; control
 account state is only `control_account_preserved: bool`.
+
+CPU profile projection is capped at 32 profile summaries and 100 function rows
+per profile. It keeps only the availability flag, a restricted Python symbol
+token (unsafe names become `other`), and bounded line/call/timing numbers.
+Integer fields require JSON integers from 0 through 1e12; timing fields must
+be finite values from 0 through 1e12. Source filenames, profile paths, raw pstats data,
+PIDs and all unrecognized profile fields are discarded before publication.
 
 Remote command output is captured in a mode-0600 temporary file, reduced to
 one bounded canonical summary, and deleted before the fixed JSON evidence is

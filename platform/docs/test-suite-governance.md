@@ -28,11 +28,9 @@ placement rules; it does not repeat tool arguments.
 | `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
 | `external-load` | performance operators | external generator to production origin | explicit operator workflow |
 
-The `web-quality` gate runs the runtime shutdown-signal, SSR stream diagnostics
-and Next root-directory glob contracts,
-`apps/platform_web/tests/shutdown-guard-contract.cjs`,
-`apps/platform_web/tests/ssr-stream-diagnostics-contract.cjs` and
-`apps/platform_web/tests/next-rootdir-glob-contract.mjs`, through the locked
+The `web-quality` gate runs shutdown, SSR stream/heap and Next root-directory
+contracts from `shutdown-guard-contract.cjs`, `ssr-stream-diagnostics-contract.cjs`,
+`ssr-heap-metrics-contract.mjs` and `next-rootdir-glob-contract.mjs` through the locked
 `platform_node.sh` helper after CI provisions Node 26.3.1. The shutdown
 contract self-signals only after the guard preload, has a bounded in-child
 watchdog, and cleans up its detached process group on failure. The SSR
@@ -40,17 +38,14 @@ contract bounds both enabled and disabled fixtures and cleans up their
 detached process groups on failure. The backend tool contour keeps
 source/ownership assertions for these contracts but does not execute their
 Node processes; this prevents an unpinned backend runner from duplicating the
-web runtime checks. The Next contract configures a patterned `next.rootDir`
+web runtime checks. The heap contract injects a fake clock, process memory and
+GC entries, verifying numeric-only output, 5,760-sample/eight-hour limits and
+timer disposal without a server or browser. The Next contract configures a patterned `next.rootDir`
 with a Pages route and verifies `@next/next/no-html-link-for-pages` still
 reports an internal navigation link. This guards the scoped glob compatibility
 override for `@next/eslint-plugin-next`; remove that override after upstream
-releases a patched `braces` dependency. The focused local commands are
-`tools/platform_web_npm.sh --prefix apps/platform_web run test:shutdown-guard`
-and
-`tools/platform_web_npm.sh --prefix apps/platform_web run test:ssr-stream-diagnostics`
-and
-`tools/platform_web_npm.sh --prefix apps/platform_web run test:next-rootdir-glob`
-from `platform/`; the helper fails closed unless Node 26.3.1 is selected.
+releases a patched `braces` dependency. Run `tools/platform_verify.py
+web-quality` from `platform/`; the helper requires Node 26.3.1.
 
 The first eight gates are deterministic and always part of the normal CI
 aggregate. The conditional `release-runtime` gate is deterministic as well,
@@ -271,6 +266,7 @@ pin-bump lifecycle; it does not silently skip historical ancestry proof.
 
 Operation-bound legacy LiveQA fixtures in `test_platform_recovery_bootstrap` stay in `backend-privileged`; they cover receipt/pointer/venv identity, service/timer snapshot, bounded readiness retries, fixed child-stage/status diagnostics and receipt-last cleanup.
 `test_platform_release_recovery_boundaries` covers the candidate-deadline-clamped reconcile timeout, retained receipt, and idempotent retry after a simulated partial payload publish. `test_platform_live_qa_runtime_install` covers fixed stage diagnostics for a post-promotion retention failure. These remain in `backend-privileged` because they exercise release-state transitions and privileged payload ownership.
+`test_platform_live_qa_wrappers` also owns the source-bound fixed-stage status contract for public launch failures before the browser supervisor starts; its failure tests remain in `backend-privileged` and invoke no browser or database work.
 `test_liveqa_reconcile_stderr_is_available_only_to_private_candidate_capture`
 checks the helper preserves reconcile stderr. Its companion
 `test_candidate_capture_runner_is_private_bounded_and_composes_with_dispatcher` verifies private
@@ -278,7 +274,7 @@ capture and closed stdout/public markers; the executable catalog snapshot tracks
 Privileged release tests prove promoted dependencies stay readable, relocation removes only wheel/RECORD-bound generated caches, cleanup is receipt/readiness/cgroup-bound, and runtime summaries stay out of deployment markers.
 Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused.
 A proof miss uses the existing fresh-venv snapshot path. These root-owned cases remain in `backend-privileged`; bootstrap extraction tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
-The canonical AST snapshot is 1,784 tests (1,712 backend, including 565 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 291, tool-contract 425, integration 255, privileged 565, and performance-contract 176.
+The canonical AST snapshot is 1,789 tests (1,717 backend, including 567 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 291, tool-contract 425, integration 255, privileged 567, and performance-contract 179.
 Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
 

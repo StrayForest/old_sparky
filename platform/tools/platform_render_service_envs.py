@@ -29,6 +29,7 @@ WEB_KEYS = frozenset({
     "PLATFORM_SESSION_COOKIE_NAME",
     "NEXT_PUBLIC_PLATFORM_API_BASE_URL",
     "PLATFORM_SSR_PERF_LOG_ENABLED",
+    "PLATFORM_SSR_HEAP_METRICS_ENABLED",
     "PLATFORM_SSR_PERF_SAMPLE_RATE",
     "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS",
 })
@@ -36,6 +37,7 @@ WEB_KEYS = frozenset({
 # API owns the public/auth boundary and legitimately needs the complete PLATFORM_*
 # configuration. Non-platform process variables are never copied from the source.
 API_PREFIXES = ("PLATFORM_",)
+WEB_ONLY_KEYS = frozenset({"PLATFORM_SSR_HEAP_METRICS_ENABLED"})
 RUNTIME_CONTROL_KEYS = frozenset({
     "PLATFORM_ENV_FILE",
     "PLATFORM_RUNTIME_SERVICE",
@@ -134,7 +136,9 @@ def selected_keys(service: str, values: dict[str, str]) -> list[str]:
         keys = {
             key
             for key in values
-            if key.startswith(API_PREFIXES) and key not in RUNTIME_CONTROL_KEYS
+            if key.startswith(API_PREFIXES)
+            and key not in RUNTIME_CONTROL_KEYS
+            and key not in WEB_ONLY_KEYS
         }
     elif service == "worker":
         keys = WORKER_KEYS & values.keys()

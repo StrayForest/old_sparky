@@ -50,6 +50,9 @@ MAX_PAYLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_PAYLOAD_FILES = 200_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MARKER_RE = re.compile(r"^liveqa-[a-z0-9-]{6,56}$")
+LIVE_LAUNCH_FAILURE_STAGES = frozenset(
+    {"validation", "identity", "trusted_generation", "dispatch"}
+)
 UUID_RE = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 EMAIL_RE = re.compile(
     r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
@@ -702,6 +705,22 @@ def _validate_bundle_and_mailbox() -> None:
             raise RuntimeError("live-QA bundle roster password is invalid")
 
 
+def _emit_live_launch_failure(*, source_sha: str, stage: str, child_exit: int) -> None:
+    """Emit only a fixed launch boundary for the outer source-bound parser."""
+
+    if (
+        stage not in LIVE_LAUNCH_FAILURE_STAGES
+        or SHA_RE.fullmatch(source_sha) is None
+        or type(child_exit) is not int
+        or child_exit not in {1, 2}
+    ):
+        return
+    print(
+        "LIVE_LAUNCH_STATUS schema=1 status=failed "
+        f"stage={stage} child_exit={child_exit} source_sha={source_sha}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if arguments and SHA_RE.fullmatch(arguments[0]):
@@ -718,6 +737,9 @@ def main(argv: list[str] | None = None) -> int:
         tail = arguments[2:]
         if mode == "run-launch":
             if len(tail) not in {3, 5}:
+                _emit_live_launch_failure(
+                    source_sha=runner_sha, stage="validation", child_exit=2
+                )
                 return 2
             base_url, provision, marker = tail[:3]
             suffix = tail[3:]
@@ -739,19 +761,39 @@ def main(argv: list[str] | None = None) -> int:
             runner_sha, suffix
         )
     except RuntimeError:
+        if mode == "run-launch":
+            _emit_live_launch_failure(
+                source_sha=runner_sha, stage="validation", child_exit=2
+            )
         return 2
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        if mode == "run-launch":
+            _emit_live_launch_failure(
+                source_sha=runner_sha, stage="validation", child_exit=1
+            )
+        return 1
     if mode == "run-launch" and (
         base_url != "https://old-sparky.com"
         or provision not in {"true", "false"}
         or (provision == "true" and MARKER_RE.fullmatch(marker) is None)
         or (provision == "false" and marker != "")
     ):
+        _emit_live_launch_failure(
+            source_sha=runner_sha, stage="validation", child_exit=2
+        )
         return 2
+    launch_stage = "identity"
     try:
         if os.geteuid() != 0:
+            if mode == "run-launch":
+                _emit_live_launch_failure(
+                    source_sha=runner_sha, stage="identity", child_exit=1
+                )
             return 1
+        launch_stage = "trusted_generation"
         manifest = _verify_install(app_target_sha)
         remote_dispatcher = _load_verified_remote_dispatcher(manifest)
+        launch_stage = "validation"
         _validate_source_binding_schema(
             remote_dispatcher,
             runner_sha,
@@ -827,14 +869,21 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if mode in {"run-locked", "run-launch"}:
             if os.environ.get("PLATFORM_RELEASE_LOCK_SUPERVISED") != "1":
+                if mode == "run-launch":
+                    _emit_live_launch_failure(
+                        source_sha=runner_sha, stage="dispatch", child_exit=1
+                    )
                 return 1
+            launch_stage = "dispatch"
             _require_release_lock_supervisor()
+            launch_stage = "validation"
             _validate_source_binding_under_lock(
                 remote_dispatcher,
                 runner_sha,
                 app_target_sha,
                 source_binding,
             )
+        launch_stage = "trusted_generation"
         _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
         manifest = _read_manifest(app_target_sha)
         payload = Path(str(manifest["payload"]))
@@ -856,6 +905,7 @@ def main(argv: list[str] | None = None) -> int:
             else ["--source-binding-base64", encoded_binding]
         )
         if mode == "run-launch":
+            launch_stage = "trusted_generation"
             wrapper = payload / "platform/tools/platform_live_launch_supervisor.sh"
             _regular(wrapper, mode=0o555, maximum=MAX_PAYLOAD_FILE_BYTES)
             environment = {
@@ -873,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
                 "PLATFORM_LIVE_MARKER": marker,
                 "PLAYWRIGHT_LIVE_BASE_URL": base_url,
             }
+            launch_stage = "dispatch"
             os.execve(
                 str(wrapper),
                 [str(wrapper), base_url, provision, marker, runner_sha, *source_arguments],
@@ -897,6 +948,12 @@ def main(argv: list[str] | None = None) -> int:
         }
         os.execve(str(wrapper), [str(wrapper), *payload_args], environment)
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError):
+        if mode == "run-launch":
+            _emit_live_launch_failure(
+                source_sha=runner_sha,
+                stage=launch_stage,
+                child_exit=1,
+            )
         return 1
     return 0
 

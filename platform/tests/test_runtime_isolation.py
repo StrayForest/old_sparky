@@ -18,6 +18,7 @@ class RuntimeIsolationTests(unittest.TestCase):
             "PLATFORM_ENVIRONMENT": "PLATFORM_ENVIRONMENT=production",
             "PLATFORM_API_PORT": "PLATFORM_API_PORT=8010",
             "PLATFORM_WEB_BIND_HOST": "PLATFORM_WEB_BIND_HOST=127.0.0.1",
+            "PLATFORM_SSR_HEAP_METRICS_ENABLED": "PLATFORM_SSR_HEAP_METRICS_ENABLED=true",
             "PLATFORM_DATABASE_URL": "PLATFORM_DATABASE_URL=postgresql://secret",
             "PLATFORM_SECRET_KEY": "PLATFORM_SECRET_KEY=secret",
             "PLATFORM_REDIS_URL": "PLATFORM_REDIS_URL=redis://secret",
@@ -31,6 +32,9 @@ class RuntimeIsolationTests(unittest.TestCase):
             self.assertNotIn(f"{key}=", rendered)
         self.assertIn("PLATFORM_ENVIRONMENT=production", rendered)
         self.assertIn("PLATFORM_API_PORT=8010", rendered)
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true", rendered)
+        api_rendered = render_service_env("api", values)
+        self.assertNotIn("PLATFORM_SSR_HEAP_METRICS_ENABLED", api_rendered)
 
     def test_worker_env_excludes_auth_and_delivery_secrets(self) -> None:
         values = {

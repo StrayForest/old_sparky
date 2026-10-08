@@ -74,6 +74,10 @@ SAFE_PROFILE_SIGNAL_REASONS = frozenset(
         "pidfd_send_failed",
     }
 )
+SAFE_PROFILE_FUNCTION_NAME_RE = re.compile(
+    r"(?:[A-Za-z_][A-Za-z0-9_]*|<[A-Za-z_][A-Za-z0-9_]*>)"
+    r"(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|<[A-Za-z_][A-Za-z0-9_]*>))*"
+)
 SAFE_WAIT_STATES = frozenset(
     {"active", "idle", "lock", "io", "lwlock", "client", "ipc", "timeout", "other"}
 )
@@ -2400,6 +2404,45 @@ def _project_cpu_profile(value: Any) -> dict[str, Any]:
     enabled = _copy_bool(source, "enabled")
     if enabled is not None:
         output["enabled"] = enabled
+    raw_profiles = source.get("profiles")
+    if isinstance(raw_profiles, list):
+        profiles: list[dict[str, Any]] = []
+        for raw_profile in raw_profiles[:32]:
+            profile_source = _mapping(raw_profile)
+            profile_available = _copy_bool(profile_source, "profile_available")
+            profile_output: dict[str, Any] = {}
+            if profile_available is not None:
+                profile_output["profile_available"] = profile_available
+            raw_functions = profile_source.get("functions")
+            if isinstance(raw_functions, list):
+                functions: list[dict[str, Any]] = []
+                for raw_function in raw_functions[:100]:
+                    function_source = _mapping(raw_function)
+                    function_name = function_source.get("function")
+                    if (
+                        isinstance(function_name, str)
+                        and len(function_name) <= 128
+                        and SAFE_PROFILE_FUNCTION_NAME_RE.fullmatch(function_name)
+                    ):
+                        safe_function_name = function_name
+                    else:
+                        safe_function_name = "other"
+                    function_output: dict[str, Any] = {
+                        "function": safe_function_name,
+                    }
+                    for key in ("line", "primitive_calls", "calls"):
+                        number = function_source.get(key)
+                        if type(number) is int and 0 <= number <= 1_000_000_000_000:
+                            function_output[key] = number
+                    for key in ("self_seconds", "cumulative_seconds"):
+                        number = _copy_number(function_source, key)
+                        if number is not None:
+                            function_output[key] = number
+                    functions.append(function_output)
+                profile_output["functions"] = functions
+            if profile_output:
+                profiles.append(profile_output)
+        output["profiles"] = profiles
     retention = _mapping(source.get("retention"))
     for key in (
         "max_profiles",

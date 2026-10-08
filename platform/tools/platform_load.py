@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections.abc import Iterator, Mapping
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -1164,12 +1165,51 @@ def _report_phase_envelope(profile: Mapping[str, Any], report: Mapping[str, Any]
         authored = ramp.get("phases")
         authored = authored if isinstance(authored, Mapping) else {}
         authored_names = list(authored)
+        timed_phases: list[tuple[datetime, datetime]] = []
+        timestamps_valid = True
+        if phase_plan and isinstance(authored, Mapping):
+            for name in expected_names:
+                phase = authored.get(name)
+                if not isinstance(phase, Mapping):
+                    timestamps_valid = False
+                    break
+                started_at = phase.get("started_at")
+                finished_at = phase.get("finished_at")
+                if not isinstance(started_at, str) or not isinstance(finished_at, str):
+                    timestamps_valid = False
+                    break
+                try:
+                    started = datetime.fromisoformat(started_at)
+                    finished = datetime.fromisoformat(finished_at)
+                except ValueError:
+                    timestamps_valid = False
+                    break
+                if (
+                    started.tzinfo is None
+                    or started.utcoffset() is None
+                    or finished.tzinfo is None
+                    or finished.utcoffset() is None
+                    or started >= finished
+                ):
+                    timestamps_valid = False
+                    break
+                timed_phases.append((started, finished))
+            if timestamps_valid:
+                timestamps_valid = all(
+                    previous_finished <= current_started
+                    for (_, previous_finished), (current_started, _) in zip(
+                        timed_phases, timed_phases[1:]
+                    )
+                )
         phase_plan_closed = (
             (not phase_plan and "ramp" not in phases)
             or (
                 bool(phase_plan)
                 and isinstance(phases.get("ramp"), Mapping)
-                and authored_names == expected_names
+                and isinstance(authored, Mapping)
+                and set(authored_names) == set(expected_names)
+                and len(authored_names) == len(expected_names)
+                and timestamps_valid
             )
         )
         phase_values_mapping = all(
@@ -1191,21 +1231,26 @@ def _report_phase_envelope(profile: Mapping[str, Any], report: Mapping[str, Any]
             isinstance(phases.get(name), Mapping) for name in expected_keys
         )
         if "capacity_ramp" in expected_keys:
-            ramp_stages = phases.get("capacity_ramp", {}).get("stages")
-            expected_stages = {
-                str(stage) for stage in (traffic.get("concurrency_stages") or [])
-            }
+            ramp = phases.get("capacity_ramp")
+            ramp = ramp if isinstance(ramp, Mapping) else {}
+            ramp_stages = ramp.get("stages")
+            authored_stages = traffic.get("concurrency_stages") or []
+            expected_stages = {str(stage) for stage in authored_stages}
             phase_values_mapping = phase_values_mapping and isinstance(
                 ramp_stages, Mapping
             ) and set(str(stage) for stage in ramp_stages) == expected_stages and all(
                 isinstance(value, Mapping) for value in ramp_stages.values()
             )
-            if isinstance(ramp_stages, Mapping):
-                phase_values_mapping = phase_values_mapping and list(
-                    str(stage) for stage in ramp_stages
-                ) == list(
-                    str(stage) for stage in (traffic.get("concurrency_stages") or [])
+            actual_stages = ramp.get("concurrency_stages")
+            phase_plan_closed = (
+                isinstance(authored_stages, list)
+                and isinstance(actual_stages, list)
+                and all(
+                    isinstance(stage, int) and not isinstance(stage, bool)
+                    for stage in actual_stages
                 )
+                and actual_stages == authored_stages
+            )
     elif mode == "page-load":
         phase_keys_closed = set(phases) == {"authenticated_page_load"}
         phase_plan_closed = True
@@ -3627,7 +3672,16 @@ def evaluate_report(
     if isinstance(report_phases, dict):
         ramp = report_phases.get("ramp")
         if isinstance(ramp, Mapping) and isinstance(ramp.get("phases"), dict):
-            report_phase_summaries.update(ramp["phases"])
+            authored_phases = profile.get("traffic", {}).get("phases") or []
+            authored_names = [
+                str(phase["name"])
+                for phase in authored_phases
+                if isinstance(phase, Mapping) and isinstance(phase.get("name"), str)
+            ]
+            for phase_name in authored_names:
+                phase_summary = ramp["phases"].get(phase_name)
+                if isinstance(phase_summary, Mapping):
+                    report_phase_summaries[phase_name] = phase_summary
         if profile.get("mode") == "ready-vote":
             primary = report_phases.get("primary")
             if isinstance(primary, Mapping):
@@ -3824,7 +3878,22 @@ def _is_complete_observer_bound_decision(
     acceptance_checks = acceptance.get("checks")
     has_resource_safety = (
         isinstance(profile_acceptance, Mapping)
-        and isinstance(profile_acceptance.get("resource_safety"), Mapping)
+        and (
+            isinstance(profile_acceptance.get("resource_safety"), Mapping)
+            or (
+                profile_kind in {"stress", "spike"}
+                and all(
+                    field in profile_acceptance
+                    for field in (
+                        "max_postgres_backend_connections",
+                        "max_waiting_backends",
+                        "max_lock_waiters",
+                        "max_cpu_per_core_percent",
+                        "pool_checkout_wait_ms",
+                    )
+                )
+            )
+        )
     )
     origin_budget_failure = False
     if has_resource_safety:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from io import BytesIO, StringIO, TextIOWrapper
 import json
 import hashlib
@@ -114,19 +114,191 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             ["run-launch", sha, "https://old-sparky.com", "false", ""],
         ):
             with self.subTest(mode=arguments[0]):
+                output = StringIO()
                 with patch.object(platform_live_user_qa_dispatch.os, "geteuid", return_value=0), \
                     patch.object(platform_live_user_qa_dispatch, "_verify_install", return_value=manifest), \
                     patch.object(platform_live_user_qa_dispatch, "_load_verified_remote_dispatcher", return_value=object()), \
                     patch.object(platform_live_user_qa_dispatch, "_validate_source_binding_schema"), \
                     patch.object(platform_live_user_qa_dispatch, "_require_release_lock_supervisor", side_effect=RuntimeError("no lock")) as lock_check, \
                     patch.object(platform_live_user_qa_dispatch, "_validate_source_binding_under_lock") as tuple_check, \
-                    patch.dict(os.environ, {"PLATFORM_RELEASE_LOCK_SUPERVISED": "1"}, clear=True):
-                    self.assertEqual(
-                        platform_live_user_qa_dispatch.main(arguments),
-                        1,
-                    )
+                    patch.dict(os.environ, {"PLATFORM_RELEASE_LOCK_SUPERVISED": "1"}, clear=True), \
+                    redirect_stdout(output):
+                    self.assertEqual(platform_live_user_qa_dispatch.main(arguments), 1)
                 lock_check.assert_called_once_with()
                 tuple_check.assert_not_called()
+                if arguments[0] == "run-launch":
+                    self.assertEqual(
+                        output.getvalue(),
+                        "LIVE_LAUNCH_STATUS schema=1 status=failed "
+                        f"stage=dispatch child_exit=1 source_sha={sha}\n",
+                    )
+                else:
+                    self.assertEqual(output.getvalue(), "")
+
+    def test_live_launch_pre_supervisor_failures_emit_only_closed_stage(self) -> None:
+        sha = "a" * 40
+        arguments = ["run-launch", sha, "https://old-sparky.com", "false", ""]
+        cases = (
+            ("source binding", "validation", 2, "_source_binding_context"),
+            ("source binding I/O", "validation", 1, "_source_binding_context"),
+            ("identity", "identity", 1, "geteuid"),
+            ("installed generation", "trusted_generation", 1, "_verify_install"),
+            ("installed dispatcher", "trusted_generation", 1, "_load_verified_remote_dispatcher"),
+            ("source schema", "validation", 1, "_validate_source_binding_schema"),
+            ("release lock", "dispatch", 1, "_require_release_lock_supervisor"),
+            ("locked binding", "validation", 1, "_validate_source_binding_under_lock"),
+            ("active payload", "trusted_generation", 1, "_read_manifest"),
+            ("trusted directory chain", "trusted_generation", 1, "_trusted_directory_chain"),
+            ("supervisor metadata", "trusted_generation", 1, "_regular"),
+            ("supervisor exec", "dispatch", 1, "execve"),
+        )
+        for name, stage, child_exit, failing_hook in cases:
+            with self.subTest(boundary=name):
+                output = StringIO()
+                with ExitStack() as stack:
+                    stack.enter_context(patch.dict(os.environ, {}, clear=True))
+                    stack.enter_context(
+                        patch.dict(os.environ, {"PLATFORM_RELEASE_LOCK_SUPERVISED": "1"})
+                    )
+                    stack.enter_context(redirect_stdout(output))
+                    stack.enter_context(
+                        patch.object(
+                            platform_live_user_qa_dispatch.os,
+                            "geteuid",
+                            return_value=1000 if failing_hook == "geteuid" else 0,
+                        )
+                    )
+                    defaults = {
+                        "_source_binding_context": (sha, None, None),
+                        "_verify_install": {"files": {}},
+                        "_load_verified_remote_dispatcher": object(),
+                        "_validate_source_binding_schema": None,
+                        "_require_release_lock_supervisor": None,
+                        "_validate_source_binding_under_lock": None,
+                        "_trusted_directory_chain": None,
+                        "_read_manifest": {"payload": "/trusted/payload"},
+                        "_regular": SimpleNamespace(st_nlink=1),
+                        "execve": None,
+                    }
+                    for name_to_patch, return_value in defaults.items():
+                        target = (
+                            platform_live_user_qa_dispatch.os
+                            if name_to_patch == "execve"
+                            else platform_live_user_qa_dispatch
+                        )
+                        if name_to_patch == failing_hook:
+                            if name == "source binding I/O" or name_to_patch == "execve":
+                                exception_type = OSError
+                            else:
+                                exception_type = RuntimeError
+                            kwargs = {"side_effect": exception_type("private detail")}
+                        else:
+                            kwargs = {"return_value": return_value}
+                        stack.enter_context(
+                            patch.object(target, name_to_patch, **kwargs)
+                        )
+                    result = platform_live_user_qa_dispatch.main(arguments)
+                self.assertEqual(result, child_exit)
+                self.assertEqual(
+                    output.getvalue(),
+                    "LIVE_LAUNCH_STATUS schema=1 status=failed "
+                    f"stage={stage} child_exit={child_exit} source_sha={sha}\n",
+                )
+                self.assertNotIn("private detail", output.getvalue())
+                self.assertEqual(
+                    platform_workflow_remote_dispatch._parse_live_launch_status(
+                        output.getvalue().encode("ascii"),
+                        child_status=child_exit,
+                        expected_sha=sha,
+                    ),
+                    ("failed", stage, child_exit),
+                )
+
+        output = StringIO()
+        with patch.object(
+            platform_live_user_qa_dispatch,
+            "_source_binding_context",
+            return_value=(sha, None, None),
+        ), redirect_stdout(output):
+            result = platform_live_user_qa_dispatch.main(
+                ["run-launch", sha, "https://old-sparky.com", "false", "private\nvalue"]
+            )
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            output.getvalue(),
+            "LIVE_LAUNCH_STATUS schema=1 status=failed "
+            f"stage=validation child_exit=2 source_sha={sha}\n",
+        )
+        self.assertNotIn("private", output.getvalue())
+        invalid_sha_output = StringIO()
+        with redirect_stdout(invalid_sha_output):
+            self.assertEqual(
+                platform_live_user_qa_dispatch.main(
+                    ["run-launch", "invalid", "https://old-sparky.com", "false", ""]
+                ),
+                2,
+            )
+        self.assertEqual(invalid_sha_output.getvalue(), "")
+
+        success_output = StringIO()
+        with patch.dict(os.environ, {"PLATFORM_RELEASE_LOCK_SUPERVISED": "1"}, clear=True), \
+            patch.object(platform_live_user_qa_dispatch.os, "geteuid", return_value=0), \
+            patch.object(
+                platform_live_user_qa_dispatch,
+                "_source_binding_context",
+                return_value=(sha, None, None),
+            ), \
+            patch.object(
+                platform_live_user_qa_dispatch,
+                "_verify_install",
+                return_value={"files": {}},
+            ), \
+            patch.object(
+                platform_live_user_qa_dispatch,
+                "_load_verified_remote_dispatcher",
+                return_value=object(),
+            ), \
+            patch.object(platform_live_user_qa_dispatch, "_validate_source_binding_schema"), \
+            patch.object(platform_live_user_qa_dispatch, "_require_release_lock_supervisor"), \
+            patch.object(platform_live_user_qa_dispatch, "_validate_source_binding_under_lock"), \
+            patch.object(platform_live_user_qa_dispatch, "_trusted_directory_chain"), \
+            patch.object(
+                platform_live_user_qa_dispatch,
+                "_read_manifest",
+                return_value={"payload": "/trusted/payload"},
+            ), \
+            patch.object(
+                platform_live_user_qa_dispatch,
+                "_regular",
+                return_value=SimpleNamespace(st_nlink=1),
+            ), \
+            patch.object(platform_live_user_qa_dispatch.os, "execve"), \
+            redirect_stdout(success_output):
+            self.assertEqual(platform_live_user_qa_dispatch.main(arguments), 0)
+        self.assertEqual(success_output.getvalue(), "")
+
+    def test_live_launch_status_parser_rejects_malformed_or_duplicate_markers(self) -> None:
+        sha = "a" * 40
+        valid = (
+            "LIVE_LAUNCH_STATUS schema=1 status=failed "
+            f"stage=dispatch child_exit=1 source_sha={sha}\n"
+        ).encode("ascii")
+        for malformed in (
+            valid + valid,
+            valid + b"unexpected\n",
+            valid.replace(b"stage=dispatch", b"stage=unknown"),
+            valid.replace(b"stage=dispatch", b"stage=trusted_entry"),
+            valid.replace(b"stage=dispatch", b"stage=timeout"),
+            valid.replace(b"source_sha=" + sha.encode("ascii"), b"source_sha=" + b"b" * 40),
+        ):
+            with self.subTest(marker=malformed[:80]):
+                self.assertIsNone(
+                    platform_workflow_remote_dispatch._parse_live_launch_status(
+                        malformed,
+                        child_status=1,
+                        expected_sha=sha,
+                    )
+                )
 
     def test_live_dispatcher_imports_under_isolated_no_bytecode_python(self) -> None:
         result = subprocess.run(

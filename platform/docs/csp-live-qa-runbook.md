@@ -271,12 +271,15 @@ refuses any candidate-provided path that is not digest-bound by the installed
 manifest.
 
 The supervisor suppresses ordinary installer, identity and browser output.
-Its only protocol output is one fixed `LIVE_LAUNCH_STATUS` line bound to the
-requested source SHA and the supervisor exit status. The dispatcher accepts
-success only for a complete browser run with exit status zero; an absent,
-duplicate, malformed or mismatched line fails closed. The workflow publishes
-only the closed stage/status projection and never persists SSH stderr or raw
-child output as the browser report.
+The trusted dispatcher also emits the same fixed `LIVE_LAUNCH_STATUS` line
+when a `run-launch` check fails before the supervisor starts. Its `stage` is
+one of the existing closed values (`validation`, `identity`,
+`trusted_generation` or `dispatch`); it carries only the target source SHA and
+numeric exit status. The dispatcher accepts success only for a complete
+browser run with exit status zero; an absent, duplicate, malformed or
+mismatched line fails closed. The workflow publishes only the closed
+stage/status projection and never persists SSH stderr or raw child output as
+the browser report.
 
 The same installer loads two named AppArmor profiles granting `userns` only to
 the checksum-pinned Chromium and headless-shell revision paths below the

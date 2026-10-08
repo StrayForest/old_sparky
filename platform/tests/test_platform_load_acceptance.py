@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
+import json
 import os
 from types import SimpleNamespace
 import unittest
@@ -21,12 +23,15 @@ from tools.platform_load import (
     _CAPACITY_PHASE_SLO_REQUIRED_CHECKS,
     _is_closed_pending_origin_candidate,
     _is_complete_observer_bound_decision,
+    _report_phase_envelope,
     get_profile,
+    load_profiles,
     profile_contract,
 )
 from tools.platform_load_runtime import PID_NAMESPACE_ISOLATION, WORKER_REPORT_SCHEMA
 from tools.platform_load_acceptance import (
     _capacity_ramp_evidence,
+    derive_expected_phase_plan,
     evaluate_acceptance,
     observer_evidence_required,
     phase_plan_completeness,
@@ -1072,7 +1077,12 @@ class LoadAcceptanceTests(unittest.TestCase):
         authored_stages = ramp_profile["traffic"]["concurrency_stages"]
         stage_counts = ramp_contract["planned_work"]["stage_logical_actions"]
 
-        def ramp_evidence(*, population_mismatch: bool = False) -> dict[str, object]:
+        def ramp_evidence(
+            *,
+            population_mismatch: bool = False,
+            stage_order: list[int] | None = None,
+            sort_stage_keys: bool = False,
+        ) -> dict[str, object]:
             stages = {
                 str(stage): canonical_raw(stage_counts[str(stage)])
                 for stage in authored_stages
@@ -1083,8 +1093,14 @@ class LoadAcceptanceTests(unittest.TestCase):
             first_stage["latency"] = latency(1, 1, 9000, 12000)
             if population_mismatch:
                 first_stage["requests"] = int(first_stage["requests"]) - 1
+            ramp = {
+                "concurrency_stages": stage_order or authored_stages,
+                "stages": stages,
+            }
+            if sort_stage_keys:
+                ramp = json.loads(json.dumps(ramp, sort_keys=True))
             return _capacity_ramp_evidence(
-                {"concurrency_stages": authored_stages, "stages": stages},
+                ramp,
                 stage_counts,
                 canonical=True,
                 expected_statuses=frozenset(
@@ -1093,6 +1109,18 @@ class LoadAcceptanceTests(unittest.TestCase):
                 acceptance_contract=ramp_profile["acceptance"],
                 max_retries=0,
             )
+
+        self.assertTrue(ramp_evidence(sort_stage_keys=True)["checks"]["ramp_stage_order"])
+        self.assertFalse(
+            ramp_evidence(stage_order=list(reversed(authored_stages)))["checks"][
+                "ramp_stage_order"
+            ]
+        )
+        self.assertFalse(
+            ramp_evidence(stage_order=[True, *authored_stages[1:]])["checks"][
+                "ramp_stage_order"
+            ]
+        )
 
         def ramp_decision(evidence: dict[str, object]) -> dict[str, object]:
             return {
@@ -1115,6 +1143,19 @@ class LoadAcceptanceTests(unittest.TestCase):
                     "passed": False,
                     "pending_origin_evidence": False,
                     "contract_ok": True,
+                    "origin_safety": {
+                        "passed": True,
+                        "checks": {
+                            "observer_completed": True,
+                            "required_diagnostics_present": True,
+                            "pool_checkout_p95_ms": True,
+                            "pool_checkout_p99_ms": True,
+                            "postgres_backend_connections": True,
+                            "waiting_backends": True,
+                            "lock_waiters": True,
+                            "cpu_per_core": True,
+                        },
+                    },
                     "observer_binding": {"complete": True},
                     "timing_evidence": {"complete": True},
                     "phase_plan_evidence": {"complete": True},
@@ -1125,6 +1166,7 @@ class LoadAcceptanceTests(unittest.TestCase):
                     "checks": {
                         "accepted_p95_ms": True,
                         "timing_complete": True,
+                        "origin_safety": True,
                         "capacity_ramp_evidence": evidence["complete"],
                     },
                 },
@@ -1213,6 +1255,497 @@ class LoadAcceptanceTests(unittest.TestCase):
         invalid_check = deepcopy(report)
         invalid_check["acceptance"]["checks"]["timing_complete"] = False
         self.assertFalse(_is_complete_observer_bound_decision(profile, invalid_check))
+
+    def test_top_level_origin_safety_profiles_classify_complete_budget_reds(self) -> None:
+        _, base_report = self._complete_observer_bound_budget_miss()
+        stress_profiles = [
+            profile
+            for profile in load_profiles().values()
+            if profile["acceptance"].get("kind") in {"stress", "spike"}
+        ]
+        self.assertEqual(
+            {profile["profile_id"] for profile in stress_profiles},
+            {
+                "authenticated-page-load-v1",
+                "authenticated-page-load-v2",
+                "read-mix-concurrency-ramp-v1",
+                "read-mix-stress-v2",
+                "ready-vote-saturation-ramp-v4",
+                "ready-vote-spike-v1",
+                "ready-vote-stress-15k-v2",
+                "ready-vote-stress-20k-v2",
+            },
+        )
+        resource_fields = (
+            "max_postgres_backend_connections",
+            "max_waiting_backends",
+            "max_lock_waiters",
+            "max_cpu_per_core_percent",
+            "pool_checkout_wait_ms",
+        )
+        for profile in stress_profiles:
+            with self.subTest(profile=profile["profile_id"]):
+                self.assertTrue(
+                    all(field in profile["acceptance"] for field in resource_fields)
+                )
+                report = deepcopy(base_report)
+                kind = profile["acceptance"]["kind"]
+                report["acceptance"]["decision"] = (
+                    "SPIKE BEHAVIOR FAIL" if kind == "spike" else "STRESS BEHAVIOR FAIL"
+                )
+                report["acceptance"]["checks"].pop("accepted_p95")
+                report["acceptance"]["checks"]["logical_p95_ms"] = False
+                self.assertNotIn("resource_safety", profile["acceptance"])
+                self.assertTrue(_is_complete_observer_bound_decision(profile, report))
+
+        profile = get_profile("ready-vote-stress-15k-v2")
+        report = deepcopy(base_report)
+        report["acceptance"]["decision"] = "STRESS BEHAVIOR FAIL"
+        report["acceptance"]["checks"].pop("accepted_p95")
+        report["acceptance"]["checks"]["logical_p95_ms"] = False
+
+        budget_safety_miss = deepcopy(report)
+        budget_safety_miss["acceptance"]["origin_safety"]["checks"][
+            "cpu_per_core"
+        ] = False
+        budget_safety_miss["acceptance"]["origin_safety"]["passed"] = False
+        budget_safety_miss["acceptance"]["checks"]["origin_safety"] = False
+        self.assertTrue(
+            _is_complete_observer_bound_decision(profile, budget_safety_miss)
+        )
+
+        invalid_safety_mutations = (
+            ("missing origin safety", lambda acceptance: acceptance.pop("origin_safety")),
+            (
+                "missing diagnostics",
+                lambda acceptance: acceptance["origin_safety"]["checks"].update(
+                    {"required_diagnostics_present": False}
+                ),
+            ),
+            (
+                "unknown safety check",
+                lambda acceptance: acceptance["origin_safety"]["checks"].update(
+                    {"unrecognized_check": True}
+                ),
+            ),
+            (
+                "non-boolean safety check",
+                lambda acceptance: acceptance["origin_safety"]["checks"].update(
+                    {"observer_completed": "true"}
+                ),
+            ),
+        )
+        for label, mutate in invalid_safety_mutations:
+            with self.subTest(invalid_safety=label):
+                invalid = deepcopy(report)
+                mutate(invalid["acceptance"])
+                self.assertFalse(_is_complete_observer_bound_decision(profile, invalid))
+
+        for profile_id in ("ready-vote-slo-v2", "read-mix-human-v2"):
+            with self.subTest(profile=profile_id, outcome="complete-slo-red"):
+                slo_profile = get_profile(profile_id)
+                slo_report = deepcopy(base_report)
+                slo_report["acceptance"]["decision"] = "SLO FAIL"
+                if not isinstance(
+                    slo_profile["acceptance"].get("resource_safety"), Mapping
+                ):
+                    slo_report["acceptance"].pop("origin_safety")
+                    slo_report["acceptance"]["checks"].pop("origin_safety")
+                self.assertTrue(
+                    _is_complete_observer_bound_decision(slo_profile, slo_report)
+                )
+
+        capacity_profile, capacity_acceptance = self._capacity_acceptance(
+            pending=False, budget_miss=True
+        )
+        capacity_acceptance["origin_safety"] = {
+            "passed": True,
+            "checks": {
+                "observer_completed": True,
+                "required_diagnostics_present": True,
+                "pool_checkout_p95_ms": True,
+                "pool_checkout_p99_ms": True,
+                "postgres_backend_connections": True,
+                "waiting_backends": True,
+                "lock_waiters": True,
+                "cpu_per_core": True,
+            },
+        }
+        capacity_report = {
+            "authoritative": True,
+            "dispatchable": True,
+            "partial_work": False,
+            "inflight_unknown": False,
+            "report_binding": {"complete": True},
+            "runtime_supervisor": {
+                "reason": "none",
+                "namespace_closed": True,
+                "descendants_reaped": True,
+                "partial_work": False,
+                "inflight_unknown": False,
+                "report_error": None,
+            },
+            "origin_observability": {"binding": {"complete": True}},
+            "acceptance": capacity_acceptance,
+        }
+        self.assertTrue(
+            _is_complete_observer_bound_decision(capacity_profile, capacity_report)
+        )
+
+        # A profile without any configured resource limits may omit the origin
+        # safety object, but attaching one without a corresponding contract is
+        # still rejected as an unexpected shape.
+        slo_profile, slo_report = self._complete_observer_bound_budget_miss()
+        slo_profile["acceptance"].pop("resource_safety")
+        slo_report["acceptance"].pop("origin_safety")
+        slo_report["acceptance"]["checks"].pop("origin_safety")
+        self.assertTrue(_is_complete_observer_bound_decision(slo_profile, slo_report))
+        unexpected_safety = deepcopy(slo_report)
+        unexpected_safety["acceptance"]["origin_safety"] = report["acceptance"][
+            "origin_safety"
+        ]
+        unexpected_safety["acceptance"]["checks"]["origin_safety"] = True
+        self.assertFalse(
+            _is_complete_observer_bound_decision(slo_profile, unexpected_safety)
+        )
+
+    def test_json_object_phase_maps_bind_authored_order_to_measured_sequence(self) -> None:
+        spike = get_profile("ready-vote-spike-v1")
+        authored = spike["traffic"]["phases"]
+        starts = [
+            "2026-10-08T12:00:00+00:00",
+            "2026-10-08T12:00:30+00:00",
+            "2026-10-08T12:00:45+00:00",
+        ]
+        finishes = [
+            "2026-10-08T12:00:30+00:00",
+            "2026-10-08T12:00:45+00:00",
+            "2026-10-08T12:01:15+00:00",
+        ]
+
+        def spike_report() -> dict[str, object]:
+            phase_map = {}
+            for index, phase in enumerate(authored):
+                phase_map[phase["name"]] = {
+                    "started_at": starts[index],
+                    "finished_at": finishes[index],
+                    "configured_actions": phase["logical_actions"],
+                    "submitted_actions": phase["logical_actions"],
+                    "missing_actions": 0,
+                    "complete": True,
+                }
+            return {
+                "phases": {
+                    "primary": {},
+                    "duplicate": {},
+                    "state": {},
+                    "ramp": {"phases": phase_map},
+                }
+            }
+
+        serialized = spike_report()
+        round_tripped = json.loads(json.dumps(serialized, sort_keys=True))
+        self.assertTrue(
+            _report_phase_envelope(spike, round_tripped)["checks"]["phase_plan_closed"]
+        )
+
+        reordered = spike_report()
+        reordered_map = reordered["phases"]["ramp"]["phases"]
+        reordered_map["normal-before"]["started_at"] = starts[1]
+        reordered_map["normal-before"]["finished_at"] = finishes[1]
+        reordered_map["burst"]["started_at"] = starts[0]
+        reordered_map["burst"]["finished_at"] = finishes[0]
+        self.assertFalse(
+            _report_phase_envelope(spike, reordered)["checks"]["phase_plan_closed"]
+        )
+
+        overlap = spike_report()
+        overlap["phases"]["ramp"]["phases"]["burst"]["started_at"] = starts[0]
+        self.assertFalse(
+            _report_phase_envelope(spike, overlap)["checks"]["phase_plan_closed"]
+        )
+
+        missing = spike_report()
+        del missing["phases"]["ramp"]["phases"]["burst"]
+        self.assertFalse(
+            _report_phase_envelope(spike, missing)["checks"]["phase_plan_closed"]
+        )
+
+        extra = spike_report()
+        extra["phases"]["ramp"]["phases"]["unexpected"] = {}
+        self.assertFalse(
+            _report_phase_envelope(spike, extra)["checks"]["phase_plan_closed"]
+        )
+
+        invalid_timestamp = spike_report()
+        invalid_timestamp["phases"]["ramp"]["phases"]["burst"]["started_at"] = 1
+        self.assertFalse(
+            _report_phase_envelope(spike, invalid_timestamp)["checks"]["phase_plan_closed"]
+        )
+
+        read_mix = get_profile("read-mix-concurrency-ramp-v1")
+        concurrency = read_mix["traffic"]["concurrency_stages"]
+        stage_report = {
+            "phases": {
+                "read_mix": {},
+                "manual_refresh": {},
+                "capacity_ramp": {
+                    "concurrency_stages": concurrency,
+                    "stages": {str(stage): {} for stage in concurrency},
+                },
+            }
+        }
+        sorted_stage_report = json.loads(json.dumps(stage_report, sort_keys=True))
+        stage_envelope = _report_phase_envelope(read_mix, sorted_stage_report)
+        self.assertTrue(stage_envelope["checks"]["phase_plan_closed"])
+        self.assertTrue(stage_envelope["checks"]["phase_values_mapping"])
+
+        reordered_stages = deepcopy(stage_report)
+        reordered_stages["phases"]["capacity_ramp"]["concurrency_stages"] = list(
+            reversed(concurrency)
+        )
+        self.assertFalse(
+            _report_phase_envelope(read_mix, reordered_stages)["checks"]["phase_plan_closed"]
+        )
+        missing_stage = deepcopy(stage_report)
+        del missing_stage["phases"]["capacity_ramp"]["stages"][str(concurrency[0])]
+        self.assertFalse(
+            _report_phase_envelope(read_mix, missing_stage)["checks"]["phase_values_mapping"]
+        )
+        invalid_stage = deepcopy(stage_report)
+        invalid_stage["phases"]["capacity_ramp"]["stages"][str(concurrency[0])] = []
+        self.assertFalse(
+            _report_phase_envelope(read_mix, invalid_stage)["checks"]["phase_values_mapping"]
+        )
+
+    def test_evaluator_emits_classifiable_top_level_resource_budget_red(self) -> None:
+        active_profiles = {
+            profile["profile_id"]
+            for profile in load_profiles().values()
+            if profile["portfolio"].get("class") in {"default", "diagnostic"}
+            and profile["portfolio"].get("status") == "active"
+        }
+        self.assertEqual(
+            active_profiles,
+            {
+                "authenticated-page-load-v1",
+                "authenticated-page-load-v2",
+                "read-mix-concurrency-ramp-v1",
+                "read-mix-human-v2",
+                "read-mix-stress-v2",
+                "ready-vote-capacity-ramp-v2",
+                "ready-vote-saturation-ramp-v4",
+                "ready-vote-slo-v2",
+                "ready-vote-spike-v1",
+                "ready-vote-stress-15k-v2",
+                "ready-vote-stress-20k-v2",
+            },
+        )
+
+        fixture_marker = "preprod202610070000abcd"
+        external_run_id = "123"
+
+        def canonical_phase(
+            actions: int,
+            *,
+            rate: int | None = None,
+            duration: int | None = None,
+        ) -> dict[str, object]:
+            logical = canonical_logical(actions)
+            logical["total_retries"] = 0
+            raw_http = canonical_raw(actions)
+            raw_http.update(
+                {
+                    "retry_attempts": 0,
+                    "total_retries": 0,
+                    "retry_amplification_percent": 0,
+                    "configured_logical_actions": actions,
+                    "submitted_logical_actions": actions,
+                    "missing_logical_actions": 0,
+                }
+            )
+            phase: dict[str, object] = {
+                "configured_actions": actions,
+                "submitted_actions": actions,
+                "missing_actions": 0,
+                "complete": True,
+                "logical": logical,
+                "raw_http": raw_http,
+            }
+            if rate is not None:
+                phase["target_logical_actions_per_second"] = rate
+                phase["duration_seconds"] = duration
+                logical["target_logical_actions_per_second"] = rate
+            return phase
+
+        def evaluate_profile(
+            profile_id: str,
+            *,
+            cpu_percent: int,
+            logical_latency_miss: bool = False,
+            missing_pool_diagnostic: bool = False,
+        ) -> tuple[dict[str, object], dict[str, object]]:
+            profile = get_profile(profile_id)
+            planned = profile_contract(profile)["planned_work"]
+            total = int(planned["logical_actions"])
+            primary = int(planned["primary_logical_actions"])
+            duplicate = int(planned["duplicate_logical_actions"])
+            phase_counts = planned["phase_logical_actions"]
+            logical = canonical_logical(total)
+            logical.update(
+                {
+                    "primary_actions": primary,
+                    "duplicate_actions": duplicate,
+                    "configured_duplicate_actions": duplicate,
+                }
+            )
+
+            def exceed_logical_latency(summary: dict[str, object]) -> None:
+                metric = {
+                    "count": int(summary.get("actions", primary)),
+                    "avg_ms": 13000,
+                    "p50_ms": 9000,
+                    "p90_ms": 11000,
+                    "p95_ms": 13000,
+                    "p99_ms": 15000,
+                    "max_ms": 17000,
+                }
+                summary["accepted_request_latency"] = dict(metric)
+                timing = summary.get("timing")
+                if isinstance(timing, dict):
+                    timing["user_observed_latency"] = dict(metric)
+
+            if logical_latency_miss:
+                exceed_logical_latency(logical)
+            raw_http = canonical_raw(total)
+            phases = {"primary": canonical_phase(primary)}
+            duplicate_phase = canonical_phase(duplicate)
+            duplicate_phase.update(
+                {"candidate_actions": primary, "completed_actions": duplicate}
+            )
+            duplicate_phase["logical"]["changed_counts"] = {"False": duplicate}
+            phases["duplicate"] = duplicate_phase
+            for authored in profile["traffic"].get("phases", []):
+                phases[authored["name"]] = canonical_phase(
+                    int(authored["logical_actions"]),
+                    rate=int(authored["target_logical_actions_per_second"]),
+                    duration=int(authored["duration_seconds"]),
+                )
+
+            observer: dict[str, object] = {
+                "stop_file_seen": True,
+                "timed_out": False,
+                "binding": {
+                    "complete": True,
+                    "fixture_marker": fixture_marker,
+                    "external_run_id": external_run_id,
+                },
+                "system": {
+                    "cpu_per_core": {"cpu0": {"max_percent": cpu_percent}},
+                    "postgres_backend_connections": {"max": 1},
+                    "postgres_waits": {
+                        "max_waiting_backends": 0,
+                        "max_lock_waiters": 0,
+                    },
+                },
+                "server_request_perf_logs": {
+                    "pool_checkout_wait_ms": {"p95_ms": 1, "p99_ms": 1}
+                },
+            }
+            if missing_pool_diagnostic:
+                observer.pop("server_request_perf_logs")
+
+            expected_plan = derive_expected_phase_plan(
+                mode=profile["mode"],
+                authored_phase_plan=profile["traffic"].get("phases"),
+                expected_phase_action_counts=phase_counts,
+            )
+            acceptance = evaluate_acceptance(
+                contract_ok=True,
+                logical_summary=logical,
+                raw_http_summary=raw_http,
+                acceptance_contract=profile["acceptance"],
+                origin_observability=observer,
+                phase_summaries=phases,
+                canonical_evidence=True,
+                expected_logical_scope="logical_user_actions",
+                allowed_phase_names=set(phases),
+                expected_phase_action_counts=phase_counts,
+                expected_fixture_marker=fixture_marker,
+                expected_external_run_id=external_run_id,
+                require_exact_observer_binding=True,
+                expected_phase_plan=expected_plan,
+                expected_duplicate_count=int(
+                    profile["traffic"].get("duplicate_count") or 0
+                ),
+                expected_primary_action_count=primary,
+                expected_total_logical_action_count=total,
+                max_retries=int(profile["traffic"]["retry"]["max_retries"]),
+            )
+            _base_profile, complete_outer_report = (
+                self._complete_observer_bound_budget_miss()
+            )
+            complete_outer_report["acceptance"] = acceptance
+            complete_outer_report["origin_observability"] = {
+                "binding": {"complete": True}
+            }
+            return profile, complete_outer_report
+
+        with self.subTest(profile="ready-vote-stress-15k-v2", result="logical-budget-red"):
+            profile, report = evaluate_profile(
+                "ready-vote-stress-15k-v2", cpu_percent=0, logical_latency_miss=True
+            )
+            acceptance = report["acceptance"]
+            self.assertEqual(acceptance["decision"], "STRESS BEHAVIOR FAIL")
+            self.assertFalse(acceptance["passed"])
+            self.assertTrue(acceptance["origin_safety"]["passed"])
+            self.assertTrue(acceptance["checks"]["phase_budgets"])
+            self.assertTrue(
+                _acceptance_failure_is_budget_only(
+                    acceptance, "stress", allow_no_budget_failure=True
+                ),
+            )
+            self.assertTrue(_is_complete_observer_bound_decision(profile, report))
+
+        with self.subTest(profile="ready-vote-spike-v1", result="resource-budget-red"):
+            profile, report = evaluate_profile("ready-vote-spike-v1", cpu_percent=101)
+            acceptance = report["acceptance"]
+            self.assertEqual(acceptance["decision"], "SPIKE BEHAVIOR FAIL")
+            self.assertFalse(acceptance["passed"])
+            self.assertEqual(
+                {name for name, passed in acceptance["checks"].items() if not passed},
+                {"origin_safety"},
+            )
+            self.assertTrue(
+                _acceptance_failure_is_budget_only(
+                    acceptance, "spike", allow_no_budget_failure=True
+                )
+            )
+            self.assertTrue(_is_complete_observer_bound_decision(profile, report))
+
+        for profile_id in (
+            "ready-vote-stress-15k-v2",
+            "ready-vote-spike-v1",
+        ):
+            with self.subTest(profile=profile_id, result="safe-pass"):
+                profile, report = evaluate_profile(profile_id, cpu_percent=0)
+                self.assertTrue(report["acceptance"]["passed"])
+                self.assertFalse(
+                    _is_complete_observer_bound_decision(profile, report)
+                )
+
+        profile, report = evaluate_profile(
+            "ready-vote-stress-15k-v2",
+            cpu_percent=0,
+            missing_pool_diagnostic=True,
+        )
+        self.assertFalse(report["acceptance"]["passed"])
+        self.assertFalse(
+            report["acceptance"]["origin_safety"]["checks"][
+                "required_diagnostics_present"
+            ]
+        )
+        self.assertFalse(_is_complete_observer_bound_decision(profile, report))
 
     def test_capacity_pending_and_completed_budget_miss_are_closed_world(self) -> None:
         profile, pending = self._capacity_acceptance(pending=True, budget_miss=False)

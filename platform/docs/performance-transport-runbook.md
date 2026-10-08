@@ -66,6 +66,24 @@ logging selectors return to their baseline values
 `PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=false`, `PLATFORM_LOG_LEVEL=INFO` and
 `PLATFORM_PERF_LOG_ENABLED=true`).
 
+The separate `PLATFORM_SSR_HEAP_METRICS_ENABLED` selector is false in the
+public baseline and is carried only to the web process. The reviewed
+`ready-vote-static-8` runtime profile enables it for process-level memory
+diagnosis without enabling request-level SSR tracing. It emits a fixed
+`ssr_heap schema=1` line every five seconds with RSS, V8 heap total/used/limit,
+external and array-buffer bytes, and interval GC count/duration. The stream
+contains no request, identity, route or URL fields and stops after 5,760
+samples or eight hours; its timer is unreferenced and disposed on process
+exit. This is a temporary override in the reviewed diagnostic release only:
+do not apply runtime-profile changes during its observation window, and do not
+treat the eight-hour sampler cap as a reset of its startup flag. The next
+reviewed normal release removes the override and restores the false baseline
+without changing the existing static-8 restore procedure. The lines are not
+part of the request-stage summary above; collect them only through the approved
+bounded memory-only journal projection, which retains fixed numeric fields and
+omits raw log text. Do not overlap this contour with request-level SSR or
+other performance diagnostic profiles.
+
 ## Timeout-path diagnostic window
 
 Use this narrow window when the unchanged
