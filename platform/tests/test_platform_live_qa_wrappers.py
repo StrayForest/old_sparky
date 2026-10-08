@@ -23,6 +23,7 @@ import zipfile
 
 from tools import platform_workflow_input_guard, platform_workflow_remote_dispatch
 from tools import platform_live_user_qa_dispatch
+from tools import platform_live_qa_guard
 from tools.platform_workflow_input_guard import (
     WorkflowInputError,
     validate_confirmation,
@@ -60,6 +61,82 @@ BROWSER_WRAPPERS = WRAPPERS[1:3]
 
 
 class LiveQaWrapperContractTests(unittest.TestCase):
+    def test_public_browser_counts_are_closed_owner_bound_and_partitioned(self) -> None:
+        source_sha = "a" * 40
+        app_sha = "b" * 40
+        marker_sha = "c" * 64
+        uid = os.getuid()
+        gid = os.getgid()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o711)
+            gate = root / "public-live-qa.a1b2c3d4"
+            gate.mkdir(mode=0o700)
+            results = gate / "test-results"
+            results.mkdir(mode=0o700)
+            count_path = results / platform_live_qa_guard.LIVE_BROWSER_COUNTS_FILE
+            payload = {
+                "schema": 1,
+                "source_sha": source_sha,
+                "app_sha": app_sha,
+                "marker_sha256": marker_sha,
+                "run_status": "failed",
+                "logical_total": 4,
+                "logical_pass": 1,
+                "logical_fail": 1,
+                "logical_expected_fail": 1,
+                "logical_flaky": 0,
+                "logical_skip": 1,
+                "logical_interrupted": 0,
+                "attempt_total": 4,
+                "attempt_pass": 1,
+                "attempt_fail": 2,
+                "attempt_skip": 1,
+                "attempt_interrupted": 0,
+                "attempt_timedout": 0,
+            }
+            count_path.write_text(json.dumps(payload) + "\n", encoding="ascii")
+            count_path.chmod(0o600)
+            with patch.object(platform_live_qa_guard, "RUN_GATE_ROOT", root), \
+                patch.object(platform_live_qa_guard, "liveqa_identity", return_value=(uid, gid)):
+                line = platform_live_qa_guard.public_browser_counts_line(
+                    gate,
+                    source_sha=source_sha,
+                    app_sha=app_sha,
+                    marker_sha256=marker_sha,
+                )
+                self.assertIn("LIVE_BROWSER_COUNTS schema=1 run_status=failed", line)
+                self.assertIn("logical_expected_fail=1", line)
+                self.assertTrue(line.endswith(f"marker_sha256={marker_sha}\n"))
+                with self.assertRaisesRegex(platform_live_qa_guard.GuardError, "binding"):
+                    platform_live_qa_guard.public_browser_counts_line(
+                        gate,
+                        source_sha="d" * 40,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                    )
+
+                payload["logical_total"] = 3
+                count_path.write_text(json.dumps(payload) + "\n", encoding="ascii")
+                count_path.chmod(0o600)
+                with self.assertRaisesRegex(platform_live_qa_guard.GuardError, "partitions"):
+                    platform_live_qa_guard.public_browser_counts_line(
+                        gate,
+                        source_sha=source_sha,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                    )
+
+                count_path.unlink()
+                count_path.symlink_to(results / "missing")
+                with self.assertRaisesRegex(platform_live_qa_guard.GuardError, "unavailable"):
+                    platform_live_qa_guard.public_browser_counts_line(
+                        gate,
+                        source_sha=source_sha,
+                        app_sha=app_sha,
+                        marker_sha256=marker_sha,
+                    )
+
     def test_live_dispatcher_lock_capability_uses_manifest_bound_canonical_helper(self) -> None:
         successful = SimpleNamespace(returncode=0)
         with patch.object(platform_live_user_qa_dispatch, "_trusted_directory_chain") as chain, \
@@ -129,8 +206,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 if arguments[0] == "run-launch":
                     self.assertEqual(
                         output.getvalue(),
-                        "LIVE_LAUNCH_STATUS schema=1 status=failed "
-                        f"stage=dispatch child_exit=1 source_sha={sha}\n",
+                        "LIVE_LAUNCH_STATUS schema=2 status=failed "
+                        f"stage=dispatch check=release_lock child_exit=1 source_sha={sha}\n",
                     )
                 else:
                     self.assertEqual(output.getvalue(), "")
@@ -152,7 +229,30 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             ("supervisor metadata", "trusted_generation", 1, "_regular"),
             ("supervisor exec", "dispatch", 1, "execve"),
         )
+        check_by_hook = {
+            "_source_binding_context": "source_binding",
+            "geteuid": "root_uid",
+            "_verify_install": "generation_manifest",
+            "_load_verified_remote_dispatcher": "trusted_entry",
+            "_validate_source_binding_schema": "source_binding_schema",
+            "_require_release_lock_supervisor": "release_lock",
+            "_validate_source_binding_under_lock": "source_binding_recheck",
+            "_read_manifest": "trusted_entry",
+            "_trusted_directory_chain": "trusted_entry",
+            "_regular": "trusted_entry",
+            "execve": "supervisor_exec",
+        }
+
+        def _check_for_hook(hook: str) -> str:
+            return (
+                "source_binding_io"
+                if hook == "_source_binding_context"
+                and current_case == "source binding I/O"
+                else check_by_hook[hook]
+            )
+
         for name, stage, child_exit, failing_hook in cases:
+            current_case = name
             with self.subTest(boundary=name):
                 output = StringIO()
                 with ExitStack() as stack:
@@ -201,8 +301,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(result, child_exit)
                 self.assertEqual(
                     output.getvalue(),
-                    "LIVE_LAUNCH_STATUS schema=1 status=failed "
-                    f"stage={stage} child_exit={child_exit} source_sha={sha}\n",
+                    "LIVE_LAUNCH_STATUS schema=2 status=failed "
+                    f"stage={stage} check={_check_for_hook(failing_hook)} "
+                    f"child_exit={child_exit} source_sha={sha}\n",
                 )
                 self.assertNotIn("private detail", output.getvalue())
                 self.assertEqual(
@@ -211,7 +312,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         child_status=child_exit,
                         expected_sha=sha,
                     ),
-                    ("failed", stage, child_exit),
+                    ("failed", stage, _check_for_hook(failing_hook), child_exit),
                 )
 
         output = StringIO()
@@ -226,8 +327,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(
             output.getvalue(),
-            "LIVE_LAUNCH_STATUS schema=1 status=failed "
-            f"stage=validation child_exit=2 source_sha={sha}\n",
+            "LIVE_LAUNCH_STATUS schema=2 status=failed "
+            f"stage=validation check=input_validation child_exit=2 source_sha={sha}\n",
         )
         self.assertNotIn("private", output.getvalue())
         invalid_sha_output = StringIO()
@@ -280,12 +381,13 @@ class LiveQaWrapperContractTests(unittest.TestCase):
     def test_live_launch_status_parser_rejects_malformed_or_duplicate_markers(self) -> None:
         sha = "a" * 40
         valid = (
-            "LIVE_LAUNCH_STATUS schema=1 status=failed "
-            f"stage=dispatch child_exit=1 source_sha={sha}\n"
+            "LIVE_LAUNCH_STATUS schema=2 status=failed stage=dispatch "
+            f"check=none child_exit=1 source_sha={sha}\n"
         ).encode("ascii")
         for malformed in (
             valid + valid,
             valid + b"unexpected\n",
+            valid.replace(b"check=none", b"check=unknown"),
             valid.replace(b"stage=dispatch", b"stage=unknown"),
             valid.replace(b"stage=dispatch", b"stage=trusted_entry"),
             valid.replace(b"stage=dispatch", b"stage=timeout"),
@@ -521,7 +623,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         )
         self.assertIn("live-launch < \"$input_path\"", source)
         self.assertIn("platform_live_browser_qa.sh\" public", supervisor)
-        self.assertIn("LIVE_LAUNCH_STATUS schema=1", supervisor)
+        self.assertIn("LIVE_LAUNCH_STATUS schema=2", supervisor)
         self.assertIn('required = ("oldsparky-platform",)', supervisor)
         self.assertIn('exec 3>&1', supervisor)
         self.assertIn('exec >/dev/null 2>&1', supervisor)
@@ -566,7 +668,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertNotIn("npm run test:live", source)
         self.assertNotIn('bash -s -- "$LIVE_BASE_URL"', source)
         self.assertNotIn("live_browser_qa_success", source.lower())
-        self.assertIn('rb"LIVE_LAUNCH_STATUS schema=1 status=(passed|failed) "', source)
+        self.assertIn('rb"LIVE_LAUNCH_STATUS schema=2 status=(passed|failed) "', source)
         self.assertIn('stage == "complete"', source)
         self.assertIn('child_status == 0', source)
         self.assertLess(
@@ -762,7 +864,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("group_missing", identity["reasons"])
 
         emitter_prologue = supervisor.split('EXPECTED_ORIGIN="https://old-sparky.com"', 1)[0]
-        emitter_script = emitter_prologue + 'launch_stage="identity"\nexit 1\n'
+        emitter_script = (
+            emitter_prologue
+            + 'launch_stage="identity"\nlaunch_check="identity"\nexit 1\n'
+        )
         emitter = subprocess.run(
             [
                 "/bin/bash", "-c", emitter_script, "live-launch-test",
@@ -776,8 +881,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertEqual(emitter.returncode, 1)
         self.assertEqual(
             emitter.stdout,
-            "LIVE_LAUNCH_STATUS schema=1 status=failed stage=identity "
-            f"child_exit=1 source_sha={status_sha}\n",
+            "LIVE_LAUNCH_STATUS schema=2 status=failed stage=identity "
+            f"check=identity child_exit=1 source_sha={status_sha}\n",
         )
         self.assertEqual(emitter.stderr, "")
 
@@ -1019,6 +1124,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 {
                     "timeout_seconds": platform_workflow_remote_dispatch.LIVE_LAUNCH_OPERATION_TIMEOUT_SECONDS,
                     "expected_live_launch_sha": valid_live["target_sha"],
+                    "expected_live_app_sha": valid_live["target_sha"],
+                    "expected_live_marker_sha256": hashlib.sha256(
+                        valid_live["marker"].encode("ascii")
+                    ).hexdigest(),
                 },
             )
 
@@ -1036,11 +1145,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             return child_status, output.getvalue()
 
         good_status = (
-            "LIVE_LAUNCH_STATUS schema=1 status=passed stage=complete "
+            "LIVE_LAUNCH_STATUS schema=2 status=passed stage=complete check=none "
             f"child_exit=0 source_sha={status_sha}"
         )
         failed_status = (
-            "LIVE_LAUNCH_STATUS schema=1 status=failed stage=identity "
+            "LIVE_LAUNCH_STATUS schema=2 status=failed stage=identity check=none "
             f"child_exit=1 source_sha={status_sha}"
         )
         with self.subTest(live_status="success"):
@@ -1061,6 +1170,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 result, sanitized = run_status_child(lines, child_exit)
                 self.assertEqual(result, child_exit or 2)
                 self.assertIn("stage=trusted_entry", sanitized)
+                self.assertIn("check=protocol", sanitized)
                 self.assertNotIn("PRIVATE_CHILD_OUTPUT", sanitized)
                 self.assertNotIn("x" * 300, sanitized)
 
@@ -1103,6 +1213,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 )
             self.assertEqual(result, 2)
             self.assertIn("stage=trusted_entry", output.getvalue())
+            self.assertIn("check=stream_limit", output.getvalue())
             self.assertTrue(child_pid.exists())
             heartbeat_size = heartbeat.stat().st_size
             time.sleep(0.05)
@@ -1111,7 +1222,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         sanitizer_match = re.search(
             r'/usr/bin/python3 - "\$raw_report" "\$safe_report" '
             r'"\$SUPERVISOR_STATUS" \\\s*'
-            r'"\$GITHUB_SHA" "\$APP_TARGET_SHA" "\$SOURCE_BINDING_SHA256" '
+            r'"\$GITHUB_SHA" "\$APP_TARGET_SHA" "\$SOURCE_BINDING_SHA256" "\$LIVE_MARKER" '
             r'<<\'PY\'\n(.*?)\n          PY',
             source,
             flags=re.DOTALL,
@@ -1136,6 +1247,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         sha,
                         sha,
                         "",
+                        "liveqa-count-contract",
                     ],
                     check=False,
                     capture_output=True,
@@ -1144,24 +1256,104 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 return json.loads(safe_path.read_text(encoding="utf-8"))
 
-        passed_report = sanitize_status((good_status + "\n").encode(), 0)
+        count_fields = {
+            "run_status": "passed",
+            "logical_total": 2,
+            "logical_pass": 1,
+            "logical_fail": 0,
+            "logical_expected_fail": 1,
+            "logical_flaky": 0,
+            "logical_skip": 0,
+            "logical_interrupted": 0,
+            "attempt_total": 2,
+            "attempt_pass": 1,
+            "attempt_fail": 1,
+            "attempt_skip": 0,
+            "attempt_interrupted": 0,
+            "attempt_timedout": 0,
+            "source_sha": status_sha,
+            "app_sha": status_sha,
+            "marker_sha256": hashlib.sha256(b"liveqa-count-contract").hexdigest(),
+        }
+        counts_line = (
+            "LIVE_BROWSER_COUNTS schema=1 "
+            + " ".join(
+                f"{name}={count_fields[name]}"
+                for name in (
+                    "run_status",
+                    *platform_workflow_remote_dispatch.LIVE_BROWSER_COUNT_FIELDS,
+                    "source_sha",
+                    "app_sha",
+                    "marker_sha256",
+                )
+            )
+            + "\n"
+        )
+        passed_report = sanitize_status(
+            (counts_line + good_status + "\n").encode(), 0
+        )
         self.assertEqual(passed_report["status"], "passed")
-        self.assertEqual(passed_report["test_count"], 1)
+        self.assertEqual(passed_report["test_count"], 2)
+        self.assertEqual(passed_report["logical_counts"]["logical_expected_fail"], 1)
+        self.assertEqual(passed_report["attempt_counts"]["attempt_fail"], 1)
+        self.assertEqual(passed_report["tests"], [])
         self.assertEqual(passed_report["stage"], "complete")
+        self.assertEqual(passed_report["check_id"], "none")
         self.assertEqual(passed_report["source_git_sha"], status_sha)
         self.assertEqual(passed_report["app_target_sha"], status_sha)
         self.assertIsNone(passed_report["source_binding_sha256"])
+        no_pass_fields = {
+            **count_fields,
+            "logical_pass": 0,
+            "logical_expected_fail": 1,
+            "logical_skip": 1,
+            "attempt_total": 1,
+            "attempt_pass": 0,
+            "attempt_fail": 1,
+        }
+        no_pass_counts_line = (
+            "LIVE_BROWSER_COUNTS schema=1 "
+            + " ".join(
+                f"{name}={no_pass_fields[name]}"
+                for name in (
+                    "run_status",
+                    *platform_workflow_remote_dispatch.LIVE_BROWSER_COUNT_FIELDS,
+                    "source_sha",
+                    "app_sha",
+                    "marker_sha256",
+                )
+            )
+            + "\n"
+        )
+        no_pass_report = sanitize_status(
+            (no_pass_counts_line + good_status + "\n").encode(), 0
+        )
+        self.assertEqual(no_pass_report["status"], "failed")
+        self.assertFalse(no_pass_report["success"])
+        self.assertEqual(no_pass_report["logical_counts"]["logical_pass"], 0)
+        self.assertEqual(no_pass_report["logical_counts"]["logical_expected_fail"], 1)
+        self.assertEqual(no_pass_report["logical_counts"]["logical_skip"], 1)
+        self.assertEqual(no_pass_report["test_count"], 2)
         failed_report = sanitize_status((failed_status + "\n").encode(), 1)
         self.assertEqual(failed_report["status"], "failed")
+        self.assertIsNone(failed_report["test_count"])
         self.assertEqual(failed_report["stage"], "identity")
+        checked_failure_status = (
+            "LIVE_LAUNCH_STATUS schema=2 status=failed stage=validation "
+            "check=provision_marker child_exit=1 "
+            f"source_sha={status_sha}\n"
+        )
+        checked_failure = sanitize_status(checked_failure_status.encode(), 1)
+        self.assertEqual(checked_failure["status"], "failed")
+        self.assertEqual(checked_failure["check_id"], "provision_marker")
         for malformed in (
-            (good_status.replace(status_sha, "b" * 40) + "\n").encode(),
+            (counts_line.replace(status_sha, "b" * 40) + good_status + "\n").encode(),
             (good_status + "\nPRIVATE_OUTPUT\n").encode(),
             b"x" * 300,
         ):
             report = sanitize_status(malformed, 0)
             self.assertEqual(report["status"], "unavailable")
-            self.assertEqual(report["test_count"], 0)
+            self.assertIsNone(report["test_count"])
             self.assertNotIn("PRIVATE_OUTPUT", json.dumps(report))
 
         # The local handoff is an atomic private file, not a shell fragment or
@@ -1799,6 +1991,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                         "",
                     ),
                 )
+
         self.assertEqual(
             run_child(passed.encode(), status=9),
             (
@@ -1818,6 +2011,113 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 "dispatcher_exit=2\n",
                 "",
             ),
+        )
+
+    def test_live_launch_count_protocol_is_ordered_bounded_and_bound(self) -> None:
+        source_sha = "a" * 40
+        app_sha = "b" * 40
+        marker_sha = "c" * 64
+        counts = {
+            "run_status": "passed",
+            "logical_total": 2,
+            "logical_pass": 1,
+            "logical_fail": 0,
+            "logical_expected_fail": 1,
+            "logical_flaky": 0,
+            "logical_skip": 0,
+            "logical_interrupted": 0,
+            "attempt_total": 2,
+            "attempt_pass": 1,
+            "attempt_fail": 1,
+            "attempt_skip": 0,
+            "attempt_interrupted": 0,
+            "attempt_timedout": 0,
+            "source_sha": source_sha,
+            "app_sha": app_sha,
+            "marker_sha256": marker_sha,
+        }
+        count_line = (
+            "LIVE_BROWSER_COUNTS schema=1 "
+            + " ".join(
+                f"{name}={counts[name]}"
+                for name in (
+                    "run_status",
+                    *platform_workflow_remote_dispatch.LIVE_BROWSER_COUNT_FIELDS,
+                    "source_sha",
+                    "app_sha",
+                    "marker_sha256",
+                )
+            )
+            + "\n"
+        ).encode("ascii")
+        status_line = (
+            "LIVE_LAUNCH_STATUS schema=2 status=passed stage=complete check=none "
+            f"child_exit=0 source_sha={source_sha}\n"
+        ).encode("ascii")
+        expected_status = ("passed", "complete", "none", 0)
+        parsed = platform_workflow_remote_dispatch._parse_live_launch_protocol(
+            count_line + status_line,
+            child_status=0,
+            expected_sha=source_sha,
+            expected_app_sha=app_sha,
+            expected_marker_sha256=marker_sha,
+        )
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed[0], expected_status)
+        self.assertEqual(parsed[1], counts)
+        child_script = (
+            "import sys\n"
+            f"print({count_line.decode('ascii').rstrip()!r})\n"
+            f"print({status_line.decode('ascii').rstrip()!r})\n"
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            child_exit = platform_workflow_remote_dispatch._run_bounded_child(
+                [sys.executable, "-c", child_script],
+                timeout_seconds=3,
+                expected_live_launch_sha=source_sha,
+                expected_live_app_sha=app_sha,
+                expected_live_marker_sha256=marker_sha,
+            )
+        self.assertEqual(child_exit, 0)
+        self.assertEqual(output.getvalue(), (count_line + status_line).decode("ascii"))
+        self.assertIsNone(
+            platform_workflow_remote_dispatch._parse_live_launch_protocol(
+                status_line + count_line,
+                child_status=0,
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256=marker_sha,
+            )
+        )
+        self.assertIsNone(
+            platform_workflow_remote_dispatch._parse_live_launch_protocol(
+                count_line + count_line + status_line,
+                child_status=0,
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256=marker_sha,
+            )
+        )
+        invalid_count_line = count_line.replace(b"logical_total=2", b"logical_total=3")
+        partial = platform_workflow_remote_dispatch._parse_live_launch_protocol(
+            invalid_count_line + status_line,
+            child_status=0,
+            expected_sha=source_sha,
+            expected_app_sha=app_sha,
+            expected_marker_sha256=marker_sha,
+        )
+        self.assertIsNotNone(partial)
+        assert partial is not None
+        self.assertEqual(partial, (expected_status, None))
+        self.assertIsNone(
+            platform_workflow_remote_dispatch._parse_live_browser_counts(
+                count_line,
+                expected_sha=source_sha,
+                expected_app_sha=app_sha,
+                expected_marker_sha256="d" * 64,
+            )
         )
 
     def test_deploy_marker_capture_keeps_bounded_timeout_cleanup(self) -> None:

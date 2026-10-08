@@ -166,9 +166,33 @@ PASSTHROUGH_ENV = frozenset(
         # back to the source checkout or lose their target binding.
         "PLATFORM_LIVE_QA_INSTALL_ROOT",
         "PLATFORM_LIVE_QA_TARGET_SHA",
+        "PLATFORM_LIVE_QA_RUNNER_SHA",
+        "PLATFORM_LIVE_QA_MARKER_SHA256",
         "PLATFORM_LIVE_USER_QA_MARKER",
         "PLAYWRIGHT_LIVE_BASE_URL",
     }
+)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+LIVE_BROWSER_COUNTS_FILE = "live-counts-v1.json"
+LIVE_BROWSER_COUNTS_MAX_BYTES = 1024
+LIVE_BROWSER_COUNTS_RUN_STATUSES = frozenset(
+    {"passed", "failed", "timedout", "interrupted"}
+)
+LIVE_BROWSER_COUNT_FIELDS = (
+    "logical_total",
+    "logical_pass",
+    "logical_fail",
+    "logical_expected_fail",
+    "logical_flaky",
+    "logical_skip",
+    "logical_interrupted",
+    "attempt_total",
+    "attempt_pass",
+    "attempt_fail",
+    "attempt_skip",
+    "attempt_interrupted",
+    "attempt_timedout",
 )
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -1740,6 +1764,178 @@ def prepare_public_browser_gate() -> Path:
             shutil.rmtree(gate)
         raise
     return gate
+
+
+def _browser_count_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def public_browser_counts_line(
+    gate: Path,
+    *,
+    source_sha: str,
+    app_sha: str,
+    marker_sha256: str,
+) -> str:
+    """Read one exact, private Playwright count record and project closed fields."""
+
+    if (
+        gate.parent != RUN_GATE_ROOT
+        or not PUBLIC_GATE_NAME_PATTERN.fullmatch(gate.name)
+        or SHA1_RE.fullmatch(source_sha) is None
+        or SHA1_RE.fullmatch(app_sha) is None
+        or SHA256_RE.fullmatch(marker_sha256) is None
+    ):
+        raise GuardError("public browser count binding is invalid")
+    uid, gid = liveqa_identity()
+    try:
+        root_metadata = RUN_GATE_ROOT.lstat()
+        gate_metadata = gate.lstat()
+        results_path = gate / "test-results"
+        results_metadata = results_path.lstat()
+    except OSError as exc:
+        raise GuardError("public browser count path is unavailable") from exc
+    if (
+        stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or RUN_GATE_ROOT.resolve(strict=True) != RUN_GATE_ROOT
+        or root_metadata.st_uid != 0
+        or root_metadata.st_gid != 0
+        or stat.S_IMODE(root_metadata.st_mode) != 0o711
+        or stat.S_ISLNK(gate_metadata.st_mode)
+        or not stat.S_ISDIR(gate_metadata.st_mode)
+        or gate_metadata.st_uid != uid
+        or gate_metadata.st_gid != gid
+        or stat.S_IMODE(gate_metadata.st_mode) != 0o700
+        or stat.S_ISLNK(results_metadata.st_mode)
+        or not stat.S_ISDIR(results_metadata.st_mode)
+        or results_metadata.st_uid != uid
+        or results_metadata.st_gid != gid
+        or stat.S_IMODE(results_metadata.st_mode) != 0o700
+    ):
+        raise GuardError("public browser count directory metadata is unsafe")
+
+    report_path = results_path / LIVE_BROWSER_COUNTS_FILE
+    descriptor: int | None = None
+    try:
+        path_metadata = report_path.lstat()
+        descriptor = os.open(
+            report_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_metadata = os.fstat(descriptor)
+        if (
+            stat.S_ISLNK(path_metadata.st_mode)
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_uid != uid
+            or path_metadata.st_gid != gid
+            or path_metadata.st_nlink != 1
+            or stat.S_IMODE(path_metadata.st_mode) != 0o600
+            or path_metadata.st_size > LIVE_BROWSER_COUNTS_MAX_BYTES
+            or _browser_count_fingerprint(path_metadata)
+            != _browser_count_fingerprint(opened_metadata)
+        ):
+            raise GuardError("public browser count file metadata is unsafe")
+        raw = os.read(descriptor, LIVE_BROWSER_COUNTS_MAX_BYTES + 1)
+        final_metadata = os.fstat(descriptor)
+        current_path_metadata = report_path.lstat()
+        if (
+            len(raw) != opened_metadata.st_size
+            or len(raw) > LIVE_BROWSER_COUNTS_MAX_BYTES
+            or _browser_count_fingerprint(final_metadata)
+            != _browser_count_fingerprint(opened_metadata)
+            or _browser_count_fingerprint(current_path_metadata)
+            != _browser_count_fingerprint(opened_metadata)
+        ):
+            raise GuardError("public browser count file changed while reading")
+    except OSError as exc:
+        raise GuardError("public browser count file is unavailable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise GuardError("public browser count JSON framing is invalid")
+    try:
+        payload = json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=_strict_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                GuardError("public browser count JSON is invalid")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise GuardError("public browser count JSON is invalid") from exc
+    expected_keys = {
+        "schema",
+        "source_sha",
+        "app_sha",
+        "marker_sha256",
+        "run_status",
+        *LIVE_BROWSER_COUNT_FIELDS,
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or type(payload.get("schema")) is not int
+        or payload["schema"] != 1
+        or payload.get("source_sha") != source_sha
+        or payload.get("app_sha") != app_sha
+        or payload.get("marker_sha256") != marker_sha256
+        or not isinstance(payload.get("run_status"), str)
+        or payload["run_status"] not in LIVE_BROWSER_COUNTS_RUN_STATUSES
+    ):
+        raise GuardError("public browser count binding is incomplete")
+    counts: dict[str, int] = {}
+    for field in LIVE_BROWSER_COUNT_FIELDS:
+        value = payload.get(field)
+        if type(value) is not int or not 0 <= value <= 32768:
+            raise GuardError("public browser count value is invalid")
+        counts[field] = value
+    if (
+        sum(
+            counts[field]
+            for field in (
+                "logical_pass",
+                "logical_fail",
+                "logical_expected_fail",
+                "logical_flaky",
+                "logical_skip",
+                "logical_interrupted",
+            )
+        )
+        != counts["logical_total"]
+        or sum(
+            counts[field]
+            for field in (
+                "attempt_pass",
+                "attempt_fail",
+                "attempt_skip",
+                "attempt_interrupted",
+                "attempt_timedout",
+            )
+        )
+        != counts["attempt_total"]
+        or counts["logical_total"] > 4096
+    ):
+        raise GuardError("public browser count partitions are incomplete")
+
+    ordered = [
+        f"run_status={payload['run_status']}",
+        *(f"{field}={counts[field]}" for field in LIVE_BROWSER_COUNT_FIELDS),
+        f"source_sha={source_sha}",
+        f"app_sha={app_sha}",
+        f"marker_sha256={marker_sha256}",
+    ]
+    return "LIVE_BROWSER_COUNTS schema=1 " + " ".join(ordered) + "\n"
 
 
 def _walk_nofollow(root: Path) -> list[Path]:
@@ -3381,6 +3577,11 @@ def _parser() -> argparse.ArgumentParser:
     gate.add_argument("--bundle-path", type=Path, required=True)
     gate.add_argument("--state-dir", type=Path, required=True)
     commands.add_parser("prepare-public-browser-gate")
+    browser_counts = commands.add_parser("emit-public-browser-counts")
+    browser_counts.add_argument("--gate", type=Path, required=True)
+    browser_counts.add_argument("--source-sha", required=True)
+    browser_counts.add_argument("--app-sha", required=True)
+    browser_counts.add_argument("--marker-sha256", required=True)
     merge = commands.add_parser("merge-browser-inventory")
     merge.add_argument("--bundle-path", type=Path, required=True)
     merge.add_argument("--state-dir", type=Path, required=True)
@@ -3477,6 +3678,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(prepare_browser_gate(args.bundle_path, args.state_dir))
         elif args.command == "prepare-public-browser-gate":
             print(prepare_public_browser_gate())
+        elif args.command == "emit-public-browser-counts":
+            print(
+                public_browser_counts_line(
+                    args.gate,
+                    source_sha=args.source_sha,
+                    app_sha=args.app_sha,
+                    marker_sha256=args.marker_sha256,
+                ),
+                end="",
+            )
         elif args.command == "merge-browser-inventory":
             merge_browser_inventory(args.bundle_path, args.state_dir)
         elif args.command == "remove-browser-gate":

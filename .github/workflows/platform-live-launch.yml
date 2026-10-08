@@ -557,6 +557,7 @@ jobs:
         shell: bash
         env:
           SUPERVISOR_STATUS: ${{ steps.run_live_supervisor.outputs.ssh_status || '1' }}
+          LIVE_MARKER: ${{ inputs.marker }}
         run: |
           set -euo pipefail
           raw_report="$RUNNER_TEMP/live-launch-raw.log"
@@ -566,7 +567,8 @@ jobs:
           }
           trap cleanup_raw_report EXIT
           /usr/bin/python3 - "$raw_report" "$safe_report" "$SUPERVISOR_STATUS" \
-            "$GITHUB_SHA" "$APP_TARGET_SHA" "$SOURCE_BINDING_SHA256" <<'PY'
+            "$GITHUB_SHA" "$APP_TARGET_SHA" "$SOURCE_BINDING_SHA256" "$LIVE_MARKER" <<'PY'
+          import hashlib
           import json
           from pathlib import Path
           import re
@@ -578,30 +580,84 @@ jobs:
               process_status = int(sys.argv[3])
           except ValueError:
               process_status = 1
-          expected_sha, app_sha, binding_digest = sys.argv[4:]
+          expected_sha, app_sha, binding_digest, marker_value = sys.argv[4:]
+          marker_sha256 = hashlib.sha256(marker_value.encode("ascii")).hexdigest()
           raw_size = source.stat().st_size
-          raw = source.read_bytes() if raw_size <= 256 else b""
+          raw = source.read_bytes() if raw_size <= 1024 else b""
           marker_pattern = re.compile(
-              rb"LIVE_LAUNCH_STATUS schema=1 status=(passed|failed) "
+              rb"LIVE_LAUNCH_STATUS schema=2 status=(passed|failed) "
               rb"stage=(validation|trusted_generation|identity|account_install|"
               rb"provision|browser_qa|dispatch|trusted_entry|timeout|complete) "
+              rb"check=(none|input_shape|input_validation|source_binding|"
+              rb"source_binding_io|source_binding_schema|source_binding_recheck|root_uid|"
+              rb"source_identity|install_root_format|origin|install_root_target|"
+              rb"provision_mode|provision_marker|marker_absent|marker_digest|"
+              rb"generation_members|generation_supervisor_path|"
+              rb"generation_supervisor_metadata|generation_manifest|identity|"
+              rb"account_install|provision|browser_qa|release_lock|trusted_entry|"
+              rb"supervisor_exec|dispatch|timeout|stream_limit|protocol) "
               rb"child_exit=(0|[1-9][0-9]{0,2}) "
               rb"source_sha=([0-9a-f]{40})\n"
           )
-          match = marker_pattern.fullmatch(raw) if raw_size <= 256 else None
+          count_fields = (
+              "logical_total", "logical_pass", "logical_fail", "logical_expected_fail",
+              "logical_flaky", "logical_skip", "logical_interrupted", "attempt_total",
+              "attempt_pass", "attempt_fail", "attempt_skip", "attempt_interrupted",
+              "attempt_timedout",
+          )
+          count_pattern = re.compile(
+              rb"LIVE_BROWSER_COUNTS schema=1 run_status=(passed|failed|timedout|interrupted) "
+              + b" ".join(
+                  rf"({field}=(?:0|[1-9][0-9]{{0,4}}))".encode("ascii")
+                  for field in count_fields
+              )
+              + rb" source_sha=([0-9a-f]{40}) app_sha=([0-9a-f]{40}) "
+              + rb"marker_sha256=([0-9a-f]{64})\n"
+          )
+          lines = raw.splitlines(keepends=True) if raw_size <= 1024 else []
+          count_values = None
+          if len(lines) == 2:
+              count_match = count_pattern.fullmatch(lines[0])
+              if count_match is not None:
+                  values = {
+                      "run_status": count_match.group(1).decode("ascii"),
+                      **{
+                          field: int(count_match.group(index + 2).split(b"=", 1)[1])
+                          for index, field in enumerate(count_fields)
+                      },
+                  }
+                  count_bindings_match = (
+                      count_match.group(15).decode("ascii") == expected_sha
+                      and count_match.group(16).decode("ascii") == app_sha
+                      and count_match.group(17).decode("ascii") == marker_sha256
+                  )
+                  logical_sum = sum(values[field] for field in count_fields[1:7])
+                  attempt_sum = sum(values[field] for field in count_fields[8:])
+                  if (
+                      count_bindings_match
+                      and all(0 <= values[field] <= 32768 for field in count_fields)
+                      and values["logical_total"] <= 4096
+                      and logical_sum == values["logical_total"]
+                      and attempt_sum == values["attempt_total"]
+                  ):
+                      count_values = values
+          status_line = lines[-1] if lines else b""
+          match = marker_pattern.fullmatch(status_line)
           marker = None
-          if match is not None and match.group(4).decode("ascii") == expected_sha:
+          if match is not None and match.group(5).decode("ascii") == expected_sha:
               marker = (
                   match.group(1).decode("ascii"),
                   match.group(2).decode("ascii"),
-                  int(match.group(3)),
+                  match.group(3).decode("ascii"),
+                  int(match.group(4)),
               )
           marker_ok = False
           if marker is not None:
-              marker_status, stage, child_status = marker
+              marker_status, stage, check_id, child_status = marker
               if marker_status == "passed":
                   marker_ok = (
                       stage == "complete"
+                      and check_id == "none"
                       and child_status == 0
                       and process_status == 0
                   )
@@ -615,11 +671,51 @@ jobs:
                       and child_status > 0
                       and process_status == child_status
                   )
-          success = bool(marker_ok and marker is not None and marker[0] == "passed")
-          status = "passed" if success else ("failed" if marker_ok else "unavailable")
+          success = bool(
+              marker_ok
+              and marker is not None
+              and marker[0] == "passed"
+              and count_values is not None
+              and count_values["run_status"] == "passed"
+              and count_values["logical_total"] > 0
+              and count_values["logical_pass"] > 0
+              and count_values["logical_fail"] == 0
+              and count_values["logical_flaky"] == 0
+              and count_values["logical_interrupted"] == 0
+          )
+          rejected_completed_run = bool(
+              marker_ok
+              and marker is not None
+              and marker[0] == "passed"
+              and count_values is not None
+          )
+          status = "passed" if success else (
+              "failed"
+              if marker_ok and marker is not None and (
+                  marker[0] == "failed" or rejected_completed_run
+              )
+              else "unavailable"
+          )
           errors = {"none": 1} if success else ({"other": 1} if marker_ok else {"transport": 1})
           stage = marker[1] if marker_ok and marker is not None else "unknown"
-          child_status = marker[2] if marker_ok and marker is not None else 1
+          check_id = marker[2] if marker_ok and marker is not None else "unknown"
+          child_status = marker[3] if marker_ok and marker is not None else 1
+          logical_counts = None if count_values is None else {
+              field: count_values[field]
+              for field in count_fields[:7]
+          }
+          attempt_counts = None if count_values is None else {
+              field: count_values[field]
+              for field in count_fields[7:]
+          }
+          status_counts = None if count_values is None else {
+              "passed": count_values["logical_pass"],
+              "failed": count_values["logical_fail"],
+              "expected_failed": count_values["logical_expected_fail"],
+              "flaky": count_values["logical_flaky"],
+              "skipped": count_values["logical_skip"],
+              "interrupted": count_values["logical_interrupted"],
+          }
           report = {
               "schema": 1,
               "source_git_sha": expected_sha,
@@ -629,17 +725,23 @@ jobs:
               "success": success,
               "process_exit_code": process_status if 0 <= process_status <= 255 else 1,
               "stage": stage,
+              "check_id": check_id,
               "child_exit_code": child_status,
               "source_sha": expected_sha,
-              "line_count": 1 if marker_ok else 0,
-              "retained_line_count": 1 if marker_ok else 0,
+              "line_count": (2 if count_values is not None else 1) if marker_ok else 0,
+              "retained_line_count": (2 if count_values is not None else 1) if marker_ok else 0,
               "truncated": False,
-              "test_count": 1 if success else 0,
-              "failed_test_count": 0 if success else (1 if marker_ok else 0),
-              "tests": ([{"name": "browser_public", "status": "passed", "route_class": "other", "http_status": 0, "error_class": "none"}] if success else []),
-              "class_counts": {"success": 1} if success else {"failure": 1},
-              "route_class_counts": {"other": 1} if marker_ok else {},
-              "status_counts": {},
+              "test_count": None if count_values is None else count_values["logical_total"],
+              "failed_test_count": None if count_values is None else count_values["logical_fail"],
+              "flaky_test_count": None if count_values is None else count_values["logical_flaky"],
+              "skipped_test_count": None if count_values is None else count_values["logical_skip"],
+              "interrupted_test_count": None if count_values is None else count_values["logical_interrupted"],
+              "logical_counts": logical_counts,
+              "attempt_counts": attempt_counts,
+              "tests": [],
+              "class_counts": logical_counts or ({"failure": 1} if marker_ok else {}),
+              "route_class_counts": {},
+              "status_counts": status_counts or {},
               "error_class_counts": errors,
           }
           destination.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
@@ -701,6 +803,35 @@ jobs:
               raise SystemExit("required live-launch source binding is invalid")
           if report.get("success") is not True:
               raise SystemExit("Live browser QA did not pass; see fixed report classes.")
+          logical_fields = (
+              "logical_total", "logical_pass", "logical_fail", "logical_expected_fail",
+              "logical_flaky", "logical_skip", "logical_interrupted",
+          )
+          attempt_fields = (
+              "attempt_total", "attempt_pass", "attempt_fail", "attempt_skip",
+              "attempt_interrupted", "attempt_timedout",
+          )
+          logical = report.get("logical_counts")
+          attempts = report.get("attempt_counts")
+          if (
+              not isinstance(logical, dict)
+              or set(logical) != set(logical_fields)
+              or not isinstance(attempts, dict)
+              or set(attempts) != set(attempt_fields)
+              or any(type(logical.get(key)) is not int or logical[key] < 0 for key in logical_fields)
+              or any(type(attempts.get(key)) is not int or attempts[key] < 0 for key in attempt_fields)
+              or logical["logical_total"] <= 0
+              or logical["logical_pass"] <= 0
+              or logical["logical_total"] != report.get("test_count")
+              or sum(logical[key] for key in logical_fields[1:]) != logical["logical_total"]
+              or sum(attempts[key] for key in attempt_fields[1:]) != attempts["attempt_total"]
+              or logical["logical_fail"] != report.get("failed_test_count")
+              or logical["logical_flaky"] != report.get("flaky_test_count")
+              or logical["logical_skip"] != report.get("skipped_test_count")
+              or logical["logical_interrupted"] != report.get("interrupted_test_count")
+              or report.get("tests") != []
+          ):
+              raise SystemExit("Live browser QA case-count report is incomplete.")
           PY
       - name: Upload browser gate report
         if: ${{ always() }}

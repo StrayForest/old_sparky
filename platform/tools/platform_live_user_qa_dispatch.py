@@ -705,7 +705,9 @@ def _validate_bundle_and_mailbox() -> None:
             raise RuntimeError("live-QA bundle roster password is invalid")
 
 
-def _emit_live_launch_failure(*, source_sha: str, stage: str, child_exit: int) -> None:
+def _emit_live_launch_failure(
+    *, source_sha: str, stage: str, child_exit: int, check: str = "dispatch"
+) -> None:
     """Emit only a fixed launch boundary for the outer source-bound parser."""
 
     if (
@@ -713,11 +715,17 @@ def _emit_live_launch_failure(*, source_sha: str, stage: str, child_exit: int) -
         or SHA_RE.fullmatch(source_sha) is None
         or type(child_exit) is not int
         or child_exit not in {1, 2}
+        or check not in {
+            "input_shape", "input_validation", "source_binding", "source_binding_io",
+            "source_binding_schema", "source_binding_recheck", "root_uid",
+            "generation_manifest", "release_lock", "trusted_entry", "supervisor_exec",
+            "dispatch",
+        }
     ):
         return
     print(
-        "LIVE_LAUNCH_STATUS schema=1 status=failed "
-        f"stage={stage} child_exit={child_exit} source_sha={source_sha}"
+        "LIVE_LAUNCH_STATUS schema=2 status=failed "
+        f"stage={stage} check={check} child_exit={child_exit} source_sha={source_sha}"
     )
 
 
@@ -738,7 +746,8 @@ def main(argv: list[str] | None = None) -> int:
         if mode == "run-launch":
             if len(tail) not in {3, 5}:
                 _emit_live_launch_failure(
-                    source_sha=runner_sha, stage="validation", child_exit=2
+                    source_sha=runner_sha, stage="validation", child_exit=2,
+                    check="input_shape",
                 )
                 return 2
             base_url, provision, marker = tail[:3]
@@ -763,13 +772,15 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError:
         if mode == "run-launch":
             _emit_live_launch_failure(
-                source_sha=runner_sha, stage="validation", child_exit=2
+                source_sha=runner_sha, stage="validation", child_exit=2,
+                check="source_binding",
             )
         return 2
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         if mode == "run-launch":
             _emit_live_launch_failure(
-                source_sha=runner_sha, stage="validation", child_exit=1
+                source_sha=runner_sha, stage="validation", child_exit=1,
+                check="source_binding_io",
             )
         return 1
     if mode == "run-launch" and (
@@ -779,21 +790,27 @@ def main(argv: list[str] | None = None) -> int:
         or (provision == "false" and marker != "")
     ):
         _emit_live_launch_failure(
-            source_sha=runner_sha, stage="validation", child_exit=2
+            source_sha=runner_sha, stage="validation", child_exit=2,
+            check="input_validation",
         )
         return 2
     launch_stage = "identity"
+    launch_check = "root_uid"
     try:
         if os.geteuid() != 0:
             if mode == "run-launch":
                 _emit_live_launch_failure(
-                    source_sha=runner_sha, stage="identity", child_exit=1
+                    source_sha=runner_sha, stage="identity", child_exit=1,
+                    check="root_uid",
                 )
             return 1
         launch_stage = "trusted_generation"
+        launch_check = "generation_manifest"
         manifest = _verify_install(app_target_sha)
+        launch_check = "trusted_entry"
         remote_dispatcher = _load_verified_remote_dispatcher(manifest)
         launch_stage = "validation"
+        launch_check = "source_binding_schema"
         _validate_source_binding_schema(
             remote_dispatcher,
             runner_sha,
@@ -801,6 +818,7 @@ def main(argv: list[str] | None = None) -> int:
             source_binding,
         )
         if mode == "direct-user":
+            launch_check = "trusted_entry"
             _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
             source_arguments = (
                 [] if encoded_binding is None
@@ -831,6 +849,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if mode == "run":
+            launch_check = "trusted_entry"
             _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
             source_arguments = (
                 [] if encoded_binding is None
@@ -871,12 +890,15 @@ def main(argv: list[str] | None = None) -> int:
             if os.environ.get("PLATFORM_RELEASE_LOCK_SUPERVISED") != "1":
                 if mode == "run-launch":
                     _emit_live_launch_failure(
-                        source_sha=runner_sha, stage="dispatch", child_exit=1
+                        source_sha=runner_sha, stage="dispatch", child_exit=1,
+                        check="release_lock",
                     )
                 return 1
             launch_stage = "dispatch"
+            launch_check = "release_lock"
             _require_release_lock_supervisor()
             launch_stage = "validation"
+            launch_check = "source_binding_recheck"
             _validate_source_binding_under_lock(
                 remote_dispatcher,
                 runner_sha,
@@ -884,6 +906,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_binding,
             )
         launch_stage = "trusted_generation"
+        launch_check = "trusted_entry"
         _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
         manifest = _read_manifest(app_target_sha)
         payload = Path(str(manifest["payload"]))
@@ -906,6 +929,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if mode == "run-launch":
             launch_stage = "trusted_generation"
+            launch_check = "trusted_entry"
             wrapper = payload / "platform/tools/platform_live_launch_supervisor.sh"
             _regular(wrapper, mode=0o555, maximum=MAX_PAYLOAD_FILE_BYTES)
             environment = {
@@ -924,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
                 "PLAYWRIGHT_LIVE_BASE_URL": base_url,
             }
             launch_stage = "dispatch"
+            launch_check = "supervisor_exec"
             os.execve(
                 str(wrapper),
                 [str(wrapper), base_url, provision, marker, runner_sha, *source_arguments],
@@ -953,6 +978,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_sha=runner_sha,
                 stage=launch_stage,
                 child_exit=1,
+                check=launch_check,
             )
         return 1
     return 0

@@ -35,9 +35,11 @@ export default defineConfig({
   },
   fullyParallel: false,
   retries: secretBearingLiveQa || productionLiveQa ? 0 : process.env.CI ? 2 : 0,
-  reporter: !secretBearingLiveQa && process.env.CI
-    ? [["list"], ["html", { outputFolder: "playwright-report-live", open: "never" }]]
-    : [["list"]],
+  reporter: secretBearingLiveQa
+    ? [["list"], ["./tests/support/live-count-reporter.cjs"]]
+    : process.env.CI
+      ? [["list"], ["html", { outputFolder: "playwright-report-live", open: "never" }]]
+      : [["list"]],
   use: {
     baseURL: configuredBaseUrl,
     trace: secretBearingLiveQa ? "off" : "on-first-retry",

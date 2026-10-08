@@ -1297,7 +1297,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('AUTODEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}', auto)
         self.assertIn('"ref": "dev"', auto)
         self.assertIn('"web_compression": "enabled"', auto)
-        self.assertIn('"runtime_profile": "ready-vote-static-8"', auto)
+        self.assertIn('"runtime_profile": "authenticated-read-admission-24x8"', auto)
         self.assertIn("Refusing stale dispatch", auto)
 
     def test_live_qa_runtime_installer_change_is_deployable_and_runtime_sensitive(self) -> None:

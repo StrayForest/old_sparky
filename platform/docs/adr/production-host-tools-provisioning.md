@@ -130,6 +130,13 @@ provisioning and self-test at
 `/opt/oldsparky/platform/shared/host-tools/3bde55d29ab7e7b1102b0f1f36608f7ffd4a73ab`.
 Do not infer that the new generation or final pin-bearing application SHA is
 installed from this repository value.
+The bounded LiveQA count protocol and authenticated-read-admission candidate
+use source **C** `bbd7fd6f46dfbd21c3dfd6b1b27f6409c580196e`; its pin-only child
+selects C and updates exactly the dispatcher and shared-environment config
+digests in the 14-member closure. The selected 24x8 profile keeps the existing
+32-slot admitted-plus-waiting envelope and temporarily enables only the
+bounded numeric heap sampler. Exact-C CI, signed provisioning and installed
+self-test are still required; this source pin does not prove activation.
 The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable

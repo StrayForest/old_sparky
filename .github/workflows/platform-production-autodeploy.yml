@@ -955,13 +955,13 @@ jobs:
             --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$DISPATCH_MODE" "$AUTODEPLOY_RUN_ID" "$AUTODEPLOY_RUN_ATTEMPT" <<'PY'
           import json
           import sys
-          # Keep the reviewed default profile and compression contract explicit:
-          # "runtime_profile":"ready-vote-static-8" and "web_compression":"enabled".
+          # Keep the reviewed profile and compression contract explicit:
+          # "runtime_profile":"authenticated-read-admission-24x8" and "web_compression":"enabled".
           print(json.dumps({
               "ref": "dev",
               "inputs": {
                   "mode": sys.argv[3],
-                  "runtime_profile": "ready-vote-static-8",
+                  "runtime_profile": "authenticated-read-admission-24x8",
                   "web_compression": "enabled",
                   "classifier_run_id": sys.argv[1],
                   "classifier_run_attempt": sys.argv[2],
