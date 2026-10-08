@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import argparse
 from array import array
+import base64
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import http.client
+import hashlib
 import json
 import math
 import os
@@ -75,6 +77,7 @@ except ModuleNotFoundError:  # Direct execution from platform/tools.
 
 EXPECTED_ORIGIN = "https://old-sparky.com"
 MANIFEST_SCHEMA = 1
+SOURCE_BOUND_MANIFEST_SCHEMA = 2
 MAX_USERS = 20_000
 MAX_TOURNAMENTS = 64
 MAX_CONCURRENCY = 512
@@ -96,6 +99,27 @@ SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]+$")
 PROFILE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+SOURCE_BINDING_KEYS = frozenset(
+    {
+        "schema",
+        "binding_mode",
+        "runner_sha",
+        "app_target_sha",
+        "baseline_identity",
+        "receipt_document_sha256",
+        "receipt_artifact_id",
+        "receipt_artifact_name",
+        "receipt_artifact_digest",
+        "receipt_archive_sha256",
+        "cumulative_manifest_sha256",
+        "source_security_run_id",
+        "source_security_run_attempt",
+        "autodeploy_run_id",
+        "autodeploy_run_attempt",
+        "production_deploy_run_id",
+        "production_deploy_run_attempt",
+    }
+)
 
 
 class ExternalLoadError(RuntimeError):
@@ -1008,6 +1032,89 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _canonical_binding_bytes(binding: Mapping[str, Any]) -> bytes:
+    try:
+        return json.dumps(
+            dict(binding),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ExternalLoadError("source binding is not canonical JSON") from exc
+
+
+def _manifest_source_binding(payload: Mapping[str, Any]) -> tuple[str, str, dict[str, Any] | None, str | None]:
+    """Validate the runner/app binding carried by a schema-2 fixture.
+
+    The workflow preflight authenticates receipt metadata and bytes. This
+    client-side check binds those exact bytes and identities to the fixture
+    manifest and report while preserving the ordinary schema-1 diagnostic
+    manifest used by local tooling.
+    """
+
+    runner_sha = payload.get("runner_sha")
+    app_target_sha = payload.get("app_target_sha")
+    binding = payload.get("source_binding")
+    binding_digest = payload.get("source_binding_sha256")
+    if (
+        not isinstance(runner_sha, str)
+        or SOURCE_SHA_RE.fullmatch(runner_sha) is None
+        or not isinstance(app_target_sha, str)
+        or SOURCE_SHA_RE.fullmatch(app_target_sha) is None
+    ):
+        raise ExternalLoadError("fixture source identity is invalid")
+    if (
+        os.environ.get("SOURCE_GIT_SHA", "").strip() != runner_sha
+        or os.environ.get("APP_TARGET_SHA", "").strip() != app_target_sha
+    ):
+        raise ExternalLoadError("fixture source identity does not match the workflow")
+
+    encoded = os.environ.get("SOURCE_BINDING_BASE64", "")
+    expected_digest = os.environ.get("SOURCE_BINDING_SHA256", "")
+    if binding is None:
+        if app_target_sha != runner_sha or binding_digest is not None or encoded or expected_digest:
+            raise ExternalLoadError("same-source fixture has a substituted source binding")
+        return runner_sha, app_target_sha, None, None
+
+    if (
+        not isinstance(binding, dict)
+        or set(binding) != SOURCE_BINDING_KEYS
+        or type(binding.get("schema")) is not int
+        or binding.get("schema") != 1
+        or binding.get("binding_mode") != "verified-noop"
+        or binding.get("runner_sha") != runner_sha
+        or binding.get("app_target_sha") != app_target_sha
+        or app_target_sha == runner_sha
+    ):
+        raise ExternalLoadError("verified no-op fixture binding is malformed")
+    canonical = _canonical_binding_bytes(binding)
+    if (
+        not encoded
+        or base64.b64encode(canonical).decode("ascii") != encoded
+        or not isinstance(binding_digest, str)
+        or PROFILE_DIGEST_RE.fullmatch(binding_digest) is None
+        or hashlib.sha256(canonical).hexdigest() != binding_digest
+        or expected_digest != binding_digest
+    ):
+        raise ExternalLoadError("verified no-op fixture binding digest is invalid")
+    try:
+        try:
+            from tools.platform_noop_source_binding import validate_active_runtime_tuple
+        except ModuleNotFoundError:  # Direct execution from platform/tools.
+            from platform_noop_source_binding import validate_active_runtime_tuple
+
+        validate_active_runtime_tuple(
+            binding,
+            binding.get("baseline_identity"),
+            expected_runner_sha=runner_sha,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ExternalLoadError("verified no-op fixture binding failed validation") from exc
+    return runner_sha, app_target_sha, binding, binding_digest
+
+
 def load_manifest(path: Path) -> tuple[dict[str, Any], list[VirtualUser]]:
     try:
         payload = json.loads(
@@ -1018,8 +1125,32 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], list[VirtualUser]]:
         raise ExternalLoadError("external load manifest is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise ExternalLoadError("external load manifest must be an object")
-    if payload.get("schema") != MANIFEST_SCHEMA:
+    schema = payload.get("schema")
+    if type(schema) is not int or schema not in (MANIFEST_SCHEMA, SOURCE_BOUND_MANIFEST_SCHEMA):
         raise ExternalLoadError("external load manifest schema is unsupported")
+    legacy_keys = {
+        "schema",
+        "purpose",
+        "origin",
+        "session_cookie_name",
+        "csrf_cookie_name",
+        "marker",
+        "tournaments",
+        "users",
+    }
+    if schema == MANIFEST_SCHEMA:
+        if set(payload) not in (legacy_keys, legacy_keys | {"created_at"}):
+            raise ExternalLoadError("legacy external load manifest schema is not closed")
+    else:
+        source_keys = {
+            "runner_sha",
+            "app_target_sha",
+            "source_binding",
+            "source_binding_sha256",
+        }
+        if set(payload) != legacy_keys | source_keys | {"created_at"}:
+            raise ExternalLoadError("source-bound external load manifest schema is not closed")
+        _manifest_source_binding(payload)
     if payload.get("purpose") != "external_ready_vote":
         raise ExternalLoadError("external load manifest purpose is invalid")
     if str(payload.get("origin") or "").rstrip("/") != EXPECTED_ORIGIN:
@@ -2326,6 +2457,13 @@ def run_load(
         and isinstance(binding.get("source_git_sha"), str)
         and SOURCE_SHA_RE.fullmatch(binding["source_git_sha"]) is not None
         and binding["source_git_sha"] == os.environ.get("SOURCE_GIT_SHA", "").strip()
+        and isinstance(binding.get("app_target_sha"), str)
+        and SOURCE_SHA_RE.fullmatch(binding["app_target_sha"]) is not None
+        and binding["app_target_sha"]
+        == (os.environ.get("APP_TARGET_SHA", "").strip() or binding["source_git_sha"])
+        and binding.get("app_target_sha") == manifest.get("app_target_sha", binding.get("app_target_sha"))
+        and binding.get("source_binding") == manifest.get("source_binding")
+        and binding.get("source_binding_sha256") == manifest.get("source_binding_sha256")
         and isinstance(binding.get("external_run_id"), str)
         and RUN_ID_RE.fullmatch(binding["external_run_id"]) is not None
         and binding["external_run_id"] == os.environ.get("GITHUB_RUN_ID", "").strip()
@@ -3140,6 +3278,10 @@ def run_load(
         # include a host/path/query when this runner is reused outside CI.
         "origin_class": "production_origin",
         "fixture_marker": manifest["marker"],
+        "runner_sha": binding.get("source_git_sha") if binding_is_authoritative else None,
+        "app_target_sha": binding.get("app_target_sha") if binding_is_authoritative else None,
+        "source_binding": manifest.get("source_binding"),
+        "source_binding_sha256": manifest.get("source_binding_sha256"),
         "users": len(users),
         "tournaments": len(manifest["tournaments"]),
         "started_at": started_at.isoformat(),

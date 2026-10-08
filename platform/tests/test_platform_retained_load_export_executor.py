@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import pwd
@@ -156,10 +157,12 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         self.assertNotIn('--value "$control_email"', cleanup)
         self.assertIn('unset control_email\ncontrol_email="$(', cleanup)
         self.assertNotIn("export control_email", cleanup)
-        self.assertIn("<target-sha> <load-run-id> <cleanup-run-id>", cleanup)
+        self.assertIn(
+            "<runner-sha> <load-run-id> <cleanup-run-id>", cleanup
+        )
         self.assertIn("--control-email-stdin", cleanup)
         self.assertIn(
-            'LIVE_QA_PAYLOAD_ROOT="$LIVE_QA_RELEASE_ROOT/$target_sha"', cleanup
+            'LIVE_QA_PAYLOAD_ROOT="$LIVE_QA_RELEASE_ROOT/$app_target_sha"', cleanup
         )
         for tool_name in (
             "platform_cleanup_retained_orphan.py",
@@ -460,13 +463,63 @@ class RetainedLoadExportExecutorTests(unittest.TestCase):
         self.assertIn(">/dev/null 2>&1", recovery_function)
         self.assertNotIn("--control-email", recovery_function)
         self.assertIn(
-            '"schema":1,"target_sha":"$target_sha","load_run_id":"$load_run_id"',
+            '"schema":1,"target_sha":"$app_target_sha","load_run_id":"$load_run_id"',
             recovery_function,
         )
         export_creation = script.index(
             '/usr/bin/mkdir -m 0700 -- "$export_dir"', recovery_call
         )
         self.assertLess(recovery_call, export_creation)
+
+    def test_external_recovery_uses_validated_app_payload_sha(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "tools"
+            / "platform_production_retained_load_cleanup_qa.sh"
+        ).read_text(encoding="utf-8")
+        function = "run_external_vote_recovery() {" + script.split(
+            "run_external_vote_recovery() {", 1
+        )[1].split("\n}", 1)[0] + "\n}"
+        with tempfile.TemporaryDirectory(prefix="cleanup-app-target-") as temporary:
+            root = Path(temporary)
+            capture = root / "capture.json"
+            interpreter = root / "capture-python"
+            interpreter.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['CAPTURE_PATH']).write_bytes(sys.stdin.buffer.read())\n",
+                encoding="ascii",
+            )
+            interpreter.chmod(0o755)
+            harness = "\n".join(
+                (
+                    "set -euo pipefail",
+                    f"TOOLS_DIR={shlex.quote(str(root))}",
+                    f"SYSTEM_PYTHON={shlex.quote(str(interpreter))}",
+                    'target_sha="' + "a" * 40 + '"',
+                    'app_target_sha="' + "b" * 40 + '"',
+                    'load_run_id="12345"',
+                    'cleanup_run_id="67890"',
+                    'control_email="qa@example.invalid"',
+                    'recovery_profile="external-vote"',
+                    function,
+                    "run_external_vote_recovery",
+                )
+            )
+            completed = subprocess.run(
+                ["/bin/bash", "-euo", "pipefail", "-c", harness],
+                env={**os.environ, "CAPTURE_PATH": str(capture)},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+            request = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertEqual(request["target_sha"], "b" * 40)
+            self.assertNotEqual(request["target_sha"], "a" * 40)
 
     def test_missing_preprovisioned_owner_fails_closed_without_provisioning(
         self,

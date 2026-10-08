@@ -126,12 +126,31 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
         )
         job = _job_blocks(source)["live-user-qa"]
         self.assertNotIn("actions/checkout@", job)
-        self.assertIn("actions/download-artifact@", job)
+        self.assertNotIn("actions/download-artifact@", job)
+        self.assertIn("contents: none", job)
+        self.assertIn('run = api(f"/actions/runs/{run_id}")', job)
         self.assertIn(
-            "/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh",
+            'listing = api(f"/actions/runs/{run_id}/artifacts?per_page=100&page=1")',
             job,
         )
-        self.assertIn("PLATFORM_LIVE_QA_TARGET_SHA", job)
+        self.assertIn('metadata = api(f"/actions/artifacts/{expected_id}")', job)
+        self.assertIn("metadata.get(\"digest\")", job)
+        self.assertIn("metadata_run.get(\"head_sha\")", job)
+        self.assertIn('f"/actions/artifacts/{expected_id}/zip"', job)
+        self.assertIn(
+            'hashlib.sha256(archive_bytes).hexdigest() != digest.removeprefix("sha256:")',
+            job,
+        )
+        self.assertIn("if len(entries) != 1", job)
+        self.assertIn("with archive.open(info) as member:", job)
+        self.assertIn("member.read(MAX_MEMBER + 1)", job)
+        self.assertIn(
+            "/root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py",
+            job,
+        )
+        self.assertIn('HANDOFF_MEMBER_NAME: live-user-qa-input.json', job)
+        self.assertIn('HANDOFF_ARTIFACT_ID: ${{ needs.validate-live-user-inputs.outputs.handoff_artifact_id }}', job)
+        self.assertIn('live-user-qa < "$input_path"', job)
         self.assertNotIn("/opt/oldsparky/platform/current/tools/", job)
         self.assertIn("live-user-qa", job)
         self.assertNotIn("bash -s", job)

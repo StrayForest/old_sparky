@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import UTC, datetime
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any
 
@@ -26,6 +28,7 @@ MIN_USERS_PER_TOURNAMENT = 14
 MAX_USERS_PER_TOURNAMENT = 500
 MAX_TOURNAMENTS = 40
 MAX_USERS = MAX_USERS_PER_TOURNAMENT * MAX_TOURNAMENTS
+SOURCE_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any], *, mode: int) -> None:
@@ -68,12 +71,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--users-per-tournament", type=int, default=500)
     parser.add_argument("--concurrency", type=int, default=20)
     parser.add_argument("--http-timeout", type=float, default=30.0)
+    parser.add_argument("--runner-sha")
+    parser.add_argument("--source-binding-base64")
     return parser.parse_args()
 
 
 async def prepare(args: argparse.Namespace) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise QaFailure("external production fixture preparation must run as root")
+    runner_sha = getattr(args, "runner_sha", None)
+    source_binding_b64 = getattr(args, "source_binding_base64", None)
+    source_binding: dict[str, Any] | None = None
+    source_binding_sha256: str | None = None
+    app_target_sha: str | None = None
+    if runner_sha is not None:
+        if not isinstance(runner_sha, str) or SOURCE_SHA_RE.fullmatch(runner_sha) is None:
+            raise QaFailure("external fixture runner source identity is invalid")
+        app_target_sha = runner_sha
+        if source_binding_b64 is not None:
+            try:
+                from platform_noop_source_binding import validate_active_runtime_binding_argument
+
+                source_binding = validate_active_runtime_binding_argument(
+                    source_binding_b64,
+                    expected_runner_sha=runner_sha,
+                )
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise QaFailure("external fixture source binding is invalid") from exc
+            app_target_sha = str(source_binding["app_target_sha"])
+            canonical_binding = json.dumps(
+                source_binding,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            source_binding_sha256 = hashlib.sha256(canonical_binding).hexdigest()
+    elif source_binding_b64 is not None:
+        raise QaFailure("external fixture source binding has no runner identity")
     if args.origin.rstrip("/") != PUBLIC_ORIGIN:
         raise QaFailure("external fixture preparation requires the canonical public origin")
     if args.local_origin.rstrip("/") != LOCAL_API_ORIGIN:
@@ -193,19 +228,32 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
             },
         )
 
+        manifest_payload: dict[str, Any] = {
+            "schema": 1 if runner_sha is None else 2,
+            "purpose": "external_ready_vote",
+            "origin": PUBLIC_ORIGIN,
+            "session_cookie_name": qa.session_cookie_name,
+            "csrf_cookie_name": qa.csrf_cookie_name,
+            "marker": qa.marker,
+            "created_at": datetime.now(UTC).isoformat(),
+            "tournaments": tournament_entries,
+            "users": manifest_users,
+        }
+        if runner_sha is not None:
+            manifest_payload.update(
+                {
+                    "runner_sha": runner_sha,
+                    "app_target_sha": app_target_sha,
+                    "source_binding": source_binding,
+                    "source_binding_sha256": source_binding_sha256,
+                }
+            )
+            qa.report["runner_sha"] = runner_sha
+            qa.report["app_target_sha"] = app_target_sha
+            qa.report["source_binding_sha256"] = source_binding_sha256
         atomic_write_json(
             args.manifest_path,
-            {
-                "schema": 1,
-                "purpose": "external_ready_vote",
-                "origin": PUBLIC_ORIGIN,
-                "session_cookie_name": qa.session_cookie_name,
-                "csrf_cookie_name": qa.csrf_cookie_name,
-                "marker": qa.marker,
-                "created_at": datetime.now(UTC).isoformat(),
-                "tournaments": tournament_entries,
-                "users": manifest_users,
-            },
+            manifest_payload,
             mode=0o600,
         )
         qa.report["finished_at"] = datetime.now(UTC).isoformat()

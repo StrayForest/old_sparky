@@ -85,9 +85,18 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertNotRegex(jobs["sanitize-live-report"], r"secrets\.PROD_SSH_")
         self.assertIn("download", jobs["sanitize-live-report"].lower())
         self.assertIn("steps.cleanup_ssh.outcome == 'success'", jobs["live-sanity"])
-        self.assertIn('handoff_dir="$RUNNER_TEMP/live-launch-input"', jobs["live-sanity"])
-        self.assertIn('rmdir -- "$handoff_dir"', jobs["live-sanity"])
+        self.assertIn('input_path="$RUNNER_TEMP/live-launch-input.json"', jobs["live-sanity"])
+        self.assertIn('rm -f -- "$input_path"', jobs["live-sanity"])
+        self.assertIn('test ! -e "$input_path"', jobs["live-sanity"])
+        self.assertNotIn("actions/checkout@", jobs["live-sanity"])
+        self.assertIn("HANDOFF_ARTIFACT_ID", jobs["live-sanity"])
+        self.assertNotIn("artifact-digest", jobs["live-sanity"])
+        self.assertIn('metadata.get("digest")', jobs["live-sanity"])
+        self.assertIn("MAX_ARCHIVE_BYTES", jobs["live-sanity"])
+        self.assertIn("ArtifactRedirect", jobs["live-sanity"])
         self.assertIn("trap cleanup_raw_report EXIT", jobs["live-sanity"])
+        self.assertIn("contents: none", jobs["live-sanity"])
+        self.assertIn("contents: read", jobs["validate-live-inputs"])
 
     def test_candidate_jobs_never_receive_production_ssh_secrets(self) -> None:
         candidate_markers = (

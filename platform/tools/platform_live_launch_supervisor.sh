@@ -9,7 +9,7 @@ export PYTHONDONTWRITEBYTECODE=1
 # never executed from a source checkout or active release tools directory.
 # The fixed root entrypoint has already verified the generation and holds the
 # canonical release lock for this complete provisioning/browser contour.
-if (( $# != 4 )); then
+if (( $# != 4 && $# != 6 )); then
   echo "Live browser supervisor received an invalid argument count" >&2
   exit 2
 fi
@@ -17,7 +17,14 @@ fi
 base_url="$1"
 provision="$2"
 marker="$3"
-target_sha="$4"
+runner_sha="$4"
+source_arguments=()
+if (( $# == 6 )); then
+  [[ "$5" == "--source-binding-base64" ]] \
+    || { echo "Live browser source-binding option is invalid" >&2; exit 2; }
+  source_arguments=("$5" "$6")
+fi
+app_target_sha="${PLATFORM_LIVE_QA_TARGET_SHA:-$runner_sha}"
 launch_stage="validation"
 # Keep the remote protocol on a dedicated descriptor.  Every ordinary
 # diagnostic and child output is discarded; the dispatcher accepts only this
@@ -32,11 +39,12 @@ emit_launch_status() {
     status="passed"
     stage="complete"
   fi
-  if [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] \
+  if [[ "$runner_sha" =~ ^[0-9a-f]{40}$ ]] \
+    && [[ "$app_target_sha" =~ ^[0-9a-f]{40}$ ]] \
     && [[ "$exit_code" =~ ^[0-9]{1,3}$ ]] \
     && (( exit_code <= 255 )); then
     printf 'LIVE_LAUNCH_STATUS schema=1 status=%s stage=%s child_exit=%s source_sha=%s\n' \
-      "$status" "$stage" "$exit_code" "$target_sha" >&3 || true
+      "$status" "$stage" "$exit_code" "$runner_sha" >&3 || true
   fi
 }
 trap 'launch_exit=$?; trap - EXIT; emit_launch_status "$launch_exit"' EXIT
@@ -51,14 +59,22 @@ test "$EUID" -eq 0 || {
   echo "Live browser supervisor must run as root" >&2
   exit 1
 }
-[[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] \
+[[ "$runner_sha" =~ ^[0-9a-f]{40}$ && "$app_target_sha" =~ ^[0-9a-f]{40}$ ]] \
   || { echo "Live browser QA requires an exact target SHA" >&2; exit 1; }
 [[ "$INSTALL_ROOT" =~ ^/root/\.oldsparky/liveqa/releases/[0-9a-f]{40}$ ]] \
   || { echo "Trusted live-QA install root is invalid" >&2; exit 1; }
 [[ "$base_url" == "$EXPECTED_ORIGIN" ]] \
   || { echo "Unexpected production origin" >&2; exit 1; }
-[[ "$INSTALL_ROOT" == "/root/.oldsparky/liveqa/releases/$target_sha" ]] \
+[[ "$INSTALL_ROOT" == "/root/.oldsparky/liveqa/releases/$app_target_sha" ]] \
   || { echo "Trusted live-QA install root does not match target SHA" >&2; exit 1; }
+if (( ${#source_arguments[@]} )); then
+  [[ "${PLATFORM_LIVE_QA_SOURCE_BINDING_BASE64:-}" == "${source_arguments[1]}" ]] \
+    || { echo "Live browser source-binding handoff changed" >&2; exit 1; }
+else
+  [[ "$app_target_sha" == "$runner_sha" \
+    && -z "${PLATFORM_LIVE_QA_SOURCE_BINDING_BASE64:-}" ]] \
+    || { echo "Same-source live browser identities differ" >&2; exit 1; }
+fi
 case "$provision" in
   true)
     [[ "$marker" =~ ^liveqa-[a-z0-9-]{6,56}$ ]] \
@@ -99,7 +115,8 @@ done
 # manifest here; it is root-installed in the same generation and its output is
 # deliberately discarded.  This protects direct/replayed supervisor calls.
 /usr/bin/python3.12 -I -B \
-  /root/.oldsparky/liveqa/platform_live_user_qa_dispatch.py verify "$target_sha"
+  /root/.oldsparky/liveqa/platform_live_user_qa_dispatch.py verify \
+  "$runner_sha" "${source_arguments[@]}"
 
 identity_report() {
   /usr/bin/python3.12 -I -B - <<'PY'
@@ -201,7 +218,8 @@ if [[ "$provision" == "true" ]]; then
     HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     PLATFORM_APP_DIR=/opt/oldsparky/platform \
     PLATFORM_LIVE_QA_INSTALL_ROOT="$INSTALL_ROOT" \
-    PLATFORM_LIVE_QA_TARGET_SHA="$target_sha" \
+    PLATFORM_LIVE_QA_TARGET_SHA="$app_target_sha" \
+    PLATFORM_LIVE_QA_RUNNER_SHA="$runner_sha" \
     "$TOOLS_DIR/platform_install_live_qa_user.sh" --apply
 
   for path in \
@@ -221,7 +239,8 @@ if [[ "$provision" == "true" ]]; then
     HOME=/root LANG=C.UTF-8 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     PLATFORM_APP_DIR=/opt/oldsparky/platform \
     PLATFORM_LIVE_QA_INSTALL_ROOT="$INSTALL_ROOT" \
-    PLATFORM_LIVE_QA_TARGET_SHA="$target_sha" \
+    PLATFORM_LIVE_QA_TARGET_SHA="$app_target_sha" \
+    PLATFORM_LIVE_QA_RUNNER_SHA="$runner_sha" \
     "$TOOLS_DIR/platform_provision_live_csp_qa.sh" \
       --marker "$marker" \
       --bundle-path /root/.oldsparky/liveqa/csp-live-qa.json \
@@ -238,6 +257,7 @@ env -i \
   PLATFORM_APP_DIR=/opt/oldsparky/platform \
   PLATFORM_LIVE_CSP_QA_BUNDLE="$BUNDLE" \
   PLATFORM_LIVE_QA_INSTALL_ROOT="$INSTALL_ROOT" \
-  PLATFORM_LIVE_QA_TARGET_SHA="$target_sha" \
+  PLATFORM_LIVE_QA_TARGET_SHA="$app_target_sha" \
+  PLATFORM_LIVE_QA_RUNNER_SHA="$runner_sha" \
   PLAYWRIGHT_LIVE_BASE_URL="$base_url" \
   "$TOOLS_DIR/platform_live_browser_qa.sh" public

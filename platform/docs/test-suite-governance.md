@@ -278,7 +278,7 @@ capture and closed stdout/public markers; the executable catalog snapshot tracks
 Privileged release tests prove promoted dependencies stay readable, relocation removes only wheel/RECORD-bound generated caches, cleanup is receipt/readiness/cgroup-bound, and runtime summaries stay out of deployment markers.
 Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused.
 A proof miss uses the existing fresh-venv snapshot path. These root-owned cases remain in `backend-privileged`; bootstrap extraction tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
-The canonical AST snapshot is 1,725 tests (1,653 backend, including 555 privileged) across 163 modules, with every ID assigned exactly once.
+The canonical AST snapshot is 1,779 tests (1,707 backend, including 565 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 291, tool-contract 421, integration 255, privileged 565, and performance-contract 175.
 Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
 
@@ -288,8 +288,7 @@ a production gate. Its validator and bundle tests belong to `backend-tool-contra
 root-owned release metadata and belongs to `backend-privileged`; catalog snapshots track both.
 The verification-contract gate invokes `host_tools_candidate_workflow_issues()` so default-branch
 guards, narrow permissions, pinned actions, data-only candidate handling, isolated-Python use,
-TOCTOU rechecks and production artifact isolation fail closed. The workflow returns a successful
-no-op for a base-reachable pin; only a novel eligible pin reaches build, attestation and upload.
+TOCTOU rechecks and production artifact isolation fail closed. The workflow returns a successful no-op for a base-reachable pin; only a novel eligible pin reaches build, attestation and upload. `test_platform_noop_source_binding` belongs to `backend-tool-contract`: its hermetic cases validate the closed no-op receipt, distinct runner/application SHA binding, authenticated artifact metadata, bounded archive extraction, and redirect credential handling without production access.
 That output is review evidence only: it grants no deploy/provision authority, and production
 workflows must not consume its artifact prefixes.
 

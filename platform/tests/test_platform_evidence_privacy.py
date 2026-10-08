@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from io import BytesIO, StringIO
+import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -51,6 +53,123 @@ def serialized(value: object) -> str:
 
 
 class EvidencePrivacyTests(unittest.TestCase):
+    def test_external_load_source_identity_is_closed_and_digest_bound(self) -> None:
+        binding: dict[str, object] = {
+            "schema": 1,
+            "binding_mode": "verified-noop",
+            "runner_sha": "a" * 40,
+            "app_target_sha": "b" * 40,
+            "baseline_identity": {
+                "schema": 1,
+                "source_sha": "b" * 40,
+                "release_slug": "gha-123456-1-bbbbbbbbbbbb",
+                "release_json_sha256": "c" * 64,
+                "current_link_dev": 100,
+                "current_link_ino": 101,
+                "release_dev": 100,
+                "release_ino": 102,
+                "pending_operation": False,
+            },
+            "receipt_document_sha256": "d" * 64,
+            "receipt_artifact_id": "456789",
+            "receipt_artifact_name": "platform-production-noop-source-receipt-123456-2",
+            "receipt_artifact_digest": "sha256:" + "e" * 64,
+            "receipt_archive_sha256": "e" * 64,
+            "cumulative_manifest_sha256": "f" * 64,
+            "source_security_run_id": "234567",
+            "source_security_run_attempt": "1",
+            "autodeploy_run_id": "345678",
+            "autodeploy_run_attempt": "3",
+            "production_deploy_run_id": "123456",
+            "production_deploy_run_attempt": "2",
+        }
+        canonical = json.dumps(
+            binding, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+        digest = hashlib.sha256(canonical).hexdigest()
+        source: dict[str, object] = {
+            "source_git_sha": "a" * 40,
+            "app_target_sha": "b" * 40,
+            "source_binding": binding,
+            "source_binding_sha256": digest,
+            "report_binding": {
+                "checks": {
+                    "source_git_sha": True,
+                    "app_target_sha": True,
+                    "source_binding": True,
+                    "source_binding_sha256": True,
+                }
+            },
+            "acceptance": {"passed": False, "decision": "SLO FAIL"},
+        }
+
+        projected = project_public_artifact("external_load", source)
+        self.assertEqual(projected["source_git_sha"], "a" * 40)
+        self.assertEqual(projected["app_target_sha"], "b" * 40)
+        self.assertEqual(projected["source_binding"], binding)
+        self.assertEqual(projected["source_binding_sha256"], digest)
+        self.assertFalse(projected["acceptance"]["passed"])
+
+        same_source = {
+            **source,
+            "app_target_sha": "a" * 40,
+            "source_binding": None,
+            "source_binding_sha256": None,
+        }
+        same_source["report_binding"] = {
+            "checks": {
+                "source_git_sha": True,
+                "app_target_sha": True,
+                "source_binding": True,
+                "source_binding_sha256": True,
+            }
+        }
+        projected_same_source = project_public_artifact("external_load", same_source)
+        self.assertEqual(projected_same_source["source_git_sha"], "a" * 40)
+        self.assertEqual(projected_same_source["app_target_sha"], "a" * 40)
+        self.assertIsNone(projected_same_source["source_binding"])
+
+        mutations: list[dict[str, object]] = []
+        forged_app = copy.deepcopy(source)
+        forged_app["app_target_sha"] = "a" * 40
+        mutations.append(forged_app)
+        bad_digest = copy.deepcopy(source)
+        bad_digest["source_binding_sha256"] = "0" * 64
+        mutations.append(bad_digest)
+        for field, value in (
+            ("unknown", "extension"),
+            ("app_target_sha", "a" * 40),
+            ("receipt_artifact_id", True),
+        ):
+            invalid_binding = copy.deepcopy(binding)
+            invalid_binding[field] = value
+            invalid_source = copy.deepcopy(source)
+            invalid_source["source_binding"] = invalid_binding
+            invalid_source["source_binding_sha256"] = hashlib.sha256(
+                json.dumps(
+                    invalid_binding,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+            ).hexdigest()
+            mutations.append(invalid_source)
+        false_check = copy.deepcopy(source)
+        false_check["report_binding"]["checks"]["source_binding"] = False  # type: ignore[index]
+        mutations.append(false_check)
+        for index, invalid_source in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                project_public_artifact("external_load", invalid_source)
+
+        # The old report schema may contain only runner provenance. It remains
+        # omitted instead of exposing an unverified identity value.
+        legacy = project_public_artifact(
+            "external_load",
+            {"source_git_sha": "a" * 40, "report_binding": {"checks": {"run_identity": True}}},
+        )
+        self.assertNotIn("source_git_sha", legacy)
+
     def test_server_observability_projects_only_safe_request_perf_sampling_fields(
         self,
     ) -> None:

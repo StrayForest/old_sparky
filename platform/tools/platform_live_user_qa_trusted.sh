@@ -12,11 +12,22 @@ export PYTHONDONTWRITEBYTECODE=1
 TRUSTED_ROOT="/root/.oldsparky/liveqa"
 DISPATCHER="$TRUSTED_ROOT/platform_live_user_qa_dispatch.py"
 BUNDLE="$TRUSTED_ROOT/csp-live-qa.json"
-TARGET_SHA="${PLATFORM_LIVE_QA_TARGET_SHA:-}"
+APP_TARGET_SHA="${PLATFORM_LIVE_QA_TARGET_SHA:-}"
+RUNNER_SHA="${PLATFORM_LIVE_QA_RUNNER_SHA:-$APP_TARGET_SHA}"
+SOURCE_BINDING="${PLATFORM_LIVE_QA_SOURCE_BINDING_BASE64:-}"
 RELEASE_LOCK_EXEC="$TRUSTED_ROOT/platform_release_lock_exec.sh"
+SOURCE_ARGUMENTS=()
+if [[ -n "$SOURCE_BINDING" ]]; then
+  SOURCE_ARGUMENTS=(--source-binding-base64 "$SOURCE_BINDING")
+fi
 
-if [[ "$EUID" -ne 0 || ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+if [[ "$EUID" -ne 0 || ! "$APP_TARGET_SHA" =~ ^[0-9a-f]{40}$ \
+  || ! "$RUNNER_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Trusted live-user QA requires root and an exact target SHA." >&2
+  exit 1
+fi
+if [[ -z "$SOURCE_BINDING" && "$RUNNER_SHA" != "$APP_TARGET_SHA" ]]; then
+  echo "Live-user runner and app identity differ without a verified binding." >&2
   exit 1
 fi
 if [[ ! -f "$DISPATCHER" || -L "$DISPATCHER" || ! -x "$DISPATCHER" ]]; then
@@ -35,10 +46,11 @@ fi
 # Verify the active generation, root entrypoints and complete payload before
 # opening the release lock.  The verifier itself is root-installed and
 # digest-bound; no candidate/current/tools helper is crossed here.
-/usr/bin/python3.12 -I -B "$DISPATCHER" verify "$TARGET_SHA"
+/usr/bin/python3.12 -I -B "$DISPATCHER" verify "$RUNNER_SHA" "${SOURCE_ARGUMENTS[@]}"
 
 # Hold the canonical release lock for the complete credential-bearing QA
 # contour, including its exact cleanup/recovery work.  The guard validates
 # that this active release names TARGET_SHA before entering the dispatcher.
-exec "$RELEASE_LOCK_EXEC" --expected-sha "$TARGET_SHA" -- \
-  /usr/bin/python3.12 -I -B "$DISPATCHER" run "$TARGET_SHA" "$@"
+exec "$RELEASE_LOCK_EXEC" --expected-sha "$APP_TARGET_SHA" -- \
+  /usr/bin/python3.12 -I -B "$DISPATCHER" run-locked \
+  "$RUNNER_SHA" "${SOURCE_ARGUMENTS[@]}" "$@"

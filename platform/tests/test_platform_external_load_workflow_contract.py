@@ -503,7 +503,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             for block in blocks
             if "metadata_path, archive_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]" in block
         ]
-        self.assertEqual(len(scripts), 4)
+        self.assertEqual(len(scripts), 3)
 
         archive_bytes = b"synthetic artifact bytes bound to the API metadata"
         expected_digest = "sha256:" + hashlib.sha256(archive_bytes).hexdigest()
@@ -648,6 +648,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             def evaluator_env(source_sha: str = target_sha) -> dict[str, str]:
                 resolved = {
                     "SOURCE_GIT_SHA": source_sha,
+                    "APP_TARGET_SHA": source_sha,
                     "PROFILE_ID": "ready-vote-slo-v2",
                     "TIMEOUT_DIAGNOSTICS": "false",
                     "INPUT_ARTIFACT_ID": "4815162341",
@@ -706,7 +707,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 if step.get("name") == "Evaluate checked-out load report"
             )
             status_match = re.search(
-                r'if /usr/bin/python3 - "\$load_status_file" "\$report" "\$(?P<sha_env>[A-Z_]+)" '
+                r'if /usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$(?P<sha_env>[A-Z_]+)" "\$APP_TARGET_SHA" '
                 r'"\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
                 r"(?P<script>.*?)\nPY",
                 evaluate_step["run"],
@@ -719,16 +720,33 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertIn(sha_env, env)
             self.assertEqual(sha_env, "SOURCE_GIT_SHA")
             report_path = root / "candidate-report.json"
-            report_bytes = b"{}\n"
+            report_bytes = json.dumps(
+                {
+                    "source_git_sha": target_sha,
+                    "app_target_sha": target_sha,
+                    "source_binding": None,
+                    "source_binding_sha256": None,
+                },
+                sort_keys=True,
+            ).encode("ascii") + b"\n"
             report_path.write_bytes(report_bytes)
+            source_input_path = root / "platform-production-external-load-input.json"
+            source_input_path.write_text(
+                json.dumps({"target_sha": target_sha, "source_binding": None}),
+                encoding="ascii",
+            )
             status_path = root / "load-status.json"
             receipt = {
-                "schema": 2,
+                "schema": 3,
                 "status": 0,
                 "client_exit_status": 3,
                 "candidate_state": "pending_origin",
                 "report_ready": True,
                 "target_sha": target_sha,
+                "runner_sha": target_sha,
+                "app_target_sha": target_sha,
+                "source_binding": None,
+                "source_binding_sha256": None,
                 "run_id": run_id,
                 "run_attempt": attempt,
                 "profile_id": "ready-vote-slo-v2",
@@ -745,7 +763,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         textwrap.dedent(status_match.group("script")),
                         str(status_path),
                         str(report_path),
+                        str(source_input_path),
                         env[sha_env],
+                        env["APP_TARGET_SHA"],
                         run_id,
                         attempt,
                         "ready-vote-slo-v2",
@@ -907,7 +927,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             )
 
         finalizer = self.jobs["fixture-finalize"]
-        self.assertIn('"$cleanup_input_path" "$TARGET_SHA" "$GITHUB_RUN_ID"', finalizer)
+        self.assertIn(
+            '"$cleanup_input_path" "$input_path" "$TARGET_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID"',
+            finalizer,
+        )
         self.assertIn('control_email_path.read_text(encoding="ascii")', finalizer)
         self.assertNotRegex(finalizer, r'python3\s+-[^\n]*\$\{?CONTROL_EMAIL')
         self.assertIn('"$RUNNER_TEMP/platform-production-control-email"', self.jobs["validate-external-inputs"])
@@ -1020,6 +1043,21 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     root = Path(temporary)
                     event_path = root / "event.json"
                     output_path = root / "platform-retained-cleanup-input.json"
+                    binding_dir = root / "retained-cleanup-source-binding"
+                    binding_dir.mkdir(mode=0o700)
+                    binding_path = binding_dir / "source-binding.json"
+                    binding_path.write_text(
+                        json.dumps(
+                            {
+                                "schema": 1,
+                                "runner_sha": "a" * 40,
+                                "app_target_sha": "a" * 40,
+                                "source_binding": None,
+                            },
+                            separators=(",", ":"),
+                        ),
+                        encoding="ascii",
+                    )
                     event_contents = json.dumps(event) if serialize_event else event
                     event_path.write_text(event_contents, encoding="utf-8")
                     result = subprocess.run(
@@ -1032,6 +1070,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                             "QA_CONFIRMATION": "DELETE-PRODUCTION-RETAINED-LOAD",
                             "LOAD_RUN_ID": "123456",
                             "TARGET_SHA": "a" * 40,
+                            "APP_TARGET_SHA": "a" * 40,
+                            "SOURCE_BINDING_ARTIFACT_ID": "654321",
+                            "SOURCE_BINDING_ARTIFACT_DIGEST": "sha256:" + "c" * 64,
                             "RUNNER_TEMP": str(root),
                         },
                         capture_output=True,
@@ -1094,6 +1135,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     "QA_CONFIRMATION": "WRONG-CONFIRMATION",
                     "LOAD_RUN_ID": "123456",
                     "TARGET_SHA": "a" * 40,
+                    "APP_TARGET_SHA": "a" * 40,
+                    "SOURCE_BINDING_ARTIFACT_ID": "654321",
+                    "SOURCE_BINDING_ARTIFACT_DIGEST": "sha256:" + "c" * 64,
                     "RUNNER_TEMP": str(root),
                 },
                 capture_output=True,
@@ -1137,6 +1181,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                             "QA_CONFIRMATION": "DELETE-PRODUCTION-RETAINED-LOAD",
                             "LOAD_RUN_ID": "123456",
                             "TARGET_SHA": "a" * 40,
+                            "APP_TARGET_SHA": "a" * 40,
+                            "SOURCE_BINDING_ARTIFACT_ID": "654321",
+                            "SOURCE_BINDING_ARTIFACT_DIGEST": "sha256:" + "c" * 64,
                             "RUNNER_TEMP": str(root),
                         },
                         capture_output=True,
@@ -1192,7 +1239,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn("upstream_ready=0", evaluator)
         self.assertIn('needs.load-client.outputs.report_ready }}\" == 1', evaluator)
         self.assertIn('payload.get("status") != 0', evaluator)
-        self.assertIn('payload.get("schema") != 2', evaluator)
+        self.assertIn('payload.get("schema") != 3', evaluator)
         self.assertIn('state == "pending_origin" and raw_status == 3 and timeout_diagnostics == "false"', evaluator)
         self.assertIn('state == "produced" and raw_status == 0', evaluator)
         self.assertIn('TIMEOUT_DIAGNOSTICS" != true && "$load_status" == 3', self.jobs["load-client"])
@@ -1252,7 +1299,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.jobs["evaluate-load"], "Evaluate checked-out load report"
         )
         receipt_verifier = re.search(
-            r"<<'PY'\n(.*?)\nPY", evaluate_script, re.DOTALL
+            r'if /usr/bin/python3 - "\$load_status_file" "\$report" "\$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "\$SOURCE_GIT_SHA" "\$APP_TARGET_SHA" "\$GITHUB_RUN_ID" "\$GITHUB_RUN_ATTEMPT" "\$PROFILE_ID" "\$TIMEOUT_DIAGNOSTICS" <<\'PY\'\n'
+            r"(?P<script>.*?)\nPY",
+            evaluate_script,
+            re.DOTALL,
         )
         self.assertIsNotNone(receipt_verifier)
         assert receipt_verifier is not None
@@ -1260,15 +1310,33 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             root = Path(temp)
             report = root / "report.json"
             receipt = root / "load-status.json"
-            report_bytes = b'{"schema":2,"candidate":true}\n'
+            source_input = root / "source-input.json"
+            target_sha = "a" * 40
+            report_bytes = json.dumps(
+                {
+                    "source_git_sha": target_sha,
+                    "app_target_sha": target_sha,
+                    "source_binding": None,
+                    "source_binding_sha256": None,
+                },
+                sort_keys=True,
+            ).encode("ascii") + b"\n"
             report.write_bytes(report_bytes)
+            source_input.write_text(
+                json.dumps({"target_sha": target_sha, "source_binding": None}),
+                encoding="ascii",
+            )
             payload = {
-                "schema": 2,
+                "schema": 3,
                 "status": 0,
                 "client_exit_status": 3,
                 "candidate_state": "pending_origin",
                 "report_ready": True,
-                "target_sha": "a" * 40,
+                "target_sha": target_sha,
+                "runner_sha": target_sha,
+                "app_target_sha": target_sha,
+                "source_binding": None,
+                "source_binding_sha256": None,
                 "run_id": "12345",
                 "run_attempt": "1",
                 "profile_id": "authenticated-page-load-v1",
@@ -1284,10 +1352,12 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                     [
                         sys.executable,
                         "-c",
-                        receipt_verifier.group(1),
+                        receipt_verifier.group("script"),
                         str(receipt),
                         str(report),
+                        str(source_input),
                         payload["target_sha"],
+                        payload["app_target_sha"],
                         payload["run_id"],
                         payload["run_attempt"],
                         payload["profile_id"],
@@ -1305,7 +1375,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 0,
             )
             self.assertNotEqual(
-                verify(text=json.dumps(payload)[:-1] + ',"schema":2}').returncode,
+                verify(text=json.dumps(payload)[:-1] + ',"schema":3}').returncode,
                 0,
             )
             report.write_bytes(report_bytes + b"tampered")

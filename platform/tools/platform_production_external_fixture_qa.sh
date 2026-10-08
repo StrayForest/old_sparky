@@ -52,7 +52,14 @@ platform_retained_load_lock_open || {
   exit 1
 }
 trap platform_retained_load_lock_close EXIT
-if (( $# != 7 && $# != 8 )); then
+source_binding_b64=""
+if (( $# == 10 )); then
+  [[ "${9}" == "--source-binding-base64" ]] || {
+    echo "Source-binding option is invalid." >&2
+    exit 2
+  }
+  source_binding_b64="${10}"
+elif (( $# != 7 && $# != 8 )); then
   echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path]" >&2
   exit 2
 fi
@@ -74,6 +81,21 @@ timeout_diagnostics="${8:-false}"
   echo "Target SHA must be a lowercase 40-character commit SHA." >&2
   exit 1
 }
+app_target_sha="$target_sha"
+if [[ -n "$source_binding_b64" ]]; then
+  binding_marker="$("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_noop_source_binding.py" \
+    validate-active-runtime-binding "$target_sha" "$source_binding_b64")" || {
+    echo "Active source-binding tuple does not match the fixture release." >&2
+    exit 1
+  }
+  if [[ "$binding_marker" =~ ^ACTIVE_RUNTIME_BINDING\ schema=1\ status=matched\ runner_sha=([0-9a-f]{40})\ app_target_sha=([0-9a-f]{40})$ ]] \
+    && [[ "${BASH_REMATCH[1]}" == "$target_sha" ]]; then
+    app_target_sha="${BASH_REMATCH[2]}"
+  else
+    echo "Active source-binding response is invalid." >&2
+    exit 1
+  fi
+fi
 unset control_email
 control_email="$("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" \
   control-email-json-stdin)" || {
@@ -136,8 +158,8 @@ payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 print(payload.get("source_git_commit", ""))
 PY
 )"
-test "$release_sha" = "$target_sha" || {
-  echo "Active production release does not match the dispatched target SHA." >&2
+test "$release_sha" = "$app_target_sha" || {
+  echo "Active production release does not match the validated app target SHA." >&2
   exit 1
 }
 
@@ -246,6 +268,10 @@ external_vote_ready="$export_dir/ready"
 external_vote_observer_output="$external_vote_root/server-observability.json"
 external_vote_observer_log="$external_vote_root/server-observer.log"
 timeout_diagnostic_ids_path="$export_dir/timeout-diagnostic-ids.json"
+fixture_source_binding_args=(--runner-sha "$target_sha")
+if [[ -n "$source_binding_b64" ]]; then
+  fixture_source_binding_args+=(--source-binding-base64 "$source_binding_b64")
+fi
 
 set +e
 timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
@@ -260,6 +286,7 @@ timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
     --users-per-tournament "$external_vote_users_per_tournament" \
     --concurrency "$concurrency" \
     --http-timeout 30 \
+    "${fixture_source_binding_args[@]}" \
     > "$run_root/qa-command.log" 2>&1
 qa_status="$?"
 set -e

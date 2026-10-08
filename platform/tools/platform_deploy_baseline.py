@@ -433,12 +433,13 @@ def classify_cumulative_baseline(
 
 
 def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
-    """Validate the two authenticated baseline-reconcile route families.
+    """Validate the authenticated baseline-reconcile route families.
 
-    A reconcile can either prove the established runtime-sensitive no-op, or
-    carry a canonical deployable full cumulative manifest. Keep these routes
-    disjoint: no-op routes never build an application release, and a real
-    cumulative release is accepted only with every full gate and no fallback.
+    A no-op is allowed only for an exact canonical source family: the
+    established storage-plus-recovery family, pure recovery-bootstrap, or
+    pure candidate-packaging. A no-op never authorizes an application release.
+    A real cumulative release is accepted only with every full gate and no
+    fallback.
     """
 
     if not isinstance(route, Mapping) or set(route) != {"manifest", "no_op"}:
@@ -456,8 +457,55 @@ def validate_cumulative_reconcile_route(route: object) -> dict[str, bool]:
     ):
         raise ProvenanceError("cumulative classifier route is not canonical full verification")
     if no_op:
-        if manifest["runtime_sensitive"] is not True:
-            raise ProvenanceError("cumulative no-op route is not runtime-sensitive")
+        files = manifest.get("files")
+        target_sha = manifest.get("target_sha")
+        if (
+            not isinstance(files, list)
+            or not files
+            or any(not isinstance(path, str) for path in files)
+            or not isinstance(target_sha, str)
+            or SHA_RE.fullmatch(target_sha) is None
+        ):
+            raise ProvenanceError("cumulative no-op manifest path set is malformed")
+        try:
+            canonical = classify(
+                files,
+                event="push",
+                branch="dev",
+                target_sha=target_sha,
+                repository_ready=True,
+            )
+        except ClassifierError as exc:
+            raise ProvenanceError("cumulative no-op manifest cannot be reclassified") from exc
+        if canonical != dict(manifest):
+            raise ProvenanceError("cumulative no-op manifest is not the canonical path classification")
+
+        recovery_family = bool(
+            any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
+            and all(path in RECOVERY_BOOTSTRAP_FILES or path.startswith(DOCS_PREFIX) for path in files)
+            and manifest.get("reason") == RECOVERY_BOOTSTRAP_REASON
+            and manifest["deployable"] is False
+        )
+        candidate_family = bool(
+            any(path in CANDIDATE_PACKAGING_FILES for path in files)
+            and all(path in CANDIDATE_PACKAGING_FILES or path.startswith(DOCS_PREFIX) for path in files)
+            and manifest.get("reason") == CANDIDATE_PACKAGING_REASON
+            and manifest["runtime_sensitive"] is False
+            and manifest["deployable"] is False
+        )
+        storage_recovery_family = bool(
+            any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
+            and any(path in STORAGE_OPERATIONS_TRIGGER_FILES for path in files)
+            and all(
+                path in STORAGE_OPERATIONS_FILES
+                or path in RECOVERY_BOOTSTRAP_FILES
+                or path.startswith(DOCS_PREFIX)
+                for path in files
+            )
+            and manifest["runtime_sensitive"] is True
+        )
+        if sum((recovery_family, candidate_family, storage_recovery_family)) != 1:
+            raise ProvenanceError("cumulative no-op route is outside the exact authorized file families")
         return {"no_op": True, "runtime_required": False}
     if manifest["deployable"] is not True:
         raise ProvenanceError("cumulative non-no-op route is not deployable")

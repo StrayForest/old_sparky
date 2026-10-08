@@ -9,13 +9,16 @@ against the active release metadata before the browser/mailbox helper starts.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import importlib.util
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 
 
@@ -449,6 +452,154 @@ def _verify_install(target_sha: str) -> dict[str, object]:
     return manifest
 
 
+def _source_binding_context(
+    runner_sha: str, arguments: list[str]
+) -> tuple[str, dict[str, object] | None, str | None]:
+    """Decode a bounded, canonical suffix to select the installed app payload."""
+
+    if SHA_RE.fullmatch(runner_sha) is None:
+        raise RuntimeError("runner source identity is invalid")
+    if not arguments:
+        return runner_sha, None, None
+    if len(arguments) != 2 or arguments[0] != "--source-binding-base64":
+        raise RuntimeError("live-QA source-binding arguments are invalid")
+    encoded = arguments[1]
+    try:
+        maximum_encoded = 4 * ((16 * 1024 + 2) // 3)
+        if not encoded.isascii() or not encoded or len(encoded) > maximum_encoded:
+            raise ValueError("binding argument is oversized")
+        raw = base64.b64decode(encoded, validate=True)
+        if not raw or len(raw) > 16 * 1024:
+            raise ValueError("binding document is oversized")
+        binding = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+        canonical = json.dumps(
+            binding,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        if not isinstance(binding, dict) or raw != canonical:
+            raise ValueError("binding document is not canonical")
+        app_target_sha = binding.get("app_target_sha")
+        if not isinstance(app_target_sha, str) or SHA_RE.fullmatch(app_target_sha) is None:
+            raise ValueError("app target is invalid")
+        if (
+            binding.get("schema") != 1
+            or binding.get("binding_mode") != "verified-noop"
+            or binding.get("runner_sha") != runner_sha
+            or app_target_sha == runner_sha
+            or not isinstance(binding.get("baseline_identity"), dict)
+            or binding["baseline_identity"].get("source_sha") != app_target_sha
+        ):
+            raise ValueError("binding identity is invalid")
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError("live-QA source binding failed closed validation") from exc
+    return app_target_sha, binding, encoded
+
+
+def _load_verified_remote_dispatcher(
+    manifest: dict[str, object],
+) -> object:
+    """Load the C2 validator only after the app manifest binds its exact bytes."""
+
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not isinstance(files.get("platform/tools/platform_workflow_remote_dispatch.py"), str):
+        raise RuntimeError("installed C2 dispatcher is absent from the live-QA manifest")
+    metadata = _regular(
+        REMOTE_DISPATCHER,
+        mode=0o555,
+        maximum=MAX_PAYLOAD_FILE_BYTES,
+    )
+    if metadata.st_nlink != 1 or _open_and_hash(
+        REMOTE_DISPATCHER, maximum=MAX_PAYLOAD_FILE_BYTES
+    ) != files["platform/tools/platform_workflow_remote_dispatch.py"]:
+        raise RuntimeError("installed C2 dispatcher differs from the active app manifest")
+    spec = importlib.util.spec_from_file_location(
+        "_verified_platform_workflow_remote_dispatch",
+        REMOTE_DISPATCHER,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("installed C2 dispatcher cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _validate_source_binding_schema(
+    remote_dispatcher: object,
+    runner_sha: str,
+    app_target_sha: str,
+    binding: dict[str, object] | None,
+) -> dict[str, object] | None:
+    payload: dict[str, object] = {"target_sha": runner_sha}
+    if binding is not None:
+        payload["source_binding"] = binding
+    try:
+        active_app_sha, baseline, _arguments = remote_dispatcher._source_binding_context(payload)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("C2 source-binding validation failed") from exc
+    if active_app_sha != app_target_sha:
+        raise RuntimeError("C2 source-binding app target differs from installed app")
+    return baseline
+
+
+def _validate_source_binding_under_lock(
+    remote_dispatcher: object,
+    runner_sha: str,
+    app_target_sha: str,
+    binding: dict[str, object] | None,
+) -> None:
+    """Re-read and compare the complete release tuple while the lock is held."""
+
+    try:
+        actual = remote_dispatcher._release_baseline()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError("active live-QA release tuple is unavailable") from exc
+    if binding is None:
+        if runner_sha != app_target_sha or actual.get("source_sha") != app_target_sha:
+            raise RuntimeError("same-source live-QA binding is inconsistent")
+        return
+    try:
+        validated_app_sha, expected_baseline, _arguments = remote_dispatcher._source_binding_context(
+            {"target_sha": runner_sha, "source_binding": binding}
+        )
+        matches = remote_dispatcher._baseline_identity_matches(expected_baseline, actual)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("active live-QA release tuple changed") from exc
+    if validated_app_sha != app_target_sha or not matches:
+        raise RuntimeError("active live-QA release tuple differs from the authenticated binding")
+
+
+def _require_release_lock_supervisor() -> None:
+    """Prove the canonical lock is held using the manifest-bound lock helper.
+
+    The environment marker is only a routing hint.  This fixed Bash invocation
+    reuses the installed lock helper's ancestor, /proc/locks, and inode checks;
+    it does not acquire or nest another flock.
+    """
+
+    _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
+    metadata = _regular(RELEASE_LOCK, mode=0o444, maximum=MAX_PAYLOAD_FILE_BYTES)
+    if metadata.st_nlink != 1:
+        raise RuntimeError("canonical release lock helper metadata is unsafe")
+    script = 'source "$1" && platform_release_lock_supervisor_holds'
+    try:
+        result = subprocess.run(
+            ["/usr/bin/bash", "-c", script, "platform-release-lock-check", str(RELEASE_LOCK)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={"HOME": "/root", "LANG": "C.UTF-8", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("canonical release lock supervisor could not be checked") from exc
+    if result.returncode != 0:
+        raise RuntimeError("canonical release lock is not held by its supervisor")
+
+
 def _validate_bundle_and_mailbox() -> None:
     """Validate every secret-bearing input before executing the supervisor."""
 
@@ -553,36 +704,158 @@ def _validate_bundle_and_mailbox() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    verify_only = len(arguments) == 2 and arguments[0] == "verify"
-    run_user_mode = len(arguments) >= 2 and arguments[0] == "run"
-    run_launch_mode = len(arguments) == 5 and arguments[0] == "run-launch"
-    run_mode = run_user_mode or run_launch_mode
-    if not verify_only and not run_mode:
+    if arguments and SHA_RE.fullmatch(arguments[0]):
+        mode = "direct-user"
+        runner_sha = arguments[0]
+        suffix = arguments[1:]
+        payload_args: list[str] = []
+        base_url = "https://old-sparky.com"
+        provision = "false"
+        marker = ""
+    elif len(arguments) >= 2 and arguments[0] in {"resolve", "verify", "run", "run-locked", "run-launch"}:
+        mode = arguments[0]
+        runner_sha = arguments[1]
+        tail = arguments[2:]
+        if mode == "run-launch":
+            if len(tail) not in {3, 5}:
+                return 2
+            base_url, provision, marker = tail[:3]
+            suffix = tail[3:]
+            payload_args = []
+        else:
+            suffix = tail[:2] if tail and tail[0] == "--source-binding-base64" else []
+            payload_args = tail[2:] if suffix else (tail if mode == "run" else [])
+            if (mode in {"resolve", "verify", "run-locked"} and tail and not suffix):
+                return 2
+            base_url = "https://old-sparky.com"
+            provision = "false"
+            marker = ""
+    else:
         return 2
-    target_sha = arguments[1]
-    if SHA_RE.fullmatch(target_sha) is None:
+    if SHA_RE.fullmatch(runner_sha) is None:
+        return 2
+    try:
+        app_target_sha, source_binding, encoded_binding = _source_binding_context(
+            runner_sha, suffix
+        )
+    except RuntimeError:
+        return 2
+    if mode == "run-launch" and (
+        base_url != "https://old-sparky.com"
+        or provision not in {"true", "false"}
+        or (provision == "true" and MARKER_RE.fullmatch(marker) is None)
+        or (provision == "false" and marker != "")
+    ):
         return 2
     try:
         if os.geteuid() != 0:
             return 1
-        _verify_install(target_sha)
-        if verify_only:
+        manifest = _verify_install(app_target_sha)
+        remote_dispatcher = _load_verified_remote_dispatcher(manifest)
+        _validate_source_binding_schema(
+            remote_dispatcher,
+            runner_sha,
+            app_target_sha,
+            source_binding,
+        )
+        if mode == "direct-user":
+            _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
+            source_arguments = (
+                [] if encoded_binding is None
+                else ["--source-binding-base64", encoded_binding]
+            )
+            os.execve(
+                str(RELEASE_LOCK_EXEC),
+                [
+                    str(RELEASE_LOCK_EXEC),
+                    "--app-dir",
+                    str(RUNTIME),
+                    "--expected-sha",
+                    app_target_sha,
+                    "--",
+                    "/usr/bin/python3.12",
+                    "-I",
+                    "-B",
+                    str(Path(__file__).resolve()),
+                    "run-locked",
+                    runner_sha,
+                    *source_arguments,
+                ],
+                {
+                    "HOME": "/root",
+                    "LANG": "C.UTF-8",
+                    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                },
+            )
             return 0
+        if mode == "run":
+            _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
+            source_arguments = (
+                [] if encoded_binding is None
+                else ["--source-binding-base64", encoded_binding]
+            )
+            os.execve(
+                str(RELEASE_LOCK_EXEC),
+                [
+                    str(RELEASE_LOCK_EXEC),
+                    "--app-dir",
+                    str(RUNTIME),
+                    "--expected-sha",
+                    app_target_sha,
+                    "--",
+                    "/usr/bin/python3.12",
+                    "-I",
+                    "-B",
+                    str(Path(__file__).resolve()),
+                    "run-locked",
+                    runner_sha,
+                    *source_arguments,
+                ],
+                {
+                    "HOME": "/root",
+                    "LANG": "C.UTF-8",
+                    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                },
+            )
+            return 0
+        if mode in {"resolve", "verify"}:
+            if mode == "resolve":
+                print(
+                    "LIVE_SOURCE_BINDING schema=1 "
+                    f"runner_sha={runner_sha} app_target_sha={app_target_sha}"
+                )
+            return 0
+        if mode in {"run-locked", "run-launch"}:
+            if os.environ.get("PLATFORM_RELEASE_LOCK_SUPERVISED") != "1":
+                return 1
+            _require_release_lock_supervisor()
+            _validate_source_binding_under_lock(
+                remote_dispatcher,
+                runner_sha,
+                app_target_sha,
+                source_binding,
+            )
         _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
-        manifest = _read_manifest(target_sha)
+        manifest = _read_manifest(app_target_sha)
         payload = Path(str(manifest["payload"]))
-        if run_launch_mode:
-            base_url, provision, marker = arguments[2:]
-            if base_url != "https://old-sparky.com":
-                return 2
-            if provision == "true":
-                if MARKER_RE.fullmatch(marker) is None:
-                    return 2
-            elif provision == "false":
-                if marker != "":
-                    return 2
-            else:
-                return 2
+        encoded_digest = (
+            None
+            if encoded_binding is None
+            else hashlib.sha256(
+                json.dumps(
+                    source_binding,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+            ).hexdigest()
+        )
+        source_arguments = (
+            [] if encoded_binding is None
+            else ["--source-binding-base64", encoded_binding]
+        )
+        if mode == "run-launch":
             wrapper = payload / "platform/tools/platform_live_launch_supervisor.sh"
             _regular(wrapper, mode=0o555, maximum=MAX_PAYLOAD_FILE_BYTES)
             environment = {
@@ -591,13 +864,20 @@ def main(argv: list[str] | None = None) -> int:
                 "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
                 "PLATFORM_APP_DIR": str(RUNTIME),
                 "PLATFORM_LIVE_CSP_QA_BUNDLE": str(BUNDLE),
-                "PLATFORM_LIVE_QA_TARGET_SHA": target_sha,
+                "PLATFORM_LIVE_QA_TARGET_SHA": app_target_sha,
+                "PLATFORM_LIVE_QA_RUNNER_SHA": runner_sha,
+                "PLATFORM_LIVE_QA_SOURCE_BINDING_BASE64": encoded_binding or "",
+                "PLATFORM_LIVE_QA_SOURCE_BINDING_SHA256": encoded_digest or "",
                 "PLATFORM_LIVE_QA_INSTALL_ROOT": str(payload),
                 "PLATFORM_LIVE_PROVISION": provision,
                 "PLATFORM_LIVE_MARKER": marker,
                 "PLAYWRIGHT_LIVE_BASE_URL": base_url,
             }
-            os.execve(str(wrapper), [str(wrapper), base_url, provision, marker, target_sha], environment)
+            os.execve(
+                str(wrapper),
+                [str(wrapper), base_url, provision, marker, runner_sha, *source_arguments],
+                environment,
+            )
             return 0
         _validate_bundle_and_mailbox()
         wrapper = payload / "platform/tools/platform_live_user_qa.sh"
@@ -608,11 +888,14 @@ def main(argv: list[str] | None = None) -> int:
             "PATH": "/usr/bin:/bin",
             "PLATFORM_APP_DIR": str(RUNTIME),
             "PLATFORM_LIVE_CSP_QA_BUNDLE": str(BUNDLE),
-            "PLATFORM_LIVE_QA_TARGET_SHA": target_sha,
+            "PLATFORM_LIVE_QA_TARGET_SHA": app_target_sha,
+            "PLATFORM_LIVE_QA_RUNNER_SHA": runner_sha,
+            "PLATFORM_LIVE_QA_SOURCE_BINDING_BASE64": encoded_binding or "",
+            "PLATFORM_LIVE_QA_SOURCE_BINDING_SHA256": encoded_digest or "",
             "PLAYWRIGHT_LIVE_BASE_URL": "https://old-sparky.com",
             "PLATFORM_LIVE_QA_INSTALL_ROOT": str(payload),
         }
-        os.execve(str(wrapper), [str(wrapper), *arguments[2:]], environment)
+        os.execve(str(wrapper), [str(wrapper), *payload_args], environment)
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError):
         return 1
     return 0
