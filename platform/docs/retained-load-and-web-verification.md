@@ -47,17 +47,33 @@ and SSH removal use `always()`, but any failed row below keeps the run failed:
 | Boundary | Passing value |
 | --- | --- |
 | dispatch, setup and load-client jobs | job result `success`; setup `setup_status=0` |
-| candidate production | schema-2 receipt binds source/run/attempt/profile and exact report digest; `pending_origin` is accepted only for the load tool's reserved exit 3 after closed worker/namespace/binding checks |
+| candidate production | schema-2 receipt binds source/run/attempt/profile and exact report digest; `pending_origin` is accepted only for the load tool's reserved exit 3 after closed worker/namespace/binding checks, including a typed status-failure check when `contract_ok` is false |
 | remote/finalization | `remote_status=0`, `observer_ready=1`, `finalize_status=0` |
 | cleanup/export cleanup | `cleanup_status=0`, `cleanup_exports_status=0` |
 | handoffs/artifacts/SSH | exact SHA/run/attempt/digest; cleanup statuses `0` |
-| evaluation/projection | observer-bound accepted result or a structurally complete profile-budget miss; `sanitizer_status=0` |
+| evaluation/projection | observer-bound accepted result, structurally complete profile-budget miss, or closed known-status failure; `sanitizer_status=0` |
 
 A structurally complete budget miss may pass through origin attachment and
 sanitization so its evidence is retained, but final workflow enforcement still
-fails the run. Missing population, timing, containment, observer, cleanup or
-artifact-identity evidence remains an invalid pipeline result and is never
-reclassified as a budget miss.
+fails the run. A status `0` or `500` result may use the same reserved candidate
+handoff only when all raw, logical and phase status counts, error-class totals,
+source/run/profile bindings, timing, containment and population evidence close
+exactly. Its `contract_ok` and `passed` fields remain false; origin attachment
+and sanitization retain the failed measurement, and final workflow enforcement
+still fails the run. Unknown statuses or error classes, extra failed checks,
+incomplete counts, partial work, observer failures, cleanup failures or
+artifact-identity mismatches remain invalid pipeline results and cannot be
+reclassified as completed failures.
+
+The QA system sampler keeps full process identity and CPU collection for all
+`/proc` rows while reading per-process RSS and I/O counters only for the seven
+groups it reports. The generic process iterator still collects the full
+record by default. A synthetic 189-process `/proc` fixture over ten iterations
+reduced RSS/I/O file reads from 3,780 to 140 and local fixture wall time from
+0.760 s to 0.374 s. This is a fixture benchmark, not a production CPU or
+under-load measurement; it does not establish a production performance gain.
+The change remains a measured optimization hypothesis until the R load matrix
+provides comparable observer evidence.
 
 Artifact handoffs carry the exact artifact ID across jobs. Each consumer then
 reads the authenticated Actions artifact metadata and requires the expected

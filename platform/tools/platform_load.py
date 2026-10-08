@@ -9,7 +9,7 @@ existing external client.  It never runs the measured generator on the origin.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 import hashlib
 import json
 import math
@@ -21,9 +21,9 @@ import tempfile
 from typing import Any, Sequence
 
 try:
-    from platform_evidence_sanitizer import safe_error_class
+    from platform_evidence_sanitizer import SAFE_ERROR_CLASSES, safe_error_class
 except ModuleNotFoundError:  # Imported as ``tools.platform_load`` by tests.
-    from tools.platform_evidence_sanitizer import safe_error_class
+    from tools.platform_evidence_sanitizer import SAFE_ERROR_CLASSES, safe_error_class
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
@@ -2000,8 +2000,10 @@ def _is_closed_pending_origin_candidate(
         or supervisor.get("report_error") is not None
         or acceptance.get("passed") is not False
         or acceptance.get("pending_origin_evidence") is not True
-        or acceptance.get("contract_ok") is not True
     ):
+        return False
+    terminal_status_failure = _closed_terminal_status_failure(profile, report)
+    if acceptance.get("contract_ok") is not True and not terminal_status_failure:
         return False
     profile_acceptance = profile.get("acceptance")
     profile_kind = (
@@ -2027,8 +2029,28 @@ def _is_closed_pending_origin_candidate(
     ):
         return False
     if profile_kind == "capacity":
-        return _closed_capacity_pending_origin_acceptance(profile, acceptance)
-    allowed_ramp_budget_checks = _authored_ramp_budget_checks(profile, acceptance)
+        closed_terminal_ramp_stages = (
+            _closed_terminal_ramp_stage_names(profile, report)
+            if terminal_status_failure
+            else frozenset()
+        )
+        return _closed_capacity_pending_origin_acceptance(
+            profile,
+            acceptance,
+            allow_closed_terminal_status_failure=terminal_status_failure,
+            closed_terminal_ramp_stages=closed_terminal_ramp_stages,
+        )
+    closed_terminal_ramp_stages = (
+        _closed_terminal_ramp_stage_names(profile, report)
+        if terminal_status_failure
+        else frozenset()
+    )
+    allowed_ramp_budget_checks = _authored_ramp_budget_checks(
+        profile,
+        acceptance,
+        allow_closed_terminal_status_failure=terminal_status_failure,
+        closed_terminal_ramp_stages=closed_terminal_ramp_stages,
+    )
     if allowed_ramp_budget_checks is None:
         return False
     return _acceptance_failure_is_budget_only(
@@ -2038,6 +2060,702 @@ def _is_closed_pending_origin_candidate(
         allow_no_budget_failure=True,
         allow_pending_observer_binding=True,
         allowed_phase_names=_profile_budget_phase_names(profile),
+        allow_closed_terminal_status_failure=terminal_status_failure,
+        closed_terminal_ramp_stages=closed_terminal_ramp_stages,
+    )
+
+
+_CLOSED_TERMINAL_STATUSES = frozenset({0, 500})
+_STATUS_ZERO_ERROR_CLASSES = frozenset(
+    {"http_error", "other", "timeout", "transport"}
+)
+
+
+def _iter_status_summaries(
+    value: Any,
+) -> Iterator[tuple[tuple[str, ...], str, Mapping[str, Any]]]:
+    """Yield each raw or logical summary in an untrusted report tree."""
+
+    seen: set[int] = set()
+
+    def visit(
+        node: Any, path: tuple[str, ...] = ()
+    ) -> Iterator[tuple[tuple[str, ...], str, Mapping[str, Any]]]:
+        if not isinstance(node, Mapping) or id(node) in seen:
+            return
+        seen.add(id(node))
+        if "status_counts" in node:
+            yield path, "raw", node
+        if "final_status_counts" in node:
+            yield path, "logical", node
+        for key, child in node.items():
+            if isinstance(child, (Mapping, list, tuple)):
+                yield from visit(child, path + (str(key),))
+
+    yield from visit(value)
+
+
+def _iter_metric_summaries(
+    value: Any,
+) -> Iterator[tuple[tuple[str, ...], Mapping[str, Any]]]:
+    """Yield report summary nodes whose timing and population are explicit."""
+
+    seen: set[int] = set()
+
+    def visit(
+        node: Any, path: tuple[str, ...] = ()
+    ) -> Iterator[tuple[tuple[str, ...], Mapping[str, Any]]]:
+        if not isinstance(node, Mapping) or id(node) in seen:
+            return
+        seen.add(id(node))
+        if isinstance(node.get("timing"), Mapping) and (
+            "requests" in node or "actions" in node
+        ):
+            yield path, node
+        for key, child in node.items():
+            if isinstance(child, (Mapping, list, tuple)):
+                yield from visit(child, path + (str(key),))
+
+    yield from visit(value)
+
+
+def _closed_terminal_ramp_stage_names(
+    profile: Mapping[str, Any], report: Mapping[str, Any]
+) -> frozenset[str]:
+    """Return ramp stages with validated status-0/500 evidence in a closed report."""
+
+    acceptance = profile.get("acceptance")
+    expected = acceptance.get("expected_statuses") if isinstance(acceptance, Mapping) else None
+    if (
+        not isinstance(expected, (list, tuple))
+        or not expected
+        or any(type(status) is not int for status in expected)
+    ):
+        return frozenset()
+    allowed_statuses = frozenset(expected) | _CLOSED_TERMINAL_STATUSES
+    stages: set[str] = set()
+    for path, kind, summary in _iter_status_summaries(report):
+        if "capacity_ramp" not in path or "stages" not in path:
+            continue
+        stage_index = path.index("stages") + 1
+        if stage_index >= len(path):
+            continue
+        field = "status_counts" if kind == "raw" else "final_status_counts"
+        counts = _closed_status_distribution(
+            summary,
+            field=field,
+            allowed_statuses=allowed_statuses,
+        )
+        if counts is not None and any(
+            count and status not in expected for status, count in counts.items()
+        ):
+            stages.add(path[stage_index])
+    return frozenset(stages)
+
+
+def _closed_timing_evidence_tree(value: Any) -> bool:
+    """Reject partial, malformed or inconsistent timing evidence anywhere."""
+
+    try:
+        from tools.platform_load_acceptance import timing_summary_is_complete
+    except ModuleNotFoundError:  # Direct execution from platform/tools.
+        from platform_load_acceptance import timing_summary_is_complete  # type: ignore[no-redef]
+
+    seen: set[int] = set()
+
+    def visit(node: Any) -> bool:
+        if isinstance(node, (list, tuple)):
+            return all(visit(child) for child in node)
+        if not isinstance(node, Mapping) or id(node) in seen:
+            return True
+        seen.add(id(node))
+        if "partial" in node and node.get("partial") is not False:
+            return False
+        if "inflight_unknown" in node and node.get("inflight_unknown") is not False:
+            return False
+        if "timing_schema" in node and "partial" in node:
+            if not timing_summary_is_complete(node, require_metrics=True):
+                return False
+        return all(
+            visit(child)
+            for child in node.values()
+            if isinstance(child, (Mapping, list, tuple))
+        )
+
+    return visit(value)
+
+
+def _closed_status_distribution(
+    summary: Mapping[str, Any],
+    *,
+    field: str,
+    allowed_statuses: frozenset[int],
+) -> dict[int, int] | None:
+    distribution = summary.get(field)
+    if not isinstance(distribution, Mapping):
+        return None
+    result: dict[int, int] = {}
+    for raw_status, raw_count in distribution.items():
+        if not isinstance(raw_status, str) or not raw_status.isdigit():
+            return None
+        status = int(raw_status)
+        if str(status) != raw_status or status not in allowed_statuses:
+            return None
+        count = _strict_nonnegative_int(raw_count)
+        if count is None:
+            return None
+        result[status] = count
+    return result
+
+
+def _closed_raw_error_classes(
+    summary: Mapping[str, Any],
+    status_counts: Mapping[int, int],
+) -> bool:
+    error_count = _strict_nonnegative_int(summary.get("errors"))
+    error_kinds = summary.get("error_kinds")
+    if error_count is None or not isinstance(error_kinds, Mapping):
+        return False
+    typed_kinds: dict[str, int] = {}
+    for name, raw_count in error_kinds.items():
+        if not isinstance(name, str) or name not in SAFE_ERROR_CLASSES:
+            return False
+        count = _strict_nonnegative_int(raw_count)
+        if count is None:
+            return False
+        typed_kinds[name] = count
+    if sum(typed_kinds.values()) != error_count:
+        return False
+
+    # Every nonzero HTTP error has a deterministic sanitizer class. Status 0
+    # has no HTTP response, so only the client's finite transport/error
+    # classes may account for the residual count.
+    expected_by_status: dict[str, int] = {}
+    zero_status_count = status_counts.get(0, 0)
+    for status, count in status_counts.items():
+        if status == 0 or 200 <= status < 400:
+            continue
+        error_class = safe_error_class("", status=status)
+        expected_by_status[error_class] = expected_by_status.get(error_class, 0) + count
+    residual: dict[str, int] = {}
+    for error_class in SAFE_ERROR_CLASSES:
+        actual = typed_kinds.get(error_class, 0)
+        expected = expected_by_status.get(error_class, 0)
+        if actual < expected:
+            return False
+        if actual > expected:
+            residual[error_class] = actual - expected
+    return (
+        sum(residual.values()) == zero_status_count
+        and set(residual).issubset(_STATUS_ZERO_ERROR_CLASSES)
+    )
+
+
+def _closed_terminal_status_failure(
+    profile: Mapping[str, Any], report: Mapping[str, Any]
+) -> bool:
+    """Validate a closed report whose only non-profile statuses are 0/500.
+
+    This evidence never changes acceptance. It only permits the workflow's
+    reserved completed-candidate handoff when the ordinary evaluator has
+    already failed. Every raw and logical population must still reconcile.
+    """
+
+    acceptance_contract = profile.get("acceptance")
+    report_acceptance = report.get("acceptance")
+    if (
+        not isinstance(acceptance_contract, Mapping)
+        or not isinstance(report_acceptance, Mapping)
+        or report_acceptance.get("contract_ok") is not False
+        or report_acceptance.get("passed") is not False
+    ):
+        return False
+    raw_expected = acceptance_contract.get("expected_statuses")
+    if (
+        not isinstance(raw_expected, (list, tuple))
+        or not raw_expected
+        or any(type(status) is not int or status < 100 or status > 599 for status in raw_expected)
+        or len(set(raw_expected)) != len(raw_expected)
+    ):
+        return False
+    expected_statuses = frozenset(raw_expected)
+    # Current profile contracts model successful HTTP outcomes plus explicitly
+    # recognized 503 overloads. A novel expected error status would need its
+    # own typed contract before it can enter this reserved path.
+    if any(not (200 <= status < 400 or status == 503) for status in expected_statuses):
+        return False
+    allowed_statuses = expected_statuses | _CLOSED_TERMINAL_STATUSES
+    if not _closed_timing_evidence_tree(report):
+        return False
+    raw_http_summary = report.get("raw_http")
+    overall_summary = report.get("overall")
+    logical_summary = report.get("logical")
+    if not all(
+        isinstance(summary, Mapping)
+        for summary in (raw_http_summary, overall_summary, logical_summary)
+    ):
+        return False
+    if (
+        "status_counts" not in raw_http_summary
+        or "status_counts" not in overall_summary
+        or (
+            "final_status_counts" not in logical_summary
+            if profile.get("mode") == "ready-vote"
+            else "status_counts" not in logical_summary
+        )
+    ):
+        return False
+    try:
+        from tools.platform_load_acceptance import (
+            _outcome_consistency,
+            normalize_evidence,
+            timing_summary_is_complete,
+        )
+    except ModuleNotFoundError:  # Direct execution from platform/tools.
+        from platform_load_acceptance import (  # type: ignore[no-redef]
+            _outcome_consistency,
+            normalize_evidence,
+            timing_summary_is_complete,
+        )
+
+    metric_summaries = list(_iter_metric_summaries(report))
+    if not metric_summaries:
+        return False
+    for _path, summary in metric_summaries:
+        timing = summary.get("timing")
+        if (
+            not isinstance(timing, Mapping)
+            or "timing_schema" not in timing
+            or "partial" not in timing
+            or not timing_summary_is_complete(timing, require_metrics=True)
+        ):
+            return False
+        if "requests" in summary and "status_counts" not in summary:
+            return False
+        if "actions" in summary and "final_status_counts" not in summary:
+            return False
+    raw_summaries = 0
+    logical_summaries = 0
+    terminal_status_seen = False
+    top_status_incomplete: set[str] = set()
+    phase_status_incomplete: set[tuple[str, str]] = set()
+    ramp_status_incomplete: set[tuple[str, str]] = set()
+    phase_shared_scope_names: set[str] = set()
+    ramp_shared_scope_names: set[str] = set()
+    ramp_stage_normalized: dict[str, Mapping[str, Any]] = {}
+    ramp_stage_populations: dict[str, tuple[int, Mapping[str, Any]]] = {}
+    top_raw_terminal_status_seen = False
+    for path, kind, summary in _iter_status_summaries(report):
+        status_field = "status_counts" if kind == "raw" else "final_status_counts"
+        counts = _closed_status_distribution(
+            summary,
+            field=status_field,
+            allowed_statuses=allowed_statuses,
+        )
+        if counts is None:
+            return False
+        unexpected_status_counts = {
+            status: count
+            for status, count in counts.items()
+            if count and status not in expected_statuses
+        }
+        if unexpected_status_counts:
+            if any(
+                status not in _CLOSED_TERMINAL_STATUSES
+                for status in unexpected_status_counts
+            ):
+                return False
+            terminal_status_seen = True
+            if path == ("raw_http",) and kind == "raw":
+                top_raw_terminal_status_seen = True
+        population_field = "requests" if kind == "raw" else "actions"
+        success_field = "successful_responses" if kind == "raw" else "final_successes"
+        failure_field = "errors" if kind == "raw" else "final_failures"
+        population = _strict_nonnegative_int(summary.get(population_field))
+        successes = _strict_nonnegative_int(summary.get(success_field))
+        failures = _strict_nonnegative_int(summary.get(failure_field))
+        status_successes = sum(
+            count for status, count in counts.items() if 200 <= status < 400
+        )
+        status_failures = sum(
+            count for status, count in counts.items() if not 200 <= status < 400
+        )
+        if (
+            population is None
+            or successes is None
+            or failures is None
+            or sum(counts.values()) != population
+            or successes != status_successes
+            or failures != status_failures
+        ):
+            return False
+        if path and "capacity_ramp" in path and "stages" in path:
+            stage_index = path.index("stages") + 1
+            if stage_index >= len(path):
+                return False
+            ramp_stage_populations[path[stage_index]] = (population, summary)
+        # The evaluator combines outcome consistency with the expected-status
+        # check for canonical evidence. Recompute outcomes and rounded failure
+        # rates independently so a false combined leaf is status-derived only.
+        if _outcome_consistency(summary, required=True).get("complete") is not True:
+            return False
+        if kind == "raw":
+            raw_summaries += 1
+            temporary_overloads = _strict_nonnegative_int(
+                summary.get("temporary_overload_responses")
+            )
+            unexpected = _strict_nonnegative_int(summary.get("unexpected_statuses"))
+            recognized_overloads = counts.get(503, 0)
+            if (
+                temporary_overloads != recognized_overloads
+                or unexpected != failures - recognized_overloads
+                or unexpected
+                != sum(
+                    count
+                    for status, count in counts.items()
+                    if status not in expected_statuses
+                )
+                or not _closed_raw_error_classes(summary, counts)
+            ):
+                return False
+        else:
+            logical_summaries += 1
+        expected_scope = (
+            "logical_user_actions" if kind == "logical" else "full_population"
+        )
+        normalized = normalize_evidence(
+            summary,
+            expected_scope=expected_scope,
+            required=True,
+            canonical=True,
+            # State reads are diagnostic, not an action-goodput population.
+            # This matches the canonical ready-vote state evidence check.
+            require_goodput=path != ("phases", "state"),
+            label="terminal_status",
+            expected_statuses=expected_statuses,
+        )
+        normalized_checks = normalized.get("checks")
+        if (
+            not isinstance(normalized_checks, Mapping)
+            or any(type(value) is not bool for value in normalized_checks.values())
+        ):
+            return False
+        failed_normalized_checks = {
+            name for name, value in normalized_checks.items() if value is False
+        }
+        status_check = (
+            "final_status_counts_matches_expected_statuses"
+            if kind == "logical"
+            else "status_counts_matches_expected_statuses"
+        )
+        allowed_normalization_failures = {status_check}
+        if kind == "raw":
+            allowed_normalization_failures.add("raw_unexpected_statuses_zero")
+        if not failed_normalized_checks.issubset(allowed_normalization_failures):
+            return False
+        if bool(failed_normalized_checks) != any(
+            count and status not in expected_statuses
+            for status, count in counts.items()
+        ):
+            return False
+        normalized_scope = (
+            "raw"
+            if path and path[-1] == "raw_http"
+            else "logical"
+            if path and path[-1] == "logical"
+            else "logical"
+            if kind == "logical"
+            else "raw"
+        )
+        if failed_normalized_checks:
+            if path and path[0] == "phases":
+                if "capacity_ramp" in path and "stages" in path:
+                    stage_index = path.index("stages") + 1
+                    if stage_index >= len(path):
+                        return False
+                    stage_name = path[stage_index]
+                    ramp_status_incomplete.add((stage_name, normalized_scope))
+                    ramp_stage_normalized[stage_name] = normalized
+                    if (
+                        profile.get("mode") != "ready-vote"
+                        and kind == "raw"
+                        and len(path) == 4
+                        and path[1:3] == ("capacity_ramp", "stages")
+                        and summary.get("scope") == "full_population"
+                    ):
+                        report_phases = report.get("phases")
+                        ramp_phase = (
+                            report_phases.get("capacity_ramp")
+                            if isinstance(report_phases, Mapping)
+                            else None
+                        )
+                        ramp_stages = (
+                            ramp_phase.get("stages")
+                            if isinstance(ramp_phase, Mapping)
+                            else None
+                        )
+                        if (
+                            isinstance(ramp_stages, Mapping)
+                            and ramp_stages.get(stage_name) is summary
+                            and "logical" not in summary
+                            and "raw_http" not in summary
+                        ):
+                            ramp_shared_scope_names.add(stage_name)
+                else:
+                    phase_name = next(
+                        (part for part in path if part in _profile_budget_phase_names(profile)),
+                        None,
+                    )
+                    if phase_name is None:
+                        return False
+                    phase_status_incomplete.add((phase_name, normalized_scope))
+                    if (
+                        profile.get("mode") != "ready-vote"
+                        and kind == "raw"
+                        and len(path) == 2
+                        and summary.get("scope") == "full_population"
+                    ):
+                        report_phases = report.get("phases")
+                        if (
+                            isinstance(report_phases, Mapping)
+                            and report_phases.get(phase_name) is summary
+                            and "logical" not in summary
+                            and "raw_http" not in summary
+                        ):
+                            phase_shared_scope_names.add(phase_name)
+            elif path and path[0] in {"logical", "raw_http", "overall"}:
+                top_status_incomplete.add(path[0])
+
+    if ramp_status_incomplete:
+        ramp_acceptance = report_acceptance.get("capacity_ramp_evidence")
+        ramp_stages = (
+            ramp_acceptance.get("stages")
+            if isinstance(ramp_acceptance, Mapping)
+            else None
+        )
+        expected_stage_counts = profile_contract(profile).get("planned_work", {}).get(
+            "stage_logical_actions"
+        )
+        if not isinstance(ramp_stages, Mapping) or not isinstance(
+            expected_stage_counts, Mapping
+        ):
+            return False
+        for stage_name, _scope in ramp_status_incomplete:
+            normalized = ramp_stage_normalized.get(stage_name)
+            stage_evidence = ramp_stages.get(stage_name)
+            normalized_checks = (
+                normalized.get("checks") if isinstance(normalized, Mapping) else None
+            )
+            stage_checks = (
+                stage_evidence.get("checks")
+                if isinstance(stage_evidence, Mapping)
+                else None
+            )
+            stage_check_aliases = {
+                "terminal_status_scope": f"ramp_{stage_name}_scope",
+                "terminal_status_scope_shape": f"ramp_{stage_name}_scope_shape",
+                "terminal_status_outcome": f"ramp_{stage_name}_outcome",
+            }
+            expected_count = _strict_nonnegative_int(
+                expected_stage_counts.get(stage_name)
+            )
+            observed_stage = ramp_stage_populations.get(stage_name)
+            if (
+                not isinstance(normalized, Mapping)
+                or not isinstance(stage_evidence, Mapping)
+                or not isinstance(normalized_checks, Mapping)
+                or not isinstance(stage_checks, Mapping)
+                or any(
+                    type(value) is not bool
+                    or stage_checks.get(stage_check_aliases.get(name, name)) is not value
+                    for name, value in normalized_checks.items()
+                )
+                or expected_count is None
+                or observed_stage is None
+                or observed_stage[0] != expected_count
+                or any(
+                    _strict_nonnegative_int(observed_stage[1]["timing"].get(field))
+                    != expected_count
+                    for field in ("expected_count", "submitted_count", "completed_count")
+                )
+            ):
+                return False
+
+    acceptance = report_acceptance
+    acceptance_checks = acceptance.get("checks")
+    capacity_acceptance = acceptance_contract.get("kind") == "capacity"
+    if not isinstance(acceptance_checks, Mapping):
+        if capacity_acceptance and acceptance_checks is None:
+            acceptance_checks = {}
+        else:
+            return False
+    if (
+        acceptance_checks.get("logical_outcome_consistency") is False
+        and "logical" not in top_status_incomplete
+    ):
+        return False
+    if (
+        acceptance_checks.get("raw_outcome_consistency") is False
+        and "raw_http" not in top_status_incomplete
+    ):
+        return False
+    if (
+        acceptance_checks.get("unexpected_statuses") is False
+        and not top_raw_terminal_status_seen
+    ):
+        return False
+
+    if capacity_acceptance:
+        phase_slo = acceptance.get("phase_slo")
+        phase_budgets = acceptance.get("phase_budget_evidence")
+        if not isinstance(phase_slo, Mapping) or not isinstance(phase_budgets, Mapping):
+            return False
+        for phase_name, phase_result in phase_slo.items():
+            checks = (
+                phase_result.get("checks")
+                if isinstance(phase_result, Mapping)
+                else None
+            )
+            if not isinstance(checks, Mapping):
+                return False
+            if checks.get("logical_outcome_consistency") is False and (
+                not _phase_status_is_bound(
+                    str(phase_name),
+                    "logical",
+                    phase_status_incomplete=phase_status_incomplete,
+                    phase_shared_scope_names=phase_shared_scope_names,
+                )
+            ):
+                return False
+            if checks.get("raw_outcome_consistency") is False and (
+                not _phase_status_is_bound(
+                    str(phase_name),
+                    "raw",
+                    phase_status_incomplete=phase_status_incomplete,
+                    phase_shared_scope_names=phase_shared_scope_names,
+                )
+            ):
+                return False
+            if checks.get("timing_complete") is False:
+                return False
+        for phase_name, budget_result in phase_budgets.items():
+            checks = (
+                budget_result.get("checks")
+                if isinstance(budget_result, Mapping)
+                else None
+            )
+            if not isinstance(checks, Mapping):
+                return False
+            for check_name, semantic_scope in (
+                ("logical_timing_complete", "logical"),
+                ("raw_http_timing_complete", "raw"),
+                ("logical_outcome_consistent", "logical"),
+                ("raw_outcome_consistent", "raw"),
+            ):
+                if checks.get(check_name) is not False:
+                    continue
+                if phase_name == "primary":
+                    status_bound = (
+                        "logical" in top_status_incomplete
+                        if semantic_scope == "logical"
+                        else "raw_http" in top_status_incomplete
+                    )
+                elif phase_name == "duplicate":
+                    status_bound = False
+                else:
+                    status_bound = _phase_status_is_bound(
+                        str(phase_name),
+                        semantic_scope,
+                        phase_status_incomplete=phase_status_incomplete,
+                        phase_shared_scope_names=phase_shared_scope_names,
+                    )
+                if not status_bound:
+                    return False
+
+    def check_status_timing_leaf(path: tuple[str, ...], name: str) -> bool:
+        if name not in {
+            "logical_outcome_consistent",
+            "logical_timing_complete",
+            "raw_outcome_consistent",
+            "raw_http_timing_complete",
+        }:
+            return False
+        if len(path) == 3 and path[0] == "phase_budget_evidence":
+            phase_name = path[1]
+        elif (
+            len(path) == 4
+            and path[:2] == ("phase_plan_evidence", "phase_budgets")
+        ):
+            phase_name = path[2]
+        else:
+            return False
+        scope = "logical" if name.startswith("logical_") else "raw"
+        return _phase_status_is_bound(
+            phase_name,
+            scope,
+            phase_status_incomplete=phase_status_incomplete,
+            phase_shared_scope_names=phase_shared_scope_names,
+        )
+
+    def check_ramp_status_timing_leaf(path: tuple[str, ...], name: str) -> bool:
+        if (
+            len(path) != 5
+            or path[:2] != ("capacity_ramp_evidence", "stages")
+            or path[3:] != ("budget_evidence", "checks")
+        ):
+            return False
+        if name not in {
+            "logical_outcome_consistent",
+            "logical_timing_complete",
+            "raw_outcome_consistent",
+            "raw_http_timing_complete",
+        }:
+            return False
+        scope = "logical" if name.startswith("logical_") else "raw"
+        stage_name = path[2]
+        return _ramp_status_is_bound(
+            stage_name,
+            scope,
+            ramp_status_incomplete=ramp_status_incomplete,
+            ramp_shared_scope_names=ramp_shared_scope_names,
+        )
+
+    def validate_status_check_paths(node: Any, path: tuple[str, ...] = ()) -> bool:
+        if isinstance(node, Mapping):
+            nested_checks = node.get("checks")
+            if isinstance(nested_checks, Mapping):
+                check_path = path + ("checks",)
+                for name, value in nested_checks.items():
+                    if value is False and name in {
+                        "logical_outcome_consistent",
+                        "logical_timing_complete",
+                        "raw_outcome_consistent",
+                        "raw_http_timing_complete",
+                    }:
+                        if not check_status_timing_leaf(check_path, str(name)):
+                            if not check_ramp_status_timing_leaf(
+                                check_path, str(name)
+                            ):
+                                return False
+            return all(
+                validate_status_check_paths(child, path + (str(key),))
+                for key, child in node.items()
+                if key != "checks" and isinstance(child, (Mapping, list, tuple))
+            )
+        if isinstance(node, (list, tuple)):
+            return all(
+                validate_status_check_paths(child, path + (str(index),))
+                for index, child in enumerate(node)
+            )
+        return True
+
+    if not validate_status_check_paths(acceptance):
+        return False
+    return (
+        raw_summaries > 0
+        and (logical_summaries > 0 or profile.get("mode") != "ready-vote")
+        and terminal_status_seen
+        and _report_binding(profile, report).get("complete") is True
     )
 
 
@@ -2050,7 +2768,11 @@ def _all_true_boolean_mapping(value: Any) -> bool:
 
 
 def _authored_ramp_budget_checks(
-    profile: Mapping[str, Any], acceptance: Mapping[str, Any]
+    profile: Mapping[str, Any],
+    acceptance: Mapping[str, Any],
+    *,
+    allow_closed_terminal_status_failure: bool = False,
+    closed_terminal_ramp_stages: frozenset[str] = frozenset(),
 ) -> frozenset[str] | None:
     """Validate read-mix ramp evidence against its authored closed stage set."""
 
@@ -2102,12 +2824,63 @@ def _authored_ramp_budget_checks(
     }:
         return None
     budget_keys = {f"ramp_{stage}_budgets" for stage in authored_stages}
+    closed_population_keys = {
+        f"ramp_{stage}_population" for stage in closed_terminal_ramp_stages
+    }
+    failed_nonbudget_checks = {
+        name
+        for name, value in checks.items()
+        if value is False and name not in budget_keys
+    }
     if (
-        any(value is not True for name, value in checks.items() if name not in budget_keys)
+        any(
+            value is not True
+            for name, value in checks.items()
+            if name not in budget_keys
+            and not (
+                allow_closed_terminal_status_failure
+                and name in closed_population_keys
+            )
+        )
+        or (
+            failed_nonbudget_checks
+            and (
+                not allow_closed_terminal_status_failure
+                or not failed_nonbudget_checks.issubset(closed_population_keys)
+            )
+        )
         or evidence.get("complete") is not all(value is True for value in checks.values())
     ):
         return None
     return frozenset(budget_keys)
+
+
+def _phase_status_is_bound(
+    phase_name: str, scope: str, *,
+    phase_status_incomplete: set[tuple[str, str]],
+    phase_shared_scope_names: set[str],
+) -> bool:
+    """Match a status failure to its exact phase scope or verified shared summary."""
+
+    return (phase_name, scope) in phase_status_incomplete or (
+        scope in {"logical", "raw"}
+        and phase_name in phase_shared_scope_names
+        and (phase_name, "raw") in phase_status_incomplete
+    )
+
+
+def _ramp_status_is_bound(
+    stage_name: str, scope: str, *,
+    ramp_status_incomplete: set[tuple[str, str]],
+    ramp_shared_scope_names: set[str],
+) -> bool:
+    """Match a status failure to its exact ramp scope or verified shared summary."""
+
+    return (stage_name, scope) in ramp_status_incomplete or (
+        scope in {"logical", "raw"}
+        and stage_name in ramp_shared_scope_names
+        and (stage_name, "raw") in ramp_status_incomplete
+    )
 
 
 def _capacity_phase_budget_check_names(profile: Mapping[str, Any]) -> frozenset[str]:
@@ -2388,7 +3161,11 @@ def _capacity_phase_retry_evidence_is_closed(value: Any) -> bool:
 
 
 def _closed_capacity_pending_origin_acceptance(
-    profile: Mapping[str, Any], acceptance: Mapping[str, Any]
+    profile: Mapping[str, Any],
+    acceptance: Mapping[str, Any],
+    *,
+    allow_closed_terminal_status_failure: bool = False,
+    closed_terminal_ramp_stages: frozenset[str] = frozenset(),
 ) -> bool:
     """Validate capacity's phase-nested candidate while origin is pending.
 
@@ -2442,6 +3219,7 @@ def _closed_capacity_pending_origin_acceptance(
                 "slo",
                 allow_no_budget_failure=True,
                 allow_pending_observer_binding=True,
+                allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
             )
             or not isinstance(budget_result, Mapping)
             or not isinstance(budget_checks, Mapping)
@@ -2455,6 +3233,7 @@ def _closed_capacity_pending_origin_acceptance(
                 budget_result,
                 "capacity",
                 allow_no_budget_failure=True,
+                allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
             )
         ):
             return False
@@ -2479,6 +3258,7 @@ def _closed_capacity_pending_origin_acceptance(
             primary_budget,
             "capacity",
             allow_no_budget_failure=True,
+            allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
         )
     ):
         return False
@@ -2504,7 +3284,12 @@ def _closed_capacity_pending_origin_acceptance(
         return False
     if any(type(value) is not bool for value in stage_checks.values()):
         return False
-    allowed_ramp_budget_checks = _authored_ramp_budget_checks(profile, acceptance)
+    allowed_ramp_budget_checks = _authored_ramp_budget_checks(
+        profile,
+        acceptance,
+        allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
+        closed_terminal_ramp_stages=closed_terminal_ramp_stages,
+    )
     if allowed_ramp_budget_checks is None:
         return False
     authored_stages = traffic.get("concurrency_stages")
@@ -2531,6 +3316,8 @@ def _closed_capacity_pending_origin_acceptance(
             "capacity",
             allow_no_budget_failure=True,
             allowed_ramp_budget_checks=allowed_ramp_budget_checks,
+            allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
+            closed_terminal_ramp_stages=closed_terminal_ramp_stages,
         ):
             return False
     elif stage_checks or stage_evidence.get("stages") != {}:
@@ -2991,7 +3778,6 @@ def _is_complete_observer_bound_decision(
         or report.get("partial_work") is not False
         or report.get("inflight_unknown") is not False
         or binding.get("complete") is not True
-        or acceptance.get("contract_ok") is not True
         or acceptance.get("pending_origin_evidence") is not False
         or acceptance.get("passed") is not False
         or supervisor.get("reason") != "none"
@@ -3027,6 +3813,9 @@ def _is_complete_observer_bound_decision(
     }.get(profile_kind)
     if decision != expected_decision:
         return False
+    terminal_status_failure = _closed_terminal_status_failure(profile, report)
+    if acceptance.get("contract_ok") is not True and not terminal_status_failure:
+        return False
     if profile_kind == "capacity" and acceptance.get("experiment_complete") is not True:
         return False
     if profile_kind == "capacity" and acceptance.get("phase_completion") is not True:
@@ -3047,12 +3836,20 @@ def _is_complete_observer_bound_decision(
             profile,
             acceptance,
             origin_budget_failure=origin_budget_failure,
+            allow_closed_terminal_status_failure=terminal_status_failure,
+            closed_terminal_ramp_stages=(
+                _closed_terminal_ramp_stage_names(profile, report)
+                if terminal_status_failure
+                else frozenset()
+            ),
         )
     return _acceptance_failure_is_budget_only(
         acceptance,
         str(profile_kind),
         allowed_ramp_budget_checks=allowed_ramp_budget_checks,
         allowed_phase_names=_profile_budget_phase_names(profile),
+        allow_no_budget_failure=terminal_status_failure,
+        allow_closed_terminal_status_failure=terminal_status_failure,
     )
 
 
@@ -3061,6 +3858,8 @@ def _closed_capacity_completed_budget_failure(
     acceptance: Mapping[str, Any],
     *,
     origin_budget_failure: bool,
+    allow_closed_terminal_status_failure: bool = False,
+    closed_terminal_ramp_stages: frozenset[str] = frozenset(),
 ) -> bool:
     """Require capacity completion and permit only authored target misses."""
 
@@ -3086,7 +3885,7 @@ def _closed_capacity_completed_budget_failure(
         or set(phase_budget_evidence) != {*phase_names, "primary", "duplicate"}
     ):
         return False
-    budget_failure_seen = origin_budget_failure
+    budget_failure_seen = origin_budget_failure or allow_closed_terminal_status_failure
     for name in phase_names:
         phase_result = phase_slo.get(name)
         budget_result = phase_budget_evidence.get(name)
@@ -3114,14 +3913,28 @@ def _closed_capacity_completed_budget_failure(
         ):
             return False
         if not _acceptance_failure_is_budget_only(
-            phase_result, "slo", allow_no_budget_failure=True
+            phase_result,
+            "slo",
+            allow_no_budget_failure=True,
+            allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
         ) or not _acceptance_failure_is_budget_only(
-            budget_result, "capacity", allow_no_budget_failure=True
+            budget_result,
+            "capacity",
+            allow_no_budget_failure=True,
+            allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
         ):
             return False
         budget_failure_seen = (
-            _acceptance_failure_is_budget_only(phase_result, "slo")
-            or _acceptance_failure_is_budget_only(budget_result, "capacity")
+            _acceptance_failure_is_budget_only(
+                phase_result,
+                "slo",
+                allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
+            )
+            or _acceptance_failure_is_budget_only(
+                budget_result,
+                "capacity",
+                allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
+            )
             or budget_failure_seen
         )
 
@@ -3142,11 +3955,16 @@ def _closed_capacity_completed_budget_failure(
             primary_budget,
             "capacity",
             allow_no_budget_failure=True,
+            allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
         )
     ):
         return False
     budget_failure_seen = (
-        _acceptance_failure_is_budget_only(primary_budget, "capacity")
+        _acceptance_failure_is_budget_only(
+            primary_budget,
+            "capacity",
+            allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
+        )
         or budget_failure_seen
     )
 
@@ -3171,7 +3989,12 @@ def _closed_capacity_completed_budget_failure(
         type(value) is not bool for value in stage_checks.values()
     ):
         return False
-    allowed_ramp_budget_checks = _authored_ramp_budget_checks(profile, acceptance)
+    allowed_ramp_budget_checks = _authored_ramp_budget_checks(
+        profile,
+        acceptance,
+        allow_closed_terminal_status_failure=allow_closed_terminal_status_failure,
+        closed_terminal_ramp_stages=closed_terminal_ramp_stages,
+    )
     if allowed_ramp_budget_checks is None:
         return False
     authored_stages = traffic.get("concurrency_stages")
@@ -3382,6 +4205,8 @@ def _acceptance_failure_is_budget_only(
     allowed_phase_names: frozenset[str] = frozenset(),
     allow_no_budget_failure: bool = False,
     allow_pending_observer_binding: bool = False,
+    allow_closed_terminal_status_failure: bool = False,
+    closed_terminal_ramp_stages: frozenset[str] = frozenset(),
 ) -> bool:
     """Reject an SLO-miss classification if any structural check failed.
 
@@ -3438,8 +4263,70 @@ def _acceptance_failure_is_budget_only(
         if isinstance(ramp_evidence_checks, Mapping)
         and ramp_evidence_checks.get(f"ramp_{stage}_budgets") is False
     }
+    terminal_status_failure_seen = False
+    terminal_status_phase_names: set[str] = set()
+    terminal_status_ramp_stages: set[str] = set(closed_terminal_ramp_stages)
+    terminal_status_check_names = frozenset(
+        {
+            "contract",
+            "logical_outcome_consistency",
+            "raw_outcome_consistency",
+            "unexpected_statuses",
+            "logical_timing_complete",
+            "raw_http_timing_complete",
+        }
+    )
+    terminal_phase_status_check_names = frozenset(
+        {
+            "logical_outcome_consistent",
+            "logical_timing_complete",
+            "raw_outcome_consistent",
+            "raw_http_timing_complete",
+        }
+    )
+    if allow_closed_terminal_status_failure:
+        ramp_evidence_stages = (
+            ramp_evidence.get("stages")
+            if isinstance(ramp_evidence, Mapping)
+            else None
+        )
+        if isinstance(ramp_evidence_stages, Mapping):
+            allowed_ramp_status_failures = frozenset(
+                {
+                    "status_counts_matches_expected_statuses",
+                    "final_status_counts_matches_expected_statuses",
+                    "raw_unexpected_statuses_zero",
+                }
+            )
+            for stage_name, stage_evidence in ramp_evidence_stages.items():
+                stage_checks = (
+                    stage_evidence.get("checks")
+                    if isinstance(stage_evidence, Mapping)
+                    else None
+                )
+                failed_stage_checks = (
+                    {
+                        name
+                        for name, value in stage_checks.items()
+                        if value is False
+                    }
+                    if isinstance(stage_checks, Mapping)
+                    else set()
+                )
+                if (
+                    failed_stage_checks
+                    and failed_stage_checks.issubset(allowed_ramp_status_failures)
+                    and failed_stage_checks.intersection(
+                        {
+                            "status_counts_matches_expected_statuses",
+                            "final_status_counts_matches_expected_statuses",
+                        }
+                    )
+                ):
+                    terminal_status_ramp_stages.add(str(stage_name))
 
     def check_tree(node: Any, path: tuple[str, ...] = ()) -> tuple[bool, bool]:
+        nonlocal terminal_status_failure_seen
         budget_failure = False
         if isinstance(node, Mapping):
             nested_checks = node.get("checks")
@@ -3491,6 +4378,69 @@ def _acceptance_failure_is_budget_only(
                         )
                         if pending_observer_leaf:
                             continue
+                        terminal_status_leaf = (
+                            allow_closed_terminal_status_failure
+                            and (
+                                check_path == ("checks",)
+                                and name in terminal_status_check_names
+                                or (
+                                    len(check_path) == 3
+                                    and check_path[0] == "phase_budget_evidence"
+                                    and check_path[1] in allowed_phase_names
+                                    and check_path[2] == "checks"
+                                    and name in terminal_phase_status_check_names
+                                )
+                                or (
+                                    len(check_path) == 4
+                                    and check_path[:2]
+                                    == ("phase_plan_evidence", "phase_budgets")
+                                    and check_path[2] in allowed_phase_names
+                                    and check_path[3] == "checks"
+                                    and name in terminal_phase_status_check_names
+                                )
+                                or (
+                                    len(check_path) == 5
+                                    and check_path[:2]
+                                    == ("capacity_ramp_evidence", "stages")
+                                    and check_path[3:] == ("budget_evidence", "checks")
+                                    and name in terminal_phase_status_check_names
+                                )
+                                or (
+                                    len(check_path) == 4
+                                    and check_path[:2]
+                                    == ("capacity_ramp_evidence", "stages")
+                                    and check_path[3] == "checks"
+                                    and check_path[2] in terminal_status_ramp_stages
+                                    and name in allowed_ramp_status_failures
+                                )
+                            )
+                        )
+                        if terminal_status_leaf:
+                            terminal_status_failure_seen = True
+                            if (
+                                len(check_path) == 3
+                                and check_path[0] == "phase_budget_evidence"
+                            ):
+                                terminal_status_phase_names.add(check_path[1])
+                            elif (
+                                len(check_path) == 4
+                                and check_path[:2]
+                                == ("phase_plan_evidence", "phase_budgets")
+                            ):
+                                terminal_status_phase_names.add(check_path[2])
+                            elif (
+                                len(check_path) == 5
+                                and check_path[:2]
+                                == ("capacity_ramp_evidence", "stages")
+                            ):
+                                terminal_status_ramp_stages.add(check_path[2])
+                            elif (
+                                len(check_path) == 4
+                                and check_path[:2]
+                                == ("capacity_ramp_evidence", "stages")
+                            ):
+                                terminal_status_ramp_stages.add(check_path[2])
+                            continue
                         top_level_budget_leaf = (
                             check_path == ("checks",)
                             and (
@@ -3524,11 +4474,20 @@ def _acceptance_failure_is_budget_only(
                             check_path == ("capacity_ramp_evidence", "checks")
                             and name in allowed_ramp_budget_checks
                         )
+                        ramp_population_leaf = (
+                            check_path == ("capacity_ramp_evidence", "checks")
+                            and isinstance(name, str)
+                            and name.startswith("ramp_")
+                            and name.endswith("_population")
+                            and name.removeprefix("ramp_").removesuffix("_population")
+                            in terminal_status_ramp_stages
+                        )
                         if (
                             top_level_budget_leaf
                             or phase_budget_leaf
                             or origin_budget_leaf
                             or ramp_budget_leaf
+                            or ramp_population_leaf
                             or ramp_stage_budget_check
                         ):
                             budget_failure = True
@@ -3544,7 +4503,12 @@ def _acceptance_failure_is_budget_only(
                             valid, nested_budget_failure = check_tree(
                                 evidence, path + (evidence_key,)
                             )
-                            if not valid or not nested_budget_failure:
+                            if not valid or not (
+                                nested_budget_failure
+                                or terminal_status_phase_names
+                                or evidence_key == "capacity_ramp_evidence"
+                                and terminal_status_ramp_stages
+                            ):
                                 return False, False
                             budget_failure = True
                         else:
@@ -3590,8 +4554,16 @@ def _acceptance_failure_is_budget_only(
                 ramp_budget_status = (
                     status_key == "complete"
                     and path == ("capacity_ramp_evidence",)
-                    and bool(failed_ramp_stages)
-                    and budget_failure
+                    and (
+                        bool(failed_ramp_stages) and budget_failure
+                        or bool(terminal_status_ramp_stages)
+                    )
+                )
+                terminal_ramp_status = (
+                    status_key == "complete"
+                    and len(path) == 3
+                    and path[:2] == ("capacity_ramp_evidence", "stages")
+                    and path[2] in terminal_status_ramp_stages
                 )
                 root_pending_status = (
                     status_key == "passed"
@@ -3626,12 +4598,36 @@ def _acceptance_failure_is_budget_only(
                         or path == ("origin_safety",)
                     )
                 )
+                terminal_phase_status = (
+                    status_key == "passed"
+                    and allow_closed_terminal_status_failure
+                    and (
+                        len(path) == 2
+                        and path[0] == "phase_budget_evidence"
+                        and path[1] in terminal_status_phase_names
+                        or len(path) == 3
+                        and path[:2]
+                        == ("phase_plan_evidence", "phase_budgets")
+                        and path[2] in terminal_status_phase_names
+                    )
+                )
+                terminal_ramp_budget_status = (
+                    status_key == "passed"
+                    and allow_closed_terminal_status_failure
+                    and len(path) == 4
+                    and path[:2] == ("capacity_ramp_evidence", "stages")
+                    and path[3] == "budget_evidence"
+                    and path[2] in terminal_status_ramp_stages
+                )
                 if not (
                     missing_observer_status
                     or ramp_budget_status
                     or root_pending_status
                     or phase_pending_status
                     or nested_budget_status
+                    or terminal_phase_status
+                    or terminal_ramp_status
+                    or terminal_ramp_budget_status
                 ):
                     return False, False
             return True, budget_failure
@@ -3639,6 +4635,8 @@ def _acceptance_failure_is_budget_only(
 
     valid, false_budget_seen = check_tree(acceptance)
     if not valid:
+        return False
+    if allow_closed_terminal_status_failure and not terminal_status_failure_seen:
         return False
     return false_budget_seen or allow_no_budget_failure
 
