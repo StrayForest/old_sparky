@@ -107,6 +107,255 @@ async function trackCsrfTokenRequests(page: Page) {
   return requests;
 }
 
+async function startTurnstileRouteSwitchWhileSdkIsInFlight(
+  page: Page,
+  outcome: "load" | "abort",
+) {
+  const resetPayloads: Array<Record<string, unknown>> = [];
+  const loginPayloads: Array<Record<string, unknown>> = [];
+  const csrfTokenRequests = await trackCsrfTokenRequests(page);
+  let resetAttempts = 0;
+  let sdkRequestCount = 0;
+  let sdkRequestCountCapped = false;
+  let markSdkRequestStarted: (() => void) | null = null;
+  let releaseSdkResponse: (() => void) | null = null;
+  const sdkRequestStarted = new Promise<void>((resolve) => {
+    markSdkRequestStarted = resolve;
+  });
+  const sdkResponseGate = new Promise<void>((resolve) => {
+    releaseSdkResponse = resolve;
+  });
+
+  await page.addInitScript(() => {
+    const probeWindow = window as Window & {
+      __turnstileLifecycleProbe?: {
+        scriptStubExecuted: boolean;
+        renderCalls: number;
+        renderCallsCapped: boolean;
+        renderActions: string[];
+        renderActionsCapped: boolean;
+      };
+      __firstTurnstileWidget?: Element | null;
+      __firstTurnstileScript?: Element | null;
+    };
+    probeWindow.__turnstileLifecycleProbe = {
+      scriptStubExecuted: false,
+      renderCalls: 0,
+      renderCallsCapped: false,
+      renderActions: [],
+      renderActionsCapped: false
+    };
+  });
+
+  await page.route("**/api/v1/auth/security-config", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "cache-control": "no-store" },
+      body: JSON.stringify({
+        public_registration_enabled: true,
+        email_verification_required: true,
+        turnstile_mode: "always",
+        turnstile_site_key: "turnstile-inflight-lifecycle-key"
+      })
+    });
+  });
+  await page.route("**/turnstile/v0/api.js*", async (route) => {
+    if (sdkRequestCount < 4) {
+      sdkRequestCount += 1;
+    } else {
+      sdkRequestCountCapped = true;
+    }
+    markSdkRequestStarted?.();
+    await sdkResponseGate;
+    if (outcome === "abort") {
+      await route.abort("failed");
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: `if (window.__turnstileLifecycleProbe) {
+        window.__turnstileLifecycleProbe.scriptStubExecuted = true;
+      }
+      window.turnstile = {
+        render(container, options) {
+          const probe = window.__turnstileLifecycleProbe;
+          if (probe) {
+            if (probe.renderCalls < 16) probe.renderCalls += 1;
+            else probe.renderCallsCapped = true;
+            if (["login", "register", "reset_request", "verification_resend"].includes(options.action)) {
+              if (probe.renderActions.length < 4) probe.renderActions.push(options.action);
+              else probe.renderActionsCapped = true;
+            }
+          }
+          container.dataset.turnstileAction = options.action;
+          container.dataset.turnstileAppearance = options.appearance;
+          setTimeout(() => options.callback("inflight-turnstile-token"), 25);
+          return "inflight-widget";
+        },
+        remove() {},
+        reset() {}
+      };`
+    });
+  });
+  await page.route("**/api/v1/auth/password-reset/request", async (route) => {
+    expectOriginOnlyAuthRequest(route);
+    resetPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
+    resetAttempts += 1;
+    await route.fulfill({
+      status: 403,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "Human verification is required." })
+    });
+  });
+  await page.route("**/api/v1/auth/login", async (route) => {
+    expectOriginOnlyAuthRequest(route);
+    loginPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
+    if (loginPayloads.length === 1) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Human verification is required." })
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        user: {
+          id: "u_turnstile_inflight",
+          email: "inflight@example.test",
+          display_name: "Turnstile Player",
+          status: "active",
+          created_at: "2026-05-20T00:00:00Z",
+          roles: ["authenticated_user", "player"],
+          can_create_public_tournaments: false,
+          has_password: true
+        },
+        expires_at: "2026-05-21T00:00:00Z"
+      })
+    });
+  });
+
+  try {
+    await page.goto("/reset-password");
+    await page.getByLabel("Email").fill("inflight@example.test");
+    await page.getByRole("button", { name: "Отправить код" }).click();
+    await sdkRequestStarted;
+    await expect(page.locator(".auth-turnstile")).toHaveCount(1);
+    await expect(page.locator("script#cloudflare-turnstile")).toHaveCount(1);
+    await page.evaluate(() => {
+      const probeWindow = window as Window & {
+        __firstTurnstileWidget?: Element | null;
+        __firstTurnstileScript?: Element | null;
+      };
+      probeWindow.__firstTurnstileWidget = document.querySelector(".auth-turnstile");
+      probeWindow.__firstTurnstileScript = document.querySelector("script#cloudflare-turnstile");
+    });
+    await page.locator('a[href="/auth/login"]').click();
+    await expect(page).toHaveURL(/\/auth\/login$/u);
+    await expect(page.locator(".auth-turnstile")).toHaveCount(0);
+    const firstWidgetDetached = await page.evaluate(() => {
+      const probeWindow = window as Window & { __firstTurnstileWidget?: Element | null };
+      return probeWindow.__firstTurnstileWidget instanceof Node && !probeWindow.__firstTurnstileWidget.isConnected;
+    });
+    expect(firstWidgetDetached).toBe(true);
+    await page.getByLabel("Email").fill("inflight@example.test");
+    await page.getByLabel("Пароль").fill("long-password");
+    await page.getByRole("button", { name: "Войти", exact: true }).click();
+    await expect(page.locator(".auth-turnstile")).toHaveCount(1);
+    await expect.poll(() => loginPayloads).toEqual([{ email: "inflight@example.test", password: "long-password" }]);
+    await page.evaluate(() => {
+      const probeWindow = window as Window & {
+        __firstTurnstileWidget?: Element | null;
+        __firstTurnstileScript?: Element | null;
+        __turnstileLifecycleTopology?: {
+          secondWidgetMounted: boolean;
+          widgetNodeReplaced: boolean;
+          sharedScriptNode: boolean;
+          currentState: "loading" | "checking" | "verified" | "expired" | "error" | "other" | null;
+        };
+      };
+      const oldWidget = probeWindow.__firstTurnstileWidget;
+      const currentWidget = document.querySelector(".auth-turnstile");
+      const oldScript = probeWindow.__firstTurnstileScript;
+      const currentScript = document.querySelector("script#cloudflare-turnstile");
+      const state = currentWidget?.getAttribute("data-state") ?? null;
+      const currentState = state === null
+        ? null
+        : ["loading", "checking", "verified", "expired", "error"].includes(state)
+          ? state as "loading" | "checking" | "verified" | "expired" | "error"
+          : "other";
+      probeWindow.__turnstileLifecycleTopology = {
+        secondWidgetMounted: currentWidget !== null,
+        widgetNodeReplaced: oldWidget !== currentWidget,
+        sharedScriptNode: oldScript === currentScript,
+        currentState
+      };
+    });
+  } catch (error) {
+    releaseSdkResponse?.();
+    throw error;
+  }
+
+  return {
+    csrfTokenRequests,
+    loginPayloads,
+    releaseSdkResponse: () => releaseSdkResponse?.(),
+    resetAttempts,
+    resetPayloads,
+    sdkRequestCount: () => ({ count: sdkRequestCount, capped: sdkRequestCountCapped }),
+  };
+}
+
+async function attachTurnstileLifecycleFailure(page: Page, testInfo: TestInfo, name: string) {
+  const diagnostic = await page.evaluate(() => {
+    type LifecycleProbe = {
+      scriptStubExecuted: boolean;
+      renderCalls: number;
+      renderCallsCapped: boolean;
+      renderActions: string[];
+      renderActionsCapped: boolean;
+    };
+    type TurnstileProbeWindow = Window & {
+      __turnstileLifecycleProbe?: LifecycleProbe;
+      turnstile?: { render?: unknown };
+      __turnstileLifecycleTopology?: {
+        secondWidgetMounted: boolean;
+        widgetNodeReplaced: boolean;
+        sharedScriptNode: boolean;
+      currentState: "loading" | "checking" | "verified" | "expired" | "error" | "other" | null;
+      };
+    };
+    const probeWindow = window as TurnstileProbeWindow;
+    const probe = probeWindow.__turnstileLifecycleProbe;
+    const widget = document.querySelector<HTMLElement>(".auth-turnstile");
+    const rawState = widget?.getAttribute("data-state") ?? null;
+    const currentWidgetState = rawState === null
+      ? null
+      : ["loading", "checking", "verified", "expired", "error"].includes(rawState)
+        ? rawState as "loading" | "checking" | "verified" | "expired" | "error"
+        : "other";
+    return {
+      topology: probeWindow.__turnstileLifecycleTopology ?? null,
+      scriptStubExecuted: probe?.scriptStubExecuted ?? false,
+      turnstileRenderAvailable: typeof probeWindow.turnstile?.render === "function",
+      renderCalls: probe?.renderCalls ?? 0,
+      renderCallsCapped: probe?.renderCallsCapped ?? false,
+      renderActions: probe?.renderActions.slice(0, 4) ?? [],
+      renderActionsCapped: probe?.renderActionsCapped ?? false,
+      currentWidgetMounted: widget !== null,
+      currentWidgetState
+    };
+  });
+  await testInfo.attach(name, {
+    body: Buffer.from(JSON.stringify(diagnostic)),
+    contentType: "application/json"
+  });
+}
+
 test("credential-bearing live QA accepts only the exact HTTPS production origin", () => {
   expect(validateLiveQaOrigin({
     allowLoopback: false,
@@ -3141,6 +3390,110 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
   expect(loginPayloads[0]).toEqual({ email: "turnstile@example.test", password: "long-password" });
   expect(loginPayloads[1].turnstile_token).toBe("turnstile-login-token");
   expect(csrfTokenRequests).toEqual([]);
+});
+
+test("an in-flight Turnstile script readies a second auth-route widget", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-layout", "The original lifecycle failure was isolated to the mobile project.");
+  const scenario = await startTurnstileRouteSwitchWhileSdkIsInFlight(page, "load");
+  const topology = await page.evaluate(() => {
+    const probeWindow = window as Window & {
+      __turnstileLifecycleTopology?: {
+        secondWidgetMounted: boolean;
+        widgetNodeReplaced: boolean;
+        sharedScriptNode: boolean;
+        currentState: "loading" | "checking" | "verified" | "expired" | "error" | "other" | null;
+      };
+    };
+    return probeWindow.__turnstileLifecycleTopology ?? null;
+  });
+  expect(topology).toEqual({
+    secondWidgetMounted: true,
+    widgetNodeReplaced: true,
+    sharedScriptNode: true,
+    currentState: "loading"
+  });
+  expect(scenario.sdkRequestCount()).toEqual({ count: 1, capped: false });
+  scenario.releaseSdkResponse();
+  try {
+    await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "login");
+  } catch (error) {
+    await attachTurnstileLifecycleFailure(page, testInfo, "turnstile-inflight-load-lifecycle.json");
+    throw error;
+  }
+
+  const loadedProbe = await page.evaluate(() => {
+    const probeWindow = window as Window & {
+      __turnstileLifecycleProbe?: { scriptStubExecuted: boolean; renderCalls: number; renderActions: string[] };
+    };
+    return probeWindow.__turnstileLifecycleProbe ?? null;
+  });
+  expect(loadedProbe?.scriptStubExecuted).toBe(true);
+  expect(loadedProbe?.renderCalls).toBe(1);
+  expect(loadedProbe?.renderActions).toEqual(["login"]);
+
+  const submitButton = page.getByRole("button", { name: "Войти", exact: true });
+  await expect(submitButton).toBeEnabled();
+  await submitButton.click();
+  await expect(page).toHaveURL(/\/$/u);
+  expect(scenario.resetAttempts).toBe(1);
+  expect(scenario.resetPayloads).toEqual([{ email: "inflight@example.test" }]);
+  expect(scenario.loginPayloads).toEqual([
+    { email: "inflight@example.test", password: "long-password" },
+    { email: "inflight@example.test", password: "long-password", turnstile_token: "inflight-turnstile-token" }
+  ]);
+  expect(scenario.sdkRequestCount()).toEqual({ count: 1, capped: false });
+  expect(scenario.csrfTokenRequests).toEqual([]);
+});
+
+test("a rejected in-flight Turnstile script keeps a second auth-route challenge fail-closed", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-layout", "The cache-rejection branch is scoped to the same mobile lifecycle reproduction.");
+  const scenario = await startTurnstileRouteSwitchWhileSdkIsInFlight(page, "abort");
+  const topology = await page.evaluate(() => {
+    const probeWindow = window as Window & {
+      __turnstileLifecycleTopology?: {
+        secondWidgetMounted: boolean;
+        widgetNodeReplaced: boolean;
+        sharedScriptNode: boolean;
+        currentState: "loading" | "checking" | "verified" | "expired" | "error" | "other" | null;
+      };
+    };
+    return probeWindow.__turnstileLifecycleTopology ?? null;
+  });
+  expect(topology).toEqual({
+    secondWidgetMounted: true,
+    widgetNodeReplaced: true,
+    sharedScriptNode: true,
+    currentState: "loading"
+  });
+  expect(scenario.sdkRequestCount()).toEqual({ count: 1, capped: false });
+  scenario.releaseSdkResponse();
+  try {
+    await expect(page.locator(".auth-turnstile")).toHaveAttribute("data-state", "error");
+  } catch (error) {
+    await attachTurnstileLifecycleFailure(page, testInfo, "turnstile-inflight-rejection-lifecycle.json");
+    throw error;
+  }
+
+  const rejectedProbe = await page.evaluate(() => {
+    const probeWindow = window as Window & {
+      __turnstileLifecycleProbe?: { scriptStubExecuted: boolean; renderCalls: number; renderActions: string[] };
+      turnstile?: { render?: unknown };
+    };
+    return {
+      probe: probeWindow.__turnstileLifecycleProbe ?? null,
+      turnstileRenderAvailable: typeof probeWindow.turnstile?.render === "function"
+    };
+  });
+  expect(rejectedProbe.probe?.scriptStubExecuted).toBe(false);
+  expect(rejectedProbe.probe?.renderCalls).toBe(0);
+  expect(rejectedProbe.probe?.renderActions).toEqual([]);
+  expect(rejectedProbe.turnstileRenderAvailable).toBe(false);
+  await expect(page.getByRole("button", { name: "Войти", exact: true })).toBeDisabled();
+  expect(scenario.resetAttempts).toBe(1);
+  expect(scenario.resetPayloads).toEqual([{ email: "inflight@example.test" }]);
+  expect(scenario.loginPayloads).toEqual([{ email: "inflight@example.test", password: "long-password" }]);
+  expect(scenario.sdkRequestCount()).toEqual({ count: 1, capped: false });
+  expect(scenario.csrfTokenRequests).toEqual([]);
 });
 
 test("Steam start does not mount Turnstile, grows the panel, or duplicate requests", async ({ page }) => {
