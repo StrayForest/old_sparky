@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -549,9 +550,14 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
             def read(self, _size: int = -1) -> bytes:
                 return b'<!doctype html><html><body>synthetic</body></html>'
 
-        def urlopen(request_object: object, *, timeout: float) -> FakeResponse:
+        def urlopen(
+            request_object: object,
+            *,
+            timeout: float,
+            context: ssl.SSLContext,
+        ) -> FakeResponse:
             nonlocal failing_attempts, failed_once
-            del timeout
+            del timeout, context
             method = request_object.get_method()
             path = request_object.full_url
             cookie = request_object.get_header("Cookie") or ""
@@ -896,9 +902,14 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 self._offset += len(chunk)
                 return chunk
 
-        def urlopen(request_object: object, *, timeout: float) -> FakeResponse:
+        def urlopen(
+            request_object: object,
+            *,
+            timeout: float,
+            context: ssl.SSLContext,
+        ) -> FakeResponse:
             nonlocal post_requests, transport_failures
-            del timeout
+            del timeout, context
             method = request_object.get_method()
             path = request_object.full_url
             if method == "POST":

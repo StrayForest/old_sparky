@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import random
 import re
+import ssl
 import threading
 import time
 from collections.abc import Iterable, Mapping
@@ -99,6 +100,36 @@ SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]+$")
 PROFILE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+_DEFAULT_HTTPS_CONTEXT_LOCK = threading.Lock()
+_DEFAULT_HTTPS_CONTEXT: ssl.SSLContext | None = None
+
+
+def _default_https_context() -> ssl.SSLContext:
+    """Return the runner's immutable urllib-compatible HTTPS context.
+
+    urllib creates a new default context for every ``urlopen`` call when no
+    context is supplied.  Build the same verified HTTP/1.1 context once and
+    share it across the runner's workers; do not mutate it after publication.
+    """
+
+    global _DEFAULT_HTTPS_CONTEXT
+    context = _DEFAULT_HTTPS_CONTEXT
+    if context is not None:
+        return context
+    with _DEFAULT_HTTPS_CONTEXT_LOCK:
+        context = _DEFAULT_HTTPS_CONTEXT
+        if context is None:
+            context = ssl.create_default_context()
+            context.set_alpn_protocols(["http/1.1"])
+            if getattr(context, "post_handshake_auth", None) is not None:
+                context.post_handshake_auth = True
+            if context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname:
+                raise ExternalLoadError("default HTTPS verification context is unsafe")
+            _DEFAULT_HTTPS_CONTEXT = context
+    return context
+
+
 SOURCE_BINDING_KEYS = frozenset(
     {
         "schema",
@@ -772,6 +803,10 @@ class _ResultAccumulator:
                     "ttfb_ms": finite_number(result.time_to_first_byte_ms),
                     "elapsed_ms": finite_number(result.elapsed_ms),
                 }
+                if isinstance(result.diagnostic_id, str) and re.fullmatch(
+                    r"tdiag-[0-9]{1,32}-[0-9]{5}", result.diagnostic_id
+                ):
+                    timeout_diagnostic["diagnostic_id"] = result.diagnostic_id
                 timeout_order = (
                     safe_phase(result.phase),
                     result.submission_index
@@ -1238,7 +1273,11 @@ def _trace(
     try:
         # The origin is validated against a fixed HTTPS allowlist before this
         # function is called; no user-controlled URL is accepted here.
-        with urlopen(request, timeout=timeout) as response:  # nosec B310
+        with urlopen(
+            request,
+            timeout=timeout,
+            context=_default_https_context(),
+        ) as response:  # nosec B310
             # Read and discard the body.  It contains edge IP, location and
             # other unique request metadata which is useful only transiently
             # while debugging a live request.
@@ -1495,7 +1534,11 @@ def _request(
     try:
         # URL is constructed only from the fixed manifest origin and a route
         # selected by this module; this is not an arbitrary fetch primitive.
-        with urlopen(request, timeout=timeout) as response:  # nosec B310
+        with urlopen(
+            request,
+            timeout=timeout,
+            context=_default_https_context(),
+        ) as response:  # nosec B310
             status = int(response.status)
             cf_ray = response.headers.get("cf-ray", "")[:128] or None
             cf_error_type, cf_error_origin, retry_after = diagnostic_headers(response.headers)

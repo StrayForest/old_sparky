@@ -297,7 +297,13 @@ def safe_error_class(value: Any, *, status: Any = 0) -> str:
         return "timeout"
     if numeric_status == 429 or "rate" in raw or "overload" in raw or "busy" in raw:
         return "rate_limited"
-    if numeric_status in {401, 403} or "auth" in raw or "csrf" in raw:
+    if (
+        numeric_status in {401, 403}
+        or (
+            raw != "authoritative_state_mismatch"
+            and ("auth" in raw or "csrf" in raw)
+        )
+    ):
         return "auth"
     if 400 <= numeric_status <= 499:
         return "validation" if numeric_status in {400, 404, 409, 422} else "http_error"

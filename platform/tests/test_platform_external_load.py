@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-import json
 import http.client
-from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 from pathlib import Path
 import signal
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError
 from unittest.mock import patch
 
+import tools.platform_external_load as external_load
 from tools.platform_external_load import (
     ExternalLoadError,
     LogicalRequestResult,
@@ -825,6 +827,17 @@ class ExternalLoadTests(unittest.TestCase):
         )
 
     def test_request_extracts_only_allowlisted_failure_headers(self) -> None:
+        class FakeContext:
+            verify_mode = ssl.CERT_REQUIRED
+            check_hostname = True
+            post_handshake_auth = False
+
+            def __init__(self) -> None:
+                self.alpn_protocols: list[str] = []
+
+            def set_alpn_protocols(self, protocols: list[str]) -> None:
+                self.alpn_protocols = protocols
+
         class FakeResponse:
             status = 522
             headers = {
@@ -846,17 +859,66 @@ class ExternalLoadTests(unittest.TestCase):
                 return b""
 
         user = VirtualUser("user-00000001", "qa-tournament", "s" * 64, "c" * 64)
-        with patch("tools.platform_external_load.urlopen", return_value=FakeResponse()):
-            result = _request(
-                "https://old-sparky.com",
-                user,
-                method="GET",
-                path="/tournaments/qa-tournament",
-                phase="diagnostic",
-                timeout=1.0,
-                session_cookie_name="session",
-                csrf_cookie_name="csrf",
-            )
+        original_context = external_load._DEFAULT_HTTPS_CONTEXT
+        fake_context = FakeContext()
+        with external_load._DEFAULT_HTTPS_CONTEXT_LOCK:
+            external_load._DEFAULT_HTTPS_CONTEXT = None
+        try:
+            with patch(
+                "tools.platform_external_load.ssl.create_default_context",
+                return_value=fake_context,
+            ) as factory:
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    contexts = list(
+                        executor.map(
+                            lambda _index: external_load._default_https_context(),
+                            range(64),
+                        )
+                    )
+                with patch(
+                    "tools.platform_external_load.urlopen",
+                    return_value=FakeResponse(),
+                ) as opener:
+                    result = _request(
+                        "https://old-sparky.com",
+                        user,
+                        method="GET",
+                        path="/tournaments/qa-tournament",
+                        phase="diagnostic",
+                        timeout=1.0,
+                        session_cookie_name="session",
+                        csrf_cookie_name="csrf",
+                    )
+                    _request(
+                        "https://old-sparky.com",
+                        user,
+                        method="GET",
+                        path="/tournaments/qa-tournament",
+                        phase="diagnostic",
+                        timeout=1.0,
+                        session_cookie_name="session",
+                        csrf_cookie_name="csrf",
+                    )
+            self.assertEqual(factory.call_count, 1)
+            factory.assert_called_once_with()
+            self.assertTrue(all(context is fake_context for context in contexts))
+            self.assertEqual(fake_context.alpn_protocols, ["http/1.1"])
+            self.assertTrue(fake_context.post_handshake_auth)
+            self.assertTrue(fake_context.check_hostname)
+            self.assertEqual(fake_context.verify_mode, ssl.CERT_REQUIRED)
+            passed_contexts = [call.kwargs["context"] for call in opener.call_args_list]
+            self.assertEqual(len(passed_contexts), 2)
+            self.assertTrue(all(context is fake_context for context in passed_contexts))
+        finally:
+            with external_load._DEFAULT_HTTPS_CONTEXT_LOCK:
+                external_load._DEFAULT_HTTPS_CONTEXT = original_context
+
+        actual_context = external_load._default_https_context()
+        self.assertIsInstance(actual_context, ssl.SSLContext)
+        self.assertEqual(actual_context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(actual_context.check_hostname)
+        if actual_context.post_handshake_auth is not None:
+            self.assertTrue(actual_context.post_handshake_auth)
 
         self.assertEqual(result.status, 522)
         self.assertEqual(result.cf_ray, "ray-522")
@@ -868,7 +930,12 @@ class ExternalLoadTests(unittest.TestCase):
         user = VirtualUser("user-00000001", "qa-tournament", "s" * 64, "c" * 64)
         captured: list[object] = []
 
-        def fail(request: object, *, timeout: float) -> object:
+        def fail(
+            request: object,
+            *,
+            timeout: float,
+            context: ssl.SSLContext,
+        ) -> object:
             captured.append(request)
             raise TimeoutError("timed out")
 
@@ -918,6 +985,10 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(len(summary["timeout_diagnostics"]), 25)
         self.assertEqual(summary["timeout_diagnostic_total"], 26)
         self.assertEqual(summary["timeout_diagnostic_truncated"], 1)
+        self.assertEqual(
+            summary["timeout_diagnostics"][0]["diagnostic_id"],
+            "tdiag-123-00000",
+        )
 
     def test_ready_vote_retries_only_explicit_overload_and_reports_logical_latency(self) -> None:
         _, users = load_manifest_from_payload(manifest_payload())
