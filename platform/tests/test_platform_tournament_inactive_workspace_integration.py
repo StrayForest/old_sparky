@@ -6,10 +6,10 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, event, select
 
 from apps.platform_api.app.main import create_app
-from python_packages.platform_infra.db import dispose_engine, session_factory
+from python_packages.platform_infra.db import dispose_engine, engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
     Tournament,
@@ -133,6 +133,53 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             201,
         )
 
+        active_member = await self._register_user("active")
+        self._assert_status(
+            await active_member["client"].post(
+                "/api/v1/tournaments/invites/claim",
+                json={"code": invite["code"], "entry_type": "solo", "team_name": None},
+            ),
+            201,
+        )
+        self._assert_status(
+            await active_member["client"].post(
+                f"/api/v1/tournaments/{slug}/join",
+                json={"entry_type": "solo", "invite_code": invite["code"]},
+            ),
+            201,
+        )
+        active_identity = self._assert_status(
+            await active_member["client"].get("/api/v1/users/me"),
+            200,
+        )
+        self.assertEqual(active_identity["id"], active_member["user_id"])
+        self.assertNotEqual(active_member["user_id"], organizer["user_id"])
+        self.assertFalse({"admin", "superadmin"}.intersection(active_identity["roles"]))
+        participant_selects: list[str] = []
+
+        def count_participant_select(
+            _conn,
+            _cursor,
+            statement: str,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            if statement.lstrip().upper().startswith("SELECT") and "tournament_participants" in statement:
+                participant_selects.append(statement)
+
+        event.listen(engine().sync_engine, "before_cursor_execute", count_participant_select)
+        try:
+            active_workspace = await active_member["client"].get(
+                f"/api/v1/tournaments/{slug}/workspace",
+                params={"workspace_view": "bracket", "participants_limit": 0},
+            )
+        finally:
+            event.remove(engine().sync_engine, "before_cursor_execute", count_participant_select)
+        self.assertEqual(active_workspace.status_code, 200, active_workspace.text)
+        self.assertEqual(len(participant_selects), 1, participant_selects)
+        self.assertIn("workspace_tournament_id", participant_selects[0])
+
         members = []
         for participant_status in ("withdrawn", "disqualified"):
             member = await self._register_user(participant_status)
@@ -178,6 +225,28 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
         # exactly these current surfaces, including retained inactive users.
         bearer_read_suffixes = ("workspace", "participants", "matches", "bracket")
         for participant_status, member in members:
+            denied_without_invite = await member["client"].get(
+                f"/api/v1/tournaments/{slug}/workspace"
+            )
+            self.assertEqual(
+                denied_without_invite.status_code,
+                403,
+                denied_without_invite.text,
+            )
+            for conditional_value in ("*", ""):
+                with self.subTest(
+                    status=participant_status,
+                    conditional_header=conditional_value or "blank",
+                ):
+                    conditional_denial = await member["client"].get(
+                        f"/api/v1/tournaments/{slug}/workspace",
+                        headers={"If-None-Match": conditional_value},
+                    )
+                    self.assertEqual(
+                        conditional_denial.status_code,
+                        403,
+                        conditional_denial.text,
+                    )
             for suffix in bearer_read_suffixes:
                 with self.subTest(status=participant_status, suffix=f"bearer:{suffix}"):
                     response = await member["client"].get(

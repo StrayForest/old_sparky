@@ -207,6 +207,23 @@ def auth_session_has_admin_role(auth_session) -> bool:
     return "admin" in auth_session.role_slugs or "superadmin" in auth_session.role_slugs
 
 
+def private_tournament_read_membership_is_active(
+    *,
+    visibility: str,
+    organizer_user_id: str,
+    user_id: str,
+    participant_status: str | None,
+) -> bool:
+    """Return the exact historical child-read membership decision."""
+
+    return (
+        visibility != "invite_only"
+        or organizer_user_id == user_id
+        or participant_status is None
+        or participant_status in ACTIVE_PARTICIPANT_STATUSES
+    )
+
+
 async def ensure_private_tournament_read_membership_is_active(
     request: Request,
     # Use the same dependency object as the route handler. FastAPI can then
@@ -294,14 +311,41 @@ async def ensure_private_tournament_read_membership_is_active(
         return
 
     visibility, organizer_user_id, participant_status = row
-    if (
-        visibility != "invite_only"
-        or organizer_user_id == auth_session.user.id
-        or participant_status is None
-        or participant_status in ACTIVE_PARTICIPANT_STATUSES
+    if private_tournament_read_membership_is_active(
+        visibility=visibility,
+        organizer_user_id=organizer_user_id,
+        user_id=auth_session.user.id,
+        participant_status=participant_status,
     ):
         return
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Inactive tournament participants cannot access private tournament workspace data.",
+    )
+
+
+async def ensure_workspace_private_membership(
+    request: Request,
+    auth_session=Depends(get_optional_authenticated_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> None:
+    """Defer only the workspace's duplicate membership read to its base query.
+
+    The workspace preflight already reads the tournament and viewer's
+    participant row. Requests with invite input, conditional headers, anonymous
+    callers, and administrators retain the original dependency and ordering.
+    """
+
+    if (
+        auth_session is not None
+        and not auth_session_has_admin_role(auth_session)
+        and "invite_code" not in request.query_params
+        and "if-none-match" not in request.headers
+    ):
+        request.state.workspace_membership_preflight_pending = True
+        return
+    await ensure_private_tournament_read_membership_is_active(
+        request,
+        auth_session=auth_session,
+        db_session=db_session,
     )

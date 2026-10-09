@@ -3061,6 +3061,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 self.assertNotIn("/usr/bin/setpriv", source)
                 self.assertNotIn("--no-sandbox", source)
                 self.assertNotIn("--disable-setuid-sandbox", source)
+        live_user = (TOOLS_ROOT / "platform_live_user_qa.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('LIVE_QA_RUNNER_SHA="${PLATFORM_LIVE_QA_RUNNER_SHA:-$SOURCE_COMMIT}"', live_user)
+        self.assertIn('printf \'%s\' "$MARKER" | /usr/bin/sha256sum', live_user)
+        self.assertIn('PLATFORM_LIVE_QA_TARGET_SHA="$SOURCE_COMMIT"', live_user)
+        self.assertIn('PLATFORM_LIVE_QA_RUNNER_SHA="$LIVE_QA_RUNNER_SHA"', live_user)
+        self.assertIn('PLATFORM_LIVE_QA_MARKER_SHA256="$LIVE_QA_MARKER_SHA256"', live_user)
 
     def test_public_browser_cleanup_reclaims_runner_ownership_before_removal(
         self,

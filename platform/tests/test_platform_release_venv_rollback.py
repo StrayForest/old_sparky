@@ -1552,6 +1552,10 @@ else:
             "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
             "web/tests/support/live-qa-origin.ts": b"export {};\n",
             "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
+            "web/tests/support/live-count-reporter.cjs": (
+                REPO_ROOT
+                / "platform/apps/platform_web/tests/support/live-count-reporter.cjs"
+            ).read_bytes(),
             "web/node_modules/@playwright/test/package.json": b'{"name":"@playwright/test"}\n',
             "web/node_modules/playwright/package.json": b'{"name":"playwright"}\n',
             "web/node_modules/playwright-core/package.json": b'{"name":"playwright-core"}\n',

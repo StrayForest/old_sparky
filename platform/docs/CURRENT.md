@@ -8,9 +8,10 @@ Read this file for the current production baseline and next engineering priority
 
 ## Verified checkpoint — 2026-10-09
 
-- Current app M6 source `84e3ed04efadb08b4d83b75e594420836ad81a95` is installed in release `gha-37858549590-1-84e3ed04efad`, with provider C `bbd7fd6f46dfbd21c3dfd6b1b27f6409c580196e`; the M4 stale release was removed through the canonical one-candidate retention path. M6 remains the deployed source while the next diagnostic fix is reviewed and published.
-- Authenticated-load diagnostic [`37860645995`](https://github.com/StrayForest/old_sparky/actions/runs/37860645995) is not a passing QA result. The bounded client report records a worker body-read exception at `platform_external_load.py:1346`, incomplete work and unknown in-flight state, so it has no request-count or performance credit. During the enclosing client-step window, API logs showed 6,237 `request_perf` rows including 651 admission sheds; Nginx logged 371 matching upstream 500s. Those server counts are step-window evidence, not exact client-action counts.
-- The same-generation observer window recorded maximum web heap-used 391.6 MB of a 562 MB limit and RSS 777.9 MB, with no OOM or restart evidence. This does not establish a memory leak or full-load completion. The pending source fix narrowly accounts for bounded HTTP body-read transport exceptions and installs the digest-bound release validator required by the copied trusted dispatcher; admission, retry, worker and request budgets remain unchanged.
+- Current app M8 source `6343099bb7686671bdef49d0c4ecd10f21ef19d2` is installed in release `gha-37873770566-1-6343099bb768` with provider C `bbd7fd6f46dfbd21c3dfd6b1b27f6409c580196e`; M6 is the previous release. The M5 stale release was removed through the canonical one-candidate retention path. The live-user validator is present in the trusted runtime. API admission remains configured at 24 active requests, 8 bounded waiters and a 250 ms wait.
+- M8 public live-QA diagnostic [`37876068895`](https://github.com/StrayForest/old_sparky/actions/runs/37876068895) ended in browser-QA startup with exit 2 and no browser counts. Source review found the custom reporter missing from the immutable runtime package; this is consistent with the failure, but the child error text was discarded, so the exact runtime exception is not established.
+- M8 authenticated-load diagnostics [`37877006118`](https://github.com/StrayForest/old_sparky/actions/runs/37877006118) and [`37880022571`](https://github.com/StrayForest/old_sparky/actions/runs/37880022571) both completed all 20,000 requests and exact fixture cleanup, but both failed the declared stress contract. The v1 run returned 19,473 HTTP 200, 526 HTTP 500 and 1 HTTP 502 with no retries; the v2 keep-alive run returned 19,290 HTTP 200 and 710 HTTP 500 with no retries. User-observed logical p95/p99 were 508,038/531,196 ms for v1 and 505,684/528,032 ms for v2 against 5,000/8,000 ms budgets. The keep-alive comparison did not establish a performance improvement. These diagnostics receive no final QA or performance credit.
+- The next source candidate is not deployed. It combines a route-scoped reuse of the authenticated workspace preflight for eligible private reads, inclusion of the digest-bound live-count reporter in the immutable browser runtime for both public and live-user QA, and removal of temporary SSR heap-measurement overrides from persistent profiles. The active API admission values and security checks remain unchanged. The candidate still requires exact-SHA CI, normal deployment, fresh release guards, and the final serial QA matrix before promotion.
 
 ## Production baseline
 
@@ -143,8 +144,8 @@ cleanup. TTFB p95/p99 was `1173.196/1359.348 ms`; Nginx upstream-header p95 was
 the OOM/queueing failure mode, but it missed the `<1,000 ms` target by `173.196
 ms`, so it is not the production default. The direct transport is now gated by
 `PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node` and the two-worker profile; ordinary
-baseline/static/diagnostic profiles explicitly use `fetch`. The current
-current production runtime is recorded in the verified checkpoint above. The
+baseline/static/diagnostic profiles explicitly use `fetch`. Current
+production runtime is recorded in the verified checkpoint above. The
 historical transport runs below did not change it.
 
 The 2026-09-11 authenticated HTML follow-up did not produce a promotion
@@ -156,8 +157,11 @@ the one-worker native transport returned `17,549` HTTP 200 and `2,451` HTTP
 HTTP 502. Database ownership/lock safety checks passed in every window, while
 the web process was replaced and RSS approached the `1 GiB` cgroup limit.
 
-Remaining performance work is explicit: authenticated page TTFB remains above
-the `<1,000 ms` target. The prior blocked attribution is retained in the
+The following transport and render investigations are historical context for
+the current M8 measurement checkpoint above. The authenticated page TTFB
+target remains `<1,000 ms`; current full-population results and the next
+source candidate are recorded in the verified checkpoint. The prior blocked
+attribution is retained in the
 [`authenticated HTML/TTFB archive`](archive/performance-authenticated-html-ttfb-2026-09-07.md),
 and the root component-tree diagnostic is archived in
 [`performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md`](archive/performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md).
@@ -246,9 +250,8 @@ successfully. A post-rollback diagnostic load also stalled before a client
 report; guarded abort and exact cleanup passed for its one marker, 20,000
 users and 40 tournaments with zero remnants. Production was restored to
 `ready-vote-static-8` by deploy `34184805970` for reviewed SHA
-`3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The active diagnostic work order
-above is now the only next performance step; the narrower
-authenticated-provider-boundary candidate is
+`3d7aca0e832bac3c79e1b391e7817b74e5695b03`. At that historical checkpoint,
+the next work item was the narrower authenticated-provider-boundary candidate,
 archived in
 [`performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md`](archive/performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md).
 Its reviewed SHA `6e3a6325a0c6bee025297a8c8edb00817faafb75` completed the exact
@@ -272,8 +275,8 @@ The tournament-detail-footer candidate is archived in
 [`performance-authenticated-html-ttfb-detail-footer-2026-09-08.md`](archive/performance-authenticated-html-ttfb-detail-footer-2026-09-08.md).
 Its exact load `34230327945` reached the full 20k/40 fixture but failed closed
 on a client `IncompleteRead` before producing a TTFB report; exact cleanup
-passed with zero remnants. No capacity-setting change is authorized while the
-active diagnostic work order is incomplete.
+passed with zero remnants. These archived experiments did not establish a
+reason to raise capacity settings.
 The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.

@@ -98,7 +98,9 @@ from apps.platform_api.app.services.tournament_participant_policy import (
 )
 from apps.platform_api.app.services.tournament_workspace_access import (
     enforce_tournament_bearer_read_rate_limit,
+    ensure_workspace_private_membership,
     ensure_private_tournament_read_membership_is_active,
+    private_tournament_read_membership_is_active,
     strict_invite_code_query,
 )
 from apps.platform_api.app.services.tournament_write_serialization import (
@@ -7421,7 +7423,7 @@ async def get_tournament_scoped_profile(
 @router.get(
     "/{slug}/workspace",
     response_model=TournamentWorkspaceResponse,
-    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+    dependencies=[Depends(ensure_workspace_private_membership)],
 )
 async def get_tournament_workspace(
     slug: str,
@@ -7599,6 +7601,27 @@ async def get_tournament_workspace(
         if workspace_base_snapshot is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
         tournament = workspace_base_snapshot.tournament
+        if (
+            getattr(request.state, "workspace_membership_preflight_pending", False)
+            and auth_session is not None
+            and not private_tournament_read_membership_is_active(
+                visibility=tournament.visibility,
+                organizer_user_id=tournament.organizer_user_id,
+                user_id=auth_session.user.id,
+                participant_status=(
+                    workspace_base_snapshot.participant_record.status
+                    if workspace_base_snapshot.participant_record is not None
+                    else None
+                ),
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Inactive tournament participants cannot access private "
+                    "tournament workspace data."
+                ),
+            )
         organizer_display_name = workspace_base_snapshot.organizer_display_name
         organizer_avatar_asset_id = workspace_base_snapshot.organizer_avatar_asset_id
         participant_count = workspace_base_snapshot.participant_count

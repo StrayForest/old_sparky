@@ -154,9 +154,8 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
                 "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": str(limit),
                 "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": str(limit),
             }
-            if limit == 8:
-                expected["PLATFORM_SSR_HEAP_METRICS_ENABLED"] = "true"
             self.assertEqual(profile, expected)
+            self.assertNotIn("PLATFORM_SSR_HEAP_METRICS_ENABLED", profile)
 
     def test_ready_vote_adaptive_v2_preserves_worker_and_database_envelope(self) -> None:
         profile = configure.RUNTIME_PROFILES["ready-vote-adaptive-v2"]
@@ -186,7 +185,6 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
                 "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "24",
                 "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "8",
                 "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "250",
-                "PLATFORM_SSR_HEAP_METRICS_ENABLED": "true",
             },
         )
         self.assertEqual(

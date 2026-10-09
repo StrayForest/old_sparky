@@ -244,6 +244,17 @@ BROWSER_GATE="$(
     --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
     --state-dir "$QA_STATE_DIR"
 )"
+LIVE_QA_RUNNER_SHA="${PLATFORM_LIVE_QA_RUNNER_SHA:-$SOURCE_COMMIT}"
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ \
+  || ! "$LIVE_QA_RUNNER_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Live-user browser counts require exact app and runner source identities." >&2
+  exit 1
+fi
+read -r LIVE_QA_MARKER_SHA256 _ < <(printf '%s' "$MARKER" | /usr/bin/sha256sum)
+if [[ ! "$LIVE_QA_MARKER_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Live-user browser marker digest is unavailable." >&2
+  exit 1
+fi
 LIVE_QA_UID="$(/usr/bin/id -u oldsparky-liveqa)"
 LIVE_QA_GID="$(/usr/bin/id -g oldsparky-liveqa)"
 if [[ "$LIVE_QA_UID" == "0" || "$LIVE_QA_GID" == "0" ]]; then
@@ -274,6 +285,9 @@ fi
     HOME="$BROWSER_GATE/home" \
     LANG=C.UTF-8 \
     PATH="$RUNTIME_CACHE/node/bin:/usr/bin:/bin" \
+    PLATFORM_LIVE_QA_TARGET_SHA="$SOURCE_COMMIT" \
+    PLATFORM_LIVE_QA_RUNNER_SHA="$LIVE_QA_RUNNER_SHA" \
+    PLATFORM_LIVE_QA_MARKER_SHA256="$LIVE_QA_MARKER_SHA256" \
     PLATFORM_LIVE_EXPECTED_ORIGIN="$EXPECTED_LIVE_ORIGIN" \
     PLATFORM_LIVE_USER_QA=1 \
     PLATFORM_LIVE_USER_QA_INVENTORY="$BROWSER_GATE/inventory.json" \

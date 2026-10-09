@@ -19,6 +19,12 @@ const ATTEMPT_STATUSES = new Set([
 ]);
 const SHA40 = /^[0-9a-f]{40}$/u;
 const SHA64 = /^[0-9a-f]{64}$/u;
+const PUBLIC_GATE_NAME = /^public-live-qa\.[a-z0-9_]{8}$/u;
+const LIVE_USER_GATE_NAME = /^live-user-qa\.[A-Za-z0-9]{6}$/u;
+
+function supportedGateName(name) {
+  return PUBLIC_GATE_NAME.test(name) || LIVE_USER_GATE_NAME.test(name);
+}
 
 function unavailable() {
   return null;
@@ -96,12 +102,19 @@ function summarizeRun(suite, runStatus) {
 
 function bindingsFromEnvironment(env = process.env) {
   const gate = env.PLATFORM_QA_BROWSER_GATE_DIR;
+  const sessions = env.PLATFORM_LIVE_USER_QA_SESSIONS;
   const appSha = env.PLATFORM_LIVE_QA_TARGET_SHA;
   const runnerSha = env.PLATFORM_LIVE_QA_RUNNER_SHA;
   const markerSha = env.PLATFORM_LIVE_QA_MARKER_SHA256;
+  const gateName = typeof gate === "string" ? path.basename(gate) : "";
+  const publicGate = PUBLIC_GATE_NAME.test(gateName);
+  const liveUserGate = LIVE_USER_GATE_NAME.test(gateName);
   if (
     typeof gate !== "string"
-    || !/^\/run\/oldsparky-liveqa\/public-live-qa\.[a-z0-9_]{8}$/u.test(gate)
+    || path.dirname(gate) !== GATE_ROOT
+    || !supportedGateName(gateName)
+    || (publicGate && Object.prototype.hasOwnProperty.call(env, "PLATFORM_LIVE_USER_QA_SESSIONS"))
+    || (liveUserGate && sessions !== path.join(gate, "browser-sessions.json"))
     || !SHA40.test(appSha ?? "")
     || !SHA40.test(runnerSha ?? "")
     || !SHA64.test(markerSha ?? "")
@@ -115,7 +128,7 @@ function writeBoundedSummary(binding, summary, { gateRoot = GATE_ROOT } = {}) {
   if (!binding || !summary) return false;
   if (
     path.dirname(binding.gate) !== gateRoot
-    || !/^public-live-qa\.[a-z0-9_]{8}$/u.test(path.basename(binding.gate))
+    || !supportedGateName(path.basename(binding.gate))
   ) return false;
   let gateMetadata;
   let resultsMetadata;

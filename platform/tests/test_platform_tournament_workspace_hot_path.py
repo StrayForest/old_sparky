@@ -4,13 +4,17 @@ import json
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
+from fastapi import HTTPException
 from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import Response
 
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
+from apps.platform_api.app.services import (
+    tournament_workspace_access as workspace_access,
+)
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
@@ -95,6 +99,43 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
             ),
         )
 
+    def test_deferred_membership_preserves_closed_active_status_policy(self) -> None:
+        decide = tournament_routes.private_tournament_read_membership_is_active
+        for active_status in ("registered", "confirmed", "checked_in"):
+            self.assertTrue(
+                decide(
+                    visibility="invite_only",
+                    organizer_user_id="organizer-1",
+                    user_id="viewer-1",
+                    participant_status=active_status,
+                )
+            )
+        for inactive_or_unknown in ("withdrawn", "banned", "future_status"):
+            self.assertFalse(
+                decide(
+                    visibility="invite_only",
+                    organizer_user_id="organizer-1",
+                    user_id="viewer-1",
+                    participant_status=inactive_or_unknown,
+                )
+            )
+        self.assertTrue(
+            decide(
+                visibility="invite_only",
+                organizer_user_id="viewer-1",
+                user_id="viewer-1",
+                participant_status="withdrawn",
+            )
+        )
+        self.assertTrue(
+            decide(
+                visibility="public",
+                organizer_user_id="organizer-1",
+                user_id="viewer-1",
+                participant_status="withdrawn",
+            )
+        )
+
     def test_workspace_conditional_preflight_statement_is_one_read_shape(self) -> None:
         statement = tournament_routes.workspace_conditional_preflight_stmt()
         sql = str(statement.compile())
@@ -168,6 +209,12 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
                 "client": ("testclient", 1),
             }
         )
+        await tournament_routes.ensure_workspace_private_membership(
+            request,
+            auth_session=auth_session,
+            db_session=AsyncMock(),
+        )
+        self.assertTrue(request.state.workspace_membership_preflight_pending)
 
         with (
             patch.object(
@@ -241,6 +288,143 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
             base_lookup.await_args.kwargs,
             {"slug": "night-cup", "user_id": "user-1"},
         )
+
+    async def test_workspace_deferred_membership_uses_snapshot_and_denies_inactive_private_member(self) -> None:
+        tournament = SimpleNamespace(
+            id="tournament-1",
+            slug="night-cup",
+            visibility="invite_only",
+            status="registration_closed",
+            format_slug="solo",
+            organizer_user_id="organizer-1",
+            updated_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+            created_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+            bracket_revision=0,
+        )
+        snapshot = tournament_routes.WorkspaceBasePreflight(
+            tournament=tournament,
+            organizer_display_name="Organizer",
+            organizer_avatar_asset_id=None,
+            participant_count=1,
+            locked_roster_count=0,
+            participant_record=SimpleNamespace(status="withdrawn"),
+            active_commitment=None,
+            ready_check=tournament_routes.WorkspaceReadyCheckPreflight(
+                round=None,
+                ready_count=0,
+                declined_count=0,
+                current_user_choice=None,
+            ),
+        )
+        auth_session = SimpleNamespace(
+            user=SimpleNamespace(id="user-1"),
+            role_slugs=frozenset(),
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/tournaments/night-cup/workspace",
+                "headers": [],
+                "query_string": b"workspace_view=bracket",
+                "scheme": "http",
+                "server": ("testserver", 80),
+                "client": ("testclient", 1),
+            }
+        )
+        tournament_routes._set_public_workspace_snapshot_cache(
+            "night-cup",
+            tournament_id="tournament-1",
+            tournament_updated_at=tournament.updated_at,
+            response=tournament_routes.TournamentWorkspaceResponse.model_construct(
+                tournament=tournament_routes.TournamentResponse.model_construct(
+                    id="tournament-1", slug="night-cup", visibility="public"
+                )
+            ),
+        )
+        await tournament_routes.ensure_workspace_private_membership(
+            request,
+            auth_session=auth_session,
+            db_session=AsyncMock(),
+        )
+        base_lookup = AsyncMock(return_value=snapshot)
+        current_tournament = SimpleNamespace(
+            id="tournament-1",
+            slug="night-cup",
+            visibility="invite_only",
+            status="registration_closed",
+            organizer_user_id="organizer-1",
+            updated_at=tournament.updated_at,
+        )
+        db_session = AsyncMock()
+        db_session.scalar = AsyncMock(return_value=current_tournament)
+        with (
+            patch.object(tournament_routes, "workspace_base_preflight", base_lookup),
+            patch.object(
+                tournament_routes,
+                "_get_public_workspace_snapshot_cache",
+                return_value=tournament_routes._get_public_workspace_snapshot_cache("night-cup"),
+            ),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await tournament_routes.get_tournament_workspace(
+                    slug="night-cup",
+                    request=request,
+                    response=Response(),
+                    participants_limit=0,
+                    participants_offset=0,
+                    workspace_view="detail",
+                    include_current_user=False,
+                    invite_code=None,
+                    auth_session=auth_session,
+                    db_session=db_session,
+                )
+        self.assertEqual(raised.exception.status_code, 403)
+        base_lookup.assert_awaited_once_with(
+            ANY,
+            slug="night-cup",
+            user_id="user-1",
+        )
+
+    async def test_workspace_membership_fallback_keeps_blank_headers_and_invites_on_old_guard(self) -> None:
+        auth_session = SimpleNamespace(
+            user=SimpleNamespace(id="user-1"),
+            role_slugs=frozenset(),
+        )
+        cases = (
+            (auth_session, [], b"invite_code="),
+            (auth_session, [], b"invite_code=ABCDEFGHIJ&invite_code=KLMNOPQRST"),
+            (auth_session, [(b"if-none-match", b"")], b""),
+            (None, [], b""),
+            (SimpleNamespace(user=auth_session.user, role_slugs=frozenset({"admin"})), [], b""),
+        )
+        for current_auth, headers, query_string in cases:
+            request = Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/tournaments/night-cup/workspace",
+                    "headers": headers,
+                    "query_string": query_string,
+                    "scheme": "http",
+                    "server": ("testserver", 80),
+                    "client": ("testclient", 1),
+                }
+            )
+            with self.subTest(headers=headers, query_string=query_string, auth=current_auth), patch.object(
+                workspace_access,
+                "ensure_private_tournament_read_membership_is_active",
+                AsyncMock(),
+            ) as original_guard:
+                await tournament_routes.ensure_workspace_private_membership(
+                    request,
+                    auth_session=current_auth,
+                    db_session=AsyncMock(),
+                )
+                original_guard.assert_awaited_once()
+                self.assertFalse(
+                    hasattr(request.state, "workspace_membership_preflight_pending")
+                )
 
     async def test_authenticated_workspace_reuses_combined_ready_check_preflight(self) -> None:
         created_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
@@ -435,6 +619,19 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
         )
         response = Response()
 
+        old_membership_guard = AsyncMock()
+        with patch.object(
+            workspace_access,
+            "ensure_private_tournament_read_membership_is_active",
+            old_membership_guard,
+        ):
+            await tournament_routes.ensure_workspace_private_membership(
+                request,
+                auth_session=auth_session,
+                db_session=db_session,
+            )
+        old_membership_guard.assert_awaited_once()
+
         with (
             patch.object(
                 tournament_routes,
@@ -612,6 +809,60 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
         self.assertLessEqual(server_time, server_time_after)
         db_session.scalar.assert_awaited_once()
         db_session.execute.assert_not_awaited()
+
+        auth_session = SimpleNamespace(
+            user=SimpleNamespace(id="viewer-1"),
+            role_slugs=frozenset(),
+        )
+        authenticated_request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/tournaments/public-cup/workspace",
+                "headers": [],
+                "query_string": b"",
+                "scheme": "http",
+                "server": ("testserver", 80),
+                "client": ("testclient", 1),
+            }
+        )
+        await tournament_routes.ensure_workspace_private_membership(
+            authenticated_request,
+            auth_session=auth_session,
+            db_session=AsyncMock(),
+        )
+        authenticated_db = AsyncMock()
+        authenticated_db.scalar = AsyncMock(return_value=current_tournament)
+        with (
+            patch.object(
+                tournament_routes,
+                "workspace_access_for_user",
+                AsyncMock(return_value=(None, None)),
+            ) as membership_lookup,
+            patch.object(
+                tournament_routes,
+                "workspace_base_preflight",
+                AsyncMock(side_effect=AssertionError("fresh public cache should return")),
+            ),
+        ):
+            authenticated_response = await tournament_routes.get_tournament_workspace(
+                "public-cup",
+                authenticated_request,
+                Response(),
+                participants_limit=0,
+                participants_offset=0,
+                workspace_view="detail",
+                include_current_user=False,
+                invite_code=None,
+                auth_session=auth_session,
+                db_session=authenticated_db,
+            )
+        self.assertEqual(authenticated_response.status_code, 200)
+        membership_lookup.assert_awaited_once_with(
+            authenticated_db,
+            tournament_id=current_tournament.id,
+            user_id="viewer-1",
+        )
 
     def test_runtime_invalidation_removes_public_snapshot(self) -> None:
         snapshot_response = tournament_routes.TournamentWorkspaceResponse.model_construct()

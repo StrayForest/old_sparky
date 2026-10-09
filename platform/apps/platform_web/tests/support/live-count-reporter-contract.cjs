@@ -81,7 +81,64 @@ assert.deepEqual(bindingsFromEnvironment(bindingEnv), {
   source_sha: bindingEnv.PLATFORM_LIVE_QA_RUNNER_SHA,
   marker_sha256: bindingEnv.PLATFORM_LIVE_QA_MARKER_SHA256,
 });
+const userBindingEnv = {
+  ...bindingEnv,
+  PLATFORM_QA_BROWSER_GATE_DIR: "/run/oldsparky-liveqa/live-user-qa.Abc123",
+  PLATFORM_LIVE_USER_QA_SESSIONS: "/run/oldsparky-liveqa/live-user-qa.Abc123/browser-sessions.json",
+};
+assert.deepEqual(bindingsFromEnvironment(userBindingEnv), {
+  gate: userBindingEnv.PLATFORM_QA_BROWSER_GATE_DIR,
+  app_sha: userBindingEnv.PLATFORM_LIVE_QA_TARGET_SHA,
+  source_sha: userBindingEnv.PLATFORM_LIVE_QA_RUNNER_SHA,
+  marker_sha256: userBindingEnv.PLATFORM_LIVE_QA_MARKER_SHA256,
+});
+assert.equal(
+  bindingsFromEnvironment({
+    ...bindingEnv,
+    PLATFORM_LIVE_USER_QA_SESSIONS: `${bindingEnv.PLATFORM_QA_BROWSER_GATE_DIR}/browser-sessions.json`,
+  }),
+  null,
+  "public mode rejects a live-user sessions binding",
+);
+assert.equal(
+  bindingsFromEnvironment({ ...userBindingEnv, PLATFORM_LIVE_USER_QA_SESSIONS: undefined }),
+  null,
+  "live-user mode requires its exact sessions path",
+);
+assert.equal(
+  bindingsFromEnvironment({ ...userBindingEnv, PLATFORM_LIVE_USER_QA_SESSIONS: "/tmp/browser-sessions.json" }),
+  null,
+  "live-user mode rejects a sessions path outside its gate",
+);
 assert.equal(bindingsFromEnvironment({ ...bindingEnv, PLATFORM_QA_BROWSER_GATE_DIR: "/tmp/public-live-qa.a1b2c3d4" }), null);
+assert.equal(bindingsFromEnvironment({ ...userBindingEnv, PLATFORM_QA_BROWSER_GATE_DIR: "/run/oldsparky-liveqa/live-user-qa.Abc12" }), null);
+for (const [label, gate] of [
+  ["short public gate", "/run/oldsparky-liveqa/public-live-qa.abc"],
+  ["uppercase public gate", "/run/oldsparky-liveqa/public-live-qa.Abc2c3d4"],
+  ["short live-user gate", "/run/oldsparky-liveqa/live-user-qa.Abc12"],
+  ["invalid live-user character", "/run/oldsparky-liveqa/live-user-qa.Abc_23"],
+  ["unrecognized gate", "/run/oldsparky-liveqa/private-qa.Abc123"],
+]) {
+  assert.equal(
+    bindingsFromEnvironment({ ...bindingEnv, PLATFORM_QA_BROWSER_GATE_DIR: gate }),
+    null,
+    `${label} is rejected`,
+  );
+}
+for (const [label, bindingPatch] of [
+  ["missing app SHA", { PLATFORM_LIVE_QA_TARGET_SHA: undefined }],
+  ["invalid app SHA", { PLATFORM_LIVE_QA_TARGET_SHA: "bad" }],
+  ["missing runner SHA", { PLATFORM_LIVE_QA_RUNNER_SHA: undefined }],
+  ["invalid runner SHA", { PLATFORM_LIVE_QA_RUNNER_SHA: "bad" }],
+  ["missing marker SHA", { PLATFORM_LIVE_QA_MARKER_SHA256: undefined }],
+  ["invalid marker SHA", { PLATFORM_LIVE_QA_MARKER_SHA256: "bad" }],
+]) {
+  assert.equal(
+    bindingsFromEnvironment({ ...bindingEnv, ...bindingPatch }),
+    null,
+    `${label} is rejected for the public gate`,
+  );
+}
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "live-count-contract-"));
 try {
@@ -101,11 +158,11 @@ try {
     assert.equal(fs.existsSync(reportPath), false);
   }
 
-  const nativeLstatSync = fs.lstatSync;
+  const publicNativeLstatSync = fs.lstatSync;
   try {
     if (rootMetadata.uid !== 0) {
       fs.lstatSync = function lstatWithRootOwnedGate(target, ...args) {
-        const metadata = nativeLstatSync.call(fs, target, ...args);
+        const metadata = publicNativeLstatSync.call(fs, target, ...args);
         if (target !== temporary) return metadata;
         return new Proxy(metadata, {
           get(value, key, receiver) {
@@ -117,7 +174,7 @@ try {
     assert.equal(writeBoundedSummary(writeBinding, summary, { gateRoot: temporary }), true);
     assert.equal(writeBoundedSummary(writeBinding, summary, { gateRoot: temporary }), false, "O_EXCL rejects replacement");
   } finally {
-    fs.lstatSync = nativeLstatSync;
+    fs.lstatSync = publicNativeLstatSync;
   }
   const metadata = fs.lstatSync(reportPath);
   assert.equal(metadata.isFile(), true);
@@ -138,6 +195,41 @@ try {
     "logical_expected_fail", "logical_flaky", "logical_interrupted", "logical_pass", "logical_skip",
     "logical_total", "marker_sha256", "run_status", "schema", "source_sha",
   ].sort());
+
+  const userGate = path.join(temporary, "live-user-qa.Abc123");
+  fs.mkdirSync(userGate, { mode: 0o700 });
+  fs.mkdirSync(path.join(userGate, "test-results"), { mode: 0o700 });
+  const userWriteBinding = {
+    ...bindingsFromEnvironment({
+      ...userBindingEnv,
+      PLATFORM_QA_BROWSER_GATE_DIR: "/run/oldsparky-liveqa/live-user-qa.Abc123",
+      PLATFORM_LIVE_USER_QA_SESSIONS: "/run/oldsparky-liveqa/live-user-qa.Abc123/browser-sessions.json",
+    }),
+    gate: userGate,
+  };
+  const userReportPath = path.join(userGate, "test-results", "live-counts-v1.json");
+  const nativeLstatSync = fs.lstatSync;
+  try {
+    if (rootMetadata.uid !== 0) {
+      fs.lstatSync = function lstatWithRootOwnedGate(target, ...args) {
+        const metadata = nativeLstatSync.call(fs, target, ...args);
+        if (target !== temporary) return metadata;
+        return new Proxy(metadata, {
+          get(value, key, receiver) {
+            return key === "uid" ? 0 : Reflect.get(value, key, receiver);
+          },
+        });
+      };
+    }
+    assert.equal(writeBoundedSummary(userWriteBinding, summary, { gateRoot: temporary }), true);
+    assert.equal(writeBoundedSummary(userWriteBinding, summary, { gateRoot: temporary }), false, "live-user report also rejects replacement");
+  } finally {
+    fs.lstatSync = nativeLstatSync;
+  }
+  const userReport = JSON.parse(fs.readFileSync(userReportPath, "ascii"));
+  assert.equal(userReport.app_sha, bindingEnv.PLATFORM_LIVE_QA_TARGET_SHA);
+  assert.equal(userReport.source_sha, bindingEnv.PLATFORM_LIVE_QA_RUNNER_SHA);
+  assert.equal(userReport.marker_sha256, bindingEnv.PLATFORM_LIVE_QA_MARKER_SHA256);
 } finally {
   fs.rmSync(temporary, { recursive: true, force: true });
 }
