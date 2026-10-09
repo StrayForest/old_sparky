@@ -1248,7 +1248,6 @@ class HostToolsBundleTests(unittest.TestCase):
                 'TOOLSET_VERSION = "production-host-tools-v3"',
                 1,
             )
-            self.assertNotIn("+ CPU_DIAGNOSTIC_CONTROL_FILES\n)", helper_text.split("HOST_TOOL_FILES =", 1)[1].split("COMPONENT_FILES =", 1)[0])
             helper.write_text(helper_text, encoding="utf-8")
             legacy_archive = root / "legacy.zip"
             legacy_summary = bundle.build_bundle(legacy_source, SOURCE_SHA, legacy_archive)

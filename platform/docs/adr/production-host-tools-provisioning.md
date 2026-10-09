@@ -460,6 +460,16 @@ changes remain outside that 14-member closure. The pin-bearing **P** records
 the raw SHA-256 digests and Git modes of all 14 files from **C**. This source
 identity alone does not establish installation or deployment.
 
+The follow-on CPU diagnostic controller uses source commit **C**
+`80af72d5fec4c868897baf3cd0172af1c17b3fa6` and pin-only commit **E**
+`4af43c5afd84af29bd40d91e9e3002ab540142c5`. E selects the exact 15-member,
+four-component v4 closure and records its source modes and digests. This pin
+selection does not establish installation: the verified T application
+deployment at source `7e5769ba3f8596cb9950735f3685835013eb1085` still used the
+previous v3 host generation. Exact-SHA CI, approved provisioning and a
+post-provision capability check remain required before the CPU diagnostic
+action is available.
+
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
    blocked.
