@@ -273,6 +273,14 @@ The public hop is the visitor-facing evidence; raw request IDs and ray values
 are not retained. Repeat the probe enough times to see variance; do not add
 its single-request values to external-load p95s.
 
+The external-load client reads each response body within its fixed byte cap.
+Known socket, timeout and HTTP protocol/read exceptions become one failed
+request with a closed transport class and bounded byte count; partial response
+content is discarded, the request is not retried by this reader, and the phase
+continues accounting later requests. Unexpected programming exceptions still
+fail the worker. These transport failures remain errors and cannot contribute
+successful-request latency or goodput.
+
 ## Compression A/B
 
 Next compression is a build-time switch, not a runtime profile toggle. The

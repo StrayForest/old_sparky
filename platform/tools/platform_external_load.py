@@ -1330,6 +1330,38 @@ def _response_requires_json_projection(method: str, path: str) -> bool:
     )
 
 
+_RESPONSE_READ_EXCEPTIONS = (
+    http.client.HTTPException,
+    URLError,
+    TimeoutError,
+    OSError,
+)
+
+
+class _BoundedResponseReadFailure(Exception):
+    """Carry only a capped byte count and fixed transport classification."""
+
+    def __init__(self, response_bytes: int, error_kind: str) -> None:
+        self.response_bytes = response_bytes
+        self.error_kind = error_kind
+
+
+def _response_read_error_kind(exc: BaseException) -> str:
+    if isinstance(exc, TimeoutError):
+        return "TimeoutError"
+    if isinstance(exc, URLError):
+        return "URLError"
+    if isinstance(exc, http.client.HTTPException):
+        return "transport_http_response_read"
+    return "transport_response_read"
+
+
+def _bounded_partial_response_bytes(exc: BaseException, prior_bytes: int = 0) -> int:
+    partial = getattr(exc, "partial", None)
+    partial_bytes = len(partial) if isinstance(partial, (bytes, bytearray)) else 0
+    return min(RESPONSE_BODY_LIMIT, prior_bytes + partial_bytes)
+
+
 def _read_bounded_response(
     response: Any,
     *,
@@ -1343,7 +1375,15 @@ def _read_bounded_response(
     if capture_json and first_chunk:
         captured.extend(first_chunk[:RESPONSE_JSON_CAPTURE_LIMIT])
     while response_bytes < RESPONSE_BODY_LIMIT:
-        chunk = response.read(min(64 * 1024, RESPONSE_BODY_LIMIT - response_bytes))
+        try:
+            chunk = response.read(
+                min(64 * 1024, RESPONSE_BODY_LIMIT - response_bytes)
+            )
+        except _RESPONSE_READ_EXCEPTIONS as exc:
+            raise _BoundedResponseReadFailure(
+                _bounded_partial_response_bytes(exc, response_bytes),
+                _response_read_error_kind(exc),
+            ) from None
         if not chunk:
             break
         accepted = min(len(chunk), RESPONSE_BODY_LIMIT - response_bytes)
@@ -1355,6 +1395,32 @@ def _read_bounded_response(
         if accepted < len(chunk):
             break
     return response_bytes, bytes(captured)
+
+
+def _read_response_body(
+    response: Any,
+    *,
+    capture_json: bool,
+) -> tuple[int, bytes, str | None]:
+    """Read one bounded body, returning no partial content after transport failure."""
+
+    try:
+        first_chunk = response.read(1)
+    except _RESPONSE_READ_EXCEPTIONS as exc:
+        return (
+            _bounded_partial_response_bytes(exc),
+            b"",
+            _response_read_error_kind(exc),
+        )
+    try:
+        response_bytes, captured_body = _read_bounded_response(
+            response,
+            first_chunk=first_chunk,
+            capture_json=capture_json,
+        )
+    except _BoundedResponseReadFailure as exc:
+        return exc.response_bytes, b"", exc.error_kind
+    return response_bytes, captured_body, None
 
 
 def _request(
@@ -1409,6 +1475,7 @@ def _request(
     cf_ray: str | None = None
     response_etag: str | None = None
     error_kind: str | None = None
+    response_body_error: str | None = None
     response_json: Any = None
     time_to_first_byte_ms: float | None = None
     cf_error_type: str | None = None
@@ -1433,46 +1500,55 @@ def _request(
             cf_ray = response.headers.get("cf-ray", "")[:128] or None
             cf_error_type, cf_error_origin, retry_after = diagnostic_headers(response.headers)
             response_etag = response.headers.get("etag", "")[:512] or None
-            first_chunk = response.read(1)
             time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
-            response_bytes, captured_body = _read_bounded_response(
+            response_bytes, captured_body, response_body_error = _read_response_body(
                 response,
-                first_chunk=first_chunk,
                 capture_json=_response_requires_json_projection(method, path),
             )
+            if response_body_error is not None:
+                error_kind = response_body_error
+                if error_kind == "TimeoutError" and diagnostic_id:
+                    exception_at_utc = datetime.now(UTC).isoformat()
             if budget is not None:
                 budget.check(phase, operation="body_complete")
+            if response_body_error is None:
+                response_json = _response_json_projection(
+                    method=method,
+                    path=path,
+                    body=captured_body,
+                )
+    except HTTPError as exc:
+        status = int(exc.code)
+        cf_ray = exc.headers.get("cf-ray", "")[:128] or None
+        cf_error_type, cf_error_origin, retry_after = diagnostic_headers(exc.headers)
+        time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
+        response_bytes, captured_body, response_body_error = _read_response_body(
+            exc,
+            capture_json=_response_requires_json_projection(method, path),
+        )
+        if response_body_error is not None:
+            error_kind = response_body_error
+            if error_kind == "TimeoutError" and diagnostic_id:
+                exception_at_utc = datetime.now(UTC).isoformat()
+        if budget is not None:
+            budget.check(phase, operation="error_body_complete")
+        if error_kind is None:
+            error_kind = "http_error"
+        if response_body_error is None:
             response_json = _response_json_projection(
                 method=method,
                 path=path,
                 body=captured_body,
             )
-    except HTTPError as exc:
-        status = int(exc.code)
-        cf_ray = exc.headers.get("cf-ray", "")[:128] or None
-        cf_error_type, cf_error_origin, retry_after = diagnostic_headers(exc.headers)
-        first_chunk = exc.read(1)
-        time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
-        response_bytes, captured_body = _read_bounded_response(
-            exc,
-            first_chunk=first_chunk,
-            capture_json=_response_requires_json_projection(method, path),
-        )
-        if budget is not None:
-            budget.check(phase, operation="error_body_complete")
-        error_kind = "http_error"
-        response_json = _response_json_projection(
-            method=method,
-            path=path,
-            body=captured_body,
-        )
+    except http.client.HTTPException:
+        error_kind = "transport_http_protocol"
     except (URLError, TimeoutError, OSError) as exc:
         exception_at_utc = datetime.now(UTC).isoformat()
         error_kind = type(exc).__name__
     finished_at = time.monotonic()
     elapsed_ms = (finished_at - started_at) * 1000
     finished_at_utc = datetime.now(UTC).isoformat()
-    ok = status in expected_statuses
+    ok = status in expected_statuses and response_body_error is None
     if not ok and error_kind is None:
         error_kind = "unexpected_status"
     return RequestResult(

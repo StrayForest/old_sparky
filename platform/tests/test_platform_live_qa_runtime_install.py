@@ -196,6 +196,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             "platform_live_launch_trusted.sh",
             "platform_live_user_qa_dispatch.py",
             "platform_workflow_remote_dispatch.py",
+            "platform_validate_release_artifact.py",
             "platform_workflow_input_guard.py",
             "platform_release_lock_exec.sh",
             "platform_release_lock.sh",
@@ -217,10 +218,11 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             "LAUNCH_HELPER_PATH": trusted / entrypoints[1],
             "DISPATCHER_PATH": trusted / entrypoints[2],
             "REMOTE_DISPATCHER_PATH": trusted / entrypoints[3],
-            "REMOTE_INPUT_GUARD_PATH": trusted / entrypoints[4],
-            "RELEASE_LOCK_EXEC_PATH": trusted / entrypoints[5],
-            "RELEASE_LOCK_HELPER_PATH": trusted / entrypoints[6],
-            "MAILBOX_HELPER_PATH": trusted / entrypoints[7],
+            "RELEASE_VALIDATOR_PATH": trusted / entrypoints[4],
+            "REMOTE_INPUT_GUARD_PATH": trusted / entrypoints[5],
+            "RELEASE_LOCK_EXEC_PATH": trusted / entrypoints[6],
+            "RELEASE_LOCK_HELPER_PATH": trusted / entrypoints[7],
+            "MAILBOX_HELPER_PATH": trusted / entrypoints[8],
             "TOOL_FILES": entrypoints,
             "SOURCE_TREES": (),
             "SOURCE_FILES": (),
@@ -284,6 +286,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
             "LAUNCH_HELPER_PATH": trusted / "platform_live_launch_trusted.sh",
             "DISPATCHER_PATH": trusted / "platform_live_user_qa_dispatch.py",
             "REMOTE_DISPATCHER_PATH": trusted / "platform_workflow_remote_dispatch.py",
+            "RELEASE_VALIDATOR_PATH": trusted / "platform_validate_release_artifact.py",
             "REMOTE_INPUT_GUARD_PATH": trusted / "platform_workflow_input_guard.py",
             "RELEASE_LOCK_EXEC_PATH": trusted / "platform_release_lock_exec.sh",
             "RELEASE_LOCK_HELPER_PATH": trusted / "platform_release_lock.sh",
@@ -462,19 +465,147 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     "platform/tools/platform_install_live_qa_user.sh",
                     "platform/tools/platform_release_lock_exec.sh",
                     "platform/tools/platform_release_lock.sh",
+                    "platform/tools/platform_validate_release_artifact.py",
                     "platform/deploy/apparmor/oldsparky-liveqa-chromium",
                 )
                 for relative in launch_members:
                     installed = payload / relative
                     self.assertIn(relative, manifest["files"])
                     self.assertTrue(installed.is_file(), relative)
-                    expected_mode = 0o555 if relative.endswith(".sh") else 0o444
+                    expected_mode = (
+                        0o555
+                        if relative.endswith(".sh")
+                        or relative.endswith("/platform_validate_release_artifact.py")
+                        else 0o444
+                    )
                     self.assertEqual(
                         stat.S_IMODE(installed.stat().st_mode), expected_mode
                     )
                     self.assertEqual(
                         runtime._digest_regular(installed), manifest["files"][relative]
                     )
+
+                trusted_validator = trusted / "platform_validate_release_artifact.py"
+                validator_relative = "platform/tools/platform_validate_release_artifact.py"
+                self.assertTrue(trusted_validator.is_file())
+                self.assertEqual(stat.S_IMODE(trusted_validator.stat().st_mode), 0o555)
+                self.assertEqual(trusted_validator.stat().st_nlink, 1)
+                self.assertEqual(
+                    runtime._digest_regular(trusted_validator),
+                    manifest["files"][validator_relative],
+                )
+
+                # Exercise the installer-copied dispatcher and its trusted-root
+                # validator sibling, matching the production __file__ layout.
+                dispatcher_path = trusted / "platform_workflow_remote_dispatch.py"
+                dispatcher_namespace: dict[str, object] = {
+                    "__file__": str(dispatcher_path),
+                    "__name__": "copied_liveqa_dispatcher_test",
+                }
+                dispatcher_source = dispatcher_path.read_bytes()
+                exec(
+                    compile(dispatcher_source, str(dispatcher_path), "exec"),
+                    dispatcher_namespace,
+                )
+                parse_release = dispatcher_namespace["_parse_active_release_receipt"]
+                release_slug = "qa-test-20261009T000000Z"
+                release_receipt = {
+                    "artifact_format_version": 1,
+                    "release_slug": release_slug,
+                    "built_at_utc": "20261009T000000Z",
+                    "release_ref": "qa-test",
+                    "source_git_commit": source_sha,
+                    "python_requirements_file": "requirements-platform.txt",
+                    "python_lock_file": "requirements-platform.lock.txt",
+                    "python_freeze_file": "requirements-platform.freeze.txt",
+                    "python_wheelhouse_dir": "wheelhouse",
+                    "python_wheelhouse_manifest_file": "wheelhouse/WHEELHOUSE.sha256",
+                    "web_package_lock_file": "apps/platform_web/package-lock.json",
+                    "web_build_id": "test-build",
+                    "node_version": "26.3.1",
+                    "npm_version": "11.16.0",
+                }
+                parsed = parse_release(
+                    json.dumps(release_receipt).encode("ascii"),
+                    release_slug=release_slug,
+                )
+                self.assertEqual(parsed["source_git_commit"], source_sha)
+
+                validator_copy = payload / validator_relative
+                runtime._validate_payload(
+                    manifest, app_dir=app_dir, validate_provider=False
+                )
+                self.assertEqual(
+                    runtime._digest_regular(validator_copy),
+                    manifest["files"][validator_relative],
+                )
+                missing_validator = validator_copy.with_name(
+                    validator_copy.name + ".missing-test"
+                )
+                validator_copy.rename(missing_validator)
+                try:
+                    missing_tree_sha, missing_files = runtime._tree_digest(payload)
+                    missing_manifest = {
+                        **manifest,
+                        "payload_tree_sha256": missing_tree_sha,
+                        "files": missing_files,
+                    }
+                    with self.assertRaises(runtime.InstallerError):
+                        runtime._validate_payload(
+                            missing_manifest,
+                            app_dir=app_dir,
+                            validate_provider=False,
+                        )
+                finally:
+                    missing_validator.rename(validator_copy)
+
+                validator_copy.chmod(0o444)
+                try:
+                    wrong_mode_tree_sha, wrong_mode_files = runtime._tree_digest(payload)
+                    wrong_mode_manifest = {
+                        **manifest,
+                        "payload_tree_sha256": wrong_mode_tree_sha,
+                        "files": wrong_mode_files,
+                    }
+                    with self.assertRaises(runtime.InstallerError):
+                        runtime._validate_payload(
+                            wrong_mode_manifest,
+                            app_dir=app_dir,
+                            validate_provider=False,
+                        )
+                finally:
+                    validator_copy.chmod(0o555)
+
+                trusted_validator.chmod(0o444)
+                try:
+                    with self.assertRaises(runtime.InstallerError):
+                        runtime._validate_payload(
+                            manifest, app_dir=app_dir, validate_provider=False
+                        )
+                finally:
+                    trusted_validator.chmod(0o555)
+
+                with tempfile.TemporaryDirectory(dir="/root") as empty_tools:
+                    dispatcher_namespace["ACTIVE_TOOLS_DIR"] = Path(empty_tools)
+                    with self.assertRaises(OSError):
+                        parse_release(
+                            json.dumps(release_receipt).encode("ascii"),
+                            release_slug=release_slug,
+                        )
+
+                with tempfile.TemporaryDirectory(dir="/root") as tampered_tools:
+                    tampered_validator = (
+                        Path(tampered_tools) / "platform_validate_release_artifact.py"
+                    )
+                    tampered_validator.write_text("# altered validator\n", encoding="ascii")
+                    os.chmod(tampered_validator, 0o555)
+                    os.chown(tampered_validator, 0, 0)
+                    dispatcher_namespace["ACTIVE_TOOLS_DIR"] = Path(tampered_tools)
+                    with self.assertRaises(OSError):
+                        parse_release(
+                            json.dumps(release_receipt).encode("ascii"),
+                            release_slug=release_slug,
+                        )
 
                 fake_python_target = Path(temporary) / "trusted-python-target"
                 fake_python_target.write_bytes(b"#!/bin/sh\nexit 0\n")
@@ -597,6 +728,56 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                     ):
                         self.assertEqual(execute_selected(), 2)
                     execve.assert_not_called()
+
+    def test_install_rejects_missing_validator_before_active_generation(self) -> None:
+        source_sha = "d" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.canonical_runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                _payload_root,
+            ):
+                source_validator = (
+                    release / "tools" / "platform_validate_release_artifact.py"
+                )
+                source_validator.unlink()
+                with self.assertRaises(runtime.InstallerError):
+                    runtime.install(app_dir, release)
+                self.assertFalse((trusted / "active").exists())
+                self.assertFalse((trusted / "active-manifest.json").exists())
+
+    def test_install_rejects_tampered_staged_validator_before_activation(self) -> None:
+        source_sha = "c" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.canonical_runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                payload_root,
+            ):
+                copy_regular = runtime._copy_regular
+
+                def tamper_staged_validator(
+                    source: Path, destination: Path, **kwargs: object
+                ) -> str:
+                    digest = copy_regular(source, destination, **kwargs)
+                    if (
+                        source.name == "platform_validate_release_artifact.py"
+                        and destination.parent.name == "tools"
+                    ):
+                        destination.chmod(0o755)
+                        destination.write_bytes(b"# tampered staged validator\n")
+                        destination.chmod(0o555)
+                    return digest
+
+                with mock.patch.object(
+                    runtime, "_copy_regular", side_effect=tamper_staged_validator
+                ), self.assertRaises(runtime.InstallerError):
+                    runtime.install(app_dir, release)
+                self.assertFalse((trusted / "active").exists())
+                self.assertFalse((trusted / "active-manifest.json").exists())
+                self.assertFalse((payload_root / source_sha).exists())
 
     def test_postpromotion_retention_failure_reports_closed_stage_and_keeps_pointer(self) -> None:
         source_sha = "e" * 40

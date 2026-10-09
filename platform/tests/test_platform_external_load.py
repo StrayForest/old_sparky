@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 from tools.platform_external_load import (
@@ -148,6 +150,139 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_body_read_transport_errors_are_counted_without_stopping_phase(self) -> None:
+        users = [
+            VirtualUser(f"read-{index:08d}", "synthetic", "s" * 64, "c" * 64)
+            for index in range(5)
+        ]
+        calls = 0
+
+        class Response:
+            status = 200
+            headers: dict[str, str] = {}
+
+            def __init__(self, partial_failure: bool) -> None:
+                self.partial_failure = partial_failure
+                self.reads = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, _size: int) -> bytes:
+                self.reads += 1
+                if self.partial_failure:
+                    if self.reads == 1:
+                        return b"{"
+                    if self.reads == 2:
+                        raise http.client.IncompleteRead(b"private-body", 8)
+                    raise AssertionError("failed response was read again")
+                return (b"{" if self.reads == 1 else b"}" if self.reads == 2 else b"")
+
+        def open_response(*_args: object, **_kwargs: object) -> Response:
+            nonlocal calls
+            calls += 1
+            return Response(partial_failure=calls == 1)
+
+        accumulator = _ResultAccumulator()
+
+        def build_request(origin: str, user: VirtualUser, phase: str, timeout: float):
+            return _request(
+                origin,
+                user,
+                method="GET",
+                path="/api/v1/users/me",
+                phase=phase,
+                timeout=timeout,
+                session_cookie_name="session",
+                csrf_cookie_name="csrf",
+                attempt_number=1,
+            )
+
+        with patch("tools.platform_external_load.urlopen", side_effect=open_response):
+            run_phase(
+                "https://old-sparky.com",
+                users,
+                phase="synthetic-transport",
+                spread_seconds=0,
+                concurrency=1,
+                timeout=1,
+                request_builder=build_request,
+                result_consumer=accumulator.add,
+            )
+
+        summary = accumulator.summary()
+        self.assertEqual(calls, len(users))
+        self.assertEqual(summary["requests"], len(users))
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["status_counts"], {"200": len(users)})
+        self.assertEqual(summary["retry_attempts"], 0)
+        self.assertEqual(summary["error_kinds"], {"transport": 1})
+        self.assertNotIn("private-body", repr(summary))
+
+        class BrokenResponse:
+            status = 200
+            headers: dict[str, str] = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, _size: int) -> bytes:
+                raise AssertionError("programming defect")
+
+        with patch("tools.platform_external_load.urlopen", return_value=BrokenResponse()):
+            with self.assertRaisesRegex(AssertionError, "programming defect"):
+                _request(
+                    "https://old-sparky.com",
+                    users[0],
+                    method="GET",
+                    path="/users/me",
+                    phase="synthetic-programming-error",
+                    timeout=1,
+                    session_cookie_name="session",
+                    csrf_cookie_name="csrf",
+                )
+
+    def test_http_error_body_read_transport_failure_is_bounded(self) -> None:
+        class PartialErrorBody:
+            def read(self, _size: int) -> bytes:
+                raise http.client.IncompleteRead(b"private-error-body", 32)
+
+            def close(self) -> None:
+                return None
+
+        error = HTTPError(
+            "https://old-sparky.com/api/v1/users/me",
+            503,
+            "service unavailable",
+            {},
+            PartialErrorBody(),
+        )
+        user = VirtualUser("read-error", "synthetic", "s" * 64, "c" * 64)
+        with patch("tools.platform_external_load.urlopen", side_effect=error):
+            result = _request(
+                "https://old-sparky.com",
+                user,
+                method="GET",
+                path="/users/me",
+                phase="synthetic-http-error",
+                timeout=1,
+                session_cookie_name="session",
+                csrf_cookie_name="csrf",
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 503)
+        self.assertEqual(result.error_kind, "transport_http_response_read")
+        self.assertEqual(result.response_bytes, len(b"private-error-body"))
+        self.assertIsNone(result.response_json)
+        self.assertNotIn("private-error-body", repr(result))
+
     def test_streaming_accumulator_preserves_high_cardinality_counts_and_percentiles(self) -> None:
         accumulator = _ResultAccumulator()
         latencies = [float((index * 37) % 1000) for index in range(4096)]

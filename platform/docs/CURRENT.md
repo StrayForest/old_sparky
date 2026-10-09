@@ -2,69 +2,15 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-07
+- Last reviewed: 2026-10-09
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
-## Verified checkpoint — 2026-10-05
+## Verified checkpoint — 2026-10-09
 
-- Current app T: source `dcad5d1baf0998bec89edfccac0f8ac7f3de1a61`, slug
-  `gha-37293942804-1-dcad5d1baf09`, RELEASE SHA-256
-  `6269ac96777eb947c9db1cbe1398508b6fcf486e1586c0e46cca2d909df8776f`; installed by
-  normal AUTO [run `37293922013`](https://github.com/StrayForest/old_sparky/actions/runs/37293922013)
-  and [child `37293942804`](https://github.com/StrayForest/old_sparky/actions/runs/37293942804).
-  Previous R source `cf29087ba2313ace344db7f2dd52aa55a0a28fad`, slug
-  `gha-37266469137-1-cf29087ba231`, RELEASE SHA-256
-  `d82005f212401947dd92c0b95acc2c431178f5edc833935d047b90a16fc2dd64`; its failed
-  status remains unchanged. Final receipt `69b5ec3bb3c13ed79d07823c227782307fb1c90d65db20adf7ba7590efea9bb8` verifies clean
-  markers, active health, three HTTP 200s, managed-QA T tree (966 files; SHA
-  `cc797eb6d7603b0aa7c6dc3de0cff5149eb3e5be6e3e498b9296d48462ccddf9`) and DB
-  head `20260913_0053`.
-- Storage diagnostic [`37359027285`](https://github.com/StrayForest/old_sparky/actions/runs/37359027285): healthy services/locks; 6,824,091,648 B free (83%) after cache-only cleanup; no release or backup was deleted.
-- Current app `f0c5f9bcf7ae7389ec2bf347fd0209ced3273961` uses installed host-tools generation `b186fbd177ab82330c1ec001d96a2d40474f9552`; reviewed
-  source **C** `97f90674ccc45d6e223ee2793ed3f3c46d928fff` and pin-only **P**
-  `ef48bd2b6b354a95094dd51260397759b4342445` remain uninstalled pending signed
-  provisioning/self-test; earlier S11/S10/S9 and recovery generations remain
-  preserved (see the [host-tools provisioning ADR](adr/production-host-tools-provisioning.md)).
-- The authenticated HTML follow-up compared the unchanged v1 control, the
-  HTTP/1.1 keep-alive client, the one-worker native server transport and the
-  two-worker native profile. All pressure windows observed web-process
-  replacement near the `1 GiB` cgroup limit and failed the declared stress
-  acceptance; the detailed evidence and decision are in the
-  [performance transport runbook](performance-transport-runbook.md).
-- The reviewed diagnostic join fix is merged in [PR #86](https://github.com/StrayForest/old_sparky/pull/86).
-  The corrected diagnostic run
-  [`34512252295`](https://github.com/StrayForest/old_sparky/actions/runs/34512252295)
-  produced `1,393` non-zero SSR↔API diagnostic joins, but is invalid as a
-  performance baseline because it returned `15,504` HTTP 200 and `4,496` HTTP
-  502 responses and replaced the web process twice. Its event-loop ELU was
-  approximately `1.0` and web CPU averaged approximately `99%`; these are
-  diagnostic-pressure signals, not an optimization result.
-- The narrow timeout-only run
-  [`34515991086`](https://github.com/StrayForest/old_sparky/actions/runs/34515991086)
-  kept the standard runtime and exact `20,000 / 40 / c64 / no-retry` load
-  contract. It recorded `49` client `TimeoutError` results. All `49/49` had
-  a correlated Nginx record with status `200`, Next upstream status `200` and
-  completed upstream processing; Nginx connect time was at most `4 ms` and
-  origin request time at most `1,173 ms`. The client received no HTTP response
-  or CF-Ray for any of these timeouts, while Nginx recorded a CF-Ray for every
-  matching origin request. Derived from the second-precision Nginx timestamp,
-  `43` origin requests started after the client timeout, `5` have ambiguous
-  start ordering, and `1` origin request completed before the timeout.
-- This localizes the reproduced timeout path outside the completed origin
-  request, at the client↔Cloudflare delivery/forwarding boundary; the artifact
-  cannot further split client socket behavior from Cloudflare edge behavior
-  because no client response headers exist for a timed-out request. The
-  timeout-only contour intentionally left SSR/event-loop and API request logs
-  off, so Node scheduling is not proven as the cause of these client timeouts.
-  No performance optimization or full correlated performance run is authorized
-  until an unchanged baseline passes its declared contract.
-- Exact fixture cleanup passed in the timeout-only run. Bounded storage
-  maintenance [`34515587266`](https://github.com/StrayForest/old_sparky/actions/runs/34515587266)
-  and final diagnostics
-  [`34515762041`](https://github.com/StrayForest/old_sparky/actions/runs/34515762041)
-  left the retained-load lock unlocked, no reclaimable release artifacts, and
-  the active/previous release protection intact.
+- Current app M6 source `84e3ed04efadb08b4d83b75e594420836ad81a95` is installed in release `gha-37858549590-1-84e3ed04efad`, with provider C `bbd7fd6f46dfbd21c3dfd6b1b27f6409c580196e`; the M4 stale release was removed through the canonical one-candidate retention path. M6 remains the deployed source while the next diagnostic fix is reviewed and published.
+- Authenticated-load diagnostic [`37860645995`](https://github.com/StrayForest/old_sparky/actions/runs/37860645995) is not a passing QA result. The bounded client report records a worker body-read exception at `platform_external_load.py:1346`, incomplete work and unknown in-flight state, so it has no request-count or performance credit. During the enclosing client-step window, API logs showed 6,237 `request_perf` rows including 651 admission sheds; Nginx logged 371 matching upstream 500s. Those server counts are step-window evidence, not exact client-action counts.
+- The same-generation observer window recorded maximum web heap-used 391.6 MB of a 562 MB limit and RSS 777.9 MB, with no OOM or restart evidence. This does not establish a memory leak or full-load completion. The pending source fix narrowly accounts for bounded HTTP body-read transport exceptions and installs the digest-bound release validator required by the copied trusted dispatcher; admission, retry, worker and request budgets remain unchanged.
 
 ## Production baseline
 
