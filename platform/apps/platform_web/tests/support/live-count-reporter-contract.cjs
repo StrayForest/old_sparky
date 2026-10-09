@@ -158,11 +158,11 @@ try {
     assert.equal(fs.existsSync(reportPath), false);
   }
 
-  const nativeLstatSync = fs.lstatSync;
+  const publicNativeLstatSync = fs.lstatSync;
   try {
     if (rootMetadata.uid !== 0) {
       fs.lstatSync = function lstatWithRootOwnedGate(target, ...args) {
-        const metadata = nativeLstatSync.call(fs, target, ...args);
+        const metadata = publicNativeLstatSync.call(fs, target, ...args);
         if (target !== temporary) return metadata;
         return new Proxy(metadata, {
           get(value, key, receiver) {
@@ -174,7 +174,7 @@ try {
     assert.equal(writeBoundedSummary(writeBinding, summary, { gateRoot: temporary }), true);
     assert.equal(writeBoundedSummary(writeBinding, summary, { gateRoot: temporary }), false, "O_EXCL rejects replacement");
   } finally {
-    fs.lstatSync = nativeLstatSync;
+    fs.lstatSync = publicNativeLstatSync;
   }
   const metadata = fs.lstatSync(reportPath);
   assert.equal(metadata.isFile(), true);
@@ -208,8 +208,24 @@ try {
     gate: userGate,
   };
   const userReportPath = path.join(userGate, "test-results", "live-counts-v1.json");
-  assert.equal(writeBoundedSummary(userWriteBinding, summary, { gateRoot: temporary }), true);
-  assert.equal(writeBoundedSummary(userWriteBinding, summary, { gateRoot: temporary }), false, "live-user report also rejects replacement");
+  const nativeLstatSync = fs.lstatSync;
+  try {
+    if (rootMetadata.uid !== 0) {
+      fs.lstatSync = function lstatWithRootOwnedGate(target, ...args) {
+        const metadata = nativeLstatSync.call(fs, target, ...args);
+        if (target !== temporary) return metadata;
+        return new Proxy(metadata, {
+          get(value, key, receiver) {
+            return key === "uid" ? 0 : Reflect.get(value, key, receiver);
+          },
+        });
+      };
+    }
+    assert.equal(writeBoundedSummary(userWriteBinding, summary, { gateRoot: temporary }), true);
+    assert.equal(writeBoundedSummary(userWriteBinding, summary, { gateRoot: temporary }), false, "live-user report also rejects replacement");
+  } finally {
+    fs.lstatSync = nativeLstatSync;
+  }
   const userReport = JSON.parse(fs.readFileSync(userReportPath, "ascii"));
   assert.equal(userReport.app_sha, bindingEnv.PLATFORM_LIVE_QA_TARGET_SHA);
   assert.equal(userReport.source_sha, bindingEnv.PLATFORM_LIVE_QA_RUNNER_SHA);
