@@ -349,7 +349,10 @@ if [[ "$pending_operation" == "rollback" ]]; then
         || { public_status failed topology >&2; exit 1; }
       runtime_reconcile_args=()
       runtime_installer="$pending_release/tools/platform_live_qa_runtime_install.py"
-      pending_source_sha="$(/usr/bin/cat "$pending_release/RELEASE.json" | json_field source_git_commit)"
+      # A missing or malformed manifest cannot opt into the legacy bridge.
+      # Keep the ordinary target installer as the strict default; the restore
+      # path validates the selected immutable release before accepting it.
+      pending_source_sha="$(/usr/bin/cat "$pending_release/RELEASE.json" | json_field source_git_commit || true)"
       if [[ "$pending_release" == "$original_previous" \
         && "$pending_source_sha" == "6343099bb7686671bdef49d0c4ecd10f21ef19d2" ]]; then
         # Reconcile the exact M8 target with the transaction-bound current

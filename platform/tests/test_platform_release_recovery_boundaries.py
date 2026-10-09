@@ -1620,10 +1620,30 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         previous = self.add_release("rollback-restart-previous")
         self.add_runtime_stubs(current)
         self.add_runtime_stubs(previous)
+        runtime_args_log = self.root / "rollback-restart-runtime-args.txt"
+        runtime_installer = previous / "tools/platform_live_qa_runtime_install.py"
         (self.app_dir / "current").symlink_to(current)
         (self.app_dir / "previous").symlink_to(previous)
         self.add_fake_venv(self.shared / "venv", marker="rollback")
         self.write_fake_python(self.shared / "venv" / "bin" / "python")
+        fake_python = self.shared / "venv/bin/python"
+        fake_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"if [[ \"${{2:-}}\" == {str(runtime_installer)!r} ]]; then\n"
+            f"  printf '%s\\n' \"$2\" > {str(runtime_args_log)!r}\n"
+            "  shift 2\n"
+            f"  printf '%s\\n' \"$*\" >> {str(runtime_args_log)!r}\n"
+            "fi\n"
+            "case \"${1:-}\" in\n"
+            "  *platform_install_nginx.py)\n"
+            "    if [[ \"${2:-}\" == \"--apply\" ]]; then\n"
+            "      printf '%s\\n' \"$PLATFORM_TEST_NGINX_LABEL\" > \"$PLATFORM_TEST_NGINX_STATE\"\n"
+            "    fi\n"
+            "    ;;\n"
+            "esac\n"
+        )
+        fake_python.chmod(0o755)
         self.create_wrapper_rollback_transaction(current, previous, phase="restart-pending")
         self.switch_pointer("current", previous)
         self.switch_pointer("previous", current)
@@ -1670,6 +1690,10 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertFalse(receipt.exists())
         self.assertEqual((self.app_dir / "current").resolve(), previous)
         self.assertEqual((self.app_dir / "previous").resolve(), current)
+        runtime_args = runtime_args_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(runtime_args[0], str(runtime_installer))
+        self.assertIn("reconcile", runtime_args[1])
+        self.assertNotIn("--rollback-reconcile-transaction", runtime_args[1])
 
     def test_immutable_recovery_wrapper_rollback_runtime_pending_restores_original_state(
         self,
