@@ -23,6 +23,7 @@ NGINX_BIN="/usr/sbin/nginx"
 NGINX_TIMEOUT_BIN="/usr/bin/timeout"
 NGINX_CONFIG_TIMEOUT_SECONDS=30
 LIVE_QA_RUNTIME_INSTALLER=""
+ROLLBACK_RECONCILE_TRANSACTION=""
 PRESERVE_LEGACY_LIVE_QA=0
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
@@ -108,6 +109,11 @@ while [[ $# -gt 0 ]]; do
     --live-qa-runtime-installer)
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       LIVE_QA_RUNTIME_INSTALLER="$2"
+      shift 2
+      ;;
+    --rollback-reconcile-transaction)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      ROLLBACK_RECONCILE_TRANSACTION="$2"
       shift 2
       ;;
     --preserve-legacy-live-qa)
@@ -260,6 +266,13 @@ if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 1 ]]; then
     validate-legacy-liveqa-recovery --state "$TRANSACTION_STATE" \
     --app-dir "$APP_DIR" --release "$RELEASE" >/dev/null 2>/dev/null
 else
+  if [[ -n "$ROLLBACK_RECONCILE_TRANSACTION" \
+    && ( "$ROLLBACK_RECONCILE_TRANSACTION" != "$TRANSACTION_STATE" \
+      || -z "$TRANSACTION_STATE" \
+      || -z "$LIVE_QA_RUNTIME_INSTALLER" ) ]]; then
+    public_status failed liveqa_runtime >&2
+    exit 1
+  fi
   if [[ -z "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
     LIVE_QA_RUNTIME_INSTALLER="$RELEASE/tools/platform_live_qa_runtime_install.py"
   fi
@@ -280,12 +293,22 @@ if [[ -n "$SYSTEMD_STATE" ]]; then
     --systemctl "$SYSTEMCTL_BIN" \
     >/dev/null 2>/dev/null
 fi
-if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 0 ]]; then
+if [[ "$PRESERVE_LEGACY_LIVE_QA" -eq 0 \
+  && ( "$PREPARE_RUNTIME" -eq 1 || "$RUN_RESTART" -eq 1 ) ]]; then
   # Rollback/recovery uses this same path, so reconcile the digest-bound
   # generation before units, Nginx, readiness or smoke can observe the restored
-  # release. The canonical release lock remains held by this script.
-  "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
-    reconcile --app-dir "$APP_DIR" >/dev/null 2>/dev/null
+  # release. A smoke-only invocation follows a completed prepare/restart and
+  # must not re-enter reconciliation after the transaction has advanced past
+  # its runtime-pending phase. The canonical release lock remains held here.
+  if [[ -n "$ROLLBACK_RECONCILE_TRANSACTION" ]]; then
+    "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+      reconcile --app-dir "$APP_DIR" \
+      --rollback-transaction "$ROLLBACK_RECONCILE_TRANSACTION" \
+      >/dev/null 2>/dev/null
+  else
+    "$SHARED_VENV/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+      reconcile --app-dir "$APP_DIR" >/dev/null 2>/dev/null
+  fi
 fi
 
 prepare_runtime_private() {

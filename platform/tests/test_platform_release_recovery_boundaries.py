@@ -2135,6 +2135,14 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
     def test_rollback_restores_previous_units_and_nginx_before_completion(self) -> None:
         current = self.add_release("current")
         previous = self.add_release("previous")
+        (current / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": "d" * 40}) + "\n", encoding="ascii"
+        )
+        (previous / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": "6343099bb7686671bdef49d0c4ecd10f21ef19d2"})
+            + "\n",
+            encoding="ascii",
+        )
         (self.app_dir / "current").symlink_to(current)
         (self.app_dir / "previous").symlink_to(previous)
         self.add_runtime_stubs(current)
@@ -2153,7 +2161,8 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 "deadlock-cloudflare-ips.service": "inactive",
             }
         )
-        rollback = self.copy_rollback_with_systemctl(systemctl)
+        runtime_restore = self.write_test_runtime_restore()
+        rollback = self.copy_rollback_with_systemctl(systemctl, runtime_restore)
 
         result = self.run_script(
             rollback,
@@ -2175,6 +2184,27 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual((self.app_dir / "current").resolve(), previous)
         self.assertEqual((self.app_dir / "previous").resolve(), current)
         self.assertFalse((self.shared / STATE_NAME).exists())
+        recorded_restore_calls = [
+            shlex.split(line)
+            for line in runtime_restore.with_suffix(".args").read_text(encoding="ascii").splitlines()
+        ]
+        expected_transaction = str(self.shared / STATE_NAME)
+        self.assertTrue(
+            any(
+                "--release" in args
+                and args[args.index("--release") + 1] == str(previous)
+                and "--transaction" in args
+                and args[args.index("--transaction") + 1] == expected_transaction
+                and "--rollback-reconcile-transaction" in args
+                and args[args.index("--rollback-reconcile-transaction") + 1]
+                == expected_transaction
+                and "--live-qa-runtime-installer" in args
+                and args[args.index("--live-qa-runtime-installer") + 1]
+                == str(current / "tools/platform_live_qa_runtime_install.py")
+                for args in recorded_restore_calls
+            ),
+            recorded_restore_calls,
+        )
 
     def test_rollback_crash_after_systemd_clear_retries_transaction_completion(self) -> None:
         current, previous = self.prepare_rollback_state()
@@ -2658,6 +2688,15 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             with_fake_python=True,
             service_state_required=True,
         )
+        (current / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": "6343099bb7686671bdef49d0c4ecd10f21ef19d2"})
+            + "\n",
+            encoding="ascii",
+        )
+        (candidate / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": "d" * 40}) + "\n",
+            encoding="ascii",
+        )
         self.add_runtime_stubs(current)
         self.add_runtime_stubs(candidate)
         self.advance_install_state(candidate, current, phase="staged")
@@ -2726,6 +2765,28 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.shared / STATE_NAME).exists())
+        restore_args = self.root / "runtime-restore.args"
+        recorded_restore_calls = [
+            shlex.split(line)
+            for line in restore_args.read_text(encoding="ascii").splitlines()
+        ]
+        expected_reconcile = str(self.shared / STATE_NAME)
+        self.assertTrue(
+            any(
+                "--release" in args
+                and args[args.index("--release") + 1] == str(current)
+                and "--transaction" in args
+                and args[args.index("--transaction") + 1] == expected_reconcile
+                and "--rollback-reconcile-transaction" in args
+                and args[args.index("--rollback-reconcile-transaction") + 1]
+                == expected_reconcile
+                and "--live-qa-runtime-installer" in args
+                and args[args.index("--live-qa-runtime-installer") + 1]
+                == str(candidate / "tools/platform_live_qa_runtime_install.py")
+                for args in recorded_restore_calls
+            ),
+            recorded_restore_calls,
+        )
         final_state = json.loads((self.root / "systemd-state.json").read_text())
         self.assertEqual(final_state["deadlock-api"], "active")
         self.assertEqual(final_state["deadlock-worker"], "inactive")
@@ -4614,8 +4675,16 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         target.chmod(0o755)
         return target
 
-    def copy_rollback_with_systemctl(self, systemctl: Path) -> Path:
+    def copy_rollback_with_systemctl(
+        self, systemctl: Path, runtime_restore: Path | None = None
+    ) -> Path:
         script = self.script_with_physical_tools(ROLLBACK_SCRIPT)
+        if runtime_restore is not None:
+            script = script.replace(
+                'RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"',
+                f'RUNTIME_RESTORE_TOOL="{runtime_restore}"',
+                1,
+            )
         script = script.replace("/usr/bin/systemctl", str(systemctl))
         target = self.root / "rollback-with-stateful-systemctl.sh"
         target.write_text(script)
@@ -4624,9 +4693,11 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
     def write_test_runtime_restore(self) -> Path:
         path = self.root / "runtime-restore.sh"
+        args_log = path.with_suffix(".args")
         path.write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
+            f"printf '%s\\n' \"$*\" >> {str(args_log)!r}\n"
             "APP_DIR=\"\"; RELEASE=\"\"\n"
             "while [[ $# -gt 0 ]]; do\n"
             "  case \"$1\" in\n"

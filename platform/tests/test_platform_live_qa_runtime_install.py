@@ -10,6 +10,8 @@ from pathlib import Path
 import shlex
 import stat
 import subprocess
+import sys
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -21,6 +23,7 @@ SPEC = importlib.util.spec_from_file_location("platform_live_qa_runtime_install_
 assert SPEC is not None and SPEC.loader is not None
 runtime = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runtime)
+ORIGINAL_VALIDATE_RUNTIME_SOURCE = runtime._validate_runtime_source
 SAFE_ENV_SCRIPT = SCRIPT.with_name("platform_safe_env_exec.py")
 SAFE_ENV_SPEC = importlib.util.spec_from_file_location(
     "platform_safe_env_exec_runtime_install_tested", SAFE_ENV_SCRIPT
@@ -855,6 +858,7 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         app_dir,
                         expected_manifest=engine_manifest,
                     )
+
                 trusted_validator.unlink()
 
                 # Changing the old provider identity remains rejected even
@@ -885,6 +889,713 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                         expected_manifest=engine_manifest,
                     )
 
+    def test_m8_source_only_provider_may_omit_only_the_new_reporter(self) -> None:
+        source_sha = runtime.LEGACY_RUNTIME_REPORTER_SOURCE_SHA
+        provider_sha = "358c71bd49bd80111ea4a7b67745f881730ec714"
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            with self.canonical_runtime_tree(root, source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                payload_root,
+            ):
+                # The canonical installer fixture supplies the trusted M8
+                # entrypoints and active manifest. Build the actual legacy
+                # source-only runtime and prior engine provider beneath those
+                # payload paths; validation below uses production validators.
+                active_manifest = runtime.install(app_dir, release)
+                active_payload = payload_root / source_sha
+                legacy_runtime = active_payload / "runtime"
+                os.chmod(active_payload, 0o700)
+                os.chmod(legacy_runtime, 0o700)
+
+                previous_release = app_dir / "releases" / f"release-{provider_sha[:8]}"
+                previous_release.mkdir(mode=0o755)
+                (previous_release / "RELEASE.json").write_text(
+                    json.dumps(
+                        {
+                            "source_git_commit": provider_sha,
+                            "release_slug": previous_release.name,
+                        }
+                    )
+                    + "\n",
+                    encoding="ascii",
+                )
+                os.chmod(previous_release / "RELEASE.json", 0o444)
+                (app_dir / "previous").symlink_to(previous_release)
+
+                engine_root, engine_files, lock_sha = self._engine_provider_fixture(
+                    payload_root / provider_sha
+                )
+                sandbox_path = engine_root / runtime.RUNTIME_SANDBOX_RELATIVE
+                sandbox_sha = runtime._digest_regular(sandbox_path, allow_sandbox=True)
+                with mock.patch.multiple(
+                    runtime,
+                    CHROMIUM_SANDBOX_SIZE=sandbox_path.stat().st_size,
+                    CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+                ):
+                    engine_sha = runtime._engine_digest(
+                        engine_files,
+                        node_version="26.3.1",
+                        package_lock_sha256=lock_sha,
+                    )
+                    prior_payload = payload_root / provider_sha
+                    prior_provider = {
+                        "version": 1,
+                        "source_sha": provider_sha,
+                        "provider_sha": provider_sha,
+                        "engine_tree_sha256": engine_sha,
+                        "node_version": "26.3.1",
+                        "package_lock_sha256": lock_sha,
+                        "engine_files": engine_files,
+                    }
+                    prior_provider_path = prior_payload / "runtime-provider.json"
+                    prior_provider_path.write_text(
+                        json.dumps(prior_provider, sort_keys=True, separators=(",", ":"))
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    os.chown(prior_provider_path, 0, 0)
+                    os.chmod(prior_provider_path, 0o444)
+                    os.chown(prior_payload, 0, 0)
+                    os.chmod(prior_payload, 0o555)
+                    suite_files: dict[str, str] = {}
+                    suite_bytes = {
+                        "web/package-lock.json": b"lock\n",
+                        "web/playwright.live.config.ts": b"export default {};\n",
+                        "web/tests/smoke/live-launch.spec.ts": b"export {};\n",
+                        "web/tests/smoke/live-user-journey.spec.ts": b"export {};\n",
+                        "web/tests/support/live-qa-origin.ts": b"export {};\n",
+                        "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
+                    }
+                    for relative, content in suite_bytes.items():
+                        destination = legacy_runtime / relative
+                        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        destination.write_bytes(content)
+                        os.chown(destination, 0, 0)
+                        os.chmod(destination, 0o444)
+                    for directory in sorted(
+                        (path for path in legacy_runtime.rglob("*") if path.is_dir()),
+                        key=lambda path: len(path.parts),
+                        reverse=True,
+                    ):
+                        os.chown(directory, 0, 0)
+                        os.chmod(directory, 0o555)
+                    os.chown(legacy_runtime, 0, 0)
+                    os.chmod(legacy_runtime, 0o555)
+                    suite_files = runtime._runtime_file_map(
+                        legacy_runtime,
+                        prefixes=("web/",),
+                        excluded_prefixes=("web/node_modules/",),
+                    )
+                    legacy_runtime_manifest = {
+                        "version": 2,
+                        "node_version": "26.3.1",
+                        "package_lock_sha256": runtime._digest_regular(
+                            legacy_runtime / "web/package-lock.json"
+                        ),
+                        "engine_tree_sha256": engine_sha,
+                        "engine_files": engine_files,
+                        "suite_tree_sha256": runtime._file_map_digest(
+                            suite_files, domain=b"oldsparky-liveqa-suite-v1\0"
+                        ),
+                        "suite_files": suite_files,
+                    }
+                    manifest_path = legacy_runtime / runtime.RUNTIME_MANIFEST_RELATIVE
+                    manifest_path.write_text(
+                        json.dumps(
+                            legacy_runtime_manifest,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    os.chown(manifest_path, 0, 0)
+                    os.chmod(manifest_path, 0o444)
+
+                    provider = {
+                        "version": 1,
+                        "source_sha": source_sha,
+                        "provider_sha": provider_sha,
+                        "engine_tree_sha256": engine_sha,
+                        "node_version": "26.3.1",
+                        "package_lock_sha256": legacy_runtime_manifest[
+                            "package_lock_sha256"
+                        ],
+                        "engine_files": engine_files,
+                    }
+                    provider_path = active_payload / "runtime-provider.json"
+                    provider_path.write_text(
+                        json.dumps(provider, sort_keys=True, separators=(",", ":"))
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    os.chown(provider_path, 0, 0)
+                    os.chmod(provider_path, 0o444)
+                    for directory in sorted(
+                        (path for path in active_payload.rglob("*") if path.is_dir()),
+                        key=lambda path: len(path.parts),
+                        reverse=True,
+                    ):
+                        os.chown(directory, 0, 0)
+                        os.chmod(directory, 0o555)
+                    os.chown(active_payload, 0, 0)
+                    os.chmod(active_payload, 0o555)
+                    tree_sha, files = runtime._tree_digest(active_payload)
+                    active_manifest = {
+                        **active_manifest,
+                        "payload_tree_sha256": tree_sha,
+                        "files": files,
+                    }
+                    runtime._write_manifest(trusted / "active-manifest.json", active_manifest)
+
+                    self.assertEqual(provider["source_sha"], source_sha)
+                    self.assertEqual(provider["engine_tree_sha256"], engine_sha)
+                    self.assertEqual(provider["node_version"], legacy_runtime_manifest["node_version"])
+                    self.assertEqual(
+                        provider["package_lock_sha256"],
+                        legacy_runtime_manifest["package_lock_sha256"],
+                    )
+                    self.assertEqual(provider["engine_files"], engine_files)
+                    real_validate_runtime_source = ORIGINAL_VALIDATE_RUNTIME_SOURCE
+                    with mock.patch.object(
+                        runtime, "_validate_runtime_source", wraps=real_validate_runtime_source
+                    ):
+                        # This is the real prior-provider call path. It must
+                        # validate the suite, provider, protected release,
+                        # engine bytes and payload closure without mocking the
+                        # runtime validator.
+                        reused = runtime._runtime_provider_payload(
+                            app_dir,
+                            expected_manifest=legacy_runtime_manifest,
+                        )
+                    self.assertEqual(reused, provider)
+
+                    release_runtime = release / "liveqa-runtime"
+                    shutil.rmtree(release_runtime)
+                    shutil.copytree(legacy_runtime, release_runtime, copy_function=shutil.copy2)
+
+                    # Recreate the post-pointer-switch rollback topology and
+                    # validate the actual transaction status through the
+                    # immutable installer path recorded as current_before.
+                    rollback_origin_sha = "f" * 40
+                    rollback_origin = app_dir / "releases" / f"release-{rollback_origin_sha[:8]}"
+                    rollback_tools = rollback_origin / "tools"
+                    rollback_tools.mkdir(mode=0o755, parents=True)
+                    (rollback_origin / "RELEASE.json").write_text(
+                        json.dumps(
+                            {
+                                "source_git_commit": rollback_origin_sha,
+                                "release_slug": rollback_origin.name,
+                            }
+                        )
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    os.chmod(rollback_origin / "RELEASE.json", 0o444)
+                    rollback_installer = rollback_tools / "platform_live_qa_runtime_install.py"
+                    rollback_installer.write_bytes(SCRIPT.read_bytes())
+                    os.chmod(rollback_installer, 0o755)
+                    transaction_tool = rollback_tools / "platform_release_transaction.py"
+                    transaction_source = SCRIPT.with_name("platform_release_transaction.py")
+                    transaction_tool.write_bytes(transaction_source.read_bytes())
+                    os.chmod(transaction_tool, 0o755)
+                    transaction_systemd_state = SCRIPT.with_name(
+                        "platform_release_systemd_state.py"
+                    )
+                    transaction_systemd_tool = rollback_tools / "platform_release_systemd_state.py"
+                    transaction_systemd_tool.write_bytes(transaction_systemd_state.read_bytes())
+                    os.chmod(transaction_systemd_tool, 0o755)
+                    current_pointer = app_dir / "current"
+                    previous_pointer = app_dir / "previous"
+                    current_pointer.unlink()
+                    current_pointer.symlink_to(rollback_origin)
+                    previous_pointer.unlink()
+                    previous_pointer.symlink_to(release)
+                    shared = app_dir / "shared"
+                    shared.mkdir(mode=0o700)
+                    state = shared / ".release-operation.json"
+                    snapshot = rollback_origin / ".rollback/shared-venv-before-install"
+                    create_args = [
+                        sys.executable,
+                        "-I",
+                        str(transaction_tool),
+                        "create",
+                        "--state",
+                        str(state),
+                        "--operation",
+                        "rollback",
+                        "--app-dir",
+                        str(app_dir),
+                        "--current-before",
+                        str(rollback_origin),
+                        "--previous-before",
+                        str(release),
+                        "--candidate-release",
+                        str(rollback_origin),
+                        "--shared-venv",
+                        str(shared / "venv"),
+                        "--peer",
+                        str(snapshot),
+                        "--snapshot",
+                        str(snapshot),
+                        "--transition",
+                        "none",
+                    ]
+                    created = subprocess.run(
+                        create_args,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        text=True,
+                    )
+                    self.assertEqual(created.returncode, 0, created.stderr)
+
+                    def run_transaction(*arguments: str) -> subprocess.CompletedProcess[str]:
+                        return subprocess.run(
+                            [sys.executable, "-I", str(transaction_tool), *arguments],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            check=False,
+                            text=True,
+                        )
+                    result = run_transaction(
+                        "phase", "--state", str(state), "--expected", "prepared",
+                        "--phase", "venv-transitioned",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    result = run_transaction(
+                        "switch-pointer", "--state", str(state), "--name", "current",
+                        "--target", str(release),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    result = run_transaction(
+                        "phase", "--state", str(state), "--expected", "venv-transitioned",
+                        "--phase", "current-switched",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    result = run_transaction(
+                        "switch-pointer", "--state", str(state), "--name", "previous",
+                        "--target", str(rollback_origin),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for expected, next_phase in (
+                        ("current-switched", "pointers-switched"),
+                        ("pointers-switched", "rollback-runtime-pending"),
+                    ):
+                        result = run_transaction(
+                            "phase", "--state", str(state), "--expected", expected,
+                            "--phase", next_phase,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    with mock.patch.object(runtime, "__file__", str(rollback_installer)):
+                        self.assertTrue(
+                            runtime._rollback_reconcile_is_authorized(
+                                app_dir, state, release
+                            )
+                        )
+                        with (
+                            mock.patch.object(
+                                runtime,
+                                "_validate_runtime_source",
+                                wraps=real_validate_runtime_source,
+                            ),
+                            mock.patch.multiple(
+                                runtime,
+                                CHROMIUM_SANDBOX_SIZE=sandbox_path.stat().st_size,
+                                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+                            ),
+                        ):
+                            migration_reconcile = runtime.reconcile(
+                                app_dir, rollback_transaction=state
+                            )
+                            self.assertEqual(
+                                migration_reconcile["source_sha"], source_sha
+                            )
+
+                    # A byte-identical installer copied from a different
+                    # release is not authorized by the transaction receipt.
+                    decoy = app_dir / "releases" / f"release-{'e' * 8}"
+                    decoy_tools = decoy / "tools"
+                    decoy_tools.mkdir(mode=0o755, parents=True)
+                    (decoy / "RELEASE.json").write_text(
+                        json.dumps(
+                            {
+                                "source_git_commit": "e" * 40,
+                                "release_slug": decoy.name,
+                            }
+                        )
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    os.chmod(decoy / "RELEASE.json", 0o444)
+                    decoy_installer = decoy_tools / "platform_live_qa_runtime_install.py"
+                    decoy_installer.write_bytes(SCRIPT.read_bytes())
+                    os.chmod(decoy_installer, 0o755)
+                    decoy_transaction_tool = decoy_tools / "platform_release_transaction.py"
+                    decoy_transaction_tool.write_bytes(transaction_source.read_bytes())
+                    os.chmod(decoy_transaction_tool, 0o755)
+                    decoy_systemd_tool = decoy_tools / "platform_release_systemd_state.py"
+                    decoy_systemd_tool.write_bytes(transaction_systemd_state.read_bytes())
+                    os.chmod(decoy_systemd_tool, 0o755)
+                    with (
+                        mock.patch.object(runtime, "__file__", str(decoy_installer)),
+                        self.assertRaisesRegex(
+                            runtime.InstallerError,
+                            "rollback runtime transaction release binding is invalid",
+                        ),
+                    ):
+                        runtime._rollback_reconcile_is_authorized(app_dir, state, release)
+
+                    # The same F installer may reconcile the exact old M8
+                    # runtime before pointer switching only during migration
+                    # uncertainty, or after transaction-bound recovery has
+                    # restored the original pointer pair.
+                    current_pointer.unlink()
+                    current_pointer.symlink_to(release)
+                    previous_pointer.unlink()
+                    previous_pointer.symlink_to(previous_release)
+                    state.unlink()
+                    install_create_args = [
+                        sys.executable,
+                        "-I",
+                        str(transaction_tool),
+                        "create",
+                        "--state",
+                        str(state),
+                        "--operation",
+                        "install",
+                        "--app-dir",
+                        str(app_dir),
+                        "--current-before",
+                        str(release),
+                        "--previous-before",
+                        str(previous_release),
+                        "--candidate-release",
+                        str(rollback_origin),
+                        "--shared-venv",
+                        str(shared / "venv"),
+                        "--peer",
+                        str(shared / f".venv-install-{rollback_origin.name}.fixture"),
+                        "--snapshot",
+                        str(snapshot),
+                        "--transition",
+                        "none",
+                    ]
+                    rollback_metadata = rollback_origin / ".rollback"
+                    rollback_metadata.mkdir(mode=0o700)
+                    (rollback_metadata / "previous-release").write_text(
+                        f"{release}\n", encoding="ascii"
+                    )
+                    (rollback_metadata / "previous-release").chmod(0o600)
+                    (rollback_metadata / "venv-transition").write_text(
+                        "unchanged\n", encoding="ascii"
+                    )
+                    (rollback_metadata / "venv-transition").chmod(0o600)
+                    freeze = rollback_origin / "requirements-platform.freeze.txt"
+                    freeze.write_text("fixture-package==1\n", encoding="ascii")
+                    freeze.chmod(0o444)
+                    (rollback_metadata / "shared-freeze.sha256").write_text(
+                        hashlib.sha256(freeze.read_bytes()).hexdigest() + "\n",
+                        encoding="ascii",
+                    )
+                    (rollback_metadata / "shared-freeze.sha256").chmod(0o600)
+                    created = subprocess.run(
+                        install_create_args,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        text=True,
+                    )
+                    self.assertEqual(created.returncode, 0, created.stderr)
+                    for expected, next_phase in (
+                        ("prepared", "venv-transitioned"),
+                        ("venv-transitioned", "snapshot-placed"),
+                        ("snapshot-placed", "staged"),
+                        ("staged", "migration-pending"),
+                    ):
+                        result = run_transaction(
+                            "phase",
+                            "--state",
+                            str(state),
+                            "--expected",
+                            expected,
+                            "--phase",
+                            next_phase,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    # During migration the original M8/M6 pointers are still
+                    # active. This exact retained install transaction is the
+                    # deploy recovery path that restores M8 using the incoming
+                    # release's immutable installer.
+                    with mock.patch.object(runtime, "__file__", str(rollback_installer)):
+                        self.assertTrue(
+                            runtime._rollback_reconcile_is_authorized(
+                                app_dir, state, release
+                            )
+                        )
+                        with self.assertRaisesRegex(
+                            runtime.InstallerError,
+                            "rollback runtime transaction release binding is invalid",
+                        ):
+                            runtime._rollback_reconcile_is_authorized(
+                                app_dir, state, previous_release
+                            )
+                        with (
+                            mock.patch.object(
+                                runtime,
+                                "_validate_runtime_source",
+                                wraps=real_validate_runtime_source,
+                            ),
+                            mock.patch.multiple(
+                                runtime,
+                                CHROMIUM_SANDBOX_SIZE=sandbox_path.stat().st_size,
+                                CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+                            ),
+                        ):
+                            migration_reconcile = runtime.reconcile(
+                                app_dir, rollback_transaction=state
+                            )
+                            self.assertEqual(
+                                migration_reconcile["source_sha"], source_sha
+                            )
+                    result = run_transaction(
+                        "phase",
+                        "--state",
+                        str(state),
+                        "--expected",
+                        "migration-pending",
+                        "--phase",
+                        "migration-failed",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    with mock.patch.object(runtime, "__file__", str(rollback_installer)):
+                        self.assertTrue(
+                            runtime._rollback_reconcile_is_authorized(
+                                app_dir, state, release
+                            )
+                        )
+                    result = run_transaction(
+                        "phase",
+                        "--state",
+                        str(state),
+                        "--expected",
+                        "migration-failed",
+                        "--phase",
+                        "recovery-authorized",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    result = run_transaction("recover", "--retain", "--state", str(state))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    recovered = run_transaction("status", "--state", str(state), "--json")
+                    self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                    self.assertEqual(json.loads(recovered.stdout)["phase"], "recovery-restored")
+                    with (
+                        mock.patch.object(runtime, "__file__", str(rollback_installer)),
+                        mock.patch.object(
+                            runtime,
+                            "_validate_runtime_source",
+                            wraps=real_validate_runtime_source,
+                        ) as validate_runtime_source,
+                        mock.patch.multiple(
+                            runtime,
+                            CHROMIUM_SANDBOX_SIZE=sandbox_path.stat().st_size,
+                            CHROMIUM_SANDBOX_SHA256=sandbox_sha,
+                        ),
+                    ):
+                        # Exercise the entire authorized rollback path through
+                        # source validation, old-provider validation, stage,
+                        # publication/reuse and the final payload validator.
+                        reconciled = runtime.reconcile(
+                            app_dir, rollback_transaction=state
+                        )
+                        self.assertEqual(reconciled["source_sha"], source_sha)
+                        self.assertTrue(validate_runtime_source.called)
+                        with self.assertRaisesRegex(
+                            runtime.InstallerError,
+                            "live-QA install path is unavailable",
+                        ):
+                            runtime.reconcile(app_dir)
+
+                    with self.assertRaisesRegex(
+                        runtime.InstallerError, "live-QA install path is unavailable"
+                    ):
+                        real_validate_runtime_source(legacy_runtime)
+
+                    # The source-hash exception is specifically for the M8
+                    # source-only v2 contract, not an older v1 runtime format.
+                    runtime_manifest_path = legacy_runtime / runtime.RUNTIME_MANIFEST_RELATIVE
+                    runtime_manifest_path.chmod(0o644)
+                    legacy_tree_sha, legacy_files = runtime._tree_digest(
+                        legacy_runtime,
+                        ignored=frozenset({runtime.RUNTIME_MANIFEST_RELATIVE.as_posix()}),
+                        sandbox_relative=runtime.RUNTIME_SANDBOX_RELATIVE,
+                    )
+                    v1_manifest = {
+                        "version": 1,
+                        "node_version": "26.3.1",
+                        "package_lock_sha256": runtime._digest_regular(
+                            legacy_runtime / "web/package-lock.json"
+                        ),
+                        "tree_sha256": legacy_tree_sha,
+                        "files": legacy_files,
+                    }
+                    runtime_manifest_path.write_text(
+                        json.dumps(v1_manifest, sort_keys=True, separators=(",", ":"))
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    os.chown(runtime_manifest_path, 0, 0)
+                    runtime_manifest_path.chmod(0o444)
+                    with self.assertRaisesRegex(
+                        runtime.InstallerError,
+                        "legacy reporter omission requires a source-only runtime",
+                    ):
+                        real_validate_runtime_source(
+                            legacy_runtime,
+                            allow_legacy_reporter_omission=True,
+                            source_sha=source_sha,
+                        )
+                    runtime_manifest_path.chmod(0o644)
+                    runtime_manifest_path.write_text(
+                        json.dumps(
+                            legacy_runtime_manifest,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    os.chown(runtime_manifest_path, 0, 0)
+                    runtime_manifest_path.chmod(0o444)
+
+                    # A second, unlisted suite member cannot be smuggled in
+                    # by recomputing the payload's outer digest.
+                    os.chmod(active_payload, 0o700)
+                    os.chmod(legacy_runtime, 0o700)
+                    reporter = legacy_runtime / "web/tests/support/live-count-reporter.cjs"
+                    reporter.write_text("// one-sided addition\n", encoding="ascii")
+                    os.chown(reporter, 0, 0)
+                    os.chmod(reporter, 0o444)
+                    os.chmod(legacy_runtime, 0o555)
+                    os.chmod(active_payload, 0o555)
+                    tree_sha, files = runtime._tree_digest(active_payload)
+                    changed_manifest = {**active_manifest, "payload_tree_sha256": tree_sha, "files": files}
+                    runtime._write_manifest(trusted / "active-manifest.json", changed_manifest)
+                    with (
+                        mock.patch.object(
+                            runtime,
+                            "_validate_runtime_source",
+                            wraps=real_validate_runtime_source,
+                        ),
+                        self.assertRaisesRegex(
+                            runtime.InstallerError,
+                            "live-QA runtime contains an unreviewed web member",
+                        ),
+                    ):
+                        runtime._runtime_provider_payload(app_dir, expected_manifest=legacy_runtime_manifest)
+
+                    # Missing an established M8 suite file is rejected even
+                    # though the reporter omission itself is permitted.
+                    os.chmod(active_payload, 0o700)
+                    os.chmod(legacy_runtime, 0o700)
+                    runtime_manifest_path.chmod(0o644)
+                    runtime_manifest = json.loads(
+                        runtime_manifest_path.read_text(encoding="ascii")
+                    )
+                    runtime_manifest["suite_files"] = runtime._runtime_file_map(
+                        legacy_runtime,
+                        prefixes=("web/",),
+                        excluded_prefixes=("web/node_modules/",),
+                    )
+                    runtime_manifest["suite_tree_sha256"] = runtime._file_map_digest(
+                        runtime_manifest["suite_files"],
+                        domain=b"oldsparky-liveqa-suite-v1\0",
+                    )
+                    missing_member = legacy_runtime / "web/tests/support/live-qa-origin.ts"
+                    missing_member.unlink()
+                    runtime_manifest["suite_files"] = runtime._runtime_file_map(
+                        legacy_runtime,
+                        prefixes=("web/",),
+                        excluded_prefixes=("web/node_modules/",),
+                    )
+                    runtime_manifest["suite_tree_sha256"] = runtime._file_map_digest(
+                        runtime_manifest["suite_files"],
+                        domain=b"oldsparky-liveqa-suite-v1\0",
+                    )
+                    runtime_manifest_path.write_text(
+                        json.dumps(runtime_manifest, sort_keys=True, separators=(",", ":"))
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    os.chown(runtime_manifest_path, 0, 0)
+                    runtime_manifest_path.chmod(0o444)
+                    for directory in sorted(
+                        (path for path in legacy_runtime.rglob("*") if path.is_dir()),
+                        key=lambda path: len(path.parts),
+                        reverse=True,
+                    ):
+                        os.chmod(directory, 0o555)
+                    os.chmod(legacy_runtime, 0o555)
+                    os.chmod(active_payload, 0o555)
+                    tree_sha, files = runtime._tree_digest(active_payload)
+                    changed_manifest = {**active_manifest, "payload_tree_sha256": tree_sha, "files": files}
+                    runtime._write_manifest(trusted / "active-manifest.json", changed_manifest)
+                    with (
+                        mock.patch.object(
+                            runtime,
+                            "_validate_runtime_source",
+                            wraps=real_validate_runtime_source,
+                        ),
+                        self.assertRaisesRegex(
+                            runtime.InstallerError, "live-QA install path is unavailable"
+                        ),
+                    ):
+                        runtime._runtime_provider_payload(app_dir, expected_manifest=legacy_runtime_manifest)
+
+                    # Manifest-only presence is rejected by the same exact
+                    # suite-file/tree equality check.
+                    os.chmod(active_payload, 0o700)
+                    os.chmod(legacy_runtime, 0o700)
+                    reporter.unlink()
+                    runtime_manifest_path = legacy_runtime / runtime.RUNTIME_MANIFEST_RELATIVE
+                    runtime_manifest_path.chmod(0o644)
+                    runtime_manifest = json.loads(runtime_manifest_path.read_text(encoding="ascii"))
+                    runtime_manifest["suite_files"][
+                        "web/tests/support/live-count-reporter.cjs"
+                    ] = "0" * 64
+                    runtime_manifest["suite_tree_sha256"] = runtime._file_map_digest(
+                        runtime_manifest["suite_files"], domain=b"oldsparky-liveqa-suite-v1\0"
+                    )
+                    runtime_manifest_path.write_text(
+                        json.dumps(runtime_manifest, sort_keys=True, separators=(",", ":"))
+                        + "\n",
+                        encoding="ascii",
+                    )
+                    os.chown(runtime_manifest_path, 0, 0)
+                    runtime_manifest_path.chmod(0o444)
+                    os.chmod(legacy_runtime, 0o555)
+                    os.chmod(active_payload, 0o555)
+                    tree_sha, files = runtime._tree_digest(active_payload)
+                    changed_manifest = {**active_manifest, "payload_tree_sha256": tree_sha, "files": files}
+                    runtime._write_manifest(trusted / "active-manifest.json", changed_manifest)
+                    with (
+                        mock.patch.object(
+                            runtime,
+                            "_validate_runtime_source",
+                            wraps=real_validate_runtime_source,
+                        ),
+                        self.assertRaisesRegex(
+                            runtime.InstallerError,
+                            "live-QA install path is unavailable",
+                        ),
+                    ):
+                        runtime._runtime_provider_payload(app_dir, expected_manifest=legacy_runtime_manifest)
     def test_install_rejects_tampered_staged_validator_before_activation(self) -> None:
         source_sha = "c" * 40
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
