@@ -149,7 +149,7 @@ PUBLIC_BASELINE = {
     # sampled stage logs for one reviewed load window.
     "PLATFORM_SSR_PERF_LOG_ENABLED": "false",
     # Separate process-level heap sampling from request-level SSR tracing.
-    # This stays off except for one explicitly reviewed runtime profile.
+    # Keep it disabled in every persistent runtime profile.
     "PLATFORM_SSR_HEAP_METRICS_ENABLED": "false",
     "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
     "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
@@ -164,11 +164,6 @@ RUNTIME_PROFILES = {
             "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": str(limit),
             "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": str(limit),
             "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": str(limit),
-            **(
-                {"PLATFORM_SSR_HEAP_METRICS_ENABLED": "true"}
-                if limit == 8
-                else {}
-            ),
         }
         for limit in (4, 6, 8, 12, 16)
     },
@@ -217,9 +212,6 @@ RUNTIME_PROFILES = {
         "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "24",
         "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "8",
         "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "250",
-        # Temporary bounded heap diagnostics stay independent of request-level
-        # SSR tracing and are removed from this profile with the final QA fix.
-        "PLATFORM_SSR_HEAP_METRICS_ENABLED": "true",
     },
     "pool-pre-ping-off": {
         "PLATFORM_DB_POOL_PRE_PING": "false",

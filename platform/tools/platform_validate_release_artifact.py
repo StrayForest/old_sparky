@@ -498,6 +498,7 @@ def _validate_liveqa_runtime(
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
+        "web/tests/support/live-count-reporter.cjs",
     )
     for relative in required:
         member = by_name.get(f"{prefix}/{relative}")
@@ -512,6 +513,7 @@ def _validate_liveqa_runtime(
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
+        "web/tests/support/live-count-reporter.cjs",
     }
     allowed_package_roots = {
         "web/node_modules/@playwright/test",

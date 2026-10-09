@@ -418,9 +418,16 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "tests/smoke/live-user-journey.spec.ts",
             "tests/support/live-qa-origin.ts",
             "tests/support/live-qa-sandbox.ts",
+            "tests/support/live-count-reporter.cjs",
             "package-lock.json",
         ):
-            cls._write_fixture_file(web / relative, relative.encode("ascii"))
+            source = REPO_ROOT / "platform/apps/platform_web" / relative
+            payload = (
+                source.read_bytes()
+                if relative == "tests/support/live-count-reporter.cjs"
+                else relative.encode("ascii")
+            )
+            cls._write_fixture_file(web / relative, payload)
         for package in ("@playwright/test", "playwright", "playwright-core"):
             cls._write_fixture_file(
                 web / "node_modules" / package / "package.json",
@@ -603,6 +610,12 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertEqual(diagnostic["reason"], "ok")
             self.assertEqual(diagnostic["cleanup"], "not-needed")
             manifest = json.loads((output / "runtime-manifest.json").read_text())
+            reporter_relative = "web/tests/support/live-count-reporter.cjs"
+            reporter_source = REPO_ROOT / "platform/apps/platform_web/tests/support/live-count-reporter.cjs"
+            self.assertEqual(
+                manifest["files"][reporter_relative],
+                hashlib.sha256(reporter_source.read_bytes()).hexdigest(),
+            )
             self.assertEqual(manifest["tree_sha256"], diagnostic["tree_sha256"])
             self.assertEqual(
                 (output / "browsers/webkit-2311/lib/alias").read_bytes(),
@@ -641,6 +654,22 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             installer.CHROMIUM_SANDBOX_SIZE = len(sandbox)
             installer.CHROMIUM_SANDBOX_SHA256 = hashlib.sha256(sandbox).hexdigest()
             installer._validate_runtime_source(output)
+
+            for mutation in ("missing", "tampered", "unlisted"):
+                with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as case_dir:
+                    candidate = Path(case_dir) / "runtime"
+                    shutil.copytree(output, candidate)
+                    reporter = candidate / reporter_relative
+                    if mutation == "missing":
+                        reporter.unlink()
+                    elif mutation == "tampered":
+                        reporter.chmod(0o644)
+                        reporter.write_bytes(b"module.exports = function changed() {};\n")
+                    else:
+                        extra = candidate / "web/tests/support/unreviewed.cjs"
+                        extra.write_bytes(b"module.exports = {};\n")
+                    with self.assertRaises(installer.InstallerError):
+                        installer._validate_runtime_source(candidate)
 
     def test_staged_live_qa_builder_output_passes_standalone_artifact_validator(
         self,
@@ -1909,8 +1938,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertEqual(
             platform_configure_shared_env.RUNTIME_PROFILES[
                 "ready-vote-static-8"
-            ]["PLATFORM_SSR_HEAP_METRICS_ENABLED"],
-            "true",
+            ].get("PLATFORM_SSR_HEAP_METRICS_ENABLED", "false"),
+            "false",
         )
 
     def test_production_preflight_requires_edge_parity_before_preflight_exit(self) -> None:
@@ -2400,7 +2429,7 @@ fail 'private lock detail must not cross the public channel'
             return selected_content["content"]
 
         static_content = apply_profile_selection("ready-vote-static-8")
-        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true\n", static_content)
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=false\n", static_content)
         current_lines = static_content.splitlines()
         static_values = {
             key: f"{key}={value}"
@@ -2410,11 +2439,11 @@ fail 'private lock detail must not cross the public channel'
         }
         static_web_env = render_service_env("web", static_values)
         static_api_env = render_service_env("api", static_values)
-        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true", static_web_env)
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=false", static_web_env)
         self.assertNotIn("PLATFORM_SSR_HEAP_METRICS_ENABLED", static_api_env)
 
         admission_content = apply_profile_selection("authenticated-read-admission-24x8")
-        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true\n", admission_content)
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=false\n", admission_content)
         admission_values = {
             key: f"{key}={value}"
             for key, value in (
@@ -2425,7 +2454,7 @@ fail 'private lock detail must not cross the public channel'
         }
         admission_web_env = render_service_env("web", admission_values)
         admission_api_env = render_service_env("api", admission_values)
-        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=true", admission_web_env)
+        self.assertIn("PLATFORM_SSR_HEAP_METRICS_ENABLED=false", admission_web_env)
         self.assertNotIn("PLATFORM_SSR_HEAP_METRICS_ENABLED", admission_api_env)
         current_lines = admission_content.splitlines()
 

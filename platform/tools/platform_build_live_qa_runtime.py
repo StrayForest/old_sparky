@@ -99,6 +99,7 @@ RUNTIME_SOURCE_FILES = (
     "tests/smoke/live-user-journey.spec.ts",
     "tests/support/live-qa-origin.ts",
     "tests/support/live-qa-sandbox.ts",
+    "tests/support/live-count-reporter.cjs",
     "package-lock.json",
 )
 PLAYWRIGHT_PACKAGES = (

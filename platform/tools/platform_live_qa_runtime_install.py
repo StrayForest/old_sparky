@@ -104,6 +104,7 @@ RUNTIME_REQUIRED_FILES = (
     "web/tests/smoke/live-user-journey.spec.ts",
     "web/tests/support/live-qa-origin.ts",
     "web/tests/support/live-qa-sandbox.ts",
+    "web/tests/support/live-count-reporter.cjs",
     "web/node_modules/@playwright/test/package.json",
     "web/node_modules/playwright/package.json",
     "web/node_modules/playwright-core/package.json",
@@ -839,6 +840,7 @@ def _validate_runtime_source(root: Path) -> dict[str, object]:
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
+        "web/tests/support/live-count-reporter.cjs",
     ]
     for relative in required:
         path = root / relative
@@ -851,6 +853,7 @@ def _validate_runtime_source(root: Path) -> dict[str, object]:
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
+        "web/tests/support/live-count-reporter.cjs",
     }
     allowed_package_roots = (
         "web/node_modules/@playwright/test",
@@ -982,6 +985,7 @@ def _validate_runtime_source(root: Path) -> dict[str, object]:
             "web/tests/smoke/live-user-journey.spec.ts",
             "web/tests/support/live-qa-origin.ts",
             "web/tests/support/live-qa-sandbox.ts",
+            "web/tests/support/live-count-reporter.cjs",
         }
         if not required_suite.issubset(suite_files):
             raise InstallerError("source-only live-QA suite is incomplete")
@@ -1046,6 +1050,7 @@ def _validate_engine_root(
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
+        "web/tests/support/live-count-reporter.cjs",
     }
     allowed_web_directories = {
         "web",
