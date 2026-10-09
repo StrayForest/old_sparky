@@ -150,13 +150,13 @@ ROUTE_MANIFEST_DIGEST_KEYS = (
     "files",
 )
 
-# The current security summary has no split provenance fields.  If its
-# producer grows those fields, only these two exact, closed spellings are
-# accepted.  Every field is type-checked and compared to the immutable merge
-# context; arbitrary extra keys never become an implicit extension.
+# Summary provenance has two exact split-source forms and one exact PR run-proof
+# form. Every accepted field set is closed and checked against the immutable
+# run context; arbitrary extra keys never become an implicit extension.
 SUMMARY_PROVENANCE_FIELD_SETS = (
     frozenset({"source_head_sha", "base_sha", "tested_tree_sha", "tested_parents"}),
     frozenset({"source_sha", "base_sha", "tree_sha", "parents"}),
+    frozenset({"baseline_guard_result", "proof_mode", "proof_run_attempt", "proof_run_id"}),
 )
 
 FULL_GATE_IDS: tuple[str, ...] = (
@@ -1301,7 +1301,15 @@ def _validate_summary(summary: Mapping[str, object], context: RunContext) -> Non
         or summary.get("tested_sha") != context.tested_merge_sha
     ):
         raise CandidateError("security final summary target is invalid")
-    if extra_keys:
+    if frozenset(extra_keys) == SUMMARY_PROVENANCE_FIELD_SETS[2]:
+        if (
+            summary.get("proof_mode") != "standard"
+            or summary.get("proof_run_id") != context.run_id
+            or summary.get("proof_run_attempt") != context.run_attempt
+            or summary.get("baseline_guard_result") != "skipped"
+        ):
+            raise CandidateError("security final summary PR run proof is invalid")
+    elif extra_keys:
         if frozenset(extra_keys) == SUMMARY_PROVENANCE_FIELD_SETS[0]:
             source_key, tree_key, parents_key = "source_head_sha", "tested_tree_sha", "tested_parents"
         else:
