@@ -58,6 +58,15 @@ export function TurnstileWidget({
   const [scriptReady, setScriptReady] = useState(false);
   const [state, setState] = useState<TurnstileState>("loading");
 
+  function handleScriptReady() {
+    if (typeof window.turnstile?.render !== "function") {
+      onTokenChange(null);
+      setState("error");
+      return;
+    }
+    setScriptReady(true);
+  }
+
   useEffect(() => {
     if (!scriptReady || !window.turnstile || !containerRef.current) {
       return;
@@ -147,11 +156,12 @@ export function TurnstileWidget({
     >
       <Script
         id="cloudflare-turnstile"
+        onLoad={handleScriptReady}
         onError={() => {
           onTokenChange(null);
           setState("error");
         }}
-        onReady={() => setScriptReady(true)}
+        onReady={handleScriptReady}
         src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
         strategy="afterInteractive"
       />
