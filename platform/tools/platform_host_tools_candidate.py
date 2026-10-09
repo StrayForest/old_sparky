@@ -1497,7 +1497,10 @@ def _pin_payload(candidate_root: Path) -> Mapping[str, object]:
 
 def _pin_closure(candidate_root: Path, payload: Mapping[str, object]) -> list[dict[str, object]]:
     closure = payload.get("closure")
-    if not isinstance(closure, list) or len(closure) != len(bundle.HOST_TOOL_FILES):
+    supported_layouts = tuple(layout["files"] for layout in bundle.SUPPORTED_LAYOUTS)
+    if not isinstance(closure, list) or len(closure) not in {
+        len(layout) for layout in supported_layouts
+    }:
         raise CandidateError("candidate host-tools pin closure is invalid")
     records: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -1506,7 +1509,11 @@ def _pin_closure(candidate_root: Path, payload: Mapping[str, object]) -> list[di
         if set(item) != {"mode", "path", "sha256"}:
             raise CandidateError("candidate pin closure row is not closed")
         path = _text(item.get("path"), "candidate pin closure path")
-        if path in seen or path != f"platform/tools/{path.removeprefix('platform/tools/')}" or path.removeprefix("platform/tools/") not in bundle.HOST_TOOL_FILES:
+        if (
+            path in seen
+            or path != f"platform/tools/{path.removeprefix('platform/tools/')}"
+            or path.removeprefix("platform/tools/") not in bundle.SUPPORTED_HOST_TOOL_FILES
+        ):
             raise CandidateError("candidate pin closure path is not fixed")
         mode = item.get("mode")
         digest = _text(item.get("sha256"), "candidate pin closure digest")
@@ -1514,7 +1521,8 @@ def _pin_closure(candidate_root: Path, payload: Mapping[str, object]) -> list[di
             raise CandidateError("candidate pin closure row is invalid")
         seen.add(path)
         records.append({"mode": mode, "path": path, "sha256": digest})
-    if tuple(row["path"] for row in records) != tuple(f"platform/tools/{name}" for name in bundle.HOST_TOOL_FILES):
+    declared_names = tuple(row["path"].removeprefix("platform/tools/") for row in records)
+    if declared_names not in supported_layouts:
         raise CandidateError("candidate pin closure ordering is not fixed")
     return records
 

@@ -607,26 +607,92 @@ class HostToolsBundleTests(unittest.TestCase):
             tools_dir = source_root / "platform" / "tools"
             tools_dir.mkdir(parents=True)
             bundle_source = tools_dir / "platform_host_tools_bundle.py"
+            legacy_groups = (
+                ("PREPARE_ARTIFACT_FILES", bundle.PREPARE_ARTIFACT_FILES),
+                ("PRODUCTION_DEPLOY_CONTROL_FILES", bundle.PRODUCTION_DEPLOY_CONTROL_FILES),
+                ("RETAINED_LOAD_ARTIFACT_FILES", bundle.RETAINED_LOAD_ARTIFACT_FILES),
+            )
+            extended_groups = (*legacy_groups, (
+                "CPU_DIAGNOSTIC_CONTROL_FILES", ("platform_cpu_diagnostic_plan.py",),
+            ))
+            def group_declarations(groups):
+                return "".join(
+                    f"{group} = ({', '.join(json.dumps(name) for name in values)},)\n"
+                    for group, values in groups
+                )
+
+            for groups in (legacy_groups, extended_groups):
+                names = tuple(name for _group, values in groups for name in values)
+                bundle_source.write_text(
+                    group_declarations(groups)
+                    + f"HOST_TOOL_FILES = ({' + '.join(group for group, _ in groups)})\n",
+                    encoding="ascii",
+                )
+                self.assertEqual(pin._bundle_file_names(source_root), names)
+            valid_declaration = bundle_source.read_bytes()
+            bundle_source.write_bytes(
+                valid_declaration + b"#" + b"x" * pin.MAX_SOURCE_CONTRACT_BYTES
+            )
+            with self.assertRaises(pin.HostToolsPinError):
+                pin._bundle_file_names(source_root)
+            bundle_source.write_bytes(valid_declaration)
+            linked_declaration = tools_dir / "linked_bundle.py"
+            os.link(bundle_source, linked_declaration)
+            try:
+                with self.assertRaises(pin.HostToolsPinError):
+                    pin._bundle_file_names(source_root)
+            finally:
+                linked_declaration.unlink()
+            saved_declaration = tools_dir / "platform_host_tools_bundle.saved"
+            bundle_source.replace(saved_declaration)
+            try:
+                bundle_source.symlink_to(saved_declaration.name)
+                with self.assertRaises(pin.HostToolsPinError):
+                    pin._bundle_file_names(source_root)
+            finally:
+                bundle_source.unlink(missing_ok=True)
+                saved_declaration.replace(bundle_source)
             bundle_source.write_text(
-                'PREPARE_ARTIFACT_FILES = ("a.py",)\n'
-                'PRODUCTION_DEPLOY_CONTROL_FILES = ("b.py",)\n'
-                'HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + PRODUCTION_DEPLOY_CONTROL_FILES\n',
+                group_declarations(legacy_groups)
+                + 'UNKNOWN_FILES = ("platform_cpu_diagnostic_plan.py",)\n'
+                + "HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + UNKNOWN_FILES\n",
                 encoding="ascii",
             )
-            self.assertEqual(pin._bundle_file_names(source_root), ("a.py", "b.py"))
+            with self.assertRaises(pin.HostToolsPinError):
+                pin._bundle_file_names(source_root)
             bundle_source.write_text(
-                'PREPARE_ARTIFACT_FILES = ("a.py",)\n'
-                'PRODUCTION_DEPLOY_CONTROL_FILES = ("b.py",)\n'
-                'RETAINED_LOAD_ARTIFACT_FILES = ("c.py",)\n'
-                'HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + PRODUCTION_DEPLOY_CONTROL_FILES + RETAINED_LOAD_ARTIFACT_FILES\n',
+                group_declarations(extended_groups)
+                + 'HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + UNKNOWN_FILES\n',
                 encoding="ascii",
             )
+            with self.assertRaises(pin.HostToolsPinError):
+                pin._bundle_file_names(source_root)
+            bundle_source.write_text(
+                group_declarations(extended_groups)
+                + 'HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + CPU_DIAGNOSTIC_CONTROL_FILES\n',
+                encoding="ascii",
+            )
+            with self.assertRaises(pin.HostToolsPinError):
+                pin._bundle_file_names(source_root)
+            cpu_layout = bundle.CPU_DIAGNOSTIC_HOST_TOOL_FILES
+            cpu_pin = {
+                "closure": [
+                    {
+                        "mode": 0o755,
+                        "path": f"platform/tools/{name}",
+                        "sha256": "a" * 64,
+                    }
+                    for name in cpu_layout
+                ]
+            }
             self.assertEqual(
-                pin._bundle_file_names(source_root), ("a.py", "b.py", "c.py")
+                tuple(row["path"] for row in candidate._pin_closure(source_root, cpu_pin)),
+                tuple(f"platform/tools/{name}" for name in cpu_layout),
             )
             bundle_source.write_text(
                 'PREPARE_ARTIFACT_FILES = ("a.py",)\n'
                 'PRODUCTION_DEPLOY_CONTROL_FILES = ("b.py",)\n'
+                'CPU_DIAGNOSTIC_CONTROL_FILES = ("platform_cpu_diagnostic_plan.py",)\n'
                 'HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + UNKNOWN_FILES\n',
                 encoding="ascii",
             )
@@ -1080,6 +1146,11 @@ class HostToolsBundleTests(unittest.TestCase):
             destination = tools / name
             shutil.copyfile(TOOLS_ROOT / name, destination)
             os.chmod(destination, 0o755)
+        shutil.copyfile(
+            TOOLS_ROOT / "platform_host_tools_bundle.py",
+            tools / "platform_host_tools_bundle.py",
+        )
+        os.chmod(tools / "platform_host_tools_bundle.py", 0o644)
         return source_root
 
     def test_bundle_is_deterministic_and_separates_closures(self) -> None:
@@ -1115,6 +1186,48 @@ class HostToolsBundleTests(unittest.TestCase):
             self.assertEqual(
                 len((contract / "files.sha256").read_text().splitlines()),
                 len(bundle.HOST_TOOL_FILES) + 1,
+            )
+            extended_source = self._source_fixture(root / "extended")
+            extended_tools = extended_source / "platform" / "tools"
+            controller = extended_tools / "platform_cpu_diagnostic_plan.py"
+            controller.write_text("# inert fixture member; builder treats it as bytes only\n", encoding="ascii")
+            controller.chmod(0o755)
+            helper = extended_tools / "platform_host_tools_bundle.py"
+            helper_text = helper.read_text(encoding="utf-8")
+            self.assertIn(
+                'CPU_DIAGNOSTIC_CONTROL_FILES = ("platform_cpu_diagnostic_plan.py",)',
+                helper_text,
+            )
+            helper_text = helper_text.replace(
+                "    + RETAINED_LOAD_ARTIFACT_FILES\n)",
+                "    + RETAINED_LOAD_ARTIFACT_FILES\n    + CPU_DIAGNOSTIC_CONTROL_FILES\n)",
+            )
+            helper_text = helper_text.replace(
+                '    "python_bytecode_disabled",\n',
+                '    "python_bytecode_disabled",\n    "cpu_diagnostic_plan_control",\n',
+            )
+            helper_text = helper_text.replace(
+                '    "retained_load_artifact_cleanup": RETAINED_LOAD_ARTIFACT_FILES,\n',
+                '    "retained_load_artifact_cleanup": RETAINED_LOAD_ARTIFACT_FILES,\n'
+                '    "cpu_diagnostic_control": CPU_DIAGNOSTIC_CONTROL_FILES,\n',
+            )
+            helper_text = helper_text.replace(
+                'TOOLSET_VERSION = "production-host-tools-v3"',
+                'TOOLSET_VERSION = "production-host-tools-v4"',
+            )
+            helper.write_text(helper_text, encoding="utf-8")
+            extended_archive = root / "extended.zip"
+            extended_summary = bundle.build_bundle(extended_source, SOURCE_SHA, extended_archive)
+            extended_manifest = extended_summary["manifest"]
+            self.assertEqual(
+                extended_manifest["components"]["cpu_diagnostic_control"],
+                ["platform_cpu_diagnostic_plan.py"],
+            )
+            self.assertIn("cpu_diagnostic_plan_control", extended_manifest["capabilities"])
+            self.assertEqual(len(extended_manifest["files"]), len(bundle.CPU_DIAGNOSTIC_HOST_TOOL_FILES) + 1)
+            self.assertEqual(
+                tuple(record["path"] for record in bundle.verify_bundle(extended_archive)["manifest"]["files"]),
+                tuple(sorted((*bundle.CPU_DIAGNOSTIC_HOST_TOOL_FILES, "capabilities.txt"))),
             )
             for contract_file in (
                 "manifest.sha256",
