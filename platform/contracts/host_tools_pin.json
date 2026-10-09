@@ -3,7 +3,7 @@
     {
       "mode": 493,
       "path": "platform/tools/platform_workflow_remote_dispatch.py",
-      "sha256": "d96495aede087a1ae963b67907fe8bdbc7f586df84eb3a504a2df0250d513742"
+      "sha256": "339b070a2f7899c70f4b4114586b56acc5a730d9d9b228b22bfa57ced24449fa"
     },
     {
       "mode": 493,
@@ -73,10 +73,10 @@
     {
       "mode": 420,
       "path": "platform/tools/platform_cpu_diagnostic_plan.py",
-      "sha256": "0385d19518b09d5e7952146456f384f8175507a7571c9b054a5760ff49dca4d4"
+      "sha256": "cb7ef066b5cfc4c2576d8aa1e4ff29538c3f5e8d40c3b7eaa6ba9efd002213d4"
     }
   ],
-  "host_tools_sha": "80af72d5fec4c868897baf3cd0172af1c17b3fa6",
+  "host_tools_sha": "7c4a4b43434b3d104c060778583f44d0bb22e682",
   "repository": "StrayForest/old_sparky",
   "schema": 1
 }
