@@ -117,8 +117,8 @@ async function startTurnstileRouteSwitchWhileSdkIsInFlight(
   let resetAttempts = 0;
   let sdkRequestCount = 0;
   let sdkRequestCountCapped = false;
-  let markSdkRequestStarted: (() => void) | null = null;
-  let releaseSdkResponse: (() => void) | null = null;
+  let markSdkRequestStarted!: () => void;
+  let releaseSdkResponse!: () => void;
   const sdkRequestStarted = new Promise<void>((resolve) => {
     markSdkRequestStarted = resolve;
   });
@@ -166,7 +166,7 @@ async function startTurnstileRouteSwitchWhileSdkIsInFlight(
     } else {
       sdkRequestCountCapped = true;
     }
-    markSdkRequestStarted?.();
+    markSdkRequestStarted();
     await sdkResponseGate;
     if (outcome === "abort") {
       await route.abort("failed");
@@ -296,14 +296,14 @@ async function startTurnstileRouteSwitchWhileSdkIsInFlight(
       };
     });
   } catch (error) {
-    releaseSdkResponse?.();
+    releaseSdkResponse();
     throw error;
   }
 
   return {
     csrfTokenRequests,
     loginPayloads,
-    releaseSdkResponse: () => releaseSdkResponse?.(),
+    releaseSdkResponse,
     resetAttempts,
     resetPayloads,
     sdkRequestCount: () => ({ count: sdkRequestCount, capped: sdkRequestCountCapped }),
