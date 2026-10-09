@@ -12,6 +12,9 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
+from apps.platform_api.app.services import (
+    tournament_workspace_access as workspace_access,
+)
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
@@ -409,7 +412,7 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
                 }
             )
             with self.subTest(headers=headers, query_string=query_string, auth=current_auth), patch.object(
-                tournament_routes,
+                workspace_access,
                 "ensure_private_tournament_read_membership_is_active",
                 AsyncMock(),
             ) as original_guard:
@@ -618,7 +621,7 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
 
         old_membership_guard = AsyncMock()
         with patch.object(
-            tournament_routes,
+            workspace_access,
             "ensure_private_tournament_read_membership_is_active",
             old_membership_guard,
         ):
