@@ -38,6 +38,13 @@ caller's umask is restrictive. For compatibility, only an existing root-owned
 closed. This adjustment does not change existing payload bytes or recursively
 change generation permissions.
 
+The copied remote dispatcher validates the active `RELEASE.json` by loading
+the `platform_validate_release_artifact.py` sibling beside its trusted-root
+copy. The installer copies that validator from the immutable generation and
+binds the sibling to its payload-manifest digest before switching the active
+pointer. The sibling is root-owned, non-writable and executable (mode `0555`);
+a missing or altered payload validator or trusted-root copy fails closed.
+
 The only set-id file permitted anywhere in this contour is the root-owned
 Chromium sandbox at its exact reviewed path, mode `04755` and pinned SHA-256.
 The guard, safe environment and dispatcher accept only the active manifest's

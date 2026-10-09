@@ -114,14 +114,9 @@ these five catalog contours:
 | `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts, including request sampling (`test_platform_request_performance`) and production-QA summary (`test_platform_production_qa_write_burst_profile`) |
 | `backend` (aggregate) | 3600s | serial orchestration | disjoint union of the five contours |
 
-The timeout values are the catalog's executable contract, not a moving test
-count or an estimate derived from the current number of methods. The catalog
-rejects unknown, duplicate, overlapping or unowned IDs and detects its
-snapshot drift through `verification-contract`; add a new test by updating
-that executable catalog and its self-test, never by hard-coding a count or
-editing a workflow filename list. The stable gate and command registry remains
-the [canonical verifier](../tools/platform_verify.py),
-which delegates `backend` and each sub-contour to the guarded runner.
+The timeout values are the catalog's executable contract, not a moving test count or an estimate derived from the current number of methods. The catalog rejects unknown, duplicate, overlapping or unowned IDs and detects snapshot drift through `verification-contract`; add tests by updating the executable catalog and its self-test, never by hard-coding a count or editing a workflow filename list. The stable gate and command registry remains the [canonical verifier](../tools/platform_verify.py), which delegates `backend` and each sub-contour to the guarded runner.
+
+`test_platform_external_load` (performance-contract) covers bounded HTTP body failures and phase accounting; `test_platform_live_qa_runtime_install` (backend-privileged) exercises the copied dispatcher against its installed release validator, including missing/tampered refusal.
 
 Every aggregate and backend sub-contour is guarded before test discovery by
 one pure, fail-closed resource validator. It requires the exact values

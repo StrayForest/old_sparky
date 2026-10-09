@@ -40,6 +40,7 @@ HELPER_PATH = TRUSTED_ROOT / "platform_live_user_qa_trusted.sh"
 LAUNCH_HELPER_PATH = TRUSTED_ROOT / "platform_live_launch_trusted.sh"
 DISPATCHER_PATH = TRUSTED_ROOT / "platform_live_user_qa_dispatch.py"
 REMOTE_DISPATCHER_PATH = TRUSTED_ROOT / "platform_workflow_remote_dispatch.py"
+RELEASE_VALIDATOR_PATH = TRUSTED_ROOT / "platform_validate_release_artifact.py"
 REMOTE_INPUT_GUARD_PATH = TRUSTED_ROOT / "platform_workflow_input_guard.py"
 RELEASE_LOCK_EXEC_PATH = TRUSTED_ROOT / "platform_release_lock_exec.sh"
 RELEASE_LOCK_HELPER_PATH = TRUSTED_ROOT / "platform_release_lock.sh"
@@ -49,7 +50,7 @@ SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 PAYLOAD_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 STAGE_PATTERN = re.compile(r"^\.[0-9a-f]{40}\.install-[0-9a-f]{32}$")
 ENTRYPOINT_TEMP_PATTERN = re.compile(
-    r"^\.platform_live_(?:user_qa_trusted\.sh|user_qa_dispatch\.py|qa_mailbox_helper\.py)\.[0-9a-f]{32}\.tmp$"
+    r"^\.(?:platform_live_(?:user_qa_trusted\.sh|user_qa_dispatch\.py|qa_mailbox_helper\.py)|platform_validate_release_artifact\.py)\.[0-9a-f]{32}\.tmp$"
 )
 MANIFEST_TEMP_PATTERN = re.compile(r"^\.active-manifest\.json\.[0-9a-f]{32}\.tmp$")
 POINTER_TEMP_PATTERN = re.compile(r"^\.active\.[0-9a-f]{32}\.tmp$")
@@ -125,6 +126,9 @@ TOOL_FILES = (
     "platform_live_user_qa_dispatch.py",
     "platform_workflow_remote_dispatch.py",
     "platform_workflow_input_guard.py",
+    # The remote dispatcher loads this exact pinned parser from its trusted
+    # live-QA directory to validate the active RELEASE.json receipt.
+    "platform_validate_release_artifact.py",
     "platform_release_lock_exec.sh",
     "platform_release_lock.sh",
     "platform_live_qa_runtime_install.py",
@@ -1343,6 +1347,7 @@ def _validate_payload(
         "platform/tools/platform_live_user_qa_dispatch.py",
         "platform/tools/platform_workflow_remote_dispatch.py",
         "platform/tools/platform_workflow_input_guard.py",
+        "platform/tools/platform_validate_release_artifact.py",
         "platform/tools/platform_release_lock_exec.sh",
         "platform/tools/platform_release_lock.sh",
         "platform/tools/platform_live_browser_qa.sh",
@@ -1417,6 +1422,16 @@ def _validate_payload(
         (LAUNCH_HELPER_PATH, 0o755, "platform/tools/platform_live_launch_trusted.sh"),
         (DISPATCHER_PATH, 0o500, "platform/tools/platform_live_user_qa_dispatch.py"),
         (REMOTE_DISPATCHER_PATH, 0o555, "platform/tools/platform_workflow_remote_dispatch.py"),
+        (
+            root / "platform/tools/platform_validate_release_artifact.py",
+            0o555,
+            "platform/tools/platform_validate_release_artifact.py",
+        ),
+        (
+            RELEASE_VALIDATOR_PATH,
+            0o555,
+            "platform/tools/platform_validate_release_artifact.py",
+        ),
         (REMOTE_INPUT_GUARD_PATH, 0o555, "platform/tools/platform_workflow_input_guard.py"),
         (RELEASE_LOCK_EXEC_PATH, 0o555, "platform/tools/platform_release_lock_exec.sh"),
         (RELEASE_LOCK_HELPER_PATH, 0o444, "platform/tools/platform_release_lock.sh"),
@@ -1680,7 +1695,14 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
         for relative in TOOL_FILES:
             source = source_platform / "tools" / relative
             target = platform / "tools" / relative
-            digest = _copy_regular(source, target, executable=relative.endswith(".sh"))
+            digest = _copy_regular(
+                source,
+                target,
+                executable=(
+                    relative.endswith(".sh")
+                    or relative == "platform_validate_release_artifact.py"
+                ),
+            )
             files[f"platform/tools/{relative}"] = digest
         for relative in SOURCE_TREES:
             files.update({f"platform/{relative}/{name}": digest for name, digest in _copy_tree(source_platform / relative, platform / relative).items()})
@@ -1760,6 +1782,7 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
             ("platform_live_launch_trusted.sh", LAUNCH_HELPER_PATH, 0o755),
             ("platform_live_user_qa_dispatch.py", DISPATCHER_PATH, 0o500),
             ("platform_workflow_remote_dispatch.py", REMOTE_DISPATCHER_PATH, 0o555),
+            ("platform_validate_release_artifact.py", RELEASE_VALIDATOR_PATH, 0o555),
             ("platform_workflow_input_guard.py", REMOTE_INPUT_GUARD_PATH, 0o555),
             ("platform_release_lock_exec.sh", RELEASE_LOCK_EXEC_PATH, 0o555),
             ("platform_release_lock.sh", RELEASE_LOCK_HELPER_PATH, 0o444),
@@ -1768,11 +1791,25 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
             source = target / "platform/tools" / source_name
             temporary = TRUSTED_ROOT / f".{destination.name}.{uuid4().hex}.tmp"
             temporary_paths.append(temporary)
-            _copy_regular(source, temporary, executable=source_name.endswith(".sh"))
+            _copy_regular(
+                source,
+                temporary,
+                executable=(
+                    source_name.endswith(".sh")
+                    or source_name == "platform_validate_release_artifact.py"
+                ),
+            )
             os.replace(temporary, destination)
             temporary_paths.remove(temporary)
             os.chmod(destination, mode)
             _fsync_directory(TRUSTED_ROOT)
+        validator_relative = "platform/tools/platform_validate_release_artifact.py"
+        validator_metadata = _regular(RELEASE_VALIDATOR_PATH, mode=0o555)
+        if (
+            validator_metadata.st_nlink != 1
+            or _digest_regular(RELEASE_VALIDATOR_PATH) != actual_files.get(validator_relative)
+        ):
+            raise InstallerError("trusted live-QA validator is not bound to payload")
         _write_manifest(ACTIVE_MANIFEST, manifest)
         # The generation directory is complete and its helper/dispatcher are
         # already durable before the single active-generation pointer switch.
