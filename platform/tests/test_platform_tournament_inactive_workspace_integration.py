@@ -172,7 +172,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
         try:
             active_workspace = await active_member["client"].get(
                 f"/api/v1/tournaments/{slug}/workspace",
-                params={"workspace_view": "bracket"},
+                params={"workspace_view": "bracket", "participants_limit": 0},
             )
         finally:
             event.remove(engine().sync_engine, "before_cursor_execute", count_participant_select)
