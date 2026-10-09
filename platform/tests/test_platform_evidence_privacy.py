@@ -16,6 +16,7 @@ import httpx
 
 from tools.platform_evidence_sanitizer import (
     project_public_artifact,
+    safe_error_class,
     sanitized_log_summary,
 )
 from tools.platform_external_load import RequestResult, summarize_results
@@ -391,6 +392,45 @@ class EvidencePrivacyTests(unittest.TestCase):
                 "max_ms": 42.5,
             }
         })
+        classified = summarize_results(
+            [
+                RequestResult(
+                    phase="state_read",
+                    method="GET",
+                    path="/tournaments/qa/deadlock/ready-check",
+                    status=200,
+                    elapsed_ms=1.0,
+                    ok=False,
+                    response_bytes=0,
+                    error_kind="authoritative_state_mismatch",
+                ),
+                RequestResult(
+                    phase="state_read",
+                    method="GET",
+                    path="/users/me",
+                    status=401,
+                    elapsed_ms=1.0,
+                    ok=False,
+                    response_bytes=0,
+                    error_kind="unauthorized",
+                ),
+                RequestResult(
+                    phase="state_read",
+                    method="GET",
+                    path="/users/me",
+                    status=403,
+                    elapsed_ms=1.0,
+                    ok=False,
+                    response_bytes=0,
+                    error_kind="forbidden",
+                ),
+            ]
+        )
+        self.assertEqual(classified["error_kinds"], {"auth": 2, "other": 1})
+        self.assertEqual(safe_error_class("authoritative_state_mismatch", status=200), "other")
+        self.assertEqual(safe_error_class("authentication_error", status=200), "auth")
+        self.assertEqual(safe_error_class("authoritative_state_mismatch", status=401), "auth")
+        self.assertEqual(safe_error_class("authoritative_state_mismatch", status=403), "auth")
 
     def test_response_diagnostics_is_fixed_schema(self) -> None:
         response = httpx.Response(
@@ -565,9 +605,16 @@ class EvidencePrivacyTests(unittest.TestCase):
                     "values": ["/home/operator/private-report.json"],
                 },
                 "error_samples": [{
+                    "diagnostic_id": "tdiag-123-00001",
                     "path": "https://old-sparky.example/invite/INVITE-CODE?token=secret-token",
                     "message": "password=secret-password",
                     "status": 500,
+                }],
+                "timeout_diagnostics": [{
+                    "diagnostic_id": "tdiag-123-00002",
+                    "phase": "authenticated_page_load",
+                    "status": 0,
+                    "error_class": "timeout",
                 }],
             },
             "logical": {
@@ -609,6 +656,8 @@ class EvidencePrivacyTests(unittest.TestCase):
             "preprod26082900000000ab",
             "a" * 40,
             "123456",
+            "tdiag-123-00001",
+            "tdiag-123-00002",
         ):
             self.assertNotIn(value.lower(), public_output.lower())
         self.assertEqual(public_report["raw_http"]["requests"], 10)
@@ -924,6 +973,7 @@ class EvidencePrivacyTests(unittest.TestCase):
                     "status": 504,
                     "path": "/tournaments/private-slug?invite=INVITE-CODE",
                     "request_id": "request-secret",
+                    "diagnostic_id": "tdiag-private",
                 },
                 "error_path": "/home/operator/private-report.json",
                 "unknown": ["SELECT email FROM users WHERE password='secret-password'"],
@@ -932,7 +982,11 @@ class EvidencePrivacyTests(unittest.TestCase):
         }
         public_timeout = project_public_artifact("timeout_diagnostics", timeout_source)
         timeout_output = serialized(public_timeout)
-        for value in FORBIDDEN_VALUES + ("private-slug", "request-secret"):
+        for value in FORBIDDEN_VALUES + (
+            "private-slug",
+            "request-secret",
+            "tdiag-private",
+        ):
             self.assertNotIn(value.lower(), timeout_output.lower())
         self.assertEqual(public_timeout["summary"]["client_timeout_errors"], 1)
         self.assertEqual(public_timeout["rows"][0]["origin"]["route_class"], "tournament_detail")
