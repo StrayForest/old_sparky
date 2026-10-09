@@ -22,6 +22,7 @@ import stat
 import subprocess  # nosec B404 - all argv below is fixed or validated data.
 import sys
 import time
+from typing import Any
 
 
 def _is_immutable_host_tools_dispatcher(path: Path) -> bool:
@@ -729,7 +730,6 @@ def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
             ):
                 return 2
             target_count = 3
-            public_status = "prepared"
             marker = (
                 f"CPU_DIAGNOSTIC_PLAN status=prepared targets={target_count} "
                 f"release_slug={result['release_slug']}"

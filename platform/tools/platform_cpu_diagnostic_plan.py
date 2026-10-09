@@ -287,7 +287,6 @@ def _read_process_environ(pid: int, *, maximum: int = 131_072) -> dict[str, byte
 
 
 def _service_targets(service: str, fields: dict[str, str]) -> list[dict[str, object]]:
-    unit = f"deadlock-{service}.service"
     cgroup = fields["ControlGroup"]
     cgroup_file = Path("/sys/fs/cgroup") / cgroup.lstrip("/") / "cgroup.procs"
     try:
