@@ -116,7 +116,20 @@ gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
 
 Storage diagnostics/maintenance workflow or exact storage-retention skill changes use the closed storage-operations route: full, runtime-sensitive verification but no application or baseline action. AUTO takes its no-deploy branch. The recovery producer uploads a bound skip receipt with a provenance attestation; the publisher checks its fields against exact producer and parent CI/classifier evidence, but does not verify the attestation cryptographically or publish a host bundle/production marker. When an activation reports a full filesystem or unusable temporary directory, collect bounded read-only evidence before cleanup:
 `gh workflow run platform-production-storage-diagnostics.yml --repo StrayForest/old_sparky --ref dev -f expected_sha=<exact-source-sha-currently-deployed>`
-It reports blocks/inodes, mounts, journald, service sandbox, top-level usage and retention candidates; it does not delete files or apply runtime settings. Failure artifacts may contain bounded partial evidence and a closed stage/outcome, never raw host output. Maintenance reports bind to one service invocation; a verified-backup report and nonzero exit may follow actual deletions when thresholds still fail, so workflow failure proves neither no deletion nor successful cleanup.
+It reports blocks/inodes, mounts, journald, service sandbox, top-level usage
+and retention candidates, the exact current/previous release identities, the
+latest restore-verified backup age and checksum result, and the maintenance
+timer's active/enabled state plus last/next trigger times. It compares the
+installed timer unit with the release-owned unit and reports only whether
+drop-ins are absent or unexpectedly present; it does not expose their paths.
+The backup check reads the retained archive to verify its checksum and is
+bounded by the workflow timeout. The diagnostics workflow does not create or
+delete backups, delete files, or apply runtime settings. Failure artifacts may
+contain bounded partial evidence and a closed stage/outcome, never raw host
+output. Maintenance reports bind to one service invocation; a
+verified-backup report and nonzero exit may follow actual deletions when
+thresholds still fail, so workflow failure proves neither no deletion nor
+successful cleanup.
 
 Preview storage cleanup without backup or deletion:
 

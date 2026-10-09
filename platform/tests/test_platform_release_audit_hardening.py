@@ -1761,7 +1761,26 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("expected_sha", workflow)
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', workflow)
         self.assertIn("platform_storage_maintenance.py\" --json", workflow)
+        self.assertIn("--check-latest --max-age-hours 24 --json", workflow)
+        self.assertIn('CURRENT_STAGE=backup_check', workflow)
+        self.assertIn('summary_tool" --mode backup --phase check', workflow)
+        self.assertIn('"previous_release_id"', workflow)
+        self.assertIn('"previous_source_sha"', workflow)
+        self.assertIn('CURRENT_STAGE=identity_recheck', workflow)
+        self.assertIn('release_pointer_changed', workflow)
+        self.assertIn('systemctl show deadlock-maintenance.timer', workflow)
+        self.assertIn("LastTriggerUSec,NextElapseUSecRealtime", workflow)
+        self.assertIn('"unit_source_match"', workflow)
+        self.assertIn('"dropin_identity": "none" if not dropins else "unexpected_present"', workflow)
+        self.assertIn('timer_dir="$(mktemp -d)"', workflow)
+        self.assertIn('chmod 700 "$timer_dir"', workflow)
+        self.assertIn('ulimit -f 16;', workflow)
+        self.assertIn('timer_size <= 16384', workflow)
+        self.assertIn('3<"$timer_file"', workflow)
+        self.assertNotIn('timer_output=', workflow)
+        self.assertIn("timeout --foreground 5s systemctl show", workflow)
         self.assertIn(
             "df -B1 --output=size,used,avail,pcent -- \"$path\"", workflow
         )
@@ -1776,6 +1795,8 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertNotIn("fuser", workflow)
         self.assertNotIn("lslocks", workflow)
         self.assertNotIn("--apply", workflow)
+        self.assertNotIn("platform_storage_maintenance.py --backup-only", workflow)
+        self.assertNotIn("systemctl start deadlock-maintenance", workflow)
         self.assertNotIn("systemctl restart", workflow)
         self.assertNotIn("rm -rf", workflow)
         self.assertNotIn('exec 9>"$retained_load_lock"', workflow)
@@ -1794,6 +1815,135 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("steps.collect_storage.outputs.report_ready == 'true'", workflow)
         self.assertIn("if-no-files-found: error", workflow)
         self.assertNotIn('cat "$ssh_error"', workflow)
+
+        release_marker = (
+            'release_identity="$(/usr/bin/python3 -I - "$runtime" "$expected_sha" '
+            "<<'PY'\n"
+        )
+        release_start = workflow.index(release_marker) + len(release_marker)
+        release_end = workflow.index("\n          PY\n          )\" \\\n", release_start)
+        release_reader = textwrap.dedent(workflow[release_start:release_end])
+        timer_marker = (
+            'timer_summary="$(/usr/bin/python3 -I - "$current" 3<"$timer_file" '
+            "<<'PY'\n"
+        )
+        timer_start = workflow.index(timer_marker) + len(timer_marker)
+        timer_end = workflow.index("\n          PY\n          )\" \\\n", timer_start)
+        timer_reader = textwrap.dedent(workflow[timer_start:timer_end])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "platform"
+            releases = runtime / "releases"
+            releases.mkdir(parents=True)
+            current_release = releases / "release-current"
+            previous_release = releases / "release-previous"
+            current_release.mkdir()
+            previous_release.mkdir()
+            current_sha = "a" * 40
+            previous_sha = "b" * 40
+            (current_release / "RELEASE.json").write_text(
+                json.dumps(
+                    {"release_slug": current_release.name, "source_git_commit": current_sha}
+                ),
+                encoding="utf-8",
+            )
+            (previous_release / "RELEASE.json").write_text(
+                json.dumps(
+                    {"release_slug": previous_release.name, "source_git_commit": previous_sha}
+                ),
+                encoding="utf-8",
+            )
+            (runtime / "current").symlink_to(Path("releases") / current_release.name)
+            (runtime / "previous").symlink_to(Path("releases") / previous_release.name)
+            identity = subprocess.run(
+                [sys.executable, "-I", "-", str(runtime), current_sha],
+                input=release_reader,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(identity.returncode, 0, identity.stderr)
+            self.assertEqual(
+                identity.stdout.strip(),
+                "\t".join(
+                    (
+                        current_release.name,
+                        current_sha,
+                        previous_release.name,
+                        previous_sha,
+                    )
+                ),
+            )
+            (current_release / "RELEASE.json").write_text(
+                '{"release_slug":"release-current","release_slug":"forged",'
+                f'"source_git_commit":"{current_sha}"}}',
+                encoding="utf-8",
+            )
+            duplicate_identity = subprocess.run(
+                [sys.executable, "-I", "-", str(runtime), current_sha],
+                input=release_reader,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(duplicate_identity.returncode, 2)
+            self.assertEqual(duplicate_identity.stdout, "")
+
+            installed_timer = root / "deadlock-maintenance.timer"
+            source_timer = runtime / "deploy/systemd/deadlock-maintenance.timer"
+            source_timer.parent.mkdir(parents=True)
+            timer_bytes = b"[Timer]\nOnCalendar=*-*-* 04:15:00\n"
+            source_timer.write_bytes(timer_bytes)
+            installed_timer.write_bytes(timer_bytes)
+            timer_reader = timer_reader.replace(
+                'Path("/etc/systemd/system/deadlock-maintenance.timer")',
+                f"Path({str(installed_timer)!r})",
+            )
+            def run_timer(raw_input: str) -> subprocess.CompletedProcess[str]:
+                with tempfile.TemporaryFile() as timer_stream:
+                    timer_stream.write(raw_input.encode("utf-8"))
+                    timer_stream.seek(0)
+                    descriptor = timer_stream.fileno()
+                    return subprocess.run(
+                        [sys.executable, "-I", "-", str(runtime), str(descriptor)],
+                        input=timer_reader,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        pass_fds=(descriptor,),
+                    )
+
+            timer_input = "\n".join(
+                (
+                    "LoadState=loaded",
+                    "ActiveState=active",
+                    "SubState=waiting",
+                    "UnitFileState=enabled",
+                    "LastTriggerUSec=Fri 2026-10-09 04:40:00 EEST",
+                    "NextElapseUSecRealtime=Sat 2026-10-10 04:15:00 EEST",
+                    f"FragmentPath={installed_timer}",
+                    "DropInPaths=",
+                )
+            )
+            timer_result = run_timer(timer_input)
+            self.assertEqual(timer_result.returncode, 0, timer_result.stderr)
+            timer_summary = json.loads(timer_result.stdout)
+            self.assertTrue(timer_summary["unit_source_match"])
+            self.assertEqual(timer_summary["last_trigger_utc"], "2026-10-09T01:40:00Z")
+            self.assertEqual(timer_summary["next_trigger_utc"], "2026-10-10T01:15:00Z")
+            self.assertEqual(timer_summary["dropin_identity"], "none")
+            self.assertNotIn(str(installed_timer), timer_result.stdout)
+
+            unexpected_dropin = timer_input.replace(
+                "DropInPaths=", "DropInPaths=/etc/systemd/system/deadlock-maintenance.timer.d/override.conf"
+            )
+            changed_timer = run_timer(unexpected_dropin)
+            self.assertEqual(changed_timer.returncode, 0, changed_timer.stderr)
+            changed_summary = json.loads(changed_timer.stdout)
+            self.assertEqual(changed_summary["dropin_count"], 1)
+            self.assertEqual(changed_summary["dropin_identity"], "unexpected_present")
+            self.assertNotIn("override.conf", changed_timer.stdout)
 
     @unittest.skipUnless(os.geteuid() == 0, "lock probe fixture requires root")
     def test_storage_diagnostic_lock_probe_output_reaches_canonical_summary(self) -> None:
