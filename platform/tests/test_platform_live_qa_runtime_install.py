@@ -747,6 +747,144 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 self.assertFalse((trusted / "active").exists())
                 self.assertFalse((trusted / "active-manifest.json").exists())
 
+    def test_prior_provider_reuse_accepts_m6_payload_without_new_validator(self) -> None:
+        source_sha = "9" * 40
+        engine_manifest = {
+            "engine_tree_sha256": "d" * 64,
+            "node_version": "26.3.1",
+            "package_lock_sha256": "e" * 64,
+            "engine_files": {},
+        }
+        provider = {
+            "version": 1,
+            "source_sha": source_sha,
+            "provider_sha": source_sha,
+            **engine_manifest,
+        }
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.canonical_runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                payload_root,
+            ):
+                active_manifest = runtime.install(app_dir, release)
+                payload = payload_root / source_sha
+                validator_relative = "platform/tools/platform_validate_release_artifact.py"
+                payload_validator = payload / validator_relative
+                trusted_validator = trusted / "platform_validate_release_artifact.py"
+
+                # Model the pre-M7 generation: its provider and all existing
+                # payload bindings are valid, but it predates this new
+                # validator member and trusted-root sibling.
+                os.chmod(payload, 0o700)
+                os.chmod(payload / "platform/tools", 0o700)
+                payload_validator.unlink()
+                trusted_validator.unlink()
+                provider_path = payload / "runtime-provider.json"
+                provider_path.write_text(
+                    json.dumps(provider, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                os.chown(provider_path, 0, 0)
+                os.chmod(provider_path, 0o444)
+                for directory in sorted(
+                    (entry for entry in payload.rglob("*") if entry.is_dir()),
+                    key=lambda entry: len(entry.parts),
+                    reverse=True,
+                ):
+                    os.chown(directory, 0, 0)
+                    os.chmod(directory, 0o555)
+                os.chown(payload, 0, 0)
+                os.chmod(payload, 0o555)
+
+                def write_active_manifest() -> dict[str, object]:
+                    tree_sha, file_map = runtime._tree_digest(payload)
+                    updated = {
+                        **active_manifest,
+                        "payload_tree_sha256": tree_sha,
+                        "files": file_map,
+                    }
+                    runtime._write_manifest(trusted / "active-manifest.json", updated)
+                    return updated
+
+                legacy_manifest = write_active_manifest()
+                with (
+                    mock.patch.object(
+                        runtime, "_validate_runtime_source", return_value=engine_manifest
+                    ),
+                    mock.patch.object(runtime, "_validate_engine_root"),
+                    self.assertRaises(runtime.InstallerError),
+                ):
+                    # Candidate activation/verification stays strict; only
+                    # prior-provider reuse opts into the M6-compatible read.
+                    runtime._validate_payload(
+                        legacy_manifest,
+                        app_dir=app_dir,
+                        validate_provider=False,
+                    )
+
+                with (
+                    mock.patch.object(
+                        runtime, "_validate_runtime_source", return_value=engine_manifest
+                    ),
+                    mock.patch.object(runtime, "_validate_engine_root"),
+                ):
+                    reused = runtime._runtime_provider_payload(
+                        app_dir,
+                        expected_manifest=engine_manifest,
+                    )
+                self.assertEqual(reused, provider)
+
+                # A one-sided validator installation is not legacy state and
+                # must fail rather than being silently accepted.
+                trusted_validator.write_bytes(
+                    (release / "tools/platform_validate_release_artifact.py").read_bytes()
+                )
+                os.chown(trusted_validator, 0, 0)
+                os.chmod(trusted_validator, 0o555)
+                with (
+                    mock.patch.object(
+                        runtime, "_validate_runtime_source", return_value=engine_manifest
+                    ),
+                    mock.patch.object(runtime, "_validate_engine_root"),
+                    self.assertRaises(runtime.InstallerError),
+                ):
+                    runtime._runtime_provider_payload(
+                        app_dir,
+                        expected_manifest=engine_manifest,
+                    )
+                trusted_validator.unlink()
+
+                # Changing the old provider identity remains rejected even
+                # when its manifest tree digest is recomputed consistently.
+                os.chmod(payload, 0o700)
+                provider_path.chmod(0o644)
+                provider_path.write_text(
+                    json.dumps(
+                        {**provider, "engine_tree_sha256": "a" * 64},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="ascii",
+                )
+                os.chmod(provider_path, 0o444)
+                os.chmod(payload, 0o555)
+                write_active_manifest()
+                with (
+                    mock.patch.object(
+                        runtime, "_validate_runtime_source", return_value=engine_manifest
+                    ),
+                    mock.patch.object(runtime, "_validate_engine_root"),
+                    self.assertRaises(runtime.InstallerError),
+                ):
+                    runtime._runtime_provider_payload(
+                        app_dir,
+                        expected_manifest=engine_manifest,
+                    )
+
     def test_install_rejects_tampered_staged_validator_before_activation(self) -> None:
         source_sha = "c" * 40
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
