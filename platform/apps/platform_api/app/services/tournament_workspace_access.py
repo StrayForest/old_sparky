@@ -329,18 +329,34 @@ async def ensure_workspace_private_membership(
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
-    """Defer only the workspace's duplicate membership read to its base query.
+    """Defer eligible membership reads to the workspace's authoritative query.
 
-    The workspace preflight already reads the tournament and viewer's
-    participant row. Requests with invite input, conditional headers, anonymous
-    callers, and administrators retain the original dependency and ordering.
+    Ordinary authenticated workspace reads are checked by the base preflight.
+    A narrowly-shaped conditional detail refresh is checked by its conditional
+    preflight before ETag evaluation. All other conditional, invite, anonymous
+    and administrator requests retain the original dependency ordering.
     """
+
+    query = request.query_params
+    conditional_headers = request.headers.getlist("if-none-match")
+    conditional_workspace_candidate = bool(
+        len(conditional_headers) == 1
+        and conditional_headers[0].strip()
+        and query.getlist("workspace_view") == ["detail"]
+        and query.getlist("participants_limit") == ["0"]
+        and query.getlist("participants_offset") in ([], ["0"])
+        and query.getlist("include_current_user") == ["false"]
+        and "invite_code" not in query
+    )
 
     if (
         auth_session is not None
         and not auth_session_has_admin_role(auth_session)
         and "invite_code" not in request.query_params
-        and "if-none-match" not in request.headers
+        and (
+            "if-none-match" not in request.headers
+            or conditional_workspace_candidate
+        )
     ):
         request.state.workspace_membership_preflight_pending = True
         return

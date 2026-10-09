@@ -442,6 +442,33 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
             ("ssr-request", "ssr-ray"),
         )
 
+    def test_diagnostic_ssr_identity_requires_matching_validated_run(self) -> None:
+        scope = {
+            "headers": [
+                (b"x-request-id", b"proxy-request"),
+                (b"cf-ray", b"proxy-ray"),
+                (b"x-platform-ssr-trace", b"a" * 32),
+                (b"x-platform-ssr-request-id", b"ssr-request"),
+                (b"x-platform-ssr-cf-ray", b"ssr-ray"),
+            ]
+        }
+        self.assertEqual(
+            performance._request_identity_from_scope(scope),
+            ("proxy-request", "proxy-ray"),
+        )
+        self.assertEqual(
+            performance._request_identity_from_scope(
+                scope, diagnostic_run_id="a" * 32
+            ),
+            ("ssr-request", "ssr-ray"),
+        )
+        self.assertEqual(
+            performance._request_identity_from_scope(
+                scope, diagnostic_run_id="b" * 32
+            ),
+            ("proxy-request", "proxy-ray"),
+        )
+
     def test_non_sampled_identity_keeps_proxy_headers(self) -> None:
         scope = {
             "headers": [

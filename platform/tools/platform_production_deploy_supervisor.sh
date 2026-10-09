@@ -282,6 +282,7 @@ for host_helper in \
   platform_workflow_input_guard.py \
   platform_prepare_artifact_dir.py \
   platform_retained_load_export_executor.py \
+  platform_cpu_diagnostic_plan.py \
   platform_production_deploy_supervisor.sh \
   platform_release_lock.sh \
   platform_release_preflight.sh \
@@ -324,6 +325,7 @@ expected_files = {
     "platform_workflow_input_guard.py",
     "platform_prepare_artifact_dir.py",
     "platform_retained_load_export_executor.py",
+    "platform_cpu_diagnostic_plan.py",
     "platform_production_deploy_supervisor.sh",
     "platform_release_lock.sh",
     "platform_release_preflight.sh",

@@ -240,6 +240,12 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
                 ):
                     conditional_denial = await member["client"].get(
                         f"/api/v1/tournaments/{slug}/workspace",
+                        params={
+                            "workspace_view": "detail",
+                            "participants_limit": 0,
+                            "participants_offset": 0,
+                            "include_current_user": "false",
+                        },
                         headers={"If-None-Match": conditional_value},
                     )
                     self.assertEqual(

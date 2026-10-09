@@ -500,27 +500,154 @@ jobs:
               raw = b""
           bounded = raw[:262144]
           lines = bounded.splitlines()[:1000]
-          text = b"\n".join(lines).decode("utf-8", errors="replace").casefold()
-          passed = exit_code == 0 and (
-              "live_user_qa_success" in text
-              or '"status": "passed"' in text
-              or '"success": true' in text
-              or '"passed": true' in text
+          output_truncated = (
+              len(raw) > len(bounded) or len(bounded.splitlines()) > len(lines)
           )
+          diagnostic_pattern = re.compile(
+              rb"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind="
+              rb"(none|playwright_cli_usage|node_module_missing|browser_executable_missing|"
+              rb"browser_launch_error|child_timeout|cleanup_failure|unclassified) "
+              rb"stdout_bytes=([0-9]{1,16}) stderr_bytes=([0-9]{1,16}) "
+              rb"truncated=(true|false) child_exit=([0-9]{1,3})"
+          )
+          diagnostic_lines = [line for line in lines if line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC ")]
+          child_diagnostic = None
+          if len(diagnostic_lines) == 1:
+              match = diagnostic_pattern.fullmatch(diagnostic_lines[0])
+              if match is not None and int(match.group(5)) == exit_code:
+                  child_diagnostic = {
+                      "kind": match.group(1).decode("ascii"),
+                      "stdout_bytes": int(match.group(2)),
+                      "stderr_bytes": int(match.group(3)),
+                      "truncated": match.group(4) == b"true",
+                      "child_exit_code": int(match.group(5)),
+                  }
+          diagnostic_valid = (
+              (not diagnostic_lines and exit_code != 0)
+              or (len(diagnostic_lines) == 1 and child_diagnostic is not None)
+          )
+
+          count_fields = (
+              "logical_total", "logical_pass", "logical_fail", "logical_expected_fail",
+              "logical_flaky", "logical_skip", "logical_interrupted", "attempt_total",
+              "attempt_pass", "attempt_fail", "attempt_skip", "attempt_interrupted",
+              "attempt_timedout",
+          )
+          count_pattern = re.compile(
+              rb"LIVE_BROWSER_COUNTS schema=1 run_status=(passed|failed|timedout|interrupted) "
+              + b" ".join(
+                  rf"{field}=(0|[1-9][0-9]{{0,4}})".encode("ascii")
+                  for field in count_fields
+              )
+              + rb" source_sha=([0-9a-f]{40}) app_sha=([0-9a-f]{40}) "
+              rb"marker_sha256=([0-9a-f]{64})"
+          )
+          count_lines = [line for line in lines if line.startswith(b"LIVE_BROWSER_COUNTS ")]
+          browser_counts = None
+          if len(count_lines) == 1:
+              match = count_pattern.fullmatch(count_lines[0])
+              if match is not None:
+                  values = [int(match.group(index)) for index in range(2, 15)]
+                  candidate = dict(zip(count_fields, values, strict=True))
+                  logical_partition = sum(candidate[name] for name in (
+                      "logical_pass", "logical_fail", "logical_expected_fail",
+                      "logical_flaky", "logical_skip", "logical_interrupted",
+                  ))
+                  attempt_partition = sum(candidate[name] for name in (
+                      "attempt_pass", "attempt_fail", "attempt_skip",
+                      "attempt_interrupted", "attempt_timedout",
+                  ))
+                  if (
+                      match.group(15).decode("ascii") == runner_sha
+                      and match.group(16).decode("ascii") == app_sha
+                      and all(value <= 32768 for value in candidate.values())
+                      and logical_partition == candidate["logical_total"]
+                      and attempt_partition == candidate["attempt_total"]
+                      and candidate["logical_total"] <= 4096
+                  ):
+                      browser_counts = {
+                          "run_status": match.group(1).decode("ascii"),
+                          **candidate,
+                          "source_sha": match.group(15).decode("ascii"),
+                          "app_sha": match.group(16).decode("ascii"),
+                          "marker_sha256": match.group(17).decode("ascii"),
+                      }
+          coverage_status = (
+              "complete" if browser_counts is not None
+              else "invalid" if count_lines
+              else "unavailable"
+          )
+          logical_executed = None
+          failed_test_count = None
+          if browser_counts is not None:
+              logical_executed = sum(browser_counts[name] for name in (
+                  "logical_pass", "logical_fail", "logical_expected_fail",
+                  "logical_flaky", "logical_interrupted",
+              ))
+              failed_test_count = sum(browser_counts[name] for name in (
+                  "logical_fail", "logical_expected_fail", "logical_flaky", "logical_interrupted",
+              ))
+          success_markers = [line for line in lines if line == b"LIVE_USER_QA_SUCCESS"]
+          passed = (
+              exit_code == 0
+              and not output_truncated
+              and diagnostic_valid
+              and child_diagnostic["kind"] == "none"
+              and len(success_markers) == 1
+              and browser_counts is not None
+              and logical_executed == 1
+              and browser_counts["logical_total"] == 1
+              and browser_counts["logical_pass"] == 1
+              and browser_counts["attempt_total"] == 1
+              and browser_counts["attempt_pass"] == 1
+              and browser_counts["run_status"] == "passed"
+              and browser_counts["logical_fail"] == 0
+              and browser_counts["logical_expected_fail"] == 0
+              and browser_counts["logical_flaky"] == 0
+              and browser_counts["logical_skip"] == 0
+              and browser_counts["logical_interrupted"] == 0
+              and browser_counts["attempt_fail"] == 0
+              and browser_counts["attempt_interrupted"] == 0
+              and browser_counts["attempt_timedout"] == 0
+          )
+          if not diagnostic_valid or (count_lines and browser_counts is None):
+              status = "error"
+          elif passed:
+              status = "passed"
+          elif exit_code != 0 or browser_counts is not None:
+              status = "failed"
+          else:
+              status = "unavailable"
           report = {
               "schema": 1,
               "source_git_sha": runner_sha,
               "app_target_sha": app_sha,
               "source_binding_sha256": binding_digest or None,
-              "status": "passed" if passed else ("failed" if exit_code else "unavailable"),
+              "status": status,
               "success": passed,
               "process_exit_code": exit_code if 0 <= exit_code <= 255 else 1,
               "line_count": len(lines),
               "retained_line_count": len(lines),
-              "truncated": len(raw) > len(bounded) or len(bounded.splitlines()) > len(lines),
-              "test_count": 1 if lines else 0,
-              "failed_test_count": 0 if passed else (1 if lines or exit_code else 0),
-              "error_class_counts": {} if passed else {"transport" if exit_code else "other": 1},
+              "truncated": output_truncated,
+              "coverage_status": coverage_status,
+              "test_count": logical_executed,
+              "logical_total": browser_counts["logical_total"] if browser_counts else None,
+              "logical_skip_count": browser_counts["logical_skip"] if browser_counts else None,
+              "logical_expected_fail_count": browser_counts["logical_expected_fail"] if browser_counts else None,
+              "failed_test_count": failed_test_count,
+              "browser_counts": browser_counts,
+              "error_class_counts": {} if passed else (
+                  {"browser_child_" + child_diagnostic["kind"]: 1}
+                  if child_diagnostic is not None and child_diagnostic["kind"] != "none"
+                  else {"playwright_logical_failures": failed_test_count}
+                  if failed_test_count
+                  else {"playwright_skipped_cases": browser_counts["logical_skip"]}
+                  if browser_counts is not None and browser_counts["logical_skip"] > 0
+                  else {"playwright_no_executed_tests": 1}
+                  if browser_counts is not None and logical_executed == 0
+                  else {"unclassified_child_or_dispatch_failure": 1}
+              ),
+              "child_diagnostic": child_diagnostic,
           }
           destination.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
           raise SystemExit(0)
@@ -593,7 +720,7 @@ jobs:
           if (
               not isinstance(report, dict)
               or report.get("truncated") is not False
-              or report.get("status") in {"truncated", "error", "unavailable"}
+              or report.get("status") != "passed"
               or report.get("source_git_sha") != runner_sha
               or report.get("app_target_sha") != app_sha
               or report.get("source_binding_sha256") != (binding_digest or None)
@@ -603,6 +730,50 @@ jobs:
               or (app_sha != runner_sha and re.fullmatch(r"[0-9a-f]{64}", binding_digest) is None)
           ):
               raise SystemExit("required live-user QA report is incomplete")
+          if report.get("status") == "passed":
+              counts = report.get("browser_counts")
+              executed = None
+              if isinstance(counts, dict):
+                  required_counts = (
+                      "logical_pass", "logical_fail", "logical_expected_fail",
+                      "logical_flaky", "logical_interrupted",
+                  )
+                  if all(type(counts.get(name)) is int for name in required_counts):
+                      executed = sum(counts[name] for name in required_counts)
+              if (
+                  report.get("coverage_status") != "complete"
+                  or not isinstance(counts, dict)
+                  or report.get("process_exit_code") != 0
+                  or not isinstance(report.get("child_diagnostic"), dict)
+                  or report["child_diagnostic"].get("kind") != "none"
+                  or report["child_diagnostic"].get("child_exit_code") != 0
+                  or counts.get("run_status") != "passed"
+                  or report.get("success") is not True
+                  or not isinstance(report.get("test_count"), int)
+                  or isinstance(report.get("test_count"), bool)
+                  or report.get("test_count", 0) <= 0
+                  or report.get("test_count") != 1
+                  or executed != report.get("test_count")
+                  or counts.get("source_sha") != runner_sha
+                  or counts.get("app_sha") != app_sha
+                  or re.fullmatch(r"[0-9a-f]{64}", counts.get("marker_sha256", "")) is None
+                  or counts.get("logical_total") != report.get("logical_total")
+                  or counts.get("logical_skip") != report.get("logical_skip_count")
+                  or counts.get("logical_expected_fail") != report.get("logical_expected_fail_count")
+                  or counts.get("logical_fail") != 0
+                  or counts.get("logical_total") != 1
+                  or counts.get("logical_pass") != 1
+                  or counts.get("logical_expected_fail") != 0
+                  or counts.get("logical_flaky") != 0
+                  or counts.get("logical_skip") != 0
+                  or counts.get("logical_interrupted") != 0
+                  or counts.get("attempt_fail") != 0
+                  or counts.get("attempt_total") != 1
+                  or counts.get("attempt_pass") != 1
+                  or counts.get("attempt_interrupted") != 0
+                  or counts.get("attempt_timedout") != 0
+              ):
+                  raise SystemExit("passed live-user QA report lacks complete Playwright coverage")
           PY
 
       - name: QA summary
@@ -623,7 +794,8 @@ jobs:
 
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           print(f"- Status: **{payload.get('status')}**")
-          print(f"- Tests observed: {payload.get('test_count', 0)}; failed: {payload.get('failed_test_count', 0)}")
+          print(f"- Coverage: {payload.get('coverage_status', 'unavailable')}")
+          print(f"- Logical tests observed: {payload.get('test_count')}; total: {payload.get('logical_total')}; skipped: {payload.get('logical_skip_count')}; failed: {payload.get('failed_test_count')}")
           print(f"- Error classes: `{payload.get('error_class_counts', {})}`")
           PY
             else
@@ -632,7 +804,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload live-user QA report
-        if: ${{ !cancelled() && steps.cleanup_ssh.outcome == 'success' && steps.sanitize_live_user_report.outcome == 'success' && steps.validate_live_user_report.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.cleanup_ssh.outcome == 'success' && steps.sanitize_live_user_report.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: platform-live-user-qa-${{ github.run_id }}-${{ github.run_attempt }}

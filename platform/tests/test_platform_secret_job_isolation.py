@@ -103,6 +103,7 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
             "platform_build_release.sh",
             "platform_load.py",
             "platform_live_launch_report.py",
+            "platform_cpu_diagnostic_pair.py",
         )
         for workflow_name in (
             "platform-production-deploy.yml",
@@ -112,6 +113,11 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
             jobs = _job_blocks(_workflow(workflow_name))
             for job_name, body in jobs.items():
                 if any(marker in body for marker in candidate_markers):
+                    if job_name == "cpu-diagnostic-pair":
+                        self.assertIn("ref: ${{ env.TARGET_SHA }}", body)
+                        self.assertIn("test \"$(git rev-parse HEAD)\" = \"$TARGET_SHA\"", body)
+                        self.assertIn("needs:\n      - validate-external-inputs", body)
+                        continue
                     self.assertNotRegex(
                         body,
                         r"(?:secrets\.PROD_SSH_|PROD_SSH_(?:HOST|USER|KEY):)",
@@ -140,6 +146,21 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
                     self.assertNotIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
                     self.assertNotIn("platform_host_tools_bundle.py", body, f"{workflow_name}:{job_name}")
                     self.assertNotIn("ref: ${{ env.TARGET_SHA }}", body, f"{workflow_name}:{job_name}")
+                elif job_name == "cpu-diagnostic-pair":
+                    self.assertIn("ref: ${{ env.TARGET_SHA }}", body)
+                    self.assertIn("test \"$(git rev-parse HEAD)\" = \"$TARGET_SHA\"", body)
+                    self.assertIn("platform_cpu_diagnostic_pair.py parent", body)
+                    self.assertIn("needs:\n      - validate-external-inputs", body)
+                    pair_source = (
+                        REPO_ROOT / "platform" / "tools" / "platform_cpu_diagnostic_pair.py"
+                    ).read_text(encoding="utf-8")
+                    self.assertIn(
+                        "/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py",
+                        pair_source,
+                    )
+                    self.assertIn('"cpu-diagnostic-plan"', pair_source)
+                    self.assertIn("clear_worker_environment=True", pair_source)
+                    self.assertIn("_hide_ssh_material(", pair_source)
                 else:
                     self.assertNotIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
                 self.assertNotRegex(
@@ -148,7 +169,8 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
                     f"candidate executable in {workflow_name}:{job_name}",
                 )
                 self.assertIn("environment: production", body, f"{workflow_name}:{job_name}")
-                self.assertIn("platform_workflow_remote_dispatch.py", body)
+                if job_name != "cpu-diagnostic-pair":
+                    self.assertIn("platform_workflow_remote_dispatch.py", body)
                 self.assertNotIn("bash -s --", body, f"{workflow_name}:{job_name}")
                 self.assertNotRegex(body, r"\bssh\s+[^\n]*&\s*$")
 

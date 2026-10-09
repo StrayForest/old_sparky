@@ -92,14 +92,14 @@ to `dev`. The chain is:
    `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` generation. It
    requires the configured SSH identity to be root and checks the generation's
    owner, mode, link count, type, capabilities and every digest with fixed
-   absolute tools. The currently installed C4 generation and pending C5 pin
-   candidate retain the same capability contract:
-   `dispatcher=3`, `supervisor=3`, `release_baseline=1` and
-   `python_bytecode_disabled=1`; every immutable dispatcher call uses
-   `/usr/bin/python3.12 -I -B`. A missing or mismatched generation fails before
-   app build/attestation, pending status or transfer. Host bundle/source bind to
-   `HOST_TOOLS_SHA`; app artifact, provenance, migration and receipt bind to
-   `TARGET_SHA`. API artifact ID/name/run/source/digest and downloaded size
+   absolute tools. The 15-member, four-component candidate adds
+   `cpu_diagnostic_plan_control=1`; its contract is in the [host-tools ADR](adr/production-host-tools-provisioning.md).
+   The closure remains inactive until pinning and deployment; dispatchers use
+   `/usr/bin/python3.12 -I -B`.
+   A missing or mismatched generation fails before app build/attestation,
+   pending status or transfer.
+   Host bundle/source bind to `HOST_TOOLS_SHA`; app artifact, provenance,
+   migration and receipt bind to `TARGET_SHA`. API artifact ID/name/run/source/digest and downloaded size
    are cross-checked by bounded canonical verification. Because a nested
    `workflow_run.run_attempt` may be absent, the secret-free builder resolves
    the exact attempt through GitHub's authoritative attempt endpoint.

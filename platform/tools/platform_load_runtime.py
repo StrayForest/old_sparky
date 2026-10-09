@@ -1386,6 +1386,9 @@ def run_supervised(
     term_grace_seconds: float = DEFAULT_TERM_GRACE_SECONDS,
     poll_seconds: float = DEFAULT_POLL_SECONDS,
     env: Mapping[str, str] | None = None,
+    worker_stdin_payload: bytes | None = None,
+    worker_stdin_payload_max_bytes: int = 0,
+    clear_worker_environment: bool = False,
 ) -> SupervisorResult:
     """Run one worker in a mandatory, killable PID namespace.
 
@@ -1413,6 +1416,17 @@ def run_supervised(
         raise ValueError("worker report must be distinct from final report")
     if any(not isinstance(value, str) or not value for value in worker_command):
         raise ValueError("worker_command entries must be non-empty strings")
+    if worker_stdin_payload is None:
+        if worker_stdin_payload_max_bytes != 0:
+            raise ValueError("worker stdin cap requires a payload")
+    elif (
+        not isinstance(worker_stdin_payload, bytes)
+        or not 0 < worker_stdin_payload_max_bytes <= 32 * 1024
+        or len(worker_stdin_payload) > worker_stdin_payload_max_bytes
+    ):
+        raise ValueError("bounded worker stdin payload is invalid")
+    if type(clear_worker_environment) is not bool:
+        raise ValueError("worker environment mode is invalid")
     if not Path(str(worker_command[0])).is_absolute():
         raise ValueError("worker interpreter must be an absolute path")
 
@@ -1607,7 +1621,16 @@ def run_supervised(
 
     try:
         previous_subreaper = _set_child_subreaper()
-        child_env = os.environ.copy()
+        child_env = (
+            {
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "TZ": "UTC",
+            }
+            if clear_worker_environment
+            else os.environ.copy()
+        )
         if env is not None:
             child_env.update({str(key): str(value) for key, value in env.items()})
         child_env["PLATFORM_LOAD_WORKER_CONFIG"] = str(config_path)
@@ -1704,7 +1727,10 @@ def run_supervised(
                     "external supervisor signal during namespace start"
                 )
             process.stdin.write(NAMESPACE_ACK)
+            if worker_stdin_payload is not None:
+                process.stdin.write(worker_stdin_payload)
             process.stdin.flush()
+            process.stdin.close()
             if primary_deadline_reason(effective=True) is not None:
                 raise NamespaceIntegrityError("namespace handshake exceeded wall deadline")
         except (AttributeError, OSError, NamespaceIntegrityError) as exc:

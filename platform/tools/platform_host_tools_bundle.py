@@ -22,7 +22,7 @@ import zipfile
 
 
 SCHEMA = 1
-TOOLSET_VERSION = "production-host-tools-v3"
+TOOLSET_VERSION = "production-host-tools-v4"
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024
@@ -57,17 +57,49 @@ PRODUCTION_DEPLOY_CONTROL_FILES = (
 RETAINED_LOAD_ARTIFACT_FILES = (
     "platform_retained_load_export_executor.py",
 )
+CPU_DIAGNOSTIC_CONTROL_FILES = ("platform_cpu_diagnostic_plan.py",)
+# The installed legacy generation remains a fixed 14-file, three-component
+# contract.  The current diagnostic generation extends that exact tuple by
+# one fixed member; neither supported layout is derived from the active tuple.
+LEGACY_HOST_TOOL_FILES = (
+    PREPARE_ARTIFACT_FILES
+    + PRODUCTION_DEPLOY_CONTROL_FILES
+    + RETAINED_LOAD_ARTIFACT_FILES
+)
+CPU_DIAGNOSTIC_HOST_TOOL_FILES = (
+    LEGACY_HOST_TOOL_FILES + CPU_DIAGNOSTIC_CONTROL_FILES
+)
 HOST_TOOL_FILES = (
     PREPARE_ARTIFACT_FILES
     + PRODUCTION_DEPLOY_CONTROL_FILES
     + RETAINED_LOAD_ARTIFACT_FILES
+    + CPU_DIAGNOSTIC_CONTROL_FILES
 )
 COMPONENT_FILES = {
     "prepare_artifact": PREPARE_ARTIFACT_FILES,
     "production_deploy_control": PRODUCTION_DEPLOY_CONTROL_FILES,
     "retained_load_artifact_cleanup": RETAINED_LOAD_ARTIFACT_FILES,
+    "cpu_diagnostic_control": CPU_DIAGNOSTIC_CONTROL_FILES,
 }
 CAPABILITIES = (
+    "artifact_prepare",
+    "input_guard",
+    "production_dispatcher",
+    "production_supervisor",
+    "production_deploy_control",
+    "release_baseline",
+    "retained_load_export_cleanup",
+    "retained_load_source_binding",
+    "cpu_diagnostic_plan_control",
+    "python_isolated",
+    "python_bytecode_disabled",
+)
+LEGACY_COMPONENT_FILES = {
+    "prepare_artifact": PREPARE_ARTIFACT_FILES,
+    "production_deploy_control": PRODUCTION_DEPLOY_CONTROL_FILES,
+    "retained_load_artifact_cleanup": RETAINED_LOAD_ARTIFACT_FILES,
+}
+LEGACY_CAPABILITIES = (
     "artifact_prepare",
     "input_guard",
     "production_dispatcher",
@@ -79,24 +111,20 @@ CAPABILITIES = (
     "python_isolated",
     "python_bytecode_disabled",
 )
-CPU_DIAGNOSTIC_CONTROL_FILES = ("platform_cpu_diagnostic_plan.py",)
-LEGACY_HOST_TOOL_FILES = HOST_TOOL_FILES
-CPU_DIAGNOSTIC_HOST_TOOL_FILES = HOST_TOOL_FILES + CPU_DIAGNOSTIC_CONTROL_FILES
-LEGACY_COMPONENT_FILES = {
-    component: tuple(names) for component, names in COMPONENT_FILES.items()
-}
 CPU_DIAGNOSTIC_COMPONENT_FILES = {
-    **LEGACY_COMPONENT_FILES,
+    "prepare_artifact": PREPARE_ARTIFACT_FILES,
+    "production_deploy_control": PRODUCTION_DEPLOY_CONTROL_FILES,
+    "retained_load_artifact_cleanup": RETAINED_LOAD_ARTIFACT_FILES,
     "cpu_diagnostic_control": CPU_DIAGNOSTIC_CONTROL_FILES,
 }
-CPU_DIAGNOSTIC_CAPABILITIES = CAPABILITIES + ("cpu_diagnostic_plan_control",)
+CPU_DIAGNOSTIC_CAPABILITIES = CAPABILITIES
 SUPPORTED_HOST_TOOL_FILES = frozenset(CPU_DIAGNOSTIC_HOST_TOOL_FILES)
 SUPPORTED_LAYOUTS = (
     {
         "files": LEGACY_HOST_TOOL_FILES,
         "components": LEGACY_COMPONENT_FILES,
-        "capabilities": CAPABILITIES,
-        "toolset_version": TOOLSET_VERSION,
+        "capabilities": LEGACY_CAPABILITIES,
+        "toolset_version": "production-host-tools-v3",
     },
     {
         "files": CPU_DIAGNOSTIC_HOST_TOOL_FILES,

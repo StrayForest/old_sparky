@@ -436,6 +436,18 @@ authority.
 
 ## Intentional host-tools bump lifecycle
 
+The performance follow-up candidate extends the previous 14-member host
+closure with the fixed CPU diagnostic plan controller, producing a
+15-member, four-component bundle. The new `cpu_diagnostic_control` component
+contains only `platform_cpu_diagnostic_plan.py`; the installed immutable
+dispatcher may invoke it only as its exact trusted sibling through the closed
+`cpu-diagnostic-plan` stdin action. The capability contract adds
+`cpu_diagnostic_plan_control=1` and advances the dispatcher schema to 4. This
+candidate is not authorized by an earlier pin: the normal C/P sequence must
+record all 15 source paths, modes and digests, pass exact-SHA CI, and provision
+and attest the new generation before the action can be used. The 14-member
+counts below are historical records for their respective prior generations.
+
 Changes to any member of the host-control closure, its closure declaration or
 the bundle helper must be handled as a reviewed **C → P** source sequence,
 never by pinning the commit that carries the pin itself:

@@ -113,6 +113,29 @@ EXTERNAL_HELPER = ACTIVE_TOOLS_DIR / "platform_production_external_fixture_qa.sh
 CLEANUP_HELPER = ACTIVE_TOOLS_DIR / "platform_production_retained_load_cleanup_qa.sh"
 LIVE_HELPER = ACTIVE_TOOLS_DIR / "platform_live_launch_supervisor.sh"
 LIVE_USER_QA_HELPER = ACTIVE_TOOLS_DIR / "platform_live_user_qa_dispatch.py"
+CPU_DIAGNOSTIC_PLAN_HELPER = ACTIVE_TOOLS_DIR / "platform_cpu_diagnostic_plan.py"
+CPU_DIAGNOSTIC_OUTPUT_CAP = 8192
+CPU_USAGE_ROW_FIELDS = {
+    "service", "phase", "expected_targets", "observed_targets", "event_count",
+    "cpu_ns", "window_ms_min", "window_ms_max", "start_lag_ms_min",
+    "start_lag_ms_max", "end_lag_ms_min", "end_lag_ms_max", "duplicate_count",
+    "timing_complete",
+}
+CPU_PROFILE_ROW_FIELDS = {
+    "service", "expected_targets", "observed_targets", "event_count", "timer",
+    "observation_unit", "total_cpu_us", "sample_count", "start_lag_ms_min",
+    "start_lag_ms_max", "elapsed_ms_min", "elapsed_ms_max", "end_lag_ms_min",
+    "end_lag_ms_max", "categories",
+}
+CPU_PROFILE_CATEGORY_FIELDS = {"category", "cpu_us", "observations"}
+CPU_PROFILE_CATEGORIES = {
+    "repo.get_tournament_workspace", "repo.get_tournament_workspace_by_slug",
+    "repo.workspace_conditional_preflight", "repo.get_current_user",
+    "repo.get_current_user_optional", "repo.get_server_request_correlation_headers",
+    "repo.run_with_ssr_trace", "repo.workspace_api_fetch", "repo.workspace_page",
+    "orm_result", "db_driver", "async_event_loop", "serialization_validation",
+    "crypto", "web_framework", "http_client", "other",
+}
 TRUSTED_LIVE_ROOT = Path("/root/.oldsparky/liveqa")
 TRUSTED_LIVE_LAUNCH = TRUSTED_LIVE_ROOT / "platform_live_launch_trusted.sh"
 DEPLOY_HELPER = ACTIVE_TOOLS_DIR / "platform_production_deploy_supervisor.sh"
@@ -140,6 +163,14 @@ CHILD_TERMINATION_GRACE_SECONDS = 5.0
 LIVE_LAUNCH_STATUS_MAX_BYTES = 256
 LIVE_LAUNCH_STREAM_MAX_BYTES = 4096
 LIVE_LAUNCH_PROTOCOL_MAX_BYTES = 1024
+LIVE_QA_DIAGNOSTIC_LINE_MAX_BYTES = 512
+LIVE_QA_DIAGNOSTIC_RE = re.compile(
+    rb"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(?P<kind>none|playwright_cli_usage|"
+    rb"node_module_missing|browser_executable_missing|browser_launch_error|"
+    rb"child_timeout|cleanup_failure|unclassified) stdout_bytes=(?P<stdout_bytes>[0-9]{1,16}) "
+    rb"stderr_bytes=(?P<stderr_bytes>[0-9]{1,16}) "
+    rb"truncated=(?P<truncated>true|false) child_exit=(?P<child_exit>[0-9]{1,3})\n"
+)
 LIVE_LAUNCH_CHECK_IDS = frozenset(
     {
         "none",
@@ -176,6 +207,7 @@ LIVE_LAUNCH_CHECK_IDS = frozenset(
     }
 )
 LIVE_BROWSER_COUNTS_MAX_BYTES = 768
+LIVE_USER_QA_MARKER_MAX_BYTES = LIVE_BROWSER_COUNTS_MAX_BYTES
 LIVE_BROWSER_COUNT_FIELDS = (
     "logical_total",
     "logical_pass",
@@ -321,6 +353,7 @@ HOST_TOOL_FILES = (
     "platform_update_cloudflare_ips.py",
     "platform_configure_shared_env.py",
     "platform_storage_evidence_summary.py",
+    "platform_cpu_diagnostic_plan.py",
 )
 HOST_TOOLS_INVENTORY = frozenset((*HOST_TOOL_FILES, "manifest.json", "capabilities.txt"))
 HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -608,6 +641,462 @@ def _run_sudo(
         timeout_seconds=timeout_seconds,
         expected_release_marker=expected_release_marker,
     )
+
+
+def _run_cpu_diagnostic_plan(payload: dict[str, Any]) -> int:
+    """Cross the pinned root boundary for one fixed, bounded plan operation."""
+
+    if not _trusted_helper(CPU_DIAGNOSTIC_PLAN_HELPER):
+        return 2
+    operation = payload.get("operation")
+    if operation == "prepare":
+        helper_command = "prepare-stdin"
+        expected_keys = {"status", "api_target_count", "web_target_count", "release_slug"}
+        helper_payload = {key: value for key, value in payload.items() if key != "operation"}
+    elif operation == "cleanup":
+        helper_command = "cleanup-stdin"
+        expected_keys = {
+            "status", "service_count", "usage_status", "usage_reason", "usage_rows",
+            "profile_status", "profile_reason", "profile_rows",
+        }
+        helper_payload = {"schema": payload["schema"], "run_id": payload["run_id"]}
+    else:
+        return 2
+    helper_payload = {"schema": helper_payload["schema"], **helper_payload}
+    child_input = json.dumps(
+        helper_payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("ascii") + b"\n"
+    if len(child_input) > 4096:
+        return 2
+    try:
+        process = subprocess.Popen(  # nosec B603
+            [SUDO, "-n", "--", str(CPU_DIAGNOSTIC_PLAN_HELPER), helper_command],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            umask=0o077,
+        )
+    except OSError:
+        return 2
+    assert process.stdin is not None and process.stdout is not None
+    try:
+        process.stdin.write(child_input)
+        process.stdin.flush()
+        process.stdin.close()
+        deadline = time.monotonic() + 30
+        output = bytearray()
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        selector = selectors.DefaultSelector()
+        selector.register(descriptor, selectors.EVENT_READ)
+        eof = False
+        while process.poll() is None or not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process_group(process)
+                return 124
+            for key, _mask in selector.select(min(remaining, 0.1)):
+                try:
+                    chunk = os.read(key.fd, CPU_DIAGNOSTIC_OUTPUT_CAP + 1 - len(output))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    eof = True
+                    continue
+                output.extend(chunk)
+                if len(output) > CPU_DIAGNOSTIC_OUTPUT_CAP:
+                    _terminate_process_group(process)
+                    return 2
+        child_status = process.wait(timeout=0)
+        if child_status != 0 or not output.endswith(b"\n") or output.count(b"\n") != 1:
+            return 2
+        helper_prefix = b"CPU_DIAGNOSTIC_PLAN "
+        if not output.startswith(helper_prefix):
+            return 2
+        result = _strict_baseline_json(output[len(helper_prefix):-1])
+        if operation == "prepare":
+            if (
+                not isinstance(result, dict)
+                or set(result) != expected_keys
+                or result.get("status") != "prepared"
+                or result.get("api_target_count") != 2
+                or result.get("web_target_count") != 1
+                or not isinstance(result.get("release_slug"), str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", result["release_slug"]) is None
+            ):
+                return 2
+            target_count = 3
+            public_status = "prepared"
+            marker = (
+                f"CPU_DIAGNOSTIC_PLAN status=prepared targets={target_count} "
+                f"release_slug={result['release_slug']}"
+            )
+        else:
+            if (
+                not isinstance(result, dict)
+                or set(result) != expected_keys
+                or result.get("status") != "expired_plans_removed"
+                or type(result.get("service_count")) is not int
+                or result["service_count"] not in {0, 2}
+                or result.get("usage_status") not in {"complete", "incomplete", "unavailable"}
+                or result.get("usage_reason") not in {
+                    "none", "missing", "duplicate", "identity_changed", "journal_failed",
+                    "byte_cap", "line_cap", "timeout", "invalid_event", "timing_incomplete",
+                }
+                or not isinstance(result.get("usage_rows"), list)
+                or len(result["usage_rows"]) not in {0, 4}
+                or result.get("profile_status") not in {"complete", "incomplete", "unavailable"}
+                or result.get("profile_reason") not in {
+                    "none", "missing", "duplicate", "identity_changed", "journal_failed",
+                    "byte_cap", "line_cap", "timeout", "invalid_profile",
+                }
+                or not isinstance(result.get("profile_rows"), list)
+                or len(result["profile_rows"]) not in {0, 2}
+                or (len(result["usage_rows"]) == 0 and not (
+                    result["service_count"] == 0
+                    and result["usage_status"] == "unavailable"
+                    and result["usage_reason"] == "missing"
+                ))
+                or (len(result["usage_rows"]) == 4 and result["service_count"] != 2)
+                or (len(result["profile_rows"]) == 0 and not (
+                    result["service_count"] == 0
+                    and result["profile_status"] == "unavailable"
+                    and result["profile_reason"] == "missing"
+                ))
+                or (len(result["profile_rows"]) == 2 and result["service_count"] != 2)
+            ):
+                return 2
+            expected_rows = (
+                ("api", "off", 2), ("api", "on", 2),
+                ("web", "off", 1), ("web", "on", 1),
+            )
+            projected_rows: list[dict[str, Any]] = []
+            for row, (service, phase, expected_targets) in zip(result["usage_rows"], expected_rows):
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != CPU_USAGE_ROW_FIELDS
+                    or row.get("service") != service
+                    or row.get("phase") != phase
+                    or row.get("expected_targets") != expected_targets
+                    or type(row.get("observed_targets")) is not int
+                    or not 0 <= row["observed_targets"] <= expected_targets
+                    or type(row.get("event_count")) is not int
+                    or not 0 <= row["event_count"] <= 8
+                    or type(row.get("duplicate_count")) is not int
+                    or not 0 <= row["duplicate_count"] <= 8
+                    or type(row.get("timing_complete")) is not bool
+                ):
+                    return 2
+                for name in (
+                    "cpu_ns", "window_ms_min", "window_ms_max", "start_lag_ms_min",
+                    "start_lag_ms_max", "end_lag_ms_min", "end_lag_ms_max",
+                ):
+                    value = row.get(name)
+                    if value is not None and (type(value) is not int or abs(value) > 10**13):
+                        return 2
+                if row["cpu_ns"] is not None and row["cpu_ns"] < 0:
+                    return 2
+                projected_rows.append({key: row[key] for key in (
+                    "service", "phase", "expected_targets", "observed_targets", "event_count",
+                    "cpu_ns", "window_ms_min", "window_ms_max", "start_lag_ms_min",
+                    "start_lag_ms_max", "end_lag_ms_min", "end_lag_ms_max", "duplicate_count",
+                    "timing_complete",
+                )})
+            if result["usage_status"] == "complete" and (
+                result["usage_reason"] != "none"
+                or len(projected_rows) != 4
+                or any(
+                    row["observed_targets"] != row["expected_targets"]
+                    or row["event_count"] != row["expected_targets"]
+                    or row["duplicate_count"] != 0
+                    or row["cpu_ns"] is None
+                    or row["timing_complete"] is not True
+                    or type(row["window_ms_min"]) is not int
+                    or type(row["window_ms_max"]) is not int
+                    or not 19_750 <= row["window_ms_min"] <= row["window_ms_max"] <= 20_500
+                    or type(row["start_lag_ms_min"]) is not int
+                    or type(row["start_lag_ms_max"]) is not int
+                    or not 0 <= row["start_lag_ms_min"] <= row["start_lag_ms_max"] <= 250
+                    or type(row["end_lag_ms_min"]) is not int
+                    or type(row["end_lag_ms_max"]) is not int
+                    or not -250 <= row["end_lag_ms_min"] <= row["end_lag_ms_max"] <= 250
+                    for row in projected_rows
+                )
+            ):
+                return 2
+            expected_profiles = (("api", 2, "thread_cpu", "calls"), ("web", 1, "v8_cpu", "samples"))
+            projected_profiles: list[dict[str, Any]] = []
+            for row, (service, expected_targets, timer, observation_unit) in zip(
+                result["profile_rows"], expected_profiles
+            ):
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != CPU_PROFILE_ROW_FIELDS
+                    or row.get("service") != service
+                    or row.get("expected_targets") != expected_targets
+                    or type(row.get("observed_targets")) is not int
+                    or not 0 <= row["observed_targets"] <= expected_targets
+                    or type(row.get("event_count")) is not int
+                    or not 0 <= row["event_count"] <= 8
+                    or row.get("timer") != timer
+                    or row.get("observation_unit") != observation_unit
+                    or not isinstance(row.get("categories"), list)
+                    or len(row["categories"]) > 16
+                ):
+                    return 2
+                for numeric in (
+                    "total_cpu_us", "sample_count", "start_lag_ms_min", "start_lag_ms_max",
+                    "elapsed_ms_min", "elapsed_ms_max", "end_lag_ms_min", "end_lag_ms_max",
+                ):
+                    value = row.get(numeric)
+                    if value is not None and (type(value) is not int or not 0 <= value <= 10**10):
+                        return 2
+                categories: list[dict[str, Any]] = []
+                category_names: list[str] = []
+                for category in row["categories"]:
+                    if (
+                        not isinstance(category, dict)
+                        or set(category) != CPU_PROFILE_CATEGORY_FIELDS
+                        or category.get("category") not in CPU_PROFILE_CATEGORIES
+                        or type(category.get("cpu_us")) is not int
+                        or not 0 <= category["cpu_us"] <= 10**10
+                        or type(category.get("observations")) is not int
+                        or not 0 <= category["observations"] <= 10**10
+                    ):
+                        return 2
+                    category_names.append(category["category"])
+                    categories.append({
+                        "category": category["category"],
+                        "cpu_us": category["cpu_us"],
+                        "observations": category["observations"],
+                    })
+                if category_names != sorted(category_names) or len(set(category_names)) != len(category_names):
+                    return 2
+                projected_profiles.append({
+                    "service": service,
+                    "expected_targets": expected_targets,
+                    "observed_targets": row["observed_targets"],
+                    "event_count": row["event_count"],
+                    "timer": timer,
+                    "observation_unit": observation_unit,
+                    "total_cpu_us": row["total_cpu_us"],
+                    "sample_count": row["sample_count"],
+                    "start_lag_ms_min": row["start_lag_ms_min"],
+                    "start_lag_ms_max": row["start_lag_ms_max"],
+                    "elapsed_ms_min": row["elapsed_ms_min"],
+                    "elapsed_ms_max": row["elapsed_ms_max"],
+                    "end_lag_ms_min": row["end_lag_ms_min"],
+                    "end_lag_ms_max": row["end_lag_ms_max"],
+                    "categories": categories,
+                })
+            if result["profile_status"] == "complete" and (
+                result["profile_reason"] != "none"
+                or len(projected_profiles) != 2
+                or any(
+                    row["observed_targets"] != row["expected_targets"]
+                    or row["event_count"] != row["expected_targets"]
+                    or not isinstance(row["total_cpu_us"], int)
+                    or row["total_cpu_us"] <= 0
+                    or type(row["start_lag_ms_min"]) is not int
+                    or type(row["start_lag_ms_max"]) is not int
+                    or not 0 <= row["start_lag_ms_min"] <= row["start_lag_ms_max"] <= 250
+                    or type(row["elapsed_ms_min"]) is not int
+                    or type(row["elapsed_ms_max"]) is not int
+                    or not 19_750 <= row["elapsed_ms_min"] <= row["elapsed_ms_max"] <= 20_500
+                    or type(row["end_lag_ms_min"]) is not int
+                    or type(row["end_lag_ms_max"]) is not int
+                    or not -250 <= row["end_lag_ms_min"] <= row["end_lag_ms_max"] <= 250
+                    or (row["service"] == "api" and row["sample_count"] is not None)
+                    or (row["service"] == "web" and (
+                        not isinstance(row["sample_count"], int) or row["sample_count"] <= 0
+                    ))
+                    or not row["categories"]
+                    for row in projected_profiles
+                )
+            ):
+                return 2
+            target_count = result["service_count"]
+            cleanup_projection = {
+                "status": "expired_plans_removed",
+                "service_count": target_count,
+                "usage_status": result["usage_status"],
+                "usage_reason": result["usage_reason"],
+                "usage_rows": projected_rows,
+                "profile_status": result["profile_status"],
+                "profile_reason": result["profile_reason"],
+                "profile_rows": projected_profiles,
+            }
+            marker = "CPU_DIAGNOSTIC_PLAN " + json.dumps(
+                cleanup_projection, ensure_ascii=True, allow_nan=False,
+                sort_keys=True, separators=(",", ":"),
+            )
+            if len(marker.encode("ascii")) > CPU_DIAGNOSTIC_OUTPUT_CAP - 1:
+                return 2
+        print(marker)
+        return 0
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        _terminate_process_group(process)
+        return 2
+    finally:
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+
+
+def _run_live_user_qa_sudo(
+    arguments: list[str], *, expected_sha: str, expected_app_sha: str
+) -> int:
+    """Capture only a fixed QA diagnostic from the trusted browser wrapper."""
+
+    if not _trusted_helper(LIVE_USER_QA_HELPER):
+        return 2
+    try:
+        process = subprocess.Popen(  # nosec B603
+            [SUDO, "-n", "--", str(LIVE_USER_QA_HELPER), *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        return 2
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    selector: selectors.BaseSelector | None = None
+    buffers: dict[int, bytearray] = {}
+    line_too_long: set[int] = set()
+    total = {"stdout": 0, "stderr": 0}
+    diagnostic: bytes | None = None
+    diagnostic_count = 0
+    browser_counts: bytes | None = None
+    browser_counts_payload: dict[str, object] | None = None
+    browser_counts_count = 0
+    deadline = time.monotonic() + LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS
+    try:
+        selector = selectors.DefaultSelector()
+        for name, stream in streams.items():
+            if stream is None:
+                raise OSError("QA child pipe is unavailable")
+            descriptor = stream.fileno()
+            os.set_blocking(descriptor, False)
+            selector.register(descriptor, selectors.EVENT_READ, name)
+            buffers[descriptor] = bytearray()
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_process_group(process)
+                return 124
+            for key, _ in selector.select(min(remaining, 0.1)):
+                try:
+                    chunk = os.read(key.fd, 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                channel = key.data
+                total[channel] += len(chunk)
+                if channel != "stdout":
+                    continue
+                line_buffer = buffers[key.fd]
+                for byte in chunk:
+                    if byte == 10:
+                        if key.fd not in line_too_long:
+                            line = bytes(line_buffer) + b"\n"
+                            if line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC "):
+                                diagnostic_count += 1
+                                if len(line) <= LIVE_QA_DIAGNOSTIC_LINE_MAX_BYTES:
+                                    match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(line)
+                                    diagnostic = line if match is not None else None
+                                else:
+                                    diagnostic = None
+                            elif line.startswith(b"LIVE_BROWSER_COUNTS "):
+                                browser_counts_count += 1
+                                parsed_counts = (
+                                    _parse_live_browser_counts(
+                                        line,
+                                        expected_sha=expected_sha,
+                                        expected_app_sha=expected_app_sha,
+                                        expected_marker_sha256=None,
+                                    )
+                                    if len(line) <= LIVE_USER_QA_MARKER_MAX_BYTES
+                                    else None
+                                )
+                                browser_counts = line if parsed_counts is not None else None
+                                browser_counts_payload = parsed_counts
+                        line_buffer.clear()
+                        line_too_long.discard(key.fd)
+                    elif key.fd not in line_too_long:
+                        if len(line_buffer) < LIVE_USER_QA_MARKER_MAX_BYTES:
+                            line_buffer.append(byte)
+                        else:
+                            line_buffer.clear()
+                            line_too_long.add(key.fd)
+        child_status = process.returncode if process.returncode is not None else 2
+        if diagnostic_count == 1 and diagnostic is not None:
+            match = LIVE_QA_DIAGNOSTIC_RE.fullmatch(diagnostic)
+            if match is not None and int(match.group("child_exit")) == child_status:
+                sys.stdout.buffer.write(diagnostic)
+                sys.stdout.buffer.flush()
+        counts_valid = browser_counts_count == 1 and browser_counts is not None
+        if counts_valid:
+            sys.stdout.buffer.write(browser_counts)
+            sys.stdout.buffer.flush()
+        if child_status == 0 and not counts_valid:
+            return 2
+        counts_passed = bool(
+            browser_counts_payload is not None
+            and browser_counts_payload["run_status"] == "passed"
+            and browser_counts_payload["logical_total"] == 1
+            and browser_counts_payload["logical_pass"] == 1
+            and browser_counts_payload["logical_total"] == sum(
+                int(browser_counts_payload[field])
+                for field in (
+                    "logical_pass", "logical_fail", "logical_expected_fail",
+                    "logical_flaky", "logical_skip", "logical_interrupted",
+                )
+            )
+            and browser_counts_payload["attempt_total"] == 1
+            and browser_counts_payload["attempt_pass"] == 1
+            and browser_counts_payload["attempt_total"] == sum(
+                int(browser_counts_payload[field])
+                for field in (
+                    "attempt_pass", "attempt_fail", "attempt_skip",
+                    "attempt_interrupted", "attempt_timedout",
+                )
+            )
+            and all(
+                browser_counts_payload[field] == 0
+                for field in (
+                    "logical_fail", "logical_expected_fail", "logical_flaky",
+                    "logical_skip", "logical_interrupted", "attempt_fail", "attempt_interrupted",
+                    "attempt_timedout",
+                )
+            )
+        )
+        if child_status == 0 and counts_passed:
+            print("LIVE_USER_QA_SUCCESS")
+            return 0
+        if child_status == 0:
+            # The browser process itself succeeded, but the bound report may
+            # describe failed/skipped tests.  Leave the actual child status
+            # intact and omit the success marker; the workflow validator
+            # rejects the sanitized report while preserving its counts.
+            return 0
+        return child_status if 0 <= child_status <= 255 else 2
+    except (OSError, ValueError):
+        _terminate_process_group(process)
+        return 2
+    finally:
+        if selector is not None:
+            selector.close()
+        for stream in streams.values():
+            if stream is not None:
+                stream.close()
 
 
 def _control_email_stdin(control_email: str) -> bytes:
@@ -1105,19 +1594,22 @@ def _parse_live_browser_counts(
     match = LIVE_BROWSER_COUNTS_RE.fullmatch(line)
     if match is None:
         return None
+    marker_sha256 = match.group("marker_sha256").decode("ascii")
     if (
         match.group("source_sha").decode("ascii") != expected_sha
         or expected_app_sha is None
         or match.group("app_sha").decode("ascii") != expected_app_sha
-        or expected_marker_sha256 is None
-        or match.group("marker_sha256").decode("ascii") != expected_marker_sha256
+        or (
+            expected_marker_sha256 is not None
+            and marker_sha256 != expected_marker_sha256
+        )
     ):
         return None
     counts: dict[str, object] = {
         "run_status": match.group("run_status").decode("ascii"),
         "source_sha": expected_sha,
         "app_sha": expected_app_sha,
-        "marker_sha256": expected_marker_sha256,
+        "marker_sha256": marker_sha256,
     }
     counts.update(
         {
@@ -1191,6 +1683,19 @@ def _parse_live_launch_protocol(
     if status is None:
         return None
     return status, counts
+
+
+def _extract_live_qa_diagnostic(output: bytes) -> tuple[bytes, bytes | None] | None:
+    """Remove one exact diagnostic marker while keeping the status protocol strict."""
+
+    lines = output.splitlines(keepends=True)
+    markers = [line for line in lines if line.startswith(b"LIVE_QA_CHILD_DIAGNOSTIC ")]
+    if not markers:
+        return output, None
+    if len(markers) != 1 or LIVE_QA_DIAGNOSTIC_RE.fullmatch(markers[0]) is None:
+        return None
+    remainder = b"".join(line for line in lines if line is not markers[0])
+    return remainder, markers[0]
 
 
 def _emit_live_browser_counts(counts: dict[str, object]) -> None:
@@ -1298,17 +1803,18 @@ def _wait_for_live_launch_status(
                 source_sha=expected_sha, check="dispatch",
             )
             return 2
-        parsed = (
-            None
-            if oversized
-            else _parse_live_launch_protocol(
-                bytes(output),
+        extracted = None if oversized else _extract_live_qa_diagnostic(bytes(output))
+        parsed = None
+        child_diagnostic = None
+        if extracted is not None:
+            protocol_output, child_diagnostic = extracted
+            parsed = _parse_live_launch_protocol(
+                protocol_output,
                 child_status=child_status,
                 expected_sha=expected_sha,
                 expected_app_sha=expected_app_sha,
                 expected_marker_sha256=expected_marker_sha256,
             )
-        )
         if parsed is None:
             safe_exit = child_status if 0 < child_status <= 255 else 2
             _emit_live_launch_status(
@@ -1320,6 +1826,9 @@ def _wait_for_live_launch_status(
             )
             return safe_exit
         (status, stage, check, child_exit), counts = parsed
+        if child_diagnostic is not None:
+            sys.stdout.write(child_diagnostic.decode("ascii"))
+            sys.stdout.flush()
         if counts is not None:
             _emit_live_browser_counts(counts)
         _emit_live_launch_status(
@@ -1619,6 +2128,7 @@ def _host_capabilities() -> int:
         "dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 "
         "release_baseline=1 retained_load_export_cleanup=1 "
         "retained_load_source_binding=1 "
+        "cpu_diagnostic_plan_control=1 "
         "python_isolated=1 python_bytecode_disabled=1"
     )
     return 0
@@ -1647,6 +2157,7 @@ def _host_baseline_generation_ready() -> bool:
         b"capability=release_baseline",
         b"capability=retained_load_export_cleanup",
         b"capability=retained_load_source_binding",
+        b"capability=cpu_diagnostic_plan_control",
     } <= set(capability_bytes.splitlines())
 
 
@@ -2157,7 +2668,9 @@ def main(argv: list[str] | None = None) -> int:
             return _fail()
         print("HOST_RELEASE_BASELINE status=match")
         return 0
-    if arguments == ["external-fixture"]:
+    if arguments == ["cpu-diagnostic-plan"]:
+        mode = "cpu-diagnostic"
+    elif arguments == ["external-fixture"]:
         mode = "external"
     elif arguments == ["external-finalize"]:
         mode = "external"
@@ -2186,6 +2699,8 @@ def main(argv: list[str] | None = None) -> int:
         if mode == "deployment" and not _trusted_generation():
             return _fail()
         payload = load_stdin_payload(mode=mode)
+        if arguments == ["cpu-diagnostic-plan"]:
+            return _run_cpu_diagnostic_plan(payload)
         if arguments == ["external-fixture"]:
             return _external_fixture(payload)
         if arguments == ["external-finalize"]:
@@ -2283,10 +2798,11 @@ def main(argv: list[str] | None = None) -> int:
                 or payload["marker"] != ""
             ):
                 return _fail()
-            return _run_sudo(
-                LIVE_USER_QA_HELPER,
-                [payload["target_sha"], *_source_binding_arguments(payload)],
-                timeout_seconds=LIVE_USER_QA_OPERATION_TIMEOUT_SECONDS,
+            app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
+            return _run_live_user_qa_sudo(
+                [payload["target_sha"], *source_arguments],
+                expected_sha=payload["target_sha"],
+                expected_app_sha=app_target_sha,
             )
         app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
         return _run_trusted_live_launch(

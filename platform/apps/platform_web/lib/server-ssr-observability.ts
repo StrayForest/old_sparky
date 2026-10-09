@@ -3,11 +3,14 @@ import "server-only";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { headers } from "next/headers";
 import { cache } from "react";
+import { formatWorkspaceApiErrorDiagnostic } from "@/lib/ssr-error-diagnostic";
+import { current_diagnostic_run_id } from "@/lib/performance-diagnostic-plan";
 
 type SsrTrace = {
   requestId: string;
   cfRay: string;
   sampled: boolean;
+  diagnosticRunId: string | null;
   startedAt: number;
   rootStartedAtMs: number;
   requestStartedAtMs: number | null;
@@ -15,6 +18,8 @@ type SsrTrace = {
 };
 
 const enabled = process.env.PLATFORM_SSR_PERF_LOG_ENABLED === "true";
+const workspaceErrorDiagnosticEnabled =
+  process.env.PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC === "true";
 const sampleRate = boundedNumber(
   process.env.PLATFORM_SSR_PERF_SAMPLE_RATE,
   0.01,
@@ -34,7 +39,7 @@ export function isSsrDiagnosticsEnabled(): boolean {
 }
 
 export async function isSsrTraceSampled(): Promise<boolean> {
-  if (!enabled) {
+  if (!enabled && current_diagnostic_run_id() === null) {
     return false;
   }
   return (await getSsrTrace())?.sampled ?? false;
@@ -71,8 +76,11 @@ function createTrace(
   rootStartedAtMs: number,
   requestHeaders: RequestHeaderSource
 ): SsrTrace {
+  const diagnosticRunId = current_diagnostic_run_id();
   const traceMarker = requestHeaders.get(SSR_TRACE_HEADER);
-  const sampled = traceMarker === "1"
+  const sampled = diagnosticRunId !== null
+    ? true
+    : traceMarker === "1"
     ? true
     : traceMarker === "0"
       ? false
@@ -82,6 +90,7 @@ function createTrace(
     requestId: safeToken(requestHeaders.get("x-request-id"), "unknown"),
     cfRay: safeToken(requestHeaders.get("cf-ray"), "unknown"),
     sampled,
+    diagnosticRunId,
     startedAt,
     rootStartedAtMs,
     requestStartedAtMs: epochMilliseconds(requestHeaders.get(SSR_REQUEST_START_HEADER)),
@@ -94,7 +103,7 @@ function createTrace(
 // then lets descendant Server Components reuse the same safe trace if React
 // resumes them outside that callback.
 const getSsrTrace = cache(async (): Promise<SsrTrace | null> => {
-  if (!enabled) {
+  if (!enabled && current_diagnostic_run_id() === null) {
     return null;
   }
   const inheritedTrace = traceStorage.getStore();
@@ -147,7 +156,7 @@ export async function getServerRequestCorrelationHeaders(): Promise<Headers> {
       correlationHeaders.set(name, value);
     }
   }
-  correlationHeaders.set(SSR_TRACE_HEADER, "1");
+  correlationHeaders.set(SSR_TRACE_HEADER, trace.diagnosticRunId ?? "1");
   return correlationHeaders;
 }
 
@@ -165,6 +174,7 @@ function recordSsrSpan(
   const safeStage = safeToken(stage, "unknown");
   console.info(
     `ssr_perf request_id=${trace.requestId} cf_ray=${trace.cfRay}`
+      + (trace.diagnosticRunId === null ? "" : ` diagnostic_run_id=${trace.diagnosticRunId}`)
       + ` stage=${safeStage} start_ms=${formatDuration(startMs)}`
       + ` end_ms=${formatDuration(endMs)} duration_ms=${formatDuration(durationMs)}`
       + ` outcome=${outcome}`
@@ -176,7 +186,7 @@ export async function recordSsrStage(
   durationMs: number,
   outcome: "ok" | "error" = "ok"
 ): Promise<void> {
-  if (!enabled) {
+  if (!enabled && current_diagnostic_run_id() === null) {
     return;
   }
   const trace = await getSsrTrace();
@@ -200,7 +210,7 @@ export async function recordSsrPoint(
   offsetMs?: number,
   outcome: "ok" | "error" = "ok"
 ): Promise<void> {
-  if (!enabled) {
+  if (!enabled && current_diagnostic_run_id() === null) {
     return;
   }
   const trace = await getSsrTrace();
@@ -211,6 +221,26 @@ export async function recordSsrPoint(
     ? Math.max(0, performance.now() - trace.startedAt)
     : Math.max(0, offsetMs);
   recordSsrSpan(trace, stage, pointMs, pointMs, 0, outcome);
+}
+
+export async function recordSsrWorkspaceApiError(status: number): Promise<void> {
+  const diagnosticRunId = current_diagnostic_run_id();
+  if (diagnosticRunId === null && (!enabled || !workspaceErrorDiagnosticEnabled)) {
+    return;
+  }
+  const trace = await getSsrTrace();
+  if (!trace?.sampled) {
+    return;
+  }
+  const record = formatWorkspaceApiErrorDiagnostic({
+    requestId: trace.requestId,
+    cfRay: trace.cfRay,
+    status,
+    diagnosticRunId: trace.diagnosticRunId
+  });
+  if (record !== null) {
+    console.info(record);
+  }
 }
 
 export async function recordSsrRequestTimeline(): Promise<void> {
@@ -268,7 +298,7 @@ export async function measureSsrStage<T>(
   stage: string,
   operation: () => Promise<T>
 ): Promise<T> {
-  if (!enabled) {
+  if (!enabled && current_diagnostic_run_id() === null) {
     return operation();
   }
   const startedAt = performance.now();

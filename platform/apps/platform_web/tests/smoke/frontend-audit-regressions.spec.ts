@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 import { NextRequest } from "next/server";
+import { formatWorkspaceApiErrorDiagnostic } from "../../lib/ssr-error-diagnostic";
+import { hasAuthorizedDiagnosticRunMarker } from "../../lib/performance-diagnostic-marker";
 import { proxy } from "../../proxy";
 
 function source(relativePath: string): string {
@@ -50,6 +52,45 @@ test("public timeout metadata cannot promote SSR trace sampling", () => {
   }
 });
 
+test("only a plan-shaped internal trace marker reaches server rendering", () => {
+  const priorEnabled = process.env.PLATFORM_SSR_PERF_LOG_ENABLED;
+  const priorRate = process.env.PLATFORM_SSR_PERF_SAMPLE_RATE;
+  process.env.PLATFORM_SSR_PERF_LOG_ENABLED = "true";
+  process.env.PLATFORM_SSR_PERF_SAMPLE_RATE = "0.05";
+  try {
+    const runId = "0123456789abcdef0123456789abcdef";
+    const accepted = proxy(new NextRequest("https://old-sparky.com/tournaments/fixture", {
+      headers: { "x-platform-ssr-trace": runId },
+    }));
+    expect(accepted.headers.get("x-middleware-request-x-platform-ssr-trace")).toBe(runId);
+    expect(accepted.headers.get("x-platform-ssr-trace")).toBeNull();
+
+    const malformed = proxy(new NextRequest("https://old-sparky.com/tournaments/fixture", {
+      headers: { "x-platform-ssr-trace": `${runId}extra` },
+    }));
+    expect(malformed.headers.get("x-middleware-request-x-platform-ssr-trace"))
+      .not.toBe(`${runId}extra`);
+  } finally {
+    if (priorEnabled === undefined) delete process.env.PLATFORM_SSR_PERF_LOG_ENABLED;
+    else process.env.PLATFORM_SSR_PERF_LOG_ENABLED = priorEnabled;
+    if (priorRate === undefined) delete process.env.PLATFORM_SSR_PERF_SAMPLE_RATE;
+    else process.env.PLATFORM_SSR_PERF_SAMPLE_RATE = priorRate;
+  }
+});
+
+test("workspace CPU diagnostics require an exact private run marker", () => {
+  const runId = "0123456789abcdef0123456789abcdef";
+  expect(hasAuthorizedDiagnosticRunMarker(runId, runId)).toBe(true);
+  for (const value of [null, "1", runId.toUpperCase(), `${runId}0`, "f".repeat(32)]) {
+    expect(hasAuthorizedDiagnosticRunMarker(value, runId)).toBe(false);
+  }
+  const planModule = source("lib/performance-diagnostic-plan.ts");
+  expect(planModule).toContain('resolve(process.cwd(), "../../..", "RELEASE.json")');
+  expect(planModule).toContain("hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id)");
+  expect(planModule.indexOf("if (!hasAuthorizedDiagnosticRunMarker(incomingTrace, plan.run_id))"))
+    .toBeLessThan(planModule.indexOf("diagnosticStorage.run({ plan, phase }, operation)"));
+});
+
 test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
   const workspaceCalls = detailPage.match(/\bgetTournamentWorkspace\s*\(/gu) ?? [];
@@ -57,10 +98,11 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   // The true/false branches each contain one source call, but only one branch
   // executes. The disabled path does not allocate a measurement callback.
   expect(workspaceCalls).toHaveLength(2);
-  expect(detailPage).toContain("const diagnosticsEnabled = isSsrDiagnosticsEnabled();");
-  expect(detailPage).toContain(
-    "const ssrTraceSampled = diagnosticsEnabled ? await isSsrTraceSampled() : false;",
-  );
+  expect(detailPage).toContain("await run_with_workspace_cpu_diagnostic(async () => {");
+  expect(detailPage).toContain("const ssrTraceSampled = await isSsrTraceSampled();");
+  expect(detailPage).toContain('from "@/lib/performance-diagnostic-plan"');
+  expect(detailPage).toContain("getServerRequestCorrelationHeaders");
+  expect(detailPage).toContain("workspaceHeaders[name] = value;");
   expect(detailPage).toContain('? measureSsrStage("tournament_workspace", () =>');
   expect(detailPage).toContain("const workspace = await (ssrTraceSampled");
   expect(detailPage).toContain(': getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));');
@@ -70,6 +112,50 @@ test("tournament workspace timing wraps the existing opt-in SSR fetch", () => {
   expect(detailPage).toContain("const workspace = await (ssrTraceSampled");
   expect(detailPage).toContain("? measureSsrStage(");
   expect(detailPage).toContain(": getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));");
+});
+
+test("workspace API error diagnostics emit only bounded status and correlation fields", () => {
+  expect(formatWorkspaceApiErrorDiagnostic({
+    requestId: "edge-request-1",
+    cfRay: "edge-ray-2",
+    status: 503,
+  })).toBe(
+    "ssr_error request_id=edge-request-1 cf_ray=edge-ray-2"
+      + " stage=tournament_workspace family=platform_api_error status=503"
+      + " response_code=unavailable",
+  );
+  expect(formatWorkspaceApiErrorDiagnostic({
+    requestId: "edge-request-1",
+    cfRay: "edge-ray-2",
+    status: 503,
+    diagnosticRunId: "0123456789abcdef0123456789abcdef",
+  })).toContain("diagnostic_run_id=0123456789abcdef0123456789abcdef");
+  expect(formatWorkspaceApiErrorDiagnostic({
+    requestId: "edge-request-1",
+    cfRay: "edge-ray-2",
+    status: 503,
+    diagnosticRunId: "not-a-plan-id",
+  })).toBeNull();
+  expect(formatWorkspaceApiErrorDiagnostic({
+    requestId: "edge request with spaces",
+    cfRay: "edge-ray-2",
+    status: 503,
+  })).toBeNull();
+  expect(formatWorkspaceApiErrorDiagnostic({
+    requestId: "edge-request-1",
+    cfRay: "edge-ray-2",
+    status: 200,
+  })).toBeNull();
+
+  const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
+  const observability = source("lib/server-ssr-observability.ts");
+  expect(observability).toContain(
+    'process.env.PLATFORM_SSR_WORKSPACE_ERROR_DIAGNOSTIC === "true"',
+  );
+  expect(observability).toContain("current_diagnostic_run_id() === null");
+  expect(observability).toContain("diagnostic_run_id=${trace.diagnosticRunId}");
+  expect(detailPage).toContain("await recordSsrWorkspaceApiError(error.status)");
+  expect(detailPage).toContain("throw error;");
 });
 
 test("invite-only pages convert missing workspace proof into invite-code flow", () => {

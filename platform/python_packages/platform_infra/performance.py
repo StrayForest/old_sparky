@@ -12,6 +12,7 @@ from uuid import uuid4
 from sqlalchemy import event
 
 from python_packages.platform_infra.config import get_settings
+from python_packages.platform_infra.performance_diagnostic import ApiCpuDiagnostic
 
 logger = logging.getLogger("platform.performance")
 REQUEST_PERF_SAMPLE_INTERVAL = 16
@@ -92,6 +93,8 @@ class RequestPerformanceMetrics:
     cf_ray: str | None = None
     client_fingerprint: str | None = None
     ready_vote_spans: dict[str, float] = field(default_factory=dict)
+    diagnostic_run_id: str | None = None
+    diagnostic_phase: str | None = None
 
 
 _current_metrics: ContextVar[RequestPerformanceMetrics | None] = ContextVar(
@@ -178,12 +181,17 @@ def _header_from_scope(scope: dict[str, Any], name: bytes) -> str | None:
     return None
 
 
-def _request_identity_from_scope(scope: dict[str, Any]) -> tuple[str | None, str | None]:
+def _request_identity_from_scope(
+    scope: dict[str, Any], *, diagnostic_run_id: str | None = None
+) -> tuple[str | None, str | None]:
     request_id = _header_from_scope(scope, b"x-request-id")
     cf_ray = _header_from_scope(scope, b"cf-ray")
     # Public Nginx API proxy locations clear these headers. The loopback web
     # hop sets them only from its already-sampled, Nginx-correlated SSR trace.
-    if _header_from_scope(scope, b"x-platform-ssr-trace") == "1":
+    trace_marker = _header_from_scope(scope, b"x-platform-ssr-trace")
+    if trace_marker == "1" or (
+        diagnostic_run_id is not None and trace_marker == diagnostic_run_id
+    ):
         ssr_request_id = _header_from_scope(scope, b"x-platform-ssr-request-id")
         ssr_cf_ray = _header_from_scope(scope, b"x-platform-ssr-cf-ray")
         if ssr_request_id and ssr_request_id not in {"unknown", "-"}:
@@ -216,6 +224,8 @@ def start_request_metrics(
     request_id: str | None = None,
     cf_ray: str | None = None,
     client_fingerprint: str | None = None,
+    diagnostic_run_id: str | None = None,
+    diagnostic_phase: str | None = None,
 ) -> Token[RequestPerformanceMetrics | None]:
     metrics = RequestPerformanceMetrics(
         request_id=request_id or uuid4().hex[:12],
@@ -225,6 +235,8 @@ def start_request_metrics(
         qa_phase=qa_phase,
         cf_ray=cf_ray,
         client_fingerprint=client_fingerprint,
+        diagnostic_run_id=diagnostic_run_id,
+        diagnostic_phase=diagnostic_phase,
     )
     return _current_metrics.set(metrics)
 
@@ -481,12 +493,18 @@ class RequestPerformanceMiddleware:
             await self.app(scope, receive, send)
             return
 
+        diagnostic_plan, diagnostic_phase = ApiCpuDiagnostic.activate_for_scope(scope)
         settings = get_settings()
         if not settings.platform_perf_log_enabled:
             await self.app(scope, receive, send)
             return
 
-        request_id, cf_ray = _request_identity_from_scope(scope)
+        request_id, cf_ray = _request_identity_from_scope(
+            scope,
+            diagnostic_run_id=(
+                diagnostic_plan.run_id if diagnostic_plan is not None else None
+            ),
+        )
         token = start_request_metrics(
             method=str(scope.get("method") or "GET"),
             path=str(scope.get("path") or ""),
@@ -494,6 +512,8 @@ class RequestPerformanceMiddleware:
             request_id=request_id,
             cf_ray=cf_ray,
             client_fingerprint=_client_fingerprint(scope),
+            diagnostic_run_id=diagnostic_plan.run_id if diagnostic_plan is not None else None,
+            diagnostic_phase=diagnostic_phase,
         )
         metrics = current_request_metrics()
         status_code = 500
@@ -638,7 +658,7 @@ class RequestPerformanceMiddleware:
             "response_bytes=%s qa_phase=%s "
             "pool_wait_ms=%.2f cf_ray=%s client=%s "
             "request_perf_selection=%s request_perf_completion_count=%s "
-            "request_perf_sample_interval=%s",
+            "request_perf_sample_interval=%s%s",
             metrics.request_id,
             metrics.method,
             metrics.path,
@@ -725,4 +745,10 @@ class RequestPerformanceMiddleware:
             selection_reason,
             completion_count,
             REQUEST_PERF_SAMPLE_INTERVAL,
+            (
+                f" diagnostic_run_id={metrics.diagnostic_run_id}"
+                f" diagnostic_phase={metrics.diagnostic_phase}"
+                if metrics.diagnostic_run_id is not None and metrics.diagnostic_phase is not None
+                else ""
+            ),
         )

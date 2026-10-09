@@ -79,7 +79,13 @@ export function proxy(request: NextRequest) {
   // The public timeout marker is edge-only observation metadata. Never pass
   // it into SSR/API correlation where a caller could contaminate a join.
   requestHeaders.delete(TIMEOUT_DIAGNOSTIC_ID_HEADER);
-  if (ssrDiagnosticsEnabled()) {
+  const diagnosticRunId = request.headers.get(SSR_TRACE_HEADER);
+  if (diagnosticRunId && /^[0-9a-f]{32}$/.test(diagnosticRunId)) {
+    // A finite, root-owned plan is validated in the server route before this
+    // internal marker can enable trace or CPU diagnostics. Keep the existing
+    // header name and never return the marker to the browser.
+    requestHeaders.set(SSR_TRACE_HEADER, diagnosticRunId);
+  } else if (ssrDiagnosticsEnabled()) {
     const sampleKey = request.headers.get("x-request-id")
       || request.headers.get("cf-ray")
       || "unknown";

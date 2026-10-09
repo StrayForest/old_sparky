@@ -3,12 +3,14 @@ import { cookies } from "next/headers";
 import { notFound } from "next/navigation";
 import { TournamentDetailClientPage } from "@/components/tournaments/tournament-detail-client-page";
 import {
-  isSsrDiagnosticsEnabled,
   isSsrTraceSampled,
+  getServerRequestCorrelationHeaders,
   measureSsrStage,
   recordSsrPoint,
-  recordSsrStage
+  recordSsrStage,
+  recordSsrWorkspaceApiError
 } from "@/lib/server-ssr-observability";
+import { run_with_workspace_cpu_diagnostic } from "@/lib/performance-diagnostic-plan";
 import {
   getTournamentWorkspace,
   normalizeTournamentInviteCode,
@@ -37,8 +39,6 @@ export default async function TournamentDetailPage({
   const startedAt = performance.now();
   const { slug } = await params;
   const resolvedSearchParams = await searchParams;
-  const diagnosticsEnabled = isSsrDiagnosticsEnabled();
-  const ssrTraceSampled = diagnosticsEnabled ? await isSsrTraceSampled() : false;
   const inviteCode = normalizeTournamentInviteCode(resolvedSearchParams?.invite_code);
   const cookieHeader = (await cookies()).toString();
   let initialTournament: TournamentDetail | undefined;
@@ -48,33 +48,47 @@ export default async function TournamentDetailPage({
   // this route as HTTP 200 and only becomes an error after hydration. Private
   // tournaments intentionally remain client-owned when the server receives
   // 401/403, preserving the invite gate and its loading behavior.
-  try {
-    const workspaceHeaders: Record<string, string> = cookieHeader
-      ? { cookie: cookieHeader }
-      : {};
-    const workspaceOptions = {
-      participantsLimit: 0,
-      workspaceView: "detail" as const,
-      includeCurrentUser: false,
-      inviteCode
-    };
-    const workspace = await (ssrTraceSampled
-      ? measureSsrStage("tournament_workspace", () =>
-        getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions)
-      )
-      : getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));
-    if (!workspace) {
-      notFound();
+  await run_with_workspace_cpu_diagnostic(async () => {
+    const ssrTraceSampled = await isSsrTraceSampled();
+    try {
+      const workspaceHeaders: Record<string, string> = cookieHeader
+        ? { cookie: cookieHeader }
+        : {};
+      if (ssrTraceSampled) {
+        (await getServerRequestCorrelationHeaders()).forEach((value, name) => {
+          workspaceHeaders[name] = value;
+        });
+      }
+      const workspaceOptions = {
+        participantsLimit: 0,
+        workspaceView: "detail" as const,
+        includeCurrentUser: false,
+        inviteCode
+      };
+      const workspace = await (ssrTraceSampled
+        ? measureSsrStage("tournament_workspace", () =>
+          getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions)
+        )
+        : getTournamentWorkspace(slug, workspaceHeaders, workspaceOptions));
+      if (!workspace) {
+        notFound();
+      }
+      initialTournament = workspace.tournament;
+      if (ssrTraceSampled) {
+        await recordSsrPoint("tournament_detail_data_ready");
+      }
+    } catch (error) {
+      if (error instanceof PlatformApiError) {
+        await recordSsrWorkspaceApiError(error.status);
+      }
+      if (!(error instanceof PlatformApiError && (error.status === 401 || error.status === 403))) {
+        throw error;
+      }
     }
-    initialTournament = workspace.tournament;
     if (ssrTraceSampled) {
-      await recordSsrPoint("tournament_detail_data_ready");
+      await recordSsrStage("page_component", performance.now() - startedAt);
     }
-  } catch (error) {
-    if (!(error instanceof PlatformApiError && (error.status === 401 || error.status === 403))) {
-      throw error;
-    }
-  }
+  });
 
   const rendered = (
     <TournamentDetailClientPage
@@ -83,8 +97,5 @@ export default async function TournamentDetailPage({
       initialTournament={initialTournament}
     />
   );
-  if (ssrTraceSampled) {
-    await recordSsrStage("page_component", performance.now() - startedAt);
-  }
   return rendered;
 }

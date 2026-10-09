@@ -591,6 +591,8 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host capability preflight must not execute repository checkout source")
         if 'grep -Fqx "capability=retained_load_source_binding" "$inner_root/capabilities.txt"' not in host_preflight:
             issues.append("host-tools artifact validation must require the retained-load source-binding capability")
+        if 'grep -Fqx "capability=cpu_diagnostic_plan_control" "$inner_root/capabilities.txt"' not in host_preflight:
+            issues.append("host-tools artifact validation must require CPU diagnostic plan control")
         if "scp " in host_preflight or "platform-production-deploy-remote" in host_preflight:
             issues.append("host capability preflight must not upload a bundle or deploy artifact")
         if (
@@ -640,6 +642,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
                 'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
                 'dispatcher=4 artifact_prepare=2 supervisor=3 input_guard=2 release_baseline=1 '
                 'retained_load_export_cleanup=1 retained_load_source_binding=1 '
+                'cpu_diagnostic_plan_control=1 '
                 'python_isolated=1 python_bytecode_disabled=1"',
                 'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
                 "command_rc=",

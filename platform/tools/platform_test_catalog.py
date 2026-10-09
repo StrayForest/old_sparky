@@ -472,10 +472,10 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 165,
     "module_digest": "a2e512646a36ca0094e9c17fd599176f44afb06da1fe28d2a0abae3ba46a761d",
-    "test_count": 1800,
-    "test_id_digest": "7f3a043b6b5d8fb963c47ab3d1c84e900163c259e26bf10f78d239e6a72e450f",
-    "backend_test_count": 1728,
-    "backend_test_id_digest": "bf6c44ed9ab758763cc93ccb9387f8c14df8e4d1c7692bab849f6d9d6addea1e",
+    "test_count": 1821,
+    "test_id_digest": "62087d955b03ce42c64dbe3257977949651c282d4e09d93e7d9766428bff5fe8",
+    "backend_test_count": 1749,
+    "backend_test_id_digest": "57e4f4d3909ce93da55ced39f1ece8233c896b259eb6f0768b8521fa6d105ec6",
     "verification_test_count": 72,
     "verification_test_id_digest": "3c52523e15a19be1b10831e2a505af8e7a711e7b9d667246e1198598c947a7c0",
     "verification_classifier_test_count": 38,
@@ -498,8 +498,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-unit": {
         "module_count": 48,
         "module_digest": "97da81814d431484c5023f96dab71a84df718c6a84c13b548142621d599335f6",
-        "test_count": 294,
-        "test_id_digest": "9558a025c0b4290cf76a426ef90df874acfe09a83a3d95d0f3802e7b663fa243",
+        "test_count": 295,
+        "test_id_digest": "d6b2bebe7c12204a360ffed3dda86ca07fdf23887e102013dfd1880931e01c2f",
     },
     "backend-tool-contract": {
         "module_count": 47,
@@ -510,20 +510,20 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-integration": {
         "module_count": 41,
         "module_digest": "c5547c1d61ed9824ad5d58b11a7f5b08a409c50e1cfd47a2a44107c22ee0e6ee",
-        "test_count": 255,
-        "test_id_digest": "046370ce425803de46582d8adf8e7e55c2a15130da7b6f2d23c4ee4f1e917efc",
+        "test_count": 256,
+        "test_id_digest": "5caeb83a0fd318d7278c6e86d4dfce886b4582281a66a99cc5c9daff6110c3c5",
     },
     "backend-privileged": {
         "module_count": 25,
         "module_digest": "dc52380f67150e2a68d0e738733503c893cee5a3a73b96d02d8af4956068dae6",
-        "test_count": 573,
-        "test_id_digest": "8f8dcc13dd27a0a37519850ecf92cb6be28a491bd58d49a1bc806758f514fbb4",
+        "test_count": 579,
+        "test_id_digest": "51e623560ccfed0a19e3b33a9c494b31a55641c7b89783e1c22323a3ddcabc06",
     },
     "performance-contract": {
         "module_count": 11,
         "module_digest": "ac879f1b292f00df28f399af5e34ed8995b39878e1961386b8eb055bb1d025e0",
-        "test_count": 181,
-        "test_id_digest": "25e768baee5ad826ccd7c202691188a2d7a2c8a4e24106510668fd6dae9d6b13",
+        "test_count": 194,
+        "test_id_digest": "b4896d7af9be01cb1da2b9024189d408d033abeacceed830f1c1947b4b5dc31e",
     },
     VERIFICATION_CONTOUR: {
         "module_count": 3,

@@ -13,7 +13,11 @@ from redis.exceptions import RedisError
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.platform_api.app.services.media import compatibility_media_url, load_media_descriptors
+from apps.platform_api.app.services.media import (
+    compatibility_media_url,
+    load_media_descriptor_for_preloaded_asset,
+    load_media_descriptors,
+)
 from apps.platform_api.app.services.tournament_allowances import (
     PRIVATE_TOURNAMENT_MONTHLY_LIMIT,
     private_tournament_monthly_remaining,
@@ -98,7 +102,17 @@ async def build_user_account_read_model(
     AvatarAsset = MediaAsset
     row = (
         await db_session.execute(
-            select(PlayerProfile, ExternalIdentity, PasswordCredential, AvatarAsset)
+            select(
+                PlayerProfile.user_id,
+                PlayerProfile.avatar_asset_id,
+                PlayerProfile.updated_at,
+                ExternalIdentity.id,
+                ExternalIdentity.subject,
+                ExternalIdentity.linked_at,
+                PasswordCredential.user_id,
+                PasswordCredential.updated_at,
+                AvatarAsset,
+            )
             .select_from(User)
             .outerjoin(PlayerProfile, PlayerProfile.user_id == User.id)
             .outerjoin(
@@ -113,17 +127,27 @@ async def build_user_account_read_model(
             .where(User.id == user.id)
         )
     ).first()
-    profile = row[0] if row is not None else None
-    steam_identity = row[1] if row is not None else None
-    password_credential = row[2] if row is not None else None
-    avatar_asset = row[3] if row is not None else None
+    profile_id = row[0] if row is not None else None
+    avatar_asset_id = row[1] if row is not None else None
+    profile_updated_at = row[2] if row is not None else None
+    steam_identity_id = row[3] if row is not None else None
+    steam_subject = row[4] if row is not None else None
+    steam_linked_at = row[5] if row is not None else None
+    password_credential_id = row[6] if row is not None else None
+    password_credential_updated_at = row[7] if row is not None else None
+    avatar_asset = row[8] if row is not None else None
     avatar_media = None
-    if profile is not None and profile.avatar_asset_id:
-        descriptors = await load_media_descriptors(
-            db_session,
-            (profile.avatar_asset_id,),
-        )
-        avatar_media = descriptors.get(profile.avatar_asset_id)
+    if profile_id is not None and avatar_asset_id:
+        if avatar_asset is not None and avatar_asset.id == avatar_asset_id:
+            avatar_media = await load_media_descriptor_for_preloaded_asset(
+                db_session,
+                avatar_asset,
+            )
+        else:
+            # Preserve the established fallback for a missing/inconsistent
+            # joined asset row instead of changing its absence semantics.
+            descriptors = await load_media_descriptors(db_session, (avatar_asset_id,))
+            avatar_media = descriptors.get(avatar_asset_id)
 
     monthly_remaining = await private_tournament_monthly_remaining(
         db_session,
@@ -138,22 +162,26 @@ async def build_user_account_read_model(
         "avatar_media": (
             avatar_media.model_dump(mode="json") if avatar_media is not None else None
         ),
-        "steam_id": steam_identity.subject if steam_identity is not None else None,
-        "steam_linked": steam_identity is not None,
-        "has_password": password_credential is not None,
+        "steam_id": steam_subject if steam_identity_id is not None else None,
+        "steam_linked": steam_identity_id is not None,
+        "has_password": password_credential_id is not None,
         "can_unlink_steam": bool(
             user.email
             and user.email_verified_at is not None
-            and password_credential is not None
+            and password_credential_id is not None
         ),
         "private_tournament_monthly_remaining": monthly_remaining,
         "private_tournament_monthly_limit": PRIVATE_TOURNAMENT_MONTHLY_LIMIT,
     }
     revision = max(
         _revision_timestamp(getattr(user, "updated_at", None)),
-        _revision_timestamp(getattr(profile, "updated_at", None)),
-        _revision_timestamp(getattr(steam_identity, "linked_at", None)),
-        _revision_timestamp(getattr(password_credential, "updated_at", None)),
+        _revision_timestamp(profile_updated_at if profile_id is not None else None),
+        _revision_timestamp(steam_linked_at if steam_identity_id is not None else None),
+        _revision_timestamp(
+            password_credential_updated_at
+            if password_credential_id is not None
+            else None
+        ),
         _revision_timestamp(getattr(avatar_asset, "updated_at", None)),
     )
     return revision, payload
