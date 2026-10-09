@@ -2009,6 +2009,68 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 self.assertNotEqual(run_policy().returncode, 0)
             finally:
                 payload[0]["verificationResult"]["statement"]["subject"].pop()
+
+            # The production recovery workflow consumes the flattened
+            # certificate object emitted by `gh attestation verify`; exercise
+            # its embedded policy directly as well as the bootstrap-abort
+            # policy above.
+            recovery_workflow = (
+                REPO_ROOT / ".github/workflows/platform-production-release-recover.yml"
+            ).read_text(encoding="utf-8")
+            recovery_policy_command = recovery_workflow.index(policy_marker)
+            recovery_policy_heredoc = recovery_workflow.index(
+                "<<'PY'", recovery_policy_command
+            )
+            recovery_policy_start = (
+                recovery_workflow.index("\n", recovery_policy_heredoc) + 1
+            )
+            recovery_policy_end = recovery_workflow.index(
+                "\n          PY", recovery_policy_start
+            )
+            policy = textwrap.dedent(
+                recovery_workflow[recovery_policy_start:recovery_policy_end]
+            )
+            self.assertEqual(run_policy().returncode, 0)
+
+            for field, bad_value in (
+                ("issuer", "https://token.actions.githubusercontent.com.invalid"),
+                ("sourceRepositoryURI", "https://github.com/other/repo"),
+                ("sourceRepositoryRef", "refs/heads/main"),
+                ("sourceRepositoryDigest", "d" * 40),
+                ("buildConfigURI", build_uri.replace("refs/heads/dev", "refs/heads/main")),
+                ("buildSignerURI", "https://github.com/other/repo/.github/workflows/wrong.yml@refs/heads/dev"),
+                (
+                    "runInvocationURI",
+                    "https://github.com/StrayForest/old_sparky/actions/runs/12345/attempts/3",
+                ),
+            ):
+                with self.subTest(recovery_field=field):
+                    original = certificate[field]
+                    certificate[field] = bad_value
+                    try:
+                        self.assertNotEqual(run_policy().returncode, 0)
+                    finally:
+                        certificate[field] = original
+
+            signature = payload[0]["verificationResult"]["signature"]
+            signature["certificate"] = {"extensions": dict(certificate)}
+            try:
+                self.assertNotEqual(run_policy().returncode, 0)
+            finally:
+                signature["certificate"] = certificate
+            payload[0]["verificationResult"]["verifiedTimestamps"] = []
+            try:
+                self.assertNotEqual(run_policy().returncode, 0)
+            finally:
+                payload[0]["verificationResult"]["verifiedTimestamps"] = [
+                    {"timestamp": "2026-09-27T00:00:00Z"}
+                ]
+            subjects = payload[0]["verificationResult"]["statement"]["subject"]
+            subjects.append({"digest": {"sha256": bundle_digest}})
+            try:
+                self.assertNotEqual(run_policy().returncode, 0)
+            finally:
+                subjects.pop()
     def test_publish_validation_is_closed_and_behaviourally_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
