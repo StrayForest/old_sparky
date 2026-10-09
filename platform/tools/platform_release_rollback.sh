@@ -171,17 +171,48 @@ json_field() {
     "$field" 2>/dev/null
 }
 
+runtime_installer_for_target() {
+  local release="$1"
+  local operation phase current_before previous_before candidate_release target_source_sha
+  operation="$(transaction_json | json_field operation)"
+  phase="$(transaction_json | json_field phase)"
+  current_before="$(transaction_json | json_field current_before)"
+  previous_before="$(transaction_json | json_field previous_before)"
+  candidate_release="$(transaction_json | json_field candidate_release)"
+  target_source_sha="$(/usr/bin/cat "$release/RELEASE.json" | json_field source_git_commit)"
+  if [[ "$operation" == "rollback" \
+    && ( "$phase" == "rollback-runtime-pending" || "$phase" == "restart-pending" ) \
+    && "$current_before" == "$CURRENT_TARGET" \
+    && "$candidate_release" == "$CURRENT_TARGET" \
+    && "$previous_before" == "$release" \
+    && "$target_source_sha" == "6343099bb7686671bdef49d0c4ecd10f21ef19d2" ]]; then
+    # The only legacy-source exception uses the running release's installer,
+    # which is transaction-bound as current_before. Every other rollback
+    # target uses that target's own immutable installer (including a newer
+    # reporter-bearing release after M8 has become current again).
+    printf '%s\n' "$CURRENT_TARGET/tools/platform_live_qa_runtime_install.py"
+    return
+  fi
+  printf '%s\n' "$release/tools/platform_live_qa_runtime_install.py"
+}
+
 restore_release_runtime() {
   local release="$1"
   local force_no_restart="${2:-0}"
+  local rollback_reconcile_args=()
+  local runtime_installer
+  runtime_installer="$(runtime_installer_for_target "$release")"
+  mapfile -t rollback_reconcile_args < <(rollback_reconcile_args_for_target "$release")
   if [[ ! -f "$SYSTEMD_STATE_RECEIPT" || -L "$SYSTEMD_STATE_RECEIPT" ]]; then
     public_status failed systemd_state >&2
     return 1
   fi
   if [[ "$RESTART_AFTER" -eq 1 && "$force_no_restart" -eq 0 ]]; then
-    "$RUNTIME_RESTORE_TOOL" \
+  "$RUNTIME_RESTORE_TOOL" \
       --app-dir "$APP_DIR" \
       --release "$release" \
+      --live-qa-runtime-installer "$runtime_installer" \
+      "${rollback_reconcile_args[@]}" \
       --systemd-state "$SYSTEMD_STATE_RECEIPT" \
       --transaction "$TRANSACTION_STATE" \
       --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
@@ -189,10 +220,31 @@ restore_release_runtime() {
     "$RUNTIME_RESTORE_TOOL" \
       --app-dir "$APP_DIR" \
       --release "$release" \
+      --live-qa-runtime-installer "$runtime_installer" \
+      "${rollback_reconcile_args[@]}" \
       --no-restart \
       --systemd-state "$SYSTEMD_STATE_RECEIPT" \
       --transaction "$TRANSACTION_STATE" \
       --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
+  fi
+}
+
+rollback_reconcile_args_for_target() {
+  local release="$1"
+  local operation phase current_before previous_before candidate_release target_source_sha
+  operation="$(transaction_json | json_field operation)"
+  phase="$(transaction_json | json_field phase)"
+  current_before="$(transaction_json | json_field current_before)"
+  previous_before="$(transaction_json | json_field previous_before)"
+  candidate_release="$(transaction_json | json_field candidate_release)"
+  target_source_sha="$(/usr/bin/cat "$release/RELEASE.json" | json_field source_git_commit)"
+  if [[ "$operation" == "rollback" \
+    && "$release" == "$previous_before" \
+    && "$CURRENT_TARGET" == "$current_before" \
+    && "$candidate_release" == "$current_before" \
+    && "$target_source_sha" == "6343099bb7686671bdef49d0c4ecd10f21ef19d2" \
+    && ( "$phase" == "rollback-runtime-pending" || "$phase" == "restart-pending" ) ]]; then
+    printf '%s\n' --rollback-reconcile-transaction "$TRANSACTION_STATE"
   fi
 }
 
@@ -337,13 +389,7 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
     && "$PENDING_PHASE" == "restart-pending" ]]; then
     trap '' HUP INT TERM
     PENDING_RELEASE="$(readlink -f "$APP_DIR/current")"
-    "$RUNTIME_RESTORE_TOOL" \
-      --app-dir "$APP_DIR" \
-      --release "$PENDING_RELEASE" \
-      --no-restart \
-      --systemd-state "$SYSTEMD_STATE_RECEIPT" \
-      --transaction "$TRANSACTION_STATE" \
-      --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
+    restore_release_runtime "$PENDING_RELEASE" 1
     restore_rollback_systemd_state 1
     verify_rollback_systemd_state
     /usr/bin/python3 -I "$TRANSACTION_TOOL" complete \
@@ -836,9 +882,15 @@ trap '' HUP INT TERM
   --expected pointers-switched \
   --phase rollback-runtime-pending
 
+ROLLBACK_RECONCILE_ARGS=()
+mapfile -t ROLLBACK_RECONCILE_ARGS < <(rollback_reconcile_args_for_target "$PREVIOUS_TARGET")
+ROLLBACK_RUNTIME_INSTALLER="$(runtime_installer_for_target "$PREVIOUS_TARGET")"
+
 "$RUNTIME_RESTORE_TOOL" \
   --app-dir "$APP_DIR" \
   --release "$PREVIOUS_TARGET" \
+  --live-qa-runtime-installer "$ROLLBACK_RUNTIME_INSTALLER" \
+  "${ROLLBACK_RECONCILE_ARGS[@]}" \
   --prepare-only \
   --systemd-state "$SYSTEMD_STATE_RECEIPT" \
   --transaction "$TRANSACTION_STATE" \
@@ -852,6 +904,8 @@ if [[ "$RESTART_AFTER" -eq 1 ]]; then
   "$RUNTIME_RESTORE_TOOL" \
     --app-dir "$APP_DIR" \
     --release "$PREVIOUS_TARGET" \
+    --live-qa-runtime-installer "$ROLLBACK_RUNTIME_INSTALLER" \
+    "${ROLLBACK_RECONCILE_ARGS[@]}" \
     --restart-only \
     --systemd-state "$SYSTEMD_STATE_RECEIPT" \
     --transaction "$TRANSACTION_STATE" \
@@ -863,6 +917,7 @@ if [[ "$RESTART_AFTER" -eq 1 ]]; then
   "$RUNTIME_RESTORE_TOOL" \
     --app-dir "$APP_DIR" \
     --release "$PREVIOUS_TARGET" \
+    --live-qa-runtime-installer "$CURRENT_TARGET/tools/platform_live_qa_runtime_install.py" \
     --smoke-only
   verify_rollback_systemd_state
   /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \

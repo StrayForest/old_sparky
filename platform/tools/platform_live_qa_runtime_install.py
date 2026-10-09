@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import time
 from uuid import uuid4
@@ -89,6 +90,7 @@ CHROMIUM_SANDBOX_SHA256 = (
     "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
 )
 RUNTIME_MANIFEST_RELATIVE = PurePosixPath("runtime-manifest.json")
+LEGACY_RUNTIME_REPORTER_SOURCE_SHA = "6343099bb7686671bdef49d0c4ecd10f21ef19d2"
 RUNTIME_BROWSER_ROOTS = frozenset(
     {
         "chromium-1228",
@@ -828,11 +830,20 @@ def _tree_digest(
     return digest.hexdigest(), files
 
 
-def _validate_runtime_source(root: Path) -> dict[str, object]:
+def _validate_runtime_source(
+    root: Path,
+    *,
+    allow_legacy_reporter_omission: bool = False,
+    source_sha: str | None = None,
+) -> dict[str, object]:
     """Recheck the artifact member before any secret-bearing promotion."""
 
     _directory(root, mode=0o555)
     _validate_source_tree(root.parent, root.name)
+    legacy_reporter_runtime = (
+        allow_legacy_reporter_omission
+        and source_sha == LEGACY_RUNTIME_REPORTER_SOURCE_SHA
+    )
     required = [
         "web/package-lock.json",
         "web/playwright.live.config.ts",
@@ -840,8 +851,9 @@ def _validate_runtime_source(root: Path) -> dict[str, object]:
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
-        "web/tests/support/live-count-reporter.cjs",
     ]
+    if not legacy_reporter_runtime:
+        required.append("web/tests/support/live-count-reporter.cjs")
     for relative in required:
         path = root / relative
         _regular(path, allow_sandbox=relative == RUNTIME_SANDBOX_RELATIVE.as_posix())
@@ -853,8 +865,9 @@ def _validate_runtime_source(root: Path) -> dict[str, object]:
         "web/tests/smoke/live-user-journey.spec.ts",
         "web/tests/support/live-qa-origin.ts",
         "web/tests/support/live-qa-sandbox.ts",
-        "web/tests/support/live-count-reporter.cjs",
     }
+    if not legacy_reporter_runtime:
+        allowed_web_files.add("web/tests/support/live-count-reporter.cjs")
     allowed_package_roots = (
         "web/node_modules/@playwright/test",
         "web/node_modules/playwright",
@@ -909,6 +922,8 @@ def _validate_runtime_source(root: Path) -> dict[str, object]:
         raise InstallerError("live-QA runtime manifest is invalid") from exc
     if not isinstance(manifest, dict):
         raise InstallerError("live-QA runtime manifest schema is invalid")
+    if legacy_reporter_runtime and manifest.get("version") != 2:
+        raise InstallerError("legacy reporter omission requires a source-only runtime")
     lock_digest = _digest_regular(root / "web/package-lock.json")
     if manifest.get("version") == 2:
         expected_keys = {
@@ -985,8 +1000,9 @@ def _validate_runtime_source(root: Path) -> dict[str, object]:
             "web/tests/smoke/live-user-journey.spec.ts",
             "web/tests/support/live-qa-origin.ts",
             "web/tests/support/live-qa-sandbox.ts",
-            "web/tests/support/live-count-reporter.cjs",
         }
+        if not legacy_reporter_runtime:
+            required_suite.add("web/tests/support/live-count-reporter.cjs")
         if not required_suite.issubset(suite_files):
             raise InstallerError("source-only live-QA suite is incomplete")
         if not {
@@ -1126,6 +1142,7 @@ def _runtime_provider_payload(
         manifest,
         app_dir=app_dir,
         allow_legacy_release_validator_omission=True,
+        allow_legacy_runtime_reporter_omission=True,
     )
     provider_file = active_root / "runtime-provider.json"
     if os.path.lexists(provider_file):
@@ -1338,6 +1355,7 @@ def _validate_payload(
     app_dir: Path = APP_DIR,
     validate_provider: bool = True,
     allow_legacy_release_validator_omission: bool = False,
+    allow_legacy_runtime_reporter_omission: bool = False,
 ) -> None:
     source_sha = str(payload["source_sha"])
     root = Path(str(payload["payload"]))
@@ -1407,7 +1425,16 @@ def _validate_payload(
             )
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise InstallerError("trusted runtime provider manifest is invalid") from exc
-        runtime_manifest = _validate_runtime_source(root / "runtime")
+        runtime_root = root / "runtime"
+        legacy_runtime_reporter_omission = (
+            allow_legacy_runtime_reporter_omission
+            and source_sha == LEGACY_RUNTIME_REPORTER_SOURCE_SHA
+        )
+        runtime_manifest = _validate_runtime_source(
+            runtime_root,
+            allow_legacy_reporter_omission=legacy_runtime_reporter_omission,
+            source_sha=source_sha,
+        )
         if (
             not isinstance(provider, dict)
             or set(provider)
@@ -1664,7 +1691,112 @@ def _retention(app_dir: Path, *, apply: bool) -> int:
     return len(candidates)
 
 
-def install(app_dir: Path, release: Path) -> dict[str, object]:
+def _rollback_reconcile_is_authorized(
+    app_dir: Path,
+    transaction_state: Path,
+    target_release: Path,
+) -> bool:
+    """Authorize only transaction-bound reconciliation of the legacy M8 runtime."""
+
+    if transaction_state != app_dir / "shared" / ".release-operation.json":
+        raise InstallerError("rollback runtime transaction path is invalid")
+    _regular(transaction_state, mode=0o600, maximum=MAX_ACTIVE_MANIFEST_BYTES)
+    installer_release = Path(__file__).resolve().parent.parent
+    transaction_tool = installer_release / "tools" / "platform_release_transaction.py"
+    _regular(transaction_tool, mode=0o755, maximum=MAX_FILE_BYTES)
+    try:
+        status = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(transaction_tool),
+                "status",
+                "--state",
+                str(transaction_state),
+                "--json",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+            text=True,
+            encoding="ascii",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise InstallerError("rollback runtime transaction cannot be validated") from exc
+    if status.returncode != 0 or len(status.stdout) > MAX_ACTIVE_MANIFEST_BYTES:
+        raise InstallerError("rollback runtime transaction cannot be validated")
+    try:
+        record = json.loads(status.stdout, object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError, InstallerError) as exc:
+        raise InstallerError("rollback runtime transaction is invalid") from exc
+    if not isinstance(record, dict):
+        raise InstallerError("rollback runtime transaction is invalid")
+    operation = record.get("operation")
+    phase = record.get("phase")
+    current_before_raw = record.get("current_before")
+    previous_before_raw = record.get("previous_before")
+    candidate_raw = record.get("candidate_release")
+    if record.get("app_dir") != str(app_dir) or not isinstance(current_before_raw, str):
+        raise InstallerError("rollback runtime transaction does not authorize reconcile")
+    current_before = Path(current_before_raw)
+    previous_before = Path(previous_before_raw) if isinstance(previous_before_raw, str) else None
+    if (
+        not current_before.is_absolute()
+        or current_before.resolve(strict=True) != current_before
+        or not isinstance(candidate_raw, str)
+    ):
+        raise InstallerError("rollback runtime transaction release binding is invalid")
+    candidate = Path(candidate_raw)
+    if operation == "rollback":
+        authorized = (
+            phase in {"rollback-runtime-pending", "restart-pending"}
+            and previous_before is not None
+            and candidate == current_before
+            and installer_release == current_before
+            and target_release.resolve(strict=True) == previous_before
+            and current_before.resolve(strict=True) == current_before
+            and (app_dir / "current").resolve(strict=True) == previous_before
+            and (app_dir / "previous").resolve(strict=True) == current_before
+        )
+    elif operation == "install":
+        legacy_install_recovery_phase = phase in {
+            "migration-pending",
+            "migration-failed",
+            "migration-applied",
+            "recovery-restored",
+        }
+        authorized = (
+            legacy_install_recovery_phase
+            and candidate.is_absolute()
+            and candidate.resolve(strict=True) == candidate
+            and installer_release == candidate
+            and target_release.resolve(strict=True) == current_before
+            and (app_dir / "current").resolve(strict=True) == current_before
+            and (
+                previous_before is not None
+                and previous_before.is_absolute()
+                and previous_before.resolve(strict=True) == previous_before
+                and (app_dir / "previous").resolve(strict=True) == previous_before
+            )
+        )
+    else:
+        authorized = False
+    if not authorized:
+        raise InstallerError("rollback runtime transaction release binding is invalid")
+    _target, target_sha, _target_slug = _safe_release(app_dir, target_release)
+    if target_sha != LEGACY_RUNTIME_REPORTER_SOURCE_SHA:
+        raise InstallerError("rollback runtime target is not the legacy source")
+    return True
+
+
+def install(
+    app_dir: Path,
+    release: Path,
+    *,
+    allow_legacy_reporter_omission: bool = False,
+) -> dict[str, object]:
     _require_release_lock()
     resolved_release, source_sha, release_slug = _safe_release(app_dir, release)
     source_platform = resolved_release
@@ -1695,7 +1827,11 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
 
     def validate_sources() -> None:
         nonlocal runtime_manifest, runtime_provider
-        runtime_manifest = _validate_runtime_source(runtime_source)
+        runtime_manifest = _validate_runtime_source(
+            runtime_source,
+            allow_legacy_reporter_omission=allow_legacy_reporter_omission,
+            source_sha=source_sha,
+        )
         if runtime_manifest.get("version") == 2:
             runtime_provider = _runtime_provider_payload(
                 app_dir,
@@ -1855,7 +1991,12 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
         _install_stage_finish(active_stage, stage_started_ns, "passed")
         active_stage = "final_payload_validation"
         stage_started_ns = _install_stage_start(active_stage)
-        _validate_payload(manifest, app_dir=app_dir, validate_provider=False)
+        _validate_payload(
+            manifest,
+            app_dir=app_dir,
+            validate_provider=False,
+            allow_legacy_runtime_reporter_omission=allow_legacy_reporter_omission,
+        )
         _install_stage_finish(active_stage, stage_started_ns, "passed")
         return manifest
     except BaseException:
@@ -1914,12 +2055,29 @@ def verify(app_dir: Path, target_sha: str) -> dict[str, object]:
     return manifest
 
 
-def reconcile(app_dir: Path) -> dict[str, object]:
+def reconcile(
+    app_dir: Path,
+    *,
+    rollback_transaction: Path | None = None,
+) -> dict[str, object]:
     """Rebuild the active generation from the immutable production release."""
 
     _require_release_lock()
-    release, _source_sha, _release_slug = _active_release(app_dir)
-    return install(app_dir, release)
+    release, source_sha, _release_slug = _active_release(app_dir)
+    legacy_rollback = False
+    if rollback_transaction is not None:
+        legacy_rollback = _rollback_reconcile_is_authorized(
+            app_dir,
+            rollback_transaction,
+            release,
+        )
+    if legacy_rollback and source_sha != LEGACY_RUNTIME_REPORTER_SOURCE_SHA:
+        raise InstallerError("rollback runtime target is not the legacy source")
+    return install(
+        app_dir,
+        release,
+        allow_legacy_reporter_omission=legacy_rollback,
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1933,6 +2091,7 @@ def parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--target-sha", required=True)
     reconcile_parser = subparsers.add_parser("reconcile")
     reconcile_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
+    reconcile_parser.add_argument("--rollback-transaction", type=Path)
     retention_parser = subparsers.add_parser("retention")
     retention_parser.add_argument("--app-dir", type=Path, default=APP_DIR)
     retention_parser.add_argument("--apply", action="store_true")
@@ -1950,7 +2109,10 @@ def main(argv: list[str] | None = None) -> int:
             manifest = verify(args.app_dir, args.target_sha)
             print(f"LIVE_QA_RUNTIME_VERIFY status=passed source_sha={manifest['source_sha']}")
         elif args.command == "reconcile":
-            manifest = reconcile(args.app_dir)
+            manifest = reconcile(
+                args.app_dir,
+                rollback_transaction=args.rollback_transaction,
+            )
             print(f"LIVE_QA_RUNTIME_RECONCILE status=passed source_sha={manifest['source_sha']}")
         else:
             removed = _retention(args.app_dir, apply=args.apply)

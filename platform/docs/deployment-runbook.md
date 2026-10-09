@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-10-07
+- Last reviewed: 2026-10-09
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -439,7 +439,7 @@ bound runtime/systemd restore before advancing to `recovery-restored`, so a
 crash in that window cannot skip runtime repair. A legacy v2
 `install`/`recovery-restored` receipt with no operation ID is recoverable only
 when the systemd receipt is absent and the candidate is inactive; that bridge
-performs receipt cleanup only and never executes retained release helpers.
+performs receipt cleanup only and never executes retained release helpers. Runtime rollback uses each non-legacy target's immutable installer; only the exact M8 source SHA may use the transaction-bound current/candidate installer for rollback or install recovery while the original pointer topology matches. Normal candidate install, active-runtime validation and all other targets remain strict.
 
 The legacy production release-abort workflow is only a compatibility bridge.
 It accepts the exact operation-less v2 `install`/`recovery-restored` receipt,

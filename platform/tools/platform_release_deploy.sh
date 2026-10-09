@@ -479,12 +479,40 @@ print_retained_state() {
 
 restore_previous_runtime() {
   local release="$1"
+  local rollback_reconcile_args=()
+  local rollback_installer_release
+  if [[ -e "$TRANSACTION_STATE" && ! -L "$TRANSACTION_STATE" ]]; then
+    local operation phase current_before previous_before candidate_release target_source_sha
+    operation="$(transaction_json | json_field operation)"
+    phase="$(transaction_json | json_field phase)"
+    current_before="$(transaction_json | json_field current_before)"
+    previous_before="$(transaction_json | json_field previous_before)"
+    candidate_release="$(transaction_json | json_field candidate_release)"
+    target_source_sha="$(/usr/bin/cat "$release/RELEASE.json" | json_field source_git_commit)"
+    rollback_installer_release="$release"
+    if [[ "$operation" == "install" \
+      && "$release" == "$current_before" \
+      && -n "$candidate_release" \
+      && ( "$(readlink -f "$APP_DIR/current" 2>/dev/null || true)" == "$current_before" ) \
+      && ( -z "$previous_before" || "$(readlink -f "$APP_DIR/previous" 2>/dev/null || true)" == "$previous_before" ) \
+      && "$target_source_sha" == "6343099bb7686671bdef49d0c4ecd10f21ef19d2" \
+      && ( "$phase" == "migration-pending" \
+        || "$phase" == "migration-failed" \
+        || "$phase" == "migration-applied" \
+        || "$phase" == "recovery-restored" ) ]]; then
+      rollback_installer_release="$candidate_release"
+      rollback_reconcile_args=(--rollback-reconcile-transaction "$TRANSACTION_STATE")
+    fi
+  fi
   # Runtime preparation must not implicitly enable/start managed timers. The
   # recorded service snapshot below is the only authority for what may start
   # during abort recovery.
   PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$RUNTIME_RESTORE_TOOL" \
     --app-dir "$APP_DIR" \
     --release "$release" \
+    --transaction "$TRANSACTION_STATE" \
+    --live-qa-runtime-installer "${rollback_installer_release:-$release}/tools/platform_live_qa_runtime_install.py" \
+    "${rollback_reconcile_args[@]}" \
     --no-restart \
     --expected-csp-mode "$EXPECTED_CSP_MODE" \
     --edge-origin "$EDGE_ORIGIN" \
