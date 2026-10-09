@@ -90,6 +90,9 @@ function safeReadPlan(): DiagnosticPlan | null {
         || (directory.mode & 0o777) !== 0o711) {
       return null;
     }
+    if (typeof process.getgid !== "function") {
+      return null;
+    }
     fd = openSync(PLAN_PATH, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     const before = fstatSync(fd);
     if (!before.isFile() || before.uid !== 0 || before.gid !== process.getgid()

@@ -633,11 +633,36 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 }),
                 encoding="ascii",
             )
+            release_info = (release_root / "RELEASE.json").stat()
+            original_fstat = diagnostic_module.os.fstat
+
+            def fstat_with_uid(fd: int, uid: int):
+                observed = original_fstat(fd)
+                if (observed.st_dev, observed.st_ino) != (
+                    release_info.st_dev,
+                    release_info.st_ino,
+                ):
+                    return observed
+                fields = list(observed)
+                fields[4] = uid
+                return diagnostic_module.os.stat_result(fields)
+
             with patch.object(diagnostic_module, "__file__", str(module_path)):
-                self.assertEqual(
-                    diagnostic_module._read_release_identity(),
-                    ("b" * 40, "release-bbbbbbbbbbbb"),
-                )
+                with patch.object(
+                    diagnostic_module.os,
+                    "fstat",
+                    side_effect=lambda fd: fstat_with_uid(fd, 0),
+                ):
+                    self.assertEqual(
+                        diagnostic_module._read_release_identity(),
+                        ("b" * 40, "release-bbbbbbbbbbbb"),
+                    )
+                with patch.object(
+                    diagnostic_module.os,
+                    "fstat",
+                    side_effect=lambda fd: fstat_with_uid(fd, 1),
+                ):
+                    self.assertIsNone(diagnostic_module._read_release_identity())
 
     def test_diagnostic_plan_rejects_other_service_duplicate_keys_and_long_window(self) -> None:
         with self.assertRaises(ValueError):

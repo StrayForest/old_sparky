@@ -177,7 +177,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _install_supervisor_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
+    def _install_supervisor_fixture(
+        root: Path, *, include_cpu_diagnostic_tool: bool = False
+    ) -> tuple[Path, Path, Path, Path]:
         """Install an exact supervisor copy under the production path shape.
 
         The real supervisor derives its trusted generation from ``BASH_SOURCE``
@@ -263,6 +265,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "platform_update_cloudflare_ips.py",
             "platform_storage_evidence_summary.py",
         )
+        if include_cpu_diagnostic_tool:
+            host_tool_files += ("platform_cpu_diagnostic_plan.py",)
         for name in host_tool_files:
             destination = generation_dir / name
             if name == "platform_release_lock.sh":
@@ -2575,7 +2579,7 @@ fail 'private lock detail must not cross the public channel'
         with tempfile.TemporaryDirectory() as temporary:
             fixture_root = Path(temporary)
             fixture, release_lock, retained_lock, generation_dir = self._install_supervisor_fixture(
-                fixture_root
+                fixture_root, include_cpu_diagnostic_tool=True
             )
 
             def cleanup_fixture() -> None:
@@ -3695,7 +3699,9 @@ fail 'private lock detail must not cross the public channel'
         with tempfile.TemporaryDirectory(prefix="deploy-artifact-errors-") as tmp:
             fixture_root = Path(tmp)
             supervisor, release_lock, retained_lock, generation_dir = (
-                self._install_supervisor_fixture(fixture_root)
+                self._install_supervisor_fixture(
+                    fixture_root, include_cpu_diagnostic_tool=True
+                )
             )
 
             def cleanup_fixture() -> None:
@@ -3872,7 +3878,9 @@ fail 'private lock detail must not cross the public channel'
         with tempfile.TemporaryDirectory() as temporary:
             fixture_root = Path(temporary)
             supervisor, release_lock, retained_lock, generation_dir = (
-                self._install_supervisor_fixture(fixture_root)
+                self._install_supervisor_fixture(
+                    fixture_root, include_cpu_diagnostic_tool=True
+                )
             )
 
             def cleanup_fixture() -> None:

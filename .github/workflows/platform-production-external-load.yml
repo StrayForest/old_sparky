@@ -1433,9 +1433,39 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set +e
-          ssh -F "$RUNNER_TEMP/external-ssh/config" -O exit "$PROD_SSH_USER@$PROD_SSH_HOST" >/dev/null 2>&1
-          rm -rf -- "$RUNNER_TEMP/external-ssh"
-          test ! -e "$RUNNER_TEMP/external-ssh" && test ! -L "$RUNNER_TEMP/external-ssh"
+          ssh_dir="$RUNNER_TEMP/external-ssh"
+          control_path="/tmp/old-sparky-external-load-ssh-cpudiag-$GITHUB_RUN_ID"
+          cleanup_status=0
+          if [[ -L "$control_path" ]]; then
+            cleanup_status=1
+          elif [[ -S "$control_path" ]]; then
+            ssh -F "$ssh_dir/config" -O exit "$PROD_SSH_USER@$PROD_SSH_HOST" >/dev/null 2>&1 \
+              || cleanup_status=$?
+            [[ ! -e "$control_path" && ! -L "$control_path" ]] || cleanup_status=1
+          elif [[ -e "$control_path" ]]; then
+            cleanup_status=1
+          fi
+          if [[ -L "$ssh_dir" ]]; then
+            cleanup_status=1
+          elif [[ -d "$ssh_dir" ]]; then
+            expected_dir_owner="$(id -u):700"
+            observed_dir_owner="$(stat -c '%u:%a' -- "$ssh_dir" 2>/dev/null)" \
+              || cleanup_status=1
+            if [[ "$observed_dir_owner" == "$expected_dir_owner" ]]; then
+              rm -rf -- "$ssh_dir" || cleanup_status=$?
+            else
+              cleanup_status=1
+            fi
+          elif [[ -e "$ssh_dir" ]]; then
+            cleanup_status=1
+          fi
+          test ! -e "$control_path" && test ! -L "$control_path" || cleanup_status=1
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir" || cleanup_status=1
+          if [[ ! -e "$control_path" && ! -L "$control_path" \
+              && ! -e "$ssh_dir" && ! -L "$ssh_dir" && "$cleanup_status" == 0 ]]; then
+            exit 0
+          fi
+          exit 1
 
   fixture-finalize:
     name: Signal fixture completion and collect origin evidence

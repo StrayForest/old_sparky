@@ -5,7 +5,9 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from uuid import uuid4
+from unittest.mock import patch
 
 from sqlalchemy import delete, event, select, update
 
@@ -13,6 +15,7 @@ from apps.platform_api.app.services.media import (
     compatibility_media_url,
     load_media_descriptors,
 )
+from apps.platform_api.app.services import media as media_service
 from apps.platform_api.app.services.user_account_read_models import (
     build_user_account_read_model,
 )
@@ -250,6 +253,15 @@ class MediaServiceIntegrationTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(len(descriptors[accepted.asset_id].variants), 3)
 
     async def test_account_read_uses_joined_avatar_without_reloading_asset(self) -> None:
+        media_settings = patch.object(
+            media_service,
+            "get_settings",
+            return_value=SimpleNamespace(
+                platform_media_public_base_url="http://127.0.0.1:9000"
+            ),
+        )
+        media_settings.start()
+        self.addCleanup(media_settings.stop)
         accepted = await self._accept_avatar()
         await self.service.process_asset(accepted.asset_id)
         asset = await self.db_session.get(MediaAsset, accepted.asset_id)

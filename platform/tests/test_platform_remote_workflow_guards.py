@@ -234,7 +234,23 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
                         remote_dispatcher,
                     )
                     self.assertIn('if arguments == ["live-user-qa"]:', remote_dispatcher)
-                    self.assertIn("return _run_sudo(\n                LIVE_USER_QA_HELPER,", remote_dispatcher)
+                    dispatch_start = remote_dispatcher.index(
+                        '        if arguments == ["live-user-qa"]:',
+                        remote_dispatcher.index("payload = load_stdin_payload(mode=mode)"),
+                    )
+                    dispatch_end_match = re.search(
+                        r"(?m)^        app_target_sha, _expected_baseline, source_arguments = _source_binding_context\(payload\)$",
+                        remote_dispatcher[dispatch_start + 1 :],
+                    )
+                    self.assertIsNotNone(dispatch_end_match)
+                    dispatch_end = dispatch_start + 1 + dispatch_end_match.start()
+                    live_user_route = remote_dispatcher[dispatch_start:dispatch_end]
+                    self.assertIn("return _run_live_user_qa_sudo(", live_user_route)
+                    self.assertIn(
+                        "[payload[\"target_sha\"], *source_arguments]", live_user_route
+                    )
+                    self.assertIn("expected_sha=payload[\"target_sha\"]", live_user_route)
+                    self.assertIn("expected_app_sha=app_target_sha", live_user_route)
                     trusted_helper = (
                         PLATFORM_ROOT / "tools/platform_live_user_qa_dispatch.py"
                     ).read_text(encoding="utf-8")

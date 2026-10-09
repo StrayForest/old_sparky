@@ -3807,13 +3807,14 @@ def _is_fixed_live_browser_command(command: list[str]) -> bool:
         env_end += 1
     if env_end == 0 or env_end + 5 > len(tail):
         return False
-    runtime_root_ok = lambda value: value.startswith(
-        (
-            "/var/lib/oldsparky-liveqa/",
-            "/opt/oldsparky/platform/shared/",
-            "/root/.oldsparky/liveqa/releases/",
+    def runtime_root_ok(value: str) -> bool:
+        return value.startswith(
+            (
+                "/var/lib/oldsparky-liveqa/",
+                "/opt/oldsparky/platform/shared/",
+                "/root/.oldsparky/liveqa/releases/",
+            )
         )
-    )
     node, cli, subcommand, config, spec, *extra = tail[env_end:]
     if (
         not runtime_root_ok(node)

@@ -470,6 +470,14 @@ previous v3 host generation. Exact-SHA CI, approved provisioning and a
 post-provision capability check remain required before the CPU diagnostic
 action is available.
 
+The source-quality correction uses **C2**
+`7c4a4b43434b3d104c060778583f44d0bb22e682`, descended from **E**. It changes
+only the pinned dispatcher and CPU-plan controller bytes; the 15-member v4
+layout and capabilities are unchanged. Pin-only **E2**
+`801e785840adce76528389e47cd22cfa9c6b62d5` names C2 and records its exact
+closure digests. The strict resolver selects C2 from E2, but neither commit
+proves that C2 has been provisioned or installed.
+
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
    blocked.

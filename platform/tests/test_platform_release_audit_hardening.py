@@ -1570,7 +1570,8 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             r")\"\s*\\?\s*$"
         )
         ssh_directory_cleanup = re.compile(
-            r'(?m)^\s*rm -rf -- "\$(?:ssh_dir|SSH_DIR)"\s*$'
+            r'(?m)^\s*rm -rf -- "\$(?:ssh_dir|SSH_DIR)"'
+            r'(?:\s*\|\|\s*cleanup_status=\$\?)?\s*$'
         )
         workflow_paths = sorted(
             (*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml"))
