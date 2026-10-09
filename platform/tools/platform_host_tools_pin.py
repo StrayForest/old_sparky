@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import stat
@@ -26,9 +27,33 @@ PIN_RELATIVE_PATH = Path("platform/contracts/host_tools_pin.json")
 MAX_PIN_BYTES = 16 * 1024
 MAX_CLOSURE_FILES = 32
 MAX_FILE_BYTES = 512 * 1024
+MAX_SOURCE_CONTRACT_BYTES = 64 * 1024
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PATH_RE = re.compile(r"^platform/tools/platform_[A-Za-z0-9_.-]+\.(?:py|sh)$")
+LEGACY_HOST_TOOL_NAMES = (
+    "platform_workflow_remote_dispatch.py",
+    "platform_workflow_input_guard.py",
+    "platform_prepare_artifact_dir.py",
+    "platform_production_deploy_supervisor.sh",
+    "platform_release_lock.sh",
+    "platform_release_preflight.sh",
+    "platform_validate_release_artifact.py",
+    "platform_safe_env_exec.py",
+    "platform_render_service_envs.py",
+    "platform_validate_edge_policy.py",
+    "platform_configure_shared_env.py",
+    "platform_update_cloudflare_ips.py",
+    "platform_storage_evidence_summary.py",
+    "platform_retained_load_export_executor.py",
+)
+CPU_DIAGNOSTIC_HOST_TOOL_NAMES = LEGACY_HOST_TOOL_NAMES + (
+    "platform_cpu_diagnostic_plan.py",
+)
+SUPPORTED_HOST_TOOL_LAYOUTS = (
+    LEGACY_HOST_TOOL_NAMES,
+    CPU_DIAGNOSTIC_HOST_TOOL_NAMES,
+)
 
 
 class HostToolsPinError(ValueError):
@@ -141,12 +166,63 @@ def _bundle_file_names(source_root: Path) -> tuple[str, ...]:
     tools_dir = source_root / "platform" / "tools"
     if tools_dir.is_symlink() or not tools_dir.is_dir():
         raise HostToolsPinError("host-tools tools directory is unsafe")
+    declaration_path = tools_dir / "platform_host_tools_bundle.py"
     try:
-        source = (tools_dir / "platform_host_tools_bundle.py").read_text(
-            encoding="utf-8"
-        )
+        before = declaration_path.lstat()
     except OSError as exc:
         raise HostToolsPinError("host-tools bundle helper is unavailable") from exc
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > MAX_SOURCE_CONTRACT_BYTES
+    ):
+        raise HostToolsPinError("host-tools bundle declaration metadata is unsafe")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            declaration_path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size != before.st_size
+            or opened.st_mtime_ns != before.st_mtime_ns
+            or opened.st_ctime_ns != before.st_ctime_ns
+            or opened.st_size > MAX_SOURCE_CONTRACT_BYTES
+        ):
+            raise HostToolsPinError("host-tools bundle declaration changed")
+        raw = bytearray()
+        while len(raw) <= MAX_SOURCE_CONTRACT_BYTES:
+            chunk = os.read(descriptor, MAX_SOURCE_CONTRACT_BYTES + 1 - len(raw))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev != opened.st_dev
+            or after.st_ino != opened.st_ino
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+            or len(raw) != after.st_size
+            or len(raw) > MAX_SOURCE_CONTRACT_BYTES
+        ):
+            raise HostToolsPinError("host-tools bundle declaration changed")
+        source = bytes(raw).decode("utf-8")
+    except HostToolsPinError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise HostToolsPinError("host-tools bundle helper is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     # The closure declaration is deliberately simple and bounded.  Importing
     # target source here would make a source-only pin gate depend on arbitrary
     # module imports, so parse only its literal HOST_TOOL_FILES tuple.
@@ -164,11 +240,16 @@ def _bundle_file_names(source_root: Path) -> tuple[str, ...]:
     declared_groups = tuple(re.findall(r"[A-Z_]+", expression))
     residual_expression = re.sub(r"[A-Z_]+", "", expression)
     allowed_declarations = {
-        ("PREPARE_ARTIFACT_FILES", "PRODUCTION_DEPLOY_CONTROL_FILES"),
         (
             "PREPARE_ARTIFACT_FILES",
             "PRODUCTION_DEPLOY_CONTROL_FILES",
             "RETAINED_LOAD_ARTIFACT_FILES",
+        ),
+        (
+            "PREPARE_ARTIFACT_FILES",
+            "PRODUCTION_DEPLOY_CONTROL_FILES",
+            "RETAINED_LOAD_ARTIFACT_FILES",
+            "CPU_DIAGNOSTIC_CONTROL_FILES",
         ),
     }
     if (
@@ -181,6 +262,7 @@ def _bundle_file_names(source_root: Path) -> tuple[str, ...]:
         "PREPARE_ARTIFACT_FILES",
         "PRODUCTION_DEPLOY_CONTROL_FILES",
         "RETAINED_LOAD_ARTIFACT_FILES",
+        "CPU_DIAGNOSTIC_CONTROL_FILES",
     }
     groups_by_name: dict[str, str] = {}
     for match in group_pattern.finditer(source):
@@ -189,19 +271,40 @@ def _bundle_file_names(source_root: Path) -> tuple[str, ...]:
             if name in groups_by_name:
                 raise HostToolsPinError("host-tools closure declaration is invalid")
             groups_by_name[name] = match.group(2)
-    if set(groups_by_name) != set(declared_groups):
+    legacy_group_names = {
+        "PREPARE_ARTIFACT_FILES",
+        "PRODUCTION_DEPLOY_CONTROL_FILES",
+        "RETAINED_LOAD_ARTIFACT_FILES",
+    }
+    extended_group_names = legacy_group_names | {"CPU_DIAGNOSTIC_CONTROL_FILES"}
+    if (
+        frozenset(declared_groups) not in {frozenset(legacy_group_names), frozenset(extended_group_names)}
+        or frozenset(groups_by_name) not in {frozenset(legacy_group_names), frozenset(extended_group_names)}
+        or not set(declared_groups) <= set(groups_by_name)
+    ):
         raise HostToolsPinError("host-tools closure declaration is invalid")
     names: list[str] = []
-    for name in declared_groups:
-        group = groups_by_name[name]
+    parsed_groups: dict[str, tuple[str, ...]] = {}
+    for name, group in groups_by_name.items():
         strings = re.findall(r'"([^\"]+)"', group)
         residual = re.sub(r'"[^\"]+"', "", group)
         if residual.strip(" ,\t\r\n"):
             raise HostToolsPinError("host-tools closure declaration is invalid")
-        names.extend(strings)
+        parsed_groups[name] = tuple(strings)
+    if (
+        "CPU_DIAGNOSTIC_CONTROL_FILES" in parsed_groups
+        and parsed_groups["CPU_DIAGNOSTIC_CONTROL_FILES"]
+        != ("platform_cpu_diagnostic_plan.py",)
+    ):
+        raise HostToolsPinError("host-tools closure declaration is invalid")
+    for name in declared_groups:
+        names.extend(parsed_groups[name])
     if not names or len(names) > MAX_CLOSURE_FILES or len(set(names)) != len(names):
         raise HostToolsPinError("host-tools closure declaration is invalid")
-    return tuple(names)
+    result = tuple(names)
+    if result not in SUPPORTED_HOST_TOOL_LAYOUTS:
+        raise HostToolsPinError("host-tools closure does not match a supported layout")
+    return result
 
 
 def _validate_closure(source_root: Path, closure: object) -> None:

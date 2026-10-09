@@ -150,10 +150,10 @@ content contracts).  The bundle manifest binds the source SHA, toolset version,
 component closure, capabilities, POSIX-relative filenames, numeric Unix modes
 and SHA-256 digests.  The generated `files.modes` sidecar serializes those
 modes as the conventional octal text emitted by `stat -c %a` (`444`/`555`) for
-shell preflight consumers.  Its two components are kept explicit:
+shell preflight consumers. Its three components are kept explicit:
 
 - `prepare_artifact`: the fixed dispatcher, input guard and artifact-directory
-  helper;
+helper;
 - `production_deploy_control`: the supervisor, release lock/preflight,
   standalone artifact validator, safe-environment/render helpers,
   edge-policy/update helpers and shared-environment/storage evidence
@@ -167,6 +167,17 @@ substituted into the trusted generation. The retained-load export executor is
 a narrow exception: it is part of the immutable host generation because it
 removes only two exact, closed export roots after the workflow has copied and
 validated them.
+
+The trusted candidate validator supports two exact source layouts while this
+transition is in progress: the installed `production-host-tools-v3` closure
+with 14 tools and three components, and a `production-host-tools-v4` candidate
+closure with those same 14 tools plus `platform_cpu_diagnostic_plan.py` in a
+fourth `cpu_diagnostic_control` component. The candidate parser accepts only
+those fixed ordered paths, component groups and capability tuples. It parses
+the candidate declarations as bounded literals and never imports or executes
+candidate code. Adding v4 support to the trusted validator does not mean that
+v4 is installed: provisioning evidence must still prove the exact installed
+generation before any v4 capability is considered available.
 
 ## Workflow boundary
 

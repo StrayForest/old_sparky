@@ -10,6 +10,7 @@ but it never executes an installer from it or copies it to the host.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ TOOLSET_VERSION = "production-host-tools-v3"
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024
+MAX_SOURCE_CONTRACT_BYTES = 64 * 1024
 MAX_FILE_COUNT = 32
 MEMBER_ROOT = "platform-host-tools"
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -77,6 +79,32 @@ CAPABILITIES = (
     "python_isolated",
     "python_bytecode_disabled",
 )
+CPU_DIAGNOSTIC_CONTROL_FILES = ("platform_cpu_diagnostic_plan.py",)
+LEGACY_HOST_TOOL_FILES = HOST_TOOL_FILES
+CPU_DIAGNOSTIC_HOST_TOOL_FILES = HOST_TOOL_FILES + CPU_DIAGNOSTIC_CONTROL_FILES
+LEGACY_COMPONENT_FILES = {
+    component: tuple(names) for component, names in COMPONENT_FILES.items()
+}
+CPU_DIAGNOSTIC_COMPONENT_FILES = {
+    **LEGACY_COMPONENT_FILES,
+    "cpu_diagnostic_control": CPU_DIAGNOSTIC_CONTROL_FILES,
+}
+CPU_DIAGNOSTIC_CAPABILITIES = CAPABILITIES + ("cpu_diagnostic_plan_control",)
+SUPPORTED_HOST_TOOL_FILES = frozenset(CPU_DIAGNOSTIC_HOST_TOOL_FILES)
+SUPPORTED_LAYOUTS = (
+    {
+        "files": LEGACY_HOST_TOOL_FILES,
+        "components": LEGACY_COMPONENT_FILES,
+        "capabilities": CAPABILITIES,
+        "toolset_version": TOOLSET_VERSION,
+    },
+    {
+        "files": CPU_DIAGNOSTIC_HOST_TOOL_FILES,
+        "components": CPU_DIAGNOSTIC_COMPONENT_FILES,
+        "capabilities": CPU_DIAGNOSTIC_CAPABILITIES,
+        "toolset_version": "production-host-tools-v4",
+    },
+)
 EXECUTABLE_MODE = 0o555
 DATA_MODE = 0o444
 
@@ -89,7 +117,7 @@ def _source_path(source_root: Path, name: str) -> Path:
     if (
         not isinstance(name, str)
         or SAFE_FILE_RE.fullmatch(name) is None
-        or name not in HOST_TOOL_FILES
+        or name not in SUPPORTED_HOST_TOOL_FILES
     ):
         raise HostToolsBundleError("host-tools file allowlist is invalid")
     path = source_root / "platform" / "tools" / name
@@ -181,16 +209,20 @@ def _canonical_json(payload: object) -> bytes:
     ).encode("ascii")
 
 
-def _capabilities_text(source_sha: str) -> bytes:
+def _capabilities_text(source_sha: str, layout: dict[str, object] | None = None) -> bytes:
+    selected = _layout_for_files(HOST_TOOL_FILES) if layout is None else layout
+    capabilities = selected["capabilities"]
+    components = selected["components"]
+    assert isinstance(capabilities, tuple) and isinstance(components, dict)
     lines = [
         f"schema={SCHEMA}",
-        f"toolset_version={TOOLSET_VERSION}",
+        f"toolset_version={selected['toolset_version']}",
         f"source_sha={source_sha}",
-        *(f"capability={capability}" for capability in CAPABILITIES),
-        *(f"component={component}" for component in COMPONENT_FILES),
+        *(f"capability={capability}" for capability in capabilities),
+        *(f"component={component}" for component in components),
         *(
             f"component_file={component}:{name}"
-            for component, names in COMPONENT_FILES.items()
+            for component, names in components.items()
             for name in names
         ),
     ]
@@ -207,15 +239,23 @@ def _zip_info(name: str, mode: int) -> zipfile.ZipInfo:
     return info
 
 
-def _manifest(source_sha: str, records: list[dict[str, object]]) -> dict[str, object]:
+def _manifest(
+    source_sha: str,
+    records: list[dict[str, object]],
+    layout: dict[str, object] | None = None,
+) -> dict[str, object]:
+    selected = _layout_for_files(HOST_TOOL_FILES) if layout is None else layout
+    capabilities = selected["capabilities"]
+    components = selected["components"]
+    assert isinstance(capabilities, tuple) and isinstance(components, dict)
     return {
         "schema": SCHEMA,
-        "toolset_version": TOOLSET_VERSION,
+        "toolset_version": selected["toolset_version"],
         "source_sha": source_sha,
         "generation": source_sha,
-        "capabilities": list(CAPABILITIES),
+        "capabilities": list(capabilities),
         "components": {
-            component: list(names) for component, names in COMPONENT_FILES.items()
+            component: list(names) for component, names in components.items()
         },
         "limits": {
             "max_bundle_bytes": MAX_BUNDLE_BYTES,
@@ -226,21 +266,126 @@ def _manifest(source_sha: str, records: list[dict[str, object]]) -> dict[str, ob
     }
 
 
+def _layout_for_files(names: tuple[str, ...]) -> dict[str, object]:
+    for layout in SUPPORTED_LAYOUTS:
+        if names == layout["files"]:
+            return layout
+    raise HostToolsBundleError("host-tools closure layout is unsupported")
+
+
+def _literal_assignment(module: ast.Module, name: str) -> ast.expr:
+    matches: list[ast.expr] = []
+    for statement in module.body:
+        if isinstance(statement, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in statement.targets
+        ):
+            matches.append(statement.value)
+        elif isinstance(statement, ast.AnnAssign) and (
+            isinstance(statement.target, ast.Name) and statement.target.id == name
+        ):
+            if statement.value is None:
+                raise HostToolsBundleError("host-tools source contract is not literal")
+            matches.append(statement.value)
+    if len(matches) != 1:
+        raise HostToolsBundleError("host-tools source contract is ambiguous")
+    return matches[0]
+
+
+def _literal_string_tuple(value: ast.expr) -> tuple[str, ...]:
+    if not isinstance(value, (ast.Tuple, ast.List)):
+        raise HostToolsBundleError("host-tools source tuple is invalid")
+    items: list[str] = []
+    for item in value.elts:
+        if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+            raise HostToolsBundleError("host-tools source tuple is not literal")
+        items.append(item.value)
+    if len(items) != len(set(items)):
+        raise HostToolsBundleError("host-tools source tuple contains duplicates")
+    return tuple(items)
+
+
+def _closure_group_order(value: ast.expr) -> tuple[str, ...]:
+    if isinstance(value, ast.Name):
+        return (value.id,)
+    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+        return _closure_group_order(value.left) + _closure_group_order(value.right)
+    raise HostToolsBundleError("host-tools closure declaration is invalid")
+
+
+def _source_layout(source_root: Path) -> dict[str, object]:
+    """Read a fixed supported source declaration without importing candidate code."""
+
+    _regular_directory(source_root)
+    _regular_directory(source_root / "platform")
+    _regular_directory(source_root / "platform" / "tools")
+    helper_path = source_root / "platform" / "tools" / "platform_host_tools_bundle.py"
+    raw = _read_source(helper_path)
+    if len(raw) > MAX_SOURCE_CONTRACT_BYTES:
+        raise HostToolsBundleError("host-tools source contract exceeds its bound")
+    try:
+        module = ast.parse(raw.decode("utf-8"), filename="platform_host_tools_bundle.py")
+    except (UnicodeError, SyntaxError, ValueError, RecursionError) as exc:
+        raise HostToolsBundleError("host-tools source contract cannot be parsed") from exc
+    group_order = _closure_group_order(_literal_assignment(module, "HOST_TOOL_FILES"))
+    expected_orders = (
+        ("PREPARE_ARTIFACT_FILES", "PRODUCTION_DEPLOY_CONTROL_FILES", "RETAINED_LOAD_ARTIFACT_FILES"),
+        (
+            "PREPARE_ARTIFACT_FILES", "PRODUCTION_DEPLOY_CONTROL_FILES",
+            "RETAINED_LOAD_ARTIFACT_FILES", "CPU_DIAGNOSTIC_CONTROL_FILES",
+        ),
+    )
+    if group_order not in expected_orders:
+        raise HostToolsBundleError("host-tools closure declaration is unsupported")
+    names: list[str] = []
+    groups_by_name: dict[str, tuple[str, ...]] = {}
+    for group in group_order:
+        values = _literal_string_tuple(_literal_assignment(module, group))
+        groups_by_name[group] = values
+        names.extend(values)
+    layout = _layout_for_files(tuple(names))
+
+    raw_components = _literal_assignment(module, "COMPONENT_FILES")
+    if not isinstance(raw_components, ast.Dict) or len(raw_components.keys) > 8:
+        raise HostToolsBundleError("host-tools component declaration is invalid")
+    components: dict[str, tuple[str, ...]] = {}
+    for key, value in zip(raw_components.keys, raw_components.values):
+        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+            raise HostToolsBundleError("host-tools component name is not literal")
+        if key.value in components:
+            raise HostToolsBundleError("host-tools component name is duplicated")
+        if not isinstance(value, ast.Name) or value.id not in groups_by_name:
+            raise HostToolsBundleError("host-tools component group is not fixed")
+        components[key.value] = groups_by_name[value.id]
+    if components != layout["components"]:
+        raise HostToolsBundleError("host-tools component contract does not match closure")
+
+    capabilities = _literal_string_tuple(_literal_assignment(module, "CAPABILITIES"))
+    if capabilities != layout["capabilities"]:
+        raise HostToolsBundleError("host-tools capability contract does not match closure")
+    version_expr = _literal_assignment(module, "TOOLSET_VERSION")
+    if not isinstance(version_expr, ast.Constant) or version_expr.value != layout["toolset_version"]:
+        raise HostToolsBundleError("host-tools version contract does not match closure")
+    return layout
+
+
 def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, object]:
     """Create a deterministic ZIP and return its verified manifest summary."""
 
     if SOURCE_SHA_RE.fullmatch(source_sha) is None:
         raise HostToolsBundleError("source SHA is invalid")
-    if len(HOST_TOOL_FILES) > MAX_FILE_COUNT:
-        raise HostToolsBundleError("host-tools closure exceeds its file bound")
-
     _regular_directory(source_root)
     _regular_directory(source_root / "platform")
     _regular_directory(source_root / "platform" / "tools")
+    layout = _source_layout(source_root)
+    names = layout["files"]
+    assert isinstance(names, tuple)
+    if len(names) > MAX_FILE_COUNT:
+        raise HostToolsBundleError("host-tools closure exceeds its file bound")
 
     contents: dict[str, bytes] = {}
     records: list[dict[str, object]] = []
-    for name in HOST_TOOL_FILES:
+    for name in names:
         path = _source_path(source_root, name)
         data = _read_source(path)
         mode = EXECUTABLE_MODE
@@ -249,7 +394,7 @@ def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, 
             {"path": name, "sha256": _sha256_bytes(data), "mode": mode}
         )
 
-    capabilities = _capabilities_text(source_sha)
+    capabilities = _capabilities_text(source_sha, layout)
     contents["capabilities.txt"] = capabilities
     records.append(
         {
@@ -259,7 +404,7 @@ def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, 
         }
     )
     records.sort(key=lambda record: str(record["path"]))
-    manifest = _manifest(source_sha, records)
+    manifest = _manifest(source_sha, records, layout)
     manifest_bytes = _canonical_json(manifest)
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -281,7 +426,7 @@ def build_bundle(source_root: Path, source_sha: str, output: Path) -> dict[str, 
                 allowZip64=False,
             ) as archive:
                 archive.writestr(_zip_info("capabilities.txt", DATA_MODE), capabilities)
-                for name in HOST_TOOL_FILES:
+                for name in names:
                     archive.writestr(_zip_info(name, EXECUTABLE_MODE), contents[name])
                 archive.writestr(_zip_info("manifest.json", DATA_MODE), manifest_bytes)
             stream.flush()
@@ -328,7 +473,38 @@ def _safe_member(info: zipfile.ZipInfo) -> str:
     return name.split("/", 1)[1]
 
 
-def _validate_manifest(payload: object, expected_source_sha: str | None) -> dict[str, object]:
+def _layout_from_manifest(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise HostToolsBundleError("host-tools manifest is not an object")
+    records = payload.get("files")
+    if not isinstance(records, list):
+        raise HostToolsBundleError("host-tools manifest file records are invalid")
+    paths: list[str] = []
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            raise HostToolsBundleError("host-tools manifest file record is invalid")
+        if record["path"] != "capabilities.txt":
+            paths.append(record["path"])
+    for layout in SUPPORTED_LAYOUTS:
+        expected_paths = sorted(layout["files"])
+        if (
+            paths == expected_paths
+            and payload.get("toolset_version") == layout["toolset_version"]
+            and payload.get("capabilities") == list(layout["capabilities"])
+            and payload.get("components") == {
+                component: list(names)
+                for component, names in layout["components"].items()
+            }
+        ):
+            return layout
+    raise HostToolsBundleError("host-tools manifest layout is unsupported")
+
+
+def _validate_manifest(
+    payload: object,
+    expected_source_sha: str | None,
+    layout: dict[str, object] | None = None,
+) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise HostToolsBundleError("host-tools manifest is not an object")
     if set(payload) != {
@@ -347,21 +523,22 @@ def _validate_manifest(payload: object, expected_source_sha: str | None) -> dict
         raise HostToolsBundleError("host-tools source SHA is invalid")
     if expected_source_sha is not None and source_sha != expected_source_sha:
         raise HostToolsBundleError("host-tools source SHA does not match target")
+    selected = _layout_from_manifest(payload) if layout is None else layout
     if (
         type(payload.get("schema")) is not int
         or payload.get("schema") != SCHEMA
         or type(payload.get("toolset_version")) is not str
-        or payload.get("toolset_version") != TOOLSET_VERSION
+        or payload.get("toolset_version") != selected["toolset_version"]
     ):
         raise HostToolsBundleError("host-tools manifest version is invalid")
     if payload.get("generation") != source_sha:
         raise HostToolsBundleError("host-tools generation is not source-bound")
     capabilities = payload.get("capabilities")
-    if capabilities != list(CAPABILITIES):
+    if capabilities != list(selected["capabilities"]):
         raise HostToolsBundleError("host-tools capabilities are invalid")
     components = payload.get("components")
     if components != {
-        component: list(names) for component, names in COMPONENT_FILES.items()
+        component: list(names) for component, names in selected["components"].items()
     }:
         raise HostToolsBundleError("host-tools component closure is invalid")
     limits = payload.get("limits")
@@ -380,9 +557,11 @@ def _validate_manifest(payload: object, expected_source_sha: str | None) -> dict
     ):
         raise HostToolsBundleError("host-tools limits are invalid")
     records = payload.get("files")
-    if not isinstance(records, list) or len(records) != len(HOST_TOOL_FILES) + 1:
+    names = selected["files"]
+    assert isinstance(names, tuple)
+    if not isinstance(records, list) or len(records) != len(names) + 1:
         raise HostToolsBundleError("host-tools manifest file count is invalid")
-    expected_paths = set(HOST_TOOL_FILES) | {"capabilities.txt"}
+    expected_paths = set(names) | {"capabilities.txt"}
     actual_paths: set[str] = set()
     for record in records:
         if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
@@ -426,7 +605,7 @@ def verify_bundle(bundle: Path, expected_source_sha: str | None = None) -> dict[
     try:
         with zipfile.ZipFile(bundle, mode="r", allowZip64=False) as archive:
             infos = archive.infolist()
-            if len(infos) != len(HOST_TOOL_FILES) + 2 or len(infos) > MAX_FILE_COUNT + 1:
+            if len(infos) > max(len(layout["files"]) for layout in SUPPORTED_LAYOUTS) + 2 or len(infos) > MAX_FILE_COUNT + 2:
                 raise HostToolsBundleError("host-tools archive member count is invalid")
             members: dict[str, bytes] = {}
             modes: dict[str, int] = {}
@@ -450,13 +629,8 @@ def verify_bundle(bundle: Path, expected_source_sha: str | None = None) -> dict[
             raise
         raise HostToolsBundleError("host-tools archive is invalid") from exc
 
-    expected_members = set(HOST_TOOL_FILES) | {"capabilities.txt", "manifest.json"}
-    if set(members) != expected_members:
-        raise HostToolsBundleError("host-tools archive member allowlist is invalid")
     if modes.get("manifest.json") != DATA_MODE or modes.get("capabilities.txt") != DATA_MODE:
         raise HostToolsBundleError("host-tools data mode is invalid")
-    if any(modes[name] != EXECUTABLE_MODE for name in HOST_TOOL_FILES):
-        raise HostToolsBundleError("host-tools executable mode is invalid")
 
     try:
         manifest = json.loads(
@@ -465,9 +639,15 @@ def verify_bundle(bundle: Path, expected_source_sha: str | None = None) -> dict[
         )
     except (UnicodeError, json.JSONDecodeError, HostToolsBundleError) as exc:
         raise HostToolsBundleError("host-tools manifest encoding is invalid") from exc
-    _validate_manifest(manifest, expected_source_sha)
+    layout = _layout_from_manifest(manifest)
+    expected_members = set(layout["files"]) | {"capabilities.txt", "manifest.json"}
+    if set(members) != expected_members:
+        raise HostToolsBundleError("host-tools archive member allowlist is invalid")
+    if any(modes[name] != EXECUTABLE_MODE for name in layout["files"]):
+        raise HostToolsBundleError("host-tools executable mode is invalid")
+    _validate_manifest(manifest, expected_source_sha, layout)
     records = {str(record["path"]): record for record in manifest["files"]}
-    if members["capabilities.txt"] != _capabilities_text(str(manifest["source_sha"])):
+    if members["capabilities.txt"] != _capabilities_text(str(manifest["source_sha"]), layout):
         raise HostToolsBundleError("host-tools capabilities payload is invalid")
     for name, record in records.items():
         if _sha256_bytes(members[name]) != record["sha256"]:
