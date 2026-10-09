@@ -429,6 +429,14 @@ Changes to any member of the host-control closure, its closure declaration or
 the bundle helper must be handled as a reviewed **C → P** source sequence,
 never by pinning the commit that carries the pin itself:
 
+The 2026-10-09 performance candidate uses source commit
+`93f8a8e0f7a2cb32d2444e2d69ae5c09ba669dee` as **C**. Its host-tools closure
+delta is limited to `platform_configure_shared_env.py` and
+`platform_validate_release_artifact.py`; the application and browser-runtime
+changes remain outside that 14-member closure. The pin-bearing **P** records
+the raw SHA-256 digests and Git modes of all 14 files from **C**. This source
+identity alone does not establish installation or deployment.
+
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
    blocked.
