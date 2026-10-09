@@ -629,6 +629,33 @@ class HostToolsBundleTests(unittest.TestCase):
                     encoding="ascii",
                 )
                 self.assertEqual(pin._bundle_file_names(source_root), names)
+            bundle_source.write_text(
+                group_declarations(legacy_groups)
+                + 'CPU_DIAGNOSTIC_CONTROL_FILES = ("platform_cpu_diagnostic_plan.py",)\n'
+                + "HOST_TOOL_FILES = (PREPARE_ARTIFACT_FILES + "
+                "PRODUCTION_DEPLOY_CONTROL_FILES + RETAINED_LOAD_ARTIFACT_FILES)\n",
+                encoding="ascii",
+            )
+            self.assertEqual(
+                pin._bundle_file_names(source_root),
+                tuple(name for _group, values in legacy_groups for name in values),
+            )
+            bundle_source.write_text(
+                group_declarations(legacy_groups)
+                + 'CPU_DIAGNOSTIC_CONTROL_FILES = ("unapproved_helper.py",)\n'
+                + "HOST_TOOL_FILES = (PREPARE_ARTIFACT_FILES + "
+                "PRODUCTION_DEPLOY_CONTROL_FILES + RETAINED_LOAD_ARTIFACT_FILES)\n",
+                encoding="ascii",
+            )
+            with self.assertRaises(pin.HostToolsPinError):
+                pin._bundle_file_names(source_root)
+            bundle_source.write_text(
+                group_declarations(legacy_groups)
+                + 'CPU_DIAGNOSTIC_CONTROL_FILES = ("platform_cpu_diagnostic_plan.py",)\n'
+                + "HOST_TOOL_FILES = (PREPARE_ARTIFACT_FILES + "
+                "PRODUCTION_DEPLOY_CONTROL_FILES + RETAINED_LOAD_ARTIFACT_FILES)\n",
+                encoding="ascii",
+            )
             valid_declaration = bundle_source.read_bytes()
             bundle_source.write_bytes(
                 valid_declaration + b"#" + b"x" * pin.MAX_SOURCE_CONTRACT_BYTES

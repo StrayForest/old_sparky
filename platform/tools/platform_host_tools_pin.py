@@ -271,16 +271,34 @@ def _bundle_file_names(source_root: Path) -> tuple[str, ...]:
             if name in groups_by_name:
                 raise HostToolsPinError("host-tools closure declaration is invalid")
             groups_by_name[name] = match.group(2)
-    if set(groups_by_name) != set(declared_groups):
+    legacy_group_names = {
+        "PREPARE_ARTIFACT_FILES",
+        "PRODUCTION_DEPLOY_CONTROL_FILES",
+        "RETAINED_LOAD_ARTIFACT_FILES",
+    }
+    extended_group_names = legacy_group_names | {"CPU_DIAGNOSTIC_CONTROL_FILES"}
+    if (
+        frozenset(declared_groups) not in {frozenset(legacy_group_names), frozenset(extended_group_names)}
+        or frozenset(groups_by_name) not in {frozenset(legacy_group_names), frozenset(extended_group_names)}
+        or not set(declared_groups) <= set(groups_by_name)
+    ):
         raise HostToolsPinError("host-tools closure declaration is invalid")
     names: list[str] = []
-    for name in declared_groups:
-        group = groups_by_name[name]
+    parsed_groups: dict[str, tuple[str, ...]] = {}
+    for name, group in groups_by_name.items():
         strings = re.findall(r'"([^\"]+)"', group)
         residual = re.sub(r'"[^\"]+"', "", group)
         if residual.strip(" ,\t\r\n"):
             raise HostToolsPinError("host-tools closure declaration is invalid")
-        names.extend(strings)
+        parsed_groups[name] = tuple(strings)
+    if (
+        "CPU_DIAGNOSTIC_CONTROL_FILES" in parsed_groups
+        and parsed_groups["CPU_DIAGNOSTIC_CONTROL_FILES"]
+        != ("platform_cpu_diagnostic_plan.py",)
+    ):
+        raise HostToolsPinError("host-tools closure declaration is invalid")
+    for name in declared_groups:
+        names.extend(parsed_groups[name])
     if not names or len(names) > MAX_CLOSURE_FILES or len(set(names)) != len(names):
         raise HostToolsPinError("host-tools closure declaration is invalid")
     result = tuple(names)
