@@ -1901,18 +1901,39 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 f"Path({str(installed_timer)!r})",
             )
             def run_timer(raw_input: str) -> subprocess.CompletedProcess[str]:
-                with tempfile.TemporaryFile() as timer_stream:
-                    timer_stream.write(raw_input.encode("utf-8"))
-                    timer_stream.seek(0)
-                    descriptor = timer_stream.fileno()
-                    return subprocess.run(
-                        [sys.executable, "-I", "-", str(runtime), str(descriptor)],
-                        input=timer_reader,
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                        pass_fds=(descriptor,),
-                    )
+                try:
+                    os.fstat(3)
+                    owns_fd3 = False
+                except OSError:
+                    reserved_fd3 = os.open(os.devnull, os.O_RDONLY)
+                    if reserved_fd3 != 3:
+                        os.close(reserved_fd3)
+                        raise AssertionError("expected to reserve child fd 3")
+                    owns_fd3 = True
+                try:
+                    with tempfile.TemporaryFile() as timer_stream:
+                        timer_stream.write(raw_input.encode("utf-8"))
+                        timer_stream.seek(0)
+                        descriptor = timer_stream.fileno()
+                        if descriptor <= 3:
+                            raise AssertionError("timer fixture must use a non-standard fd")
+
+                        def bind_timer_to_fd3() -> None:
+                            os.dup2(descriptor, 3)
+                            os.close(descriptor)
+
+                        return subprocess.run(
+                            [sys.executable, "-I", "-", str(runtime), str(descriptor)],
+                            input=timer_reader,
+                            text=True,
+                            capture_output=True,
+                            check=False,
+                            pass_fds=(descriptor, 3),
+                            preexec_fn=bind_timer_to_fd3,
+                        )
+                finally:
+                    if owns_fd3:
+                        os.close(3)
 
             timer_input = "\n".join(
                 (
