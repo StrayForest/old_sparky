@@ -44,6 +44,12 @@ copy. The installer copies that validator from the immutable generation and
 binds the sibling to its payload-manifest digest before switching the active
 pointer. The sibling is root-owned, non-writable and executable (mode `0555`);
 a missing or altered payload validator or trusted-root copy fails closed.
+When an installer reads an already-active generation only to reuse its
+verified runtime provider, a pre-validator generation may omit the validator
+only if both its payload manifest member and trusted-root sibling are absent.
+All other prior-generation payload, runtime and provider checks remain
+required; new candidate activation and active-generation verification always
+require the manifest-bound validator at both locations.
 
 The only set-id file permitted anywhere in this contour is the root-owned
 Chromium sandbox at its exact reviewed path, mode `04755` and pinned SHA-256.

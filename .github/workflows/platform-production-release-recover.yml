@@ -423,19 +423,22 @@ jobs:
               result = item.get("verificationResult")
               signature = result.get("signature") if isinstance(result, dict) else None
               certificate = signature.get("certificate") if isinstance(signature, dict) else None
-              extensions = certificate.get("extensions") if isinstance(certificate, dict) else None
+              # `gh attestation verify --format=json` emits the parsed X.509
+              # certificate claims directly on this object. Keep this strict:
+              # an unexpected nested shape must not satisfy the policy.
+              certificate_claims = certificate
               statement = result.get("statement") if isinstance(result, dict) else None
               timestamps = result.get("verifiedTimestamps") if isinstance(result, dict) else None
-              if not isinstance(extensions, dict) or not isinstance(statement, dict) or not isinstance(timestamps, list) or not timestamps:
+              if not isinstance(certificate_claims, dict) or not isinstance(statement, dict) or not isinstance(timestamps, list) or not timestamps:
                   continue
               if (
-                  extensions.get("issuer") != "https://token.actions.githubusercontent.com"
-                  or extensions.get("sourceRepositoryURI") != repo
-                  or extensions.get("sourceRepositoryRef") != "refs/heads/dev"
-                  or extensions.get("sourceRepositoryDigest") != os.environ["RECOVERY_WORKFLOW_SHA"]
-                  or extensions.get("buildConfigURI") != build
-                  or extensions.get("buildSignerURI") != build
-                  or extensions.get("runInvocationURI") != runner
+                  certificate_claims.get("issuer") != "https://token.actions.githubusercontent.com"
+                  or certificate_claims.get("sourceRepositoryURI") != repo
+                  or certificate_claims.get("sourceRepositoryRef") != "refs/heads/dev"
+                  or certificate_claims.get("sourceRepositoryDigest") != os.environ["RECOVERY_WORKFLOW_SHA"]
+                  or certificate_claims.get("buildConfigURI") != build
+                  or certificate_claims.get("buildSignerURI") != build
+                  or certificate_claims.get("runInvocationURI") != runner
               ):
                   continue
               subjects = statement.get("subject")

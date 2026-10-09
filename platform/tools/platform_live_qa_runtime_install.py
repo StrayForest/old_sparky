@@ -1117,7 +1117,11 @@ def _runtime_provider_payload(
     manifest = _read_manifest()
     source_sha = str(manifest["source_sha"])
     active_root = PAYLOAD_ROOT / source_sha
-    _validate_payload(manifest, app_dir=app_dir)
+    _validate_payload(
+        manifest,
+        app_dir=app_dir,
+        allow_legacy_release_validator_omission=True,
+    )
     provider_file = active_root / "runtime-provider.json"
     if os.path.lexists(provider_file):
         metadata = _regular(provider_file, mode=0o444, maximum=MAX_RUNTIME_MANIFEST_BYTES)
@@ -1328,6 +1332,7 @@ def _validate_payload(
     *,
     app_dir: Path = APP_DIR,
     validate_provider: bool = True,
+    allow_legacy_release_validator_omission: bool = False,
 ) -> None:
     source_sha = str(payload["source_sha"])
     root = Path(str(payload["payload"]))
@@ -1340,6 +1345,18 @@ def _validate_payload(
     manifest_files = payload["files"]
     if not isinstance(manifest_files, dict):
         raise InstallerError("trusted live-QA manifest file map is invalid")
+    release_validator_relative = "platform/tools/platform_validate_release_artifact.py"
+    release_validator_in_manifest = release_validator_relative in manifest_files
+    release_validator_in_trusted_root = os.path.lexists(RELEASE_VALIDATOR_PATH)
+    if allow_legacy_release_validator_omission and (
+        release_validator_in_manifest != release_validator_in_trusted_root
+    ):
+        raise InstallerError("trusted live-QA legacy validator state is inconsistent")
+    legacy_validator_omission = (
+        allow_legacy_release_validator_omission
+        and not release_validator_in_manifest
+        and not release_validator_in_trusted_root
+    )
     required_files = {
         "platform/tools/platform_live_user_qa_trusted.sh",
         "platform/tools/platform_live_launch_trusted.sh",
@@ -1347,7 +1364,7 @@ def _validate_payload(
         "platform/tools/platform_live_user_qa_dispatch.py",
         "platform/tools/platform_workflow_remote_dispatch.py",
         "platform/tools/platform_workflow_input_guard.py",
-        "platform/tools/platform_validate_release_artifact.py",
+        release_validator_relative,
         "platform/tools/platform_release_lock_exec.sh",
         "platform/tools/platform_release_lock.sh",
         "platform/tools/platform_live_browser_qa.sh",
@@ -1362,6 +1379,8 @@ def _validate_payload(
         "platform/tools/platform_recover_retained_report.py",
         "platform/tools/platform_cleanup_retained_matrix.py",
     }
+    if legacy_validator_omission:
+        required_files.remove(release_validator_relative)
     if not required_files.issubset(manifest_files):
         raise InstallerError("trusted live-QA manifest is missing a required entrypoint")
     provider_path = root / "runtime-provider.json"
@@ -1417,7 +1436,7 @@ def _validate_payload(
                 node_version=str(runtime_manifest["node_version"]),
                 package_lock_sha256=str(runtime_manifest["package_lock_sha256"]),
             )
-    for path, mode, relative in (
+    required_entrypoints = (
         (HELPER_PATH, 0o755, "platform/tools/platform_live_user_qa_trusted.sh"),
         (LAUNCH_HELPER_PATH, 0o755, "platform/tools/platform_live_launch_trusted.sh"),
         (DISPATCHER_PATH, 0o500, "platform/tools/platform_live_user_qa_dispatch.py"),
@@ -1436,7 +1455,10 @@ def _validate_payload(
         (RELEASE_LOCK_EXEC_PATH, 0o555, "platform/tools/platform_release_lock_exec.sh"),
         (RELEASE_LOCK_HELPER_PATH, 0o444, "platform/tools/platform_release_lock.sh"),
         (MAILBOX_HELPER_PATH, 0o500, "platform/tools/platform_live_qa_mailbox_helper.py"),
-    ):
+    )
+    for path, mode, relative in required_entrypoints:
+        if legacy_validator_omission and relative == release_validator_relative:
+            continue
         metadata = _regular(path, mode=mode)
         if metadata.st_nlink != 1:
             raise InstallerError("trusted live-QA entrypoint is hard-linked")
