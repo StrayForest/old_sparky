@@ -1583,6 +1583,51 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             self.assertFalse(typed_report.exists())
 
+            typed_report.write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "failed",
+                        "error_class": "backup",
+                        "restore_diagnostic": {
+                            "schema": 1,
+                            "restore_stage": "create_database",
+                            "guard_reason": "none",
+                            "free_bytes": None,
+                            "required_free_bytes": None,
+                            "temporary_database_created": None,
+                            "drop_outcome": "not_required",
+                            "temporary_database_absent": None,
+                            "archive_sha256": "b" * 64,
+                            "archive_size_bytes": 120,
+                        },
+                    }
+                ),
+                encoding="ascii",
+            )
+            typed_report.chmod(0o600)
+            uncertain_completed = subprocess.run(
+                ["bash", "-s", "--", "123458", "1", "create", "none", "none", "false"],
+                input=typed_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(uncertain_completed.returncode, 0)
+            uncertain_receipt_path = typed_shared / "backup-failure-123458-1.json"
+            uncertain_receipt = json.loads(
+                uncertain_receipt_path.read_text(encoding="ascii")
+            )
+            self.assertEqual(uncertain_receipt["report_state"], "typed_failure")
+            self.assertIsNone(
+                uncertain_receipt["restore_diagnostic"]["temporary_database_created"]
+            )
+            self.assertEqual(
+                uncertain_receipt["restore_diagnostic"]["restore_stage"],
+                "create_database",
+            )
+            self.assertFalse(typed_report.exists())
+
     def _assert_backup_child_group_is_terminated(self, workflow_path: Path) -> None:
         workflow = yaml.safe_load(workflow_path.read_text())
         run_script = next(
