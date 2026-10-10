@@ -219,7 +219,7 @@ Archives may carry `deploy/python-venv-policy.json` (`schema: 1`,
 proof, reject dependency-skip requests, and need free space of at least
 `max(5 GiB, 15% of filesystem) + 128 MiB`. Proof, bypass or space failure
 aborts before replacement-venv/pointer changes. Missing policy stays legacy;
-cold fallback needs artifact-bound size evidence and a capacity guard.
+cold fallback needs artifact-bound size evidence and a capacity guard. Without an origin receipt, the verifier follows a bounded, cycle-checked unchanged-release chain to the snapshot; after strict proof, the installer writes a root-owned mode-`0600` exclusive candidate receipt binding origin and candidate release identities, shared-venv device/inode, freeze and wheelhouse digests, and activation-script digest. Later unchanged releases validate that receipt and full venv proof without retaining the origin/intermediate releases; malformed or mismatched receipts fail closed.
 
 The production Alembic wrapper keeps the exact `upgrade head` allowlist. Its
 candidate-bound read-only revision check runs under quiesced locks before

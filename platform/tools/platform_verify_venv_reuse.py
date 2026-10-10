@@ -48,6 +48,237 @@ def _regular(path: Path, *, mode: int | None = None, max_size: int = 16 * 1024 *
         raise ReuseRefused("missing") from exc
 
 
+def _stable_private_regular(path: Path, *, mode: int, max_size: int = 4096) -> bytes:
+    """Read a root-private receipt without following or racing its pathname."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    fd = -1
+    try:
+        fd = os.open(path, flags)
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != mode
+                or before.st_size <= 0 or before.st_size > max_size):
+            raise ReuseRefused("origin_receipt_metadata")
+        raw = bytearray()
+        while len(raw) <= max_size:
+            chunk = os.read(fd, min(4096, max_size + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(fd)
+        named = path.lstat()
+        def identity(item: os.stat_result) -> tuple[int, ...]:
+            return (
+                item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
+                item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
+            )
+        if (len(raw) != before.st_size or identity(after) != identity(before)
+                or identity(named) != identity(before)):
+            raise ReuseRefused("origin_receipt_changed")
+        return bytes(raw)
+    except OSError as exc:
+        raise ReuseRefused("origin_receipt_metadata") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ReuseRefused("origin_receipt_schema")
+        result[key] = value
+    return result
+
+
+def _release_identity(release: Path, releases: Path) -> tuple[str, str, str]:
+    """Return (slug, source SHA, RELEASE.json SHA) for one direct real release."""
+    try:
+        info = release.lstat()
+        releases_real = releases.resolve(strict=True)
+        if (release.parent.resolve(strict=True) != releases_real
+                or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != 0 or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) & (0o022 | 0o7000)):
+            raise ReuseRefused("release_identity")
+        slug = release.name
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", slug) is None:
+            raise ReuseRefused("release_identity")
+        raw = _regular(release / "RELEASE.json", max_size=65536)
+        metadata = json.loads(raw, object_pairs_hook=_unique_object)
+        source = metadata.get("source_git_commit") if isinstance(metadata, dict) else None
+        if (not isinstance(source, str)
+                or re.fullmatch(r"[0-9a-f]{40,64}", source) is None
+                or metadata.get("release_slug") != slug):
+            raise ReuseRefused("release_identity")
+        return slug, source, hashlib.sha256(raw).hexdigest()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ReuseRefused("release_identity") from exc
+
+
+def _release_rollback(release: Path) -> Path:
+    rollback = release / ".rollback"
+    try:
+        info = rollback.lstat()
+    except OSError as exc:
+        raise ReuseRefused("transaction_identity") from exc
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0 or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise ReuseRefused("transaction_identity")
+    return rollback
+
+
+def _activation_scripts_digest(scripts: dict[Path, tuple[bytes, int]]) -> str:
+    digest = hashlib.sha256(b"oldsparky-venv-activation-v1\0")
+    for path, (content, mode) in sorted(scripts.items(), key=lambda item: item[0].name):
+        name = path.name.encode("ascii")
+        digest.update(len(name).to_bytes(2, "big"))
+        digest.update(name)
+        digest.update(mode.to_bytes(2, "big"))
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+_ORIGIN_RECEIPT_FIELDS = frozenset({
+    "schema", "release_slug", "release_source_sha", "release_json_sha256",
+    "venv_dev", "venv_ino", "freeze_sha256", "wheelhouse_manifest_sha256",
+    "origin_release_slug", "origin_source_sha", "origin_release_json_sha256",
+    "activation_sha256",
+})
+
+
+def _read_origin_receipt(
+    release: Path,
+    releases: Path,
+    venv: Path,
+) -> dict[str, object] | None:
+    path = release / ".rollback" / "venv-origin.json"
+    if not path.exists() and not path.is_symlink():
+        return None
+    raw = _stable_private_regular(path, mode=0o600)
+    try:
+        payload = json.loads(raw, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReuseRefused("origin_receipt_schema") from exc
+    if not isinstance(payload, dict) or set(payload) != _ORIGIN_RECEIPT_FIELDS:
+        raise ReuseRefused("origin_receipt_schema")
+    if type(payload.get("schema")) is not int or payload["schema"] != 1:
+        raise ReuseRefused("origin_receipt_schema")
+    slug, source, release_sha = _release_identity(release, releases)
+    venv_info = venv.lstat()
+    if (stat.S_ISLNK(venv_info.st_mode) or not stat.S_ISDIR(venv_info.st_mode)
+            or venv_info.st_uid != 0 or venv_info.st_gid != 0
+            or stat.S_IMODE(venv_info.st_mode) != 0o755):
+        raise ReuseRefused("venv_directory")
+    expected_hashes = {
+        "release_source_sha": source,
+        "release_json_sha256": release_sha,
+        "freeze_sha256": _sha(release / "requirements-platform.freeze.txt"),
+        "wheelhouse_manifest_sha256": _sha(release / "wheelhouse" / "WHEELHOUSE.sha256"),
+    }
+    for name, expected in expected_hashes.items():
+        if payload.get(name) != expected:
+            raise ReuseRefused("origin_receipt_binding")
+    if (payload.get("release_slug") != slug
+            or type(payload.get("venv_dev")) is not int
+            or type(payload.get("venv_ino")) is not int
+            or payload["venv_dev"] != venv_info.st_dev
+            or payload["venv_ino"] != venv_info.st_ino):
+        raise ReuseRefused("origin_receipt_binding")
+    origin_slug = payload.get("origin_release_slug")
+    origin_source = payload.get("origin_source_sha")
+    if (not isinstance(origin_slug, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", origin_slug) is None
+            or not isinstance(origin_source, str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", origin_source) is None):
+        raise ReuseRefused("origin_receipt_schema")
+    for name in ("freeze_sha256", "wheelhouse_manifest_sha256",
+                 "origin_release_json_sha256", "activation_sha256"):
+        value = payload.get(name)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ReuseRefused("origin_receipt_schema")
+    return payload
+
+
+def _derive_venv_origin(
+    current: Path,
+    app: Path,
+    venv: Path,
+    *,
+    max_hops: int = 32,
+) -> tuple[str, str, str, dict[str, object] | None]:
+    """Resolve the generation slug from an anchor or a bounded legacy chain."""
+    releases = app / "releases"
+    current_slug, current_source, _current_sha = _release_identity(current, releases)
+    transition = _stable_private_regular(
+        _release_rollback(current) / "venv-transition", mode=0o600, max_size=32,
+    )
+    if transition not in (b"snapshot\n", b"unchanged\n"):
+        raise ReuseRefused("transaction_identity")
+    receipt = _read_origin_receipt(current, releases, venv)
+    if receipt is not None:
+        if transition != b"unchanged\n":
+            raise ReuseRefused("origin_receipt_binding")
+        return (
+            str(receipt["origin_release_slug"]),
+            str(receipt["origin_source_sha"]),
+            str(receipt["origin_release_json_sha256"]),
+            receipt,
+        )
+
+    visited: set[tuple[int, int]] = set()
+    release = current
+    for _ in range(max_hops):
+        slug, source, release_sha = _release_identity(release, releases)
+        info = release.lstat()
+        identity = (info.st_dev, info.st_ino)
+        if identity in visited:
+            raise ReuseRefused("origin_chain_cycle")
+        visited.add(identity)
+        rollback = _release_rollback(release)
+        transition = _stable_private_regular(
+            rollback / "venv-transition", mode=0o600, max_size=32,
+        )
+        if transition == b"snapshot\n":
+            snapshot = rollback / "shared-venv-before-install"
+            try:
+                snapshot_info = snapshot.lstat()
+            except OSError as exc:
+                raise ReuseRefused("transaction_identity") from exc
+            if (stat.S_ISLNK(snapshot_info.st_mode) or not stat.S_ISDIR(snapshot_info.st_mode)
+                    or snapshot_info.st_uid != 0 or snapshot_info.st_gid != 0):
+                raise ReuseRefused("transaction_identity")
+            return slug, source, release_sha, None
+        if transition != b"unchanged\n":
+            raise ReuseRefused("transaction_identity")
+        snapshot = rollback / "shared-venv-before-install"
+        if snapshot.exists() or snapshot.is_symlink():
+            raise ReuseRefused("transaction_identity")
+        freeze_receipt = _stable_private_regular(
+            rollback / "shared-freeze.sha256", mode=0o600, max_size=128,
+        ).decode("ascii").strip()
+        if freeze_receipt != _sha(release / "requirements-platform.freeze.txt"):
+            raise ReuseRefused("transaction_identity")
+        previous_raw = _stable_private_regular(
+            rollback / "previous-release", mode=0o600, max_size=4096,
+        )
+        try:
+            previous_text = previous_raw.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise ReuseRefused("transaction_identity") from exc
+        previous = Path(previous_text)
+        if (not previous.is_absolute() or previous.parent != releases
+                or previous.name == release.name):
+            raise ReuseRefused("transaction_identity")
+        _release_identity(previous, releases)
+        release = previous
+    raise ReuseRefused("origin_chain_limit")
+
+
 def _sha(path: Path) -> str:
     return hashlib.sha256(_regular(path)).hexdigest()
 
@@ -266,7 +497,7 @@ def _safe_record_target(root: Path, relative: str, venv: Path) -> Path:
     return current.resolve(strict=False)
 
 
-def _venv_integrity(venv: Path, wheelhouse: Path, release_slug: str) -> None:
+def _venv_integrity(venv: Path, wheelhouse: Path, release_slug: str) -> str:
     site_roots = sorted((venv / "lib").glob("python*/site-packages"))
     if len(site_roots) != 1:
         raise ReuseRefused("site_packages")
@@ -451,6 +682,7 @@ def _venv_integrity(venv: Path, wheelhouse: Path, release_slug: str) -> None:
         if (stat.S_IMODE(info.st_mode) != expected_mode or expected_mode != 0o644
                 or path.read_bytes() != expected_content):
             raise ReuseRefused("activation_content")
+    activation_digest = _activation_scripts_digest(expected_activation)
     if set(expected_scripts) != generated_console_scripts:
         raise ReuseRefused("script_set")
     for path, expected_content in expected_scripts.items():
@@ -463,6 +695,7 @@ def _venv_integrity(venv: Path, wheelhouse: Path, release_slug: str) -> None:
         # pip wrote this RECORD row before relocate_venv_paths rewrote the
         # temporary environment shebang; require the exact reproducible script
         # and row membership while allowing only that known transformation.
+    return activation_digest
 
 
 def _transaction_identity(
@@ -531,7 +764,9 @@ def prove(
             raise ReuseRefused("transaction_identity")
         if transition == b"unchanged\n" and (snapshot.exists() or snapshot.is_symlink()):
             raise ReuseRefused("transaction_identity")
-        previous = _regular(rollback / "previous-release", mode=0o600).decode().strip()
+        previous = _stable_private_regular(
+            rollback / "previous-release", mode=0o600, max_size=4096,
+        ).decode().strip()
         if not previous or not Path(previous).is_dir() or Path(previous).is_symlink():
             raise ReuseRefused("transaction_identity")
         if transition == b"unchanged\n":
@@ -540,14 +775,11 @@ def prove(
                 raise ReuseRefused("transaction_identity")
     else:
         raise ReuseRefused("transaction_identity")
-    releases = (current, candidate, *((Path(previous),) if previous else ()))
-    for release in releases:
-        metadata = json.loads(_regular(release / "RELEASE.json", max_size=65536))
-        source = metadata.get("source_git_commit")
-        slug = metadata.get("release_slug")
-        if (not isinstance(source, str) or re.fullmatch(r"[0-9a-f]{40,64}", source) is None
-                or slug != release.name):
-            raise ReuseRefused("release_identity")
+    releases_root = app / "releases"
+    current_slug, current_source, _current_release_sha = _release_identity(current, releases_root)
+    candidate_slug, candidate_source, candidate_release_sha = _release_identity(candidate, releases_root)
+    if previous:
+        _release_identity(Path(previous), releases_root)
     _transaction_identity(transaction_state, quiesce_state, app, current,
                           candidate, previous_before)
     _same_dependency_inputs(current, candidate)
@@ -555,7 +787,13 @@ def prove(
     env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LANG": "C.UTF-8",
            "LC_ALL": "C.UTF-8", "PIP_CONFIG_FILE": "/dev/null", "PIP_NO_INDEX": "1",
            "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
-    _venv_integrity(venv, current / "wheelhouse", current.name)
+    origin_slug, origin_source, origin_release_sha, origin_receipt = _derive_venv_origin(
+        current, app, venv,
+    )
+    activation_digest = _venv_integrity(venv, current / "wheelhouse", origin_slug)
+    if (origin_receipt is not None
+            and origin_receipt.get("activation_sha256") != activation_digest):
+        raise ReuseRefused("origin_receipt_binding")
     for args in (("-I", "-m", "pip", "check"), ("-I", "-m", "pip", "freeze", "--all")):
         result = subprocess.run([str(venv / "bin/python"), "-B", *args], env=env,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -566,6 +804,25 @@ def prove(
             expected = _regular(current / "requirements-platform.freeze.txt", mode=0o444).splitlines()
             if sorted(result.stdout.splitlines()) != sorted(expected):
                 raise ReuseRefused("freeze")
+    venv_info = venv.lstat()
+    if (stat.S_ISLNK(venv_info.st_mode) or not stat.S_ISDIR(venv_info.st_mode)
+            or venv_info.st_uid != 0 or venv_info.st_gid != 0
+            or stat.S_IMODE(venv_info.st_mode) != 0o755):
+        raise ReuseRefused("venv_directory")
+    return {
+        "schema": 1,
+        "release_slug": candidate_slug,
+        "release_source_sha": candidate_source,
+        "release_json_sha256": candidate_release_sha,
+        "venv_dev": venv_info.st_dev,
+        "venv_ino": venv_info.st_ino,
+        "freeze_sha256": _sha(candidate / "requirements-platform.freeze.txt"),
+        "wheelhouse_manifest_sha256": _sha(candidate / "wheelhouse" / "WHEELHOUSE.sha256"),
+        "origin_release_slug": origin_slug,
+        "origin_source_sha": origin_source,
+        "origin_release_json_sha256": origin_release_sha,
+        "activation_sha256": activation_digest,
+    }
 
 
 def main() -> int:
@@ -580,10 +837,11 @@ def main() -> int:
     parser.add_argument("--previous-before", default="")
     args = parser.parse_args()
     try:
-        prove(args.app, args.current, args.candidate, args.venv, args.python,
-              args.transaction_state, args.quiesce_state, args.previous_before)
+        receipt = prove(args.app, args.current, args.candidate, args.venv, args.python,
+                        args.transaction_state, args.quiesce_state, args.previous_before)
     except (ReuseRefused, OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
         return 1
+    sys.stdout.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
     return 0
 
 
