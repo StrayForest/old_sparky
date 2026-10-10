@@ -779,9 +779,21 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         source = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(
             encoding="utf-8"
         )
+        browser_spec = (
+            REPO_ROOT / "platform/apps/platform_web/tests/smoke/live-launch.spec.ts"
+        ).read_text(encoding="utf-8")
+        browser_config = (
+            REPO_ROOT / "platform/apps/platform_web/playwright.live.config.ts"
+        ).read_text(encoding="utf-8")
         supervisor = (
             TOOLS_ROOT / "platform_live_launch_supervisor.sh"
         ).read_text(encoding="utf-8")
+        route_cases = re.findall(r'^  \{ path: "[^"]+", text:', browser_spec, re.MULTILINE)
+        explicit_tests = re.findall(r"^test\(", browser_spec, re.MULTILINE)
+        browser_projects = re.findall(r'^      name: "live-[a-z-]+",$', browser_config, re.MULTILINE)
+        self.assertEqual((len(route_cases) + len(explicit_tests), len(browser_projects)), (18, 3))
+        self.assertEqual((len(route_cases) + len(explicit_tests)) * len(browser_projects), 54)
+        self.assertEqual(browser_spec.count('type: "public-live-qa-expected-skip"'), 6)
         self.assertIn("PROD_SSH_HOST", source)
         self.assertIn("ssh " + "\\", source)
         self.assertIn(
@@ -1425,17 +1437,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
 
         count_fields = {
             "run_status": "passed",
-            "logical_total": 2,
-            "logical_pass": 1,
+            "logical_total": 54,
+            "logical_pass": 44,
             "logical_fail": 0,
-            "logical_expected_fail": 1,
+            "logical_expected_fail": 0,
             "logical_flaky": 0,
-            "logical_skip": 0,
+            "logical_skip": 10,
             "logical_interrupted": 0,
-            "attempt_total": 2,
-            "attempt_pass": 1,
-            "attempt_fail": 1,
-            "attempt_skip": 0,
+            "attempt_total": 54,
+            "attempt_pass": 44,
+            "attempt_fail": 0,
+            "attempt_skip": 10,
             "attempt_interrupted": 0,
             "attempt_timedout": 0,
             "source_sha": status_sha,
@@ -1460,23 +1472,58 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             (counts_line + good_status + "\n").encode(), 0
         )
         self.assertEqual(passed_report["status"], "passed")
-        self.assertEqual(passed_report["test_count"], 2)
-        self.assertEqual(passed_report["logical_counts"]["logical_expected_fail"], 1)
-        self.assertEqual(passed_report["attempt_counts"]["attempt_fail"], 1)
+        self.assertTrue(passed_report["success"])
+        self.assertEqual(passed_report["failure_reason"], "none")
+        self.assertEqual(passed_report["test_count"], 44)
+        self.assertEqual(passed_report["logical_counts"]["logical_total"], 54)
+        self.assertEqual(passed_report["logical_counts"]["logical_skip"], 10)
+        self.assertEqual(passed_report["attempt_counts"]["attempt_pass"], 44)
         self.assertEqual(passed_report["tests"], [])
         self.assertEqual(passed_report["stage"], "complete")
         self.assertEqual(passed_report["check_id"], "none")
         self.assertEqual(passed_report["source_git_sha"], status_sha)
         self.assertEqual(passed_report["app_target_sha"], status_sha)
         self.assertIsNone(passed_report["source_binding_sha256"])
+        validator_match = re.search(
+            r'/usr/bin/python3 - "\$RUNNER_TEMP/live-launch-report\.json" \\\s*'
+            r'"\$GITHUB_SHA" <<\'PY\'\n(.*?)\n\s*PY',
+            source,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(validator_match)
+        assert validator_match is not None
+        validator_script = textwrap.dedent(validator_match.group(1))
+        with tempfile.TemporaryDirectory(prefix="live-launch-validator-") as directory:
+            report_path = Path(directory) / "report.json"
+            report_path.write_text(json.dumps(passed_report), encoding="utf-8")
+            valid_summary = subprocess.run(
+                [sys.executable, "-", str(report_path), status_sha],
+                input=validator_script,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(valid_summary.returncode, 0, valid_summary.stderr)
+            inconsistent_status = {**passed_report, "status": "failed"}
+            report_path.write_text(json.dumps(inconsistent_status), encoding="utf-8")
+            rejected_summary = subprocess.run(
+                [sys.executable, "-", str(report_path), status_sha],
+                input=validator_script,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected_summary.returncode, 0)
+            self.assertIn("status is not passed", rejected_summary.stderr)
         no_pass_fields = {
             **count_fields,
             "logical_pass": 0,
             "logical_expected_fail": 1,
-            "logical_skip": 1,
-            "attempt_total": 1,
+            "logical_skip": 53,
+            "attempt_total": 54,
             "attempt_pass": 0,
             "attempt_fail": 1,
+            "attempt_skip": 53,
         }
         no_pass_counts_line = (
             "LIVE_BROWSER_COUNTS schema=1 "
@@ -1499,12 +1546,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertFalse(no_pass_report["success"])
         self.assertEqual(no_pass_report["logical_counts"]["logical_pass"], 0)
         self.assertEqual(no_pass_report["logical_counts"]["logical_expected_fail"], 1)
-        self.assertEqual(no_pass_report["logical_counts"]["logical_skip"], 1)
-        self.assertEqual(no_pass_report["test_count"], 2)
+        self.assertEqual(no_pass_report["logical_counts"]["logical_skip"], 53)
+        self.assertEqual(no_pass_report["test_count"], 1)
+        self.assertEqual(no_pass_report["failure_reason"], "coverage_incomplete")
         failed_report = sanitize_status((failed_status + "\n").encode(), 1)
         self.assertEqual(failed_report["status"], "failed")
         self.assertIsNone(failed_report["test_count"])
         self.assertEqual(failed_report["stage"], "identity")
+        self.assertEqual(failed_report["failure_reason"], "child_failed")
         checked_failure_status = (
             "LIVE_LAUNCH_STATUS schema=2 status=failed stage=validation "
             "check=provision_marker child_exit=1 "
@@ -1513,14 +1562,33 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         checked_failure = sanitize_status(checked_failure_status.encode(), 1)
         self.assertEqual(checked_failure["status"], "failed")
         self.assertEqual(checked_failure["check_id"], "provision_marker")
-        for malformed in (
-            (counts_line.replace(status_sha, "b" * 40) + good_status + "\n").encode(),
-            (good_status + "\nPRIVATE_OUTPUT\n").encode(),
-            b"x" * 300,
+        for malformed, reason, error_classes in (
+            (
+                (counts_line.replace(status_sha, "b" * 40) + good_status + "\n").encode(),
+                "counts_unavailable",
+                {"other": 1},
+            ),
+            (
+                (good_status + "\nPRIVATE_OUTPUT\n").encode(),
+                "marker_unavailable",
+                {"unclassified_child_or_dispatch_failure": 1},
+            ),
+            (
+                b"x" * 300,
+                "marker_unavailable",
+                {"unclassified_child_or_dispatch_failure": 1},
+            ),
+            (
+                b"",
+                "marker_unavailable",
+                {"unclassified_child_or_dispatch_failure": 1},
+            ),
         ):
             report = sanitize_status(malformed, 0)
             self.assertEqual(report["status"], "unavailable")
             self.assertIsNone(report["test_count"])
+            self.assertEqual(report["failure_reason"], reason)
+            self.assertEqual(report["error_class_counts"], error_classes)
             self.assertNotIn("PRIVATE_OUTPUT", json.dumps(report))
 
         # The local handoff is an atomic private file, not a shell fragment or

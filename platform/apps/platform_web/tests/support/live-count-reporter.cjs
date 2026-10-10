@@ -21,6 +21,50 @@ const SHA40 = /^[0-9a-f]{40}$/u;
 const SHA64 = /^[0-9a-f]{64}$/u;
 const PUBLIC_GATE_NAME = /^public-live-qa\.[a-z0-9_]{8}$/u;
 const LIVE_USER_GATE_NAME = /^live-user-qa\.[A-Za-z0-9]{6}$/u;
+const PUBLIC_LOGICAL_TOTAL = 54;
+const EXPECTED_PUBLIC_SKIP_TYPE = "public-live-qa-expected-skip";
+const PUBLIC_PROJECTS = new Set([
+  "live-desktop",
+  "live-mobile",
+  "live-webkit-mobile",
+]);
+const PUBLIC_TEST_TITLES = new Set([
+  ...[
+    "/", "/info", "/tournaments", "/tournaments/new", "/profile/me", "/profile/lisalexy",
+  ].map((route) => `live route ${route} renders without horizontal overflow`),
+  "production Chromium live QA keeps its process sandbox enabled",
+  "live CSP nonce is stable on soft navigation and rotates on hard reload",
+  "local enforced CSP blocks negative inline and external probes",
+  "live tournaments hub exposes a valid empty or populated list",
+  "live 1920 catalog stays contained after every card asset loads",
+  "live tournament detail and bracket routes render from the current public data",
+  "live admin route is protected for anonymous users",
+  "live home uses text-only tournament steps without overflow",
+  "live public contact surfaces do not publish the support recipient",
+  "live patch renders separate Urn and Rift objectives with source icons",
+  "live Cloudflare Analytics is conditionally observed without widening CSP",
+  "live image currentSrc inventory stays inside the exact CSP hosts",
+]);
+const EXPECTED_PUBLIC_SKIP_DESCRIPTIONS = new Map([
+  ["production Chromium live QA keeps its process sandbox enabled", new Set([
+    "chromium_only:live-webkit-mobile",
+  ])],
+  ["local enforced CSP blocks negative inline and external probes", new Set([
+    "local_csp_disabled:live-desktop",
+    "local_csp_disabled:live-mobile",
+    "local_csp_disabled:live-webkit-mobile",
+  ])],
+  ["live 1920 catalog stays contained after every card asset loads", new Set([
+    "desktop_only:live-mobile",
+    "desktop_only:live-webkit-mobile",
+    "empty_tournament_list:live-desktop",
+  ])],
+  ["live tournament detail and bracket routes render from the current public data", new Set([
+    "empty_tournament_list:live-desktop",
+    "empty_tournament_list:live-mobile",
+    "empty_tournament_list:live-webkit-mobile",
+  ])],
+]);
 
 function supportedGateName(name) {
   return PUBLIC_GATE_NAME.test(name) || LIVE_USER_GATE_NAME.test(name);
@@ -30,7 +74,51 @@ function unavailable() {
   return null;
 }
 
-function summarizeRun(suite, runStatus) {
+function expectedPublicSkip(test) {
+  if (!test || typeof test.title !== "string" || !Array.isArray(test.results)) {
+    return false;
+  }
+  const result = test.results.at(-1);
+  if (!result || !Array.isArray(result.annotations)) return false;
+  const allowed = EXPECTED_PUBLIC_SKIP_DESCRIPTIONS.get(test.title);
+  if (!allowed) return false;
+  const annotations = result.annotations.filter(
+    (annotation) => annotation?.type === EXPECTED_PUBLIC_SKIP_TYPE,
+  );
+  const project = typeof test.parent?.project === "function"
+    ? test.parent.project()?.name
+    : undefined;
+  return annotations.length === 1
+    && typeof project === "string"
+    && allowed.has(annotations[0].description)
+    && annotations[0].description.endsWith(`:${project}`);
+}
+
+function publicCoverageIsComplete(tests, logical) {
+  if (
+    tests.length !== PUBLIC_LOGICAL_TOTAL
+    || logical.skip < 6
+    || logical.skip > 10
+  ) return false;
+  const seen = new Set();
+  for (const test of tests) {
+    const project = typeof test.parent?.project === "function"
+      ? test.parent.project()?.name
+      : undefined;
+    if (
+      typeof test.title !== "string"
+      || !PUBLIC_TEST_TITLES.has(test.title)
+      || !PUBLIC_PROJECTS.has(project)
+    ) return false;
+    const key = `${project}:${test.title}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    if (test.outcome() === "skipped" && !expectedPublicSkip(test)) return false;
+  }
+  return seen.size === PUBLIC_LOGICAL_TOTAL;
+}
+
+function summarizeRun(suite, runStatus, { publicGate = false } = {}) {
   if (!RUN_STATUSES.has(runStatus)) return unavailable();
   if (!suite || typeof suite.allTests !== "function") return unavailable();
   const tests = suite.allTests();
@@ -97,7 +185,13 @@ function summarizeRun(suite, runStatus) {
   ) {
     return unavailable();
   }
-  return { run_status: runStatus, logical, attempts };
+  return {
+    run_status: publicGate && !publicCoverageIsComplete(tests, logical)
+      ? "failed"
+      : runStatus,
+    logical,
+    attempts,
+  };
 }
 
 function bindingsFromEnvironment(env = process.env) {
@@ -213,7 +307,8 @@ class LiveCountReporter {
 
   onEnd(result) {
     const binding = bindingsFromEnvironment();
-    const summary = summarizeRun(this.suite, result?.status);
+    const publicGate = binding !== null && PUBLIC_GATE_NAME.test(path.basename(binding.gate));
+    const summary = summarizeRun(this.suite, result?.status, { publicGate });
     if (!writeBoundedSummary(binding, summary)) return { status: "failed" };
     return undefined;
   }
