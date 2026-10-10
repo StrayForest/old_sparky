@@ -415,15 +415,87 @@ class SsrObservabilityTests(unittest.TestCase):
             [
                 {
                     "method": "GET",
-                    "uri": "/tournaments/fixture",
+                    "uri": "/tournaments/private-slug?invite_code=PRIVATE-TOKEN",
                     "status": 200,
+                    "upstream_status": "200",
                     "request_time": 1.25,
                     "upstream_time": "1.10",
-                }
+                },
+                {
+                    "method": "GET",
+                    "uri": "/tournaments/another-private-slug",
+                    "status": 500,
+                    "upstream_status": "500",
+                    "request_time": "0.500",
+                    "upstream_connect_time": "0.003",
+                    "upstream_header_time": "0.300",
+                    "upstream_time": "0.450",
+                },
+                {
+                    "method": "GET",
+                    "uri": "/tournaments/third-private-slug",
+                    "status": 503,
+                    # Count each upstream attempt; the trailing "-" means
+                    # an additional attempt has no reported response status.
+                    "upstream_status": "502, 503 : -",
+                    "request_time": "1.500",
+                    "upstream_connect_time": "0.010",
+                    "upstream_header_time": "1.000",
+                    "upstream_time": "1.400",
+                },
+                {
+                    "method": "POST",
+                    "uri": "/tournaments/not-a-page",
+                    "status": 500,
+                    "upstream_status": "500",
+                },
+                {
+                    "method": "GET",
+                    "uri": "/api/v1/auth/bootstrap?token=PRIVATE-TOKEN",
+                    "status": 503,
+                    "upstream_status": "503",
+                },
             ],
         )
 
-        self.assertEqual(summary["nginx_html"]["request_time_ms"]["p50_ms"], 1250.0)
+        html = summary["nginx_html"]
+        self.assertEqual(html["requests"], 3)
+        self.assertEqual(html["statuses"], {"200": 1, "500": 1, "503": 1})
+        self.assertEqual(
+            html["upstream_statuses"],
+            {"200": 1, "500": 1, "502": 1, "503": 1},
+        )
+        self.assertEqual(
+            html["by_status"]["500"]["request_time_ms"]["p50_ms"],
+            500.0,
+        )
+        self.assertEqual(
+            html["by_status"]["500"]["upstream_time_ms"]["p50_ms"],
+            450.0,
+        )
+        self.assertEqual(
+            html["by_status"]["503"]["upstream_statuses"],
+            {"502": 1, "503": 1},
+        )
+        self.assertEqual(html["upstream_status_unknown_attempts"], 1)
+        self.assertEqual(
+            html["by_status"]["503"]["upstream_status_unknown_attempts"],
+            1,
+        )
+        self.assertEqual(
+            html["by_status"]["503"]["upstream_time_ms"]["p50_ms"],
+            1400.0,
+        )
+        self.assertEqual(html["request_time_ms"]["p50_ms"], 1250.0)
+        self.assertEqual(html["upstream_time_ms"]["p50_ms"], 1100.0)
+        serialized = json.dumps(summary)
+        for forbidden in (
+            "private-slug",
+            "another-private-slug",
+            "third-private-slug",
+            "PRIVATE-TOKEN",
+        ):
+            self.assertNotIn(forbidden, serialized)
 
     def test_nginx_api_summary_uses_safe_route_classes_and_statuses(self) -> None:
         summary = summarize_ssr_observability(

@@ -285,6 +285,11 @@ RETAINED_CLEANUP_STAGES = frozenset(
         "complete",
     }
 )
+RETAINED_CLEANUP_DIAGNOSTIC_STAGES = RETAINED_CLEANUP_STAGES | {
+    "dispatcher",
+    "timeout",
+    "unknown",
+}
 RETAINED_CLEANUP_MARKER_RE = re.compile(
     rb"RETAINED_CLEANUP_STAGE schema=1 stage="
     rb"(?P<stage>lock|input|identity|release_binding|run_root|"
@@ -338,6 +343,7 @@ RELEASE_FAILURE_REASONS = {
     ("deployment", "readiness"): frozenset({"runtime_profile_failed"}),
 }
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
+EXTERNAL_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 HOST_GENERATION_RE = re.compile(r"^[0-9a-f]{40}$")
 HOST_TOOL_FILES = (
     "platform_workflow_remote_dispatch.py",
@@ -1115,20 +1121,91 @@ def _control_email_stdin(control_email: str) -> bytes:
 
 
 def _run_retained_cleanup_sudo(
-    helper: Path, arguments: list[str], *, control_email: str
+    helper: Path,
+    arguments: list[str],
+    *,
+    control_email: str,
+    diagnostic_binding: dict[str, str] | None = None,
 ) -> int:
     """Run exact cleanup while retaining only its fixed stage marker."""
 
-    if not _trusted_helper(helper):
+    def emit_diagnostic(
+        *,
+        stage: str,
+        dispatcher_exit: int,
+        child_state: str,
+        child_exit: int | str,
+        stdout_eof: str,
+        timed_out: bool,
+    ) -> None:
+        if diagnostic_binding is None:
+            print(
+                "RETAINED_CLEANUP_DIAGNOSTIC schema=1 "
+                f"stage={stage} child_exit={dispatcher_exit}"
+            )
+            return
+        binding_keys = {
+            "source_sha", "app_sha", "run_id", "load_run_id", "run_attempt", "profile"
+        }
+        if (
+            set(diagnostic_binding) != binding_keys
+            or SOURCE_SHA_RE.fullmatch(diagnostic_binding.get("source_sha", "")) is None
+            or SOURCE_SHA_RE.fullmatch(diagnostic_binding.get("app_sha", "")) is None
+            or RUN_ID_RE.fullmatch(diagnostic_binding.get("run_id", "")) is None
+            or RUN_ID_RE.fullmatch(diagnostic_binding.get("load_run_id", "")) is None
+            or RUN_ID_RE.fullmatch(diagnostic_binding.get("run_attempt", "")) is None
+            or EXTERNAL_PROFILE_ID_RE.fullmatch(
+                diagnostic_binding.get("profile", "")
+            ) is None
+            or stage not in RETAINED_CLEANUP_DIAGNOSTIC_STAGES
+            or child_state not in {"not_started", "running", "exited", "unknown"}
+            or stdout_eof not in {"true", "false", "unknown"}
+            or type(timed_out) is not bool
+            or type(dispatcher_exit) is not int
+            or not 0 <= dispatcher_exit <= 255
+            or (
+                child_exit != "unknown"
+                and (type(child_exit) is not int or not 0 <= child_exit <= 255)
+            )
+        ):
+            print("RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2")
+            return
         print(
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=2 "
+            f"stage={stage} dispatcher_exit={dispatcher_exit} "
+            f"child_state={child_state} child_exit={child_exit} "
+            f"stdout_eof={stdout_eof} timed_out={'true' if timed_out else 'false'} "
+            f"source_sha={diagnostic_binding['source_sha']} "
+            f"app_sha={diagnostic_binding['app_sha']} "
+            f"run_id={diagnostic_binding['run_id']} "
+            f"run_attempt={diagnostic_binding['run_attempt']} "
+            f"load_run_id={diagnostic_binding['load_run_id']} "
+            f"profile={diagnostic_binding['profile']}"
+        )
+
+    def return_code(value: int) -> int:
+        return min(255, 128 + abs(value)) if value < 0 else min(255, value)
+
+    if not _trusted_helper(helper):
+        emit_diagnostic(
+            stage="dispatcher",
+            dispatcher_exit=2,
+            child_state="not_started",
+            child_exit="unknown",
+            stdout_eof="unknown",
+            timed_out=False,
         )
         return 2
     try:
         input_bytes = _control_email_stdin(control_email)
     except (TypeError, ValueError, UnicodeEncodeError):
-        print(
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        emit_diagnostic(
+            stage="dispatcher",
+            dispatcher_exit=2,
+            child_state="not_started",
+            child_exit="unknown",
+            stdout_eof="unknown",
+            timed_out=False,
         )
         return 2
     command = [SUDO, "-n", "--", str(helper), *arguments]
@@ -1142,16 +1219,26 @@ def _run_retained_cleanup_sudo(
             close_fds=True,
         )
     except OSError:
-        print(
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        emit_diagnostic(
+            stage="dispatcher",
+            dispatcher_exit=2,
+            child_state="not_started",
+            child_exit="unknown",
+            stdout_eof="unknown",
+            timed_out=False,
         )
         return 2
     stream = process.stdout
     input_stream = process.stdin
     if stream is None or input_stream is None:
         _terminate_process_group(process)
-        print(
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        emit_diagnostic(
+            stage="dispatcher",
+            dispatcher_exit=2,
+            child_state="unknown",
+            child_exit="unknown",
+            stdout_eof="unknown",
+            timed_out=False,
         )
         return 2
     try:
@@ -1164,8 +1251,13 @@ def _run_retained_cleanup_sudo(
         _terminate_process_group(process)
         input_stream.close()
         stream.close()
-        print(
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        emit_diagnostic(
+            stage="dispatcher",
+            dispatcher_exit=2,
+            child_state="unknown",
+            child_exit="unknown",
+            stdout_eof="unknown",
+            timed_out=False,
         )
         return 2
     finally:
@@ -1179,8 +1271,13 @@ def _run_retained_cleanup_sudo(
     except (OSError, ValueError):
         _terminate_process_group(process)
         stream.close()
-        print(
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        emit_diagnostic(
+            stage="dispatcher",
+            dispatcher_exit=2,
+            child_state="unknown",
+            child_exit="unknown",
+            stdout_eof="unknown",
+            timed_out=False,
         )
         return 2
 
@@ -1197,9 +1294,22 @@ def _run_retained_cleanup_sudo(
         while process.poll() is None or not eof:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                deadline_returncode = process.poll()
+                deadline_child_state = (
+                    "exited" if deadline_returncode is not None else "running"
+                )
                 _terminate_process_group(process)
-                print(
-                    "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=timeout child_exit=124"
+                emit_diagnostic(
+                    stage="timeout",
+                    dispatcher_exit=124,
+                    child_state=deadline_child_state,
+                    child_exit=(
+                        return_code(deadline_returncode)
+                        if deadline_returncode is not None
+                        else "unknown"
+                    ),
+                    stdout_eof="true" if eof else "false",
+                    timed_out=True,
                 )
                 return 124
             for key, _ in selector.select(min(remaining, 0.1)):
@@ -1231,32 +1341,42 @@ def _run_retained_cleanup_sudo(
                             oversized_line = True
                         else:
                             pending.append(byte)
-        child_status = process.returncode
-        if child_status is None:
-            child_status = 2
-        if child_status < 0:
-            child_status = min(255, 128 + abs(child_status))
+        raw_child_status = process.returncode
+        child_status = 2 if raw_child_status is None else return_code(raw_child_status)
         if (
             marker is None
             or marker_invalid
             or marker[1] != child_status
             or child_status > 255
         ):
-            print(
-                "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=unknown "
-                f"child_exit={child_status}"
+            emit_diagnostic(
+                stage="unknown",
+                dispatcher_exit=child_status if child_status != 0 else 2,
+                child_state="exited" if raw_child_status is not None else "unknown",
+                child_exit=child_status if raw_child_status is not None else "unknown",
+                stdout_eof="true" if eof else "false",
+                timed_out=False,
             )
             return child_status if child_status != 0 else 2
         stage, _ = marker
-        print(
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 "
-            f"stage={stage} child_exit={child_status}"
+        emit_diagnostic(
+            stage=stage,
+            dispatcher_exit=child_status,
+            child_state="exited",
+            child_exit=child_status,
+            stdout_eof="true",
+            timed_out=False,
         )
         return child_status
     except (OSError, ValueError):
         _terminate_process_group(process)
-        print(
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=dispatcher child_exit=2"
+        emit_diagnostic(
+            stage="dispatcher",
+            dispatcher_exit=2,
+            child_state="unknown",
+            child_exit="unknown",
+            stdout_eof="unknown",
+            timed_out=False,
         )
         return 2
     finally:
@@ -2674,11 +2794,25 @@ def main(argv: list[str] | None = None) -> int:
         mode = "external"
     elif arguments == ["external-finalize"]:
         mode = "external"
-    elif arguments == ["external-cleanup"]:
+    elif (
+        len(arguments) == 5
+        and arguments[:2] == ["external-cleanup", "--run-attempt"]
+        and RUN_ID_RE.fullmatch(arguments[2]) is not None
+        and arguments[3] == "--profile-id"
+        and EXTERNAL_PROFILE_ID_RE.fullmatch(arguments[4]) is not None
+    ):
         # Cleanup gets its own reduced identity document.  It must remain
         # usable when the measurement handoff (which also carries load
         # parameters and temporary session material) is unavailable or has
         # failed revalidation after fixture setup.
+        mode = "cleanup"
+    elif (
+        len(arguments) == 5
+        and arguments[:2] == ["retained-cleanup", "--run-attempt"]
+        and RUN_ID_RE.fullmatch(arguments[2]) is not None
+        and arguments[3] == "--load-run-id"
+        and RUN_ID_RE.fullmatch(arguments[4]) is not None
+    ):
         mode = "cleanup"
     elif arguments == ["external-cleanup-exports"]:
         mode = "cleanup"
@@ -2705,8 +2839,10 @@ def main(argv: list[str] | None = None) -> int:
             return _external_fixture(payload)
         if arguments == ["external-finalize"]:
             return _touch_complete(payload)
-        if arguments == ["external-cleanup"]:
-            _app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
+        if len(arguments) == 5 and arguments[:2] == ["external-cleanup", "--run-attempt"]:
+            app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
+            if payload["load_run_id"] != payload["cleanup_run_id"]:
+                return _fail()
             return _run_retained_cleanup_sudo(
                 CLEANUP_HELPER,
                 [
@@ -2717,6 +2853,37 @@ def main(argv: list[str] | None = None) -> int:
                     *source_arguments,
                 ],
                 control_email=payload["control_email"],
+                diagnostic_binding={
+                    "source_sha": payload["target_sha"],
+                    "app_sha": app_target_sha,
+                    "run_id": payload["cleanup_run_id"],
+                    "load_run_id": payload["load_run_id"],
+                    "run_attempt": arguments[2],
+                    "profile": arguments[4],
+                },
+            )
+        if len(arguments) == 5 and arguments[:2] == ["retained-cleanup", "--run-attempt"]:
+            app_target_sha, _expected_baseline, source_arguments = _source_binding_context(payload)
+            if payload["load_run_id"] != arguments[4]:
+                return _fail()
+            return _run_retained_cleanup_sudo(
+                CLEANUP_HELPER,
+                [
+                    DELETE_CONFIRMATION,
+                    payload["target_sha"],
+                    payload["load_run_id"],
+                    payload["cleanup_run_id"],
+                    *source_arguments,
+                ],
+                control_email=payload["control_email"],
+                diagnostic_binding={
+                    "source_sha": payload["target_sha"],
+                    "app_sha": app_target_sha,
+                    "run_id": payload["cleanup_run_id"],
+                    "load_run_id": payload["load_run_id"],
+                    "run_attempt": arguments[2],
+                    "profile": "retained-load-cleanup",
+                },
             )
         if arguments == ["external-cleanup-exports"]:
             app_target_sha, expected_baseline, _source_arguments = _source_binding_context(payload)

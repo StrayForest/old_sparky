@@ -1751,7 +1751,10 @@ def _rollback_reconcile_is_authorized(
     candidate = Path(candidate_raw)
     if operation == "rollback":
         authorized = (
-            phase in {"rollback-runtime-pending", "restart-pending"}
+            phase in {
+                "rollback-runtime-pending",
+                "rollback-cache-purged",
+            }
             and previous_before is not None
             and candidate == current_before
             and installer_release == current_before

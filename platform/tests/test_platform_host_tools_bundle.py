@@ -119,7 +119,7 @@ class HostToolsBundleTests(unittest.TestCase):
                 return self.returncode
 
         def invoke(
-            command: str,
+            command: list[str] | str,
             payload: dict[str, object],
             *,
             returncode: int = 0,
@@ -147,7 +147,9 @@ class HostToolsBundleTests(unittest.TestCase):
                 patch.object(dispatcher.subprocess, "Popen", side_effect=spawn),
                 redirect_stdout(output),
             ):
-                result = dispatcher.main([command])
+                result = dispatcher.main(
+                    [command] if isinstance(command, str) else command
+                )
             return result, output.getvalue(), child_args, child.input_bytes
 
         common = {
@@ -167,16 +169,38 @@ class HostToolsBundleTests(unittest.TestCase):
         ).encode("ascii")
 
         for command, payload, expected_cleanup_id in (
-            ("external-cleanup", external, load_run_id),
-            ("retained-cleanup", retained, cleanup_run_id),
+            (
+                [
+                    "external-cleanup",
+                    "--run-attempt",
+                    "2",
+                    "--profile-id",
+                    "ready-vote-slo-v2",
+                ],
+                external,
+                load_run_id,
+            ),
+            (["retained-cleanup"], retained, cleanup_run_id),
         ):
             with self.subTest(command=command):
                 result, output, child_args, child_stdin = invoke(command, payload)
                 self.assertEqual(result, 0)
-                self.assertEqual(
-                    output,
-                    "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=complete child_exit=0\n",
-                )
+                if command[0] == "external-cleanup":
+                    self.assertEqual(
+                        output,
+                        "RETAINED_CLEANUP_DIAGNOSTIC schema=2 stage=complete "
+                        "dispatcher_exit=0 child_state=exited child_exit=0 "
+                        "stdout_eof=true timed_out=false "
+                        f"source_sha={target_sha} app_sha={target_sha} "
+                        f"run_id={load_run_id} run_attempt=2 load_run_id={load_run_id} "
+                        "profile=ready-vote-slo-v2\n",
+                    )
+                else:
+                    self.assertEqual(
+                        output,
+                        "RETAINED_CLEANUP_DIAGNOSTIC schema=1 "
+                        "stage=complete child_exit=0\n",
+                    )
                 self.assertEqual(
                     child_args,
                     [
@@ -242,21 +266,38 @@ class HostToolsBundleTests(unittest.TestCase):
             b"RETAINED_CLEANUP_STAGE schema=1 stage=matrix_cleanup exit_code=1\n"
         )
         result, output, _, _ = invoke(
-            "external-cleanup", external, returncode=1, marker=failed_marker
+            ["external-cleanup", "--run-attempt", "2", "--profile-id", "ready-vote-slo-v2"],
+            external,
+            returncode=1,
+            marker=failed_marker,
         )
         self.assertEqual(result, 1)
         self.assertEqual(
             output,
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 "
-            "stage=matrix_cleanup child_exit=1\n",
+                    "RETAINED_CLEANUP_DIAGNOSTIC schema=2 stage=matrix_cleanup "
+                    "dispatcher_exit=1 child_state=exited child_exit=1 stdout_eof=true "
+                    "timed_out=false source_sha="
+            + target_sha
+            + " app_sha="
+            + target_sha
+                    + f" run_id={load_run_id} run_attempt=2 load_run_id={load_run_id} profile=ready-vote-slo-v2\n",
         )
         result, output, _, _ = invoke(
-            "external-cleanup", external, returncode=1, marker=b"invalid marker\n"
+            ["external-cleanup", "--run-attempt", "2", "--profile-id", "ready-vote-slo-v2"],
+            external,
+            returncode=1,
+            marker=b"invalid marker\n",
         )
         self.assertEqual(result, 1)
         self.assertEqual(
             output,
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=unknown child_exit=1\n",
+                    "RETAINED_CLEANUP_DIAGNOSTIC schema=2 stage=unknown "
+                    "dispatcher_exit=1 child_state=exited child_exit=1 stdout_eof=true "
+                    "timed_out=false source_sha="
+            + target_sha
+            + " app_sha="
+            + target_sha
+                    + f" run_id={load_run_id} run_attempt=2 load_run_id={load_run_id} profile=ready-vote-slo-v2\n",
         )
 
     def test_active_release_baseline_reader_returns_stable_closed_tuple(self) -> None:
@@ -2215,6 +2256,14 @@ raise SystemExit(module.main(["host-capabilities"]))
                     Path("/fixed/cleanup-helper"),
                     ["closed", "target-sha", "12345", "67890"],
                     control_email="private@example.invalid",
+                    diagnostic_binding={
+                        "source_sha": "a" * 40,
+                        "app_sha": "b" * 40,
+                        "run_id": "12345",
+                        "load_run_id": "12345",
+                        "run_attempt": "1",
+                        "profile": "ready-vote-slo-v2",
+                    },
                 )
             self.assertEqual(result, expected_exit)
             self.assertNotIn("private@example.invalid", observed_command)
@@ -2230,8 +2279,13 @@ raise SystemExit(module.main(["host-capabilities"]))
         )
         self.assertEqual(
             failed_marker,
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 "
-            "stage=external_vote_recovery child_exit=7\n",
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=2 stage=external_vote_recovery "
+            "dispatcher_exit=7 child_state=exited child_exit=7 stdout_eof=true "
+            "timed_out=false source_sha="
+            + "a" * 40
+            + " app_sha="
+            + "b" * 40
+            + " run_id=12345 run_attempt=1 load_run_id=12345 profile=ready-vote-slo-v2\n",
         )
         missing_marker, _ = run_cleanup_child(
             "import json,sys; assert json.load(sys.stdin) == "
@@ -2241,7 +2295,35 @@ raise SystemExit(module.main(["host-capabilities"]))
         )
         self.assertEqual(
             missing_marker,
-            "RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=unknown child_exit=1\n",
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=2 stage=unknown "
+            "dispatcher_exit=1 child_state=exited child_exit=1 stdout_eof=true "
+            "timed_out=false source_sha="
+            + "a" * 40
+            + " app_sha="
+            + "b" * 40
+            + " run_id=12345 run_attempt=1 load_run_id=12345 profile=ready-vote-slo-v2\n",
+        )
+
+        with (
+            patch.object(dispatcher, "CLEANUP_OPERATION_TIMEOUT_SECONDS", 0.15),
+            patch.object(dispatcher, "CHILD_TERMINATION_GRACE_SECONDS", 0.15),
+        ):
+            timed_out_marker, _ = run_cleanup_child(
+                "import subprocess,sys; "
+                "print('RETAINED_CLEANUP_STAGE schema=1 stage=complete exit_code=0', flush=True); "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'], "
+                "stdout=sys.stdout, stderr=subprocess.DEVNULL); sys.exit(0)",
+                124,
+            )
+        self.assertEqual(
+            timed_out_marker,
+            "RETAINED_CLEANUP_DIAGNOSTIC schema=2 stage=timeout "
+            "dispatcher_exit=124 child_state=exited child_exit=0 stdout_eof=false "
+            "timed_out=true source_sha="
+            + "a" * 40
+            + " app_sha="
+            + "b" * 40
+            + " run_id=12345 run_attempt=1 load_run_id=12345 profile=ready-vote-slo-v2\n",
         )
 
     def test_declared_host_tools_are_the_recursive_static_runtime_closure(self) -> None:

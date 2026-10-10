@@ -11,7 +11,11 @@ from sqlalchemy import delete, select
 from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import AuditLog, User
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -45,8 +49,8 @@ class PlatformAuditApiTests(PlatformIsolatedAsyncioTestCase):
     async def _client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
 
@@ -60,6 +64,7 @@ class PlatformAuditApiTests(PlatformIsolatedAsyncioTestCase):
                     "password": INTEGRATION_PASSWORD,
                     "display_name": f"audit-{label}",
                 },
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(response.status_code, 201, response.text)
         return client, response.json()["user"]["id"]

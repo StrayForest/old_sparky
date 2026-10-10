@@ -66,7 +66,10 @@ Never begin with broad bucket deletion/listing.
 
 Stop writes. Prefer a compatible previous app release or reviewed forward fix.
 A production restore follows the backup runbook and explicit operator gate;
-never auto-downgrade migrations.
+never auto-downgrade migrations. Keep the API and worker stopped until the
+restored database reaches Alembic head and the fixed restore-only profile
+cache purge in `backup-restore-runbook.md` succeeds; do not restart either
+service after a purge guard failure.
 
 ### Cloudflare or origin
 

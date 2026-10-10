@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -21,6 +22,8 @@ from tools.platform_external_load import (
     summarize_results,
 )
 from tools.platform_external_load_observer import (
+    ObserverProgressReceipt,
+    OBSERVER_PROGRESS_NAME,
     _signal_api_workers_detailed,
     _signal_delivery_summary,
     api_worker_identities,
@@ -1021,11 +1024,133 @@ class PerformanceProfileContractTests(unittest.TestCase):
         self.assertIn("re.fullmatch(r\"preprod[0-9]{12}[0-9a-f]{4}\", marker)", supervisor)
         self.assertIn('--fixture-marker "$fixture_marker"', supervisor)
         self.assertIn('--external-run-id "$run_id"', supervisor)
+        self.assertIn('--run-attempt "$run_attempt"', supervisor)
+        self.assertIn('--progress-path "$external_vote_progress"', supervisor)
+        self.assertIn('record_progress "observer_reaped"', supervisor)
+        self.assertIn('record_progress "supervisor_exit"', supervisor)
+        self.assertIn('record_progress "fixture_setup_requested"', supervisor)
+        self.assertNotIn('record_progress "fixture_preflight"', supervisor)
+        self.assertNotIn('record_progress "fixture_creation"', supervisor)
+        self.assertIn('"authoritative": False', observer)
+        self.assertIn('"final_credit": False', observer)
         self.assertLess(supervisor.index('--fixture-marker "$fixture_marker"'), supervisor.index(': > "$external_vote_ready"'))
         self.assertIn("pidfd_send_signal", observer)
         self.assertNotIn("os.kill(pid, signum)", observer)
         self.assertIn("platform_load.py validate", workflow)
         self.assertIn('--profile "$PROFILE_ID" --dispatchable', workflow)
+
+        marker_helper = re.search(
+            r"(?ms)^completion_marker_was_present\(\) \{\n.*?^\}",
+            supervisor,
+        )
+        self.assertIsNotNone(marker_helper)
+        helper = marker_helper.group(0)  # type: ignore[union-attr]
+        state_capture = supervisor.index(
+            'if completion_marker_was_present "$external_vote_complete"; then'
+        )
+        forced_marker = supervisor.index(': > "$external_vote_complete"', state_capture)
+        observer_reaped = supervisor.index(
+            'record_progress "observer_reaped"', forced_marker
+        )
+        self.assertLess(state_capture, forced_marker)
+        self.assertLess(forced_marker, observer_reaped)
+
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "complete"
+
+            def marker_state() -> str:
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        helper
+                        + '\ncompletion_marker_was_present "$1" && printf true || printf false',
+                        "marker-state-test",
+                        str(marker),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                return result.stdout
+
+            self.assertEqual(marker_state(), "false")
+            marker.write_text("", encoding="ascii")
+            self.assertEqual(marker_state(), "true")
+            marker.unlink()
+            target = Path(directory) / "target"
+            target.write_text("", encoding="ascii")
+            marker.symlink_to(target.name)
+            self.assertEqual(marker_state(), "false")
+
+    def test_observer_progress_receipt_is_private_bound_monotonic_and_non_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / OBSERVER_PROGRESS_NAME
+            receipt = ObserverProgressReceipt(
+                path,
+                source_sha="a" * 40,
+                run_id="123456",
+                run_attempt="2",
+            )
+            receipt.emit("fixture_setup_requested", stop_marker_seen=False)
+            first = json.loads(path.read_text(encoding="ascii"))
+            self.assertEqual(first["sequence"], 1)
+            self.assertEqual(first["elapsed_ms"], 0)
+            self.assertEqual(first["source_sha"], "a" * 40)
+            self.assertEqual(first["run_id"], "123456")
+            self.assertEqual(first["run_attempt"], "2")
+            self.assertEqual(first["profile_id"], "external-vote")
+            self.assertFalse(first["authoritative"])
+            self.assertFalse(first["dispatchable"])
+            self.assertFalse(first["final_credit"])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+            receipt.emit("observer_startup", stop_marker_seen=False)
+            second = json.loads(path.read_text(encoding="ascii"))
+            self.assertEqual(second["sequence"], 2)
+            self.assertGreaterEqual(second["elapsed_ms"], first["elapsed_ms"])
+            self.assertEqual(second["started_monotonic_ms"], first["started_monotonic_ms"])
+
+            with self.assertRaises(ValueError):
+                receipt.emit("fixture_setup_requested", stop_marker_seen=False)
+            receipt.emit("stop_marker_seen", stop_marker_seen=True)
+            receipt.emit("sampler_stop", stop_marker_seen=True)
+            with self.assertRaises(ValueError):
+                receipt.emit(
+                    "observer_reaped",
+                    stop_marker_seen=True,
+                    observer_exit_code=2,
+                )
+            receipt.emit(
+                "observer_reaped",
+                stop_marker_seen=True,
+                observer_exit_code=2,
+                observer_command_reaped=True,
+                observer_output_closed=True,
+            )
+            final = json.loads(path.read_text(encoding="ascii"))
+            self.assertEqual(final["phase"], "observer_reaped")
+            self.assertEqual(final["observer_exit_code"], 2)
+            self.assertTrue(final["observer_command_reaped"])
+            self.assertTrue(final["observer_output_closed"])
+            self.assertFalse(final["final_credit"])
+
+            other_binding = ObserverProgressReceipt(
+                path,
+                source_sha="b" * 40,
+                run_id="123456",
+                run_attempt="2",
+            )
+            with self.assertRaises(ValueError):
+                other_binding.emit("export_summary", stop_marker_seen=True)
+
+            path.unlink()
+            target = Path(directory) / "external-target"
+            target.write_text("not a progress receipt", encoding="ascii")
+            path.symlink_to(target.name)
+            with self.assertRaises(OSError):
+                receipt.emit("export_summary", stop_marker_seen=True)
 
     def test_external_workflow_requires_and_binds_observer_before_evaluation(self) -> None:
         root = Path(__file__).resolve().parents[1]

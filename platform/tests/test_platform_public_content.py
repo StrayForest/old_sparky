@@ -892,7 +892,16 @@ class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
         with patch.object(
             content_routes,
             "get_settings",
-            return_value=PlatformSettings(_env_file=None),
+            return_value=PlatformSettings(
+                _env_file=None,
+                platform_support_recipient_email="support@example.com",
+                platform_email_sender_email=None,
+                platform_resend_api_key=None,
+                platform_support_smtp_host=None,
+                platform_support_smtp_username=None,
+                platform_support_smtp_password=None,
+                platform_support_smtp_sender_email=None,
+            ),
         ):
             with self.assertRaises(HTTPException) as raised:
                 await content_routes.submit_support_message(payload, request)

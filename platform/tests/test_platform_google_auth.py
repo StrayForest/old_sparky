@@ -19,7 +19,7 @@ from apps.platform_api.app.services.google_oauth import (
     GoogleOAuthError,
     verify_google_authorization_code,
 )
-from python_packages.platform_infra.config import PlatformSettings
+from python_packages.platform_infra.config import PlatformSettings, get_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
@@ -27,7 +27,11 @@ from python_packages.platform_infra.models import (
     GoogleAuthFlow,
     User,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 
 
 class GoogleOAuthUnitTests(PlatformIsolatedAsyncioTestCase):
@@ -121,14 +125,14 @@ class GoogleAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
         # test before this integration test opens its first session.
         await dispose_engine()
         self.prefix = f"it-google-{uuid4().hex[:8]}"
-        self.settings = PlatformSettings(
-            _env_file=None,
-            platform_secret_key="google-integration-secret",
-            platform_google_login_enabled=True,
-            platform_google_client_id="google-client-id.apps.googleusercontent.com",
-            platform_google_client_secret="google-client-secret",
-            platform_google_callback_url="http://testserver/api/v1/auth/google/callback",
-            platform_auth_generic_response_min_seconds=0,
+        self.settings = get_settings().model_copy(
+            update={
+                "platform_google_login_enabled": True,
+                "platform_google_client_id": "google-client-id.apps.googleusercontent.com",
+                "platform_google_client_secret": "google-client-secret",
+                "platform_google_callback_url": "https://testserver/api/v1/auth/google/callback",
+                "platform_auth_generic_response_min_seconds": 0,
+            }
         )
         self.app = create_app()
         self.clients = AsyncExitStack()
@@ -163,8 +167,8 @@ class GoogleAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def _client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
                 follow_redirects=False,
             )
         )
@@ -188,6 +192,7 @@ class GoogleAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             started = await client.post(
                 "/api/v1/auth/google/login/start",
                 json={"return_to": f"/{self.prefix}/profile"},
+                headers=same_origin_request_headers(client),
             )
             self.assertEqual(started.status_code, 200, started.text)
             authorization = started.json()["authorization_url"]
@@ -203,6 +208,7 @@ class GoogleAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             started_again = await client.post(
                 "/api/v1/auth/google/login/start",
                 json={"return_to": f"/{self.prefix}/profile"},
+                headers=same_origin_request_headers(client),
             )
             self.assertEqual(started_again.status_code, 200, started_again.text)
             state_again = parse_qs(urlparse(started_again.json()["authorization_url"]).query)["state"][0]

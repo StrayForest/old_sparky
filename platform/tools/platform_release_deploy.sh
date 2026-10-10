@@ -993,6 +993,25 @@ verify_recorded_service_readiness() {
 }
 
 restore_recorded_services() {
+  if transaction_path_present; then
+    local transaction_operation
+    transaction_operation="$(transaction_json | json_field operation)" || {
+      public_status failed transaction >&2
+      return 1
+    }
+    if [[ "$transaction_operation" != "install" ]]; then
+      public_status failed transaction >&2
+      return 1
+    fi
+    # An install transaction can coexist with the separate quiesce receipt.
+    # `transaction_exists` intentionally excludes that state, so use the
+    # validated transaction receipt directly at this old-service boundary.
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" purge-legacy-profile-access-cache \
+      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || {
+        public_status failed cache_purge >&2
+        return 1
+      }
+  fi
   restart_recorded_services || return 1
   verify_recorded_service_readiness || return 1
 }

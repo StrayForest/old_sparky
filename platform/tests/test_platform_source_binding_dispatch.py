@@ -203,7 +203,7 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 "target_sha": RUNNER_SHA,
                 "control_email": "qa.control@example.test",
                 "load_run_id": "567890",
-                "cleanup_run_id": "678901",
+                "cleanup_run_id": "567890",
                 "source_binding": _binding(),
             }
         )
@@ -211,7 +211,12 @@ class SourceBindingDispatchTests(unittest.TestCase):
             patch.object(dispatcher, "load_stdin_payload", return_value=payload),
             patch.object(dispatcher, "_run_retained_cleanup_sudo", return_value=0) as cleanup,
         ):
-            self.assertEqual(dispatcher.main(["external-cleanup"]), 0)
+            self.assertEqual(
+                dispatcher.main(
+                    ["external-cleanup", "--run-attempt", "1", "--profile-id", "ready-vote-slo-v2"]
+                ),
+                0,
+            )
         arguments = cleanup.call_args.args[1]
         self.assertEqual(
             arguments[:4],
@@ -219,12 +224,67 @@ class SourceBindingDispatchTests(unittest.TestCase):
                 "DELETE-PRODUCTION-RETAINED-LOAD",
                 RUNNER_SHA,
                 "567890",
-                "678901",
+                "567890",
             ],
+        )
+        self.assertEqual(
+            cleanup.call_args.kwargs["diagnostic_binding"],
+            {
+                "source_sha": RUNNER_SHA,
+                "app_sha": APP_SHA,
+                "run_id": "567890",
+                "load_run_id": "567890",
+                "run_attempt": "1",
+                "profile": "ready-vote-slo-v2",
+            },
         )
         self.assertEqual(arguments[4], "--source-binding-base64")
         self.assertEqual(
             json.loads(base64.b64decode(arguments[5], validate=True)), _binding()
+        )
+
+        mismatched_payload = validate_cleanup_payload(
+            {
+                "schema": 2,
+                "target_sha": RUNNER_SHA,
+                "control_email": "qa.control@example.test",
+                "load_run_id": "567890",
+                "cleanup_run_id": "678901",
+                "source_binding": _binding(),
+            }
+        )
+        with (
+            patch.object(dispatcher, "load_stdin_payload", return_value=mismatched_payload),
+            patch.object(dispatcher, "_run_retained_cleanup_sudo") as rejected_cleanup,
+        ):
+            self.assertEqual(
+                dispatcher.main(
+                    ["external-cleanup", "--run-attempt", "1", "--profile-id", "ready-vote-slo-v2"]
+                ),
+                2,
+            )
+        rejected_cleanup.assert_not_called()
+
+        with (
+            patch.object(dispatcher, "load_stdin_payload", return_value=payload),
+            patch.object(dispatcher, "_run_retained_cleanup_sudo", return_value=0) as cleanup,
+        ):
+            self.assertEqual(
+                dispatcher.main(
+                    ["retained-cleanup", "--run-attempt", "1", "--load-run-id", "567890"]
+                ),
+                0,
+            )
+        self.assertEqual(
+            cleanup.call_args.kwargs["diagnostic_binding"],
+            {
+                "source_sha": RUNNER_SHA,
+                "app_sha": APP_SHA,
+                "run_id": "567890",
+                "load_run_id": "567890",
+                "run_attempt": "1",
+                "profile": "retained-load-cleanup",
+            },
         )
 
     def test_source_binding_context_rejects_changed_or_malformed_tuple(self) -> None:

@@ -33,7 +33,11 @@ from python_packages.platform_infra.models import (
     UserRole,
 )
 from python_packages.platform_infra.security import invalidate_user_session_cache
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -43,7 +47,7 @@ from tests.platform_integration_password import (
 class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-policy-{uuid4().hex[:8]}"
-        self.base_url = "http://testserver"
+        self.base_url = "https://testserver"
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup_test_data()
@@ -86,7 +90,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
                 base_url=self.base_url,
             )
         )
@@ -109,6 +113,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                         "password": INTEGRATION_PASSWORD,
                         "display_name": f"test-{label}"[:15],
                     },
+                    headers=same_origin_request_headers(client),
                 ),
                 201,
             )
@@ -151,6 +156,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "pool": ["Abrams"],
                     "captain_priority": "neutral" if rank in {"Eternus", "Ascendant"} else None,
                 },
+                headers=same_origin_request_headers(user["client"]),
             ),
             200,
         )
@@ -178,6 +184,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "format_slug": "solo",
                 "cover_url": "https://attacker.invalid/cover.png",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(remote_cover.status_code, 422, remote_cover.text)
 
@@ -203,6 +210,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "captain_selection_starts_at": captain_start.isoformat(),
                 "starts_at": ready_start.isoformat(),
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(invalid_response.status_code, 422, invalid_response.text)
 
@@ -224,6 +232,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "final_format": "bo5",
                     "teams_count": 129,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -272,6 +281,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -286,6 +296,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
         forbidden = await outsider["client"].post(
             f"/api/v1/tournaments/{slug}/cover",
             files={"file": ("cover.png", tiny_png, "image/png")},
+            headers=same_origin_request_headers(outsider["client"]),
         )
         self.assertEqual(forbidden.status_code, 403, forbidden.text)
         settings = get_settings()
@@ -314,12 +325,14 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 invalid_type = await organizer["client"].post(
                     f"/api/v1/tournaments/{slug}/banner",
                     files={"file": ("cover.txt", b"not an image", "text/plain")},
+                    headers=same_origin_request_headers(organizer["client"]),
                 )
                 self.assertEqual(invalid_type.status_code, 415, invalid_type.text)
 
                 invalid_content = await organizer["client"].post(
                     f"/api/v1/tournaments/{slug}/banner",
                     files={"file": ("cover.png", b"not a png", "image/png")},
+                    headers=same_origin_request_headers(organizer["client"]),
                 )
                 self.assertEqual(invalid_content.status_code, 415, invalid_content.text)
 
@@ -330,6 +343,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 too_large = await organizer["client"].post(
                     f"/api/v1/tournaments/{slug}/banner",
                     files={"file": ("cover.png", oversized, "image/png")},
+                    headers=same_origin_request_headers(organizer["client"]),
                 )
                 self.assertEqual(too_large.status_code, 413, too_large.text)
 
@@ -339,6 +353,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     await outsider["client"].post(
                         f"/api/v1/tournaments/{slug}/banner",
                         files={"file": ("cover.png", tiny_png, "image/png")},
+                        headers=same_origin_request_headers(outsider["client"]),
                     ),
                     202,
                 )
@@ -349,7 +364,8 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 self.assertEqual(organizer_status.status_code, 200, organizer_status.text)
                 deleted = self._assert_status(
                     await organizer["client"].delete(
-                        f"/api/v1/tournaments/{slug}/banner"
+                        f"/api/v1/tournaments/{slug}/banner",
+                        headers=same_origin_request_headers(organizer["client"]),
                     ),
                     202,
                 )
@@ -381,6 +397,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "visibility": "public",
                 "format_slug": "solo",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(public_attempt.status_code, 403, public_attempt.text)
 
@@ -391,6 +408,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "visibility": "invite_only",
                 "format_slug": "standard_bracket",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(standard_attempt.status_code, 422, standard_attempt.text)
 
@@ -401,6 +419,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "visibility": "invite_only",
                 "format_slug": "solo_balanced_deadlock",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(legacy_solo_attempt.status_code, 422, legacy_solo_attempt.text)
 
@@ -412,6 +431,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "description": "Default private policy",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -448,6 +468,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "visibility": "invite_only",
                 "format_slug": "solo",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(second_private.status_code, 409, second_private.text)
         self.assertIn("monthly private tournament", second_private.json()["detail"])
@@ -470,6 +491,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -487,6 +509,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "format_slug": "solo",
                 "starts_at": (now - timedelta(minutes=1)).isoformat(),
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(past_schedule.status_code, 422, past_schedule.text)
         self.assertIn("Tournament start must be in the future", past_schedule.json()["detail"])
@@ -504,6 +527,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "captain_selection_starts_at": (now + timedelta(hours=1, minutes=30)).isoformat(),
                     "starts_at": (now + timedelta(hours=2)).isoformat(),
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -525,6 +549,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             organizer["client"].post(
                 "/api/v1/tournaments",
@@ -533,6 +558,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
         )
         self.assertEqual(sorted(response.status_code for response in responses), [201, 403])
@@ -553,6 +579,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 "/api/v1/tournaments",
                 json={"name": shared_name, "visibility": "invite_only", "format_slug": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -560,6 +587,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 "/api/v1/tournaments",
                 json={"name": shared_name, "visibility": "invite_only", "format_slug": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -569,6 +597,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 "/api/v1/tournaments",
                 json={"name": shared_name.upper(), "visibility": "public", "format_slug": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -577,12 +606,14 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
         duplicate_public = await organizer["client"].post(
             "/api/v1/tournaments",
             json={"name": shared_name, "visibility": "public", "format_slug": "solo"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(duplicate_public.status_code, 409, duplicate_public.text)
 
         private_after_public = await organizer["client"].post(
             "/api/v1/tournaments",
             json={"name": shared_name, "visibility": "invite_only", "format_slug": "solo"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(private_after_public.status_code, 409, private_after_public.text)
 
@@ -591,10 +622,12 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             organizer["client"].post(
                 "/api/v1/tournaments",
                 json={"name": concurrent_name, "visibility": "public", "format_slug": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             organizer["client"].post(
                 "/api/v1/tournaments",
                 json={"name": concurrent_name.upper(), "visibility": "public", "format_slug": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
         )
         self.assertEqual(sorted(response.status_code for response in concurrent_responses), [201, 409])
@@ -613,6 +646,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "private_tournament_credits": 1,
                     "note": "Allow public event smoke coverage.",
                 },
+                headers=same_origin_request_headers(admin["client"]),
             ),
             200,
         )
@@ -628,6 +662,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -640,6 +675,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -650,6 +686,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "visibility": "public",
                 "format_slug": "solo",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(over_quota.status_code, 403, over_quota.text)
         self.assertIn("no public tournament credits", over_quota.json()["detail"])
@@ -662,6 +699,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -674,6 +712,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -685,6 +724,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "visibility": "invite_only",
                 "format_slug": "solo",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(exhausted_private.status_code, 409, exhausted_private.text)
         current_user = self._assert_status(await organizer["client"].get("/api/v1/users/me"), 200)
@@ -695,6 +735,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -702,6 +743,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
         team_attempt = await player["client"].post(
             f"/api/v1/tournaments/{slug}/join",
             json={"entry_type": "team", "team_name": "No Teams"},
+            headers=same_origin_request_headers(player["client"]),
         )
         self.assertEqual(team_attempt.status_code, 422, team_attempt.text)
 
@@ -735,6 +777,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "format_slug": "solo",
                     "invite_code": invite_code,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -763,6 +806,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "format_slug": "solo",
                 "invite_code": invite_code,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(duplicate.status_code, 409, duplicate.text)
 
@@ -793,6 +837,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                         "format_slug": "solo",
                         "invite_code": raw_code,
                     },
+                    headers=same_origin_request_headers(organizer["client"]),
                 )
                 self.assertEqual(response.status_code, 422, response.text)
                 self.assertNotIn(raw_code, response.text)
@@ -824,6 +869,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "format_slug": "solo",
                     "invite_code": f"{self.prefix[-8:]}ab".lower(),
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -894,6 +940,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -902,6 +949,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -914,6 +962,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await player["client"].post(
                 "/api/v1/tournaments/invites/claim",
                 json={"code": invites[0]["code"], "entry_type": "solo", "team_name": None},
+                headers=same_origin_request_headers(player["client"]),
             ),
             201,
         )
@@ -927,6 +976,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await player["client"].post(
                 f"/api/v1/tournaments/{slug}/join",
                 json={"entry_type": "solo", "invite_code": invites[0]["code"]},
+                headers=same_origin_request_headers(player["client"]),
             ),
             201,
         )
@@ -946,6 +996,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -954,33 +1005,46 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
         self._assert_status(
-            await player["client"].post(f"/api/v1/tournaments/{slug}/join", json={"entry_type": "solo"}),
+            await player["client"].post(
+                f"/api/v1/tournaments/{slug}/join",
+                json={"entry_type": "solo"},
+                headers=same_origin_request_headers(player["client"]),
+            ),
             201,
         )
         self._assert_status(
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
         self._assert_status(
-            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
+            await organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/deadlock/ready-check/start",
+                headers=same_origin_request_headers(organizer["client"]),
+            ),
             201,
         )
         self._assert_status(
             await player["client"].post(
                 f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                 json={"choice": "yes"},
+                headers=same_origin_request_headers(player["client"]),
             ),
             200,
         )
 
-        leave_response = await player["client"].delete(f"/api/v1/tournaments/{slug}/join")
+        leave_response = await player["client"].delete(
+            f"/api/v1/tournaments/{slug}/join",
+            headers=same_origin_request_headers(player["client"]),
+        )
         self.assertEqual(leave_response.status_code, 409, leave_response.text)
         self.assertIn("Confirmed participants cannot leave", leave_response.json()["detail"])
         participants = self._assert_status(
@@ -1005,6 +1069,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1013,6 +1078,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1021,6 +1087,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 await player["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo"},
+                    headers=same_origin_request_headers(player["client"]),
                 ),
                 201,
             )
@@ -1034,7 +1101,10 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(search_response.headers["x-total-count"], "1")
 
         self._assert_status(
-            await second_player["client"].delete(f"/api/v1/tournaments/{slug}/join"),
+            await second_player["client"].delete(
+                f"/api/v1/tournaments/{slug}/join",
+                headers=same_origin_request_headers(second_player["client"]),
+            ),
             204,
         )
         participant_response = await organizer["client"].get(
@@ -1063,6 +1133,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "allowed_ranks": ["Oracle"],
                     "max_participants": 1,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1073,17 +1144,23 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
 
         self._assert_status(
-            await oracle_player["client"].post(f"/api/v1/tournaments/{slug}/join", json={"entry_type": "solo"}),
+            await oracle_player["client"].post(
+                f"/api/v1/tournaments/{slug}/join",
+                json={"entry_type": "solo"},
+                headers=same_origin_request_headers(oracle_player["client"]),
+            ),
             201,
         )
         capacity_blocked = await phantom_player["client"].post(
             f"/api/v1/tournaments/{slug}/join",
             json={"entry_type": "solo"},
+            headers=same_origin_request_headers(phantom_player["client"]),
         )
         self.assertEqual(capacity_blocked.status_code, 409, capacity_blocked.text)
         self.assertIn("participant limit", capacity_blocked.json()["detail"])
@@ -1098,6 +1175,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "allowed_ranks": ["Oracle"],
                     "max_participants": 2,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1105,12 +1183,14 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{rank_only['slug']}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
         rank_blocked = await phantom_player["client"].post(
             f"/api/v1/tournaments/{rank_only['slug']}/join",
             json={"entry_type": "solo"},
+            headers=same_origin_request_headers(phantom_player["client"]),
         )
         self.assertEqual(rank_blocked.status_code, 409, rank_blocked.text)
         self.assertIn("outside this tournament", rank_blocked.json()["detail"])
@@ -1128,6 +1208,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "format_slug": "solo",
                     "max_participants": 999_999_999,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1141,6 +1222,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                 "format_slug": "solo",
                 "max_participants": 1_000_000_000,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(rejected.status_code, 422, rejected.text)
 
@@ -1156,6 +1238,7 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1169,5 +1252,6 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             )
             self.assertEqual(rejected.status_code, 422, rejected.text)

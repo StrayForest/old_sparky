@@ -1180,6 +1180,46 @@ def _project_status_counter(value: Any) -> dict[str, int]:
     return dict(sorted(output.items(), key=lambda item: int(item[0])))
 
 
+def _project_status_summary_map(value: Any) -> dict[str, dict[str, Any]]:
+    """Project per-status aggregates through a closed, numeric-key schema."""
+
+    source = _mapping(value)
+    output: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_value in source.items():
+        if not isinstance(raw_key, str) or not re.fullmatch(r"[1-5][0-9]{2}", raw_key):
+            continue
+        status = safe_status(raw_key)
+        if not 100 <= status <= 599:
+            continue
+        row = _mapping(raw_value)
+        projected: dict[str, Any] = {}
+        requests = _copy_int(row, "requests")
+        if requests is not None:
+            projected["requests"] = requests
+        upstream_statuses = _project_status_counter(row.get("upstream_statuses"))
+        if upstream_statuses:
+            projected["upstream_statuses"] = upstream_statuses
+        upstream_status_unknown_attempts = _copy_int(
+            row, "upstream_status_unknown_attempts"
+        )
+        if upstream_status_unknown_attempts is not None:
+            projected["upstream_status_unknown_attempts"] = (
+                upstream_status_unknown_attempts
+            )
+        for key in (
+            "request_time_ms",
+            "upstream_connect_time_ms",
+            "upstream_header_time_ms",
+            "upstream_time_ms",
+        ):
+            metric = _project_metric(row.get(key))
+            if metric:
+                projected[key] = metric
+        if projected:
+            output[str(status)] = projected
+    return dict(sorted(output.items(), key=lambda item: int(item[0])))
+
+
 def _project_route_metric_map(value: Any) -> dict[str, dict[str, Any]]:
     source = _mapping(value)
     output: dict[str, dict[str, Any]] = {}
@@ -1462,10 +1502,23 @@ def _project_summary(value: Any) -> dict[str, Any]:
     phase_summaries = _project_phase_summary_map(source.get("by_qa_phase"))
     if phase_summaries:
         output["by_qa_phase"] = phase_summaries
-    for key in ("status_counts", "final_status_counts", "statuses"):
+    for key in (
+        "status_counts",
+        "final_status_counts",
+        "statuses",
+        "upstream_statuses",
+    ):
         statuses = _project_status_counter(source.get(key))
         if statuses:
             output[key] = statuses
+    upstream_status_unknown_attempts = _copy_int(
+        source, "upstream_status_unknown_attempts"
+    )
+    if upstream_status_unknown_attempts is not None:
+        output["upstream_status_unknown_attempts"] = upstream_status_unknown_attempts
+    status_summaries = _project_status_summary_map(source.get("by_status"))
+    if status_summaries:
+        output["by_status"] = status_summaries
     for key in ("error_kinds", "cf_error_type_counts", "cf_error_origin_counts"):
         counters = _project_counter(source.get(key), SAFE_ERROR_CLASSES | SAFE_CF_ERROR_CLASSES)
         if counters:

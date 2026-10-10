@@ -9,9 +9,11 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+import uuid
 from typing import cast
 from unittest import mock
 
@@ -65,6 +67,58 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 self._release_lock.cleanup()
         finally:
             self.temp_dir.cleanup()
+
+    def test_cache_purge_runtime_uses_transaction_bound_pre_activation_source(self) -> None:
+        current = self.add_release("purge-source-current")
+        older = self.add_release("purge-target-older")
+        shared = self.shared / "venv"
+        peer = self.shared / ".venv-peer"
+        snapshot = self.shared / ".venv-snapshot"
+        for path in (shared, peer, snapshot):
+            path.mkdir(mode=0o755)
+            path.chmod(0o755)
+            (path / "bin").mkdir(mode=0o755)
+            (path / "bin").chmod(0o755)
+            (path / "bin/python").symlink_to("/usr/bin/python3.12")
+
+        rollback_record: dict[str, object] = {
+            "operation": "rollback",
+            "transition": "exchange",
+            "candidate_path": older,
+            "current_before_path": current,
+            "shared_before": transaction._identity(snapshot.lstat()),
+            "peer_before": transaction._identity(shared.lstat()),
+            "shared_venv_path": shared,
+            "peer_path": peer,
+            "snapshot_path": snapshot,
+        }
+        rollback_source, rollback_python = transaction._cache_purge_runtime(
+            rollback_record
+        )
+        self.assertEqual(rollback_source, current)
+        self.assertEqual(rollback_python, snapshot / "bin/python")
+        self.assertNotEqual(rollback_source, older)
+
+        install_record: dict[str, object] = {
+            "operation": "install",
+            "transition": "exchange",
+            "candidate_path": older,
+            "current_before_path": current,
+            "shared_before": transaction._identity(shared.lstat()),
+            "peer_before": transaction._identity(peer.lstat()),
+            "shared_venv_path": shared,
+            "peer_path": peer,
+            "snapshot_path": snapshot,
+        }
+        install_source, install_python = transaction._cache_purge_runtime(
+            install_record
+        )
+        self.assertEqual(install_source, older)
+        self.assertEqual(install_python, peer / "bin/python")
+
+        rollback_record["current_before_path"] = None
+        with self.assertRaisesRegex(transaction.TransactionError, "source is unavailable"):
+            transaction._cache_purge_runtime(rollback_record)
 
     def test_immutable_recovery_wrapper_first_install_avoids_systemd_and_current_helpers(
         self,
@@ -1066,9 +1120,63 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             transaction._record_for_write(record),
             creating=False,
         )
-        receipt_before = (self.shared / STATE_NAME).read_bytes()
+        with (
+            mock.patch.object(transaction, "_validate_legacy_liveqa_recovery"),
+            mock.patch.object(transaction, "_run_systemctl") as run_systemctl,
+        ):
+            with self.assertRaisesRegex(
+                transaction.TransactionError, "profile cache purge proof"
+            ):
+                transaction.restore_legacy_services(
+                    self.shared / STATE_NAME,
+                    systemctl="/usr/bin/systemctl",
+                )
+        run_systemctl.assert_not_called()
+
+        purge_python = self.prepare_wrapper_cache_purge(candidate)
+        purge = self.run_transaction(
+            "purge-legacy-profile-access-cache", check=False
+        )
+        self.assertEqual(purge.returncode, 0, purge.stderr)
+        if purge_python is not None:
+            original = purge_python["original"]
+            python_path = cast(Path, purge_python["path"])
+            python_path.unlink(missing_ok=True)
+            if original is not None:
+                kind, value, mode = original
+                if kind == "symlink":
+                    python_path.symlink_to(cast(str, value))
+                else:
+                    python_path.write_bytes(cast(bytes, value))
+                    python_path.chmod(cast(int, mode))
         enabled = cast(dict[str, str], record["service_enabled_before"])
         service_state = cast(dict[str, str], record["service_state_before"])
+        with (
+            mock.patch.object(transaction, "_validate_legacy_liveqa_recovery"),
+            mock.patch.object(transaction, "_run_systemctl", return_value="process") as run_systemctl,
+            mock.patch.object(
+                transaction,
+                "_read_systemctl_enabled",
+                side_effect=lambda _systemctl, unit: (
+                    cast(str, record["timer_enabled_before"])
+                    if unit == "deadlock-cloudflare-ips.timer"
+                    else enabled[unit]
+                ),
+            ),
+            mock.patch.object(
+                transaction,
+                "_read_systemctl_state",
+                side_effect=lambda _systemctl, unit: (
+                    "active" if unit.endswith(".timer") else service_state[unit]
+                ),
+            ),
+        ):
+            transaction.restore_legacy_services(
+                self.shared / STATE_NAME,
+                systemctl="/usr/bin/systemctl",
+            )
+        self.assertGreater(run_systemctl.call_count, 0)
+        receipt_before = (self.shared / STATE_NAME).read_bytes()
 
         with (
             mock.patch.object(transaction, "_validate_legacy_liveqa_recovery"),
@@ -1612,7 +1720,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertTrue(receipt.exists())
         self.assertEqual((self.root / "systemctl.log").read_text(), "")
 
-    def test_immutable_recovery_wrapper_rollback_restart_pending_resumes_immutable_runtime(
+    def test_immutable_recovery_wrapper_rollback_cache_purged_resumes_immutable_runtime(
         self,
     ) -> None:
         generation = self.install_recovery_generation()
@@ -1644,7 +1752,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "esac\n"
         )
         fake_python.chmod(0o755)
-        self.create_wrapper_rollback_transaction(current, previous, phase="restart-pending")
+        self.create_wrapper_rollback_transaction(current, previous, phase="rollback-cache-purged")
         self.switch_pointer("current", previous)
         self.switch_pointer("previous", current)
         systemctl = self.write_stateful_systemctl(
@@ -1694,6 +1802,223 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual(runtime_args[0], str(runtime_installer))
         self.assertIn("reconcile", runtime_args[1])
         self.assertNotIn("--rollback-reconcile-transaction", runtime_args[1])
+
+    def test_immutable_recovery_rejects_legacy_restart_pending_without_purge_proof(
+        self,
+    ) -> None:
+        # Exercise the only supported proof writer through the transaction CLI:
+        # the fixed v1 purge child succeeds, then the receipt can advance and
+        # complete.  Invalid bindings remain read-only failures.
+        proof_current = self.add_release("purge-proof-current")
+        proof_previous = self.add_release("purge-proof-previous")
+        self.add_runtime_stubs(proof_current)
+        self.add_runtime_stubs(proof_previous)
+        (self.app_dir / "current").symlink_to(proof_current)
+        (self.app_dir / "previous").symlink_to(proof_previous)
+        venv = self.shared / "venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin/python").symlink_to("/usr/bin/python3.12")
+        safe_env = proof_current / "tools/platform_safe_env_exec.py"
+        safe_env.write_text(
+            "import base64\n"
+            "value = base64.b64encode(b'redis://127.0.0.1:6379/15').decode('ascii')\n"
+            "print('PLATFORM_REDIS_URL\\t' + value)\n",
+            encoding="ascii",
+        )
+        safe_env.chmod(0o555)
+        services = proof_current / "apps/platform_api/app/services"
+        services.mkdir(parents=True)
+        for package in (
+            proof_current / "apps/platform_api/app/__init__.py",
+            services.parent / "__init__.py",
+            services / "__init__.py",
+        ):
+            package.write_text("", encoding="ascii")
+            package.chmod(0o444)
+        (services / "tournament_profile_access.py").write_text(
+            "async def purge_legacy_profile_access_cache():\n"
+            "    return 0\n",
+            encoding="ascii",
+        )
+        (services / "tournament_profile_access.py").chmod(0o444)
+        self.create_wrapper_rollback_transaction(
+            proof_current, proof_previous, phase="rollback-runtime-pending"
+        )
+        transaction_state = self.shared / STATE_NAME
+        purge = self.run_transaction("purge-legacy-profile-access-cache", check=False)
+        self.assertEqual(purge.returncode, 0, purge.stderr)
+        proof_bytes = transaction_state.read_bytes()
+        proof_record = json.loads(proof_bytes)
+        purge_proof = proof_record["profile_access_cache_purge_proof"]
+        self.assertEqual(purge_proof["operation"], "rollback")
+        self.assertEqual(purge_proof["operation_id"], proof_record["operation_id"])
+        self.assertEqual(purge_proof["source_role"], "current-before")
+        self.assertEqual(purge_proof["source_identity"], proof_record["current_before_identity"])
+        self.assertEqual(purge_proof["scope"], "tournament-profile-access-v1")
+
+        for mutate_proof in (
+            lambda value: value.update(scope="tournament-profile-access-v2"),
+            lambda value: value.update(operation="install"),
+            lambda value: value.update(
+                source_identity={
+                    "dev": value["source_identity"]["dev"],
+                    "ino": value["source_identity"]["ino"] + 1,
+                }
+            ),
+        ):
+            changed = json.loads(proof_bytes)
+            mutate_proof(changed["profile_access_cache_purge_proof"])
+            transaction_state.write_text(
+                json.dumps(changed, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+            transaction_state.chmod(0o600)
+            invalid = self.run_transaction("status", "--json", check=False)
+            self.assertNotEqual(invalid.returncode, 0)
+            transaction_state.write_bytes(proof_bytes)
+            transaction_state.chmod(0o600)
+
+        self.run_transaction(
+            "phase",
+            "--expected",
+            "rollback-runtime-pending",
+            "--phase",
+            "rollback-cache-purged",
+        )
+        self.run_transaction(
+            "phase",
+            "--expected",
+            "rollback-cache-purged",
+            "--phase",
+            "services-restarted",
+        )
+        self.run_transaction(
+            "phase", "--expected", "services-restarted", "--phase", "smoke-passed"
+        )
+        self.run_transaction(
+            "phase",
+            "--expected",
+            "smoke-passed",
+            "--phase",
+            "rollback-runtime-applied",
+        )
+        self.switch_pointer("current", proof_previous)
+        self.switch_pointer("previous", proof_current)
+        self.run_transaction("complete", "--retain-receipt")
+        self.assertEqual(
+            json.loads(transaction_state.read_text())["profile_access_cache_purge_proof"],
+            purge_proof,
+        )
+        self.run_transaction("complete")
+        self.assertFalse(transaction_state.exists())
+        (self.app_dir / "current").unlink()
+        (self.app_dir / "previous").unlink()
+        shutil.rmtree(venv)
+
+        generation = self.install_recovery_generation()
+        current = self.add_release("legacy-restart-current")
+        previous = self.add_release("legacy-restart-previous")
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(previous)
+        runtime_args_log = self.root / "legacy-restart-runtime-args.txt"
+        self.create_wrapper_rollback_transaction(
+            current, previous, phase="rollback-runtime-pending"
+        )
+        transaction_state = self.shared / STATE_NAME
+        runtime_pending_bytes = transaction_state.read_bytes()
+        direct_phase = self.run_script(
+            TRANSACTION_TOOL,
+            "phase",
+            "--state",
+            str(transaction_state),
+            "--expected",
+            "rollback-runtime-pending",
+            "--phase",
+            "rollback-cache-purged",
+            check=False,
+        )
+        self.assertNotEqual(direct_phase.returncode, 0)
+        self.assertEqual(transaction_state.read_bytes(), runtime_pending_bytes)
+        legacy_record = json.loads(transaction_state.read_text(encoding="utf-8"))
+        legacy_record["phase"] = "restart-pending"
+        transaction_state.write_text(
+            json.dumps(legacy_record, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        transaction_state.chmod(0o600)
+        legacy_state_bytes = transaction_state.read_bytes()
+        direct_completion = self.run_script(
+            TRANSACTION_TOOL,
+            "complete",
+            "--state",
+            str(transaction_state),
+            check=False,
+        )
+        self.assertNotEqual(direct_completion.returncode, 0)
+        self.assertEqual(transaction_state.read_bytes(), legacy_state_bytes)
+        self.switch_pointer("current", previous)
+        self.switch_pointer("previous", current)
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api.service": "active",
+                "deadlock-worker.service": "active",
+                "deadlock-web.service": "inactive",
+            }
+        )
+        receipt = self.shared / ".release-systemd-state.json"
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "capture-transaction",
+            "--state",
+            str(receipt),
+            "--transaction",
+            str(transaction_state),
+            "--app-dir",
+            str(self.app_dir),
+            "--helper-release",
+            str(previous),
+            "--require-helper-manifest",
+            "--systemctl",
+            str(systemctl),
+        )
+        (self.root / "systemctl.log").write_text("")
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            env=self.runtime_env(label="previous"),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(transaction_state.is_file())
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(json.loads(transaction_state.read_text())["phase"], "restart-pending")
+        self.assertEqual((self.app_dir / "current").resolve(), previous)
+        self.assertEqual((self.app_dir / "previous").resolve(), current)
+        self.assertEqual((self.root / "systemctl.log").read_text(), "")
+        self.assertFalse(runtime_args_log.exists())
+
+        applied_record = json.loads(transaction_state.read_text(encoding="utf-8"))
+        applied_record["phase"] = "rollback-runtime-applied"
+        transaction_state.write_text(
+            json.dumps(applied_record, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        transaction_state.chmod(0o600)
+        legacy_applied_bytes = transaction_state.read_bytes()
+        direct_completion = self.run_script(
+            TRANSACTION_TOOL,
+            "complete",
+            "--state",
+            str(transaction_state),
+            check=False,
+        )
+        self.assertNotEqual(direct_completion.returncode, 0)
+        self.assertEqual(transaction_state.read_bytes(), legacy_applied_bytes)
 
     def test_immutable_recovery_wrapper_rollback_runtime_pending_restores_original_state(
         self,
@@ -1990,6 +2315,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         )
         self.add_runtime_stubs(current)
         self.add_runtime_stubs(candidate)
+        self.prepare_wrapper_cache_purge(candidate)
         self.advance_install_state(candidate, current, phase="staged")
         self.run_transaction(
             "record-services",
@@ -2723,6 +3049,109 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         )
         self.add_runtime_stubs(current)
         self.add_runtime_stubs(candidate)
+        # The child must run through the recorded venv launcher so Python
+        # keeps the venv prefix under -I, while that launcher resolves to the
+        # fixed system interpreter accepted by the transaction guard.
+        shared_python = self.shared / "venv/bin/python"
+        shared_python.unlink()
+        shared_python.symlink_to("/usr/bin/python3.12")
+        shared_venv = self.shared / "venv"
+        (shared_venv / "pyvenv.cfg").write_text(
+            "home = /usr/bin\ninclude-system-site-packages = true\n",
+            encoding="ascii",
+        )
+        site_packages = (
+            Path(sys.prefix)
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+        if not site_packages.is_dir():
+            self.fail("test runtime site-packages are unavailable")
+        candidate_site_packages = (
+            shared_venv
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+        candidate_site_packages.parent.mkdir(parents=True)
+        candidate_site_packages.symlink_to(site_packages, target_is_directory=True)
+        safe_env = candidate / "tools/platform_safe_env_exec.py"
+        safe_env.write_text(
+            "import base64\n"
+            "value = base64.b64encode(b'redis://127.0.0.1:6379/15').decode('ascii')\n"
+            "print('PLATFORM_REDIS_URL\\t' + value)\n",
+            encoding="ascii",
+        )
+        safe_env.chmod(0o555)
+        env_file = self.shared / ".env.platform"
+        env_file.write_text(
+            "PLATFORM_TESTING=1\nPLATFORM_REDIS_URL=redis://127.0.0.1:6379/15\n",
+            encoding="ascii",
+        )
+        env_file.chmod(0o600)
+        from redis.asyncio import from_url
+
+        cache_token = uuid.uuid4().hex
+        v1_keys = tuple(
+            f"platform:tournament:{namespace}:v1:{cache_token}"
+            for namespace in ("profile-access", "profile-viewers", "profile-roster")
+        )
+        v2_keys = tuple(
+            f"platform:tournament:{namespace}:v2:{cache_token}"
+            for namespace in ("profile-access", "profile-viewers", "profile-roster")
+        )
+
+        async def seed_profile_access_keys() -> None:
+            client = from_url("redis://127.0.0.1:6379/15", decode_responses=False)
+            try:
+                for key in (*v1_keys, *v2_keys):
+                    await client.set(key, b"test-only")
+            finally:
+                await client.aclose()
+
+        async def remove_profile_access_keys() -> None:
+            client = from_url("redis://127.0.0.1:6379/15", decode_responses=False)
+            try:
+                await client.unlink(*v1_keys, *v2_keys)
+            finally:
+                await client.aclose()
+
+        async def profile_access_key_state() -> tuple[bool, ...]:
+            client = from_url("redis://127.0.0.1:6379/15", decode_responses=False)
+            try:
+                states = []
+                for key in (*v1_keys, *v2_keys):
+                    states.append(bool(await client.exists(key)))
+                return tuple(states)
+            finally:
+                await client.aclose()
+
+        import asyncio
+
+        self.addCleanup(lambda: asyncio.run(remove_profile_access_keys()))
+        asyncio.run(seed_profile_access_keys())
+        candidate_source = REPO_ROOT / "platform"
+        shutil.copytree(candidate_source / "python_packages", candidate / "python_packages")
+        candidate_services = candidate / "apps/platform_api/app/services"
+        candidate_services.mkdir(parents=True)
+        for package in (
+            candidate / "apps/platform_api/app/__init__.py",
+            candidate_services.parent / "__init__.py",
+            candidate_services / "__init__.py",
+        ):
+            package.write_text("", encoding="ascii")
+            package.chmod(0o444)
+        shutil.copy2(
+            candidate_source / "apps/platform_api/app/services/tournament_profile_access.py",
+            candidate_services / "tournament_profile_access.py",
+        )
+        (candidate_services / "tournament_profile_access.py").chmod(0o444)
+        shutil.copy2(
+            candidate_source / "tools/platform_safe_env_exec.py",
+            candidate / "tools/platform_safe_env_exec.py",
+        )
+        (candidate / "tools/platform_safe_env_exec.py").chmod(0o555)
         self.advance_install_state(candidate, current, phase="staged")
         self.run_transaction(
             "record-services",
@@ -2762,6 +3191,16 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.state_phase(), "migration-failed")
         self.assertEqual((self.app_dir / "current").resolve(), current)
+        transaction_record = json.loads((self.shared / STATE_NAME).read_text())
+        self.assertIsNotNone(
+            transaction_record["profile_access_cache_purge_proof"],
+            "old services must not restart while a concurrent quiesce receipt hides the install transaction",
+        )
+        self.assertEqual(
+            asyncio.run(profile_access_key_state()),
+            (False, False, False, True, True, True),
+            "the isolated purge child must remove only v1 keys using the real service module",
+        )
         migration_state = json.loads((self.root / "systemd-state.json").read_text())
         self.assertEqual(migration_state["deadlock-api"], "active")
         self.assertEqual(migration_state["deadlock-worker"], "inactive")
@@ -4496,6 +4935,10 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
     def create_wrapper_rollback_transaction(
         self, current: Path, previous: Path, *, phase: str
     ) -> None:
+        needs_cache_purge = phase in transaction.ROLLBACK_CACHE_PURGE_PROOF_PHASES
+        purge_python = (
+            self.prepare_wrapper_cache_purge(current) if needs_cache_purge else None
+        )
         rollback = current / ".rollback"
         rollback.mkdir()
         snapshot = rollback / "shared-venv-before-install"
@@ -4526,15 +4969,75 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 ("venv-transitioned", "current-switched"),
                 ("current-switched", "pointers-switched"),
                 ("pointers-switched", "rollback-runtime-pending"),
-                ("rollback-runtime-pending", "restart-pending"),
-                ("restart-pending", "services-restarted"),
+                ("rollback-runtime-pending", "rollback-cache-purged"),
+                ("rollback-cache-purged", "services-restarted"),
                 ("services-restarted", "smoke-passed"),
                 ("smoke-passed", "rollback-runtime-applied"),
             ):
+                if next_phase == "rollback-cache-purged":
+                    purge = self.run_transaction(
+                        "purge-legacy-profile-access-cache", check=False
+                    )
+                    self.assertEqual(purge.returncode, 0, purge.stderr)
+                    if purge_python is not None:
+                        original = purge_python["original"]
+                        python_path = cast(Path, purge_python["path"])
+                        python_path.unlink(missing_ok=True)
+                        if original is not None:
+                            kind, value, mode = original
+                            if kind == "symlink":
+                                python_path.symlink_to(cast(str, value))
+                            else:
+                                python_path.write_bytes(cast(bytes, value))
+                                python_path.chmod(cast(int, mode))
                 self.run_transaction("phase", "--expected", expected, "--phase", next_phase)
                 if next_phase == phase:
                     return
             raise AssertionError(f"unsupported rollback test phase: {phase}")
+
+    def prepare_wrapper_cache_purge(
+        self, current: Path
+    ) -> dict[str, object]:
+        """Make the immutable purge CLI fixture use the pinned system Python."""
+
+        venv = self.shared / "venv"
+        bin_dir = venv / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        python_path = bin_dir / "python"
+        original: tuple[str, object, int | None] | None = None
+        if python_path.is_symlink():
+            original = ("symlink", os.readlink(python_path), None)
+        elif python_path.exists():
+            metadata = python_path.lstat()
+            original = ("file", python_path.read_bytes(), stat.S_IMODE(metadata.st_mode))
+        python_path.unlink(missing_ok=True)
+        python_path.symlink_to("/usr/bin/python3.12")
+
+        (current / "tools").mkdir(parents=True, exist_ok=True)
+        safe_env = current / "tools/platform_safe_env_exec.py"
+        safe_env.write_text(
+            "import base64\n"
+            "value = base64.b64encode(b'redis://127.0.0.1:6379/15').decode('ascii')\n"
+            "print('PLATFORM_REDIS_URL\\t' + value)\n",
+            encoding="ascii",
+        )
+        safe_env.chmod(0o555)
+        services = current / "apps/platform_api/app/services"
+        services.mkdir(parents=True, exist_ok=True)
+        for package in (
+            current / "apps/platform_api/app/__init__.py",
+            services.parent / "__init__.py",
+            services / "__init__.py",
+        ):
+            package.write_text("", encoding="ascii")
+            package.chmod(0o444)
+        (services / "tournament_profile_access.py").write_text(
+            "async def purge_legacy_profile_access_cache():\n"
+            "    return 0\n",
+            encoding="ascii",
+        )
+        (services / "tournament_profile_access.py").chmod(0o444)
+        return {"path": python_path, "original": original}
 
     def write_failing_systemctl(
         self, label: str, *, exit_code: int = 99
@@ -4979,7 +5482,9 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
         return json.loads((self.shared / STATE_NAME).read_text())["phase"]
 
-    def run_transaction(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def run_transaction(
+        self, *args: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
         normalized = list(args)
         if normalized and normalized[0] in {"record-services", "prepare-quiesce"}:
             if "--service-enabled" not in normalized:
@@ -4991,6 +5496,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             *normalized,
             "--state",
             str(self.shared / STATE_NAME),
+            check=check,
         )
 
     def copy_script_with_replacement(

@@ -1104,6 +1104,13 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         )
         for workflow_source, modes in workflow_modes:
             for mode in modes:
+                dispatch_mode = (
+                    "external-cleanup --run-attempt"
+                    if workflow_source is external_source and mode == "external-cleanup"
+                    else "retained-cleanup --run-attempt"
+                    if workflow_source is cleanup_source and mode == "retained-cleanup"
+                    else mode
+                )
                 if workflow_source is source:
                     expected_dispatcher = dispatcher
                 elif workflow_source is deploy_source:
@@ -1121,7 +1128,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 mode_positions = [
                     position
                     for position in range(len(workflow_source))
-                    if workflow_source.startswith(f"{mode} <", position)
+                    if workflow_source.startswith(f"{dispatch_mode} ", position)
                 ]
                 self.assertGreaterEqual(len(mode_positions), 1, mode)
                 mode_position = mode_positions[-1]
@@ -1129,7 +1136,9 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 if ssh_position < 0:
                     ssh_position = workflow_source.rfind("ssh ", 0, mode_position)
                 self.assertGreaterEqual(ssh_position, 0)
-                command = workflow_source[ssh_position : mode_position + len(mode) + 1]
+                command = workflow_source[
+                    ssh_position : mode_position + len(dispatch_mode) + 1
+                ]
                 self.assertIn(expected_dispatcher, command)
                 self.assertNotRegex(
                     command,
@@ -1137,6 +1146,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     r"LIVE_MARKER|live_marker|marker|DEPLOY_MODE|RUNTIME_PROFILE|"
                     r"RELEASE_SLUG|ARTIFACT_REMOTE_DIR|release_slug)",
                 )
+                if workflow_source is external_source and mode == "external-cleanup":
+                    self.assertIn('--profile-id "$PROFILE_ID"', workflow_source)
+                if workflow_source is cleanup_source and mode == "retained-cleanup":
+                    self.assertIn('--load-run-id "$LOAD_RUN_ID"', workflow_source)
+                    self.assertIn('rb"profile=retained-load-cleanup\\n"', workflow_source)
 
         # Adversarial dispatch data is rejected by the same canonical parser
         # before the remote dispatcher can invoke SSH/sudo.

@@ -16,7 +16,11 @@ from python_packages.platform_infra.db import (
     session_factory,
 )
 from python_packages.platform_infra.models import AuditLog, Tournament, User
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -61,8 +65,8 @@ class AS11WorkerErrorSanitizationTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
 
@@ -76,6 +80,7 @@ class AS11WorkerErrorSanitizationTests(PlatformIsolatedAsyncioTestCase):
                     "password": self.password,
                     "display_name": "as11-organizer",
                 },
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(response.status_code, 201, response.text)
         user_id = str(response.json()["user"]["id"])
@@ -95,6 +100,7 @@ class AS11WorkerErrorSanitizationTests(PlatformIsolatedAsyncioTestCase):
                 "visibility": "public",
                 "format_slug": "solo",
             },
+            headers=same_origin_request_headers(organizer),
         )
         self.assertEqual(created.status_code, 201, created.text)
         slug = str(created.json()["slug"])

@@ -95,8 +95,11 @@ For an operation-ID rollback, `platform_recover_pending.sh` owns the complete
 phase matrix inside that generation: pre-runtime phases retain the filesystem
 transaction, runtime-pending phases first record
 `filesystem-restored-runtime-pending` after restoring pointers/venv and then
-restore the original runtime and bound systemd receipt, `restart-pending`
-resumes the swapped target, and later phases only verify and complete the
+restore the original runtime and bound systemd receipt. The
+`rollback-cache-purged` phase resumes the swapped target only after the fixed
+legacy profile-access cache purge is durably recorded. A legacy
+`restart-pending` receipt has no purge proof and fails closed with both receipts
+retained. Later phases only verify and complete the
 two-phase cleanup. The explicit filesystem marker makes a kill between the
 filesystem and runtime steps replay the runtime step instead of incorrectly
 considering the rollback complete. A retry after the systemd receipt has been

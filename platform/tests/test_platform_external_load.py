@@ -152,6 +152,109 @@ def load_manifest_from_payload(
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_progress_callback_reports_only_completed_status_aggregates(self) -> None:
+        users = [
+            VirtualUser(f"progress-{index}", "synthetic", "s" * 32, "c" * 32)
+            for index in range(2)
+        ]
+        callbacks: list[tuple[str, object | None]] = []
+
+        def build(_origin: str, user: VirtualUser, phase: str, _timeout: float):
+            first = RequestResult(phase, "GET", "/private", 200, 1.0, True, 0)
+            if user.user_id.endswith("0"):
+                return first
+            retry = RequestResult(phase, "GET", "/private", 503, 1.0, False, 0)
+            final = RequestResult(phase, "GET", "/private", 200, 1.0, True, 0)
+            return LogicalRequestResult([retry, final], elapsed_ms=2.0)
+
+        run_phase(
+            "https://old-sparky.com",
+            users,
+            phase="synthetic-progress",
+            spread_seconds=0,
+            concurrency=2,
+            timeout=1,
+            request_builder=build,
+            progress_callback=lambda phase, result: callbacks.append((phase, result)),
+        )
+
+        self.assertEqual(callbacks[0], ("http", None))
+        completed = [result for phase, result in callbacks if phase == "http" and result is not None]
+        self.assertEqual(len(completed), 2)
+        self.assertEqual([len(getattr(item, "attempts", [item])) for item in completed], [1, 2])
+        self.assertTrue(all(isinstance(item, (RequestResult, LogicalRequestResult)) for item in completed))
+        # A broken diagnostic sink cannot change or stop measured requests.
+        def fail_progress(_phase: str, _result: object | None) -> None:
+            raise OSError("diagnostic-only failure")
+
+        returned = run_phase(
+            "https://old-sparky.com",
+            users[:1],
+            phase="synthetic-progress-failure",
+            spread_seconds=0,
+            concurrency=1,
+            timeout=1,
+            request_builder=build,
+            progress_callback=fail_progress,
+        )
+        self.assertEqual(len(returned), 1)
+
+        streamed = LogicalRequestResult(
+            [
+                RequestResult("stream", "GET", "/private", 503, 1.0, False, 1),
+                RequestResult("stream", "GET", "/private", 200, 1.0, True, 1),
+            ],
+            elapsed_ms=2.0,
+        )
+        observed_statuses: list[list[int]] = []
+        consumed: list[LogicalRequestResult] = []
+
+        def capture_progress(phase: str, result: object | None) -> None:
+            if phase == "http" and result is not None:
+                observed_statuses.append([attempt.status for attempt in result.attempts])
+
+        run_phase(
+            "https://old-sparky.com",
+            users[:1],
+            phase="streamed-progress",
+            spread_seconds=0,
+            concurrency=1,
+            timeout=1,
+            request_builder=lambda *_args: streamed,
+            result_consumer=consumed.append,
+            progress_callback=capture_progress,
+        )
+        self.assertEqual(observed_statuses, [[503, 200]])
+        self.assertEqual(consumed, [streamed])
+        self.assertEqual(streamed.attempts, [])
+
+        streamed_rate = LogicalRequestResult(
+            [
+                RequestResult("rate", "GET", "/private", 429, 1.0, False, 0),
+                RequestResult("rate", "GET", "/private", 200, 1.0, True, 0),
+            ],
+            elapsed_ms=2.0,
+        )
+        rate_statuses: list[list[int]] = []
+
+        def rate_progress(phase: str, result: object | None) -> None:
+            if phase == "http" and result is not None:
+                rate_statuses.append([attempt.status for attempt in result.attempts])
+
+        run_rate_phase(
+            "https://old-sparky.com",
+            users[:1],
+            phase="streamed-rate-progress",
+            duration_seconds=0.1,
+            concurrency=1,
+            timeout=1,
+            request_builder=lambda *_args: streamed_rate,
+            result_consumer=lambda _result: None,
+            progress_callback=rate_progress,
+        )
+        self.assertEqual(rate_statuses, [[429, 200]])
+        self.assertEqual(streamed_rate.attempts, [])
+
     def test_body_read_transport_errors_are_counted_without_stopping_phase(self) -> None:
         users = [
             VirtualUser(f"read-{index:08d}", "synthetic", "s" * 64, "c" * 64)

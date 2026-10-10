@@ -12,7 +12,14 @@ from python_packages.platform_infra.media.hard_delete import (
     MediaCleanupRequired,
     purge_deleted_media_metadata,
 )
-from python_packages.platform_infra.models import Role, Tournament, User, UserRole
+from python_packages.platform_infra.models import (
+    Role,
+    Tournament,
+    TournamentParticipant,
+    TournamentTeamMember,
+    User,
+    UserRole,
+)
 from python_packages.platform_infra.security import (
     get_authenticated_session,
     invalidate_user_session_cache,
@@ -45,6 +52,22 @@ async def role_slugs_for_user(db_session: AsyncSession, user_id: str) -> list[st
     return sorted(str(role) for role in rows)
 
 
+async def tournament_ids_for_profile_access(
+    db_session: AsyncSession, user_id: str
+) -> set[str]:
+    participant_ids = await db_session.scalars(
+        select(TournamentParticipant.tournament_id).where(
+            TournamentParticipant.user_id == user_id
+        )
+    )
+    roster_ids = await db_session.scalars(
+        select(TournamentTeamMember.tournament_id).where(
+            TournamentTeamMember.user_id == user_id
+        )
+    )
+    return {str(value) for value in (*participant_ids.all(), *roster_ids.all())}
+
+
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def admin_delete_user(
     user_id: str,
@@ -67,11 +90,43 @@ async def admin_delete_user(
             detail="Нельзя удалить собственный аккаунт из админ-панели.",
         )
 
+    # Deleting a user cascades into participant and roster rows. Acquire every
+    # affected tournament first, in stable order, so each FK cascade and its
+    # profile-access generation trigger follows the platform T -> User order.
+    initial_tournament_ids = await tournament_ids_for_profile_access(
+        db_session, user_id
+    )
+    locked_tournament_ids: set[str] = set()
+    if initial_tournament_ids:
+        locked_tournament_ids = {
+            str(value)
+            for value in await db_session.scalars(
+                select(Tournament.id)
+                .where(Tournament.id.in_(initial_tournament_ids))
+                .order_by(Tournament.id.asc())
+                .with_for_update()
+            )
+        }
+
     user = await db_session.scalar(
         select(User).where(User.id == user_id).with_for_update()
     )
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    # A concurrent membership writer may have committed while the tournament
+    # locks were being acquired. Recheck after the User lock; if it introduced
+    # an unseen tournament, abort and let the caller retry under the full lock
+    # set instead of taking User -> Tournament locks.
+    current_tournament_ids = await tournament_ids_for_profile_access(
+        db_session, user_id
+    )
+    if not current_tournament_ids.issubset(locked_tournament_ids):
+        await db_session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Удаление заблокировано конкурентным изменением. Повторите попытку.",
+        )
 
     target_roles = await role_slugs_for_user(db_session, user.id)
     if "superadmin" in target_roles:

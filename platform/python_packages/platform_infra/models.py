@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     Boolean,
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -569,6 +570,10 @@ class Tournament(TimestampMixin, Base):
             name="max_participants_positive",
         ),
         CheckConstraint("bracket_revision >= 0", name="bracket_revision_nonnegative"),
+        CheckConstraint(
+            "profile_access_generation >= 0",
+            name="profile_access_generation_nonnegative",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
@@ -613,6 +618,9 @@ class Tournament(TimestampMixin, Base):
     match_format: Mapped[str] = mapped_column(String(20), default="bo1")
     final_format: Mapped[str] = mapped_column(String(20), default="bo3")
     bracket_revision: Mapped[int] = mapped_column(Integer, default=0)
+    profile_access_generation: Mapped[int] = mapped_column(
+        BigInteger, server_default="0", nullable=False
+    )
     captain_response_deadline_minutes: Mapped[int | None] = mapped_column(
         Integer, nullable=True
     )

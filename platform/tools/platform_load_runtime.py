@@ -23,8 +23,10 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import select
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -54,6 +56,25 @@ DEFAULT_NAMESPACE_CAPTURE_TIMEOUT_SECONDS = 5.0
 # extend the deadline.
 MIN_NAMESPACE_REAP_GRACE_SECONDS = 1.0
 MAX_CHILD_REPORT_BYTES = 16 * 1024 * 1024
+MAX_PROGRESS_CHECKPOINT_BYTES = 32 * 1024
+PROGRESS_CHECKPOINT_SCHEMA = 1
+PROGRESS_WRITE_INTERVAL_SECONDS = 30.0
+PROGRESS_WRITE_INTERVAL_COMPLETIONS = 250
+_PROGRESS_PHASES = frozenset(
+    {
+        "supervisor_bootstrap",
+        "namespace_probe",
+        "namespace_handshake",
+        "worker_start",
+        "fixture_validation",
+        "http",
+        "teardown",
+    }
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+_RUN_ID_RE = re.compile(r"^[0-9]{1,20}$")
 MAX_REASON_LENGTH = 96
 _SAFE_REASON = frozenset({"none", "max_duration_seconds", "max_runner_minutes"})
 WORKER_FAILURE_SCHEMA = 1
@@ -845,6 +866,470 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
             pass
 
 
+def _progress_context(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "source_git_sha",
+        "app_target_sha",
+        "source_binding_sha256",
+        "profile_id",
+        "profile_digest",
+        "external_run_id",
+        "max_logical_actions",
+        "max_http_attempts",
+    }:
+        raise ValueError("progress binding is not closed")
+    context = dict(value)
+    if (
+        not isinstance(context["source_git_sha"], str)
+        or _SHA1_RE.fullmatch(context["source_git_sha"]) is None
+        or not isinstance(context["app_target_sha"], str)
+        or _SHA1_RE.fullmatch(context["app_target_sha"]) is None
+        or not isinstance(context["source_binding_sha256"], str)
+        or _SHA256_RE.fullmatch(context["source_binding_sha256"]) is None
+        or not isinstance(context["profile_id"], str)
+        or _PROFILE_ID_RE.fullmatch(context["profile_id"]) is None
+        or not isinstance(context["profile_digest"], str)
+        or _SHA256_RE.fullmatch(context["profile_digest"]) is None
+        or not isinstance(context["external_run_id"], str)
+        or _RUN_ID_RE.fullmatch(context["external_run_id"]) is None
+    ):
+        raise ValueError("progress binding identity is invalid")
+    for name in ("max_logical_actions", "max_http_attempts"):
+        number = context[name]
+        if type(number) is not int or number < 0 or number > 10_000_000:
+            raise ValueError("progress binding limit is invalid")
+    return context
+
+
+def _read_progress_checkpoint(
+    path: Path,
+    *,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = _progress_context(context)
+    parent_stat = path.parent.lstat()
+    if parent_stat.st_uid != os.geteuid() or parent_stat.st_mode & 0o077:
+        raise ValueError("progress directory is not private to the runner")
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        raise ValueError("progress directory is not a real directory")
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("progress checkpoint is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        after = path.lstat()
+        if (
+            (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+            or opened.st_size <= 0
+            or opened.st_size > MAX_PROGRESS_CHECKPOINT_BYTES
+        ):
+            raise ValueError("progress checkpoint metadata is invalid")
+        chunks: list[bytes] = []
+        remaining = MAX_PROGRESS_CHECKPOINT_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, min(remaining, 8192))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_PROGRESS_CHECKPOINT_BYTES:
+            raise ValueError("progress checkpoint exceeds its size bound")
+    finally:
+        os.close(fd)
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("progress checkpoint has duplicate keys")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("progress checkpoint is malformed") from exc
+    keys = {
+        "schema",
+        "source_git_sha",
+        "app_target_sha",
+        "source_binding_sha256",
+        "profile_id",
+        "profile_digest",
+        "external_run_id",
+        "phase",
+        "last_active_phase",
+        "sequence",
+        "updated_at_monotonic_ns",
+        "last_http_checkpoint_monotonic_ns",
+        "logical_completed",
+        "http_attempts_completed",
+        "status_counts",
+        "inflight_unknown",
+        "max_logical_actions",
+        "max_http_attempts",
+    }
+    if not isinstance(payload, dict) or set(payload) != keys:
+        raise ValueError("progress checkpoint schema is not closed")
+    if any(payload.get(key) != value for key, value in expected.items()):
+        raise ValueError("progress checkpoint binding differs")
+    if type(payload["schema"]) is not int or payload["schema"] != PROGRESS_CHECKPOINT_SCHEMA:
+        raise ValueError("progress checkpoint schema version is invalid")
+    if payload["phase"] not in _PROGRESS_PHASES:
+        raise ValueError("progress checkpoint phase is invalid")
+    if payload["last_active_phase"] not in _PROGRESS_PHASES - {"teardown"}:
+        raise ValueError("progress active phase is invalid")
+    for name in ("sequence", "updated_at_monotonic_ns", "logical_completed", "http_attempts_completed"):
+        if type(payload[name]) is not int or payload[name] < (1 if name in {"sequence", "updated_at_monotonic_ns"} else 0):
+            raise ValueError("progress checkpoint counter is invalid")
+    last_http_checkpoint = payload["last_http_checkpoint_monotonic_ns"]
+    if last_http_checkpoint is not None and (
+        type(last_http_checkpoint) is not int
+        or last_http_checkpoint <= 0
+        or last_http_checkpoint > payload["updated_at_monotonic_ns"]
+    ):
+        raise ValueError("progress HTTP checkpoint time is invalid")
+    if type(payload["inflight_unknown"]) is not bool:
+        raise ValueError("progress checkpoint inflight status is invalid")
+    if (
+        payload["logical_completed"] > expected["max_logical_actions"]
+        or payload["http_attempts_completed"] > expected["max_http_attempts"]
+    ):
+        raise ValueError("progress checkpoint exceeds its profile bounds")
+    statuses = payload["status_counts"]
+    if not isinstance(statuses, dict) or len(statuses) > 501:
+        raise ValueError("progress checkpoint status counts are invalid")
+    status_total = 0
+    for code, count in statuses.items():
+        if (
+            not isinstance(code, str)
+            or len(code) > 3
+            or (code != "0" and (not code.isdigit() or str(int(code)) != code or not 100 <= int(code) <= 599))
+            or type(count) is not int
+            or count <= 0
+        ):
+            raise ValueError("progress checkpoint status bucket is invalid")
+        status_total += count
+    if status_total != payload["http_attempts_completed"]:
+        raise ValueError("progress checkpoint status total differs")
+    return payload
+
+
+def _write_progress_payload(path: Path, payload: Mapping[str, Any]) -> None:
+    parent_stat = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.geteuid()
+        or parent_stat.st_mode & 0o077
+    ):
+        raise ValueError("progress directory is not private to the runner")
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if not 0 < len(encoded) <= MAX_PROGRESS_CHECKPOINT_BYTES:
+        raise ValueError("progress checkpoint exceeds its size bound")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+class ProgressCheckpoint:
+    """Private aggregate-only progress for a source-bound supervised run."""
+
+    def __init__(self, path: Path, context: Mapping[str, Any], *, create: bool = False) -> None:
+        self.path = path
+        self.context = _progress_context(context)
+        self.logical_completed = 0
+        self.http_attempts_completed = 0
+        self.status_counts: dict[str, int] = {}
+        self.sequence = 0
+        self.phase = "supervisor_bootstrap"
+        self.last_active_phase = "supervisor_bootstrap"
+        self.last_http_checkpoint_monotonic_ns: int | None = None
+        self.inflight_unknown = False
+        self._last_write = time.monotonic()
+        self._completions_since_write = 0
+        try:
+            payload = _read_progress_checkpoint(self.path, context=self.context)
+        except FileNotFoundError:
+            if not create:
+                raise
+        else:
+            self.logical_completed = payload["logical_completed"]
+            self.http_attempts_completed = payload["http_attempts_completed"]
+            self.status_counts = dict(payload["status_counts"])
+            self.sequence = payload["sequence"]
+            self.phase = payload["phase"]
+            self.last_active_phase = payload["last_active_phase"]
+            self.last_http_checkpoint_monotonic_ns = payload[
+                "last_http_checkpoint_monotonic_ns"
+            ]
+            self.inflight_unknown = payload["inflight_unknown"]
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "schema": PROGRESS_CHECKPOINT_SCHEMA,
+            **self.context,
+            "phase": self.phase,
+            "last_active_phase": self.last_active_phase,
+            "sequence": self.sequence + 1,
+            "updated_at_monotonic_ns": time.monotonic_ns(),
+            "last_http_checkpoint_monotonic_ns": self.last_http_checkpoint_monotonic_ns,
+            "logical_completed": self.logical_completed,
+            "http_attempts_completed": self.http_attempts_completed,
+            "status_counts": dict(sorted(self.status_counts.items(), key=lambda item: int(item[0]))),
+            "inflight_unknown": self.inflight_unknown,
+        }
+
+    def emit(self, phase: str, *, inflight_unknown: bool | None = None, force: bool = True) -> None:
+        if phase not in _PROGRESS_PHASES:
+            raise ValueError("progress phase is not in the closed set")
+        if inflight_unknown is not None:
+            if type(inflight_unknown) is not bool:
+                raise ValueError("progress inflight state is invalid")
+            self.inflight_unknown = inflight_unknown
+        self.phase = phase
+        if phase != "teardown":
+            self.last_active_phase = phase
+        if not force:
+            return
+        if phase == "http":
+            self.last_http_checkpoint_monotonic_ns = time.monotonic_ns()
+        payload = self._payload()
+        _write_progress_payload(self.path, payload)
+        self.sequence = payload["sequence"]
+        self._last_write = time.monotonic()
+        self._completions_since_write = 0
+
+    def record_http_result(self, statuses: Sequence[int], *, logical_delta: int = 1) -> None:
+        if type(logical_delta) is not int or logical_delta not in {0, 1}:
+            raise ValueError("progress logical delta is invalid")
+        if not isinstance(statuses, Sequence) or isinstance(statuses, (str, bytes)):
+            raise ValueError("progress status result is invalid")
+        if not statuses:
+            raise ValueError("completed HTTP result must include a status")
+        self.logical_completed += logical_delta
+        for raw_status in statuses:
+            if type(raw_status) is not int or (raw_status != 0 and not 100 <= raw_status <= 599):
+                raise ValueError("progress HTTP status is invalid")
+            code = str(raw_status)
+            self.status_counts[code] = self.status_counts.get(code, 0) + 1
+            self.http_attempts_completed += 1
+        if (
+            self.logical_completed > self.context["max_logical_actions"]
+            or self.http_attempts_completed > self.context["max_http_attempts"]
+        ):
+            raise ValueError("progress exceeded its profile bounds")
+        self._completions_since_write += 1
+        if (
+            self._completions_since_write >= PROGRESS_WRITE_INTERVAL_COMPLETIONS
+            or time.monotonic() - self._last_write >= PROGRESS_WRITE_INTERVAL_SECONDS
+        ):
+            self.emit("http", inflight_unknown=True)
+
+    def maybe_checkpoint_http(self) -> None:
+        if time.monotonic() - self._last_write >= PROGRESS_WRITE_INTERVAL_SECONDS:
+            self.emit("http", inflight_unknown=True)
+
+    def closed_snapshot(
+        self,
+        *,
+        namespace_closed: bool,
+        descendants_reaped: bool,
+        partial_work: bool,
+    ) -> dict[str, Any]:
+        if namespace_closed is not True or descendants_reaped is not True:
+            raise ValueError("progress cannot be exported before namespace closure")
+        if type(partial_work) is not bool:
+            raise ValueError("progress partial-work state is invalid")
+        payload = _read_progress_checkpoint(self.path, context=self.context)
+        now = time.monotonic_ns()
+        return {
+            "schema": PROGRESS_CHECKPOINT_SCHEMA,
+            **{key: payload[key] for key in self.context},
+            "phase": payload["phase"],
+            "last_active_phase": payload["last_active_phase"],
+            "sequence": payload["sequence"],
+            "checkpoint_age_seconds": round(max(0, now - payload["updated_at_monotonic_ns"]) / 1_000_000_000, 3),
+            "http_checkpoint_age_seconds": (
+                None
+                if payload["last_http_checkpoint_monotonic_ns"] is None
+                else round(
+                    max(0, now - payload["last_http_checkpoint_monotonic_ns"])
+                    / 1_000_000_000,
+                    3,
+                )
+            ),
+            "logical_completed": payload["logical_completed"],
+            "http_attempts_completed": payload["http_attempts_completed"],
+            "status_counts": payload["status_counts"],
+            "inflight_unknown": payload["inflight_unknown"],
+            "partial_work": partial_work,
+            "namespace_closed": True,
+            "authoritative": False,
+            "dispatchable": False,
+            "final_credit": False,
+        }
+
+
+def write_closed_progress_artifact(path: Path, payload: Mapping[str, Any]) -> None:
+    """Publish one validated progress snapshot without replacing an artifact."""
+
+    allowed = {
+        "schema",
+        "source_git_sha",
+        "app_target_sha",
+        "source_binding_sha256",
+        "profile_id",
+        "profile_digest",
+        "external_run_id",
+        "max_logical_actions",
+        "max_http_attempts",
+        "phase",
+        "last_active_phase",
+        "sequence",
+        "checkpoint_age_seconds",
+        "http_checkpoint_age_seconds",
+        "logical_completed",
+        "http_attempts_completed",
+        "status_counts",
+        "inflight_unknown",
+        "partial_work",
+        "namespace_closed",
+        "authoritative",
+        "dispatchable",
+        "final_credit",
+    }
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != allowed
+        or payload.get("namespace_closed") is not True
+        or payload.get("authoritative") is not False
+        or payload.get("dispatchable") is not False
+        or payload.get("final_credit") is not False
+        or payload.get("schema") != PROGRESS_CHECKPOINT_SCHEMA
+        or type(payload.get("schema")) is not int
+        or payload.get("phase") not in _PROGRESS_PHASES
+        or payload.get("last_active_phase") not in _PROGRESS_PHASES - {"teardown"}
+        or type(payload.get("sequence")) is not int
+        or payload["sequence"] <= 0
+        or type(payload.get("checkpoint_age_seconds")) not in (int, float)
+        or not math.isfinite(float(payload["checkpoint_age_seconds"]))
+        or payload["checkpoint_age_seconds"] < 0
+        or (
+            payload.get("http_checkpoint_age_seconds") is not None
+            and (
+                type(payload.get("http_checkpoint_age_seconds")) not in (int, float)
+                or not math.isfinite(float(payload["http_checkpoint_age_seconds"]))
+                or payload["http_checkpoint_age_seconds"] < 0
+            )
+        )
+        or type(payload.get("partial_work")) is not bool
+        or type(payload.get("inflight_unknown")) is not bool
+    ):
+        raise ValueError("progress artifact is not a closed diagnostic snapshot")
+    context = _progress_context({key: payload[key] for key in (
+        "source_git_sha",
+        "app_target_sha",
+        "source_binding_sha256",
+        "profile_id",
+        "profile_digest",
+        "external_run_id",
+        "max_logical_actions",
+        "max_http_attempts",
+    )})
+    logical = payload.get("logical_completed")
+    attempts = payload.get("http_attempts_completed")
+    statuses = payload.get("status_counts")
+    if (
+        type(logical) is not int
+        or not 0 <= logical <= context["max_logical_actions"]
+        or type(attempts) is not int
+        or not 0 <= attempts <= context["max_http_attempts"]
+        or not isinstance(statuses, dict)
+        or len(statuses) > 501
+    ):
+        raise ValueError("progress artifact counters are invalid")
+    status_total = 0
+    for code, count in statuses.items():
+        if (
+            not isinstance(code, str)
+            or len(code) > 3
+            or (code != "0" and (not code.isdigit() or str(int(code)) != code or not 100 <= int(code) <= 599))
+            or type(count) is not int
+            or count <= 0
+        ):
+            raise ValueError("progress artifact status bucket is invalid")
+        status_total += count
+    if status_total != attempts:
+        raise ValueError("progress artifact status total differs")
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if not 0 < len(encoded) <= MAX_PROGRESS_CHECKPOINT_BYTES:
+        raise ValueError("progress artifact exceeds its size bound")
+    parent_stat = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.geteuid()
+        or parent_stat.st_mode & 0o022
+    ):
+        raise ValueError("progress artifact directory metadata is invalid")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    identity: tuple[int, int] | None = None
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+        ):
+            raise ValueError("progress artifact metadata is invalid")
+        identity = (opened.st_dev, opened.st_ino)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if identity is not None:
+            try:
+                current = path.lstat()
+                if (current.st_dev, current.st_ino) == identity and stat.S_ISREG(current.st_mode):
+                    path.unlink()
+            except OSError:
+                pass
+        raise
+
+
 def _read_closed_report(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     try:
         if path.is_symlink() or not path.is_file():
@@ -1511,7 +1996,41 @@ def run_supervised(
             namespace_init_pid=None,
         )
 
+    progress_checkpoint: ProgressCheckpoint | None = None
+    def emit_progress(phase: str, *, inflight_unknown: bool | None = None) -> None:
+        nonlocal progress_checkpoint
+        checkpoint = progress_checkpoint
+        if checkpoint is None:
+            return
+        try:
+            checkpoint.emit(phase, inflight_unknown=inflight_unknown)
+        except (OSError, TypeError, ValueError):
+            # A diagnostic write cannot change the load's primary outcome.
+            progress_checkpoint = None
+
+    progress_path_raw = worker_config.get("progress_checkpoint_path")
+    progress_context_raw = worker_config.get("progress_context")
+    if progress_path_raw is not None or progress_context_raw is not None:
+        if not isinstance(progress_path_raw, str) or not isinstance(progress_context_raw, Mapping):
+            raise ValueError("progress checkpoint configuration is invalid")
+        progress_path = Path(progress_path_raw)
+        if (
+            progress_path.name != "progress.json"
+            or progress_path.parent.resolve() != worker_report_path.parent.resolve()
+        ):
+            raise ValueError("progress checkpoint path is outside the private worker directory")
+        try:
+            progress_checkpoint = ProgressCheckpoint(
+                progress_path,
+                progress_context_raw,
+                create=True,
+            )
+            emit_progress("supervisor_bootstrap")
+        except (OSError, TypeError, ValueError):
+            progress_checkpoint = None
+
     try:
+        emit_progress("namespace_probe")
         require_pid_namespace_capability()
         runner_uid, runner_gid = _runner_identity()
     except NamespaceCapabilityError as exc:
@@ -1524,7 +2043,6 @@ def run_supervised(
     preflight_deadline_reason = primary_deadline_reason()
     if preflight_deadline_reason is not None:
         return early_failure(preflight_deadline_reason, "preflight_deadline_exceeded")
-
     report_path.parent.mkdir(parents=True, exist_ok=True)
     worker_report_path.parent.mkdir(parents=True, exist_ok=True)
     for stale_path in (report_path, worker_report_path):
@@ -1680,6 +2198,7 @@ def run_supervised(
             )
             if process.stdout is None or process.stdin is None:
                 raise NamespaceIntegrityError("namespace stdio protocol is unavailable")
+            emit_progress("namespace_handshake")
             if not _await_namespace_ready(
                 process.stdout,
                 process,
@@ -1726,6 +2245,7 @@ def run_supervised(
                 raise NamespaceIntegrityError(
                     "external supervisor signal during namespace start"
                 )
+            emit_progress("worker_start")
             process.stdin.write(NAMESPACE_ACK)
             if worker_stdin_payload is not None:
                 process.stdin.write(worker_stdin_payload)
@@ -1921,6 +2441,29 @@ def run_supervised(
             config_path.unlink()
         except FileNotFoundError:
             pass
+
+    if progress_checkpoint is not None and namespace_closed and namespace_reaped:
+        try:
+            # The worker owns checkpoints after ACK. Refresh from disk only
+            # after PID 1 and the namespace wrapper have been reaped, then
+            # publish a final teardown observation. A timeout retains the
+            # worker's conservative in-flight-unknown bit.
+            progress_checkpoint = ProgressCheckpoint(
+                progress_checkpoint.path,
+                progress_checkpoint.context,
+            )
+            progress_checkpoint.emit(
+                "teardown",
+                inflight_unknown=(
+                    progress_checkpoint.inflight_unknown
+                    or reason in {"max_duration_seconds", "max_runner_minutes", "external_signal"}
+                    or killed
+                ),
+            )
+        except (OSError, ValueError, TypeError):
+            # Progress is diagnostic-only. Invalid or unavailable progress
+            # must never replace the primary worker/containment result.
+            progress_checkpoint = None
 
     assert process is not None
     if reason == "worker_failed" and returncode is not None and returncode < 0:

@@ -15,7 +15,11 @@ from python_packages.platform_infra.models import (
     TournamentParticipant,
     User,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -28,7 +32,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-exclude-{uuid4().hex[:8]}"
         self.password = INTEGRATION_PASSWORD
-        self.base_url = "http://testserver"
+        self.base_url = "https://testserver"
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup_test_data()
@@ -63,7 +67,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
                 base_url=self.base_url,
             )
         )
@@ -90,6 +94,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
                         "password": self.password,
                         "display_name": f"exclude-{label}"[:15],
                     },
+                    headers=same_origin_request_headers(client),
                 ),
                 201,
             )
@@ -112,6 +117,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -120,6 +126,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -153,6 +160,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
                     "entry_type": "solo",
                     "team_name": None,
                 },
+                headers=same_origin_request_headers(player["client"]),
             ),
             201,
         )
@@ -160,13 +168,15 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
             await player["client"].post(
                 f"/api/v1/tournaments/{slug_a}/join",
                 json={"entry_type": "solo", "invite_code": invite_a["code"]},
+                headers=same_origin_request_headers(player["client"]),
             ),
             201,
         )
         participant_id = joined["id"]
 
         removed = await organizer["client"].delete(
-            f"/api/v1/tournaments/{slug_a}/participants/{participant_id}"
+            f"/api/v1/tournaments/{slug_a}/participants/{participant_id}",
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(removed.status_code, 204, removed.text)
         self.assertEqual(removed.content, b"")
@@ -218,6 +228,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
                 "entry_type": "solo",
                 "team_name": None,
             },
+            headers=same_origin_request_headers(player["client"]),
         )
         self.assertEqual(rejected_claim.status_code, 403, rejected_claim.text)
         self.assertIn("Inactive", rejected_claim.json()["detail"])
@@ -233,6 +244,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
         rejected_rejoin = await player["client"].post(
             f"/api/v1/tournaments/{slug_a}/join",
             json={"entry_type": "solo", "invite_code": invite_a["code"]},
+            headers=same_origin_request_headers(player["client"]),
         )
         self.assertEqual(rejected_rejoin.status_code, 403, rejected_rejoin.text)
         self.assertIn("Inactive participants", rejected_rejoin.json()["detail"])
@@ -255,6 +267,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
                     "entry_type": "solo",
                     "team_name": None,
                 },
+                headers=same_origin_request_headers(player["client"]),
             ),
             201,
         )
@@ -262,6 +275,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
             await player["client"].post(
                 f"/api/v1/tournaments/{slug_b}/join",
                 json={"entry_type": "solo", "invite_code": invite_b["code"]},
+                headers=same_origin_request_headers(player["client"]),
             ),
             201,
         )
@@ -274,6 +288,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
                     "status": "registered",
                     "moderation_note": "Restored by organizer.",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )

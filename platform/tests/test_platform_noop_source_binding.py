@@ -693,7 +693,7 @@ class NoopSourceBindingTests(unittest.TestCase):
                 "target_sha": RUNNER_SHA,
                 "control_email": "control@example.invalid",
                 "load_run_id": "567890",
-                "cleanup_run_id": "678901",
+                "cleanup_run_id": "567890",
                 "source_binding": binding,
             }
         )
@@ -707,7 +707,9 @@ class NoopSourceBindingTests(unittest.TestCase):
             return_value=0,
         ) as cleanup:
             self.assertEqual(
-                platform_workflow_remote_dispatch.main(["external-cleanup"]), 0
+                platform_workflow_remote_dispatch.main(
+                    ["external-cleanup", "--run-attempt", "1", "--profile-id", "ready-vote-slo-v2"]
+                ), 0
             )
 
         helper, arguments = cleanup.call_args.args
@@ -718,8 +720,19 @@ class NoopSourceBindingTests(unittest.TestCase):
                 platform_workflow_remote_dispatch.DELETE_CONFIRMATION,
                 RUNNER_SHA,
                 "567890",
-                "678901",
+                "567890",
             ],
+        )
+        self.assertEqual(
+            cleanup.call_args.kwargs["diagnostic_binding"],
+            {
+                "source_sha": RUNNER_SHA,
+                "app_sha": APP_SHA,
+                "run_id": "567890",
+                "load_run_id": "567890",
+                "run_attempt": "1",
+                "profile": "ready-vote-slo-v2",
+            },
         )
         self.assertEqual(arguments[-2], "--source-binding-base64")
         self.assertEqual(

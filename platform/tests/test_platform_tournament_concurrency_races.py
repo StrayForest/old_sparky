@@ -25,7 +25,11 @@ from python_packages.platform_infra.models import (
     TournamentParticipant,
     User,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -72,8 +76,8 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
 
@@ -88,6 +92,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                     "password": self.password,
                     "display_name": f"test-{label}"[:15],
                 },
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(response.status_code, 201, response.text)
         payload = response.json()
@@ -190,6 +195,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
             response = await player["client"].post(
                 "/api/v1/tournaments/invites/claim",
                 json={"code": code, "entry_type": "solo", "team_name": None},
+                headers=same_origin_request_headers(player["client"]),
             )
 
         self.assertEqual(response.status_code, 201, response.text)
@@ -209,6 +215,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
             return await player["client"].post(
                 f"/api/v1/tournaments/{slug}/join",
                 json={"entry_type": "solo"},
+                headers=same_origin_request_headers(player["client"]),
             )
 
         first_response, second_response = await asyncio.gather(
@@ -237,6 +244,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
             return await player["client"].post(
                 "/api/v1/tournaments/invites/claim",
                 json={"code": code, "entry_type": "solo", "team_name": None},
+                headers=same_origin_request_headers(player["client"]),
             )
 
         with patch.object(tournament_routes, "check_invite_rate_limit", new=AsyncMock()):
@@ -254,6 +262,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                     "user_email": player["email"],
                     "entry_type": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             )
 
         first_response, second_response = await asyncio.gather(
@@ -313,6 +322,8 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                     organizer["client"].patch(
                         f"/api/v1/tournaments/{slug}/status",
                         json={"status": "cancelled"},
+
+                        headers=same_origin_request_headers(organizer["client"]),
                     )
                 )
                 await asyncio.wait_for(second_waiting.wait(), timeout=10)

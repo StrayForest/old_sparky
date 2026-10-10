@@ -1380,37 +1380,11 @@ else:
         self.assertEqual((snapshot / "deps-version").read_text(), "old\n")
         self.assertFalse((self.shared_dir / TRANSACTION_STATE_NAME).exists())
 
-    def test_restart_pending_recovery_finishes_without_rolling_forward(self) -> None:
+    def test_rollback_cache_purge_failure_recovers_before_older_activation(self) -> None:
         current_release, previous_release, snapshot = self.prepare_rollback_fixture()
-        interrupted_runtime = self.root / "platform_release_restore_runtime_restart_kill.sh"
-        interrupted_runtime.write_text(
-            RUNTIME_RESTORE_SCRIPT.read_text().replace(
-                'if [[ "$RUN_RESTART" -eq 1 && "$RESTART_AFTER" -eq 1 ]]; then',
-                'if [[ "$RUN_RESTART" -eq 1 && "$RESTART_AFTER" -eq 1 ]]; then\n'
-                '  /bin/kill -KILL "$PPID" # test interrupted restart',
-                1,
-            )
-        )
-        interrupted_runtime.chmod(0o755)
-        self.install_test_lock_helper(
-            interrupted_runtime.parent / "platform_release_lock.sh"
-        )
-        shutil.copy2(
-            REPO_ROOT / "platform" / "tools" / "platform_release_systemd_state.py",
-            interrupted_runtime.parent / "platform_release_systemd_state.py",
-        )
-        (interrupted_runtime.parent / "platform_release_systemd_state.py").chmod(0o755)
-        interrupted_text = self._script_with_physical_tools(ROLLBACK_SCRIPT).replace(
-            'RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"',
-            f'RUNTIME_RESTORE_TOOL="{interrupted_runtime}"',
-            1,
-        )
-        interrupted = self.root / "platform_release_rollback_restart_kill.sh"
-        interrupted.write_text(interrupted_text)
-        interrupted.chmod(0o755)
 
         result = self.run_script(
-            interrupted,
+            ROLLBACK_SCRIPT,
             "--app-dir",
             str(self.app_dir),
             check=False,
@@ -1418,40 +1392,13 @@ else:
 
         self.assertNotEqual(result.returncode, 0)
         state = self.shared_dir / TRANSACTION_STATE_NAME
-        self.assertTrue(state.is_file())
-        self.assertEqual(json.loads(state.read_text())["phase"], "restart-pending")
-        self.assertEqual((self.app_dir / "current").resolve(), previous_release)
-        self.assertEqual((self.app_dir / "previous").resolve(), current_release)
-        self.assertEqual(
-            (self.shared_dir / "venv" / "deps-version").read_text(), "old\n"
-        )
-        self.assertEqual((snapshot / "deps-version").read_text(), "new\n")
-
-        recovery_runtime = self.root / "platform_release_restore_runtime_recover.sh"
-        recovery_runtime.write_text("#!/usr/bin/env sh\nexit 0\n")
-        recovery_runtime.chmod(0o755)
-        recovery_text = self._script_with_physical_tools(ROLLBACK_SCRIPT).replace(
-            'RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"',
-            f'RUNTIME_RESTORE_TOOL="{recovery_runtime}"',
-            1,
-        )
-        recovery = self.root / "platform_release_rollback_restart_recover.sh"
-        recovery.write_text(recovery_text)
-        recovery.chmod(0o755)
-        self.run_script(
-            recovery,
-            "--recover-pending",
-            "--app-dir",
-            str(self.app_dir),
-        )
-
-        self.assertEqual((self.app_dir / "current").resolve(), previous_release)
-        self.assertEqual((self.app_dir / "previous").resolve(), current_release)
-        self.assertEqual(
-            (self.shared_dir / "venv" / "deps-version").read_text(), "old\n"
-        )
-        self.assertEqual((snapshot / "deps-version").read_text(), "new\n")
         self.assertFalse(state.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current_release)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous_release)
+        self.assertEqual(
+            (self.shared_dir / "venv" / "deps-version").read_text(), "new\n"
+        )
+        self.assertEqual((snapshot / "deps-version").read_text(), "old\n")
 
     def test_rollback_refuses_unsafe_pointer_snapshot_and_expected_record(self) -> None:
         outside = self.root / "outside-release"

@@ -248,6 +248,7 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
         sql = str(statement.compile())
 
         self.assertIn("workspace_tournament_id", sql)
+        self.assertIn("workspace_tournament_profile_access_generation", sql)
         self.assertIn("workspace_participant_status", sql)
         self.assertIn("workspace_ready_round_id", sql)
         self.assertNotIn("SELECT platform.tournaments.id, platform.tournaments.slug", sql)

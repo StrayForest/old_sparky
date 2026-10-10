@@ -57,6 +57,7 @@ from tools.platform_verify import (
 from tools.platform_test_runner import (
     TimingRunner,
     TestResourceConfigurationError,
+    _clear_integration_auth_rate_limit_keys,
     _summary,
     _integration_preflight_error,
     _require_integration_resources_ready,
@@ -409,6 +410,175 @@ class PlatformVerificationContractTests(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 with self.assertRaises(TestResourceConfigurationError):
                     validate_test_resource_configuration(self._test_settings(**overrides))
+
+        class FakeRedis:
+            def __init__(self) -> None:
+                self.keys = {b"platform:other-cache:keep"}
+                self.patterns: list[str] = []
+                self.closed = False
+
+            async def ping(self) -> bool:
+                return True
+
+            async def scan(self, *, cursor: int, match: str, count: int):
+                if match != "platform:auth-rate:v1:*" or count != 200:
+                    raise AssertionError("cleanup used an unexpected Redis scan scope")
+                self.patterns.append(match)
+                matching = sorted(
+                    key for key in self.keys if key.startswith(b"platform:auth-rate:v1:")
+                )
+                return 0, matching
+
+            async def unlink(self, *keys: bytes) -> int:
+                removed = 0
+                for key in keys:
+                    if key in self.keys:
+                        self.keys.remove(key)
+                        removed += 1
+                return removed
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        safe_environment = {
+            "PLATFORM_ENVIRONMENT": "test",
+            "PLATFORM_DB_SCHEMA": "platform",
+            "PLATFORM_DATABASE_URL": (
+                "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test"
+            ),
+            "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+        }
+        fake_redis = FakeRedis()
+
+        for invalid in (
+            {"PLATFORM_ENVIRONMENT": "production"},
+            {"PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/0"},
+        ):
+            with self.subTest(invalid=invalid):
+                environment = dict(safe_environment)
+                environment.update(invalid)
+                imported: list[str] = []
+                real_import = __import__
+
+                def recording_import(name: str, *args: object, **kwargs: object) -> object:
+                    imported.append(name)
+                    return real_import(name, *args, **kwargs)
+
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch("builtins.__import__", side_effect=recording_import),
+                    self.assertRaises(RuntimeError),
+                ):
+                    _clear_integration_auth_rate_limit_keys()
+                self.assertFalse(any(name.startswith("redis") for name in imported))
+
+        events: list[str] = []
+
+        def first_body() -> None:
+            fake_redis.keys.update(
+                {
+                    b"platform:auth-rate:v1:register:actor-a:1",
+                    b"platform:auth-rate:v1:register:actor-b:1",
+                }
+            )
+            self.assertEqual(
+                sum(key.startswith(b"platform:auth-rate:v1:") for key in fake_redis.keys),
+                2,
+            )
+            events.append("first-body")
+
+        def assert_case_cleanup_ran() -> None:
+            self.assertTrue(
+                any(key.startswith(b"platform:auth-rate:v1:") for key in fake_redis.keys)
+            )
+            events.append("first-cleanup")
+
+        class FirstCase(unittest.TestCase):
+            def runTest(self) -> None:
+                first_body()
+
+        first_case = FirstCase()
+        first_case.addCleanup(assert_case_cleanup_ran)
+
+        def second_body() -> None:
+            self.assertFalse(
+                any(key.startswith(b"platform:auth-rate:v1:") for key in fake_redis.keys)
+            )
+            events.append("second-body")
+
+        class SecondCase(unittest.TestCase):
+            def runTest(self) -> None:
+                second_body()
+
+        second_case = SecondCase()
+
+        def between_case_cleanup() -> None:
+            events.append("between-case-cleanup")
+            _clear_integration_auth_rate_limit_keys()
+
+        test_runner = TimingRunner(stream=io.StringIO(), verbosity=0)
+        test_runner.between_case_cleanup = between_case_cleanup
+        with (
+            patch.dict(os.environ, safe_environment, clear=True),
+            patch("redis.asyncio.from_url", return_value=fake_redis) as redis_factory,
+        ):
+            result = test_runner.run(unittest.TestSuite((first_case, second_case)))
+        self.assertEqual(
+            events,
+            [
+                "first-body",
+                "first-cleanup",
+                "between-case-cleanup",
+                "second-body",
+                "between-case-cleanup",
+            ],
+        )
+        self.assertEqual(result.testsRun, 2)
+        self.assertEqual(result.between_case_cleanup_failures, 0)
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(redis_factory.call_count, 2)
+        self.assertTrue(
+            all(
+                call.args[0] == safe_environment["PLATFORM_REDIS_URL"]
+                for call in redis_factory.call_args_list
+            )
+        )
+        self.assertEqual(
+            fake_redis.patterns,
+            ["platform:auth-rate:v1:*"] * 4,
+        )
+        self.assertEqual(fake_redis.keys, {b"platform:other-cache:keep"})
+        self.assertTrue(fake_redis.closed)
+
+        failing_redis = FakeRedis()
+
+        async def fail_scan(*, cursor: int, match: str, count: int):
+            raise OSError("private Redis failure detail")
+
+        failing_redis.scan = fail_scan
+        with (
+            patch.dict(os.environ, safe_environment, clear=True),
+            patch("redis.asyncio.from_url", return_value=failing_redis),
+            self.assertRaises(OSError),
+        ):
+            _clear_integration_auth_rate_limit_keys()
+        self.assertTrue(failing_redis.closed)
+
+        failing_events: list[str] = []
+        failing_case = unittest.FunctionTestCase(lambda: failing_events.append("case"))
+        skipped_case = unittest.FunctionTestCase(lambda: failing_events.append("unexpected"))
+
+        def fail_closed_cleanup() -> None:
+            failing_events.append("between-case-cleanup")
+            raise RuntimeError("sanitized by the result hook")
+
+        failure_runner = TimingRunner(stream=io.StringIO(), verbosity=0)
+        failure_runner.between_case_cleanup = fail_closed_cleanup
+        failure_result = failure_runner.run(unittest.TestSuite((failing_case, skipped_case)))
+        self.assertEqual(failing_events, ["case", "between-case-cleanup"])
+        self.assertEqual(failure_result.testsRun, 1)
+        self.assertEqual(failure_result.between_case_cleanup_failures, 1)
+        self.assertFalse(failure_result.wasSuccessful())
 
     def test_migration_target_validator_is_loopback_test_only(self) -> None:
         target = validate_disposable_migration_target(

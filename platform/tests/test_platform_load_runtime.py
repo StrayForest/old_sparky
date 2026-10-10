@@ -18,6 +18,7 @@ from tools.platform_load_runtime import (
     LoadRuntimeBudgetExceeded,
     NamespaceCapabilityError,
     NamespaceIntegrityError,
+    ProgressCheckpoint,
     WORKER_REPORT_SCHEMA,
     _closed_failure_report,
     _await_namespace_ready,
@@ -26,12 +27,14 @@ from tools.platform_load_runtime import (
     _namespace_closed,
     _reap_captured_chain,
     _read_closed_report,
+    _read_progress_checkpoint,
     _read_process_starttime,
     _read_process_state,
     _reap_after_signal,
     _verify_expected_parent,
     probe_pid_namespace_capability,
     run_supervised,
+    write_closed_progress_artifact,
     worker_entry,
 )
 from tools.platform_load_namespace import _kill_tree
@@ -168,6 +171,118 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
         with self.assertRaises(LoadRuntimeBudgetExceeded) as runner_error:
             runner.check("future", operation="wait")
         self.assertEqual(runner_error.exception.reason, "max_runner_minutes")
+
+    def test_progress_checkpoint_is_source_bound_closed_and_privacy_limited(self) -> None:
+        context = {
+            "source_git_sha": "a" * 40,
+            "app_target_sha": "b" * 40,
+            "source_binding_sha256": "c" * 64,
+            "profile_id": "authenticated-page-load-v1",
+            "profile_digest": "d" * 64,
+            "external_run_id": "123456789",
+            "max_logical_actions": 2,
+            "max_http_attempts": 4,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint_path = root / "progress.json"
+            checkpoint = ProgressCheckpoint(checkpoint_path, context, create=True)
+            checkpoint.emit("namespace_probe")
+            checkpoint.emit("namespace_handshake")
+            checkpoint.emit("worker_start")
+            checkpoint.emit("fixture_validation")
+            checkpoint.emit("http", inflight_unknown=True)
+            starting_sequence = checkpoint.sequence
+            with patch("tools.platform_load_runtime.PROGRESS_WRITE_INTERVAL_COMPLETIONS", 1):
+                checkpoint.record_http_result([503, 200])
+            self.assertGreater(checkpoint.sequence, starting_sequence)
+            checkpoint.emit("teardown", inflight_unknown=True)
+            snapshot = checkpoint.closed_snapshot(
+                namespace_closed=True,
+                descendants_reaped=True,
+                partial_work=True,
+            )
+            self.assertEqual(snapshot["logical_completed"], 1)
+            self.assertEqual(snapshot["http_attempts_completed"], 2)
+            self.assertEqual(snapshot["status_counts"], {"200": 1, "503": 1})
+            self.assertTrue(snapshot["inflight_unknown"])
+            self.assertEqual(snapshot["phase"], "teardown")
+            self.assertEqual(snapshot["last_active_phase"], "http")
+            self.assertIsNotNone(snapshot["http_checkpoint_age_seconds"])
+            self.assertFalse(snapshot["authoritative"])
+            self.assertFalse(snapshot["dispatchable"])
+            self.assertFalse(snapshot["final_credit"])
+
+            with self.assertRaises(ValueError):
+                checkpoint.closed_snapshot(
+                    namespace_closed=False,
+                    descendants_reaped=True,
+                    partial_work=True,
+                )
+            with self.assertRaises(ValueError):
+                _read_progress_checkpoint(
+                    checkpoint_path,
+                    context={**context, "external_run_id": "987654321"},
+                )
+            checkpoint_link = root / "linked-progress.json"
+            checkpoint_link.symlink_to(checkpoint_path)
+            with self.assertRaises(ValueError):
+                ProgressCheckpoint(checkpoint_link, context)
+
+            artifact = root / "report.progress.json"
+            write_closed_progress_artifact(artifact, snapshot)
+            self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
+            public = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertEqual(set(public), set(snapshot))
+            self.assertNotIn("user_id", public)
+            self.assertNotIn("path", public)
+            with self.assertRaises(FileExistsError):
+                write_closed_progress_artifact(artifact, snapshot)
+
+            malformed = dict(snapshot)
+            malformed["actor_email"] = "private@example.invalid"
+            with self.assertRaises(ValueError):
+                write_closed_progress_artifact(root / "bad.json", malformed)
+
+    def test_timeout_checkpoint_survives_missing_report_only_after_namespace_reap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "worker.py"
+            script.write_text(WORKER_SCRIPT)
+            checkpoint_path = root / "progress.json"
+            context = {
+                "source_git_sha": "a" * 40,
+                "app_target_sha": "a" * 40,
+                "source_binding_sha256": "b" * 64,
+                "profile_id": "authenticated-page-load-v1",
+                "profile_digest": "c" * 64,
+                "external_run_id": "123456789",
+                "max_logical_actions": 20_000,
+                "max_http_attempts": 20_000,
+            }
+            result = self._supervise(
+                script,
+                root / "final.json",
+                root / "child.json",
+                mode="hang",
+                duration=3.0,
+                progress_checkpoint_path=str(checkpoint_path),
+                progress_context=context,
+            )
+            self.assertEqual(result.reason, "max_duration_seconds")
+            self.assertTrue(result.namespace_closed)
+            self.assertTrue(result.descendants_reaped)
+            self.assertFalse(result.report["acceptance"]["passed"])
+            self.assertEqual(
+                result.report["runtime_supervisor"]["report_error"],
+                "missing_or_symlink_report",
+            )
+            checkpoint = _read_progress_checkpoint(checkpoint_path, context=context)
+            self.assertEqual(checkpoint["phase"], "teardown")
+            self.assertEqual(checkpoint["last_active_phase"], "worker_start")
+            self.assertEqual(checkpoint["logical_completed"], 0)
+            self.assertEqual(checkpoint["http_attempts_completed"], 0)
+            self.assertTrue(checkpoint["inflight_unknown"])
 
     def _supervise(
         self,
@@ -324,6 +439,8 @@ class LoadRuntimeBudgetTests(unittest.TestCase):
                 inflight_unknown=False,
                 signal=None,
                 returncode=1,
+                namespace_closed=True,
+                descendants_reaped=True,
             )
             with tempfile.TemporaryDirectory() as run_directory:
                 report_path = Path(run_directory) / "report.json"

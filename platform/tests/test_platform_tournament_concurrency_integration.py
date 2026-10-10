@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
@@ -15,6 +16,9 @@ from unittest.mock import patch
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services import tournament_workflow, tournament_write_serialization
 from apps.platform_api.app.services.tournament_workflow import transition_locked_tournament_status
+from apps.platform_api.app.services import tournament_profile_access
+from python_packages.platform_infra.config import get_settings
+from python_packages.platform_infra.csrf import csrf_cookie_name
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
@@ -27,7 +31,12 @@ from python_packages.platform_infra.models import (
     User,
     new_uuid,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from python_packages.platform_infra.redis import redis_client
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -40,7 +49,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-as03-{uuid4().hex[:8]}"
         self.password = INTEGRATION_PASSWORD
-        self.base_url = "http://testserver"
+        self.base_url = "https://testserver"
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup_test_data()
@@ -75,7 +84,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
                 base_url=self.base_url,
             )
         )
@@ -102,6 +111,8 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                         "password": self.password,
                         "display_name": f"as03-{label}"[:15],
                     },
+
+                    headers=same_origin_request_headers(client),
                 ),
                 201,
             )
@@ -166,6 +177,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                     "format_slug": "solo",
                     "max_participants": max_participants,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -174,6 +186,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -197,6 +210,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/invites",
                 json={"max_uses": max_uses},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -213,6 +227,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                 "entry_type": "solo",
                 "team_name": None,
             },
+            headers=same_origin_request_headers(player["client"]),
         )
 
     async def _join(
@@ -224,6 +239,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
         return await player["client"].post(
             f"/api/v1/tournaments/{slug}/join",
             json={"entry_type": "solo", "invite_code": invite_code},
+            headers=same_origin_request_headers(player["client"]),
         )
 
     async def _seed_published_roster(
@@ -388,6 +404,8 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                         organizer["client"].patch(
                             f"/api/v1/tournaments/{slug}/status",
                             json={"status": "registration_closed"},
+
+                            headers=same_origin_request_headers(organizer["client"]),
                         )
                     )
                     await asyncio.wait_for(close_lock_called.wait(), timeout=5)
@@ -417,6 +435,123 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
         self.assertEqual(close_response.status_code, 200, close_response.text)
         self.assertEqual(join_response.status_code, 409, join_response.text)
         self.assertEqual(await self._participant_count(slug), 0)
+
+    async def test_join_profile_access_cache_uses_db_generation_cas_and_leave_rejects_stale_delta(
+        self,
+    ) -> None:
+        # Keep the real Secure cookie and Origin/CSRF contract while exercising
+        # the production ASGI route, PostgreSQL trigger, and Redis Lua scripts.
+        self.base_url = "https://testserver"
+        organizer = await self._register_user("profile-cas-organizer")
+        player = await self._register_user("profile-cas-player")
+        for account in (organizer, player):
+            token = account["client"].cookies.get(csrf_cookie_name(get_settings()))
+            self.assertIsNotNone(token, "registration should issue a CSRF cookie")
+
+        slug, tournament_id = await self._seed_tournament(
+            organizer_user_id=organizer["user_id"],
+            suffix="profile-cas",
+            status="registration_open",
+        )
+        await tournament_profile_access.delete_tournament_profile_access_state(slug)
+        try:
+            async with session_factory()() as db_session:
+                initial_generation = await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == tournament_id
+                    )
+                )
+            self.assertEqual(initial_generation, 0)
+
+            initial_state = await tournament_profile_access.refresh_tournament_profile_access_state(
+                slug
+            )
+            self.assertIsNotNone(initial_state)
+            self.assertEqual(initial_state.profile_access_generation, 0)
+            self.assertEqual(initial_state.viewer_user_ids, frozenset())
+
+            redis = redis_client(decode_responses=False)
+            try:
+                warmed = json.loads(
+                    await redis.get(tournament_profile_access.profile_access_key(slug))
+                )
+                self.assertEqual(warmed["profile_access_generation"], 0)
+                self.assertEqual(warmed["viewer_count"], 0)
+                self.assertEqual(warmed["roster_count"], 0)
+            finally:
+                await redis.aclose()
+
+            original_builder = tournament_profile_access.build_tournament_profile_access_state
+            with patch.object(
+                tournament_profile_access,
+                "build_tournament_profile_access_state",
+                wraps=original_builder,
+            ) as full_builder:
+                joined = await self._join(player, slug)
+            self.assertEqual(joined.status_code, 201, joined.text)
+            full_builder.assert_not_awaited()
+
+            async with session_factory()() as db_session:
+                joined_generation = await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == tournament_id
+                    )
+                )
+            self.assertEqual(joined_generation, 1)
+            redis = redis_client(decode_responses=False)
+            try:
+                joined_access = json.loads(
+                    await redis.get(tournament_profile_access.profile_access_key(slug))
+                )
+                self.assertEqual(joined_access["profile_access_generation"], 1)
+                self.assertEqual(joined_access["viewer_count"], 1)
+                self.assertEqual(
+                    await redis.sismember(
+                        tournament_profile_access.profile_viewers_key(slug),
+                        player["user_id"],
+                    ),
+                    1,
+                )
+            finally:
+                await redis.aclose()
+
+            left = await player["client"].delete(f"/api/v1/tournaments/{slug}/join", headers=same_origin_request_headers(player["client"]))
+            self.assertEqual(left.status_code, 204, left.text)
+            async with session_factory()() as db_session:
+                left_generation = await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == tournament_id
+                    )
+                )
+            self.assertEqual(left_generation, 2)
+
+            # An out-of-order join callback from generation zero must not
+            # re-add a participant after the leave trigger/rebuild advanced
+            # both DB and cache to generation two.
+            accepted = await tournament_profile_access.add_joined_tournament_profile_viewer(
+                slug,
+                str(player["user_id"]),
+                expected_generation=0,
+            )
+            self.assertFalse(accepted)
+            redis = redis_client(decode_responses=False)
+            try:
+                current_access = json.loads(
+                    await redis.get(tournament_profile_access.profile_access_key(slug))
+                )
+                self.assertEqual(current_access["profile_access_generation"], 2)
+                self.assertEqual(current_access["viewer_count"], 0)
+                self.assertEqual(
+                    await redis.sismember(
+                        tournament_profile_access.profile_viewers_key(slug),
+                        player["user_id"],
+                    ),
+                    0,
+                )
+            finally:
+                await redis.aclose()
+        finally:
+            await tournament_profile_access.delete_tournament_profile_access_state(slug)
 
     async def test_leave_waits_for_close_and_serializes_after_registration_closes(
         self,
@@ -475,13 +610,15 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                         organizer["client"].patch(
                             f"/api/v1/tournaments/{slug}/status",
                             json={"status": "registration_closed"},
+
+                            headers=same_origin_request_headers(organizer["client"]),
                         )
                     )
                     await asyncio.wait_for(close_lock_called.wait(), timeout=5)
                     await blocker.commit()
                     await asyncio.wait_for(close_lock_acquired.wait(), timeout=5)
                     leave_task = asyncio.create_task(
-                        player["client"].delete(f"/api/v1/tournaments/{slug}/join")
+                        player["client"].delete(f"/api/v1/tournaments/{slug}/join", headers=same_origin_request_headers(player["client"]))
                     )
                     await asyncio.wait_for(leave_lock_called.wait(), timeout=5)
                     close_release.set()
@@ -597,7 +734,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                 side_effect=gated_dependency_lock,
             ):
                 leave_task = asyncio.create_task(
-                    player["client"].delete(f"/api/v1/tournaments/{slug}/join")
+                    player["client"].delete(f"/api/v1/tournaments/{slug}/join", headers=same_origin_request_headers(player["client"]))
                 )
                 await asyncio.wait_for(leave_lock_called.wait(), timeout=5)
                 roster_release.set()
@@ -794,6 +931,8 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                             "entry_type": "solo",
                             "team_name": None,
                         },
+
+                        headers=same_origin_request_headers(organizer["client"]),
                     )
                 ),
             ]
@@ -859,6 +998,8 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
         joined_a = self._assert_status(await self._join(player_a, slug, invite_a["code"]), 201)
         removed = await organizer["client"].delete(
             f"/api/v1/tournaments/{slug}/participants/{joined_a['id']}"
+        ,
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(removed.status_code, 204, removed.text)
 
@@ -872,6 +1013,7 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                 "status": "registered",
                 "moderation_note": "Capacity regression.",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(restore.status_code, 409, restore.text)
         self.assertIn("participant limit", restore.json()["detail"].lower())

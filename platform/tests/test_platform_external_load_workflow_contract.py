@@ -60,6 +60,13 @@ def _pass_truth_table(state: dict[str, object]) -> bool:
             state["observer_ready"] == "1",
             state["finalize_status"] == "0",
             state["cleanup_status"] == "0",
+            state["cleanup_remote_diagnostic_status"] == "0",
+            state["cleanup_remote_dispatch_exit_code"] == "0",
+            state["cleanup_remote_stage"] == "complete",
+            state["cleanup_remote_child_state"] == "exited",
+            state["cleanup_remote_child_exit"] == "0",
+            state["cleanup_remote_stdout_eof"] == "true",
+            state["cleanup_remote_timed_out"] == "false",
             state["cleanup_exports_status"] == "0",
             state["ssh_cleanup_status"] == "0",
             state["cleanup_identity_status"] == "0",
@@ -93,6 +100,13 @@ def _evidence_publish_truth_table(state: dict[str, object]) -> bool:
             state["observer_ready"] == "1",
             state["finalize_status"] == "0",
             state["cleanup_status"] == "0",
+            state["cleanup_remote_diagnostic_status"] == "0",
+            state["cleanup_remote_dispatch_exit_code"] == "0",
+            state["cleanup_remote_stage"] == "complete",
+            state["cleanup_remote_child_state"] == "exited",
+            state["cleanup_remote_child_exit"] == "0",
+            state["cleanup_remote_stdout_eof"] == "true",
+            state["cleanup_remote_timed_out"] == "false",
             state["cleanup_exports_status"] == "0",
             state["ssh_cleanup_status"] == "0",
             state["cleanup_identity_status"] == "0",
@@ -190,6 +204,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "needs.fixture-finalize.outputs.observer_ready",
             "needs.fixture-finalize.outputs.finalize_status",
             "needs.fixture-finalize.outputs.cleanup_status",
+            "needs.fixture-finalize.outputs.cleanup_remote_diagnostic_status",
+            "needs.fixture-finalize.outputs.cleanup_remote_dispatch_exit_code",
+            "needs.fixture-finalize.outputs.cleanup_remote_stage",
+            "needs.fixture-finalize.outputs.cleanup_remote_child_state",
+            "needs.fixture-finalize.outputs.cleanup_remote_child_exit",
+            "needs.fixture-finalize.outputs.cleanup_remote_stdout_eof",
+            "needs.fixture-finalize.outputs.cleanup_remote_timed_out",
             "needs.fixture-finalize.outputs.cleanup_exports_status",
             "needs.fixture-finalize.outputs.ssh_cleanup_status",
             "needs.fixture-finalize.outputs.cleanup_identity_status",
@@ -224,6 +245,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "observer_ready": "1",
             "finalize_status": "0",
             "cleanup_status": "0",
+            "cleanup_remote_diagnostic_status": "0",
+            "cleanup_remote_dispatch_exit_code": "0",
+            "cleanup_remote_stage": "complete",
+            "cleanup_remote_child_state": "exited",
+            "cleanup_remote_child_exit": "0",
+            "cleanup_remote_stdout_eof": "true",
+            "cleanup_remote_timed_out": "false",
             "cleanup_exports_status": "0",
             "ssh_cleanup_status": "0",
             "cleanup_identity_status": "0",
@@ -267,6 +295,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "observer_ready": "1",
             "finalize_status": "0",
             "cleanup_status": "0",
+            "cleanup_remote_diagnostic_status": "0",
+            "cleanup_remote_dispatch_exit_code": "0",
+            "cleanup_remote_stage": "complete",
+            "cleanup_remote_child_state": "exited",
+            "cleanup_remote_child_exit": "0",
+            "cleanup_remote_stdout_eof": "true",
+            "cleanup_remote_timed_out": "false",
             "cleanup_exports_status": "0",
             "ssh_cleanup_status": "0",
             "cleanup_identity_status": "0",
@@ -290,9 +325,12 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         )[0]
         self.assertIn("cleanup_identity_status", cleanup)
         self.assertNotIn('HANDOFF_STATUS" == 0', cleanup)
-        self.assertIn("external-cleanup <", cleanup)
+        self.assertIn('external-cleanup --run-attempt "$GITHUB_RUN_ATTEMPT"', cleanup)
+        self.assertIn("external-cleanup --run-attempt", cleanup)
+        self.assertIn("--profile-id \"$PROFILE_ID\"", cleanup)
         self.assertIn("external-cleanup-exports <", cleanup)
         self.assertIn("cleanup_status=1", cleanup)
+        self.assertIn("cleanup_remote_diagnostic_status", cleanup)
 
     def test_cleanup_evidence_flows_through_origin_archive_and_sanitizer(self) -> None:
         workflow = yaml.safe_load(self.source)
@@ -342,11 +380,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
 
             (fake_bin / "ssh").write_text(
                 "#!/usr/bin/python3\n"
-                "import sys\n"
+                "import os, sys\n"
                 "if any('external-cleanup-exports' in arg for arg in sys.argv):\n"
                 "    raise SystemExit(0)\n"
                 "if any('external-cleanup' in arg for arg in sys.argv):\n"
-                "    print('RETAINED_CLEANUP_DIAGNOSTIC schema=1 stage=complete child_exit=0')\n"
+                "    print('RETAINED_CLEANUP_DIAGNOSTIC schema=2 stage=complete dispatcher_exit=0 child_state=exited child_exit=0 stdout_eof=true timed_out=false source_sha=' + os.environ['TARGET_SHA'] + ' app_sha=' + os.environ['APP_TARGET_SHA'] + ' run_id=' + os.environ['GITHUB_RUN_ID'] + ' run_attempt=' + os.environ['GITHUB_RUN_ATTEMPT'] + ' load_run_id=' + os.environ['GITHUB_RUN_ID'] + ' profile=' + os.environ['PROFILE_ID'])\n"
                 "    raise SystemExit(0)\n"
                 "raise SystemExit(91)\n",
                 encoding="ascii",
@@ -378,6 +416,10 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 "GITHUB_OUTPUT": str(cleanup_output),
                 "GITHUB_STEP_SUMMARY": str(summary),
                 "GITHUB_RUN_ID": "123456789",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "TARGET_SHA": "a" * 40,
+                "APP_TARGET_SHA": "b" * 40,
+                "PROFILE_ID": "ready-vote-slo-v2",
                 "HOST_TOOLS_SHA": "a" * 40,
                 "CLEANUP_IDENTITY_STATUS": "0",
                 "PROD_SSH_USER": "fixture-user",
@@ -396,6 +438,9 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             cleanup_outputs = cleanup_output.read_text(encoding="utf-8")
             self.assertIn("cleanup_status=0", cleanup_outputs)
             self.assertIn("cleanup_exports_status=0", cleanup_outputs)
+            self.assertIn("cleanup_remote_child_state=exited", cleanup_outputs)
+            self.assertIn("cleanup_remote_stdout_eof=true", cleanup_outputs)
+            self.assertIn("cleanup_remote_diagnostic_status=0", cleanup_outputs)
             self.assertTrue((evidence / "cleanup-canonical.log").is_file())
             self.assertFalse((evidence / "cleanup-canonical.raw").exists())
 
@@ -466,6 +511,14 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                         if match.group(1).endswith("acceptance_status")
                         else "pending_origin"
                         if match.group(1).endswith("candidate_state")
+                        else "complete"
+                        if match.group(1).endswith("cleanup_remote_stage")
+                        else "exited"
+                        if match.group(1).endswith("cleanup_remote_child_state")
+                        else "true"
+                        if match.group(1).endswith("cleanup_remote_stdout_eof")
+                        else "false"
+                        if match.group(1).endswith("cleanup_remote_timed_out")
                         else "1"
                         if match.group(1).endswith(("report_ready", "observer_ready"))
                         else "success"
@@ -1032,8 +1085,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         self.assertIn('os.fstat(descriptor)', workflow)
         self.assertIn('"control_email": canonical_email', workflow)
         self.assertIn('"$input_path"', workflow)
-        for mode in ("retained-cleanup", "retained-cleanup-exports"):
-            self.assertIn(f"{mode} < \"$input_path\"", workflow)
+        normalized_workflow = re.sub(r"\\\n\s*", "", workflow)
+        self.assertIn(
+            'retained-cleanup --run-attempt "$GITHUB_RUN_ATTEMPT" '
+            '--load-run-id "$LOAD_RUN_ID" < "$input_path"',
+            normalized_workflow,
+        )
+        self.assertIn('retained-cleanup-exports < "$input_path"', workflow)
         cleanup_step = _jobs(workflow)["cleanup"]
         parsed_workflow = yaml.safe_load(workflow)
         cleanup_job = parsed_workflow["jobs"]["cleanup"]
@@ -1353,6 +1411,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "observer_ready": "1",
             "finalize_status": "0",
             "cleanup_status": "0",
+            "cleanup_remote_diagnostic_status": "0",
+            "cleanup_remote_dispatch_exit_code": "0",
+            "cleanup_remote_stage": "complete",
+            "cleanup_remote_child_state": "exited",
+            "cleanup_remote_child_exit": "0",
+            "cleanup_remote_stdout_eof": "true",
+            "cleanup_remote_timed_out": "false",
             "cleanup_exports_status": "0",
             "ssh_cleanup_status": "0",
             "cleanup_identity_status": "0",
@@ -1563,7 +1628,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py external-fixture",
             fixture_setup,
         )
-        self.assertIn("/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \\\n              external-cleanup <", finalizer)
+        self.assertIn('external-cleanup --run-attempt "$GITHUB_RUN_ATTEMPT"', finalizer)
         self.assertIn("cleanup_exports_status=", finalizer)
         self.assertIn("cleanup_status\" != 0 || \"$cleanup_exports_status\" != 0", finalizer)
         self.assertIn("cleanup summary projection input is invalid", finalizer)
@@ -2040,7 +2105,18 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "ORIGIN_CLEANUP_IDENTITY_STATUS": "0",
             "ORIGIN_CLEANUP_REMOTE_SSH_EXIT": "0",
             "ORIGIN_CLEANUP_REMOTE_STAGE": "complete",
+            "ORIGIN_CLEANUP_REMOTE_DISPATCH_EXIT": "0",
+            "ORIGIN_CLEANUP_REMOTE_CHILD_STATE": "exited",
             "ORIGIN_CLEANUP_REMOTE_CHILD_EXIT": "0",
+            "ORIGIN_CLEANUP_REMOTE_STDOUT_EOF": "true",
+            "ORIGIN_CLEANUP_REMOTE_TIMED_OUT": "false",
+            "ORIGIN_CLEANUP_REMOTE_DIAGNOSTIC_STATUS": "0",
+            "ORIGIN_SOURCE_SHA": "a" * 40,
+            "GITHUB_SHA": "a" * 40,
+            "ORIGIN_APP_SHA": "b" * 40,
+            "ORIGIN_RUN_ID": "123456",
+            "ORIGIN_RUN_ATTEMPT": "2",
+            "ORIGIN_PROFILE_ID": "ready-vote-slo-v2",
         }
         with tempfile.TemporaryDirectory(prefix="external-load-origin-diagnostic-") as temp:
             evidence_root = Path(temp) / "external-evidence"
@@ -2062,8 +2138,19 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertIn("explicit_conditions_met=yes", valid_summary)
             diagnostic_path = evidence_root / "cleanup-diagnostic.json"
             diagnostic = json.loads(diagnostic_path.read_text(encoding="ascii"))
-            self.assertEqual(set(diagnostic), {"schema", "conditions", "explicit_conditions_met"})
-            self.assertEqual(diagnostic["schema"], 1)
+            self.assertEqual(
+                set(diagnostic),
+                {
+                    "schema", "source_sha", "app_sha", "run_id", "run_attempt",
+                    "profile_id", "conditions", "explicit_conditions_met",
+                },
+            )
+            self.assertEqual(diagnostic["schema"], 2)
+            self.assertEqual(diagnostic["source_sha"], "a" * 40)
+            self.assertEqual(diagnostic["app_sha"], "b" * 40)
+            self.assertEqual(diagnostic["run_id"], "123456")
+            self.assertEqual(diagnostic["run_attempt"], "2")
+            self.assertEqual(diagnostic["profile_id"], "ready-vote-slo-v2")
             self.assertEqual(diagnostic["explicit_conditions_met"], "yes")
             self.assertEqual(diagnostic["conditions"]["cleanup_stage"], "complete")
             self.assertEqual(output_path.read_text(encoding="ascii"), "explicit_conditions_met=yes\n")
@@ -2152,8 +2239,13 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             "steps.external-finalize.outputs.finalize_status == '0'",
             "steps.cleanup.outputs.cleanup_status == '0'",
             "steps.cleanup.outputs.cleanup_remote_ssh_exit_code == '0'",
+            "steps.cleanup.outputs.cleanup_remote_diagnostic_status == '0'",
+            "steps.cleanup.outputs.cleanup_remote_dispatch_exit_code == '0'",
             "steps.cleanup.outputs.cleanup_remote_stage == 'complete'",
+            "steps.cleanup.outputs.cleanup_remote_child_state == 'exited'",
             "steps.cleanup.outputs.cleanup_remote_child_exit == '0'",
+            "steps.cleanup.outputs.cleanup_remote_stdout_eof == 'true'",
+            "steps.cleanup.outputs.cleanup_remote_timed_out == 'false'",
             "steps.cleanup.outputs.cleanup_exports_status == '0'",
             "steps.cleanup_ssh.outputs.ssh_cleanup_status != ''",
             "steps.cleanup_ssh.outputs.ssh_cleanup_status == '0'",

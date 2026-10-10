@@ -53,13 +53,8 @@ platform_retained_load_lock_open || {
 }
 trap platform_retained_load_lock_close EXIT
 source_binding_b64=""
-if (( $# == 10 )); then
-  [[ "${9}" == "--source-binding-base64" ]] || {
-    echo "Source-binding option is invalid." >&2
-    exit 2
-  }
-  source_binding_b64="${10}"
-elif (( $# != 7 && $# != 8 )); then
+run_attempt=""
+if (( $# < 7 || $# > 12 )); then
   echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path]" >&2
   exit 2
 fi
@@ -72,6 +67,37 @@ profile="$5"
 external_vote_tournament_count="$6"
 external_vote_users_per_tournament="$7"
 timeout_diagnostics="${8:-false}"
+next_extra_arg=9
+if (( $# >= 9 )) && [[ "${9}" == "--source-binding-base64" ]]; then
+  (( $# >= 10 )) || {
+    echo "Source-binding option is incomplete." >&2
+    exit 2
+  }
+  source_binding_b64="${10}"
+  next_extra_arg=11
+fi
+if (( $# >= next_extra_arg )); then
+  if (( next_extra_arg == 9 )); then
+    extra_option="${9}"
+    extra_value="${10:-}"
+  else
+    extra_option="${11}"
+    extra_value="${12:-}"
+  fi
+  [[ "$extra_option" == "--run-attempt" && -n "$extra_value" ]] || {
+    echo "Run-attempt option is invalid." >&2
+    exit 2
+  }
+  run_attempt="$extra_value"
+  (( $# == next_extra_arg + 1 )) || {
+    echo "Unexpected external-load fixture arguments." >&2
+    exit 2
+  }
+fi
+if (( $# != 7 && $# != 8 && $# != 9 && $# != 10 && $# != 11 && $# != 12 )); then
+  echo "Unexpected external-load fixture arguments." >&2
+  exit 2
+fi
 
 [[ "$profile" == "external-vote" ]] || {
   echo "External-load fixture supports only the external-vote profile." >&2
@@ -114,6 +140,10 @@ fi
   echo "Run id must be numeric." >&2
   exit 1
 }
+if [[ -n "$run_attempt" && ! "$run_attempt" =~ ^[1-9][0-9]{0,8}$ ]]; then
+  echo "Run attempt must be a positive decimal integer." >&2
+  exit 1
+fi
 if [[ ! "$external_vote_tournament_count" =~ ^[1-9][0-9]?$ ]] \
   || (( external_vote_tournament_count > 40 )); then
   echo "External vote tournament count must be between 1 and 40." >&2
@@ -184,6 +214,12 @@ export_dir_identity=""
 # shellcheck disable=SC2317
 write_supervisor_exit() {
   local supervisor_status=$?
+  if [[ "${progress_enabled:-0}" == "1" ]]; then
+    record_progress "supervisor_exit" "${progress_stop_marker_seen:-false}" || true
+    if [[ "${progress_write_failed:-0}" == "1" && "$supervisor_status" == "0" ]]; then
+      supervisor_status=1
+    fi
+  fi
   if [[ "$export_created" == "1" && -n "$export_dir_identity" \
     && -d "$export_dir" && ! -L "$export_dir" \
     && "$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h' -- "$export_dir" 2>/dev/null || true)" == "$export_dir_identity" ]]; then
@@ -267,13 +303,48 @@ external_vote_complete="$export_dir/complete"
 external_vote_ready="$export_dir/ready"
 external_vote_observer_output="$external_vote_root/server-observability.json"
 external_vote_observer_log="$external_vote_root/server-observer.log"
+external_vote_progress="$run_root/observer-progress.json"
 timeout_diagnostic_ids_path="$export_dir/timeout-diagnostic-ids.json"
+progress_enabled=0
+progress_write_failed=0
+progress_stop_marker_seen=false
+if [[ -n "$run_attempt" ]]; then
+  progress_enabled=1
+fi
+completion_marker_was_present() {
+  [[ -f "$1" && ! -L "$1" ]]
+}
+record_progress() {
+  local phase="$1"
+  local stop_marker_seen="${2:-false}"
+  local observer_exit_code="${3:-}"
+  local progress_args=(
+    --progress-path "$external_vote_progress"
+    --record-progress-phase "$phase"
+    --source-sha "$target_sha"
+    --external-run-id "$run_id"
+    --run-attempt "$run_attempt"
+    --profile-id external-vote
+    --stop-marker-seen "$stop_marker_seen"
+  )
+  if [[ -n "$observer_exit_code" ]]; then
+    progress_args+=(--observer-exit-code "$observer_exit_code")
+  fi
+  if ! "$QA_PYTHON" -B "$TOOLS_DIR/platform_external_load_observer.py" \
+    "${progress_args[@]}" >/dev/null 2>&1; then
+    progress_write_failed=1
+    return 1
+  fi
+}
 fixture_source_binding_args=(--runner-sha "$target_sha")
 if [[ -n "$source_binding_b64" ]]; then
   fixture_source_binding_args+=(--source-binding-base64 "$source_binding_b64")
 fi
 
 set +e
+if [[ "$progress_enabled" == "1" ]]; then
+  record_progress "fixture_setup_requested" false || true
+fi
 timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
   env PLATFORM_RUNTIME_SERVICE=qa \
   "$QA_PYTHON" -B "$TOOLS_DIR/platform_prepare_external_vote_fixture.py" \
@@ -388,6 +459,9 @@ PY
   fi
 
   if [[ "$qa_status" == "0" && -n "$fixture_marker" ]]; then
+  if [[ "$progress_enabled" == "1" ]]; then
+    record_progress "observer_startup" false || true
+  fi
   set +e
   observer_args=(
     "$TOOLS_DIR/platform_external_load_observer.py"
@@ -399,6 +473,14 @@ PY
     --fixture-marker "$fixture_marker"
     --external-run-id "$run_id"
   )
+  if [[ "$progress_enabled" == "1" ]]; then
+    observer_args+=(
+      --run-attempt "$run_attempt"
+      --source-sha "$target_sha"
+      --progress-path "$external_vote_progress"
+      --profile-id external-vote
+    )
+  fi
   if [[ "$timeout_diagnostics" == "true" ]]; then
     observer_args+=(--diagnostic-id-file "$timeout_diagnostic_ids_path")
   fi
@@ -420,9 +502,14 @@ PY
   fi
   printf 'PRODUCTION_EXTERNAL_LOAD_READY=%s\n' "$export_dir/manifest.json"
   observer_deadline=$(( $(date +%s) + 10800 ))
+  observer_waited_early=0
+  observer_exited_before_complete=0
+  observer_early_status=0
   while [[ ! -e "$external_vote_complete" ]]; do
     if ! kill -0 "$observer_pid" 2>/dev/null; then
-      wait "$observer_pid" 2>/dev/null || true
+      wait "$observer_pid" 2>/dev/null || observer_early_status="$?"
+      observer_waited_early=1
+      observer_exited_before_complete=1
       echo "External-load observer exited before the load completed." >&2
       qa_status=1
       break
@@ -434,13 +521,28 @@ PY
     fi
     sleep 1
   done
+  # Snapshot whether the client completed before the supervisor creates its
+  # forced stop marker.  The observer needs the marker in either case to exit,
+  # but only the pre-existing regular marker proves client completion.
+  if completion_marker_was_present "$external_vote_complete"; then
+    progress_stop_marker_seen=true
+  else
+    progress_stop_marker_seen=false
+  fi
   if [[ ! -e "$external_vote_complete" ]]; then
     : > "$external_vote_complete"
     chown "$export_uid:$export_gid" "$external_vote_complete"
     chmod 0600 "$external_vote_complete"
   fi
-  observer_status=0
-  wait "$observer_pid" 2>/dev/null || observer_status="$?"
+  if [[ "$observer_waited_early" == "1" ]]; then
+    observer_status="$observer_early_status"
+  else
+    observer_status=0
+    wait "$observer_pid" 2>/dev/null || observer_status="$?"
+  fi
+  if [[ "$progress_enabled" == "1" ]]; then
+    record_progress "observer_reaped" "$progress_stop_marker_seen" "$observer_status" || true
+  fi
   if [[ "$observer_status" != "0" ]]; then
     qa_status=1
   fi
@@ -511,6 +613,10 @@ Path(path).write_text(
 PY
 else
   summary_path="${summaries[0]}"
+fi
+
+if [[ "$progress_enabled" == "1" ]]; then
+  record_progress "export_summary" "$progress_stop_marker_seen" || true
 fi
 
 # Keep the exact origin-side report private until the compact export is copied.

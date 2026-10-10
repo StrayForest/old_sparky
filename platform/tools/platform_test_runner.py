@@ -25,7 +25,7 @@ import shutil
 import sys
 import time
 import unittest
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 import ipaddress
 from urllib.parse import urlsplit
 
@@ -74,6 +74,12 @@ except ModuleNotFoundError:  # Import as tools.platform_test_runner in tests.
 
 TEST_ENV_CONTOURS = frozenset((BACKEND_AGGREGATE, *BACKEND_CONTOURS))
 TEST_RESOURCE_CONTOURS = frozenset((BACKEND_AGGREGATE, "backend-integration"))
+AUTH_RATE_LIMIT_KEY_PATTERN = "platform:auth-rate:v1:*"
+AUTH_RATE_LIMIT_KEY_PREFIX = b"platform:auth-rate:v1:"
+AUTH_RATE_LIMIT_CLEANUP_SCAN_COUNT = 200
+AUTH_RATE_LIMIT_CLEANUP_MAX_KEYS = 4096
+AUTH_RATE_LIMIT_CLEANUP_MAX_SCAN_PAGES = 64
+AUTH_RATE_LIMIT_CLEANUP_MAX_SECONDS = 5.0
 INTEGRATION_REQUIRED_ROLE_SLUGS = frozenset(
     {
         "authenticated_user",
@@ -439,6 +445,85 @@ def _teardown_test_resources() -> None:
     asyncio.run(reset())
 
 
+def _clear_integration_auth_rate_limit_keys() -> None:
+    """Remove only authentication rate-limit keys between integration cases.
+
+    The caller is the serial backend-integration result hook, so the canonical
+    verification lock remains held. Revalidating the fixed test target here
+    keeps cleanup fail-closed if process environment state changes after the
+    contour preflight.
+    """
+
+    try:
+        configuration = validate_test_resource_configuration()
+    except TestResourceConfigurationError as exc:
+        raise RuntimeError("refusing unsafe per-case Redis cleanup") from exc
+
+    async def clear() -> None:
+        from redis.asyncio import from_url
+
+        client = from_url(
+            configuration.redis_url,
+            decode_responses=False,
+            socket_connect_timeout=2.0,
+            socket_timeout=2.0,
+        )
+        started_at = time.monotonic()
+
+        def check_budget(page_count: int, key_count: int) -> None:
+            if page_count > AUTH_RATE_LIMIT_CLEANUP_MAX_SCAN_PAGES:
+                raise RuntimeError("per-case Redis cleanup exceeded scan-page bound")
+            if key_count > AUTH_RATE_LIMIT_CLEANUP_MAX_KEYS:
+                raise RuntimeError("per-case Redis cleanup exceeded key bound")
+            if time.monotonic() - started_at > AUTH_RATE_LIMIT_CLEANUP_MAX_SECONDS:
+                raise RuntimeError("per-case Redis cleanup exceeded time bound")
+
+        async def scan_namespace(*, delete: bool) -> int:
+            cursor = 0
+            page_count = 0
+            key_count = 0
+            while True:
+                check_budget(page_count, key_count)
+                next_cursor, keys = await client.scan(
+                    cursor=cursor,
+                    match=AUTH_RATE_LIMIT_KEY_PATTERN,
+                    count=AUTH_RATE_LIMIT_CLEANUP_SCAN_COUNT,
+                )
+                if type(next_cursor) is not int or not isinstance(keys, (list, tuple)):
+                    raise RuntimeError("per-case Redis cleanup received invalid scan data")
+                page_count += 1
+                key_count += len(keys)
+                check_budget(page_count, key_count)
+                if any(
+                    not isinstance(key, bytes) or not key.startswith(AUTH_RATE_LIMIT_KEY_PREFIX)
+                    for key in keys
+                ):
+                    raise RuntimeError("per-case Redis cleanup received an out-of-scope key")
+                if delete:
+                    for offset in range(0, len(keys), 100):
+                        batch = keys[offset : offset + 100]
+                        if not batch:
+                            continue
+                        removed = await client.unlink(*batch)
+                        if type(removed) is not int or not 0 <= removed <= len(batch):
+                            raise RuntimeError("per-case Redis cleanup received invalid unlink data")
+                        check_budget(page_count, key_count)
+                cursor = next_cursor
+                if cursor == 0:
+                    return key_count
+
+        try:
+            await client.ping()
+            await scan_namespace(delete=True)
+            remaining = await scan_namespace(delete=False)
+            if remaining:
+                raise RuntimeError("per-case Redis cleanup did not empty the fixed namespace")
+        finally:
+            await client.aclose()
+
+    asyncio.run(clear())
+
+
 def _require_test_environment(contour: str) -> TestResourceConfiguration | None:
     """Refuse backend contours unless the isolated test target is selected.
 
@@ -475,6 +560,8 @@ class TimingResult(unittest.TextTestResult):
         self.timeout_message: str | None = None
         self._started_at: float | None = None
         self._subtest_outcomes: dict[str, set[str]] = {}
+        self.between_case_cleanup: Callable[[], None] | None = None
+        self.between_case_cleanup_failures = 0
 
     @staticmethod
     def _test_id(test: unittest.case.TestCase) -> str:
@@ -510,6 +597,20 @@ class TimingResult(unittest.TextTestResult):
             else:
                 outcome = "passed"
             self._record(test, outcome)
+        if self.between_case_cleanup is not None:
+            try:
+                self.between_case_cleanup()
+            except Exception:
+                # Keep diagnostics closed: no Redis key, URL or exception text
+                # is emitted. Stop before another case can inherit this state;
+                # the existing guarded whole-contour cleanup still runs.
+                self.between_case_cleanup_failures += 1
+                self.shouldStop = True
+                print(
+                    "[TEST CLEANUP FAIL] between-case auth rate-limit cleanup failed",
+                    file=sys.stderr,
+                    flush=True,
+                )
         super().stopTest(test)
 
     def addSuccess(self, test: unittest.case.TestCase) -> None:
@@ -547,6 +648,9 @@ class TimingResult(unittest.TextTestResult):
         self._record(test, "unexpected-success")
         super().addUnexpectedSuccess(test)
 
+    def wasSuccessful(self) -> bool:
+        return super().wasSuccessful() and self.between_case_cleanup_failures == 0
+
     def _record(self, test: unittest.case.TestCase, outcome: str) -> None:
         started = self._started_at
         duration_ms = 0.0 if started is None else (time.perf_counter() - started) * 1000
@@ -566,9 +670,11 @@ class TimingRunner(unittest.TextTestRunner):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
         self.last_result: TimingResult | None = None
+        self.between_case_cleanup: Callable[[], None] | None = None
 
     def _makeResult(self) -> TimingResult:
         result = super()._makeResult()
+        result.between_case_cleanup = self.between_case_cleanup
         self.last_result = result
         return result
 
@@ -771,6 +877,9 @@ def _summary(
         "tests_run": 0 if result is None else result.testsRun,
         "failures": 0 if result is None else len(result.failures),
         "errors": 0 if result is None else len(result.errors),
+        "between_case_cleanup_failures": (
+            0 if result is None else result.between_case_cleanup_failures
+        ),
         "expected_failures": 0 if result is None else len(result.expectedFailures),
         "unexpected_successes": 0
         if result is None
@@ -1156,6 +1265,8 @@ def _run_contour(args: argparse.Namespace) -> int:
             )
             suite = _load_suite(_flatten_ids(cases))
             runner = TimingRunner(verbosity=0 if args.quiet else 1)
+            if args.contour == "backend-integration":
+                runner.between_case_cleanup = _clear_integration_auth_rate_limit_keys
             result = runner.run(suite)
             if result.timed_out:
                 timeout_message = result.timeout_message
@@ -1203,6 +1314,7 @@ def _run_contour(args: argparse.Namespace) -> int:
         else "passed"
         if result is not None
         and result.wasSuccessful()
+        and not result.between_case_cleanup_failures
         and not result.expectedFailures
         and not result.unexpectedSuccesses
         and not unexpected_skips

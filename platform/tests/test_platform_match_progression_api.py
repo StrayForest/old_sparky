@@ -21,7 +21,11 @@ from python_packages.platform_infra.models import (
     TournamentMatch,
     User,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -32,7 +36,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-bracket-{uuid4().hex[:8]}"
         self.password = INTEGRATION_PASSWORD
-        self.base_url = "http://testserver"
+        self.base_url = "https://testserver"
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup_test_data()
@@ -61,7 +65,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
                 base_url=self.base_url,
             )
         )
@@ -85,6 +89,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                         "password": self.password,
                         "display_name": display_name,
                     },
+                    headers=same_origin_request_headers(client),
                 ),
                 201,
             )
@@ -165,6 +170,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "match_format": "bo3",
                     "final_format": "bo5",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -174,6 +180,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -181,6 +188,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -197,6 +205,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 4",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -211,6 +220,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 3",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -222,6 +232,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/schedule",
                 json={"scheduled_at": semifinal_one_start.isoformat()},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -229,17 +240,20 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_two['id']}/schedule",
                 json={"scheduled_at": semifinal_two_start.isoformat()},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
         spectator_schedule_attempt = await spectator["client"].patch(
             f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/schedule",
             json={"scheduled_at": semifinal_one_start.isoformat()},
+            headers=same_origin_request_headers(spectator["client"]),
         )
         self.assertEqual(spectator_schedule_attempt.status_code, 403, spectator_schedule_attempt.text)
 
         blocked_next_round = await organizer["client"].post(
-            f"/api/v1/tournaments/{slug}/matches/seed-next-round"
+            f"/api/v1/tournaments/{slug}/matches/seed-next-round",
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_next_round.status_code, 409, blocked_next_round.text)
         self.assertIn("Complete every match", blocked_next_round.json()["detail"])
@@ -248,6 +262,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/report",
                 json={"home_score": 2, "away_score": 0, "note": "Semifinal one complete."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -255,6 +270,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_two['id']}/report",
                 json={"home_score": 2, "away_score": 1, "note": "Semifinal two complete."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -262,6 +278,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         premature_completion = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/status",
             json={"status": "completed"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(premature_completion.status_code, 422, premature_completion.text)
         self.assertIn(
@@ -270,7 +287,8 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         )
 
         spectator_progression_attempt = await spectator["client"].post(
-            f"/api/v1/tournaments/{slug}/matches/seed-next-round"
+            f"/api/v1/tournaments/{slug}/matches/seed-next-round",
+            headers=same_origin_request_headers(spectator["client"]),
         )
         self.assertEqual(spectator_progression_attempt.status_code, 403, spectator_progression_attempt.text)
         self.assertIn(
@@ -280,7 +298,8 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
 
         next_round_payload = self._assert_status(
             await organizer["client"].post(
-                f"/api/v1/tournaments/{slug}/matches/seed-next-round"
+                f"/api/v1/tournaments/{slug}/matches/seed-next-round",
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -295,6 +314,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         invalid_final_schedule = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/matches/{final_match_id}/schedule",
             json={"scheduled_at": (semifinal_two_start - timedelta(minutes=10)).isoformat()},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(invalid_final_schedule.status_code, 422, invalid_final_schedule.text)
         self.assertIn("cannot start before", invalid_final_schedule.json()["detail"])
@@ -304,19 +324,22 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{final_match_id}/schedule",
                 json={"scheduled_at": final_start.isoformat()},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
         invalid_source_reschedule = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/matches/{semifinal_two['id']}/schedule",
             json={"scheduled_at": (final_start + timedelta(minutes=10)).isoformat()},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(invalid_source_reschedule.status_code, 422, invalid_source_reschedule.text)
         self.assertIn("cannot start after", invalid_source_reschedule.json()["detail"])
 
         idempotent_progression = self._assert_status(
             await organizer["client"].post(
-                f"/api/v1/tournaments/{slug}/matches/seed-next-round"
+                f"/api/v1/tournaments/{slug}/matches/seed-next-round",
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -326,6 +349,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{next_round_payload[0]['id']}/report",
                 json={"home_score": 3, "away_score": 1, "note": "Grand final complete."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -337,7 +361,8 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(completed_tournament["status"], "completed")
 
         completed_round_read = await organizer["client"].post(
-            f"/api/v1/tournaments/{slug}/matches/seed-next-round"
+            f"/api/v1/tournaments/{slug}/matches/seed-next-round",
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(completed_round_read.status_code, 409, completed_round_read.text)
         self.assertIn(
@@ -348,6 +373,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         frozen_status_update = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/matches/{next_round_payload[0]['id']}/status",
             json={"status": "scheduled"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(frozen_status_update.status_code, 409, frozen_status_update.text)
         self.assertIn(
@@ -358,6 +384,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         frozen_report_update = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/matches/{next_round_payload[0]['id']}/report",
             json={"home_score": 4, "away_score": 0, "note": "Post-completion edit."},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(frozen_report_update.status_code, 409, frozen_report_update.text)
         self.assertIn(
@@ -379,6 +406,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "match_format": "bo3",
                     "final_format": "bo5",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -388,6 +416,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -395,6 +424,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -411,6 +441,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 2",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -419,6 +450,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{final_match['id']}/report",
                 json={"home_score": 3, "away_score": 1, "note": "Final complete."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -474,6 +506,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "match_format": "bo3",
                     "final_format": "bo5",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -483,6 +516,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -490,6 +524,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -506,6 +541,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 4",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -520,6 +556,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                 "away_label": "Winner SF2",
                 "scheduled_at": None,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(premature_final.status_code, 409, premature_final.text)
         self.assertIn(
@@ -538,6 +575,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 3",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -546,6 +584,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "in_progress"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -554,6 +593,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/report",
                 json={"home_score": 2, "away_score": 0, "note": "Semifinal one complete."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -561,6 +601,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_two['id']}/report",
                 json={"home_score": 2, "away_score": 1, "note": "Semifinal two complete."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -576,6 +617,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 2",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -591,6 +633,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                 "away_label": "Team 6",
                 "scheduled_at": None,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_backfill.status_code, 409, blocked_backfill.text)
         self.assertIn(
@@ -608,6 +651,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                 "away_label": "TBD",
                 "scheduled_at": None,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(skipped_round.status_code, 409, skipped_round.text)
         self.assertIn(
@@ -619,6 +663,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{final_payload['id']}/report",
                 json={"home_score": 3, "away_score": 1, "note": "Final complete."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -633,6 +678,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                 "away_label": "TBD",
                 "scheduled_at": None,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_after_final.status_code, 409, blocked_after_final.text)
         self.assertIn(
@@ -650,6 +696,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -658,6 +705,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -665,6 +713,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -684,6 +733,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                         "home_label": home_label,
                         "away_label": away_label,
                     },
+                    headers=same_origin_request_headers(organizer["client"]),
                 )
                 self.assertIn(response.status_code, (409, 422), response.text)
 
@@ -709,6 +759,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "match_format": "bo3",
                     "final_format": "bo5",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -718,6 +769,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -725,6 +777,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -741,6 +794,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 4",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -755,6 +809,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 3",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -763,6 +818,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "in_progress"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -771,6 +827,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/report",
                 json={"home_score": 2, "away_score": 0, "note": "Original semifinal one."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -778,13 +835,15 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_two['id']}/report",
                 json={"home_score": 2, "away_score": 1, "note": "Original semifinal two."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
 
         final_payload = self._assert_status(
             await organizer["client"].post(
-                f"/api/v1/tournaments/{slug}/matches/seed-next-round"
+                f"/api/v1/tournaments/{slug}/matches/seed-next-round",
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -794,6 +853,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/status",
                 json={"status": "scheduled"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -802,6 +862,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/report",
                 json={"home_score": 2, "away_score": 0, "note": "Restored result."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -810,6 +871,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{final_match_id}/report",
                 json={"home_score": 3, "away_score": 0, "note": "Original final result."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -826,6 +888,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         reset_final = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/matches/{final_match_id}/status",
             json={"status": "scheduled"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(reset_final.status_code, 409, reset_final.text)
         self.assertIn(
@@ -847,6 +910,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "match_format": "bo3",
                     "final_format": "bo5",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -856,6 +920,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -863,6 +928,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -879,6 +945,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 4",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -893,6 +960,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 3",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -901,6 +969,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "in_progress"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -909,6 +978,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/status",
                 json={"status": "cancelled"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -916,12 +986,14 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_two['id']}/report",
                 json={"home_score": 2, "away_score": 1, "note": "Other semifinal complete."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
 
         blocked_next_round = await organizer["client"].post(
-            f"/api/v1/tournaments/{slug}/matches/seed-next-round"
+            f"/api/v1/tournaments/{slug}/matches/seed-next-round",
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_next_round.status_code, 409, blocked_next_round.text)
         self.assertIn("Complete every match", blocked_next_round.json()["detail"])
@@ -936,6 +1008,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                 "away_label": "Winner SF2",
                 "scheduled_at": None,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_manual_final.status_code, 409, blocked_manual_final.text)
         self.assertIn(
@@ -946,6 +1019,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         blocked_completion = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/status",
             json={"status": "completed"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_completion.status_code, 409, blocked_completion.text)
         self.assertIn(
@@ -957,6 +1031,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/status",
                 json={"status": "scheduled"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -964,13 +1039,15 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/report",
                 json={"home_score": 2, "away_score": 0, "note": "Replay complete."},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
 
         next_round_payload = self._assert_status(
             await organizer["client"].post(
-                f"/api/v1/tournaments/{slug}/matches/seed-next-round"
+                f"/api/v1/tournaments/{slug}/matches/seed-next-round",
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -990,6 +1067,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "match_format": "bo3",
                     "final_format": "bo5",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -999,6 +1077,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1006,6 +1085,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1022,6 +1102,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 2",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1030,6 +1111,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "cancelled"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1038,6 +1120,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         frozen_status_update = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/matches/{created_match['id']}/status",
             json={"status": "cancelled"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(frozen_status_update.status_code, 409, frozen_status_update.text)
         self.assertIn(
@@ -1048,6 +1131,7 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         frozen_report_update = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/matches/{created_match['id']}/report",
             json={"home_score": 2, "away_score": 0, "note": "Should stay frozen."},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(frozen_report_update.status_code, 409, frozen_report_update.text)
         self.assertIn(
@@ -1056,7 +1140,8 @@ class PlatformMatchProgressionApiTests(PlatformIsolatedAsyncioTestCase):
         )
 
         frozen_delete = await organizer["client"].delete(
-            f"/api/v1/tournaments/{slug}/matches/{created_match['id']}"
+            f"/api/v1/tournaments/{slug}/matches/{created_match['id']}",
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(frozen_delete.status_code, 409, frozen_delete.text)
         self.assertIn(

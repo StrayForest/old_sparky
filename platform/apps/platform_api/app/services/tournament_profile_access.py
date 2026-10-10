@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import json
 import logging
 from time import perf_counter
-from typing import Any
+from typing import Any, Awaitable
 
 from redis.exceptions import RedisError
 from sqlalchemy import func, select
@@ -25,19 +25,41 @@ from python_packages.platform_infra.redis import redis_client
 
 logger = logging.getLogger(__name__)
 
-PROFILE_ACCESS_KEY_PREFIX = "platform:tournament:profile-access:v1"
-PROFILE_VIEWERS_KEY_PREFIX = "platform:tournament:profile-viewers:v1"
-PROFILE_ROSTER_KEY_PREFIX = "platform:tournament:profile-roster:v1"
+PROFILE_ACCESS_KEY_PREFIX = "platform:tournament:profile-access:v2"
+PROFILE_VIEWERS_KEY_PREFIX = "platform:tournament:profile-viewers:v2"
+PROFILE_ROSTER_KEY_PREFIX = "platform:tournament:profile-roster:v2"
+LEGACY_PROFILE_ACCESS_KEY_PREFIX = "platform:tournament:profile-access:v1"
+LEGACY_PROFILE_VIEWERS_KEY_PREFIX = "platform:tournament:profile-viewers:v1"
+LEGACY_PROFILE_ROSTER_KEY_PREFIX = "platform:tournament:profile-roster:v1"
 PROFILE_ACCESS_SAFETY_TTL_SECONDS = 7 * 24 * 60 * 60
+PROFILE_ACCESS_PURGE_SCAN_COUNT = 256
+PROFILE_ACCESS_PURGE_MAX_KEYS = 100_000
+PROFILE_ACCESS_PURGE_MAX_SCAN_PAGES = 10_000
+PROFILE_ACCESS_PURGE_TIMEOUT_SECONDS = 30.0
+PROFILE_ACCESS_PURGE_UNLINK_BATCH_SIZE = 256
 INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")
 _REDIS_UNAVAILABLE = (RedisError, OSError, asyncio.TimeoutError)
+_V1_PROFILE_ACCESS_PREFIXES = (
+    LEGACY_PROFILE_ACCESS_KEY_PREFIX,
+    LEGACY_PROFILE_VIEWERS_KEY_PREFIX,
+    LEGACY_PROFILE_ROSTER_KEY_PREFIX,
+)
+_V2_PROFILE_ACCESS_PREFIXES = (
+    PROFILE_ACCESS_KEY_PREFIX,
+    PROFILE_VIEWERS_KEY_PREFIX,
+    PROFILE_ROSTER_KEY_PREFIX,
+)
 
 _SET_ACCESS_IF_NEWER_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
 if current then
-    local current_revision = string.match(current, '"revision":(%d+)')
-    if current_revision and tonumber(current_revision) > tonumber(ARGV[1]) then
-        return 0
+    local current_generation = string.match(current, '"profile_access_generation":(%d+)')
+    if current_generation then
+        local incoming_generation = ARGV[1]
+        if #current_generation > #incoming_generation
+            or (#current_generation == #incoming_generation and current_generation >= incoming_generation) then
+            return 0
+        end
     end
 end
 redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
@@ -62,13 +84,107 @@ end
 return 1
 """
 
+# A self-join changes exactly one field in a warmed authorization snapshot:
+# the joined user becomes a viewer.  Keep this operation conditional on the
+# prior DB generation and on the cached set cardinalities so a partial/evicted
+# projection falls back to the authoritative one-statement builder.
+_ADD_JOINED_VIEWER_IF_CURRENT_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if not current then
+    return 0
+end
+
+local current_generation = string.match(current, '"profile_access_generation":(%d+)')
+if not current_generation or current_generation ~= ARGV[1] then
+    return 0
+end
+local _, generation_fields = string.gsub(current, '"profile_access_generation":', '')
+if generation_fields ~= 1 then
+    return 0
+end
+
+local viewer_count_raw = string.match(current, '"viewer_count":(%d+)')
+local roster_count_raw = string.match(current, '"roster_count":(%d+)')
+if not viewer_count_raw or not roster_count_raw then
+    return 0
+end
+local _, viewer_count_fields = string.gsub(current, '"viewer_count":', '')
+local _, roster_count_fields = string.gsub(current, '"roster_count":', '')
+if viewer_count_fields ~= 1 or roster_count_fields ~= 1 then
+    return 0
+end
+local viewer_count = tonumber(viewer_count_raw)
+local roster_count = tonumber(roster_count_raw)
+if not viewer_count or not roster_count
+    or viewer_count < 0 or roster_count < 0
+    or math.floor(viewer_count) ~= viewer_count
+    or math.floor(roster_count) ~= roster_count then
+    return 0
+end
+local roster_ready = string.find(current, '"roster_ready":true', 1, true)
+local roster_not_ready = string.find(current, '"roster_ready":false', 1, true)
+if (roster_ready and roster_not_ready)
+    or (not roster_ready and not roster_not_ready)
+    or (roster_ready and roster_count == 0)
+    or (roster_not_ready and roster_count > 0) then
+    return 0
+end
+
+local function set_matches(key, expected_count)
+    local key_type = redis.call('TYPE', key).ok
+    if expected_count == 0 then
+        return key_type == 'none' or (key_type == 'set' and redis.call('SCARD', key) == 0)
+    end
+    return key_type == 'set' and redis.call('SCARD', key) == expected_count
+end
+
+if not set_matches(KEYS[2], viewer_count) or not set_matches(KEYS[3], roster_count) then
+    return 0
+end
+if redis.call('SISMEMBER', KEYS[2], ARGV[3]) ~= 0 then
+    return 0
+end
+
+local updated, generation_replacements = string.gsub(
+    current,
+    '"profile_access_generation":%d+',
+    '"profile_access_generation":' .. ARGV[2],
+    1
+)
+if generation_replacements ~= 1 then
+    return 0
+end
+local updated_with_count, count_replacements = string.gsub(
+    updated,
+    '"viewer_count":%d+',
+    '"viewer_count":' .. tostring(viewer_count + 1),
+    1
+)
+if count_replacements ~= 1 then
+    return 0
+end
+
+-- SADD comes before the access document's generation advance.  If a later
+-- Redis write fails, the old generation remains and the reader rejects this
+-- partial projection against its fresh DB generation.
+if redis.call('SADD', KEYS[2], ARGV[3]) ~= 1 then
+    return 0
+end
+redis.call('SET', KEYS[1], updated_with_count, 'EX', ARGV[4])
+redis.call('EXPIRE', KEYS[2], ARGV[4])
+if roster_count > 0 then
+    redis.call('EXPIRE', KEYS[3], ARGV[4])
+end
+return 1
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class TournamentProfileAccessState:
     tournament_id: str
     organizer_user_id: str
     roster_ready: bool
-    revision: int
+    profile_access_generation: int
     viewer_user_ids: frozenset[str]
     roster_user_ids: frozenset[str]
 
@@ -101,7 +217,9 @@ def _state_payload(state: TournamentProfileAccessState) -> bytes:
             "tournament_id": state.tournament_id,
             "organizer_user_id": state.organizer_user_id,
             "roster_ready": state.roster_ready,
-            "revision": state.revision,
+            "profile_access_generation": state.profile_access_generation,
+            "viewer_count": len(state.viewer_user_ids),
+            "roster_count": len(state.roster_user_ids),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -119,7 +237,9 @@ def decode_profile_access_state(
             tournament_id=str(value["tournament_id"]),
             organizer_user_id=str(value["organizer_user_id"]),
             roster_ready=bool(value["roster_ready"]),
-            revision=int(value["revision"]),
+            profile_access_generation=_decode_profile_access_generation(
+                value.get("profile_access_generation")
+            ),
             viewer_user_ids=frozenset(),
             roster_user_ids=frozenset(),
         )
@@ -133,18 +253,10 @@ def _ids_from_aggregate(value: Any) -> frozenset[str]:
     return frozenset(str(item) for item in value if item is not None)
 
 
-def _state_revision(
-    tournament: Tournament,
-    *,
-    active_participant_count: int,
-) -> int:
-    updated_at = tournament.updated_at or tournament.created_at
-    updated_ms = int(updated_at.timestamp() * 1000) if updated_at is not None else 0
-    return (
-        updated_ms
-        + int(tournament.bracket_revision or 0) * 1_000_000
-        + max(0, int(active_participant_count))
-    )
+def _decode_profile_access_generation(value: Any) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("profile access generation is invalid")
+    return value
 
 
 async def _build_state_with_session(
@@ -173,15 +285,6 @@ async def _build_state_with_session(
         .correlate(Tournament)
         .exists()
     )
-    active_participant_count = (
-        select(func.count(TournamentParticipant.id))
-        .where(
-            TournamentParticipant.tournament_id == Tournament.id,
-            TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
-        )
-        .correlate(Tournament)
-        .scalar_subquery()
-    )
     row = (
         await db_session.execute(
             select(
@@ -189,7 +292,6 @@ async def _build_state_with_session(
                 active_viewer_ids.label("active_viewer_ids"),
                 roster_user_ids.label("roster_user_ids"),
                 roster_ready.label("roster_ready"),
-                active_participant_count.label("active_participant_count"),
             ).where(Tournament.slug == slug)
         )
     ).one_or_none()
@@ -203,9 +305,8 @@ async def _build_state_with_session(
         tournament_id=str(tournament.id),
         organizer_user_id=str(tournament.organizer_user_id),
         roster_ready=bool(row.roster_ready),
-        revision=_state_revision(
-            tournament,
-            active_participant_count=int(row.active_participant_count or 0),
+        profile_access_generation=_decode_profile_access_generation(
+            tournament.profile_access_generation
         ),
         viewer_user_ids=viewer_ids,
         roster_user_ids=roster_ids,
@@ -240,7 +341,7 @@ async def _write_profile_access_state(
                 profile_access_key(slug),
                 profile_viewers_key(slug),
                 profile_roster_key(slug),
-                str(state.revision),
+                str(state.profile_access_generation),
                 _state_payload(state),
                 str(PROFILE_ACCESS_SAFETY_TTL_SECONDS),
                 str(len(viewer_ids)),
@@ -255,19 +356,81 @@ async def _write_profile_access_state(
             else "tournament_profile_access_stale_write_skipped",
             pipeline_ms=(perf_counter() - started_at) * 1000,
             payload_bytes=len(_state_payload(state)),
-            revision=state.revision,
+            revision=state.profile_access_generation,
         )
     except _REDIS_UNAVAILABLE as exc:
         record_tournament_profile_access_event(
             "tournament_profile_access_redis_error",
             pipeline_ms=(perf_counter() - started_at) * 1000,
-            revision=state.revision,
+            revision=state.profile_access_generation,
         )
         logger.warning(
             "Redis profile access refresh failed slug=%s error=%s",
             slug,
             type(exc).__name__,
         )
+    finally:
+        await client.aclose()
+
+
+async def add_joined_tournament_profile_viewer(
+    slug: str,
+    user_id: str,
+    *,
+    expected_generation: int | None,
+) -> bool:
+    """Advance a warmed profile projection for one committed solo self-join.
+
+    The route supplies the generation read after taking the Tournament row
+    lock.  Any missing, stale, malformed, or incomplete cache returns False so
+    the caller can use the existing authoritative full-snapshot refresh.
+    """
+
+    if (
+        type(expected_generation) is not int
+        or expected_generation < 0
+        or expected_generation >= 9_223_372_036_854_775_807
+        or not user_id
+    ):
+        return False
+
+    client = redis_client(decode_responses=False)
+    started_at = perf_counter()
+    next_generation = expected_generation + 1
+    try:
+        updated = bool(
+            await client.eval(
+                _ADD_JOINED_VIEWER_IF_CURRENT_SCRIPT,
+                3,
+                profile_access_key(slug),
+                profile_viewers_key(slug),
+                profile_roster_key(slug),
+                str(expected_generation),
+                str(next_generation),
+                user_id,
+                str(PROFILE_ACCESS_SAFETY_TTL_SECONDS),
+            )
+        )
+        record_tournament_profile_access_event(
+            "tournament_profile_access_join_delta"
+            if updated
+            else "tournament_profile_access_join_delta_fallback",
+            pipeline_ms=(perf_counter() - started_at) * 1000,
+            revision=next_generation,
+        )
+        return updated
+    except _REDIS_UNAVAILABLE as exc:
+        record_tournament_profile_access_event(
+            "tournament_profile_access_redis_error",
+            pipeline_ms=(perf_counter() - started_at) * 1000,
+            revision=next_generation,
+        )
+        logger.warning(
+            "Redis profile access join delta failed slug=%s error=%s",
+            slug,
+            type(exc).__name__,
+        )
+        return False
     finally:
         await client.aclose()
 
@@ -283,7 +446,9 @@ async def refresh_tournament_profile_access_state(
             "tournament_profile_access_build",
             build_ms=(perf_counter() - started_at) * 1000,
             payload_bytes=len(_state_payload(state)) if state is not None else 0,
-            revision=state.revision if state is not None else None,
+            revision=(
+                state.profile_access_generation if state is not None else None
+            ),
         )
         if state is not None:
             await _write_profile_access_state(slug, state)
@@ -309,6 +474,106 @@ async def delete_tournament_profile_access_state(slug: str) -> None:
         )
     finally:
         await client.aclose()
+
+
+async def _purge_profile_access_prefixes(prefixes: tuple[str, ...]) -> int:
+    """Remove a fixed set of profile-cache namespaces while writers are stopped.
+
+    Release/restore callers own the service-stop and rollback locks. This
+    helper accepts no caller-provided key or prefix, bounds the Redis scan,
+    removes only discovered keys under the exact namespaces, and verifies that
+    those namespaces are empty before returning.
+    """
+
+    client = redis_client(decode_responses=False)
+    started_at = perf_counter()
+    scanned_pages = 0
+    discovered: set[bytes] = set()
+
+    def remaining_seconds() -> float:
+        remaining = PROFILE_ACCESS_PURGE_TIMEOUT_SECONDS - (perf_counter() - started_at)
+        if remaining <= 0:
+            raise RuntimeError("profile access cache purge exceeded its time bound")
+        return remaining
+
+    async def bounded(awaitable: Awaitable[Any]) -> Any:
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining_seconds())
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "profile access cache purge exceeded its time bound"
+            ) from exc
+
+    async def collect_namespace_keys() -> set[bytes]:
+        nonlocal scanned_pages
+        found: set[bytes] = set()
+        for prefix in prefixes:
+            expected_prefix = f"{prefix}:".encode("ascii")
+            cursor: int | bytes | str = 0
+            while True:
+                scanned_pages += 1
+                if (
+                    scanned_pages > PROFILE_ACCESS_PURGE_MAX_SCAN_PAGES
+                    or perf_counter() - started_at
+                    > PROFILE_ACCESS_PURGE_TIMEOUT_SECONDS
+                ):
+                    raise RuntimeError("profile access cache purge exceeded its scan bound")
+                cursor, keys = await bounded(
+                    client.scan(
+                        cursor=cursor,
+                        match=f"{prefix}:*",
+                        count=PROFILE_ACCESS_PURGE_SCAN_COUNT,
+                    )
+                )
+                for key in keys:
+                    raw_key = (
+                        key if isinstance(key, bytes) else str(key).encode("utf-8")
+                    )
+                    if not raw_key.startswith(expected_prefix):
+                        raise RuntimeError("profile access cache scan returned an unexpected key")
+                    found.add(raw_key)
+                    if len(discovered | found) > PROFILE_ACCESS_PURGE_MAX_KEYS:
+                        raise RuntimeError(
+                            "profile access cache purge exceeded its key bound"
+                        )
+                if cursor in (0, b"0", "0"):
+                    break
+        return found
+
+    try:
+        discovered = await collect_namespace_keys()
+        keys = tuple(discovered)
+        for offset in range(0, len(keys), PROFILE_ACCESS_PURGE_UNLINK_BATCH_SIZE):
+            await bounded(
+                client.unlink(
+                    *keys[offset : offset + PROFILE_ACCESS_PURGE_UNLINK_BATCH_SIZE]
+                )
+            )
+
+        remaining = await collect_namespace_keys()
+        if remaining:
+            raise RuntimeError(
+                "profile access cache purge could not prove empty namespaces"
+            )
+        return len(discovered)
+    except _REDIS_UNAVAILABLE as exc:
+        raise RuntimeError("profile access cache purge failed") from exc
+    finally:
+        await client.aclose()
+
+
+async def purge_legacy_profile_access_cache() -> int:
+    """Purge only v1 profile-access keys before restoring the v1 application."""
+
+    return await _purge_profile_access_prefixes(_V1_PROFILE_ACCESS_PREFIXES)
+
+
+async def purge_all_tournament_profile_access_cache() -> int:
+    """Purge v1 and v2 profile-access keys after restoring the database."""
+
+    return await _purge_profile_access_prefixes(
+        (*_V1_PROFILE_ACCESS_PREFIXES, *_V2_PROFILE_ACCESS_PREFIXES)
+    )
 
 
 async def read_tournament_profile_pipeline(

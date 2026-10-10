@@ -178,7 +178,7 @@ pointer/venv switch
     -> rollback-runtime-pending
     -> filesystem-restored-runtime-pending
     -> immutable runtime/systemd restore
-    -> restart-pending
+    -> rollback-cache-purged
     -> services-restarted
     -> smoke-passed
     -> rollback-runtime-applied
@@ -186,6 +186,13 @@ pointer/venv switch
 
 The rollback target's systemd units and Nginx configuration are installed while
 the receipt is in `rollback-runtime-pending`, before any restart or smoke.
+Before the restored release can restart, the transaction purges the fixed
+legacy profile-access cache namespaces and records `rollback-cache-purged`.
+That phase is the durable proof that the old runtime cannot reuse stale v1
+authorization projections. Recovery resumes restart only from this phase; an
+older `restart-pending` receipt lacks purge proof and fails closed with its receipts
+retained. A purge failure leaves services stopped and recovery restores the
+pre-rollback runtime instead of activating the old release.
 `--no-restart` still restores units and Nginx but deliberately omits service
 restart and smoke. Runtime restore always invokes the unit installer with
 `PLATFORM_ENABLE_SYSTEMD_UNITS=0`, so restoring unit files never enables or
@@ -238,7 +245,10 @@ compatibility handoff needed for the normal cross-release boundary.
 
   This restores the recorded pointers and venv, reapplies the old units and
   Nginx configuration without an unconditional restart, then idempotently
-  restarts and checks only services that were active before the transaction.
+  purges the fixed legacy profile-access cache namespaces before reactivating
+  the prior runtime, then restarts and checks only services that were active
+  before the transaction. If the source-bound purge cannot complete, recovery
+  keeps the application services stopped and retains the transaction.
   Services intentionally inactive before quiesce remain stopped. A restart,
   readiness, pointer or identity mismatch retains the receipt for another
   recovery attempt. The confirmation is an operator statement that the
@@ -269,7 +279,8 @@ compatibility handoff needed for the normal cross-release boundary.
   `filesystem-restored-runtime-pending` before invoking any runtime or systemd
   helper. A retry at that marker replays the bound runtime/systemd restore and
   only then advances to `recovery-restored` and the two-phase receipt cleanup.
-  Recovery either completes the already committed restart-pending rollback or
+  Recovery resumes an already committed `rollback-cache-purged` operation and
+  refuses a legacy `restart-pending` receipt without purge proof; otherwise it
   restores the exact pre-rollback pointers, venv, units and Nginx while both
   the rollback transaction and the systemd-state receipt remain durable.
   Recovery is invoked through the shared bundle, including when `current`

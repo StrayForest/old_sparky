@@ -1323,6 +1323,10 @@ class ExternalLoadPendingOriginPipelineTests(unittest.TestCase):
                 lambda match: (
                     "slo_failed" if match.group(1).endswith("acceptance_status")
                     else "pending_origin" if match.group(1).endswith("candidate_state")
+                    else "complete" if match.group(1).endswith("cleanup_remote_stage")
+                    else "exited" if match.group(1).endswith("cleanup_remote_child_state")
+                    else "true" if match.group(1).endswith("cleanup_remote_stdout_eof")
+                    else "false" if match.group(1).endswith("cleanup_remote_timed_out")
                     else "1" if match.group(1).endswith(("report_ready", "observer_ready"))
                     else "success" if match.group(1).endswith(".result")
                     else "0"

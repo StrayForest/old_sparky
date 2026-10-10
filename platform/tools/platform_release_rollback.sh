@@ -62,8 +62,10 @@ dependency compatibility review and must not bypass a failed receipt check.
 
 If an install or rollback was interrupted, --recover-pending restores the exact
 pre-operation pointers and venv from shared/.release-operation.json, removes an
-unactivated install candidate, and exits. A rollback already in restart-pending
-instead repeats the service restart and durably completes that same rollback.
+unactivated install candidate, and exits. A rollback in the new
+rollback-cache-purged phase resumes the restart only after the transaction
+proves the candidate-bound v1 cache purge completed. Older restart-pending
+receipts fail closed because they do not carry that proof.
 The rollback path prepares shared/.release-recovery before switching current;
 the previous release's rollback entrypoint delegates there if a second process
 must recover after that pointer switch.
@@ -181,7 +183,8 @@ runtime_installer_for_target() {
   candidate_release="$(transaction_json | json_field candidate_release)"
   target_source_sha="$(/usr/bin/cat "$release/RELEASE.json" | json_field source_git_commit)"
   if [[ "$operation" == "rollback" \
-    && ( "$phase" == "rollback-runtime-pending" || "$phase" == "restart-pending" ) \
+    && ( "$phase" == "rollback-runtime-pending" \
+      || "$phase" == "rollback-cache-purged" ) \
     && "$current_before" == "$CURRENT_TARGET" \
     && "$candidate_release" == "$CURRENT_TARGET" \
     && "$previous_before" == "$release" \
@@ -243,7 +246,8 @@ rollback_reconcile_args_for_target() {
     && "$CURRENT_TARGET" == "$current_before" \
     && "$candidate_release" == "$current_before" \
     && "$target_source_sha" == "6343099bb7686671bdef49d0c4ecd10f21ef19d2" \
-    && ( "$phase" == "rollback-runtime-pending" || "$phase" == "restart-pending" ) ]]; then
+    && ( "$phase" == "rollback-runtime-pending" \
+      || "$phase" == "rollback-cache-purged" ) ]]; then
     printf '%s\n' --rollback-reconcile-transaction "$TRANSACTION_STATE"
   fi
 }
@@ -386,7 +390,7 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
     trap - HUP INT TERM
     public_status passed recovery
   elif [[ "$PENDING_OPERATION" == "rollback" \
-    && "$PENDING_PHASE" == "restart-pending" ]]; then
+    && "$PENDING_PHASE" == "rollback-cache-purged" ]]; then
     trap '' HUP INT TERM
     PENDING_RELEASE="$(readlink -f "$APP_DIR/current")"
     restore_release_runtime "$PENDING_RELEASE" 1
@@ -400,12 +404,16 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
     # receipt or invoking runtime helpers blindly.
     /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
       --state "$TRANSACTION_STATE" \
-      --expected restart-pending \
+      --expected rollback-cache-purged \
       --phase rollback-runtime-applied
     clear_rollback_systemd_state
     /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
     trap - HUP INT TERM
     public_status passed recovery
+  elif [[ "$PENDING_OPERATION" == "rollback" \
+    && "$PENDING_PHASE" == "restart-pending" ]]; then
+    public_status failed cache_purge >&2
+    exit 1
   elif [[ "$PENDING_OPERATION" == "rollback" \
     && ( "$PENDING_PHASE" == "rollback-runtime-pending" \
       || "$PENDING_PHASE" == "filesystem-restored-runtime-pending" ) ]]; then
@@ -794,6 +802,7 @@ cleanup_failed_rollback() {
       "$pending_phase" == "rollback-runtime-pending" || \
       "$pending_phase" == "filesystem-restored-runtime-pending" || \
       "$pending_phase" == "restart-pending" || \
+      "$pending_phase" == "rollback-cache-purged" || \
       "$pending_phase" == "services-restarted" || \
       "$pending_phase" == "smoke-passed" || \
       "$pending_phase" == "rollback-runtime-applied" ) ]]; then
@@ -896,11 +905,16 @@ ROLLBACK_RUNTIME_INSTALLER="$(runtime_installer_for_target "$PREVIOUS_TARGET")"
   --transaction "$TRANSACTION_STATE" \
   --systemctl "$SYSTEMCTL_BIN"
 
+/usr/bin/python3 -I "$TRANSACTION_TOOL" purge-legacy-profile-access-cache \
+  --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null || {
+    public_status failed cache_purge >&2
+    exit 1
+  }
+/usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+  --state "$TRANSACTION_STATE" \
+  --expected rollback-runtime-pending \
+  --phase rollback-cache-purged
 if [[ "$RESTART_AFTER" -eq 1 ]]; then
-  /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
-    --state "$TRANSACTION_STATE" \
-    --expected rollback-runtime-pending \
-    --phase restart-pending
   "$RUNTIME_RESTORE_TOOL" \
     --app-dir "$APP_DIR" \
     --release "$PREVIOUS_TARGET" \
@@ -912,7 +926,7 @@ if [[ "$RESTART_AFTER" -eq 1 ]]; then
     --systemctl "$SYSTEMCTL_BIN"
   /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
     --state "$TRANSACTION_STATE" \
-    --expected restart-pending \
+    --expected rollback-cache-purged \
     --phase services-restarted
   "$RUNTIME_RESTORE_TOOL" \
     --app-dir "$APP_DIR" \

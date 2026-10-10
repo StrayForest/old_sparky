@@ -22,7 +22,11 @@ from python_packages.platform_infra.models import (
     User,
     UserRole,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -67,8 +71,8 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
     async def _client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
 
@@ -87,6 +91,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                         "password": self.password,
                         "display_name": f"test-{label}"[:15],
                     },
+                    headers=same_origin_request_headers(client),
                 ),
                 201,
             )
@@ -193,6 +198,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                     "match_format": "bo3",
                     "final_format": "bo5",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -201,6 +207,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -208,6 +215,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -218,7 +226,8 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
 
         opening = self._payload(
             await admin["client"].post(
-                f"/api/v1/tournaments/{slug}/matches/seed-opening-round"
+                f"/api/v1/tournaments/{slug}/matches/seed-opening-round",
+                headers=same_origin_request_headers(admin["client"]),
             ),
             201,
         )
@@ -255,11 +264,13 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                 "ordered_team_ids": ["1", "4", "8", "5", "3", "6", "2", "7"],
                 "expected_revision": 1,
             },
+            headers=same_origin_request_headers(admin["client"]),
         )
         self.assertEqual(reorder_removed.status_code, 404, reorder_removed.text)
         reset_removed = await admin["client"].post(
             f"/api/v1/tournaments/{slug}/bracket/rounds/1/reset",
             json={"expected_revision": 1},
+            headers=same_origin_request_headers(admin["client"]),
         )
         self.assertEqual(reset_removed.status_code, 404, reset_removed.text)
 
@@ -273,6 +284,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                 "away_score": 0,
                 "expected_revision": 1,
             },
+            headers=same_origin_request_headers(admin["client"]),
         )
         self.assertEqual(invalid_score.status_code, 422, invalid_score.text)
 
@@ -284,6 +296,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_score": 0,
                     "expected_revision": 1,
                 },
+                headers=same_origin_request_headers(admin["client"]),
             ),
             200,
         )
@@ -292,6 +305,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             await admin["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{quarterfinals[0]['id']}/status",
                 json={"status": "scheduled", "expected_revision": 2},
+                headers=same_origin_request_headers(admin["client"]),
             ),
             200,
         )
@@ -315,6 +329,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_score": 2,
                     "expected_revision": 3,
                 },
+                headers=same_origin_request_headers(admin["client"]),
             ),
             200,
         )
@@ -326,6 +341,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_score": 1,
                     "expected_revision": 4,
                 },
+                headers=same_origin_request_headers(admin["client"]),
             ),
             200,
         )
@@ -347,6 +363,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "in_progress"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -354,12 +371,14 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             await admin["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal['id']}/status",
                 json={"status": "live", "expected_revision": 5},
+                headers=same_origin_request_headers(admin["client"]),
             ),
             200,
         )
         blocked_recovery = await admin["client"].patch(
             f"/api/v1/tournaments/{slug}/matches/{quarterfinals[0]['id']}/status",
             json={"status": "scheduled", "expected_revision": 6},
+            headers=same_origin_request_headers(admin["client"]),
         )
         self.assertEqual(blocked_recovery.status_code, 409, blocked_recovery.text)
 
@@ -378,6 +397,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                     "match_format": "bo3",
                     "final_format": "bo5",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -386,6 +406,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -393,6 +414,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -403,7 +425,8 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
 
         opening = self._payload(
             await organizer["client"].post(
-                f"/api/v1/tournaments/{slug}/matches/seed-opening-round"
+                f"/api/v1/tournaments/{slug}/matches/seed-opening-round",
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -415,6 +438,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_score": 0,
                     "expected_revision": 1,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -449,6 +473,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                     "match_format": "bo3",
                     "final_format": "bo5",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -458,6 +483,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
                 await organizer["client"].patch(
                     f"/api/v1/tournaments/{slug}/status",
                     json={"status": next_status},
+                    headers=same_origin_request_headers(organizer["client"]),
                 ),
                 200,
             )
@@ -467,7 +493,8 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
         )
         opening = self._payload(
             await organizer["client"].post(
-                f"/api/v1/tournaments/{slug}/matches/seed-opening-round"
+                f"/api/v1/tournaments/{slug}/matches/seed-opening-round",
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -486,6 +513,7 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "cancelled"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -512,5 +540,10 @@ class PlatformBracketGraphApiTests(PlatformIsolatedAsyncioTestCase):
             ),
         ):
             method = "PATCH" if path.endswith("/schedule") else "POST"
-            response = await organizer["client"].request(method, path, json=payload)
+            response = await organizer["client"].request(
+                method,
+                path,
+                json=payload,
+                headers=same_origin_request_headers(organizer["client"]),
+            )
             self.assertEqual(response.status_code, 409, response.text)

@@ -1549,6 +1549,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                         child_commands.append(command)
                         command_name = next(
                             (part for part in command if part in {
+                                "purge-legacy-profile-access-cache",
                                 "mark-legacy-services-restored",
                                 "verify-legacy-services",
                                 "complete-recovery",
@@ -1594,6 +1595,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             child_names = [
                 next((part for part in command if part in {
                     "validate-legacy-liveqa-recovery", "restore-legacy-services",
+                    "purge-legacy-profile-access-cache",
                     "mark-legacy-services-restored", "verify-legacy-services",
                     "complete-recovery",
                 }), "runtime-prepare" if command[0] == str(recovery_runtime) else "unknown")
@@ -1603,6 +1605,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 child_names,
                 [
                     "validate-legacy-liveqa-recovery", "runtime-prepare",
+                    "purge-legacy-profile-access-cache",
                     "restore-legacy-services", "mark-legacy-services-restored",
                     "verify-legacy-services",
                     "complete-recovery", "complete-recovery",

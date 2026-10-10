@@ -2670,13 +2670,31 @@ def _nginx_html_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             status = int(record.get("status") or 0)
         except (TypeError, ValueError):
             continue
-        if status != 200:
+        if not 100 <= status <= 599:
             continue
         path = str(record.get("uri") or "").split("?", 1)[0]
         if not re.fullmatch(r"/tournaments/[^/]+", path):
             continue
         selected.append(record)
     return selected
+
+
+def _nginx_upstream_status_values(record: dict[str, Any]) -> tuple[list[str], int]:
+    """Return bounded upstream statuses and explicit dash/unknown attempts."""
+
+    raw = record.get("upstream_status")
+    if not isinstance(raw, str):
+        return [], 0
+    statuses: list[str] = []
+    unknown_attempts = 0
+    for token in re.split(r"[,\s:]+", raw.strip()):
+        if token == "-":
+            unknown_attempts += 1
+            continue
+        if not re.fullmatch(r"[1-5][0-9]{2}", token):
+            continue
+        statuses.append(token)
+    return statuses, unknown_attempts
 
 
 def _safe_transport_value(value: Any) -> str:
@@ -3206,6 +3224,43 @@ def summarize_ssr_observability(
     for route, method, status, record in api_records:
         api_groups[f"{method} {route}"].append((status, record))
 
+    html_by_status: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in html_records:
+        html_by_status[str(safe_status(record.get("status")))].append(record)
+
+    def html_status_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        upstream_values = [
+            _nginx_upstream_status_values(record)
+            for record in rows
+        ]
+        return {
+            "requests": len(rows),
+            "upstream_statuses": dict(
+                sorted(
+                    Counter(
+                        status
+                        for statuses, _unknown in upstream_values
+                        for status in statuses
+                    ).items()
+                )
+            ),
+            "upstream_status_unknown_attempts": sum(
+                unknown for _statuses, unknown in upstream_values
+            ),
+            "request_time_ms": metric_stats(
+                [value for record in rows if (value := _nginx_seconds(record.get("request_time"))) is not None]
+            ),
+            "upstream_connect_time_ms": metric_stats(
+                [value for record in rows if (value := _nginx_seconds(record.get("upstream_connect_time"))) is not None]
+            ),
+            "upstream_header_time_ms": metric_stats(
+                [value for record in rows if (value := _nginx_seconds(record.get("upstream_header_time"))) is not None]
+            ),
+            "upstream_time_ms": metric_stats(
+                [value for record in rows if (value := _nginx_seconds(record.get("upstream_time"))) is not None]
+            ),
+        }
+
     def api_group_summary(rows: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
         return {
             "requests": len(rows),
@@ -3316,6 +3371,35 @@ def summarize_ssr_observability(
         },
         "nginx_html": {
             "requests": len(html_records),
+            "statuses": dict(
+                (status, len(rows)) for status, rows in sorted(html_by_status.items())
+            ),
+            "by_status": {
+                status: html_status_summary(rows)
+                for status, rows in sorted(html_by_status.items())
+            },
+            # Nginx can record multiple upstream attempts for one client
+            # request. This is an attempt-count distribution, not a request
+            # count; `statuses` above remains the client-facing response split.
+            "upstream_statuses": dict(
+                sorted(
+                    Counter(
+                        status
+                        for statuses, _unknown in (
+                            _nginx_upstream_status_values(record)
+                            for record in html_records
+                        )
+                        for status in statuses
+                    ).items()
+                )
+            ),
+            "upstream_status_unknown_attempts": sum(
+                unknown
+                for _statuses, unknown in (
+                    _nginx_upstream_status_values(record)
+                    for record in html_records
+                )
+            ),
             "request_time_ms": metric_stats(
                 [value for record in html_records if (value := _nginx_seconds(record.get("request_time"))) is not None]
             ),

@@ -184,20 +184,30 @@ async def _seed_legacy_rows() -> tuple[str, int, int]:
     async with session_factory()() as db_session:
         db_session.add(User(id=user_id, email=f"{prefix}@example.test", display_name=prefix))
         await db_session.flush()
-        tournament = Tournament(
-            id=tournament_id,
-            slug=prefix,
-            name=f"Migration scenario {prefix}",
-            description="Disposable populated migration fixture.",
-            visibility="private",
-            status="registration_closed",
-            format_slug="solo",
-            organizer_user_id=user_id,
-            allowed_ranks=[],
-            max_participants=16,
+        # This fixture is seeded at TARGET_REVISION, which intentionally
+        # predates current ORM columns. Keep the INSERT on the historical
+        # schema so a new server-defaulted model field cannot leak into its
+        # RETURNING list before that migration has run.
+        await db_session.execute(
+            text(
+                "INSERT INTO platform.tournaments "
+                "(id, slug, name, description, visibility, status, format_slug, "
+                "organizer_user_id, max_participants) "
+                "VALUES (:id, :slug, :name, :description, :visibility, :status, "
+                ":format_slug, :organizer_user_id, :max_participants)"
+            ),
+            {
+                "id": tournament_id,
+                "slug": prefix,
+                "name": f"Migration scenario {prefix}",
+                "description": "Disposable populated migration fixture.",
+                "visibility": "private",
+                "status": "registration_closed",
+                "format_slug": "solo",
+                "organizer_user_id": user_id,
+                "max_participants": 16,
+            },
         )
-        db_session.add(tournament)
-        await db_session.flush()
         first = TournamentDeadlockReadyRound(
             tournament_id=tournament_id,
             status="active",

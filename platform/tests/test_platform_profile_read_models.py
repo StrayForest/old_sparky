@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_api.app.services import (
@@ -62,6 +63,106 @@ class _Redis:
         pipeline = _Pipeline(self.pipeline_values)
         self.pipelines.append(pipeline)
         return pipeline
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _JoinDeltaRedis:
+    def __init__(
+        self,
+        *,
+        access: bytes,
+        viewers: set[str] | None = None,
+        roster: set[str] | None = None,
+        fail_after_sadd: bool = False,
+    ) -> None:
+        self.access = access
+        self.viewers = set(viewers or ())
+        self.roster = set(roster or ())
+        self.fail_after_sadd = fail_after_sadd
+        self.eval_calls: list[tuple[object, ...]] = []
+        self.closed = False
+        self._lock = asyncio.Lock()
+
+    async def eval(self, script: str, key_count: int, *args: object) -> int:
+        async with self._lock:
+            self.eval_calls.append((script, key_count, *args))
+            self_key, viewers_key, roster_key, expected, incoming, user_id, _ttl = args
+            self.assert_delta_keys(key_count, self_key, viewers_key, roster_key)
+            current = json.loads(self.access)
+            if current.get("profile_access_generation") != int(str(expected)):
+                return 0
+            viewer_count = current.get("viewer_count")
+            roster_count = current.get("roster_count")
+            if (
+                type(viewer_count) is not int
+                or type(roster_count) is not int
+                or viewer_count != len(self.viewers)
+                or roster_count != len(self.roster)
+            ):
+                return 0
+            if str(user_id) in self.viewers:
+                return 0
+            self.viewers.add(str(user_id))
+            if self.fail_after_sadd:
+                raise ConnectionError("simulated Redis write failure")
+            current["profile_access_generation"] = int(str(incoming))
+            current["viewer_count"] = viewer_count + 1
+            self.access = json.dumps(current, separators=(",", ":")).encode()
+            return 1
+
+    @staticmethod
+    def assert_delta_keys(
+        key_count: int,
+        access_key: object,
+        viewers_key: object,
+        roster_key: object,
+    ) -> None:
+        if key_count != 3:
+            raise AssertionError(f"unexpected Redis key count: {key_count}")
+        if not str(access_key).startswith(tournament_profile_access.PROFILE_ACCESS_KEY_PREFIX):
+            raise AssertionError("unexpected profile access key")
+        if not str(viewers_key).startswith(tournament_profile_access.PROFILE_VIEWERS_KEY_PREFIX):
+            raise AssertionError("unexpected profile viewers key")
+        if not str(roster_key).startswith(tournament_profile_access.PROFILE_ROSTER_KEY_PREFIX):
+            raise AssertionError("unexpected profile roster key")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _ProfileAccessPurgeRedis:
+    def __init__(self, keys: set[bytes], *, page_size: int = 2) -> None:
+        self.keys = set(keys)
+        self.page_size = page_size
+        self.scan_calls: list[tuple[int | bytes | str, str, int]] = []
+        self.unlink_calls: list[tuple[bytes, ...]] = []
+        self.closed = False
+
+    async def scan(
+        self,
+        *,
+        cursor: int | bytes | str,
+        match: str,
+        count: int,
+    ) -> tuple[int, list[bytes]]:
+        self.scan_calls.append((cursor, match, count))
+        prefix = match[:-1].encode("ascii")
+        matching = sorted(key for key in self.keys if key.startswith(prefix))
+        offset = int(cursor)
+        page = matching[offset : offset + self.page_size]
+        next_offset = offset + len(page)
+        return (0 if next_offset >= len(matching) else next_offset), page
+
+    async def unlink(self, *keys: bytes) -> int:
+        self.unlink_calls.append(tuple(keys))
+        removed = 0
+        for key in keys:
+            if key in self.keys:
+                self.keys.remove(key)
+                removed += 1
+        return removed
 
     async def aclose(self) -> None:
         self.closed = True
@@ -161,9 +262,30 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
                 "tournament_id": "tournament-1",
                 "organizer_user_id": "organizer-1",
                 "roster_ready": True,
-                "revision": 7,
+                "profile_access_generation": 7,
             }
         ).encode()
+
+    @staticmethod
+    def _profile_request(generation: int | None = 7) -> Request:
+        state = {}
+        if generation is not None:
+            state["tournament_profile_access_generation"] = generation
+        return Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "https",
+                "path": "/api/v1/tournaments/night-veil/profiles/target-1",
+                "raw_path": b"/api/v1/tournaments/night-veil/profiles/target-1",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 443),
+                "state": state,
+            }
+        )
 
     async def test_warm_route_returns_cached_bytes_without_database_session(self) -> None:
         payload = b'{"profile":{"user_id":"target-1"},"deadlock_profile":null}'
@@ -191,6 +313,7 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
             response = await tournament_routes.get_tournament_scoped_profile(
                 "night-veil",
                 "target-1",
+                self._profile_request(),
                 self._auth_session(),
             )
 
@@ -223,6 +346,7 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
             response = await tournament_routes.get_tournament_scoped_profile(
                 "night-veil",
                 "target-1",
+                self._profile_request(),
                 self._auth_session(),
             )
 
@@ -243,7 +367,7 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
             tournament_id="tournament-1",
             organizer_user_id="organizer-1",
             roster_ready=True,
-            revision=7,
+            profile_access_generation=7,
             viewer_user_ids=frozenset({"viewer-1"}),
             roster_user_ids=frozenset({"target-1"}),
         )
@@ -278,6 +402,7 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
             response = await tournament_routes.get_tournament_scoped_profile(
                 "night-veil",
                 "target-1",
+                self._profile_request(),
                 self._auth_session(),
             )
 
@@ -316,11 +441,63 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
                         await tournament_routes.get_tournament_scoped_profile(
                             "night-veil",
                             "target-1",
+                            self._profile_request(),
                             self._auth_session(),
                         )
 
                 self.assertEqual(raised.exception.status_code, expected_status)
                 session_factory.assert_not_called()
+
+        stale_pipeline = TournamentProfilePipelineResult(
+            access_raw=self._ready_access_raw(),
+            requester_is_viewer=True,
+            target_is_roster_member=True,
+            profile_raw=b"11\n{}",
+            redis_available=True,
+            pipeline_ms=0.3,
+        )
+        current_state = tournament_profile_access.TournamentProfileAccessState(
+            tournament_id="tournament-1",
+            organizer_user_id="organizer-1",
+            roster_ready=True,
+            profile_access_generation=8,
+            viewer_user_ids=frozenset(),
+            roster_user_ids=frozenset({"target-1"}),
+        )
+
+        def session_factory():
+            def make_session():
+                return _SessionContext()
+
+            return make_session
+
+        with (
+            patch.object(
+                tournament_routes,
+                "read_tournament_profile_pipeline",
+                AsyncMock(return_value=stale_pipeline),
+            ),
+            patch.object(
+                tournament_routes,
+                "refresh_tournament_profile_access_state",
+                AsyncMock(return_value=current_state),
+            ) as refresh_access,
+            patch.object(
+                tournament_routes,
+                "session_factory",
+                side_effect=session_factory,
+            ),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await tournament_routes.get_tournament_scoped_profile(
+                    "night-veil",
+                    "target-1",
+                    self._profile_request(generation=8),
+                    self._auth_session(),
+                )
+
+        self.assertEqual(raised.exception.status_code, 403)
+        refresh_access.assert_awaited_once()
 
     async def test_redis_pipeline_failure_is_explicitly_a_fallback_signal(self) -> None:
         class _FailingRedis(_Redis):
@@ -424,7 +601,7 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
         public_url.assert_called_once_with("avatars/user-1/avatar-256.webp")
 
     async def test_tournament_profile_pipeline_is_one_redis_round_trip(self) -> None:
-        access = b'{"tournament_id":"tournament-1","organizer_user_id":"organizer","roster_ready":true,"revision":7}'
+        access = b'{"tournament_id":"tournament-1","organizer_user_id":"organizer","roster_ready":true,"profile_access_generation":7}'
         redis = _Redis(pipeline_values=[access, True, True, b"9\n{}"])
         with patch.object(
             tournament_profile_access,
@@ -455,16 +632,16 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
         tournament = SimpleNamespace(
             id="tournament-1",
             organizer_user_id="organizer",
+            profile_access_generation=12,
             updated_at=updated_at,
             created_at=updated_at,
             bracket_revision=4,
         )
         row = _Row(
-            (tournament, ["viewer-1", "viewer-2"], ["target-1"], True, 2),
+            (tournament, ["viewer-1", "viewer-2"], ["target-1"], True),
             active_viewer_ids=["viewer-1", "viewer-2"],
             roster_user_ids=["target-1"],
             roster_ready=True,
-            active_participant_count=2,
         )
         session = SimpleNamespace(
             execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: row))
@@ -478,6 +655,338 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(state.viewer_user_ids, frozenset({"viewer-1", "viewer-2"}))
         self.assertEqual(state.roster_user_ids, frozenset({"target-1"}))
         self.assertTrue(state.roster_ready)
+        self.assertEqual(state.profile_access_generation, 12)
+
+    async def test_join_profile_delta_advances_warmed_empty_roster_cache_with_cas(self) -> None:
+        access = json.dumps(
+            {
+                "tournament_id": "tournament-1",
+                "organizer_user_id": "organizer-1",
+                "roster_ready": False,
+                "profile_access_generation": 5,
+                "viewer_count": 0,
+                "roster_count": 0,
+            },
+            separators=(",", ":"),
+        ).encode()
+        redis = _JoinDeltaRedis(access=access)
+        with patch.object(tournament_profile_access, "redis_client", return_value=redis):
+            updated = await tournament_profile_access.add_joined_tournament_profile_viewer(
+                "night-veil",
+                "new-viewer",
+                expected_generation=5,
+            )
+
+        self.assertTrue(updated)
+        stored = json.loads(redis.access)
+        self.assertEqual(stored["profile_access_generation"], 6)
+        self.assertEqual(stored["viewer_count"], 1)
+        self.assertEqual(stored["roster_count"], 0)
+        self.assertEqual(redis.viewers, {"new-viewer"})
+        self.assertEqual(redis.roster, set())
+        self.assertEqual(len(redis.eval_calls), 1)
+        self.assertEqual(redis.eval_calls[0][1], 3)
+        self.assertEqual(redis.eval_calls[0][-4:], ("5", "6", "new-viewer", "604800"))
+        self.assertTrue(redis.closed)
+
+        with (
+            patch.object(
+                tournament_routes,
+                "add_joined_tournament_profile_viewer",
+                AsyncMock(return_value=True),
+            ) as fast_path,
+            patch.object(
+                tournament_routes,
+                "refresh_tournament_profile_access_state",
+                AsyncMock(),
+            ) as full_refresh,
+        ):
+            await tournament_routes._refresh_tournament_profile_access_after_join(
+                "night-veil",
+                "new-viewer",
+                expected_generation=5,
+            )
+        fast_path.assert_awaited_once_with(
+            "night-veil",
+            "new-viewer",
+            expected_generation=5,
+        )
+        full_refresh.assert_not_awaited()
+
+        with (
+            patch.object(
+                tournament_routes,
+                "add_joined_tournament_profile_viewer",
+                AsyncMock(return_value=False),
+            ),
+            patch.object(
+                tournament_routes,
+                "refresh_tournament_profile_access_state",
+                AsyncMock(return_value=None),
+            ) as full_refresh,
+        ):
+            await tournament_routes._refresh_tournament_profile_access_after_join(
+                "night-veil",
+                "new-viewer",
+                expected_generation=5,
+            )
+        full_refresh.assert_awaited_once_with("night-veil")
+
+        # Out-of-order joins or a full rebuild that already advanced the
+        # cache cannot move it backward or bless a request twice.
+        stale_cache = _JoinDeltaRedis(
+            access=json.dumps(
+                {**stored, "profile_access_generation": 4, "viewer_count": 1},
+                separators=(",", ":"),
+            ).encode(),
+            viewers={"new-viewer"},
+        )
+        equal_incoming_cache = _JoinDeltaRedis(
+            access=json.dumps(stored, separators=(",", ":")).encode(),
+            viewers={"new-viewer"},
+        )
+        newer_cache = _JoinDeltaRedis(
+            access=json.dumps(
+                {**stored, "profile_access_generation": 8},
+                separators=(",", ":"),
+            ).encode(),
+            viewers={"new-viewer"},
+        )
+        bad_cardinality = _JoinDeltaRedis(
+            access=json.dumps(
+                {**stored, "profile_access_generation": 6, "viewer_count": 3},
+                separators=(",", ":"),
+            ).encode(),
+            viewers={"new-viewer"},
+        )
+        for rejected in (
+            stale_cache,
+            equal_incoming_cache,
+            newer_cache,
+            bad_cardinality,
+        ):
+            with self.subTest(cache_generation=json.loads(rejected.access)["profile_access_generation"]):
+                with patch.object(
+                    tournament_profile_access,
+                    "redis_client",
+                    return_value=rejected,
+                ):
+                    result = await tournament_profile_access.add_joined_tournament_profile_viewer(
+                        "night-veil",
+                        "another-viewer",
+                        expected_generation=5,
+                    )
+                self.assertFalse(result)
+                self.assertNotIn("another-viewer", rejected.viewers)
+
+        concurrent = _JoinDeltaRedis(access=access)
+        with patch.object(
+            tournament_profile_access,
+            "redis_client",
+            return_value=concurrent,
+        ):
+            outcomes = await asyncio.gather(
+                tournament_profile_access.add_joined_tournament_profile_viewer(
+                    "night-veil", "join-a", expected_generation=5
+                ),
+                tournament_profile_access.add_joined_tournament_profile_viewer(
+                    "night-veil", "join-b", expected_generation=5
+                ),
+            )
+        self.assertEqual(sorted(outcomes), [False, True])
+        self.assertEqual(json.loads(concurrent.access)["profile_access_generation"], 6)
+        self.assertEqual(len(concurrent.viewers), 1)
+
+    async def test_join_delta_partial_write_is_rejected_and_db_state_controls_profile_access(self) -> None:
+        access = json.dumps(
+            {
+                "tournament_id": "tournament-1",
+                "organizer_user_id": "organizer-1",
+                "roster_ready": True,
+                "profile_access_generation": 5,
+                "viewer_count": 0,
+                "roster_count": 1,
+            },
+            separators=(",", ":"),
+        ).encode()
+        redis = _JoinDeltaRedis(
+            access=access,
+            roster={"target-1"},
+            fail_after_sadd=True,
+        )
+        with patch.object(tournament_profile_access, "redis_client", return_value=redis):
+            updated = await tournament_profile_access.add_joined_tournament_profile_viewer(
+                "night-veil",
+                "joined-viewer",
+                expected_generation=5,
+            )
+
+        self.assertFalse(updated)
+        self.assertEqual(json.loads(redis.access)["profile_access_generation"], 5)
+        self.assertEqual(redis.viewers, {"joined-viewer"})
+
+        # The cache's set changed but its generation did not. A request with
+        # the post-commit DB generation must ignore those Redis booleans and
+        # authorize from the complete DB-built state instead.
+        stale_pipeline = TournamentProfilePipelineResult(
+            access_raw=redis.access,
+            requester_is_viewer=True,
+            target_is_roster_member=True,
+            profile_raw=b"11\n{}",
+            redis_available=True,
+            pipeline_ms=0.2,
+        )
+        current_state = tournament_profile_access.TournamentProfileAccessState(
+            tournament_id="tournament-1",
+            organizer_user_id="organizer-1",
+            roster_ready=True,
+            profile_access_generation=6,
+            viewer_user_ids=frozenset({"joined-viewer"}),
+            roster_user_ids=frozenset({"target-1"}),
+        )
+        with (
+            patch.object(
+                tournament_routes,
+                "read_tournament_profile_pipeline",
+                AsyncMock(return_value=stale_pipeline),
+            ),
+            patch.object(
+                tournament_routes,
+                "refresh_tournament_profile_access_state",
+                AsyncMock(return_value=current_state),
+            ) as refresh_access,
+            patch.object(
+                tournament_routes,
+                "session_factory",
+                return_value=lambda: _SessionContext(),
+            ),
+        ):
+            response = await tournament_routes.get_tournament_scoped_profile(
+                "night-veil",
+                "target-1",
+                self._profile_request(generation=6),
+                SimpleNamespace(
+                    user=SimpleNamespace(id="joined-viewer"),
+                    role_slugs=frozenset(),
+                ),
+            )
+
+        self.assertEqual(response.body, b"{}")
+        refresh_access.assert_awaited_once()
+
+    async def test_profile_access_cache_purge_is_fixed_bounded_and_verified(self) -> None:
+        prefixes_v1 = (
+            tournament_profile_access.LEGACY_PROFILE_ACCESS_KEY_PREFIX,
+            tournament_profile_access.LEGACY_PROFILE_VIEWERS_KEY_PREFIX,
+            tournament_profile_access.LEGACY_PROFILE_ROSTER_KEY_PREFIX,
+        )
+        prefixes_v2 = (
+            tournament_profile_access.PROFILE_ACCESS_KEY_PREFIX,
+            tournament_profile_access.PROFILE_VIEWERS_KEY_PREFIX,
+            tournament_profile_access.PROFILE_ROSTER_KEY_PREFIX,
+        )
+        keys = {
+            f"{prefix}:night-veil".encode()
+            for prefix in (*prefixes_v1, *prefixes_v2)
+        }
+        keys.add(b"platform:tournament:profile-access:v10:must-remain")
+        redis = _ProfileAccessPurgeRedis(keys, page_size=1)
+
+        with patch.object(tournament_profile_access, "redis_client", return_value=redis):
+            removed_legacy = (
+                await tournament_profile_access.purge_legacy_profile_access_cache()
+            )
+
+        self.assertEqual(removed_legacy, 3)
+        self.assertEqual(
+            redis.keys,
+            {
+                *(f"{prefix}:night-veil".encode() for prefix in prefixes_v2),
+                b"platform:tournament:profile-access:v10:must-remain",
+            },
+        )
+        self.assertEqual(
+            {match for _cursor, match, _count in redis.scan_calls},
+            {f"{prefix}:*" for prefix in prefixes_v1},
+        )
+        self.assertTrue(all(
+            count == tournament_profile_access.PROFILE_ACCESS_PURGE_SCAN_COUNT
+            for _cursor, _match, count in redis.scan_calls
+        ))
+        self.assertTrue(redis.closed)
+
+        redis = _ProfileAccessPurgeRedis(redis.keys, page_size=1)
+        with patch.object(tournament_profile_access, "redis_client", return_value=redis):
+            removed_all = (
+                await tournament_profile_access.purge_all_tournament_profile_access_cache()
+            )
+        self.assertEqual(removed_all, 3)
+        self.assertEqual(
+            redis.keys,
+            {b"platform:tournament:profile-access:v10:must-remain"},
+        )
+        self.assertEqual(
+            {match for _cursor, match, _count in redis.scan_calls},
+            {f"{prefix}:*" for prefix in (*prefixes_v1, *prefixes_v2)},
+        )
+        self.assertTrue(redis.closed)
+
+        class _UnexpectedKeyRedis(_ProfileAccessPurgeRedis):
+            async def scan(self, **kwargs: object) -> tuple[int, list[bytes]]:
+                self.scan_calls.append(
+                    (kwargs["cursor"], kwargs["match"], kwargs["count"])
+                )
+                return 0, [b"unrelated:key"]
+
+        redis = _UnexpectedKeyRedis(set())
+        with (
+            patch.object(tournament_profile_access, "redis_client", return_value=redis),
+            self.assertRaisesRegex(RuntimeError, "unexpected key"),
+        ):
+            await tournament_profile_access.purge_legacy_profile_access_cache()
+        self.assertEqual(redis.unlink_calls, [])
+        self.assertTrue(redis.closed)
+
+        redis = _ProfileAccessPurgeRedis(
+            {
+                f"{prefix}:night-veil".encode()
+                for prefix in prefixes_v1[:2]
+            },
+            page_size=2,
+        )
+        with (
+            patch.object(tournament_profile_access, "redis_client", return_value=redis),
+            patch.object(tournament_profile_access, "PROFILE_ACCESS_PURGE_MAX_KEYS", 1),
+            self.assertRaisesRegex(RuntimeError, "key bound"),
+        ):
+            await tournament_profile_access.purge_legacy_profile_access_cache()
+        self.assertEqual(redis.unlink_calls, [])
+        self.assertTrue(redis.closed)
+
+        class _StuckCursorRedis(_ProfileAccessPurgeRedis):
+            async def scan(
+                self,
+                *,
+                cursor: int | bytes | str,
+                match: str,
+                count: int,
+            ) -> tuple[int, list[bytes]]:
+                self.scan_calls.append((cursor, match, count))
+                return 1, [f"{match[:-1]}night-veil".encode()]
+
+        redis = _StuckCursorRedis(set())
+        with (
+            patch.object(tournament_profile_access, "redis_client", return_value=redis),
+            patch.object(
+                tournament_profile_access,
+                "PROFILE_ACCESS_PURGE_MAX_SCAN_PAGES",
+                1,
+            ),
+            self.assertRaisesRegex(RuntimeError, "scan bound"),
+        ):
+            await tournament_profile_access.purge_legacy_profile_access_cache()
+        self.assertEqual(redis.unlink_calls, [])
+        self.assertTrue(redis.closed)
 
     async def test_stale_profile_revision_cannot_replace_newer_json(self) -> None:
         redis = _CasRedis()

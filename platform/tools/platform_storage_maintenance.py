@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 from typing import Any, Callable, Iterator, Mapping
+from urllib.parse import urlsplit
 
 # The backup workflow executes this exact attested helper with Python's
 # isolated mode.  `-I` intentionally omits the script directory from
@@ -285,6 +286,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--purge-profile-access-cache-after-restore",
+        action="store_true",
+        help=(
+            "Purge only the fixed v1/v2 tournament profile-access Redis namespaces "
+            "after a database restore, while API and worker are stopped."
+        ),
+    )
+    parser.add_argument(
         "--evict-pinned-build-node-cache",
         action="store_true",
         help=(
@@ -343,6 +352,23 @@ def parse_args() -> argparse.Namespace:
         parser.error("backup-only modes are mutually exclusive")
     if args.verify_existing_backup_only and args.skip_backup:
         parser.error("--verify-existing-backup-only cannot be combined with --skip-backup")
+    if args.purge_profile_access_cache_after_restore:
+        if not args.apply:
+            parser.error("--purge-profile-access-cache-after-restore requires --apply")
+        if not args.as_json:
+            parser.error("--purge-profile-access-cache-after-restore requires --json")
+        if (
+            args.backup_only
+            or args.verify_existing_backup_only
+            or args.skip_backup
+            or args.private_backup_diagnostics
+            or args.evict_pinned_build_node_cache
+            or args.compact_legacy_fallback_runtime_cache
+            or args.resume_legacy_fallback_runtime_cache_compaction
+        ):
+            parser.error(
+                "restore profile-access cache purge is an exclusive maintenance operation"
+            )
     if args.evict_pinned_build_node_cache and not args.verify_existing_backup_only:
         parser.error("--evict-pinned-build-node-cache requires --verify-existing-backup-only")
     eviction_bindings = (
@@ -795,6 +821,150 @@ def run_backup(
         else None,
         "preexisting_archives_preserved": result.get("preexisting_archives_preserved") is True,
     }
+
+
+RESTORE_PURGE_SERVICES = ("deadlock-api.service", "deadlock-worker.service")
+RESTORE_PURGE_SYSTEM_PYTHON = Path("/usr/bin/python3.12")
+
+
+def _restore_purge_python(app_dir: Path) -> Path:
+    """Validate and return the fixed shared-venv launcher without resolving argv."""
+
+    try:
+        canonical_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
+        app_metadata = app_dir.lstat()
+    except OSError as exc:
+        raise RuntimeError("canonical restore Python runtime is unavailable") from exc
+    if (
+        app_dir != canonical_app_dir
+        or not stat.S_ISDIR(app_metadata.st_mode)
+        or stat.S_ISLNK(app_metadata.st_mode)
+        or app_metadata.st_uid != os.geteuid()
+        or app_metadata.st_gid != os.getegid()
+        or app_metadata.st_mode & 0o022
+    ):
+        raise RuntimeError("canonical restore Python runtime is unsafe")
+
+    shared = app_dir / "shared"
+    venv = shared / "venv"
+    bin_dir = venv / "bin"
+    expected_owner = (app_metadata.st_uid, app_metadata.st_gid)
+    for directory in (shared, venv, bin_dir):
+        try:
+            metadata = directory.lstat()
+        except OSError as exc:
+            raise RuntimeError("canonical restore Python runtime is unavailable") from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or (metadata.st_uid, metadata.st_gid) != expected_owner
+            or metadata.st_mode & 0o022
+            or metadata.st_nlink < 2
+        ):
+            raise RuntimeError("canonical restore Python runtime is unsafe")
+
+    python = bin_dir / "python"
+    try:
+        python_metadata = python.lstat()
+        resolved_python = python.resolve(strict=True)
+        resolved_metadata = resolved_python.lstat()
+    except OSError as exc:
+        raise RuntimeError("canonical restore Python runtime is unavailable") from exc
+    if (
+        not (stat.S_ISLNK(python_metadata.st_mode) or stat.S_ISREG(python_metadata.st_mode))
+        or python_metadata.st_uid != expected_owner[0]
+        or python_metadata.st_gid != expected_owner[1]
+        or (stat.S_ISREG(python_metadata.st_mode) and python_metadata.st_mode & 0o022)
+        or python_metadata.st_nlink != 1
+        or resolved_python != RESTORE_PURGE_SYSTEM_PYTHON
+        or not stat.S_ISREG(resolved_metadata.st_mode)
+        or resolved_metadata.st_uid != 0
+        or resolved_metadata.st_gid != 0
+        or resolved_metadata.st_mode & 0o022
+        or not os.access(resolved_python, os.X_OK)
+    ):
+        raise RuntimeError("canonical restore Python runtime is unsafe")
+    return python
+
+
+def _require_restore_services_stopped() -> None:
+    """Require both write-capable application units to be explicitly inactive."""
+
+    for unit in RESTORE_PURGE_SERVICES:
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", unit],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("restore cache purge could not verify application services") from exc
+        if result.returncode != 3 or result.stdout.strip() != "inactive":
+            raise RuntimeError("restore cache purge requires stopped API and worker services")
+
+
+def _purge_restored_profile_access_cache(app_dir: Path, current_release: Path) -> int:
+    """Invoke the deployed service's fixed all-version purge with its Redis URL."""
+
+    from platform_safe_env_exec import load_env_file
+
+    python = _restore_purge_python(app_dir)
+
+    values = load_env_file(app_dir / "shared" / ".env.platform")
+    redis_url = values.get("PLATFORM_REDIS_URL")
+    if not isinstance(redis_url, str) or not redis_url:
+        raise RuntimeError("canonical platform Redis configuration is unavailable")
+    parsed = urlsplit(redis_url)
+    if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
+        raise RuntimeError("canonical platform Redis configuration is invalid")
+
+    api_root = current_release / "apps" / "platform_api"
+    if not api_root.is_dir() or api_root.is_symlink():
+        raise RuntimeError("current API source is unavailable for restore cache purge")
+    if not (api_root / "app" / "services" / "tournament_profile_access.py").is_file():
+        raise RuntimeError("current profile-access purge helper is unavailable")
+
+    # Use a clean child environment so an inherited test or operator override
+    # cannot redirect this fixed purge to another Redis database.  The URL is
+    # consumed by the child only and never appears in output or argv.
+    child_env = {
+        "PATH": os.defpath,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PLATFORM_ENVIRONMENT": "production",
+        "PLATFORM_SHARED_DIR": str(app_dir / "shared"),
+        "PLATFORM_REDIS_URL": redis_url,
+    }
+    child_code = (
+        "import asyncio\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "root = Path(sys.argv[1]).resolve(strict=True)\n"
+        "sys.path[:0] = [str(root / 'apps/platform_api'), "
+        "str(root / 'python_packages'), str(root)]\n"
+        "from app.services.tournament_profile_access import "
+        "purge_all_tournament_profile_access_cache\n"
+        "count = asyncio.run(purge_all_tournament_profile_access_cache())\n"
+        "if isinstance(count, bool) or not isinstance(count, int) or count < 0:\n"
+        "    raise SystemExit(2)\n"
+        "print(count)\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(python), "-I", "-B", "-c", child_code, str(current_release)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=child_env,
+            cwd="/",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("restore profile-access cache purge did not complete") from exc
+    if result.returncode != 0 or re.fullmatch(r"(?:0|[1-9][0-9]{0,5})\n", result.stdout) is None:
+        raise RuntimeError("restore profile-access cache purge did not complete")
+    return int(result.stdout)
 
 
 def verify_existing_backup(
@@ -1953,8 +2123,10 @@ def _plan_and_maybe_apply(
 def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     app_dir = args.app_dir.resolve(strict=True)
-    if getattr(args, "evict_pinned_build_node_cache", False) or getattr(
-        args, "compact_legacy_fallback_runtime_cache", False
+    if (
+        getattr(args, "evict_pinned_build_node_cache", False)
+        or getattr(args, "compact_legacy_fallback_runtime_cache", False)
+        or getattr(args, "purge_profile_access_cache_after_restore", False)
     ):
         try:
             canonical_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
@@ -1967,7 +2139,7 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
             or args.source_release_dir != DEFAULT_SOURCE_RELEASE_DIR
         ):
             raise RuntimeError(
-                "canonical app/build lock roots are required for pinned Node cache eviction"
+                "canonical app/build lock roots are required for fixed cache maintenance"
             )
     disk_before_snapshot = disk_snapshot_for_path(Path("/"))
 
@@ -1977,6 +2149,38 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
         # only the first; deploy takes the first two; builds take only the
         # third; standalone live-QA retention takes first then the fourth.
         with maintenance_lock_scope(args, app_dir=app_dir) as source_release_dir:
+            if getattr(args, "purge_profile_access_cache_after_restore", False):
+                try:
+                    canonical_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
+                    canonical_build_dir = DEFAULT_SOURCE_RELEASE_DIR.resolve(strict=True)
+                    releases_dir = (canonical_app_dir / "releases").resolve(strict=True)
+                except OSError as exc:
+                    raise RuntimeError(
+                        "canonical restore cache purge lock roots are unavailable"
+                    ) from exc
+                if (
+                    app_dir != canonical_app_dir
+                    or source_release_dir is None
+                    or source_release_dir != canonical_build_dir
+                ):
+                    raise RuntimeError(
+                        "canonical app/build lock roots are required for restore cache purge"
+                    )
+                current_release = resolved_release_target(
+                    app_dir, "current", releases_dir
+                )
+                with live_qa_machine_lock():
+                    _require_restore_services_stopped()
+                    purged_count = _purge_restored_profile_access_cache(
+                        app_dir, current_release
+                    )
+                return {
+                    "ok": True,
+                    "status": "completed",
+                    "mode": "restore-profile-access-cache-purge",
+                    "purged_key_count": purged_count,
+                    "services_stopped": True,
+                }
             if getattr(args, "verify_existing_backup_only", False):
                 # The lock owner never creates or rotates a backup in this mode.
                 # The backup tool only updates the selected newest sidecar after
@@ -2312,7 +2516,9 @@ def main() -> int:
     args = parse_args()
     try:
         report = run_maintenance(args)
-        if args.apply:
+        if args.apply and not getattr(
+            args, "purge_profile_access_cache_after_restore", False
+        ):
             write_report(
                 args.app_dir / "shared" / "maintenance",
                 report,

@@ -19,7 +19,11 @@ from python_packages.platform_infra.models import (
     PasswordCredential,
     User,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 
 
 class AuthIdentityRouteTests(PlatformIsolatedAsyncioTestCase):
@@ -109,8 +113,8 @@ class AuthIdentityIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def _register(self, label: str) -> tuple[httpx.AsyncClient, str]:
         client = await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
         response = await client.post(
@@ -120,6 +124,7 @@ class AuthIdentityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 "password": "integration-pass-123",
                 "display_name": f"steam-{label}"[:15],
             },
+            headers=same_origin_request_headers(client),
         )
         self.assertEqual(response.status_code, 201, response.text)
         user_id = response.json()["user"]["id"]
@@ -151,7 +156,7 @@ class AuthIdentityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(verified_me.status_code, 200, verified_me.text)
         self.assertTrue(verified_me.json()["can_unlink_steam"])
 
-        unlinked = await verified_client.delete("/api/v1/auth/identities/steam")
+        unlinked = await verified_client.delete("/api/v1/auth/identities/steam", headers=same_origin_request_headers(verified_client))
         self.assertEqual(unlinked.status_code, 200, unlinked.text)
         self.assertFalse(unlinked.json()["steam_linked"])
         async with session_factory()() as db_session:
@@ -169,7 +174,7 @@ class AuthIdentityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 )
             )
 
-        already_unlinked = await verified_client.delete("/api/v1/auth/identities/steam")
+        already_unlinked = await verified_client.delete("/api/v1/auth/identities/steam", headers=same_origin_request_headers(verified_client))
         self.assertEqual(already_unlinked.status_code, 200, already_unlinked.text)
         self.assertFalse(already_unlinked.json()["steam_linked"])
 
@@ -189,7 +194,7 @@ class AuthIdentityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(steam_only_me.status_code, 200, steam_only_me.text)
         self.assertFalse(steam_only_me.json()["can_unlink_steam"])
 
-        blocked = await steam_only_client.delete("/api/v1/auth/identities/steam")
+        blocked = await steam_only_client.delete("/api/v1/auth/identities/steam", headers=same_origin_request_headers(steam_only_client))
         self.assertEqual(blocked.status_code, 409, blocked.text)
         self.assertIn("подтвержденную почту", blocked.json()["detail"])
 
@@ -198,7 +203,7 @@ class AuthIdentityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 update(User).where(User.id == steam_only_user_id).values(status="disabled")
             )
             await db_session.commit()
-        inactive = await steam_only_client.delete("/api/v1/auth/identities/steam")
+        inactive = await steam_only_client.delete("/api/v1/auth/identities/steam", headers=same_origin_request_headers(steam_only_client))
         self.assertEqual(inactive.status_code, 401, inactive.text)
 
 

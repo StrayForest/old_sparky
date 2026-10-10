@@ -197,6 +197,7 @@ from apps.platform_api.app.services.profile_read_models import (
     profile_read_model_payload,
 )
 from apps.platform_api.app.services.tournament_profile_access import (
+    add_joined_tournament_profile_viewer,
     decode_profile_access_state,
     refresh_tournament_profile_access_state,
     read_tournament_profile_pipeline,
@@ -623,6 +624,7 @@ class WorkspaceTournamentSnapshot:
     automation_failure_count: int
     automation_retry_after: datetime | None
     organizer_user_id: str
+    profile_access_generation: int
     created_at: datetime
     updated_at: datetime
 
@@ -900,6 +902,29 @@ async def _refresh_tournament_profile_access_after_commit(slug: str) -> None:
     except Exception:
         logger.exception(
             "Post-commit tournament profile access refresh failed slug=%s",
+            slug,
+        )
+
+
+async def _refresh_tournament_profile_access_after_join(
+    slug: str,
+    user_id: str,
+    *,
+    expected_generation: int | None,
+) -> None:
+    """Use the generation-CAS fast path for a committed solo self-join."""
+
+    try:
+        updated = await add_joined_tournament_profile_viewer(
+            slug,
+            user_id,
+            expected_generation=expected_generation,
+        )
+        if not updated:
+            await refresh_tournament_profile_access_state(slug)
+    except Exception:
+        logger.exception(
+            "Post-join tournament profile access refresh failed slug=%s",
             slug,
         )
 
@@ -7252,8 +7277,17 @@ async def join_tournament(
         ) from exc
     bind_mutation_idempotency_resource(idempotency, participant.id)
     tournament.updated_at = auth_session.now
+    profile_access_generation = getattr(
+        tournament,
+        "profile_access_generation",
+        None,
+    )
     await db_session.commit()
-    await _refresh_tournament_profile_access_after_commit(tournament.slug)
+    await _refresh_tournament_profile_access_after_join(
+        tournament.slug,
+        auth_session.user.id,
+        expected_generation=profile_access_generation,
+    )
     await refresh_tournament_list_read_model_after_commit(tournament.id)
     invalidate_tournament_runtime_caches(tournament.id)
     return serialize_participant(participant, auth_session.user.display_name)
@@ -7383,6 +7417,7 @@ async def leave_tournament(
 async def get_tournament_scoped_profile(
     slug: str,
     user_id: str,
+    request: Request,
     auth_session=Depends(get_authenticated_session),
 ) -> Response:
     current_user_id = auth_session.user.id
@@ -7393,6 +7428,21 @@ async def get_tournament_scoped_profile(
         profile_key=profile_read_model_key(user_id),
     )
     state = decode_profile_access_state(pipeline.access_raw)
+    expected_generation = getattr(
+        request.state,
+        "tournament_profile_access_generation",
+        None,
+    )
+    if (
+        type(expected_generation) is not int
+        or expected_generation < 0
+        or state is None
+        or state.profile_access_generation != expected_generation
+    ):
+        # A Redis projection is only authoritative for the DB generation read
+        # by the membership dependency. Missing generation (for example, the
+        # platform-admin fast path) also takes the DB-authoritative route.
+        state = None
     profile_payload = profile_read_model_payload(pipeline.profile_raw)
 
     if state is None:
@@ -7412,7 +7462,7 @@ async def get_tournament_scoped_profile(
     else:
         record_tournament_profile_access_event(
             "tournament_profile_access_hit",
-            revision=state.revision,
+            revision=state.profile_access_generation,
         )
         requester_is_viewer = pipeline.requester_is_viewer
         target_is_roster_member = pipeline.target_is_roster_member

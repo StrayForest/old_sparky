@@ -94,6 +94,7 @@ RECOVERY_CHILD_STAGES = frozenset(
         "transaction_cleanup_final",
         "legacy_validate_receipt",
         "legacy_runtime_prepare",
+        "legacy_cache_purge",
         "legacy_restore_services",
         "legacy_mark_services_restored",
         "legacy_verify_services",
@@ -2386,6 +2387,8 @@ def _recovery_child_stage(command: list[str]) -> str:
                 return "transaction_cleanup_final"
             if operation == "validate-legacy-liveqa-recovery":
                 return "legacy_validate_receipt"
+            if operation == "purge-legacy-profile-access-cache":
+                return "legacy_cache_purge"
             if operation == "restore-legacy-services":
                 return "legacy_restore_services"
             if operation == "mark-legacy-services-restored":
@@ -2491,6 +2494,13 @@ def _restore_legacy_liveqa_release(
                 "--prepare-only", "--preserve-legacy-live-qa", "--transaction", str(state),
             ],
             stage="legacy_runtime_prepare",
+        )
+        _run_recovery_child(
+            [
+                    "/usr/bin/python3", "-I", str(transaction),
+                    "purge-legacy-profile-access-cache", "--state", str(state),
+                ],
+            stage="legacy_cache_purge",
         )
         _run_recovery_child(
             [

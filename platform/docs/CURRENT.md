@@ -2,17 +2,16 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-09
+- Last reviewed: 2026-10-11
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
-## Verified checkpoint — 2026-10-09
+## Verified checkpoint — 2026-10-10
 
-- Current app M8 source `6343099bb7686671bdef49d0c4ecd10f21ef19d2` is installed in release `gha-37873770566-1-6343099bb768` with provider C `bbd7fd6f46dfbd21c3dfd6b1b27f6409c580196e`; M6 is the previous release. The M5 stale release was removed through the canonical one-candidate retention path. The live-user validator is present in the trusted runtime. API admission remains configured at 24 active requests, 8 bounded waiters and a 250 ms wait.
-- M8 public live-QA diagnostic [`37876068895`](https://github.com/StrayForest/old_sparky/actions/runs/37876068895) ended in browser-QA startup with exit 2 and no browser counts. Source review found the custom reporter missing from the immutable runtime package; this is consistent with the failure, but the child error text was discarded, so the exact runtime exception is not established.
-- M8 authenticated-load diagnostics [`37877006118`](https://github.com/StrayForest/old_sparky/actions/runs/37877006118) and [`37880022571`](https://github.com/StrayForest/old_sparky/actions/runs/37880022571) both completed all 20,000 requests and exact fixture cleanup, but both failed the declared stress contract. The v1 run returned 19,473 HTTP 200, 526 HTTP 500 and 1 HTTP 502 with no retries; the v2 keep-alive run returned 19,290 HTTP 200 and 710 HTTP 500 with no retries. User-observed logical p95/p99 were 508,038/531,196 ms for v1 and 505,684/528,032 ms for v2 against 5,000/8,000 ms budgets. The keep-alive comparison did not establish a performance improvement. These diagnostics receive no final QA or performance credit.
-- The release-independent C93 host-tools generation is now installed and passed its bounded capability self-test. The exact F-source preflight run completed read-only; no F application generation was installed. The next application candidate must include the transaction-bound M8 runtime-reconcile compatibility fix, then pass its own exact-SHA CI and normal automatic deployment before it can receive a fresh release guard or QA credit.
-- The next source candidate is not deployed. It combines a route-scoped reuse of the authenticated workspace preflight for eligible private reads, inclusion of the digest-bound live-count reporter in the immutable browser runtime for both public and live-user QA, and removal of temporary SSR heap-measurement overrides from persistent profiles. The active API admission values and security checks remain unchanged. The candidate still requires exact-SHA CI, normal deployment, fresh release guards, and the final serial QA matrix before promotion.
+- App source `3f7879a409a0a1d072c3bcc4234c7f3573b8509f` is installed in release `gha-38069256428-1-3f7879a409a0`; `current` resolves to dev:ino `2049:768060` and `previous` to `gha-38007983720-1-9178971b313c` (dev:ino `2049:768059`). The first automatic deployment attempt failed before install without a more specific established cause; the reviewed all-jobs auto-dispatcher recovery completed and produced the installed release. The maintenance one-shot remains failed and has not been restarted.
+- The source-bound verify-existing/compaction workflow [`38067331192`](https://github.com/StrayForest/old_sparky/actions/runs/38067331192) failed in its public-summary stage. Native receipts establish that fallback-cache compaction reclaimed `397,406,208` allocated bytes and that the latest backup restore and Alembic checks completed successfully; both newest-backup verification flags are true and the archive remains retained. The inner public-summary failure cause is unknown because its private report was removed by the failed workflow. The bounded failure-classification change is uncommitted and is not part of the installed source.
+- The authenticated-page diagnostic workflow [`38071042340`](https://github.com/StrayForest/old_sparky/actions/runs/38071042340) used the unchanged `authenticated-page-load-v1` profile but ended with a runtime-budget-failed client envelope. The bounded report contains no child report or HTTP totals, and no source-owned origin telemetry was published, so app/origin attribution is unknown. Accepted fixture cleanup is still unproven; do not start another production profile until exact-run cleanup and retention are verified.
+- The observer source change that reports all client statuses for exact tournament-page GETs and separates upstream attempts is not deployed. Its report interpretation is documented in the [authenticated HTML transport runbook](performance-transport-runbook.md). Do not assign it production or QA credit before a later exact-SHA CI pass and automatic deployment.
 
 ## Production baseline
 
@@ -70,7 +69,7 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-Current next step: finish exact-SHA gates, then rerun the unchanged authenticated-page load; the follow-up candidate is not deployed or load-tested.
+Current next step: prove exact-run cleanup for the failed authenticated-page diagnostic, then complete the source and release gates before considering another bounded production QA step. The failed run has no performance acceptance or final-matrix credit.
 The historical production performance stage completed on 2026-09-07 against deployed SHA `bba3fb278e348906a6942aee8462b758c3d616ef`. The measurement
 boundary and retained-load runtime contour were corrected, then the exact
 13-profile matrix was rerun with the original contracts, thresholds and

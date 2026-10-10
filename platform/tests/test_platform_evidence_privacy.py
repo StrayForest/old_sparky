@@ -774,6 +774,33 @@ class EvidencePrivacyTests(unittest.TestCase):
                     "samples_detail": [{"pid": 987654, "p95_ms": 8.0}],
                     "by_pid": {"987654": {"memory": {"rss_bytes": 123456}}},
                 },
+                "nginx_html": {
+                    "requests": 3,
+                    "statuses": {
+                        "200": 1,
+                        "500": 1,
+                        "503": 1,
+                        "operator@example.test": 99,
+                    },
+                    "upstream_statuses": {
+                        "502": 1,
+                        "503": 1,
+                        "secret-token": 7,
+                    },
+                    "upstream_status_unknown_attempts": 1,
+                    "request_time_ms": {"p50_ms": 500.0},
+                    "by_status": {
+                        "503": {
+                            "requests": 1,
+                            "upstream_statuses": {"502": 1, "secret-token": 4},
+                            "upstream_status_unknown_attempts": 1,
+                            "request_time_ms": {"p50_ms": 1500.0},
+                            "raw_uri": "/tournaments/private-slug?token=secret-token",
+                        },
+                        "900": {"requests": 99, "request_time_ms": {"p50_ms": 999.0}},
+                        "/private": {"requests": 99},
+                    },
+                },
                 "nginx_api": {
                     "requests": 1,
                     "by_method_route": {
@@ -876,6 +903,25 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(public_observer["system"]["processes"]["deadlock-api"]["rss_bytes"], 123456)
         self.assertNotIn("binding", public_observer)
         self.assertNotIn("by_pid", public_observer["server_ssr_observability"]["event_loop"])
+        public_html = public_observer["server_ssr_observability"]["nginx_html"]
+        self.assertEqual(
+            public_html["statuses"],
+            {"200": 1, "500": 1, "503": 1},
+        )
+        self.assertEqual(public_html["upstream_statuses"], {"502": 1, "503": 1})
+        self.assertEqual(public_html["upstream_status_unknown_attempts"], 1)
+        self.assertEqual(public_html["request_time_ms"], {"p50_ms": 500.0})
+        self.assertEqual(
+            public_html["by_status"],
+            {
+                    "503": {
+                        "requests": 1,
+                        "upstream_statuses": {"502": 1},
+                        "upstream_status_unknown_attempts": 1,
+                    "request_time_ms": {"p50_ms": 1500.0},
+                }
+            },
+        )
         self.assertNotIn("armed_worker_identities", public_observer["cpu_profile"])
         self.assertEqual(public_observer["cpu_profile"]["ignored_stale_profiles"], 2)
         profile = public_observer["cpu_profile"]["profiles"][0]

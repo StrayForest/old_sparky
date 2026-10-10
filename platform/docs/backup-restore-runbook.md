@@ -161,13 +161,35 @@ not an immutable vault; retain tested offline ciphertext too.
 
 A production restore is destructive and requires explicit operator approval.
 
-1. Stop writes and record incident/recovery-point ownership.
+1. Stop writes and stop `deadlock-api.service` and `deadlock-worker.service`.
+   Record incident/recovery-point ownership; keep both units stopped through the
+   restore and cache-purge steps.
 2. Identify the exact archive, manifest and Alembic revision; verify checksum
    and decryption.
 3. Take a fresh pre-restore snapshot when the database is readable.
 4. Restore only to `platformdb`; never use `sparkydb`.
-5. Run Alembic head, readiness, role/workflow smoke and media reconciliation.
-6. Retain the pre-restore evidence and document any data-loss interval.
+5. Run Alembic head and database-only readiness checks while API and worker
+   remain stopped.
+6. Purge profile-access cache entries for both cache generations before
+   starting either service. The fixed command acquires the normal maintenance
+   lock order, verifies both units are inactive, and removes only the three
+   source-owned v1 and three v2 profile-access prefixes:
+
+   ```bash
+   cd /opt/oldsparky/platform/current
+   sudo /opt/oldsparky/platform/shared/venv/bin/python \
+     tools/platform_storage_maintenance.py \
+     --app-dir /opt/oldsparky/platform \
+     --purge-profile-access-cache-after-restore --apply --json
+   ```
+
+   A nonzero result or missing `"ok": true` means the purge was not proven;
+   keep API and worker stopped and resolve the lock, service-state or Redis
+   failure before proceeding. The command does not create a backup, prune
+   artifacts, or accept caller-supplied key prefixes.
+7. Start API and worker, then run service readiness, role/workflow smoke and
+   media reconciliation.
+8. Retain the pre-restore evidence and document any data-loss interval.
 
 Routine drills always use a new temporary database. Never downgrade migrations
 automatically. Media mapping is in PostgreSQL; after restore use targeted R2

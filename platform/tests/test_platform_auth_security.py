@@ -54,7 +54,11 @@ from python_packages.platform_infra.security import (
     validate_auth_security_settings,
 )
 from python_packages.platform_infra.turnstile import verify_turnstile_token
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tools.platform_create_operator import bootstrap_operator, normalize_confirmed_email
 
 
@@ -252,7 +256,7 @@ class AuthSecurityUnitTests(PlatformIsolatedAsyncioTestCase):
                 )
                 rejected = await client.post(
                     "/cors-unsafe-probe",
-                    headers={"Origin": settings.platform_web_origin},
+                    headers=same_origin_request_headers(client, extra={"Origin": settings.platform_web_origin}),
                 )
 
         self.assertEqual(response.status_code, 200, response.text)
@@ -324,11 +328,11 @@ class AuthSecurityUnitTests(PlatformIsolatedAsyncioTestCase):
             client.cookies.set(csrf_cookie_name(settings), token)
             response = await client.post(
                 "/unsafe",
-                headers={
+                headers=same_origin_request_headers(client, extra={
                     "Origin": "https://old-sparky.com",
                     "Sec-Fetch-Site": "same-origin",
                     "X-CSRF-Token": token,
-                },
+                }),
             )
 
         self.assertEqual(response.status_code, 200, response.text)
@@ -405,17 +409,17 @@ class AuthSecurityUnitTests(PlatformIsolatedAsyncioTestCase):
                 with self.subTest(path=path):
                     accepted = await client.post(
                         path,
-                        headers={
+                        headers=same_origin_request_headers(client, extra={
                             "Origin": "https://old-sparky.com",
                             "Sec-Fetch-Site": "same-origin",
-                        },
+                        }),
                     )
                     cross_site = await client.post(
                         path,
-                        headers={
+                        headers=same_origin_request_headers(client, extra={
                             "Origin": "https://evil.example",
                             "Sec-Fetch-Site": "cross-site",
-                        },
+                        }),
                     )
                     self.assertEqual(accepted.status_code, 200, accepted.text)
                     self.assertEqual(cross_site.status_code, 403, cross_site.text)
@@ -469,32 +473,44 @@ class AuthSecurityUnitTests(PlatformIsolatedAsyncioTestCase):
             "platform_turnstile_mode": "always",
             "platform_turnstile_site_key": "test-site-key",
             "platform_turnstile_secret_key": "test-secret-key",
+            "platform_email_sender_email": None,
+            "platform_resend_api_key": None,
+            "platform_support_smtp_host": None,
+            "platform_support_smtp_username": None,
+            "platform_support_smtp_password": None,
+            "platform_support_smtp_sender_email": None,
         }
         with self.assertRaisesRegex(RuntimeError, "email delivery"):
             validate_auth_security_settings(self._settings(**production_values))
         with self.assertRaisesRegex(RuntimeError, "email delivery"):
             validate_auth_security_settings(
                 self._settings(
-                    **production_values,
-                    platform_support_smtp_host="smtp.example.com",
-                    platform_support_smtp_sender_email="noreply@old-sparky.com",
-                    platform_support_smtp_starttls=False,
-                    platform_support_smtp_ssl=False,
+                    **{
+                        **production_values,
+                        "platform_support_smtp_host": "smtp.example.com",
+                        "platform_support_smtp_sender_email": "noreply@old-sparky.com",
+                        "platform_support_smtp_starttls": False,
+                        "platform_support_smtp_ssl": False,
+                    }
                 )
             )
 
         validate_auth_security_settings(
             self._settings(
-                **production_values,
-                platform_support_smtp_host="smtp.example.com",
-                platform_support_smtp_sender_email="noreply@old-sparky.com",
+                **{
+                    **production_values,
+                    "platform_support_smtp_host": "smtp.example.com",
+                    "platform_support_smtp_sender_email": "noreply@old-sparky.com",
+                }
             )
         )
         validate_auth_security_settings(
             self._settings(
-                **production_values,
-                platform_email_sender_email="support@old-sparky.com",
-                platform_resend_api_key="replace-me-resend-key",
+                **{
+                    **production_values,
+                    "platform_email_sender_email": "support@old-sparky.com",
+                    "platform_resend_api_key": "replace-me-resend-key",
+                }
             )
         )
 
@@ -783,8 +799,8 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
 
@@ -795,10 +811,10 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         email: str,
         user_agent: str | None = None,
     ) -> httpx.Response:
-        headers = {"User-Agent": user_agent} if user_agent is not None else None
+        extra_headers = {"User-Agent": user_agent} if user_agent is not None else None
         return await client.post(
             "/api/v1/auth/register",
-            headers=headers,
+            headers=same_origin_request_headers(client, extra=extra_headers),
             json={
                 "email": email,
                 "password": self.password,
@@ -816,6 +832,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 "password": self.password,
                 "display_name": "safe-player",
             },
+            headers=same_origin_request_headers(client),
         )
         self.assertEqual(registered.status_code, 201, registered.text)
         self.assertEqual(registered.headers["Cache-Control"], "no-store")
@@ -847,6 +864,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         login = await login_client.post(
             "/api/v1/auth/login",
             json={"email": email, "password": self.password},
+            headers=same_origin_request_headers(login_client),
         )
         current_session = await client.get("/api/v1/auth/session")
         async with session_factory()() as db_session:
@@ -981,7 +999,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 clients_by_user_agent[user_agent] = client
                 logged_in = await client.post(
                     "/api/v1/auth/login",
-                    headers={"User-Agent": user_agent},
+                    headers=same_origin_request_headers(client, extra={"User-Agent": user_agent}),
                     json={"email": email, "password": self.password},
                 )
                 self.assertEqual(logged_in.status_code, 200, logged_in.text)
@@ -1008,6 +1026,8 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             revoked_client = clients_by_user_agent[revoked["user_agent"]]
             revoke_response = await current_client.delete(
                 f"/api/v1/auth/sessions/{revoked['id']}"
+            ,
+                headers=same_origin_request_headers(current_client),
             )
             self.assertEqual(revoke_response.status_code, 204, revoke_response.text)
             self.assertEqual(
@@ -1015,7 +1035,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 401,
             )
 
-            logout_all = await current_client.post("/api/v1/auth/logout-all")
+            logout_all = await current_client.post("/api/v1/auth/logout-all", headers=same_origin_request_headers(current_client))
             self.assertEqual(logout_all.status_code, 204, logout_all.text)
             self.assertEqual(
                 (await current_client.get("/api/v1/auth/session")).status_code,
@@ -1048,6 +1068,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         second_login = await second_client.post(
             "/api/v1/auth/login",
             json={"email": email, "password": self.password},
+            headers=same_origin_request_headers(second_client),
         )
         self.assertEqual(second_login.status_code, 200, second_login.text)
 
@@ -1096,10 +1117,12 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             requested = await first_client.post(
                 "/api/v1/auth/password-reset/request",
                 json={"email": email},
+                headers=same_origin_request_headers(first_client),
             )
             missing = await first_client.post(
                 "/api/v1/auth/password-reset/request",
                 json={"email": f"{self.prefix}-missing@example.com"},
+                headers=same_origin_request_headers(first_client),
             )
 
             self.assertEqual(requested.status_code, 202, requested.text)
@@ -1154,14 +1177,17 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             verified = await first_client.post(
                 "/api/v1/auth/password-reset/verify-code",
                 json={"email": email, "code": reset_code},
+                headers=same_origin_request_headers(first_client),
             )
             confirmed = await first_client.post(
                 "/api/v1/auth/password-reset/confirm",
                 json={"email": email, "code": reset_code, "new_password": new_password},
+                headers=same_origin_request_headers(first_client),
             )
             reused = await first_client.post(
                 "/api/v1/auth/password-reset/confirm",
                 json={"email": email, "code": reset_code, "new_password": "another-pass-789"},
+                headers=same_origin_request_headers(first_client),
             )
             self.assertEqual(turnstile.await_count, 2)
             self.assertTrue(
@@ -1193,10 +1219,12 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         old_login = await login_client.post(
             "/api/v1/auth/login",
             json={"email": email, "password": self.password},
+            headers=same_origin_request_headers(login_client),
         )
         new_login = await login_client.post(
             "/api/v1/auth/login",
             json={"email": email, "password": new_password},
+            headers=same_origin_request_headers(login_client),
         )
         self.assertEqual(old_login.status_code, 401, old_login.text)
         self.assertEqual(new_login.status_code, 200, new_login.text)
@@ -1240,6 +1268,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     "password": new_password,
                     "display_name": "Restarted User",
                 },
+                headers=same_origin_request_headers(second_client),
             )
 
             self.assertEqual(restarted.status_code, 201, restarted.text)
@@ -1252,24 +1281,28 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             old_code = await second_client.post(
                 "/api/v1/auth/email-verification/confirm",
                 json={"email": email, "code": first_code},
+                headers=same_origin_request_headers(second_client),
             )
             self.assertEqual(old_code.status_code, 400, old_code.text)
 
             confirmed = await second_client.post(
                 "/api/v1/auth/email-verification/confirm",
                 json={"email": email, "code": second_code},
+                headers=same_origin_request_headers(second_client),
             )
             self.assertEqual(confirmed.status_code, 200, confirmed.text)
 
             old_password_login = await first_client.post(
                 "/api/v1/auth/login",
                 json={"email": email, "password": self.password},
+                headers=same_origin_request_headers(first_client),
             )
             self.assertEqual(old_password_login.status_code, 401, old_password_login.text)
 
             new_password_login = await first_client.post(
                 "/api/v1/auth/login",
                 json={"email": email, "password": new_password},
+                headers=same_origin_request_headers(first_client),
             )
             self.assertEqual(new_password_login.status_code, 200, new_password_login.text)
 
@@ -1307,6 +1340,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     "password": "attacker-replacement-password",
                     "display_name": "attacker",
                 },
+                headers=same_origin_request_headers(attacker),
             )
             fresh = await self._register(
                 fresh_client,
@@ -1330,10 +1364,12 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         original_login = await existing_client.post(
             "/api/v1/auth/login",
             json={"email": email, "password": self.password},
+            headers=same_origin_request_headers(existing_client),
         )
         attacker_login = await attacker.post(
             "/api/v1/auth/login",
             json={"email": email, "password": "attacker-replacement-password"},
+            headers=same_origin_request_headers(attacker),
         )
         self.assertEqual(original_login.status_code, 200, original_login.text)
         self.assertEqual(attacker_login.status_code, 401, attacker_login.text)
@@ -1369,17 +1405,35 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             blocked_login = await client.post(
                 "/api/v1/auth/login",
                 json={"email": email, "password": self.password},
+                headers=same_origin_request_headers(client),
             )
             self.assertEqual(blocked_login.status_code, 401, blocked_login.text)
 
             mail.reset_mock()
+            # Registration reserves this address's delivery cooldown. Clear
+            # only that fixture-owned key so this scenario can exercise token
+            # rotation rather than the separate cooldown behavior.
+            cooldown_fingerprint = auth_rate_limit._fingerprint(
+                settings,
+                f"delivery:email-verification:{email}",
+            )
+            cache = auth_rate_limit.redis_client()
+            try:
+                deleted_cooldown = await cache.delete(
+                    f"platform:auth-delivery:v1:email-verification:{cooldown_fingerprint}"
+                )
+            finally:
+                await cache.aclose()
+            self.assertEqual(deleted_cooldown, 1)
             resent = await client.post(
                 "/api/v1/auth/email-verification/resend",
                 json={"email": email},
+                headers=same_origin_request_headers(client),
             )
             missing = await client.post(
                 "/api/v1/auth/email-verification/resend",
                 json={"email": f"{self.prefix}-missing@example.com"},
+                headers=same_origin_request_headers(client),
             )
             self.assertEqual(resent.status_code, 202, resent.text)
             self.assertEqual(missing.status_code, 202, missing.text)
@@ -1431,10 +1485,12 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             confirmed = await client.post(
                 "/api/v1/auth/email-verification/confirm",
                 json={"email": email, "code": verification_code},
+                headers=same_origin_request_headers(client),
             )
             reused = await client.post(
                 "/api/v1/auth/email-verification/confirm",
                 json={"email": email, "code": verification_code},
+                headers=same_origin_request_headers(client),
             )
 
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
@@ -1459,6 +1515,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             logged_in = await client.post(
                 "/api/v1/auth/login",
                 json={"email": old_email, "password": self.password},
+                headers=same_origin_request_headers(client),
             )
             self.assertEqual(logged_in.status_code, 200, logged_in.text)
 
@@ -1486,6 +1543,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 "email": new_email,
                 "new_password": None,
             },
+            headers=same_origin_request_headers(change_client),
         )
         self.assertEqual(legacy_change.status_code, 409, legacy_change.text)
 
@@ -1505,6 +1563,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             missing_password = await change_client.post(
                 "/api/v1/auth/email-change/request",
                 json={"email": new_email},
+                headers=same_origin_request_headers(change_client),
             )
             self.assertEqual(missing_password.status_code, 422, missing_password.text)
 
@@ -1514,6 +1573,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     "email": new_email,
                     "current_password": "definitely-wrong-password",
                 },
+                headers=same_origin_request_headers(change_client),
             )
             self.assertEqual(wrong_password.status_code, 401, wrong_password.text)
             delivery.assert_not_awaited()
@@ -1524,6 +1584,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     "email": new_email,
                     "current_password": self.password,
                 },
+                headers=same_origin_request_headers(change_client),
             )
             self.assertEqual(requested.status_code, 202, requested.text)
             delivery.assert_awaited_once()
@@ -1557,6 +1618,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             wrong_browser = await other_browser.post(
                 "/api/v1/auth/email-change/confirm",
                 json={"email": new_email, "code": code},
+                headers=same_origin_request_headers(other_browser),
             )
             self.assertEqual(wrong_browser.status_code, 400, wrong_browser.text)
 
@@ -1564,6 +1626,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             wrong_candidate = await change_client.post(
                 "/api/v1/auth/email-change/confirm",
                 json={"email": other_candidate, "code": code},
+                headers=same_origin_request_headers(change_client),
             )
             self.assertEqual(wrong_candidate.status_code, 400, wrong_candidate.text)
 
@@ -1571,6 +1634,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             wrong_code = await change_client.post(
                 "/api/v1/auth/email-change/confirm",
                 json={"email": new_email, "code": bad_code},
+                headers=same_origin_request_headers(change_client),
             )
             self.assertEqual(wrong_code.status_code, 400, wrong_code.text)
 
@@ -1587,6 +1651,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
             confirmed = await change_client.post(
                 "/api/v1/auth/email-change/confirm",
                 json={"email": new_email, "code": code},
+                headers=same_origin_request_headers(change_client),
             )
             self.assertEqual(confirmed.status_code, 200, confirmed.text)
             self.assertEqual(confirmed.json()["email"], new_email)
@@ -1688,6 +1753,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
         logged_in = await client.post(
             "/api/v1/auth/login",
             json={"email": old_email, "password": self.password},
+            headers=same_origin_request_headers(client),
         )
         self.assertEqual(logged_in.status_code, 200, logged_in.text)
 
@@ -1706,6 +1772,7 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     "email": occupied_email,
                     "current_password": self.password,
                 },
+                headers=same_origin_request_headers(client),
             )
 
         self.assertEqual(response.status_code, 409, response.text)
@@ -1803,6 +1870,8 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     login_client.post(
                         "/api/v1/auth/login",
                         json={"email": email, "password": self.password},
+
+                        headers=same_origin_request_headers(login_client),
                     )
                 )
                 await asyncio.wait_for(login_reached_session_creation.wait(), timeout=3)
@@ -1814,6 +1883,8 @@ class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
                             "code": issued.code,
                             "new_password": "race-safe-new-password-456",
                         },
+
+                        headers=same_origin_request_headers(reset_client),
                     )
                 )
                 await asyncio.wait_for(reset_user_lock_entered.wait(), timeout=3)

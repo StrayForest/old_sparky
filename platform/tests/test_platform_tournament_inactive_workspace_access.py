@@ -236,7 +236,7 @@ class PlatformTournamentInactiveWorkspaceAccessTests(PlatformIsolatedAsyncioTest
                         _tournament_child_request("private-cup", "workspace"),
                         auth_session=_auth_session(),
                         db_session=_db_session(
-                            ("invite_only", "organizer-1", participant_status)
+                            ("invite_only", "organizer-1", participant_status, 7)
                         ),
                     )
                 self.assertEqual(raised.exception.status_code, 403)
@@ -248,18 +248,23 @@ class PlatformTournamentInactiveWorkspaceAccessTests(PlatformIsolatedAsyncioTest
             frozenset({"registered", "confirmed", "checked_in"}),
         )
         allowed_rows = (
-            ("invite_only", "organizer-1", "registered"),
-            ("invite_only", "organizer-1", "confirmed"),
-            ("invite_only", "organizer-1", "checked_in"),
-            ("invite_only", "organizer-1", None),
-            ("public", "organizer-1", "withdrawn"),
+            ("invite_only", "organizer-1", "registered", 7),
+            ("invite_only", "organizer-1", "confirmed", 8),
+            ("invite_only", "organizer-1", "checked_in", 9),
+            ("invite_only", "organizer-1", None, 10),
+            ("public", "organizer-1", "withdrawn", 11),
         )
         for row in allowed_rows:
             with self.subTest(row=row):
+                request = _tournament_child_request("private-cup", "workspace")
                 await ensure_private_tournament_read_membership_is_active(
-                    _tournament_child_request("private-cup", "workspace"),
+                    request,
                     auth_session=_auth_session(),
                     db_session=_db_session(row),
+                )
+                self.assertEqual(
+                    request.state.tournament_profile_access_generation,
+                    row[3],
                 )
 
     async def test_anonymous_unknown_tournament_is_not_confused_with_private_access(self) -> None:
@@ -273,7 +278,7 @@ class PlatformTournamentInactiveWorkspaceAccessTests(PlatformIsolatedAsyncioTest
         self.assertEqual(raised.exception.detail, "Tournament not found.")
 
     async def test_organizer_and_platform_admin_keep_management_access(self) -> None:
-        inactive_private_row = ("invite_only", "user-1", "disqualified")
+        inactive_private_row = ("invite_only", "user-1", "disqualified", 7)
         organizer_db = _db_session(inactive_private_row)
         await ensure_private_tournament_read_membership_is_active(
             _tournament_child_request("private-cup", "bracket"),

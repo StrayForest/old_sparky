@@ -298,6 +298,7 @@ async def ensure_private_tournament_read_membership_is_active(
                 Tournament.visibility,
                 Tournament.organizer_user_id,
                 TournamentParticipant.status,
+                Tournament.profile_access_generation,
             )
             .outerjoin(
                 TournamentParticipant,
@@ -310,7 +311,15 @@ async def ensure_private_tournament_read_membership_is_active(
     if row is None:
         return
 
-    visibility, organizer_user_id, participant_status = row
+    (
+        visibility,
+        organizer_user_id,
+        participant_status,
+        profile_access_generation,
+    ) = row
+    request.state.tournament_profile_access_generation = int(
+        profile_access_generation
+    )
     if private_tournament_read_membership_is_active(
         visibility=visibility,
         organizer_user_id=organizer_user_id,

@@ -569,8 +569,9 @@ is a compatibility shim to the same bundle:
   --app-dir /opt/oldsparky/platform
 ```
 
-Recovery is idempotent and completes any recorded restart-pending phase. After
-it succeeds, rerun preflight and smoke for the restored CSP mode before deciding
+Recovery resumes only `rollback-cache-purged`; legacy `restart-pending` receipts
+fail closed without purge proof. After it succeeds, rerun preflight and smoke
+for the restored CSP mode before deciding
 whether to retry installation or perform a normal rollback.
 
 Preview, then apply the symlink rollback:

@@ -10,7 +10,11 @@ from sqlalchemy import delete, select
 from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import AuditLog, Tournament, User
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 
 
 class PlatformParticipantManageSecurityTests(PlatformIsolatedAsyncioTestCase):
@@ -51,8 +55,8 @@ class PlatformParticipantManageSecurityTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
 
@@ -66,6 +70,7 @@ class PlatformParticipantManageSecurityTests(PlatformIsolatedAsyncioTestCase):
                 "password": self.password,
                 "display_name": f"sec-{label}"[:15],
             },
+            headers=same_origin_request_headers(client),
         )
         self.assertEqual(response.status_code, 201, response.text)
         payload = response.json()
@@ -87,6 +92,7 @@ class PlatformParticipantManageSecurityTests(PlatformIsolatedAsyncioTestCase):
                 "format_slug": "solo",
                 "max_participants": 8,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(create_response.status_code, 201, create_response.text)
         tournament = create_response.json()
@@ -95,6 +101,7 @@ class PlatformParticipantManageSecurityTests(PlatformIsolatedAsyncioTestCase):
         open_response = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/status",
             json={"status": "registration_open"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(open_response.status_code, 200, open_response.text)
 
@@ -105,6 +112,7 @@ class PlatformParticipantManageSecurityTests(PlatformIsolatedAsyncioTestCase):
                 "entry_type": "solo",
                 "team_name": None,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         missing_account = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/participants/manage",
@@ -113,6 +121,7 @@ class PlatformParticipantManageSecurityTests(PlatformIsolatedAsyncioTestCase):
                 "entry_type": "solo",
                 "team_name": None,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
 
         self.assertEqual(existing_without_access.status_code, 201)

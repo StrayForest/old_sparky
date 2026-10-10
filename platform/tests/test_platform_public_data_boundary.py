@@ -10,7 +10,11 @@ from sqlalchemy import delete, select
 from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import AuditLog, Tournament, User
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -55,8 +59,8 @@ class PlatformPublicDataBoundaryTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
 
@@ -70,6 +74,7 @@ class PlatformPublicDataBoundaryTests(PlatformIsolatedAsyncioTestCase):
                     "password": self.password,
                     "display_name": f"as05-{label}"[:15],
                 },
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(response.status_code, 201, response.text)
         payload = response.json()
@@ -96,6 +101,7 @@ class PlatformPublicDataBoundaryTests(PlatformIsolatedAsyncioTestCase):
                 "discord_account": "public-discord",
                 "region": "EU",
             },
+            headers=same_origin_request_headers(owner["client"]),
         )
         self.assertEqual(response.status_code, 200, response.text)
 
@@ -127,6 +133,7 @@ class PlatformPublicDataBoundaryTests(PlatformIsolatedAsyncioTestCase):
                 "visibility": "public",
                 "format_slug": "solo",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(created.status_code, 201, created.text)
         slug = created.json()["slug"]
@@ -134,12 +141,14 @@ class PlatformPublicDataBoundaryTests(PlatformIsolatedAsyncioTestCase):
         opened = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/status",
             json={"status": "registration_open"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(opened.status_code, 200, opened.text)
 
         joined = await player["client"].post(
             f"/api/v1/tournaments/{slug}/join",
             json={"entry_type": "solo"},
+            headers=same_origin_request_headers(player["client"]),
         )
         self.assertEqual(joined.status_code, 201, joined.text)
         participant_id = joined.json()["id"]
@@ -150,6 +159,7 @@ class PlatformPublicDataBoundaryTests(PlatformIsolatedAsyncioTestCase):
                 "status": "confirmed",
                 "moderation_note": "organizer-only moderation context",
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(moderated.status_code, 200, moderated.text)
 

@@ -1654,7 +1654,12 @@ jobs:
       cleanup_status: ${{ steps.cleanup.outputs.cleanup_status }}
       cleanup_remote_ssh_exit_code: ${{ steps.cleanup.outputs.cleanup_remote_ssh_exit_code }}
       cleanup_remote_stage: ${{ steps.cleanup.outputs.cleanup_remote_stage }}
+      cleanup_remote_dispatch_exit_code: ${{ steps.cleanup.outputs.cleanup_remote_dispatch_exit_code }}
+      cleanup_remote_child_state: ${{ steps.cleanup.outputs.cleanup_remote_child_state }}
       cleanup_remote_child_exit: ${{ steps.cleanup.outputs.cleanup_remote_child_exit }}
+      cleanup_remote_stdout_eof: ${{ steps.cleanup.outputs.cleanup_remote_stdout_eof }}
+      cleanup_remote_timed_out: ${{ steps.cleanup.outputs.cleanup_remote_timed_out }}
+      cleanup_remote_diagnostic_status: ${{ steps.cleanup.outputs.cleanup_remote_diagnostic_status }}
       cleanup_exports_status: ${{ steps.cleanup.outputs.cleanup_exports_status }}
       cleanup_export_status: ${{ steps.cleanup.outputs.cleanup_export_status }}
       ssh_cleanup_status: ${{ steps.cleanup_ssh.outputs.ssh_cleanup_status }}
@@ -2101,6 +2106,9 @@ jobs:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           CLEANUP_IDENTITY_STATUS: ${{ steps.revalidate-finalizer.outputs.cleanup_identity_status }}
+          TARGET_SHA: ${{ github.sha }}
+          APP_TARGET_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
+          PROFILE_ID: ${{ inputs.profile_id }}
         run: |
           set -u
           umask 077
@@ -2111,7 +2119,12 @@ jobs:
           cleanup_status=1
           cleanup_remote_ssh_exit_code=255
           cleanup_remote_stage=unknown
+          cleanup_remote_dispatch_exit_code=unknown
+          cleanup_remote_child_state=unknown
           cleanup_remote_child_exit=unknown
+          cleanup_remote_stdout_eof=unknown
+          cleanup_remote_timed_out=unknown
+          cleanup_remote_diagnostic_status=1
           cleanup_exports_status=1
           cleanup_export_status=1
           [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]] || HOST_TOOLS_SHA=""
@@ -2184,30 +2197,94 @@ jobs:
           # handoff validation: setup may have committed state already.
           if [[ "$CLEANUP_IDENTITY_STATUS" == 0 && -s "$input_path" \
             && -s "$ssh_dir/config" && -s "$ssh_dir/id_ed25519" ]]; then
-            set +e
-            ssh -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-              -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
-              /usr/bin/python3.12 -I -B /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
-              external-cleanup < "$input_path" > "$ssh_output_file" 2>&1
-            cleanup_status="$?"
-            cleanup_remote_ssh_exit_code="$cleanup_status"
+            if [[ ! -e "$ssh_output_file" && ! -L "$ssh_output_file" ]]; then
+              install -m 600 /dev/null "$ssh_output_file"
+            fi
             if [[ -f "$ssh_output_file" && ! -L "$ssh_output_file" ]] \
-              && [[ "$(stat -c '%s' -- "$ssh_output_file" 2>/dev/null || echo 999999)" =~ ^[0-9]+$ ]] \
-              && (( $(stat -c '%s' -- "$ssh_output_file" 2>/dev/null || echo 999999) <= 512 )); then
-              diagnostic_count=0
-              while IFS= read -r diagnostic_line; do
-                if [[ "$diagnostic_line" =~ ^RETAINED_CLEANUP_DIAGNOSTIC\ schema=1\ stage=(lock|input|identity|release_binding|run_root|external_vote_recovery|orphan_cleanup|matrix_cleanup|export_cleanup|complete|dispatcher|timeout|unknown)\ child_exit=([0-9]{1,3})$ ]]; then
-                  diagnostic_count=$((diagnostic_count + 1))
-                  if (( diagnostic_count == 1 )); then
-                    cleanup_remote_stage="${BASH_REMATCH[1]}"
-                    cleanup_remote_child_exit="${BASH_REMATCH[2]}"
-                  fi
+              && [[ "$(stat -c '%u:%a:%h' -- "$ssh_output_file" 2>/dev/null || true)" == "$(id -u):600:1" ]]; then
+              set +e
+              ssh -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+                -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+                -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+                /usr/bin/python3.12 -I -B /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+                external-cleanup --run-attempt "$GITHUB_RUN_ATTEMPT" \
+                --profile-id "$PROFILE_ID" < "$input_path" > "$ssh_output_file" 2>&1
+              cleanup_status="$?"
+              cleanup_remote_ssh_exit_code="$cleanup_status"
+              set -e
+              parsed_cleanup_diagnostic="$(/usr/bin/python3 - "$ssh_output_file" "$TARGET_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_RUN_ID" "$PROFILE_ID" <<'PY' 2>/dev/null
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          expected = sys.argv[2:]
+          try:
+              before = path.lstat()
+              if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                      or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600
+                      or before.st_size > 1024):
+                  raise SystemExit(1)
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                      raise SystemExit(1)
+                  raw = os.read(descriptor, 1025)
+                  after = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              if len(raw) > 1024 or (after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns) != (
+                      before.st_dev, before.st_ino, before.st_size,
+                      before.st_mtime_ns, before.st_ctime_ns):
+                  raise SystemExit(1)
+              match = re.fullmatch(
+                  rb"RETAINED_CLEANUP_DIAGNOSTIC schema=2 "
+                  rb"stage=(lock|input|identity|release_binding|run_root|external_vote_recovery|"
+                  rb"orphan_cleanup|matrix_cleanup|export_cleanup|complete|dispatcher|timeout|unknown) "
+                  rb"dispatcher_exit=(0|[1-9][0-9]{0,2}) "
+                  rb"child_state=(not_started|running|exited|unknown) "
+                  rb"child_exit=(unknown|0|[1-9][0-9]{0,2}) "
+                  rb"stdout_eof=(true|false|unknown) timed_out=(true|false) "
+                  rb"source_sha=([0-9a-f]{40}) app_sha=([0-9a-f]{40}) "
+                  rb"run_id=([1-9][0-9]{0,31}) run_attempt=([1-9][0-9]{0,31}) "
+                  rb"load_run_id=([1-9][0-9]{0,31}) "
+                  rb"profile=([A-Za-z0-9][A-Za-z0-9._-]{0,63})\n",
+                  raw,
+              )
+              if match is None:
+                  raise SystemExit(1)
+              stage, dispatch_exit, child_state, child_exit, eof, timed_out, source, app, run_id, attempt, load_run_id, profile = (
+                  item.decode("ascii") for item in match.groups()
+              )
+              if [source, app, run_id, attempt, load_run_id, profile] != expected:
+                  raise SystemExit(1)
+              if (timed_out == "true") != (stage == "timeout"):
+                  raise SystemExit(1)
+              if timed_out == "true" and dispatch_exit != "124":
+                  raise SystemExit(1)
+              if child_state == "exited" and child_exit == "unknown":
+                  raise SystemExit(1)
+              if child_state in {"running", "not_started"} and child_exit != "unknown":
+                  raise SystemExit(1)
+              if child_state == "not_started" and eof != "unknown":
+                  raise SystemExit(1)
+          except (OSError, ValueError):
+              raise SystemExit(1)
+          print("\t".join((stage, dispatch_exit, child_state, child_exit, eof, timed_out)))
+          PY
+              )"
+              if [[ -n "$parsed_cleanup_diagnostic" ]]; then
+                IFS=$'\t' read -r cleanup_remote_stage cleanup_remote_dispatch_exit_code \
+                  cleanup_remote_child_state cleanup_remote_child_exit cleanup_remote_stdout_eof \
+                  cleanup_remote_timed_out <<< "$parsed_cleanup_diagnostic"
+                cleanup_remote_diagnostic_status=0
+                if [[ "$cleanup_remote_dispatch_exit_code" != "$cleanup_remote_ssh_exit_code" ]]; then
+                  cleanup_remote_diagnostic_status=1
                 fi
-              done < "$ssh_output_file"
-              if (( diagnostic_count != 1 )); then
-                cleanup_remote_stage=unknown
-                cleanup_remote_child_exit=unknown
               fi
             fi
             rm -f -- "$ssh_output_file"
@@ -2270,14 +2347,25 @@ jobs:
             fi
             set -e
           fi
+          if [[ "$cleanup_remote_diagnostic_status" != 0 ]]; then
+            cleanup_status=1
+          fi
           echo "cleanup_status=$cleanup_status" >> "$GITHUB_OUTPUT"
           echo "cleanup_remote_ssh_exit_code=$cleanup_remote_ssh_exit_code" >> "$GITHUB_OUTPUT"
           echo "cleanup_remote_stage=$cleanup_remote_stage" >> "$GITHUB_OUTPUT"
+          echo "cleanup_remote_dispatch_exit_code=$cleanup_remote_dispatch_exit_code" >> "$GITHUB_OUTPUT"
+          echo "cleanup_remote_child_state=$cleanup_remote_child_state" >> "$GITHUB_OUTPUT"
           echo "cleanup_remote_child_exit=$cleanup_remote_child_exit" >> "$GITHUB_OUTPUT"
+          echo "cleanup_remote_stdout_eof=$cleanup_remote_stdout_eof" >> "$GITHUB_OUTPUT"
+          echo "cleanup_remote_timed_out=$cleanup_remote_timed_out" >> "$GITHUB_OUTPUT"
+          echo "cleanup_remote_diagnostic_status=$cleanup_remote_diagnostic_status" >> "$GITHUB_OUTPUT"
           echo "cleanup_exports_status=$cleanup_exports_status" >> "$GITHUB_OUTPUT"
           echo "cleanup_export_status=$cleanup_export_status" >> "$GITHUB_OUTPUT"
-          printf 'External cleanup diagnostic: ssh_exit=%s stage=%s child_exit=%s\n' \
-            "$cleanup_remote_ssh_exit_code" "$cleanup_remote_stage" "$cleanup_remote_child_exit" >> "$GITHUB_STEP_SUMMARY"
+          printf 'External cleanup diagnostic: ssh_exit=%s stage=%s dispatch_exit=%s child_state=%s child_exit=%s stdout_eof=%s timed_out=%s bound=%s\n' \
+            "$cleanup_remote_ssh_exit_code" "$cleanup_remote_stage" \
+            "$cleanup_remote_dispatch_exit_code" "$cleanup_remote_child_state" \
+            "$cleanup_remote_child_exit" "$cleanup_remote_stdout_eof" \
+            "$cleanup_remote_timed_out" "$cleanup_remote_diagnostic_status" >> "$GITHUB_STEP_SUMMARY"
           # Keep status-bearing cleanup observable to the final gate.  The
           # gate consumes these explicit values before handoff diagnostics.
           exit 0
@@ -2347,14 +2435,25 @@ jobs:
           ORIGIN_CLEANUP_STATUS: ${{ steps.cleanup.outputs.cleanup_status }}
           ORIGIN_CLEANUP_REMOTE_SSH_EXIT: ${{ steps.cleanup.outputs.cleanup_remote_ssh_exit_code }}
           ORIGIN_CLEANUP_REMOTE_STAGE: ${{ steps.cleanup.outputs.cleanup_remote_stage }}
+          ORIGIN_CLEANUP_REMOTE_DISPATCH_EXIT: ${{ steps.cleanup.outputs.cleanup_remote_dispatch_exit_code }}
+          ORIGIN_CLEANUP_REMOTE_CHILD_STATE: ${{ steps.cleanup.outputs.cleanup_remote_child_state }}
           ORIGIN_CLEANUP_REMOTE_CHILD_EXIT: ${{ steps.cleanup.outputs.cleanup_remote_child_exit }}
+          ORIGIN_CLEANUP_REMOTE_STDOUT_EOF: ${{ steps.cleanup.outputs.cleanup_remote_stdout_eof }}
+          ORIGIN_CLEANUP_REMOTE_TIMED_OUT: ${{ steps.cleanup.outputs.cleanup_remote_timed_out }}
+          ORIGIN_CLEANUP_REMOTE_DIAGNOSTIC_STATUS: ${{ steps.cleanup.outputs.cleanup_remote_diagnostic_status }}
           ORIGIN_CLEANUP_EXPORTS_STATUS: ${{ steps.cleanup.outputs.cleanup_exports_status }}
           ORIGIN_SSH_CLEANUP_STATUS: ${{ steps.cleanup_ssh.outputs.ssh_cleanup_status }}
           ORIGIN_CLEANUP_IDENTITY_STATUS: ${{ steps.revalidate-finalizer.outputs.cleanup_identity_status }}
+          ORIGIN_SOURCE_SHA: ${{ github.sha }}
+          ORIGIN_APP_SHA: ${{ needs.validate-external-inputs.outputs.app_target_sha }}
+          ORIGIN_RUN_ID: ${{ github.run_id }}
+          ORIGIN_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ORIGIN_PROFILE_ID: ${{ inputs.profile_id }}
         run: |
           set +e
           /usr/bin/python3 - <<'PY'
           import os
+          import re
 
           def classify(name: str, allowed: dict[str, str]) -> str:
               value = os.environ.get(name)
@@ -2386,11 +2485,47 @@ jobs:
                       "orphan_cleanup": "orphan_cleanup", "matrix_cleanup": "matrix_cleanup",
                       "export_cleanup": "export_cleanup", "complete": "complete",
                       "dispatcher": "dispatcher", "timeout": "timeout", "unknown": "unknown",
-                  },
+                },
+              ),
+              "cleanup_dispatch_exit": classify(
+                  "ORIGIN_CLEANUP_REMOTE_DISPATCH_EXIT",
+                  {str(value): str(value) for value in range(256)},
+              ),
+              "cleanup_child_state": classify(
+                  "ORIGIN_CLEANUP_REMOTE_CHILD_STATE",
+                  {value: value for value in ("not_started", "running", "exited", "unknown")},
               ),
               "cleanup_child_exit": classify(
                   "ORIGIN_CLEANUP_REMOTE_CHILD_EXIT",
                   {str(value): str(value) for value in range(256)},
+              ),
+              "cleanup_stdout_eof": classify(
+                  "ORIGIN_CLEANUP_REMOTE_STDOUT_EOF",
+                  {value: value for value in ("true", "false", "unknown")},
+              ),
+              "cleanup_timed_out": classify(
+                  "ORIGIN_CLEANUP_REMOTE_TIMED_OUT", {"true": "true", "false": "false"}
+              ),
+              "cleanup_diagnostic": classify(
+                  "ORIGIN_CLEANUP_REMOTE_DIAGNOSTIC_STATUS", {"0": "bound", "1": "invalid"}
+              ),
+              "binding_source": (
+                  "bound"
+                  if re.fullmatch(r"[0-9a-f]{40}", os.environ.get("ORIGIN_SOURCE_SHA", ""))
+                  and os.environ.get("ORIGIN_SOURCE_SHA") == os.environ.get("GITHUB_SHA")
+                  else "invalid"
+              ),
+              "binding_app": (
+                  "bound"
+                  if re.fullmatch(r"[0-9a-f]{40}", os.environ.get("ORIGIN_APP_SHA", ""))
+                  else "invalid"
+              ),
+              "binding_run": (
+                  "bound"
+                  if re.fullmatch(r"[1-9][0-9]{0,31}", os.environ.get("ORIGIN_RUN_ID", ""))
+                  and re.fullmatch(r"[1-9][0-9]{0,31}", os.environ.get("ORIGIN_RUN_ATTEMPT", ""))
+                  and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", os.environ.get("ORIGIN_PROFILE_ID", ""))
+                  else "invalid"
               ),
               "exports": classify("ORIGIN_CLEANUP_EXPORTS_STATUS", {"0": "ok", "1": "failed"}),
               "ssh_cleanup": classify("ORIGIN_SSH_CLEANUP_STATUS", {"0": "ok", "1": "failed"}),
@@ -2408,7 +2543,15 @@ jobs:
                   ("cleanup", "ok"),
                   ("cleanup_ssh_exit", "0"),
                   ("cleanup_stage", "complete"),
+                  ("cleanup_dispatch_exit", "0"),
+                  ("cleanup_child_state", "exited"),
                   ("cleanup_child_exit", "0"),
+                  ("cleanup_stdout_eof", "true"),
+                  ("cleanup_timed_out", "false"),
+                  ("cleanup_diagnostic", "bound"),
+                  ("binding_source", "bound"),
+                  ("binding_app", "bound"),
+                  ("binding_run", "bound"),
                   ("exports", "ok"),
                   ("ssh_cleanup", "ok"),
                   ("identity", "ok"),
@@ -2440,10 +2583,21 @@ jobs:
                   raise RuntimeError("cleanup diagnostic directory is unsafe")
               diagnostic_path = evidence_root / "cleanup-diagnostic.json"
               payload = json.dumps(
-                  {"schema": 1, "conditions": fields, "explicit_conditions_met": explicit_value},
+                  {
+                      "schema": 2,
+                      "source_sha": os.environ.get("ORIGIN_SOURCE_SHA", ""),
+                      "app_sha": os.environ.get("ORIGIN_APP_SHA", ""),
+                      "run_id": os.environ.get("ORIGIN_RUN_ID", ""),
+                      "run_attempt": os.environ.get("ORIGIN_RUN_ATTEMPT", ""),
+                      "profile_id": os.environ.get("ORIGIN_PROFILE_ID", ""),
+                      "conditions": fields,
+                      "explicit_conditions_met": explicit_value,
+                  },
                   sort_keys=True,
                   separators=(",", ":"),
               ).encode("ascii") + b"\n"
+              if len(payload) > 16384:
+                  raise RuntimeError("cleanup diagnostic exceeds its fixed size cap")
               descriptor = os.open(
                   diagnostic_path,
                   os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -2475,7 +2629,7 @@ jobs:
 
       - name: Publish origin evidence
         id: publish-origin
-        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' && steps.cleanup_ssh.outcome == 'success' && steps.external-finalize.outputs.remote_status == '0' && steps.external-finalize.outputs.observer_ready == '1' && steps.external-finalize.outputs.finalize_status == '0' && steps.cleanup.outputs.cleanup_status == '0' && steps.cleanup.outputs.cleanup_remote_ssh_exit_code == '0' && steps.cleanup.outputs.cleanup_remote_stage == 'complete' && steps.cleanup.outputs.cleanup_remote_child_exit == '0' && steps.cleanup.outputs.cleanup_exports_status == '0' && steps.cleanup_ssh.outputs.ssh_cleanup_status != '' && steps.cleanup_ssh.outputs.ssh_cleanup_status == '0' && steps.revalidate-finalizer.outputs.cleanup_identity_status == '0' }}
+        if: ${{ always() && needs.namespace-containment-barrier.outputs.namespace_closed_status == '0' && needs.namespace-containment-manual-barrier.outputs.manual_required == '0' && steps.cleanup_ssh.outcome == 'success' && steps.external-finalize.outputs.remote_status == '0' && steps.external-finalize.outputs.observer_ready == '1' && steps.external-finalize.outputs.finalize_status == '0' && steps.cleanup.outputs.cleanup_status == '0' && steps.cleanup.outputs.cleanup_remote_ssh_exit_code == '0' && steps.cleanup.outputs.cleanup_remote_diagnostic_status == '0' && steps.cleanup.outputs.cleanup_remote_dispatch_exit_code == '0' && steps.cleanup.outputs.cleanup_remote_stage == 'complete' && steps.cleanup.outputs.cleanup_remote_child_state == 'exited' && steps.cleanup.outputs.cleanup_remote_child_exit == '0' && steps.cleanup.outputs.cleanup_remote_stdout_eof == 'true' && steps.cleanup.outputs.cleanup_remote_timed_out == 'false' && steps.cleanup.outputs.cleanup_exports_status == '0' && steps.cleanup_ssh.outputs.ssh_cleanup_status != '' && steps.cleanup_ssh.outputs.ssh_cleanup_status == '0' && steps.revalidate-finalizer.outputs.cleanup_identity_status == '0' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-production-external-load-origin-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2682,6 +2836,13 @@ jobs:
             && "${{ needs.fixture-finalize.outputs.observer_ready }}" == 1 \
             && "${{ needs.fixture-finalize.outputs.finalize_status }}" == 0 \
             && "${{ needs.fixture-finalize.outputs.cleanup_status }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.cleanup_remote_diagnostic_status }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.cleanup_remote_dispatch_exit_code }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.cleanup_remote_stage }}" == complete \
+            && "${{ needs.fixture-finalize.outputs.cleanup_remote_child_state }}" == exited \
+            && "${{ needs.fixture-finalize.outputs.cleanup_remote_child_exit }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.cleanup_remote_stdout_eof }}" == true \
+            && "${{ needs.fixture-finalize.outputs.cleanup_remote_timed_out }}" == false \
             && "${{ needs.fixture-finalize.outputs.cleanup_exports_status }}" == 0 \
             && "${{ needs.fixture-finalize.outputs.ssh_cleanup_status }}" == 0 \
             && "${{ needs.fixture-finalize.outputs.cleanup_identity_status }}" == 0 \
@@ -2962,6 +3123,13 @@ jobs:
           needs.fixture-finalize.outputs.observer_ready == '1' &&
           needs.fixture-finalize.outputs.finalize_status == '0' &&
           needs.fixture-finalize.outputs.cleanup_status == '0' &&
+          needs.fixture-finalize.outputs.cleanup_remote_diagnostic_status == '0' &&
+          needs.fixture-finalize.outputs.cleanup_remote_dispatch_exit_code == '0' &&
+          needs.fixture-finalize.outputs.cleanup_remote_stage == 'complete' &&
+          needs.fixture-finalize.outputs.cleanup_remote_child_state == 'exited' &&
+          needs.fixture-finalize.outputs.cleanup_remote_child_exit == '0' &&
+          needs.fixture-finalize.outputs.cleanup_remote_stdout_eof == 'true' &&
+          needs.fixture-finalize.outputs.cleanup_remote_timed_out == 'false' &&
           needs.fixture-finalize.outputs.cleanup_exports_status == '0' &&
           needs.fixture-finalize.outputs.ssh_cleanup_status != '' &&
           needs.fixture-finalize.outputs.ssh_cleanup_status == '0' &&
@@ -3013,6 +3181,13 @@ jobs:
           test "${{ needs.fixture-finalize.outputs.observer_ready }}" = 1 || { echo "Origin observer barrier was not reached." >&2; exit 1; }
           test "${{ needs.fixture-finalize.outputs.finalize_status }}" = 0 || { echo "External fixture finalization failed." >&2; exit 1; }
           test "${{ needs.fixture-finalize.outputs.cleanup_status }}" = 0 || { echo "Exact external-load cleanup failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_diagnostic_status }}" = 0 || { echo "Bound cleanup diagnostic is unavailable or invalid." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_dispatch_exit_code }}" = 0 || { echo "Cleanup dispatcher did not complete successfully." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_stage }}" = complete || { echo "Cleanup helper stage is incomplete." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_child_state }}" = exited || { echo "Cleanup helper exit state is unknown." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_child_exit }}" = 0 || { echo "Cleanup helper failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_stdout_eof }}" = true || { echo "Cleanup helper output stream did not close." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_remote_timed_out }}" = false || { echo "Cleanup helper exceeded its bounded wait." >&2; exit 1; }
           test "${{ needs.fixture-finalize.outputs.cleanup_exports_status }}" = 0 || { echo "External-load private export cleanup failed." >&2; exit 1; }
           test "${{ needs.fixture-finalize.outputs.ssh_cleanup_status }}" = 0 || { echo "Finalizer SSH cleanup failed." >&2; exit 1; }
           test "${{ needs.fixture-finalize.outputs.cleanup_identity_status }}" = 0 || { echo "Cleanup identity validation failed." >&2; exit 1; }

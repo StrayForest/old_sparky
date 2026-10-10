@@ -7,13 +7,15 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, event, or_, select, update
 
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.tournament_teams import (
     materialize_assignment_run_teams,
 )
-from python_packages.platform_infra.db import dispose_engine, session_factory
+from python_packages.platform_infra.csrf import csrf_cookie_name
+from python_packages.platform_infra.config import get_settings
+from python_packages.platform_infra.db import dispose_engine, engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
     DeadlockProfile,
@@ -27,11 +29,17 @@ from python_packages.platform_infra.models import (
     TournamentInvite,
     TournamentMatch,
     TournamentParticipant,
+    TournamentTeam,
+    TournamentTeamMember,
     User,
     UserRole,
     UserSession,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     INTEGRATION_PASSWORD_HASH,
@@ -42,7 +50,9 @@ from tests.platform_integration_password import (
 class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-admin-{uuid4().hex[:8]}"
-        self.base_url = "http://testserver"
+        self.base_url = "https://testserver"
+        self.use_distinct_fixture_client_ips = False
+        self.fixture_client_ip_index = 1
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup_test_data()
@@ -78,9 +88,20 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await db_session.commit()
 
     async def _new_client(self) -> httpx.AsyncClient:
+        transport_kwargs = {}
+        if self.use_distinct_fixture_client_ips:
+            if self.fixture_client_ip_index > 6:
+                raise AssertionError("admin-delete fixture exhausted its synthetic client IPs")
+            transport_kwargs["client"] = (
+                f"127.0.0.{self.fixture_client_ip_index}",
+                12345,
+            )
+            self.fixture_client_ip_index += 1
+        else:
+            transport_kwargs["client"] = next_test_asgi_peer()
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
+                transport=httpx.ASGITransport(app=self.app, **transport_kwargs),
                 base_url=self.base_url,
             )
         )
@@ -104,6 +125,8 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                         "password": INTEGRATION_PASSWORD,
                         "display_name": display_name,
                     },
+
+                    headers=same_origin_request_headers(client),
                 ),
                 201,
             )
@@ -358,6 +381,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -367,6 +391,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -374,6 +399,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -389,6 +415,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 2",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -400,6 +427,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "status": "completed",
                     "note": "Freeze organizer workflow while a disputed result is reviewed.",
                 },
+                headers=same_origin_request_headers(admin_user["client"]),
             ),
             200,
         )
@@ -415,6 +443,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
         frozen_match_update = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/matches/{created_match['id']}/status",
             json={"status": "live"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(frozen_match_update.status_code, 409, frozen_match_update.text)
         self.assertIn(
@@ -475,6 +504,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "status": "in_progress",
                     "note": "Return organizer control after dispute review completes.",
                 },
+                headers=same_origin_request_headers(admin_user["client"]),
             ),
             200,
         )
@@ -486,6 +516,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{created_match['id']}/status",
                 json={"status": "live"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -499,6 +530,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_score": 0,
                     "note": "Organizer control restored after admin reopen.",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -660,6 +692,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -669,6 +702,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -676,6 +710,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -691,6 +726,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "away_label": "Team 2",
                     "scheduled_at": None,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -708,6 +744,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
         missing_note = await admin_user["client"].patch(
             f"/api/v1/admin/tournaments/{slug}",
             json={"visibility": "public"},
+            headers=same_origin_request_headers(admin_user["client"]),
         )
         self.assertEqual(missing_note.status_code, 422, missing_note.text)
         self.assertIn(
@@ -722,6 +759,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "note": "Expose bracket reads during temporary public review.",
                 },
+                headers=same_origin_request_headers(admin_user["client"]),
             ),
             200,
         )
@@ -751,6 +789,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "note": "Restore scoped reads after public review completes.",
                 },
+                headers=same_origin_request_headers(admin_user["client"]),
             ),
             200,
         )
@@ -782,6 +821,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "private_tournament_credits": 5,
                     "note": "Approved expanded organizer capacity.",
                 },
+                headers=same_origin_request_headers(regular_admin["client"]),
             ),
             200,
         )
@@ -794,6 +834,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                 "is_admin": True,
                 "note": "Regular admins cannot grant admin access.",
             },
+            headers=same_origin_request_headers(regular_admin["client"]),
         )
         self.assertEqual(blocked_role_update.status_code, 403, blocked_role_update.text)
 
@@ -804,6 +845,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "is_admin": True,
                     "note": "Add a second platform administrator.",
                 },
+                headers=same_origin_request_headers(superadmin["client"]),
             ),
             200,
         )
@@ -912,6 +954,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                 "confirm": "DELETE_TEST_DATA",
                 "note": "Only superadmins may clean test data.",
             },
+            headers=same_origin_request_headers(regular_admin["client"]),
         )
         self.assertEqual(blocked.status_code, 403, blocked.text)
 
@@ -922,6 +965,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "confirm": "DELETE_TEST_DATA",
                     "note": "Remove inspected synthetic data.",
                 },
+                headers=same_origin_request_headers(superadmin["client"]),
             ),
             200,
         )
@@ -952,6 +996,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -963,6 +1008,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                 "status": "registration_open",
                 "note": "Reopen registration after schedule review.",
             },
+            headers=same_origin_request_headers(admin_user["client"]),
         )
         self.assertEqual(missing_schedule.status_code, 422, missing_schedule.text)
         self.assertIn("Opening registration requires new", missing_schedule.text)
@@ -985,6 +1031,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "starts_at": tournament_start.isoformat(),
                     "note": "Reopen registration with a completely new workflow schedule.",
                 },
+                headers=same_origin_request_headers(admin_user["client"]),
             ),
             200,
         )
@@ -996,6 +1043,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1011,6 +1059,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                 "starts_at": tournament_start.isoformat(),
                 "note": "Attempt reopening a locked roster.",
             },
+            headers=same_origin_request_headers(admin_user["client"]),
         )
         self.assertEqual(locked_reopen.status_code, 409, locked_reopen.text)
 
@@ -1027,6 +1076,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1036,6 +1086,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1043,6 +1094,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/join",
                 json={"entry_type": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1050,6 +1102,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1064,6 +1117,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "home_label": "Team 1",
                     "away_label": "Team 2",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1075,6 +1129,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                 "confirmation_name": "wrong",
                 "note": "Verify exact-name deletion guard.",
             },
+            headers=same_origin_request_headers(admin_user["client"]),
         )
         self.assertEqual(wrong_confirmation.status_code, 422, wrong_confirmation.text)
 
@@ -1101,6 +1156,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                 "confirmation_name": tournament["name"],
                 "note": "Do not orphan a prepared R2 banner.",
             },
+            headers=same_origin_request_headers(admin_user["client"]),
         )
         self.assertEqual(media_blocked.status_code, 409, media_blocked.text)
         self.assertEqual(
@@ -1123,6 +1179,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                 "confirmation_name": tournament["name"],
                 "note": "Remove obsolete tournament and all scoped data.",
             },
+            headers=same_origin_request_headers(admin_user["client"]),
         )
         self.assertEqual(deleted.status_code, 204, deleted.text)
 
@@ -1151,12 +1208,30 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             self.assertEqual(audit.payload["slug"], slug)
 
     async def test_superadmin_user_delete_enforces_boundaries_and_invalidates_cache(self) -> None:
-        regular_admin = await self._register_user("user-delete-admin")
-        superadmin = await self._register_user("user-delete-superadmin")
-        target = await self._register_user("user-delete-target")
-        target_superadmin = await self._register_user("user-delete-target-superadmin")
-        target_owner = await self._register_user("user-delete-owner")
-        target_media = await self._register_user("user-delete-media")
+        # These synthetic fixture registrations exercise the admin delete
+        # boundary. Keep the real origin check and limiter; give each signup a
+        # distinct loopback ASGI peer address so this six-account fixture does
+        # not trip the per-IP registration window before the scenario begins.
+        # The configured __Host- session cookie is Secure, so this scenario's
+        # ASGI clients use HTTPS and submit their own issued CSRF token per request.
+        self.base_url = "https://testserver"
+        self.use_distinct_fixture_client_ips = True
+
+        async def register_authenticated_fixture(label: str) -> dict[str, object]:
+            account = await self._register_user(label)
+            client = account["client"]
+            token = client.cookies.get(csrf_cookie_name(get_settings()))
+            self.assertIsNotNone(token, "registration should issue a CSRF cookie")
+            return account
+
+        regular_admin = await register_authenticated_fixture("user-delete-admin")
+        superadmin = await register_authenticated_fixture("user-delete-superadmin")
+        target = await register_authenticated_fixture("user-delete-target")
+        target_superadmin = await register_authenticated_fixture(
+            "user-delete-target-superadmin"
+        )
+        target_owner = await register_authenticated_fixture("user-delete-owner")
+        target_media = await register_authenticated_fixture("user-delete-media")
         await self._grant_role(regular_admin["user_id"], "admin")
         await self._grant_role(superadmin["user_id"], "superadmin")
         await self._grant_role(target_superadmin["user_id"], "superadmin")
@@ -1165,6 +1240,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             "DELETE",
             f"/api/v1/admin/users/{target['user_id']}",
             json={"confirmation": target["email"], "note": "Not allowed."},
+            headers=same_origin_request_headers(regular_admin["client"]),
         )
         self.assertEqual(forbidden.status_code, 403, forbidden.text)
 
@@ -1172,6 +1248,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             "DELETE",
             f"/api/v1/admin/users/{superadmin['user_id']}",
             json={"confirmation": superadmin["email"], "note": "Do not self delete."},
+            headers=same_origin_request_headers(superadmin["client"]),
         )
         self.assertEqual(self_delete.status_code, 409, self_delete.text)
 
@@ -1179,6 +1256,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             "DELETE",
             f"/api/v1/admin/users/{target_superadmin['user_id']}",
             json={"confirmation": target_superadmin["email"], "note": "Protect superadmin."},
+            headers=same_origin_request_headers(superadmin["client"]),
         )
         self.assertEqual(protected_role.status_code, 409, protected_role.text)
 
@@ -1186,6 +1264,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             "DELETE",
             f"/api/v1/admin/users/{target['user_id']}",
             json={"confirmation": "wrong", "note": "Check exact confirmation."},
+            headers=same_origin_request_headers(superadmin["client"]),
         )
         self.assertEqual(wrong_confirmation.status_code, 422, wrong_confirmation.text)
 
@@ -1215,6 +1294,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(target_owner["client"]),
             ),
             201,
         )
@@ -1222,6 +1302,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             "DELETE",
             f"/api/v1/admin/users/{target_owner['user_id']}",
             json={"confirmation": target_owner["email"], "note": "Owned tournament must block."},
+            headers=same_origin_request_headers(superadmin["client"]),
         )
         self.assertEqual(blocked_owner.status_code, 409, blocked_owner.text)
         self.assertEqual(blocked_owner.json()["detail"]["code"], "user_owns_tournaments")
@@ -1231,23 +1312,434 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
             "DELETE",
             f"/api/v1/admin/users/{target_media['user_id']}",
             json={"confirmation": target_media["email"], "note": "Active media must block."},
+            headers=same_origin_request_headers(superadmin["client"]),
         )
         self.assertEqual(blocked_media.status_code, 409, blocked_media.text)
         self.assertEqual(blocked_media.json()["detail"]["code"], "user_media_cleanup_required")
 
+        cascade_tournament_id = str(uuid4())
+        move_target_tournament_id = str(uuid4())
+        cascade_participant_id = str(uuid4())
+        second_cascade_participant_id = str(uuid4())
+        async with session_factory()() as db_session:
+            for tournament_id, suffix in (
+                (cascade_tournament_id, "cascade-membership"),
+                (move_target_tournament_id, "moved-membership"),
+            ):
+                db_session.add(
+                    Tournament(
+                        id=tournament_id,
+                        slug=f"{self.prefix}-{suffix}",
+                        name=f"{self.prefix}-{suffix}",
+                        format_slug="solo",
+                        organizer_user_id=superadmin["user_id"],
+                        visibility="public",
+                        status="registration_open",
+                    )
+                )
+            db_session.add(
+                TournamentParticipant(
+                    id=cascade_participant_id,
+                    tournament_id=cascade_tournament_id,
+                    user_id=target["user_id"],
+                    entry_type="solo",
+                    status="registered",
+                )
+            )
+            await db_session.commit()
+            generation_before_user_cascade = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == cascade_tournament_id
+                )
+            )
+        self.assertIsNotNone(generation_before_user_cascade)
+        self.assertEqual(generation_before_user_cascade, 1)
+
+        async with session_factory()() as db_session:
+            participant = await db_session.get(
+                TournamentParticipant, cascade_participant_id
+            )
+            self.assertIsNotNone(participant)
+            participant.status = "checked_in"
+            await db_session.commit()
+            cascade_generation = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == cascade_tournament_id
+                )
+            )
+            self.assertEqual(cascade_generation, 2)
+
+            # Same-value DML must not invalidate an otherwise-current
+            # projection; this exercises the database trigger's semantic
+            # no-op check rather than SQLAlchemy dirty-state detection.
+            await db_session.execute(
+                update(TournamentParticipant)
+                .where(TournamentParticipant.id == cascade_participant_id)
+                .values(status="checked_in")
+            )
+            await db_session.commit()
+            cascade_generation = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == cascade_tournament_id
+                )
+            )
+            self.assertEqual(cascade_generation, 2)
+
+            await db_session.execute(
+                update(TournamentParticipant)
+                .where(TournamentParticipant.id == cascade_participant_id)
+                .values(status="withdrawn")
+            )
+            await db_session.rollback()
+            cascade_generation = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == cascade_tournament_id
+                )
+            )
+            self.assertEqual(cascade_generation, 2)
+
+            # Use SQL after rollback: the ORM object was expired by rollback,
+            # and this checks the database trigger on a direct row mutation.
+            await db_session.execute(
+                update(TournamentParticipant)
+                .where(TournamentParticipant.id == cascade_participant_id)
+                .values(tournament_id=move_target_tournament_id)
+            )
+            await db_session.commit()
+            moved_generation = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == move_target_tournament_id
+                )
+            )
+            self.assertEqual(moved_generation, 1)
+            cascade_generation = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == cascade_tournament_id
+                )
+            )
+            self.assertEqual(cascade_generation, 3)
+
+            # The target remains a participant in two tournaments. This makes
+            # the destructive admin path prove it locks both aggregates in
+            # canonical ID order before it locks User.
+            db_session.add(
+                TournamentParticipant(
+                    id=second_cascade_participant_id,
+                    tournament_id=cascade_tournament_id,
+                    user_id=target["user_id"],
+                    entry_type="solo",
+                    status="registered",
+                )
+            )
+            await db_session.commit()
+            cascade_generation = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == cascade_tournament_id
+                )
+            )
+            self.assertEqual(cascade_generation, 4)
+
+            tournament = await db_session.get(
+                Tournament, move_target_tournament_id
+            )
+            self.assertIsNotNone(tournament)
+            tournament.organizer_user_id = regular_admin["user_id"]
+            await db_session.commit()
+            generation_before_user_cascade = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == move_target_tournament_id
+                )
+            )
+            self.assertEqual(generation_before_user_cascade, 2)
+
+        await self._lock_deadlock_roster(
+            f"{self.prefix}-moved-membership", superadmin["user_id"]
+        )
+        await self._lock_deadlock_roster(
+            f"{self.prefix}-cascade-membership", superadmin["user_id"]
+        )
+        async with session_factory()() as db_session:
+            team_id = await db_session.scalar(
+                select(TournamentTeam.id).where(
+                    TournamentTeam.tournament_id == move_target_tournament_id
+                )
+            )
+            second_team_id = await db_session.scalar(
+                select(TournamentTeam.id).where(
+                    TournamentTeam.tournament_id == cascade_tournament_id
+                )
+            )
+            self.assertIsNotNone(team_id)
+            self.assertIsNotNone(second_team_id)
+            db_session.add(
+                TournamentTeamMember(
+                    id=str(uuid4()),
+                    tournament_id=move_target_tournament_id,
+                    team_id=team_id,
+                    user_id=target["user_id"],
+                    slot_number=0,
+                    roster_role="captain",
+                    assigned_role="Carry",
+                    strength=1.0,
+                    rank="Seeker",
+                    subrank=1,
+                )
+            )
+            await db_session.commit()
+            generation_before_user_cascade = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == move_target_tournament_id
+                )
+            )
+            self.assertEqual(generation_before_user_cascade, 3)
+            await db_session.execute(
+                update(TournamentTeamMember)
+                .where(
+                    TournamentTeamMember.tournament_id == move_target_tournament_id,
+                    TournamentTeamMember.user_id == target["user_id"],
+                )
+                .values(user_id=regular_admin["user_id"])
+            )
+            await db_session.commit()
+            self.assertEqual(
+                await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == move_target_tournament_id
+                    )
+                ),
+                4,
+            )
+            await db_session.execute(
+                update(TournamentTeamMember)
+                .where(
+                    TournamentTeamMember.tournament_id == move_target_tournament_id,
+                    TournamentTeamMember.user_id == regular_admin["user_id"],
+                )
+                .values(user_id=target["user_id"])
+            )
+            await db_session.commit()
+            await db_session.execute(
+                update(TournamentTeamMember)
+                .where(
+                    TournamentTeamMember.tournament_id == move_target_tournament_id,
+                    TournamentTeamMember.user_id == target["user_id"],
+                )
+                .values(
+                    tournament_id=cascade_tournament_id,
+                    team_id=second_team_id,
+                )
+            )
+            await db_session.commit()
+            self.assertEqual(
+                await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == move_target_tournament_id
+                    )
+                ),
+                6,
+            )
+            self.assertEqual(
+                await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == cascade_tournament_id
+                    )
+                ),
+                5,
+            )
+            await db_session.execute(
+                update(TournamentTeamMember)
+                .where(
+                    TournamentTeamMember.tournament_id == cascade_tournament_id,
+                    TournamentTeamMember.user_id == target["user_id"],
+                )
+                .values(
+                    tournament_id=move_target_tournament_id,
+                    team_id=team_id,
+                )
+            )
+            await db_session.commit()
+            self.assertEqual(
+                await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == move_target_tournament_id
+                    )
+                ),
+                7,
+            )
+            self.assertEqual(
+                await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == cascade_tournament_id
+                    )
+                ),
+                6,
+            )
+            await db_session.execute(
+                delete(TournamentTeamMember).where(
+                    TournamentTeamMember.tournament_id == move_target_tournament_id,
+                    TournamentTeamMember.user_id == target["user_id"],
+                )
+            )
+            await db_session.commit()
+            self.assertEqual(
+                await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == move_target_tournament_id
+                    )
+                ),
+                8,
+            )
+            db_session.add(
+                TournamentTeamMember(
+                    id=str(uuid4()),
+                    tournament_id=move_target_tournament_id,
+                    team_id=team_id,
+                    user_id=target["user_id"],
+                    slot_number=0,
+                    roster_role="captain",
+                    assigned_role="Carry",
+                    strength=1.0,
+                    rank="Seeker",
+                    subrank=1,
+                )
+            )
+            await db_session.commit()
+            generation_before_user_cascade = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == move_target_tournament_id
+                )
+            )
+            self.assertEqual(generation_before_user_cascade, 9)
+            await db_session.execute(
+                update(Tournament).where(Tournament.id == move_target_tournament_id).values(
+                    organizer_user_id=regular_admin["user_id"]
+                )
+            )
+            await db_session.commit()
+            generation_after_noop_organizer = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == move_target_tournament_id
+                )
+            )
+            self.assertEqual(
+                generation_after_noop_organizer,
+                generation_before_user_cascade,
+            )
+            await db_session.execute(
+                update(Tournament)
+                .where(Tournament.id == move_target_tournament_id)
+                .values(profile_access_generation=0)
+            )
+            await db_session.commit()
+            self.assertEqual(
+                await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == move_target_tournament_id
+                    )
+                ),
+                generation_before_user_cascade + 1,
+            )
+            generation_before_user_cascade += 1
+
+        # Simulate a membership committed between the initial scope read and
+        # the User lock. The endpoint must abort rather than take User->T lock.
+        with patch(
+            "apps.platform_api.app.api.routes.admin_user_delete.tournament_ids_for_profile_access",
+            side_effect=[
+                {cascade_tournament_id},
+                {cascade_tournament_id, move_target_tournament_id},
+            ],
+        ):
+            expanded_scope = await superadmin["client"].request(
+                "DELETE",
+                f"/api/v1/admin/users/{target['user_id']}",
+                json={"confirmation": target["email"], "note": "Exercise expanded lock scope."},
+                headers=same_origin_request_headers(superadmin["client"]),
+            )
+        self.assertEqual(expanded_scope.status_code, 409, expanded_scope.text)
+        self.assertTrue(expanded_scope.json()["detail"].startswith("Удаление заблокировано"))
+
+        lock_sql: list[str] = []
+
+        def capture_lock_sql(
+            _conn: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            normalized = statement.lower()
+            if "for update" in normalized and (
+                "platform.tournaments" in normalized
+                or "platform.users" in normalized
+            ):
+                lock_sql.append(normalized)
+
+        sync_engine = engine().sync_engine
+        event.listen(sync_engine, "before_cursor_execute", capture_lock_sql)
         with patch(
             "apps.platform_api.app.api.routes.admin_user_delete.invalidate_user_session_cache"
         ) as invalidate_cache:
-            deleted = await superadmin["client"].request(
-                "DELETE",
-                f"/api/v1/admin/users/{target['user_id']}",
-                json={"confirmation": target["email"], "note": "Remove the approved account."},
-            )
+            try:
+                deleted = await superadmin["client"].request(
+                    "DELETE",
+                    f"/api/v1/admin/users/{target['user_id']}",
+                    json={"confirmation": target["email"], "note": "Remove the approved account."},
+                    headers=same_origin_request_headers(superadmin["client"]),
+                )
+            finally:
+                event.remove(sync_engine, "before_cursor_execute", capture_lock_sql)
+        tournament_lock_indexes = [
+            index for index, statement in enumerate(lock_sql)
+            if "platform.tournaments" in statement
+        ]
+        user_lock_indexes = [
+            index for index, statement in enumerate(lock_sql)
+            if "platform.users" in statement
+        ]
+        self.assertTrue(tournament_lock_indexes, lock_sql)
+        self.assertTrue(user_lock_indexes, lock_sql)
+        self.assertLess(max(tournament_lock_indexes), min(user_lock_indexes), lock_sql)
+        self.assertIn("order by", lock_sql[tournament_lock_indexes[0]], lock_sql)
         self.assertEqual(deleted.status_code, 204, deleted.text)
         invalidate_cache.assert_called_once_with(target["user_id"])
 
         async with session_factory()() as db_session:
             self.assertIsNone(await db_session.get(User, target["user_id"]))
+            self.assertIsNone(
+                await db_session.scalar(
+                    select(TournamentParticipant.id).where(
+                        TournamentParticipant.tournament_id == move_target_tournament_id,
+                        TournamentParticipant.user_id == target["user_id"],
+                    )
+                )
+            )
+            self.assertIsNone(
+                await db_session.scalar(
+                    select(TournamentTeamMember.id).where(
+                        TournamentTeamMember.tournament_id == move_target_tournament_id,
+                        TournamentTeamMember.user_id == target["user_id"],
+                    )
+                )
+            )
+            generation_after_user_cascade = await db_session.scalar(
+                select(Tournament.profile_access_generation).where(
+                    Tournament.id == move_target_tournament_id
+                )
+            )
+            self.assertEqual(
+                generation_after_user_cascade,
+                generation_before_user_cascade + 2,
+            )
+            self.assertEqual(
+                await db_session.scalar(
+                    select(Tournament.profile_access_generation).where(
+                        Tournament.id == cascade_tournament_id
+                    )
+                ),
+                7,
+            )
             self.assertEqual(
                 await db_session.scalar(
                     select(UserSession.id).where(UserSession.user_id == target["user_id"])

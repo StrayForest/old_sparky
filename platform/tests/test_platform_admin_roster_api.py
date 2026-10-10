@@ -26,7 +26,11 @@ from python_packages.platform_infra.models import (
     User,
     UserRole,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -71,8 +75,8 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
 
@@ -87,6 +91,7 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
                     "password": self.password,
                     "display_name": f"ops-{label}"[:15],
                 },
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(response.status_code, 201, response.text)
         return {"client": client, "user_id": response.json()["user"]["id"]}
@@ -262,7 +267,9 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
         added = self._assert_json(
             await client.post(
                 f"/api/v1/admin/tournaments/{slug}/roster/add-player",
-                headers={"Idempotency-Key": "roster-add-once"},
+                headers=same_origin_request_headers(
+                    client, extra={"Idempotency-Key": "roster-add-once"}
+                ),
                 json=add_payload,
             ),
             200,
@@ -278,7 +285,9 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
         replayed = self._assert_json(
             await client.post(
                 f"/api/v1/admin/tournaments/{slug}/roster/add-player",
-                headers={"Idempotency-Key": "roster-add-once"},
+                headers=same_origin_request_headers(
+                    client, extra={"Idempotency-Key": "roster-add-once"}
+                ),
                 json=add_payload,
             ),
             200,
@@ -293,6 +302,7 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
                 "team_key": "1",
                 "user_id": player_ids[1],
             },
+            headers=same_origin_request_headers(client),
         )
         self.assertEqual(stale.status_code, 409, stale.text)
         self.assertIn("state changed", stale.json()["detail"])
@@ -308,6 +318,7 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
                     "destination_team_key": "2",
                     "destination_slot": 2,
                 },
+                headers=same_origin_request_headers(client),
             ),
             200,
         )
@@ -326,6 +337,7 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
                     "team_key": "1",
                     "user_id": player_ids[1],
                 },
+                headers=same_origin_request_headers(client),
             ),
             200,
         )
@@ -342,6 +354,7 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
                     "team_key": "2",
                     "user_id": player_ids[4],
                 },
+                headers=same_origin_request_headers(client),
             ),
             200,
         )
@@ -357,6 +370,7 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
                     "slot_number": 1,
                     "replacement_user_id": player_ids[5],
                 },
+                headers=same_origin_request_headers(client),
             ),
             200,
         )
@@ -407,6 +421,7 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
                 "user_id": player_id,
                 "slot_number": 2,
             },
+            headers=same_origin_request_headers(admin["client"]),
         )
         self.assertEqual(blocked.status_code, 409, blocked.text)
 
@@ -421,6 +436,7 @@ class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
                     "user_id": player_id,
                     "slot_number": 2,
                 },
+                headers=same_origin_request_headers(superadmin["client"]),
             ),
             200,
         )

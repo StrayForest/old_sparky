@@ -624,7 +624,12 @@ jobs:
           remote_status=1
           remote_ssh_exit_code=255
           remote_stage=unknown
+          remote_dispatch_exit_code=unknown
+          remote_child_state=unknown
           remote_child_exit=unknown
+          remote_stdout_eof=unknown
+          remote_timed_out=unknown
+          remote_diagnostic_status=1
           cleanup_artifact_status=1
           cleanup_export_status=1
           input_path="$RUNNER_TEMP/platform-retained-cleanup-input.json"
@@ -640,6 +645,12 @@ jobs:
             || { echo "Retained-load host-tools pin is invalid; refusing remote export cleanup" >&2; exit 1; }
           retained_load_dispatcher="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA/platform_workflow_remote_dispatch.py"
           install -d -m 700 "$artifact_dir"
+          if [[ -e "$ssh_output_file" || -L "$ssh_output_file" ]]; then
+            echo "Cleanup SSH output path already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+          install -m 600 /dev/null "$ssh_output_file"
+          test "$(stat -c '%F:%h:%a:%u' -- "$ssh_output_file")" = "regular file:1:600:$(id -u)"
           trap 'rm -f -- "$ssh_output_file" "$input_path"; test ! -e "$input_path"; ssh_dir="$RUNNER_TEMP/production-retained-cleanup-ssh"; if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then test -d "$ssh_dir" && test ! -L "$ssh_dir"; rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/known_hosts.scan.1" "$ssh_dir/known_hosts.scan.2" "$ssh_dir/config" "$ssh_dir/control.sock" "$ssh_dir/control-master" "$ssh_dir/control-master.sock"; rmdir -- "$ssh_dir"; fi; test ! -e "$ssh_dir" && test ! -L "$ssh_dir"' EXIT
 
           project_cleanup_summary() {
@@ -713,26 +724,81 @@ jobs:
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             /usr/bin/python3.12 -I -B \
             /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
-            retained-cleanup < "$input_path" > "$ssh_output_file" 2>&1
+            retained-cleanup --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --load-run-id "$LOAD_RUN_ID" < "$input_path" > "$ssh_output_file" 2>&1
           remote_status="$?"
           remote_ssh_exit_code="$remote_status"
           set -e
-          if [[ -f "$ssh_output_file" && ! -L "$ssh_output_file" ]] \
-            && [[ "$(stat -c '%s' -- "$ssh_output_file" 2>/dev/null || echo 999999)" =~ ^[0-9]+$ ]] \
-            && (( $(stat -c '%s' -- "$ssh_output_file" 2>/dev/null || echo 999999) <= 512 )); then
-            diagnostic_count=0
-            while IFS= read -r diagnostic_line; do
-              if [[ "$diagnostic_line" =~ ^RETAINED_CLEANUP_DIAGNOSTIC\ schema=1\ stage=(lock|input|identity|release_binding|run_root|external_vote_recovery|orphan_cleanup|matrix_cleanup|export_cleanup|complete|dispatcher|timeout|unknown)\ child_exit=([0-9]{1,3})$ ]]; then
-                diagnostic_count=$((diagnostic_count + 1))
-                if (( diagnostic_count == 1 )); then
-                  remote_stage="${BASH_REMATCH[1]}"
-                  remote_child_exit="${BASH_REMATCH[2]}"
-                fi
-              fi
-            done < "$ssh_output_file"
-            if (( diagnostic_count != 1 )); then
-              remote_stage=unknown
-              remote_child_exit=unknown
+          parsed_cleanup_diagnostic="$(/usr/bin/python3 - "$ssh_output_file" "$TARGET_SHA" "$APP_TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$LOAD_RUN_ID" <<'PY' 2>/dev/null
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          expected = sys.argv[2:]
+          try:
+              before = path.lstat()
+              if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                      or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600
+                      or before.st_size > 1024):
+                  raise SystemExit(1)
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                      raise SystemExit(1)
+                  raw = os.read(descriptor, 1025)
+                  after = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              if len(raw) > 1024 or (after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns) != (
+                      before.st_dev, before.st_ino, before.st_size,
+                      before.st_mtime_ns, before.st_ctime_ns):
+                  raise SystemExit(1)
+              match = re.fullmatch(
+                  rb"RETAINED_CLEANUP_DIAGNOSTIC schema=2 "
+                  rb"stage=(lock|input|identity|release_binding|run_root|external_vote_recovery|"
+                  rb"orphan_cleanup|matrix_cleanup|export_cleanup|complete|dispatcher|timeout|unknown) "
+                  rb"dispatcher_exit=(0|[1-9][0-9]{0,2}) "
+                  rb"child_state=(not_started|running|exited|unknown) "
+                  rb"child_exit=(unknown|0|[1-9][0-9]{0,2}) "
+                  rb"stdout_eof=(true|false|unknown) timed_out=(true|false) "
+                  rb"source_sha=([0-9a-f]{40}) app_sha=([0-9a-f]{40}) "
+                  rb"run_id=([1-9][0-9]{0,31}) run_attempt=([1-9][0-9]{0,31}) "
+                  rb"load_run_id=([1-9][0-9]{0,31}) "
+                  rb"profile=retained-load-cleanup\n",
+                  raw,
+              )
+              if match is None:
+                  raise SystemExit(1)
+              stage, dispatch_exit, child_state, child_exit, eof, timed_out, source, app, run_id, attempt, load_run_id = (
+                  item.decode("ascii") for item in match.groups()
+              )
+              if [source, app, run_id, attempt, load_run_id] != expected:
+                  raise SystemExit(1)
+              if (timed_out == "true") != (stage == "timeout"):
+                  raise SystemExit(1)
+              if timed_out == "true" and dispatch_exit != "124":
+                  raise SystemExit(1)
+              if child_state == "exited" and child_exit == "unknown":
+                  raise SystemExit(1)
+              if child_state in {"running", "not_started"} and child_exit != "unknown":
+                  raise SystemExit(1)
+              if child_state == "not_started" and eof != "unknown":
+                  raise SystemExit(1)
+          except (OSError, ValueError):
+              raise SystemExit(1)
+          print("\t".join((stage, dispatch_exit, child_state, child_exit, eof, timed_out)))
+          PY
+          )"
+          if [[ -n "$parsed_cleanup_diagnostic" ]]; then
+            IFS=$'\t' read -r remote_stage remote_dispatch_exit_code remote_child_state \
+              remote_child_exit remote_stdout_eof remote_timed_out <<< "$parsed_cleanup_diagnostic"
+            if [[ "$remote_dispatch_exit_code" == "$remote_ssh_exit_code" ]]; then
+              remote_diagnostic_status=0
             fi
           fi
           rm -f -- "$ssh_output_file"
@@ -812,6 +878,9 @@ jobs:
             retained-cleanup-exports < "$input_path" >/dev/null 2>&1
           cleanup_export_status="$?"
           set -e
+          if [[ "$remote_diagnostic_status" != "0" ]]; then
+            remote_status=1
+          fi
           if [[ "$remote_status" == "0" ]] \
             && { [[ "$cleanup_artifact_status" != "0" ]] || [[ "$cleanup_export_status" != "0" ]]; }; then
             remote_status=1
@@ -819,11 +888,18 @@ jobs:
           echo "remote_exit_code=$remote_status" >> "$GITHUB_OUTPUT"
           echo "remote_ssh_exit_code=$remote_ssh_exit_code" >> "$GITHUB_OUTPUT"
           echo "remote_stage=$remote_stage" >> "$GITHUB_OUTPUT"
+          echo "remote_dispatch_exit_code=$remote_dispatch_exit_code" >> "$GITHUB_OUTPUT"
+          echo "remote_child_state=$remote_child_state" >> "$GITHUB_OUTPUT"
           echo "remote_child_exit=$remote_child_exit" >> "$GITHUB_OUTPUT"
+          echo "remote_stdout_eof=$remote_stdout_eof" >> "$GITHUB_OUTPUT"
+          echo "remote_timed_out=$remote_timed_out" >> "$GITHUB_OUTPUT"
+          echo "remote_diagnostic_status=$remote_diagnostic_status" >> "$GITHUB_OUTPUT"
           echo "cleanup_artifact_status=$cleanup_artifact_status" >> "$GITHUB_OUTPUT"
           echo "cleanup_export_status=$cleanup_export_status" >> "$GITHUB_OUTPUT"
-          printf 'Retained cleanup diagnostic: ssh_exit=%s stage=%s child_exit=%s\n' \
-            "$remote_ssh_exit_code" "$remote_stage" "$remote_child_exit" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Retained cleanup diagnostic: ssh_exit=%s stage=%s dispatch_exit=%s child_state=%s child_exit=%s stdout_eof=%s timed_out=%s bound=%s\n' \
+            "$remote_ssh_exit_code" "$remote_stage" "$remote_dispatch_exit_code" \
+            "$remote_child_state" "$remote_child_exit" "$remote_stdout_eof" \
+            "$remote_timed_out" "$remote_diagnostic_status" >> "$GITHUB_STEP_SUMMARY"
           # The final always-run gate reports the preserved primary status and
           # rejects any incomplete artifact projection or export deletion.
           exit 0
@@ -865,20 +941,34 @@ jobs:
           test -z "${SSH_DIR:-}"
 
       - name: Diagnose cleanup evidence inputs
+        id: diagnose-cleanup-inputs
         if: ${{ always() }}
         shell: bash
         env:
           CLEANUP_REMOTE_EXIT: ${{ steps.run-cleanup.outputs.remote_exit_code }}
           CLEANUP_SSH_EXIT_CODE: ${{ steps.run-cleanup.outputs.remote_ssh_exit_code }}
           CLEANUP_REMOTE_STAGE: ${{ steps.run-cleanup.outputs.remote_stage }}
+          CLEANUP_REMOTE_DISPATCH_EXIT: ${{ steps.run-cleanup.outputs.remote_dispatch_exit_code }}
+          CLEANUP_REMOTE_CHILD_STATE: ${{ steps.run-cleanup.outputs.remote_child_state }}
           CLEANUP_REMOTE_CHILD_EXIT: ${{ steps.run-cleanup.outputs.remote_child_exit }}
+          CLEANUP_REMOTE_STDOUT_EOF: ${{ steps.run-cleanup.outputs.remote_stdout_eof }}
+          CLEANUP_REMOTE_TIMED_OUT: ${{ steps.run-cleanup.outputs.remote_timed_out }}
+          CLEANUP_REMOTE_DIAGNOSTIC_STATUS: ${{ steps.run-cleanup.outputs.remote_diagnostic_status }}
           CLEANUP_ARTIFACT_STATUS: ${{ steps.run-cleanup.outputs.cleanup_artifact_status }}
           CLEANUP_EXPORT_STATUS: ${{ steps.run-cleanup.outputs.cleanup_export_status }}
           CLEANUP_SSH_STEP: ${{ steps.cleanup_ssh.outcome }}
+          CLEANUP_SOURCE_SHA: ${{ github.sha }}
+          CLEANUP_APP_SHA: ${{ needs.resolve-host-tools-pin.outputs.app_target_sha }}
+          CLEANUP_RUN_ID: ${{ github.run_id }}
+          CLEANUP_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CLEANUP_LOAD_RUN_ID: ${{ inputs.load_run_id }}
         run: |
           set +e
           /usr/bin/python3 - <<'PY'
+          import json
           import os
+          import re
+          import stat
           from pathlib import Path
 
           def classify(name: str, allowed: dict[str, str]) -> str:
@@ -909,7 +999,12 @@ jobs:
                   "export_cleanup": "export_cleanup", "complete": "complete",
                   "dispatcher": "dispatcher", "timeout": "timeout", "unknown": "unknown",
               }),
+              "dispatch_exit": classify("CLEANUP_REMOTE_DISPATCH_EXIT", {str(value): str(value) for value in range(256)}),
+              "child_state": classify("CLEANUP_REMOTE_CHILD_STATE", {value: value for value in ("not_started", "running", "exited", "unknown")}),
               "child_exit": classify("CLEANUP_REMOTE_CHILD_EXIT", {str(value): str(value) for value in range(256)}),
+              "stdout_eof": classify("CLEANUP_REMOTE_STDOUT_EOF", {value: value for value in ("true", "false", "unknown")}),
+              "timed_out": classify("CLEANUP_REMOTE_TIMED_OUT", {"true": "true", "false": "false"}),
+              "diagnostic": classify("CLEANUP_REMOTE_DIAGNOSTIC_STATUS", {"0": "bound", "1": "invalid"}),
               "artifact": classify("CLEANUP_ARTIFACT_STATUS", {"0": "ok", "1": "failed"}),
               "exports": classify("CLEANUP_EXPORT_STATUS", {"0": "ok", "1": "failed"}),
               "ssh_cleanup": classify("CLEANUP_SSH_STEP", {"success": "ok", "failure": "failed", "cancelled": "cancelled", "skipped": "skipped"}),
@@ -917,6 +1012,48 @@ jobs:
               "summary": present(artifact_dir / "cleanup-summary.json"),
               "canonical": present(artifact_dir / "canonical.log"),
           }
+          bindings = {
+              "source_sha": os.environ.get("CLEANUP_SOURCE_SHA", ""),
+              "app_sha": os.environ.get("CLEANUP_APP_SHA", ""),
+              "run_id": os.environ.get("CLEANUP_RUN_ID", ""),
+              "run_attempt": os.environ.get("CLEANUP_RUN_ATTEMPT", ""),
+              "load_run_id": os.environ.get("CLEANUP_LOAD_RUN_ID", ""),
+              "profile_id": "retained-load-cleanup",
+          }
+          if not (
+              all(re.fullmatch(r"[0-9a-f]{40}", bindings[key]) for key in ("source_sha", "app_sha"))
+              and re.fullmatch(r"[1-9][0-9]{0,31}", bindings["run_id"])
+              and re.fullmatch(r"[1-9][0-9]{0,31}", bindings["run_attempt"])
+              and re.fullmatch(r"[1-9][0-9]{0,31}", bindings["load_run_id"])
+          ):
+              raise SystemExit("retained cleanup diagnostic source binding is invalid")
+          try:
+              artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+              root_stat = artifact_dir.lstat()
+              if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.geteuid() or stat.S_IMODE(root_stat.st_mode) & 0o077:
+                  raise OSError("diagnostic directory unsafe")
+              diagnostic_path = artifact_dir / "cleanup-diagnostic.json"
+              encoded = json.dumps(
+                  {"schema": 2, **bindings, "conditions": fields},
+                  sort_keys=True, separators=(",", ":"),
+              ).encode("ascii") + b"\n"
+              if len(encoded) > 16384:
+                  raise OSError("diagnostic exceeds fixed cap")
+              descriptor = os.open(
+                  diagnostic_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+              )
+              try:
+                  written_stat = os.fstat(descriptor)
+                  if not stat.S_ISREG(written_stat.st_mode) or written_stat.st_uid != os.geteuid() or written_stat.st_nlink != 1 or stat.S_IMODE(written_stat.st_mode) != 0o600:
+                      raise OSError("diagnostic file unsafe")
+                  with os.fdopen(descriptor, "wb", closefd=False) as output:
+                      output.write(encoded)
+                      output.flush()
+                      os.fsync(output.fileno())
+              finally:
+                  os.close(descriptor)
+          except OSError:
+              raise SystemExit("retained cleanup diagnostic cannot be safely recorded")
           print("RETAINED_CLEANUP_INPUT " + " ".join(f"{name}={value}" for name, value in fields.items()))
           PY
           diagnostic_status="$?"
@@ -1106,15 +1243,25 @@ jobs:
           PY
 
       - name: Publish cleanup artifacts
-        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.validate_cleanup_evidence.outcome == 'success' }}
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.diagnose-cleanup-inputs.outcome == 'success' && steps.validate_cleanup_evidence.outcome == 'success' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-production-retained-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/production-retained-cleanup-artifacts/cleanup-summary.json
             ${{ runner.temp }}/production-retained-cleanup-artifacts/canonical.log
+            ${{ runner.temp }}/production-retained-cleanup-artifacts/cleanup-diagnostic.json
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish closed retained-cleanup failure diagnostic
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.diagnose-cleanup-inputs.outcome == 'success' && steps.run-cleanup.outputs.remote_exit_code != '0' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-retained-cleanup-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-retained-cleanup-artifacts/cleanup-diagnostic.json
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Write cleanup summary
         if: ${{ always() }}
@@ -1151,6 +1298,20 @@ jobs:
           set -euo pipefail
           test "${{ steps.run-cleanup.outputs.remote_exit_code }}" = "0" \
             || { echo "Production retained-load cleanup failed; retained data was not removed by the supervisor." >&2; exit 1; }
+          test "${{ steps.run-cleanup.outputs.remote_diagnostic_status }}" = "0" \
+            || { echo "Bound retained-cleanup diagnostic is unavailable or invalid." >&2; exit 1; }
+          test "${{ steps.run-cleanup.outputs.remote_dispatch_exit_code }}" = "0" \
+            || { echo "Retained-cleanup dispatcher did not complete successfully." >&2; exit 1; }
+          test "${{ steps.run-cleanup.outputs.remote_stage }}" = "complete" \
+            || { echo "Retained-cleanup helper stage is incomplete." >&2; exit 1; }
+          test "${{ steps.run-cleanup.outputs.remote_child_state }}" = "exited" \
+            || { echo "Retained-cleanup helper exit state is unknown." >&2; exit 1; }
+          test "${{ steps.run-cleanup.outputs.remote_child_exit }}" = "0" \
+            || { echo "Retained-cleanup helper failed." >&2; exit 1; }
+          test "${{ steps.run-cleanup.outputs.remote_stdout_eof }}" = "true" \
+            || { echo "Retained-cleanup helper output stream did not close." >&2; exit 1; }
+          test "${{ steps.run-cleanup.outputs.remote_timed_out }}" = "false" \
+            || { echo "Retained-cleanup helper exceeded its bounded wait." >&2; exit 1; }
           test "${{ steps.run-cleanup.outputs.cleanup_artifact_status }}" = "0" \
             || { echo "Retained-load cleanup public projection or evidence copy failed." >&2; exit 1; }
           test "${{ steps.run-cleanup.outputs.cleanup_export_status }}" = "0" \

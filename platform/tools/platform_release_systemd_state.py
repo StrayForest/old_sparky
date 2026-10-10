@@ -74,6 +74,17 @@ RECEIPT_KEYS: Final = frozenset(
     }
 )
 UNIT_KEYS: Final = frozenset(("name", "active", "enabled"))
+PROFILE_ACCESS_CACHE_PURGE_PROOF_KEYS: Final = frozenset(
+    {
+        "schema",
+        "operation_id",
+        "operation",
+        "source_role",
+        "source_identity",
+        "venv_identity",
+        "scope",
+    }
+)
 TRANSACTION_KEYS: Final = frozenset(
     {
         "operation_id",
@@ -100,11 +111,18 @@ TRANSACTION_KEYS: Final = frozenset(
         "timer_active_before",
         "timer_enabled_before",
         "systemd_state_before",
+        "profile_access_cache_purge_proof",
     }
 )
 TRANSACTION_KEYS_WITHOUT_SYSTEMD_STATE: Final = TRANSACTION_KEYS - {
     "systemd_state_before"
 }
+TRANSACTION_KEYS_WITHOUT_PROFILE_CACHE_PURGE_PROOF: Final = TRANSACTION_KEYS - {
+    "profile_access_cache_purge_proof"
+}
+TRANSACTION_KEYS_WITHOUT_SYSTEMD_AND_PROFILE_CACHE_PURGE_PROOF: Final = (
+    TRANSACTION_KEYS_WITHOUT_SYSTEMD_STATE - {"profile_access_cache_purge_proof"}
+)
 TRANSACTION_SERVICE_UNITS: Final = (
     "deadlock-api.service",
     "deadlock-worker.service",
@@ -520,6 +538,8 @@ def _read_transaction(
     if not isinstance(record, dict) or set(record) not in (
         TRANSACTION_KEYS,
         TRANSACTION_KEYS_WITHOUT_SYSTEMD_STATE,
+        TRANSACTION_KEYS_WITHOUT_PROFILE_CACHE_PURGE_PROOF,
+        TRANSACTION_KEYS_WITHOUT_SYSTEMD_AND_PROFILE_CACHE_PURGE_PROOF,
     ):
         raise StateError("release transaction schema is invalid")
     _validate_initial_systemd_snapshot(record)
@@ -528,6 +548,35 @@ def _read_transaction(
     operation_id = record.get("operation_id")
     if not isinstance(operation_id, str) or OPERATION_ID_PATTERN.fullmatch(operation_id) is None:
         raise StateError("release transaction operation identity is invalid")
+    purge_proof = record.get("profile_access_cache_purge_proof")
+    if purge_proof is not None:
+        if (
+            not isinstance(purge_proof, dict)
+            or set(purge_proof) != PROFILE_ACCESS_CACHE_PURGE_PROOF_KEYS
+            or type(purge_proof.get("schema")) is not int
+            or purge_proof.get("schema") != 1
+            or purge_proof.get("operation_id") != operation_id
+            or purge_proof.get("operation") != record.get("operation")
+            or purge_proof.get("source_role")
+            != ("current-before" if record.get("operation") == "rollback" else "candidate")
+            or not _valid_identity(purge_proof.get("source_identity"))
+            or not _valid_identity(purge_proof.get("venv_identity"))
+            or purge_proof.get("source_identity")
+            != (
+                record.get("current_before_identity")
+                if record.get("operation") == "rollback"
+                else record.get("candidate_identity")
+            )
+            or purge_proof.get("venv_identity")
+            != (
+                record.get("shared_before")
+                if record.get("operation") == "rollback"
+                or record.get("transition") not in {"exchange", "create"}
+                else record.get("peer_before")
+            )
+            or purge_proof.get("scope") != "tournament-profile-access-v1"
+        ):
+            raise StateError("release transaction cache-purge proof is invalid")
     if record.get("app_dir") != str(app_dir):
         raise StateError("release transaction application path changed")
     current_before = record.get("current_before")

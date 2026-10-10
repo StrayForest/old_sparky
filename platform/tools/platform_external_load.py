@@ -28,7 +28,7 @@ import re
 import ssl
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -1847,6 +1847,7 @@ def run_phase(
     request_builder,
     budget: LoadRuntimeBudget | None = None,
     result_consumer=None,
+    progress_callback: Callable[[str, Any | None], None] | None = None,
 ) -> list[Any]:
     """Run a phase with at most ``concurrency`` live futures.
 
@@ -1859,6 +1860,18 @@ def run_phase(
         budget.check(phase, operation="phase_start")
     offsets = spread_offsets(len(users), spread_seconds)
     phase_started_at = time.monotonic()
+    def notify_progress(result: Any | None) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback("http", result)
+        except Exception:
+            # Diagnostic progress is deliberately outside the load result path.
+            return
+
+    if progress_callback is not None:
+        notify_progress(None)
+    next_progress_at = time.monotonic() + 30.0
     results: list[Any] = []
     executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load")
     in_flight: dict[Future[Any], int] = {}
@@ -1916,25 +1929,47 @@ def run_phase(
             pass
         while in_flight:
             if budget is None:
-                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                done, _ = wait(
+                    in_flight,
+                    timeout=(
+                        max(0.0, next_progress_at - time.monotonic())
+                        if progress_callback is not None
+                        else None
+                    ),
+                    return_when=FIRST_COMPLETED,
+                )
             else:
                 budget.check(phase, operation="future_wait")
                 remaining = budget.remaining_seconds()
                 runner_remaining = budget.remaining_runner_seconds()
                 if runner_remaining is not None:
                     remaining = min(remaining, runner_remaining)
+                if progress_callback is not None:
+                    remaining = min(remaining, max(0.0, next_progress_at - time.monotonic()))
                 done, _ = wait(
                     in_flight,
                     timeout=max(0.0, remaining),
                     return_when=FIRST_COMPLETED,
                 )
                 if not done:
+                    if progress_callback is not None and time.monotonic() >= next_progress_at:
+                        notify_progress(None)
+                        next_progress_at = time.monotonic() + 30.0
                     budget.check(phase, operation="future_wait")
+                    continue
+            if not done:
+                if progress_callback is not None and time.monotonic() >= next_progress_at:
+                    notify_progress(None)
+                    next_progress_at = time.monotonic() + 30.0
+                continue
             if budget is not None:
                 budget.check(phase, operation="future_complete")
             for future in sorted(done, key=in_flight.__getitem__):
                 in_flight.pop(future, None)
                 result = future.result()
+                # Progress needs the completed HTTP statuses before a streaming
+                # consumer releases response payloads and retry attempts.
+                notify_progress(result)
                 if result_consumer is None:
                     results.append(result)
                 else:
@@ -1971,11 +2006,24 @@ def run_rate_phase(
     request_builder,
     budget: LoadRuntimeBudget | None = None,
     result_consumer=None,
+    progress_callback: Callable[[str, Any | None], None] | None = None,
 ) -> tuple[list[Any], float]:
     """Run a paced phase and return its submission window separately from drain time."""
 
     offsets = spread_offsets(len(users), duration_seconds)
     phase_started_at = time.monotonic()
+    def notify_progress(result: Any | None) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback("http", result)
+        except Exception:
+            # Diagnostic progress is deliberately outside the load result path.
+            return
+
+    if progress_callback is not None:
+        notify_progress(None)
+    next_progress_at = time.monotonic() + 30.0
     first_submission_at: float | None = None
     last_submission_at: float | None = None
     results: list[Any] = []
@@ -2038,25 +2086,47 @@ def run_rate_phase(
             pass
         while in_flight:
             if budget is None:
-                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                done, _ = wait(
+                    in_flight,
+                    timeout=(
+                        max(0.0, next_progress_at - time.monotonic())
+                        if progress_callback is not None
+                        else None
+                    ),
+                    return_when=FIRST_COMPLETED,
+                )
             else:
                 budget.check(phase, operation="future_wait")
                 remaining = budget.remaining_seconds()
                 runner_remaining = budget.remaining_runner_seconds()
                 if runner_remaining is not None:
                     remaining = min(remaining, runner_remaining)
+                if progress_callback is not None:
+                    remaining = min(remaining, max(0.0, next_progress_at - time.monotonic()))
                 done, _ = wait(
                     in_flight,
                     timeout=max(0.0, remaining),
                     return_when=FIRST_COMPLETED,
                 )
                 if not done:
+                    if progress_callback is not None and time.monotonic() >= next_progress_at:
+                        notify_progress(None)
+                        next_progress_at = time.monotonic() + 30.0
                     budget.check(phase, operation="future_wait")
+                    continue
+            if not done:
+                if progress_callback is not None and time.monotonic() >= next_progress_at:
+                    notify_progress(None)
+                    next_progress_at = time.monotonic() + 30.0
+                continue
             if budget is not None:
                 budget.check(phase, operation="future_complete")
             for future in sorted(done, key=in_flight.__getitem__):
                 in_flight.pop(future, None)
                 result = future.result()
+                # Progress needs the completed HTTP statuses before a streaming
+                # consumer releases response payloads and retry attempts.
+                notify_progress(result)
                 if result_consumer is None:
                     results.append(result)
                 else:
@@ -2362,7 +2432,18 @@ def run_load(
     client_transport: str = DEFAULT_CLIENT_TRANSPORT,
     max_http_attempts: int | None = None,
     runtime_budget: LoadRuntimeBudget | None = None,
+    progress_callback: Callable[[str, Any | None], None] | None = None,
 ) -> dict[str, Any]:
+    def run_progress_phase(*args: Any, **kwargs: Any) -> Any:
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
+        return run_phase(*args, **kwargs)
+
+    def run_progress_rate_phase(*args: Any, **kwargs: Any) -> Any:
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
+        return run_rate_phase(*args, **kwargs)
+
     if runtime_budget is not None:
         runtime_budget.check("preflight", operation="run_start")
     for value, field in (
@@ -2724,7 +2805,7 @@ def run_load(
                     for attempt in action.attempts:
                         primary_raw_acc.add(attempt)
 
-                _, phase_submission_window = run_rate_phase(
+                _, phase_submission_window = run_progress_rate_phase(
                     origin,
                     phase_users,
                     phase=f"write_external_vote_{phase_name}",
@@ -2788,7 +2869,7 @@ def run_load(
                 "offered_window_seconds": round(offered_window_seconds, 3),
             }
         else:
-            run_phase(
+            run_progress_phase(
                 origin,
                 users,
                 phase="write_external_vote",
@@ -2840,7 +2921,7 @@ def run_load(
         # mark the phase incomplete when any duplicate action is missing.
         duplicate_users = duplicate_candidates[:duplicate_count]
         duplicate_started_at = time.monotonic()
-        run_phase(
+        run_progress_phase(
             origin,
             duplicate_users,
             phase="write_external_vote_duplicate",
@@ -3064,7 +3145,7 @@ def run_load(
             page_acc.add(result)
             overall_raw_acc.add(result)
 
-        run_phase(
+        run_progress_phase(
             origin,
             users,
             phase="authenticated_page_load",
@@ -3131,7 +3212,7 @@ def run_load(
                 read_acc.add(result)
                 overall_raw_acc.add(result)
 
-            run_phase(
+            run_progress_phase(
                 origin,
                 users,
                 phase=f"scale_external_read_mix_c{stage_concurrency}",
@@ -3216,7 +3297,7 @@ def run_load(
                 refresh_acc.add(result)
                 overall_raw_acc.add(result)
 
-            run_phase(
+            run_progress_phase(
                 origin,
                 refresh_users,
                 phase="manual_workspace_refresh",

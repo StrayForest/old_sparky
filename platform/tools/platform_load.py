@@ -1697,10 +1697,15 @@ def run_profile_worker(
         from tools.platform_load_runtime import (
             LoadRuntimeBudget,
             LoadRuntimeBudgetExceeded,
+            ProgressCheckpoint,
         )
     except ModuleNotFoundError:  # Direct execution from platform/tools.
         from platform_external_load import ExternalLoadError, load_manifest, run_load
-        from platform_load_runtime import LoadRuntimeBudget, LoadRuntimeBudgetExceeded
+        from platform_load_runtime import (  # type: ignore[no-redef]
+            LoadRuntimeBudget,
+            LoadRuntimeBudgetExceeded,
+            ProgressCheckpoint,
+        )
 
     contract = profile_contract(profile)
     try:
@@ -1729,6 +1734,57 @@ def run_profile_worker(
             )
         )
         return 1
+    progress_checkpoint = None
+    if runtime_config is not None:
+        progress_path_raw = runtime_config.get("progress_checkpoint_path")
+        progress_context_raw = runtime_config.get("progress_context")
+        try:
+            planned = contract["planned_work"]
+            request_limits = profile["portfolio"]["request_budget"]
+            expected_progress_context = {
+                "source_git_sha": source_git_sha,
+                "app_target_sha": app_target_sha,
+                "source_binding_sha256": source_binding_sha256,
+                "profile_id": str(contract["profile_id"]),
+                "profile_digest": str(contract["profile_digest"]),
+                "external_run_id": external_run_id,
+                "max_logical_actions": int(planned["logical_actions"] or 0),
+                "max_http_attempts": int(request_limits["max_http_attempts"]),
+            }
+            if (
+                isinstance(progress_path_raw, str)
+                and isinstance(progress_context_raw, Mapping)
+                and dict(progress_context_raw) == expected_progress_context
+            ):
+                progress_checkpoint = ProgressCheckpoint(
+                    Path(progress_path_raw),
+                    progress_context_raw,
+                )
+                progress_checkpoint.emit("fixture_validation", inflight_unknown=False)
+        except (OSError, TypeError, ValueError):
+            progress_checkpoint = None
+
+    def record_progress(phase: str, result: Any | None) -> None:
+        nonlocal progress_checkpoint
+        checkpoint = progress_checkpoint
+        if checkpoint is None:
+            return
+        try:
+            if result is None:
+                checkpoint.emit(phase, inflight_unknown=(phase == "http"))
+                return
+            attempts = getattr(result, "attempts", None)
+            if isinstance(attempts, list):
+                statuses = [getattr(attempt, "status", None) for attempt in attempts]
+            else:
+                statuses = [getattr(result, "status", None)]
+            if any(type(status) is not int for status in statuses):
+                return
+            checkpoint.record_http_result(statuses, logical_delta=1)
+        except (OSError, TypeError, ValueError):
+            # The progress channel is never allowed to change load execution.
+            progress_checkpoint = None
+
     try:
         manifest, users = load_manifest(manifest_path)
         manifest_app_target = manifest.get("app_target_sha", source_git_sha)
@@ -1836,7 +1892,15 @@ def run_profile_worker(
             client_transport=client_transport,
             max_http_attempts=int(profile["portfolio"]["request_budget"]["max_http_attempts"]),
             runtime_budget=runtime_budget,
+            progress_callback=(record_progress if progress_checkpoint is not None else None),
         )
+        if progress_checkpoint is not None:
+            try:
+                # Returning from run_load means all measured futures drained.
+                # A timeout or worker kill skips this line and stays unknown.
+                progress_checkpoint.emit("teardown", inflight_unknown=False)
+            except (OSError, TypeError, ValueError):
+                progress_checkpoint = None
     except LoadRuntimeBudgetExceeded as exc:
         status = runtime_budget.runner_budget_status(
             phase=exc.phase,
@@ -1973,12 +2037,16 @@ def run_profile(
     try:
         from tools.platform_load_runtime import (
             NamespaceCapabilityError,
+            ProgressCheckpoint,
             require_pid_namespace_capability,
+            write_closed_progress_artifact,
         )
     except ModuleNotFoundError:  # Direct execution from platform/tools.
         from platform_load_runtime import (  # type: ignore[no-redef]
             NamespaceCapabilityError,
+            ProgressCheckpoint,
             require_pid_namespace_capability,
+            write_closed_progress_artifact,
         )
     try:
         require_pid_namespace_capability()
@@ -2028,6 +2096,17 @@ def run_profile(
 
     request_budget = profile["portfolio"]["request_budget"]
     cost_budget = profile["portfolio"]["cost_budget"]
+    planned_work = contract["planned_work"]
+    progress_context = {
+        "source_git_sha": source_git_sha,
+        "app_target_sha": app_target_sha,
+        "source_binding_sha256": source_binding_sha256,
+        "profile_id": str(contract["profile_id"]),
+        "profile_digest": str(contract["profile_digest"]),
+        "external_run_id": external_run_id,
+        "max_logical_actions": int(planned_work["logical_actions"] or 0),
+        "max_http_attempts": int(request_budget["max_http_attempts"]),
+    }
     max_duration_seconds = float(request_budget["max_duration_seconds"])
     max_runner_minutes = float(cost_budget["max_runner_minutes"])
     try:
@@ -2041,6 +2120,7 @@ def run_profile(
         dir=report_path.parent,
     ) as worker_directory:
         worker_report_path = Path(worker_directory) / "child-report.json"
+        progress_path = Path(worker_directory) / "progress.json"
         worker_config = {
             "profile_id": str(profile["profile_id"]),
             "manifest_path": str(manifest_path),
@@ -2052,6 +2132,8 @@ def run_profile(
                 "source_binding_sha256": source_binding_sha256,
                 "external_run_id": external_run_id,
             },
+            "progress_checkpoint_path": str(progress_path),
+            "progress_context": progress_context,
         }
         result = run_supervised(
             worker_command=(
@@ -2064,6 +2146,32 @@ def run_profile(
             max_runner_minutes=max_runner_minutes,
             worker_config=worker_config,
         )
+        progress_snapshot = None
+        if result.namespace_closed is True and result.descendants_reaped is True:
+            try:
+                progress_snapshot = ProgressCheckpoint(
+                    progress_path,
+                    progress_context,
+                ).closed_snapshot(
+                    namespace_closed=True,
+                    descendants_reaped=True,
+                    partial_work=bool(result.partial_work),
+                )
+            except (OSError, TypeError, ValueError):
+                # Progress is diagnostic-only and cannot change the primary
+                # load result or its acceptance decision.
+                progress_snapshot = None
+
+    if progress_snapshot is not None:
+        progress_artifact_path = report_path.with_name(
+            f"{report_path.stem}.progress.json"
+        )
+        try:
+            write_closed_progress_artifact(progress_artifact_path, progress_snapshot)
+        except (FileExistsError, OSError, TypeError, ValueError):
+            # Preserve the primary report and never overwrite a prior or
+            # replaced artifact. Missing progress remains explicitly unknown.
+            pass
 
     payload = result.report
     decision = (

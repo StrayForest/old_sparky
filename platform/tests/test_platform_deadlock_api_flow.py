@@ -41,7 +41,11 @@ from python_packages.platform_infra.models import (
     UserSession,
 )
 from python_packages.platform_infra.security import session_token_digest
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -51,7 +55,7 @@ from tests.platform_integration_password import (
 class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-deadlock-{uuid4().hex[:8]}"
-        self.base_url = "http://testserver"
+        self.base_url = "https://testserver"
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup_test_data()
@@ -80,7 +84,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
                 base_url=self.base_url,
             )
         )
@@ -111,6 +115,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                         "password": INTEGRATION_PASSWORD,
                         "display_name": display_name,
                     },
+
+                    headers=same_origin_request_headers(client),
                 ),
                 201,
             )
@@ -125,6 +131,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "pool": ["Abrams", "Kelvin", "Seven"],
                     "captain_priority": captain_priority,
                 },
+                headers=same_origin_request_headers(client),
             ),
             200,
         )
@@ -199,6 +206,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -207,6 +215,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -218,6 +227,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 201,
             )
@@ -225,12 +236,15 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
         self._assert_status(
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"
+            ,
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -307,7 +321,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                         response = await voter["client"].post(
                             f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                             json={"choice": choice},
-                            headers={"X-Request-ID": request_id},
+                            headers=same_origin_request_headers(voter["client"], extra={"X-Request-ID": request_id}),
                         )
                     finally:
                         checkout_scope.reset(token)
@@ -411,7 +425,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 response = await voter["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
-                    headers={"X-Request-ID": request_id},
+                    headers=same_origin_request_headers(voter["client"], extra={"X-Request-ID": request_id}),
                 )
             invalidate_cache.assert_not_called()
         finally:
@@ -668,6 +682,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     voter["client"].post(
                         f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                         json={"choice": "yes"},
+
+                        headers=same_origin_request_headers(voter["client"]),
                     )
                 )
                 await asyncio.wait_for(vote_at_upsert.wait(), timeout=10)
@@ -678,6 +694,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                             "status": "withdrawn",
                             "moderation_note": "Withdrawn during ready vote race.",
                         },
+
+                        headers=same_origin_request_headers(organizer["client"]),
                     )
                 )
                 exclusion_response = await asyncio.wait_for(exclusion_task, timeout=10)
@@ -729,10 +747,14 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 voter["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(voter["client"]),
                 ),
                 voter["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "no"},
+
+                    headers=same_origin_request_headers(voter["client"]),
                 ),
             )
         self.assertEqual(yes_response.status_code, 200, yes_response.text)
@@ -806,6 +828,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -814,6 +837,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -821,6 +845,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/join",
                 json={"entry_type": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -828,13 +853,14 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
 
         first_response, second_response = await asyncio.gather(
-            organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
-            organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
+            organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start", headers=same_origin_request_headers(organizer["client"])),
+            organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start", headers=same_origin_request_headers(organizer["client"])),
         )
         self.assertEqual(
             sorted((first_response.status_code, second_response.status_code)),
@@ -875,6 +901,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -883,6 +910,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -891,6 +919,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 201,
             )
@@ -898,11 +928,12 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
         self._assert_status(
-            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
+            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start", headers=same_origin_request_headers(organizer["client"])),
             201,
         )
 
@@ -927,11 +958,13 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     voter["client"].post(
                         f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                         json={"choice": "yes"},
+
+                        headers=same_origin_request_headers(voter["client"]),
                     )
                 )
                 await asyncio.wait_for(vote_at_upsert.wait(), timeout=10)
                 close_task = asyncio.create_task(
-                    organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close")
+                    organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close", headers=same_origin_request_headers(organizer["client"]))
                 )
                 await asyncio.wait_for(asyncio.shield(close_task), timeout=2)
                 self.assertTrue(
@@ -1009,6 +1042,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1018,6 +1052,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1027,6 +1062,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 201,
             )
@@ -1041,6 +1078,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1055,12 +1093,15 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 "away_label": "Team 2",
                 "scheduled_at": None,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_match_creation.status_code, 409, blocked_match_creation.text)
         self.assertIn("Lock a Deadlock roster before creating matches.", blocked_match_creation.json()["detail"])
 
         blocked_seed_creation = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/matches/seed-opening-round"
+        ,
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_seed_creation.status_code, 409, blocked_seed_creation.text)
         self.assertIn("Lock a Deadlock roster before creating matches.", blocked_seed_creation.json()["detail"])
@@ -1068,12 +1109,13 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         blocked_in_progress = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/status",
             json={"status": "in_progress"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_in_progress.status_code, 422, blocked_in_progress.text)
         self.assertIn("Lock a Deadlock roster", blocked_in_progress.json()["detail"])
 
         ready_start_payload = self._assert_status(
-            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
+            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start", headers=same_origin_request_headers(organizer["client"])),
             201,
         )
         self.assertEqual(ready_start_payload["eligible_participant_count"], 14)
@@ -1083,6 +1125,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 200,
             )
@@ -1108,7 +1152,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         )
 
         self._assert_status(
-            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close"),
+            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close", headers=same_origin_request_headers(organizer["client"])),
             200,
         )
 
@@ -1116,6 +1160,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/deadlock/captain-round/start",
                 json={"teams_count": 2},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1127,6 +1172,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         captain_retry = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/captain-round/start",
             json={"teams_count": 2},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(captain_retry.status_code, 409, captain_retry.text)
         self.assertIn(
@@ -1163,6 +1209,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                         }
                     ]
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1198,6 +1245,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
 
         legacy_run_response = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/auto-assignment/run"
+        ,
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(legacy_run_response.status_code, 404, legacy_run_response.text)
         with self.assertRaises(HTTPException) as duplicate_run_error:
@@ -1211,6 +1260,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         published_run_payload = self._assert_status(
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/deadlock/auto-assignment/{run_id}/publish"
+            ,
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1256,6 +1307,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         locked_run_payload = self._assert_status(
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/deadlock/auto-assignment/{run_id}/lock"
+            ,
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1293,6 +1346,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1301,6 +1355,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{waiting_slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1308,6 +1363,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await players[1]["client"].post(
                 f"/api/v1/tournaments/{waiting_slug}/join",
                 json={"entry_type": "solo"},
+                headers=same_origin_request_headers(players[1]["client"]),
             ),
             201,
         )
@@ -1364,6 +1420,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
 
         duplicate_seed_attempt = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/matches/seed-opening-round"
+        ,
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(duplicate_seed_attempt.status_code, 409, duplicate_seed_attempt.text)
         self.assertIn("Matches already exist for this tournament.", duplicate_seed_attempt.json()["detail"])
@@ -1371,6 +1429,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         blocked_live_before_start = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/matches/{match_id}/status",
             json={"status": "live"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_live_before_start.status_code, 409, blocked_live_before_start.text)
         self.assertIn("Tournament must be in progress", blocked_live_before_start.json()["detail"])
@@ -1378,6 +1437,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         blocked_reopen = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/status",
             json={"status": "registration_open"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(blocked_reopen.status_code, 422, blocked_reopen.text)
         self.assertIn("Registration cannot be reopened", blocked_reopen.json()["detail"])
@@ -1386,6 +1446,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "in_progress"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1395,6 +1456,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/matches/{match_id}/status",
                 json={"status": "live"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1408,6 +1470,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "away_score": 1,
                     "note": "Locked-roster handoff match completed.",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1466,6 +1529,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1475,6 +1539,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1482,6 +1547,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await participant["client"].post(
                 f"/api/v1/tournaments/{slug}/join",
                 json={"entry_type": "solo"},
+                headers=same_origin_request_headers(participant["client"]),
             ),
             201,
         )
@@ -1489,12 +1555,15 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
 
         participant_start_attempt = await participant["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"
+        ,
+            headers=same_origin_request_headers(participant["client"]),
         )
         self.assertEqual(participant_start_attempt.status_code, 403, participant_start_attempt.text)
         self.assertIn("Only the organizer can manage this tournament.", participant_start_attempt.json()["detail"])
@@ -1508,6 +1577,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         self._assert_status(
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"
+            ,
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1556,6 +1627,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1564,6 +1636,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1571,6 +1644,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/join",
                 json={"entry_type": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1612,6 +1686,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1620,6 +1695,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1627,6 +1703,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/join",
                 json={"entry_type": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1634,6 +1711,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1652,6 +1730,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         before_start_response = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
             json={"choice": "yes"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(before_start_response.status_code, 409, before_start_response.text)
         self.assertIn("has not started", before_start_response.json()["detail"])
@@ -1673,10 +1752,14 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 organizer["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(organizer["client"]),
                 ),
                 organizer["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(organizer["client"]),
                 ),
             )
         self.assertEqual(
@@ -1774,6 +1857,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1783,6 +1867,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1792,6 +1877,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 201,
             )
@@ -1809,6 +1896,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1820,13 +1908,14 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "status": "withdrawn",
                     "moderation_note": "Removed before ready-check.",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
         self.assertEqual(withdrawn_payload["status"], "withdrawn")
 
         ready_start_payload = self._assert_status(
-            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
+            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start", headers=same_origin_request_headers(organizer["client"])),
             201,
         )
         self.assertEqual(ready_start_payload["eligible_participant_count"], 3)
@@ -1836,6 +1925,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 200,
             )
@@ -1843,6 +1934,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         withdrawn_vote_attempt = await removed_before_start["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
             json={"choice": "yes"},
+            headers=same_origin_request_headers(removed_before_start["client"]),
         )
         self.assertEqual(withdrawn_vote_attempt.status_code, 403, withdrawn_vote_attempt.text)
         self.assertIn(
@@ -1857,6 +1949,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "status": "disqualified",
                     "moderation_note": "Removed after ready-check vote.",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1884,6 +1977,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         disqualified_vote_attempt = await active_two["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
             json={"choice": "yes"},
+            headers=same_origin_request_headers(active_two["client"]),
         )
         self.assertEqual(disqualified_vote_attempt.status_code, 403, disqualified_vote_attempt.text)
         self.assertIn(
@@ -1892,13 +1986,14 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         )
 
         self._assert_status(
-            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close"),
+            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close", headers=same_origin_request_headers(organizer["client"])),
             200,
         )
 
         closed_vote_attempt = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
             json={"choice": "yes"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(closed_vote_attempt.status_code, 409, closed_vote_attempt.text)
         self.assertIn("no longer active", closed_vote_attempt.json()["detail"])
@@ -1945,6 +2040,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -1954,6 +2050,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -1963,6 +2060,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 201,
             )
@@ -1980,12 +2079,13 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
 
         self._assert_status(
-            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
+            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start", headers=same_origin_request_headers(organizer["client"])),
             201,
         )
         for user in (organizer, active_one, active_two):
@@ -1993,18 +2093,21 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 200,
             )
 
         self._assert_status(
-            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close"),
+            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close", headers=same_origin_request_headers(organizer["client"])),
             200,
         )
 
         captain_round_attempt = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/captain-round/start",
             json={"teams_count": 2},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(captain_round_attempt.status_code, 409, captain_round_attempt.text)
         self.assertIn("At least 14 ready players", captain_round_attempt.json()["detail"])
@@ -2016,6 +2119,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "status": "disqualified",
                     "moderation_note": "Removed during captain round.",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -2024,6 +2128,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         disqualified_response_attempt = await active_one["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/captain-round/respond",
             json={"decision": "accept"},
+            headers=same_origin_request_headers(active_one["client"]),
         )
         self.assertEqual(
             disqualified_response_attempt.status_code,
@@ -2061,6 +2166,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "visibility": "public",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -2070,6 +2176,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -2077,6 +2184,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/join",
                 json={"entry_type": "solo"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -2084,6 +2192,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         decline_attempt = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/deadlock/captain-round/respond",
             json={"decision": "decline"},
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(decline_attempt.status_code, 409, decline_attempt.text)
         self.assertIn(
@@ -2120,6 +2229,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 "captain_selection_starts_at": (ready_start + timedelta(minutes=5)).isoformat(),
                 "teams_count": 2,
             },
+            headers=same_origin_request_headers(organizer["client"]),
         )
         self.assertEqual(invalid_payload.status_code, 422, invalid_payload.text)
 
@@ -2135,6 +2245,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "captain_selection_starts_at": captain_start.isoformat(),
                     "teams_count": 2,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -2146,6 +2257,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 201,
             )
@@ -2175,6 +2288,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 200,
             )
@@ -2279,6 +2394,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                     "captain_selection_starts_at": captain_start.isoformat(),
                     "teams_count": 2,
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -2290,6 +2406,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 201,
             )
@@ -2326,6 +2444,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             await first_ready_user["client"].post(
                 f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                 json={"choice": "yes"},
+                headers=same_origin_request_headers(first_ready_user["client"]),
             ),
             200,
         )
@@ -2361,6 +2480,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await first_ready_user["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(first_ready_user["client"]),
                 ),
                 200,
             )
@@ -2400,6 +2521,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await first_ready_user["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "no"},
+
+                    headers=same_origin_request_headers(first_ready_user["client"]),
                 ),
                 200,
             )
@@ -2418,6 +2541,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await first_ready_user["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(first_ready_user["client"]),
                 ),
                 200,
             )
@@ -2436,6 +2561,8 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
                 await user["client"].post(
                     f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
                     json={"choice": "yes"},
+
+                    headers=same_origin_request_headers(user["client"]),
                 ),
                 200,
             )

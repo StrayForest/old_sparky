@@ -49,6 +49,15 @@ Cloudflare ray. The report exposes only aggregate join counts and the join
 method class. Read
 `correlated_html.timeline[].api_request_perf[]` together with the SSR stages:
 
+The aggregate Nginx HTML observer includes exact `GET /tournaments/<slug>`
+records with client statuses from 100 through 599, so failed responses remain
+visible in the request/status and timing summaries. `upstream_statuses` counts
+upstream attempts, which can exceed client requests when Nginx retries; a dash
+attempt is counted separately as unknown. These are separate distributions:
+compare client status counts to load results and upstream-attempt counts to
+diagnose origin retries. The projection retains no slug, query, or raw access
+log value.
+
 - `total_ms`/`request_ms`, `sql_ms`, pool wait and the
   `auth_bootstrap_*_ms` fields measure auth/API work inside FastAPI.
 - `auth_bootstrap_fetch`, `root_layout` and `first_body_write_attempt` measure

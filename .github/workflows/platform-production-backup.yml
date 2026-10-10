@@ -672,6 +672,7 @@ jobs:
             [[ "$resume_compaction_run_id" = none && "$resume_compaction_run_attempt" = none && "$resume_compaction_bundle_sha256" = none ]]
           fi
           failure_stage=preflight
+          public_summary_error=none
           backup_report_file=""
           helper_stage=""
           helper_stage_identity=""
@@ -682,7 +683,7 @@ jobs:
             if (( exit_code != 0 )); then
               /usr/bin/python3 -I -B - "$runtime/shared" "$run_id" "$run_attempt" \
                 "$operation" "$source_sha" "$bundle_sha" "$failure_stage" "$exit_code" \
-                "$backup_report_file" "$backup_capture_file" <<'PY' >/dev/null 2>&1 || :
+                "$backup_report_file" "$backup_capture_file" "$public_summary_error" <<'PY' >/dev/null 2>&1 || :
           import hashlib
           import json
           import os
@@ -690,7 +691,7 @@ jobs:
           import stat
           import sys
 
-          shared_path, run_id, attempt, operation, source_sha, bundle_sha, stage, exit_code, report_path, capture_path = sys.argv[1:]
+          shared_path, run_id, attempt, operation, source_sha, bundle_sha, stage, exit_code, report_path, capture_path, public_summary_error = sys.argv[1:]
           stages = {
               "preflight", "helper_bundle_validation", "backup_create", "backup_verify_existing",
               "summary_validation", "public_summary", "private_capture_cleanup", "helper_cleanup",
@@ -705,6 +706,13 @@ jobs:
               or (source_sha != "none" and re.fullmatch(r"[0-9a-f]{40}", source_sha) is None)
               or (bundle_sha != "none" and re.fullmatch(r"[0-9a-f]{64}", bundle_sha) is None)
           ):
+              raise SystemExit(1)
+          summary_errors = {
+              "none", "summary_tool_failed", "summary_validation_failed",
+              "normalizer_summary_invalid", "normalizer_mode_mismatch",
+              "normalizer_projection_invalid", "unclassified",
+          }
+          if public_summary_error not in summary_errors:
               raise SystemExit(1)
 
           def identity(value):
@@ -906,6 +914,7 @@ jobs:
                   "source_sha": None if source_sha == "none" else source_sha,
                   "bundle_sha256": None if bundle_sha == "none" else bundle_sha,
                   "stage": stage,
+                  "public_summary_error": public_summary_error,
                   "exit_code": int(exit_code),
                   "report_state": report_state,
                   "report_error_class": report_error_class,
@@ -1372,6 +1381,7 @@ jobs:
           raise SystemExit(status)
           PY
           failure_stage=summary_validation
+          public_summary_error=summary_tool_failed
           public_report="$({
             /usr/bin/python3 -I "$summary_tool" --mode retention \
               <"$backup_report_file"
@@ -1379,6 +1389,7 @@ jobs:
             echo "Production backup summary failed" >&2
             exit 1
           }
+          public_summary_error=summary_validation_failed
           /usr/bin/python3 -I - "$backup_report_file" "$operation" "$evict_build_node_cache" "$compact_fallback_runtime_cache" "$resume_compaction" "$run_id" "$run_attempt" "$source_sha" "$bundle_sha" "$resume_compaction_run_id" "$resume_compaction_run_attempt" "$resume_compaction_bundle_sha256" <<'PY'
           import json
           from pathlib import Path
@@ -1545,59 +1556,82 @@ jobs:
               ):
                   raise SystemExit(f"backup-only changed {category}")
           PY
+          public_summary_error=none
           failure_stage=public_summary
-          public_report="$({
+          public_summary_error=unclassified
+          classify_public_summary_error() {
+            local output="$1"
+            if [[ "$output" =~ ^BACKUP_PUBLIC_SUMMARY_FAILURE\ reason=(normalizer_summary_invalid|normalizer_mode_mismatch|normalizer_projection_invalid)$ ]]; then
+              public_summary_error="${BASH_REMATCH[1]}"
+            else
+              public_summary_error=unclassified
+            fi
+          }
+          public_summary_output="$({
           /usr/bin/python3 -I - "$public_report" "$operation" "$backup_report_file" "$EVICT_BUILD_NODE_CACHE" "$COMPACT_FALLBACK_RUNTIME_CACHE" <<'PY'
           import json
           from pathlib import Path
           import sys
 
-          public = json.loads(sys.argv[1])
+          def fail(reason):
+              print(f"BACKUP_PUBLIC_SUMMARY_FAILURE reason={reason}")
+              raise SystemExit(1)
+
+          try:
+              public = json.loads(sys.argv[1])
+          except (TypeError, ValueError):
+              fail("normalizer_summary_invalid")
           if not isinstance(public, dict) or public.get("mode") != "unknown":
-              raise SystemExit("unexpected retention summary mode")
-          public["mode"] = "backup-only" if sys.argv[2] == "create" else "verify-existing-backup-only"
-          if sys.argv[4] == "true":
-              report = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
-              cache = report["backup"]["build_node_cache"]
-              projected = {
-                  "status": cache["status"],
-                  "node_version": cache["node_version"],
-                  "reclaimed_bytes": cache["reclaimed_bytes"],
-                  "intent_receipt": cache["intent_receipt"],
-                  "completion_receipt": cache["completion_receipt"],
-                  "run_id": cache["run_id"],
-                  "run_attempt": cache["run_attempt"],
-                  "source_sha": cache["source_sha"],
-                  "bundle_sha256": cache["bundle_sha256"],
-              }
-              if cache["status"] == "removed":
-                  projected["manifest_tree_sha256"] = cache["manifest_tree_sha256"]
-                  projected["regeneration"] = cache["regeneration"]
-              public["build_node_cache"] = projected
-          elif sys.argv[4] != "false":
-              raise SystemExit("cache eviction selection is invalid")
-          if sys.argv[5] == "true":
-              report = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
-              cache = report["backup"]["fallback_runtime_cache_compaction"]
-              public["fallback_runtime_cache_compaction"] = {
-                  "status": cache["status"],
-                  "result": cache["result"],
-                  "reclaimed_bytes": cache["reclaimed_bytes"],
-                  "source_commit": cache["source_commit"],
-                  "old_tree_sha256": cache["old_tree_sha256"],
-                  "new_tree_sha256": cache["new_tree_sha256"],
-                  "intent_receipt": cache["intent_receipt"],
-                  "validated_receipt": cache["validated_receipt"],
-                  "completion_receipt": cache["completion_receipt"],
-              }
-          elif sys.argv[5] != "false":
-              raise SystemExit("fallback cache compaction selection is invalid")
+              fail("normalizer_mode_mismatch")
+          try:
+              public["mode"] = "backup-only" if sys.argv[2] == "create" else "verify-existing-backup-only"
+              if sys.argv[4] == "true":
+                  report = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+                  cache = report["backup"]["build_node_cache"]
+                  projected = {
+                      "status": cache["status"],
+                      "node_version": cache["node_version"],
+                      "reclaimed_bytes": cache["reclaimed_bytes"],
+                      "intent_receipt": cache["intent_receipt"],
+                      "completion_receipt": cache["completion_receipt"],
+                      "run_id": cache["run_id"],
+                      "run_attempt": cache["run_attempt"],
+                      "source_sha": cache["source_sha"],
+                      "bundle_sha256": cache["bundle_sha256"],
+                  }
+                  if cache["status"] == "removed":
+                      projected["manifest_tree_sha256"] = cache["manifest_tree_sha256"]
+                      projected["regeneration"] = cache["regeneration"]
+                  public["build_node_cache"] = projected
+              elif sys.argv[4] != "false":
+                  raise ValueError
+              if sys.argv[5] == "true":
+                  report = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+                  cache = report["backup"]["fallback_runtime_cache_compaction"]
+                  public["fallback_runtime_cache_compaction"] = {
+                      "status": cache["status"],
+                      "result": cache["result"],
+                      "reclaimed_bytes": cache["reclaimed_bytes"],
+                      "source_commit": cache["source_commit"],
+                      "old_tree_sha256": cache["old_tree_sha256"],
+                      "new_tree_sha256": cache["new_tree_sha256"],
+                      "intent_receipt": cache["intent_receipt"],
+                      "validated_receipt": cache["validated_receipt"],
+                      "completion_receipt": cache["completion_receipt"],
+                  }
+              elif sys.argv[5] != "false":
+                  raise ValueError
+          except (KeyError, OSError, TypeError, ValueError):
+              fail("normalizer_projection_invalid")
           print(json.dumps(public, sort_keys=True, separators=(",", ":")))
           PY
           } 2>/dev/null)" || {
+            classify_public_summary_error "$public_summary_output"
             echo "Production backup public summary normalization failed" >&2
             exit 1
           }
+          public_report="$public_summary_output"
+          public_summary_error=none
           test -n "$public_report" || {
             echo "Production backup summary was unavailable" >&2
             exit 1

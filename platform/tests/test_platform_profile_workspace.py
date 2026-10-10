@@ -21,7 +21,11 @@ from python_packages.platform_infra.models import (
     PlayerProfile,
     User,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -74,8 +78,8 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
     async def _register(self, label: str) -> httpx.AsyncClient:
         client = await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
         with patch_integration_registration_hash():
@@ -86,6 +90,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                     "password": self.password,
                     "display_name": f"test-{label}"[:15],
                 },
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(response.status_code, 201, response.text)
         return client
@@ -233,6 +238,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                 "pool": ["Abrams", "Haze", "Ivy"],
                 "captain_priority": "yes",
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(deadlock.status_code, 200, deadlock.text)
 
@@ -248,6 +254,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                     }
                 ],
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(captain.status_code, 200, captain.text)
 
@@ -301,6 +308,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                     }
                 ],
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(initial.status_code, 200, initial.text)
 
@@ -316,6 +324,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                     }
                 ],
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(rejected.status_code, 422, rejected.text)
 
@@ -342,6 +351,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                         }
                     ]
                 },
+                headers=same_origin_request_headers(owner),
             ),
         )
 
@@ -365,6 +375,7 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
                         }
                     ],
                 },
+                headers=same_origin_request_headers(owner),
             ),
             observe_scalar_lock=True,
         )
@@ -398,7 +409,14 @@ class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
         ]
 
         responses = await asyncio.gather(
-            *(owner.put("/api/v1/profiles/me/captain", json=payload) for payload in payloads)
+            *(
+                owner.put(
+                    "/api/v1/profiles/me/captain",
+                    json=payload,
+                    headers=same_origin_request_headers(owner),
+                )
+                for payload in payloads
+            )
         )
         self.assertEqual([response.status_code for response in responses], [200, 200])
 

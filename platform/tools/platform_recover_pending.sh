@@ -338,10 +338,11 @@ if [[ "$pending_operation" == "rollback" ]]; then
         >/dev/null 2>/dev/null \
         || { public_status failed transaction >&2; exit 1; }
       ;;
-    restart-pending)
+    rollback-cache-purged)
       # Filesystem rollback is complete and the target pointer pair must stay
-      # swapped.  Resume only the target runtime/systemd phase, then mark the
-      # durable rollback-runtime-applied boundary before receipt cleanup.
+      # swapped.  Resume only the target runtime/systemd phase after the
+      # transaction proves the pre-activation v1 cache purge completed, then
+      # mark the durable runtime-applied boundary before receipt cleanup.
       rollback_systemd_validate "$original_previous" \
         || { public_status failed systemd_state >&2; exit 1; }
       pending_release="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
@@ -375,7 +376,7 @@ if [[ "$pending_operation" == "rollback" ]]; then
       rollback_systemd_verify "$original_previous" \
         || { public_status failed systemd_state >&2; exit 1; }
       /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
-        --state "$STATE" --expected restart-pending \
+        --state "$STATE" --expected rollback-cache-purged \
         --phase rollback-runtime-applied \
         >/dev/null 2>/dev/null \
         || { public_status failed transaction >&2; exit 1; }
@@ -386,6 +387,12 @@ if [[ "$pending_operation" == "rollback" ]]; then
       /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$STATE" \
         >/dev/null 2>/dev/null \
         || { public_status failed transaction >&2; exit 1; }
+      ;;
+    restart-pending)
+      # Older receipts have no durable proof that the legacy profile cache was
+      # purged.  Keep the stopped state and both receipts for operator recovery.
+      public_status failed cache_purge >&2
+      exit 1
       ;;
     rollback-runtime-applied)
       # No runtime replay on a retry after the two-phase runtime boundary.

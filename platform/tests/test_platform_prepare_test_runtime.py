@@ -4,8 +4,10 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
 
+from python_packages.platform_infra.config import PlatformSettings
 from tools import platform_prepare_test_runtime as prepare
 
 
@@ -17,7 +19,11 @@ class PlatformPrepareTestRuntimeTests(unittest.TestCase):
             "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/0",
             "PLATFORM_SECRET_KEY=production-secret",
             "PLATFORM_OBJECT_STORAGE_BACKEND=r2",
+            "PLATFORM_COOKIE_SECURE=false",
             "PLATFORM_R2_SECRET_ACCESS_KEY=must-disappear",
+            "PLATFORM_RESEND_API_KEY=must-disappear",
+            "PLATFORM_EMAIL_SENDER_EMAIL=must-disappear",
+            "PLATFORM_SUPPORT_RECIPIENT_EMAIL=must-disappear",
             "PLATFORM_TURNSTILE_SECRET_KEY=must-disappear",
             "UNRELATED_SETTING=retained",
         ]
@@ -32,8 +38,17 @@ class PlatformPrepareTestRuntimeTests(unittest.TestCase):
         self.assertIn("/platformdb_test", content)
         self.assertIn("PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15", content)
         self.assertIn("PLATFORM_OBJECT_STORAGE_BACKEND=local", content)
+        self.assertEqual(content.count("PLATFORM_COOKIE_SECURE=true"), 1)
+        self.assertNotIn("PLATFORM_SESSION_COOKIE_SECURE", content)
         self.assertIn("UNRELATED_SETTING=retained", content)
         self.assertNotIn("must-disappear", content)
+        with patch.dict(
+            os.environ,
+            {"PLATFORM_COOKIE_SECURE": "true"},
+            clear=False,
+        ):
+            settings = PlatformSettings(_env_file=None)
+        self.assertTrue(settings.platform_cookie_secure)
         parsed = urlsplit(database_url)
         self.assertEqual(parsed.username, prepare.TEST_DATABASE_USER)
         self.assertEqual(unquote(parsed.password or ""), "new secret")

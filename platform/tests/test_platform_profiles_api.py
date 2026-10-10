@@ -26,7 +26,11 @@ from python_packages.platform_infra.models import (
     UserSession,
     new_uuid,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 
 
 class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
@@ -67,8 +71,8 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
             )
         )
 
@@ -81,6 +85,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "password": self.password,
                 "display_name": f"test-{label}"[:15],
             },
+            headers=same_origin_request_headers(client),
         )
         self.assertEqual(response.status_code, 201, response.text)
         return client
@@ -94,6 +99,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "password": self.password,
                 "display_name": "x" * 16,
             },
+            headers=same_origin_request_headers(client),
         )
         self.assertEqual(response.status_code, 422, response.text)
 
@@ -108,6 +114,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "discord_account": "private-discord",
                 "region": "Private region",
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(account_response.status_code, 200, account_response.text)
         deadlock_response = await owner.put(
@@ -120,6 +127,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "pool": ["Abrams"],
                 "captain_priority": "neutral",
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(deadlock_response.status_code, 200, deadlock_response.text)
 
@@ -140,6 +148,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
         response = await owner.put(
             "/api/v1/profiles/me",
             json={"steam_id": "76561198000000000"},
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(response.status_code, 422, response.text)
 
@@ -149,6 +158,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
         response = await owner.put(
             "/api/v1/profiles/me",
             json={"handle": handle},
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(response.status_code, 200, response.text)
 
@@ -163,6 +173,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
         response = await owner.put(
             "/api/v1/profiles/me",
             json={"captain_team_name": "Alpha Team"},
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["captain_team_name"], "Alpha Team")
@@ -174,6 +185,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
         cleared = await owner.put(
             "/api/v1/profiles/me",
             json={"captain_team_name": ""},
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(cleared.status_code, 200, cleared.text)
         self.assertIsNone(cleared.json()["captain_team_name"])
@@ -190,6 +202,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "discord_account": "old-discord",
                 "captain_team_name": "Old Team",
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(initial.status_code, 200, initial.text)
 
@@ -203,6 +216,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "discord_account": None,
                 "captain_team_name": None,
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(cleared.status_code, 200, cleared.text)
         payload = cleared.json()
@@ -259,10 +273,15 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "bio": "Keep this bio",
                 "contact_email": "keep@example.com",
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(saved.status_code, 200, saved.text)
 
-        omitted = await owner.put("/api/v1/profiles/me", json={"region": None})
+        omitted = await owner.put(
+            "/api/v1/profiles/me",
+            json={"region": None},
+            headers=same_origin_request_headers(owner),
+        )
         self.assertEqual(omitted.status_code, 200, omitted.text)
         self.assertEqual(omitted.json()["handle"], f"{self.prefix}-omit")
         self.assertEqual(omitted.json()["bio"], "Keep this bio")
@@ -271,6 +290,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
         invalid = await owner.put(
             "/api/v1/profiles/me",
             json={"display_name": None},
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(invalid.status_code, 422, invalid.text)
 
@@ -282,6 +302,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "avatar_url": "https://attacker.invalid/avatar.png",
                 "banner_url": "https://attacker.invalid/banner.png",
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(response.status_code, 422, response.text)
 
@@ -364,6 +385,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
         login = await second_session.post(
             "/api/v1/auth/login",
             json={"email": email, "password": self.password},
+            headers=same_origin_request_headers(second_session),
         )
         self.assertEqual(login.status_code, 200, login.text)
 
@@ -374,6 +396,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "current_password": "wrong-password",
                 "new_password": new_password,
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(rejected.status_code, 401, rejected.text)
 
@@ -383,6 +406,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 "current_password": self.password,
                 "new_password": new_password,
             },
+            headers=same_origin_request_headers(owner),
         )
         self.assertEqual(updated.status_code, 200, updated.text)
         self.assertEqual(updated.json()["email"], email)
@@ -400,11 +424,13 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
         old_login = await fresh.post(
             "/api/v1/auth/login",
             json={"email": email, "password": self.password},
+            headers=same_origin_request_headers(fresh),
         )
         self.assertEqual(old_login.status_code, 401, old_login.text)
         new_login = await fresh.post(
             "/api/v1/auth/login",
             json={"email": email, "password": new_password},
+            headers=same_origin_request_headers(fresh),
         )
         self.assertEqual(new_login.status_code, 200, new_login.text)
 
@@ -461,6 +487,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 gif_rejected = await owner.post(
                     "/api/v1/profiles/me/avatar",
                     files={"file": ("avatar.gif", b"GIF89a", "image/gif")},
+                    headers=same_origin_request_headers(owner),
                 )
                 self.assertEqual(gif_rejected.status_code, 415, gif_rejected.text)
                 self.assertEqual(gif_rejected.json()["detail"]["code"], "unsupported_media_type")
@@ -469,6 +496,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 too_large = await owner.post(
                     "/api/v1/profiles/me/avatar",
                     files={"file": ("avatar.png", oversized, "image/png")},
+                    headers=same_origin_request_headers(owner),
                 )
                 self.assertEqual(too_large.status_code, 413, too_large.text)
                 self.assertEqual(too_large.json()["detail"]["code"], "media_too_large")
@@ -476,6 +504,7 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 first = await owner.post(
                     "/api/v1/profiles/me/avatar",
                     files={"file": ("avatar.png", tiny_png, "image/png")},
+                    headers=same_origin_request_headers(owner),
                 )
                 self.assertEqual(first.status_code, 202, first.text)
                 first_asset_id = first.json()["asset_id"]
@@ -491,12 +520,16 @@ class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
                 second = await owner.post(
                     "/api/v1/profiles/me/avatar",
                     files={"file": ("avatar.png", tiny_png, "image/png")},
+                    headers=same_origin_request_headers(owner),
                 )
                 self.assertEqual(second.status_code, 202, second.text)
                 replaced_status = await owner.get(first.json()["status_url"])
                 self.assertEqual(replaced_status.json()["status"], "replaced")
 
-                deleted = await owner.delete("/api/v1/profiles/me/avatar")
+                deleted = await owner.delete(
+                    "/api/v1/profiles/me/avatar",
+                    headers=same_origin_request_headers(owner),
+                )
                 self.assertEqual(deleted.status_code, 202, deleted.text)
                 self.assertEqual(deleted.json()["status"], "cleanup_pending")
                 second_status = await owner.get(second.json()["status_url"])

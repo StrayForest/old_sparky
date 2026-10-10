@@ -37,7 +37,11 @@ from python_packages.platform_infra.models import (
     User,
 )
 from python_packages.platform_infra.security import invalidate_user_session_cache
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 
 
 class _CooldownRedis:
@@ -166,7 +170,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
         self.settings = PlatformSettings(
             _env_file=None,
             platform_steam_callback_url=(
-                "http://testserver/api/v1/auth/steam/callback"
+                "https://testserver/api/v1/auth/steam/callback"
             ),
             platform_steam_login_enabled=True,
             platform_auth_generic_response_min_seconds=0,
@@ -220,8 +224,8 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
-                base_url="http://testserver",
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
+                base_url="https://testserver",
                 follow_redirects=False,
             )
         )
@@ -238,6 +242,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 "password": self.password,
                 "display_name": f"safe-{label}"[:15],
             },
+            headers=same_origin_request_headers(client),
         )
         self.assertEqual(response.status_code, 201, response.text)
         payload = response.json()
@@ -258,6 +263,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             started = await client.post(
                 start_path,
                 json={"return_to": target_path},
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(started.status_code, 200, started.text)
         authorization_query = parse_qs(urlparse(started.json()["authorization_url"]).query)
@@ -327,10 +333,15 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             start = await client.post(
                 "/api/v1/auth/steam/login/start",
                 json={"return_to": "/"},
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(security_config.status_code, 200, security_config.text)
         self.assertFalse(security_config.json()["steam_login_enabled"])
         self.assertEqual(start.status_code, 503, start.text)
+        self.assertEqual(
+            start.json()["detail"],
+            "Steam authentication is currently unavailable.",
+        )
 
     async def test_link_is_session_bound_rotates_sessions_and_rejects_collision(self) -> None:
         steam_id = "76561198000010002"
@@ -343,6 +354,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
                 "email": owner_payload["user"]["email"],
                 "password": self.password,
             },
+            headers=same_origin_request_headers(second_owner_session),
         )
         self.assertEqual(logged_in.status_code, 200, logged_in.text)
         linked = await self._steam_callback(owner, steam_id=steam_id, purpose="link")
@@ -371,6 +383,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             started = await client.post(
                 "/api/v1/auth/steam/login/start",
                 json={"return_to": f"/{self.prefix}/login"},
+                headers=same_origin_request_headers(client),
             )
         return_to = parse_qs(urlparse(started.json()["authorization_url"]).query)[
             "openid.return_to"
@@ -412,6 +425,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             started = await client.post(
                 "/api/v1/auth/steam/login/start",
                 json={"return_to": f"/{self.prefix}/provider-failure"},
+                headers=same_origin_request_headers(client),
             )
         return_to = parse_qs(urlparse(started.json()["authorization_url"]).query)[
             "openid.return_to"
@@ -441,6 +455,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             started = await client.post(
                 "/api/v1/auth/steam/login/start",
                 json={"return_to": f"/{self.prefix}/rate-limited"},
+                headers=same_origin_request_headers(client),
             )
         return_to = parse_qs(urlparse(started.json()["authorization_url"]).query)[
             "openid.return_to"
@@ -499,6 +514,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     "password": self.password,
                     "display_name": "pending-user",
                 },
+                headers=same_origin_request_headers(registering_client),
             )
         self.assertEqual(registered.status_code, 201, registered.text)
         self.assertIsNone(registered.json()["user"])
@@ -517,6 +533,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             requested = await recovery_client.post(
                 "/api/v1/auth/password-reset/request",
                 json={"email": email},
+                headers=same_origin_request_headers(recovery_client),
             )
             self.assertEqual(requested.status_code, 202, requested.text)
             reset_code = reset_mail.await_args.kwargs["code"]
@@ -528,6 +545,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     "code": reset_code,
                     "new_password": new_password,
                 },
+                headers=same_origin_request_headers(recovery_client),
             )
         self.assertEqual(recovered.status_code, 200, recovered.text)
         self.assertEqual(recovered.json()["user"]["status"], "active")
@@ -560,10 +578,12 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             old_login = await old_login_client.post(
                 "/api/v1/auth/login",
                 json={"email": email, "password": self.password},
+                headers=same_origin_request_headers(old_login_client),
             )
             new_login = await old_login_client.post(
                 "/api/v1/auth/login",
                 json={"email": email, "password": new_password},
+                headers=same_origin_request_headers(old_login_client),
             )
         self.assertEqual(old_login.status_code, 401, old_login.text)
         self.assertEqual(new_login.status_code, 200, new_login.text)
@@ -596,20 +616,41 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     "password": self.password,
                     "display_name": "grant-user",
                 },
+                headers=same_origin_request_headers(origin_client),
             )
+            self.assertEqual(registered.status_code, 201, registered.text)
             code = mail.await_args.kwargs["code"]
             mail.reset_mock()
+            # Registration reserves this exact address's delivery cooldown.
+            # Clear only that fixture-owned key so this case reaches the
+            # originating-browser check instead of testing the separate
+            # cooldown contract (covered above).
+            cooldown_fingerprint = auth_rate_limit._fingerprint(
+                settings,
+                f"delivery:email-verification:{email}",
+            )
+            cache = auth_rate_limit.redis_client()
+            try:
+                deleted_cooldown = await cache.delete(
+                    f"platform:auth-delivery:v1:email-verification:{cooldown_fingerprint}"
+                )
+            finally:
+                await cache.aclose()
+            self.assertEqual(deleted_cooldown, 1)
             standalone_resend = await other_client.post(
                 "/api/v1/auth/email-verification/resend",
                 json={"email": email},
+                headers=same_origin_request_headers(other_client),
             )
             rejected = await other_client.post(
                 "/api/v1/auth/email-verification/confirm",
                 json={"email": email, "code": code},
+                headers=same_origin_request_headers(other_client),
             )
             confirmed = await origin_client.post(
                 "/api/v1/auth/email-verification/confirm",
                 json={"email": email, "code": code},
+                headers=same_origin_request_headers(origin_client),
             )
         self.assertIsNone(registered.json()["user"])
         async with session_factory()() as db_session:
@@ -645,6 +686,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             requested = await client.post(
                 "/api/v1/auth/email-link/request",
                 json={"email": email},
+                headers=same_origin_request_headers(client),
             )
             self.assertEqual(requested.status_code, 202, requested.text)
             async with session_factory()() as db_session:
@@ -660,6 +702,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             confirmed = await client.post(
                 "/api/v1/auth/email-link/confirm",
                 json={"email": email, "code": email_mail.await_args.kwargs["code"]},
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         self.assertEqual(confirmed.json()["email"], email)
@@ -674,6 +717,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
             reset_requested = await client.post(
                 "/api/v1/auth/password-reset/request",
                 json={"email": email},
+                headers=same_origin_request_headers(client),
             )
             self.assertEqual(reset_requested.status_code, 202, reset_requested.text)
             password_created = await client.post(
@@ -683,6 +727,7 @@ class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
                     "code": reset_mail.await_args.kwargs["code"],
                     "new_password": "first-email-password-789",
                 },
+                headers=same_origin_request_headers(client),
             )
         self.assertEqual(password_created.status_code, 200, password_created.text)
         self.assertTrue(password_created.json()["user"]["has_password"])

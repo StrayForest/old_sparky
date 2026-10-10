@@ -7,6 +7,7 @@ import argparse
 import asyncio
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
+import fcntl
 import json
 import math
 import os
@@ -14,6 +15,7 @@ from pathlib import Path
 import pwd
 import re
 import signal
+import stat
 import time
 from pstats import Stats
 from typing import Callable
@@ -70,6 +72,52 @@ from python_packages.platform_infra.db import session_factory
 TIMEOUT_DIAGNOSTIC_ID_RE = re.compile(r"^tdiag-[0-9]{1,32}-[0-9]{5}$")
 FIXTURE_MARKER_RE = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 EXTERNAL_RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
+SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+OBSERVER_PROGRESS_NAME = "observer-progress.json"
+OBSERVER_PROGRESS_MAX_BYTES = 16 * 1024
+OBSERVER_PROGRESS_MAX_ELAPSED_MS = 16_200_000
+OBSERVER_PROGRESS_PHASES = (
+    "fixture_setup_requested",
+    "observer_startup",
+    "observer_env_load",
+    "observer_db_before",
+    "sampler_start",
+    "sampling",
+    "stop_marker_seen",
+    "sampler_stop",
+    "post_stop_grace",
+    "observer_db_after",
+    "observer_explain",
+    "observer_journal_collect",
+    "observer_nginx_collect",
+    "observer_summary_write",
+    "observer_reaped",
+    "export_summary",
+    "supervisor_exit",
+)
+OBSERVER_PROGRESS_PHASE_INDEX = {
+    value: index for index, value in enumerate(OBSERVER_PROGRESS_PHASES)
+}
+OBSERVER_PROGRESS_KEYS = frozenset(
+    {
+        "schema",
+        "source_sha",
+        "run_id",
+        "run_attempt",
+        "profile_id",
+        "sequence",
+        "started_monotonic_ms",
+        "elapsed_ms",
+        "phase",
+        "stop_marker_seen",
+        "observer_exit_code",
+        "observer_command_reaped",
+        "observer_output_closed",
+        "authoritative",
+        "dispatchable",
+        "final_credit",
+    }
+)
 CPROFILE_NAME_RE = re.compile(
     r"^ready-vote-cprofile-(?P<pid>[0-9]+)-(?P<start_time_ticks>[1-9][0-9]*)\.pstats$"
 )
@@ -445,17 +493,391 @@ def signal_api_workers(
     return signalled
 
 
+def _unique_progress_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate progress key")
+        result[key] = value
+    return result
+
+
+def _validate_progress_context(
+    *, source_sha: str, run_id: str, run_attempt: str, profile_id: str
+) -> None:
+    if (
+        SOURCE_SHA_RE.fullmatch(source_sha) is None
+        or EXTERNAL_RUN_ID_RE.fullmatch(run_id) is None
+        or EXTERNAL_RUN_ID_RE.fullmatch(run_attempt) is None
+        or profile_id != "external-vote"
+    ):
+        raise ValueError("observer progress binding is invalid")
+
+
+def _validate_progress_payload(
+    payload: object,
+    *,
+    source_sha: str,
+    run_id: str,
+    run_attempt: str,
+    profile_id: str,
+) -> dict[str, object]:
+    if not isinstance(payload, dict) or set(payload) != OBSERVER_PROGRESS_KEYS:
+        raise ValueError("observer progress schema is invalid")
+    if (
+        type(payload.get("schema")) is not int
+        or payload["schema"] != 1
+        or payload.get("source_sha") != source_sha
+        or payload.get("run_id") != run_id
+        or payload.get("run_attempt") != run_attempt
+        or payload.get("profile_id") != profile_id
+        or type(payload.get("sequence")) is not int
+        or not 1 <= payload["sequence"] <= 1_000_000
+        or type(payload.get("started_monotonic_ms")) is not int
+        or not 0 <= payload["started_monotonic_ms"] <= 9_223_372_036_854_775_807
+        or type(payload.get("elapsed_ms")) is not int
+        or not 0 <= payload["elapsed_ms"] <= OBSERVER_PROGRESS_MAX_ELAPSED_MS
+        or payload.get("phase") not in OBSERVER_PROGRESS_PHASE_INDEX
+        or type(payload.get("stop_marker_seen")) is not bool
+        or type(payload.get("observer_command_reaped")) is not bool
+        or type(payload.get("observer_output_closed")) is not bool
+        or payload.get("authoritative") is not False
+        or payload.get("dispatchable") is not False
+        or payload.get("final_credit") is not False
+    ):
+        raise ValueError("observer progress binding or values are invalid")
+    if payload["phase"] == "stop_marker_seen" and payload["stop_marker_seen"] is not True:
+        raise ValueError("observer stop-marker phase is invalid")
+    if (
+        OBSERVER_PROGRESS_PHASE_INDEX[str(payload["phase"])]
+        < OBSERVER_PROGRESS_PHASE_INDEX["stop_marker_seen"]
+        and payload["stop_marker_seen"] is True
+    ):
+        raise ValueError("observer stop-marker state is premature")
+    exit_code = payload.get("observer_exit_code")
+    if exit_code is not None and (
+        type(exit_code) is not int or not 0 <= exit_code <= 255
+    ):
+        raise ValueError("observer progress exit code is invalid")
+    if payload["phase"] == "observer_reaped":
+        if (
+            exit_code is None
+            or payload["observer_command_reaped"] is not True
+            or payload["observer_output_closed"] is not True
+        ):
+            raise ValueError("observer reap receipt is incomplete")
+    elif (
+        exit_code is not None
+        or payload["observer_command_reaped"] is not False
+        or payload["observer_output_closed"] is not False
+    ):
+        raise ValueError("observer reap fields appeared before wait completion")
+    return payload
+
+
+class ObserverProgressReceipt:
+    """Write a bounded, private, source-bound observer phase receipt."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        source_sha: str,
+        run_id: str,
+        run_attempt: str,
+        profile_id: str = "external-vote",
+    ) -> None:
+        _validate_progress_context(
+            source_sha=source_sha,
+            run_id=run_id,
+            run_attempt=run_attempt,
+            profile_id=profile_id,
+        )
+        if path.name != OBSERVER_PROGRESS_NAME:
+            raise ValueError("observer progress path is invalid")
+        self.path = path
+        self.source_sha = source_sha
+        self.run_id = run_id
+        self.run_attempt = run_attempt
+        self.profile_id = profile_id
+
+    def _read(self, directory_fd: int) -> tuple[dict[str, object] | None, tuple[int, int] | None]:
+        try:
+            descriptor = os.open(
+                OBSERVER_PROGRESS_NAME,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return None, None
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_size > OBSERVER_PROGRESS_MAX_BYTES
+            ):
+                raise ValueError("observer progress file metadata is invalid")
+            raw = bytearray()
+            while len(raw) <= OBSERVER_PROGRESS_MAX_BYTES:
+                chunk = os.read(
+                    descriptor,
+                    min(4096, OBSERVER_PROGRESS_MAX_BYTES + 1 - len(raw)),
+                )
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            after = os.fstat(descriptor)
+            path_after = os.stat(
+                OBSERVER_PROGRESS_NAME,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            identity_before = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            identity_after = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if (
+                len(raw) > OBSERVER_PROGRESS_MAX_BYTES
+                or identity_before != identity_after
+                or (path_after.st_dev, path_after.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise ValueError("observer progress changed while reading")
+        finally:
+            os.close(descriptor)
+        try:
+            payload = json.loads(
+                raw.decode("ascii"), object_pairs_hook=_unique_progress_pairs
+            )
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("observer progress JSON is invalid") from exc
+        _validate_progress_payload(
+            payload,
+            source_sha=self.source_sha,
+            run_id=self.run_id,
+            run_attempt=self.run_attempt,
+            profile_id=self.profile_id,
+        )
+        return payload, (before.st_dev, before.st_ino)
+
+    def emit(
+        self,
+        phase: str,
+        *,
+        stop_marker_seen: bool,
+        observer_exit_code: int | None = None,
+        observer_command_reaped: bool = False,
+        observer_output_closed: bool = False,
+    ) -> None:
+        if phase not in OBSERVER_PROGRESS_PHASE_INDEX or type(stop_marker_seen) is not bool:
+            raise ValueError("observer progress phase is invalid")
+        directory = self.path.parent
+        parent_before = directory.lstat()
+        if (
+            not stat.S_ISDIR(parent_before.st_mode)
+            or parent_before.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_before.st_mode) & 0o077
+        ):
+            raise ValueError("observer progress directory is unsafe")
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW,
+        )
+        temporary_name = f".observer-progress-{os.getpid()}-{uuid4().hex}.tmp"
+        temporary_fd: int | None = None
+        directory_locked = False
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
+            directory_locked = True
+            opened_parent = os.fstat(directory_fd)
+            if (opened_parent.st_dev, opened_parent.st_ino) != (
+                parent_before.st_dev,
+                parent_before.st_ino,
+            ):
+                raise ValueError("observer progress directory changed")
+            previous, previous_identity = self._read(directory_fd)
+            now_monotonic_ms = time.monotonic_ns() // 1_000_000
+            if previous is None:
+                sequence = 1
+                started_monotonic_ms = now_monotonic_ms
+                elapsed_ms = 0
+            else:
+                if OBSERVER_PROGRESS_PHASE_INDEX[phase] < OBSERVER_PROGRESS_PHASE_INDEX[str(previous["phase"])]:
+                    raise ValueError("observer progress phase regressed")
+                if previous["stop_marker_seen"] is True and not stop_marker_seen:
+                    raise ValueError("observer progress stop marker regressed")
+                sequence = int(previous["sequence"]) + 1
+                started_monotonic_ms = int(previous["started_monotonic_ms"])
+                elapsed_ms = max(
+                    int(previous["elapsed_ms"]),
+                    now_monotonic_ms - started_monotonic_ms,
+                )
+            if sequence > 1_000_000 or elapsed_ms > OBSERVER_PROGRESS_MAX_ELAPSED_MS:
+                raise ValueError("observer progress exceeded its fixed bound")
+            if phase == "observer_reaped":
+                if (
+                    type(observer_exit_code) is not int
+                    or not 0 <= observer_exit_code <= 255
+                    or observer_command_reaped is not True
+                    or observer_output_closed is not True
+                ):
+                    raise ValueError("observer reap state is incomplete")
+            elif (
+                observer_exit_code is not None
+                or observer_command_reaped is not False
+                or observer_output_closed is not False
+            ):
+                raise ValueError("observer reap state is premature")
+            payload: dict[str, object] = {
+                "schema": 1,
+                "source_sha": self.source_sha,
+                "run_id": self.run_id,
+                "run_attempt": self.run_attempt,
+                "profile_id": self.profile_id,
+                "sequence": sequence,
+                "started_monotonic_ms": started_monotonic_ms,
+                "elapsed_ms": elapsed_ms,
+                "phase": phase,
+                "stop_marker_seen": stop_marker_seen,
+                "observer_exit_code": observer_exit_code,
+                "observer_command_reaped": observer_command_reaped,
+                "observer_output_closed": observer_output_closed,
+                "authoritative": False,
+                "dispatchable": False,
+                "final_credit": False,
+            }
+            _validate_progress_payload(
+                payload,
+                source_sha=self.source_sha,
+                run_id=self.run_id,
+                run_attempt=self.run_attempt,
+                profile_id=self.profile_id,
+            )
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("ascii") + b"\n"
+            if len(encoded) > OBSERVER_PROGRESS_MAX_BYTES:
+                raise ValueError("observer progress exceeds its size bound")
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            os.fchmod(temporary_fd, 0o600)
+            view = memoryview(encoded)
+            while view:
+                written = os.write(temporary_fd, view)
+                if written <= 0:
+                    raise OSError("observer progress write was incomplete")
+                view = view[written:]
+            os.fsync(temporary_fd)
+            temporary_metadata = os.fstat(temporary_fd)
+            if (
+                not stat.S_ISREG(temporary_metadata.st_mode)
+                or temporary_metadata.st_uid != os.geteuid()
+                or temporary_metadata.st_nlink != 1
+                or stat.S_IMODE(temporary_metadata.st_mode) != 0o600
+                or temporary_metadata.st_size != len(encoded)
+            ):
+                raise ValueError("observer progress temporary metadata is invalid")
+            current, current_identity = self._read(directory_fd)
+            if previous is None:
+                if current is not None:
+                    raise ValueError("observer progress appeared during write")
+            elif current is None or current_identity != previous_identity or current != previous:
+                raise ValueError("observer progress changed during write")
+            os.replace(
+                temporary_name,
+                OBSERVER_PROGRESS_NAME,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+            final, _identity = self._read(directory_fd)
+            if final != payload:
+                raise ValueError("observer progress replacement did not persist")
+        finally:
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            if directory_locked:
+                fcntl.flock(directory_fd, fcntl.LOCK_UN)
+            os.close(directory_fd)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Observe one external load window on the origin.")
-    parser.add_argument("--env-file", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--stop-file", type=Path, required=True)
+    parser.add_argument("--env-file", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--stop-file", type=Path)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--max-runtime", type=float, default=9_000.0)
     parser.add_argument("--diagnostic-id-file", type=Path)
-    parser.add_argument("--fixture-marker", required=True)
-    parser.add_argument("--external-run-id", required=True)
+    parser.add_argument("--fixture-marker")
+    parser.add_argument("--external-run-id")
+    parser.add_argument("--run-attempt")
+    parser.add_argument("--source-sha")
+    parser.add_argument("--profile-id", default="external-vote")
+    parser.add_argument("--progress-path", type=Path)
+    parser.add_argument("--record-progress-phase", choices=OBSERVER_PROGRESS_PHASES)
+    parser.add_argument("--stop-marker-seen", choices=("true", "false"), default="false")
+    parser.add_argument("--observer-exit-code", type=int)
     return parser.parse_args()
+
+
+def _record_progress_from_args(args: argparse.Namespace) -> int | None:
+    if args.record_progress_phase is None:
+        return None
+    if (
+        args.progress_path is None
+        or args.source_sha is None
+        or args.external_run_id is None
+        or args.run_attempt is None
+        or args.env_file is not None
+        or args.output is not None
+        or args.stop_file is not None
+        or args.diagnostic_id_file is not None
+        or args.fixture_marker is not None
+    ):
+        raise ValueError("observer progress command arguments are invalid")
+    if os.geteuid() != 0:
+        raise RuntimeError("observer progress writer must run as root")
+    stop_marker_seen = args.stop_marker_seen == "true"
+    observer_reaped = args.record_progress_phase == "observer_reaped"
+    ObserverProgressReceipt(
+        args.progress_path,
+        source_sha=args.source_sha,
+        run_id=args.external_run_id,
+        run_attempt=args.run_attempt,
+        profile_id=args.profile_id,
+    ).emit(
+        args.record_progress_phase,
+        stop_marker_seen=stop_marker_seen,
+        observer_exit_code=args.observer_exit_code,
+        observer_command_reaped=observer_reaped,
+        observer_output_closed=observer_reaped,
+    )
+    return 0
 
 
 def load_timeout_diagnostic_ids(path: Path | None) -> set[str] | None:
@@ -1077,6 +1499,9 @@ def _safe_process_lifecycle(value: object) -> dict[str, dict[str, int]]:
 
 async def async_main() -> int:
     args = parse_args()
+    progress_command_status = _record_progress_from_args(args)
+    if progress_command_status is not None:
+        return progress_command_status
     if os.geteuid() != 0:
         raise RuntimeError("external load observer must run as root")
     if not 0.25 <= args.interval <= 60:
@@ -1087,10 +1512,24 @@ async def async_main() -> int:
         raise ValueError("observer fixture-marker is invalid")
     if EXTERNAL_RUN_ID_RE.fullmatch(args.external_run_id) is None:
         raise ValueError("observer external-run-id is invalid")
+    progress: ObserverProgressReceipt | None = None
+    if any((args.run_attempt, args.source_sha, args.progress_path)):
+        if args.run_attempt is None or args.source_sha is None or args.progress_path is None:
+            raise ValueError("observer progress binding is incomplete")
+        progress = ObserverProgressReceipt(
+            args.progress_path,
+            source_sha=args.source_sha,
+            run_id=args.external_run_id,
+            run_attempt=args.run_attempt,
+            profile_id=args.profile_id,
+        )
+        progress.emit("observer_env_load", stop_marker_seen=False)
     load_env_file(args.env_file)
     os.environ["PLATFORM_RUNTIME_SERVICE"] = "observer"
     profile_dir_raw = os.environ.get("PLATFORM_READY_VOTE_CPU_PROFILE_DIR", "").strip()
     profile_dir = Path(profile_dir_raw) if profile_dir_raw else None
+    if progress is not None:
+        progress.emit("observer_db_before", stop_marker_seen=False)
     postgres_before = await postgres_statement_snapshot()
 
     sampler = SystemSampler(interval_seconds=args.interval)
@@ -1105,6 +1544,8 @@ async def async_main() -> int:
     started_at = datetime.now(UTC)
     journal_since = started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
     started_monotonic = time.monotonic()
+    if progress is not None:
+        progress.emit("sampler_start", stop_marker_seen=False)
     await sampler.start()
     profile_baseline = profile_artifact_snapshot(profile_dir) if profile_dir else None
     armed_worker_identities = api_worker_identities() if profile_dir else {}
@@ -1125,13 +1566,23 @@ async def async_main() -> int:
         if pid in armed_worker_identities
     }
     timed_out = False
+    last_progress_at = time.monotonic()
     try:
         while not args.stop_file.exists() and not stop_event.is_set():
             if time.monotonic() - started_monotonic >= args.max_runtime:
                 timed_out = True
                 break
             await asyncio.sleep(min(1.0, args.interval))
+            now = time.monotonic()
+            if progress is not None and now - last_progress_at >= 10:
+                progress.emit("sampling", stop_marker_seen=False)
+                last_progress_at = now
     finally:
+        stop_marker_seen = args.stop_file.exists()
+        if progress is not None and stop_marker_seen:
+            progress.emit("stop_marker_seen", stop_marker_seen=True)
+        if progress is not None:
+            progress.emit("sampler_stop", stop_marker_seen=stop_marker_seen)
         await sampler.stop()
         flushed_workers: list[int] = []
         if profile_dir:
@@ -1141,12 +1592,20 @@ async def async_main() -> int:
             )
     # Nginx buffers access records for up to five seconds. Let the final
     # records reach disk before taking the window's read-only snapshot.
+    if progress is not None:
+        progress.emit("post_stop_grace", stop_marker_seen=stop_marker_seen)
     await asyncio.sleep(6)
+    if progress is not None:
+        progress.emit("observer_db_after", stop_marker_seen=stop_marker_seen)
     postgres_after = await postgres_statement_snapshot()
+    if progress is not None:
+        progress.emit("observer_explain", stop_marker_seen=stop_marker_seen)
     postgres_explain = await ready_vote_explain_evidence(args.fixture_marker)
 
     finished_at = datetime.now(UTC)
     journal_until = finished_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    if progress is not None:
+        progress.emit("observer_journal_collect", stop_marker_seen=stop_marker_seen)
     request_perf_lines = collect_api_journal_lines(
         journal_since,
         journal_until,
@@ -1157,6 +1616,8 @@ async def async_main() -> int:
         journal_until,
         with_timestamps=True,
     )
+    if progress is not None:
+        progress.emit("observer_nginx_collect", stop_marker_seen=stop_marker_seen)
     nginx_access_records = collect_nginx_access_records(started_at, finished_at)
     timeout_diagnostic_ids = load_timeout_diagnostic_ids(args.diagnostic_id_file)
 
@@ -1193,6 +1654,8 @@ async def async_main() -> int:
         for sample in sampler.samples
     ]
 
+    if progress is not None:
+        progress.emit("observer_summary_write", stop_marker_seen=stop_marker_seen)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": 1,

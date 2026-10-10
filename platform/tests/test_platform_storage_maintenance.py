@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 import errno
 import fcntl
@@ -10,14 +11,17 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 from types import SimpleNamespace
 import textwrap
 import unittest
+import uuid
 from unittest import mock
 import zipfile
 
@@ -114,6 +118,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             apply=True,
             backup_only=False,
             verify_existing_backup_only=False,
+            purge_profile_access_cache_after_restore=False,
             evict_pinned_build_node_cache=False,
             eviction_run_id=None,
             eviction_run_attempt=None,
@@ -268,6 +273,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 maintenance.parse_args()
+
         with mock.patch.object(
             maintenance.sys,
             "argv",
@@ -404,6 +410,327 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 maintenance.parse_args()
+
+        for argv in (
+            [
+                "platform_storage_maintenance.py",
+                "--purge-profile-access-cache-after-restore",
+            ],
+            [
+                "platform_storage_maintenance.py",
+                "--purge-profile-access-cache-after-restore",
+                "--apply",
+            ],
+        ):
+            with self.subTest(argv=argv), mock.patch.object(
+                maintenance.sys, "argv", argv
+            ), self.assertRaises(SystemExit):
+                maintenance.parse_args()
+
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--purge-profile-access-cache-after-restore",
+                "--apply",
+                "--json",
+            ],
+        ):
+            args = maintenance.parse_args()
+            self.assertTrue(args.purge_profile_access_cache_after_restore)
+
+    def test_restore_profile_access_cache_purge_requires_stopped_services_and_skips_retention(
+        self,
+    ) -> None:
+        app_dir = self.root / "runtime" / "platform"
+        (app_dir / "shared").mkdir(parents=True)
+        current = self.add_runtime_release(app_dir, "release-current")
+        (app_dir / "current").symlink_to(current)
+        args = self.maintenance_args(app_dir)
+        args.purge_profile_access_cache_after_restore = True
+        args.as_json = True
+        args.source_release_dir = self.release_dir
+        events: list[str] = []
+
+        venv = app_dir / "shared" / "venv"
+        python = venv / "bin" / "python"
+        (venv / "bin").mkdir(parents=True)
+        python.symlink_to(maintenance.RESTORE_PURGE_SYSTEM_PYTHON)
+
+        shared_env = app_dir / "shared" / ".env.platform"
+        shared_env.write_text(
+            "PLATFORM_REDIS_URL=redis://127.0.0.1:6379/15\n", encoding="utf-8"
+        )
+        shared_env.chmod(0o600)
+        purge_helper = (
+            current
+            / "apps"
+            / "platform_api"
+            / "app"
+            / "services"
+            / "tournament_profile_access.py"
+        )
+        purge_helper.parent.mkdir(parents=True)
+        purge_helper.write_text("# test-only fixed purge source\n", encoding="utf-8")
+
+        python.unlink()
+        python.symlink_to("/usr/bin/true")
+        with (
+            mock.patch.object(maintenance, "DEFAULT_APP_DIR", app_dir),
+            mock.patch.object(maintenance.subprocess, "run") as rejected_child,
+            self.assertRaisesRegex(RuntimeError, "Python runtime is unsafe"),
+        ):
+            maintenance._purge_restored_profile_access_cache(app_dir, current)
+        rejected_child.assert_not_called()
+        python.unlink()
+        python.symlink_to(maintenance.RESTORE_PURGE_SYSTEM_PYTHON)
+
+        inactive = subprocess.CompletedProcess(
+            ["systemctl", "is-active", "deadlock-api.service"],
+            3,
+            "inactive\n",
+            "",
+        )
+        with mock.patch.object(
+            maintenance.subprocess,
+            "run",
+            side_effect=[inactive, inactive],
+        ) as systemctl:
+            maintenance._require_restore_services_stopped()
+        self.assertEqual(systemctl.call_count, 2)
+
+        active = subprocess.CompletedProcess(
+            ["systemctl", "is-active", "deadlock-api.service"], 0, "active\n", ""
+        )
+        with mock.patch.object(maintenance.subprocess, "run", return_value=active):
+            with self.assertRaisesRegex(RuntimeError, "stopped API and worker"):
+                maintenance._require_restore_services_stopped()
+
+        with mock.patch.object(
+            maintenance.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "17\n", "private detail"),
+        ) as purge_child:
+            with mock.patch.object(maintenance, "DEFAULT_APP_DIR", app_dir):
+                self.assertEqual(
+                    maintenance._purge_restored_profile_access_cache(app_dir, current), 17
+                )
+        child_command = purge_child.call_args.args[0]
+        child_environment = purge_child.call_args.kwargs["env"]
+        self.assertEqual(
+            child_command[:3], [str(python), "-I", "-B"]
+        )
+        self.assertEqual(child_command[-1], str(current))
+        self.assertIn(
+            "purge_all_tournament_profile_access_cache",
+            child_command[child_command.index("-c") + 1],
+        )
+        self.assertIn("sys.path[:0]", child_command[child_command.index("-c") + 1])
+        self.assertEqual(purge_child.call_args.kwargs["cwd"], "/")
+        self.assertEqual(
+            child_environment["PLATFORM_REDIS_URL"], "redis://127.0.0.1:6379/15"
+        )
+        self.assertEqual(
+            set(child_environment),
+            {
+                "PATH",
+                "PYTHONDONTWRITEBYTECODE",
+                "PLATFORM_ENVIRONMENT",
+                "PLATFORM_SHARED_DIR",
+                "PLATFORM_REDIS_URL",
+            },
+        )
+
+        @maintenance.contextmanager
+        def tracked_scope(*_args: object, **_kwargs: object):
+            events.append("maintenance-locks-enter")
+            yield self.release_dir
+            events.append("maintenance-locks-exit")
+
+        @maintenance.contextmanager
+        def tracked_live_qa_lock():
+            events.append("live-qa-lock-enter")
+            yield
+            events.append("live-qa-lock-exit")
+
+        def stopped_services() -> None:
+            events.append("services-stopped-check")
+
+        def purge_cache(_app_dir: Path, _current: Path) -> int:
+            events.append("purge")
+            return 17
+
+        with (
+            mock.patch.object(maintenance, "DEFAULT_APP_DIR", app_dir),
+            mock.patch.object(maintenance, "DEFAULT_SOURCE_RELEASE_DIR", self.release_dir),
+            mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
+            mock.patch.object(maintenance, "live_qa_machine_lock", tracked_live_qa_lock),
+            mock.patch.object(
+                maintenance,
+                "_require_restore_services_stopped",
+                side_effect=stopped_services,
+            ),
+            mock.patch.object(
+                maintenance,
+                "_purge_restored_profile_access_cache",
+                side_effect=purge_cache,
+            ) as purge,
+            mock.patch.object(maintenance, "run_backup") as run_backup,
+            mock.patch.object(maintenance, "verify_existing_backup") as verify_backup,
+            mock.patch.object(maintenance, "_plan_and_maybe_apply") as retention,
+        ):
+            report = run_maintenance(args)
+
+        self.assertEqual(
+            report,
+            {
+                "ok": True,
+                "status": "completed",
+                "mode": "restore-profile-access-cache-purge",
+                "purged_key_count": 17,
+                "services_stopped": True,
+            },
+        )
+
+        # Exercise the actual isolated restore child against the guarded local
+        # Redis DB15 fixture.  The production entrypoint is fixed to the
+        # canonical app root, so this test binds that root only inside its
+        # disposable fixture and preserves the same argv/runtime checks.
+        from redis.asyncio import from_url
+
+        from tools.platform_test_runner import validate_test_resource_configuration
+
+        resources = validate_test_resource_configuration()
+        self.assertEqual(resources.database_name, "platformdb_test")
+        self.assertEqual(resources.database_schema, "platform")
+        self.assertEqual(resources.redis_database, "15")
+        self.assertEqual(resources.redis_host, "127.0.0.1")
+
+        test_prefixes = (
+            "platform:tournament:profile-access:v1",
+            "platform:tournament:profile-viewers:v1",
+            "platform:tournament:profile-roster:v1",
+            "platform:tournament:profile-access:v2",
+            "platform:tournament:profile-viewers:v2",
+            "platform:tournament:profile-roster:v2",
+        )
+        nonce = uuid.uuid4().hex
+        cache_keys = tuple(f"{prefix}:restore-proof-{nonce}" for prefix in test_prefixes)
+        unrelated_key = f"platform:restore-proof-unrelated:{nonce}"
+        runtime_venv = app_dir / "shared" / "venv"
+        python.unlink()
+        python.symlink_to(maintenance.RESTORE_PURGE_SYSTEM_PYTHON)
+
+        runtime_site = Path(sysconfig.get_path("purelib")).resolve(strict=True)
+        try:
+            runtime_site.relative_to(Path(sys.prefix).resolve(strict=True))
+        except ValueError as exc:
+            raise AssertionError("test child dependencies are outside the pinned venv") from exc
+        self.assertEqual(sys.version_info[:2], (3, 12))
+        self.assertTrue((runtime_site / "redis").is_dir())
+        self.assertTrue((runtime_site / "sqlalchemy").is_dir())
+        self.assertTrue((runtime_site / "pydantic_settings").is_dir())
+        pyvenv_cfg = runtime_venv / "pyvenv.cfg"
+        pyvenv_cfg.write_text(
+            "home = /usr/bin\n"
+            "include-system-site-packages = false\n"
+            f"version = {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n",
+            encoding="ascii",
+        )
+        pyvenv_cfg.chmod(0o600)
+        venv_site = (
+            runtime_venv
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+        venv_site.parent.mkdir(parents=True)
+        venv_site.symlink_to(runtime_site, target_is_directory=True)
+
+        shutil.rmtree(current / "apps")
+        api_root = current / "apps" / "platform_api"
+        api_root.mkdir(parents=True)
+        platform_root = REPO_ROOT / "platform"
+        shutil.copytree(
+            platform_root / "apps" / "platform_api" / "app", api_root / "app"
+        )
+        shutil.copytree(platform_root / "python_packages", current / "python_packages")
+        # The source tree is copied into the disposable release so its settings
+        # loader cannot read the developer checkout's ignored environment file.
+        self.assertFalse((current / ".env.platform").exists())
+
+        redis_client = from_url(resources.redis_url, decode_responses=False)
+        real_run = maintenance.subprocess.run
+
+        def systemctl_or_child(
+            command: list[str], *run_args: object, **run_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if command[:2] == ["systemctl", "is-active"]:
+                self.assertIn(command[2], maintenance.RESTORE_PURGE_SERVICES)
+                events.append("services-stopped-check")
+                return subprocess.CompletedProcess(command, 3, "inactive\n", "")
+            events.append("purge-child")
+            return real_run(command, *run_args, **run_kwargs)
+
+        async def exercise_real_child() -> None:
+            try:
+                self.assertTrue(await redis_client.ping())
+                self.assertEqual(await redis_client.exists(*cache_keys, unrelated_key), 0)
+                await redis_client.mset({key: b"test" for key in cache_keys})
+                await redis_client.set(unrelated_key, b"preserve")
+
+                event_offset = len(events)
+                with (
+                    mock.patch.object(maintenance, "DEFAULT_APP_DIR", app_dir),
+                    mock.patch.object(
+                        maintenance, "DEFAULT_SOURCE_RELEASE_DIR", self.release_dir
+                    ),
+                    mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
+                    mock.patch.object(maintenance, "live_qa_machine_lock", tracked_live_qa_lock),
+                    mock.patch.object(
+                        maintenance.subprocess, "run", side_effect=systemctl_or_child
+                    ),
+                ):
+                    real_report = run_maintenance(args)
+
+                self.assertEqual(real_report["mode"], "restore-profile-access-cache-purge")
+                self.assertGreaterEqual(real_report["purged_key_count"], len(cache_keys))
+                self.assertEqual(await redis_client.exists(*cache_keys), 0)
+                self.assertEqual(await redis_client.get(unrelated_key), b"preserve")
+                child_events = events[event_offset:]
+                self.assertEqual(
+                    child_events,
+                    [
+                        "maintenance-locks-enter",
+                        "live-qa-lock-enter",
+                        "services-stopped-check",
+                        "services-stopped-check",
+                        "purge-child",
+                        "live-qa-lock-exit",
+                        "maintenance-locks-exit",
+                    ],
+                )
+            finally:
+                await redis_client.delete(*cache_keys, unrelated_key)
+                await redis_client.aclose()
+
+        asyncio.run(exercise_real_child())
+        purge.assert_called_once_with(app_dir, current)
+        self.assertEqual(
+            events[:6],
+            [
+                "maintenance-locks-enter",
+                "live-qa-lock-enter",
+                "services-stopped-check",
+                "purge",
+                "live-qa-lock-exit",
+                "maintenance-locks-exit",
+            ],
+        )
+        run_backup.assert_not_called()
+        verify_backup.assert_not_called()
+        retention.assert_not_called()
 
     def test_backup_command_verifies_freshness_before_returning(self) -> None:
         create_result = {
@@ -1355,6 +1682,75 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             '/usr/bin/python3 -I - "$backup_report_file" "$operation" '
             '"$evict_build_node_cache" "$compact_fallback_runtime_cache"'
         )
+        normalizer_script = workflow_python(
+            '/usr/bin/python3 -I - "$public_report" "$operation" '
+            '"$backup_report_file" "$EVICT_BUILD_NODE_CACHE"'
+        )
+        with tempfile.TemporaryDirectory() as normalizer_dir_name:
+            normalizer_report_path = Path(normalizer_dir_name) / "report.json"
+            normalizer_compaction = {
+                "status": "completed",
+                "result": "compacted",
+                "reclaimed_bytes": 397_406_208,
+                "source_commit": "4a04b2dffaf0d02c2d3910e7ba28dca9b89de209",
+                "old_tree_sha256": "1" * 64,
+                "new_tree_sha256": "2" * 64,
+                "intent_receipt": "liveqa-fallback-cache-compaction-123456-1.intent.json",
+                "validated_receipt": "liveqa-fallback-cache-compaction-123456-1.validated.json",
+                "completion_receipt": "liveqa-fallback-cache-compaction-123456-1.completion.json",
+            }
+            normalizer_report = {
+                "backup": {
+                    "fallback_runtime_cache_compaction": normalizer_compaction
+                }
+            }
+
+            def normalize_public_summary(
+                public_json: str = '{"mode":"unknown"}',
+            ) -> subprocess.CompletedProcess[str]:
+                normalizer_report_path.write_text(
+                    json.dumps(normalizer_report, sort_keys=True), encoding="utf-8"
+                )
+                return run_inline(
+                    normalizer_script,
+                    public_json,
+                    "verify-existing",
+                    str(normalizer_report_path),
+                    "false",
+                    "true",
+                )
+
+            normalized = normalize_public_summary()
+            self.assertEqual(normalized.returncode, 0, normalized.stderr)
+            normalized_report = json.loads(normalized.stdout)
+            self.assertEqual(normalized_report["mode"], "verify-existing-backup-only")
+            self.assertEqual(
+                normalized_report["fallback_runtime_cache_compaction"]["reclaimed_bytes"],
+                397_406_208,
+            )
+
+            invalid_summary = normalize_public_summary('{"mode":"unexpected"}')
+            self.assertNotEqual(invalid_summary.returncode, 0)
+            self.assertEqual(
+                invalid_summary.stdout,
+                "BACKUP_PUBLIC_SUMMARY_FAILURE reason=normalizer_mode_mismatch\n",
+            )
+            invalid_json = normalize_public_summary("not-json")
+            self.assertNotEqual(invalid_json.returncode, 0)
+            self.assertEqual(
+                invalid_json.stdout,
+                "BACKUP_PUBLIC_SUMMARY_FAILURE reason=normalizer_summary_invalid\n",
+            )
+
+            del normalizer_compaction["new_tree_sha256"]
+            missing_projection = normalize_public_summary()
+            self.assertNotEqual(missing_projection.returncode, 0)
+            self.assertEqual(
+                missing_projection.stdout,
+                "BACKUP_PUBLIC_SUMMARY_FAILURE reason=normalizer_projection_invalid\n",
+            )
+            self.assertNotIn("4a04b2dffaf0d02c2d3910e7ba28dca9b89de209", missing_projection.stdout)
+
         with tempfile.TemporaryDirectory() as summary_dir_name:
             summary_dir = Path(summary_dir_name)
             summary_report_path = summary_dir / "report.json"
@@ -1854,7 +2250,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 set(receipt),
                 {
                     "schema", "event", "run_id", "attempt", "operation", "source_sha",
-                    "bundle_sha256", "stage", "exit_code", "report_state",
+                    "bundle_sha256", "stage", "public_summary_error", "exit_code", "report_state",
                     "report_error_class", "restore_diagnostic", "report_bytes",
                     "report_sha256", "stderr_state",
                     "stderr_exception_class", "stderr_bytes", "stderr_sha256",
@@ -1862,6 +2258,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             self.assertEqual(receipt["event"], "platform_backup_failure")
             self.assertEqual(receipt["stage"], "preflight")
+            self.assertEqual(receipt["public_summary_error"], "none")
             self.assertEqual(receipt["exit_code"], completed.returncode)
             self.assertEqual(receipt["report_error_class"], "none")
             self.assertEqual(receipt["stderr_exception_class"], "none")
@@ -2001,6 +2398,87 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "create_database",
             )
             self.assertFalse(typed_report.exists())
+
+            trap_start = remote_script.index(
+                "import hashlib\n", remote_script.index("backup_failure_marker() {")
+            )
+            trap_end = remote_script.index("\nPY", trap_start)
+            failure_receipt_script = textwrap.dedent(
+                remote_script[trap_start:trap_end]
+            )
+            classifier_start = remote_script.index(
+                "classify_public_summary_error() {"
+            )
+            classifier_end = remote_script.index("\n}", classifier_start) + len(
+                "\n}"
+            )
+            classifier_source = textwrap.dedent(
+                remote_script[classifier_start:classifier_end]
+            )
+            classifier_script = (
+                "public_summary_error=none\n"
+                + classifier_source
+                + '\nclassify_public_summary_error "$1"\n'
+                + "printf '%s\\n' \"$public_summary_error\"\n"
+            )
+            accepted_classification = subprocess.run(
+                ["bash", "-s", "--", "BACKUP_PUBLIC_SUMMARY_FAILURE reason=normalizer_projection_invalid"],
+                input=classifier_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(accepted_classification.returncode, 0)
+            self.assertEqual(accepted_classification.stdout, "normalizer_projection_invalid\n")
+            untrusted_classification = subprocess.run(
+                ["bash", "-s", "--", "private detail operator@example.test"],
+                input=classifier_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(untrusted_classification.returncode, 0)
+            self.assertEqual(untrusted_classification.stdout, "unclassified\n")
+            self.assertNotIn("operator@example.test", untrusted_classification.stdout)
+
+            for run_id, stage, summary_error in (
+                ("123459", "public_summary", "normalizer_projection_invalid"),
+                ("123460", "summary_validation", "summary_tool_failed"),
+            ):
+                failure_receipt = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-",
+                        str(shared),
+                        run_id,
+                        "1",
+                        "verify-existing",
+                        "a" * 40,
+                        "b" * 64,
+                        stage,
+                        "1",
+                        "",
+                        "",
+                        summary_error,
+                    ],
+                    input=failure_receipt_script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(failure_receipt.returncode, 0, failure_receipt.stderr)
+                saved_path = shared / f"backup-failure-{run_id}-1.json"
+                saved = json.loads(saved_path.read_text(encoding="ascii"))
+                self.assertEqual(saved["stage"], stage)
+                self.assertEqual(saved["public_summary_error"], summary_error)
+                self.assertEqual(saved["source_sha"], "a" * 40)
+                self.assertEqual(saved["bundle_sha256"], "b" * 64)
+                self.assertEqual(stat.S_IMODE(saved_path.lstat().st_mode), 0o600)
+                self.assertEqual(saved_path.lstat().st_nlink, 1)
+                self.assertNotIn("private detail", saved_path.read_text(encoding="ascii"))
 
     def _assert_backup_child_group_is_terminated(self, workflow_path: Path) -> None:
         workflow = yaml.safe_load(workflow_path.read_text())

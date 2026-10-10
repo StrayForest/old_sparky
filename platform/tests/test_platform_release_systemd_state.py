@@ -270,6 +270,7 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             ],
             "timer_active_before": True,
             "timer_enabled_before": "enabled",
+            "profile_access_cache_purge_proof": None,
         }
         transaction.write_text(json.dumps(record, sort_keys=True) + "\n")
         transaction.chmod(0o600)
@@ -287,6 +288,51 @@ class PlatformReleaseSystemdStateTests(unittest.TestCase):
             "--app-dir",
             str(self.app),
         )
+
+        current_record = json.loads(transaction.read_text(encoding="utf-8"))
+        current_record["profile_access_cache_purge_proof"] = {
+            "schema": 1,
+            "operation_id": current_record["operation_id"],
+            "operation": "install",
+            "source_role": "candidate",
+            "source_identity": current_record["candidate_identity"],
+            "venv_identity": current_record["peer_before"],
+            "scope": "tournament-profile-access-v1",
+        }
+        transaction.write_text(json.dumps(current_record, sort_keys=True) + "\n")
+        transaction.chmod(0o600)
+        proof_receipt = self.shared / ".release-systemd-state-purge-proof.json"
+        self.run_helper(
+            "capture-transaction",
+            "--state",
+            str(proof_receipt),
+            "--transaction",
+            str(transaction),
+            "--require-helper-manifest",
+            "--app-dir",
+            str(self.app),
+        )
+        invalid_record = dict(current_record)
+        invalid_proof = dict(current_record["profile_access_cache_purge_proof"])
+        invalid_proof["scope"] = "tournament-profile-access-v2"
+        invalid_record["profile_access_cache_purge_proof"] = invalid_proof
+        invalid_transaction = self.shared / ".release-operation-invalid-proof.json"
+        invalid_transaction.write_text(json.dumps(invalid_record, sort_keys=True) + "\n")
+        invalid_transaction.chmod(0o600)
+        invalid_receipt = self.shared / ".release-systemd-state-invalid-proof.json"
+        result = self.run_helper(
+            "capture-transaction",
+            "--state",
+            str(invalid_receipt),
+            "--transaction",
+            str(invalid_transaction),
+            "--require-helper-manifest",
+            "--app-dir",
+            str(self.app),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(invalid_receipt.exists())
 
     def test_initial_systemd_snapshot_rejects_empty_pointer_strings(self) -> None:
         transaction = self.write_install_transaction()

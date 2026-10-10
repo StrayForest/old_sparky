@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import errno
 import grp
@@ -80,6 +81,7 @@ PHASES = {
     "activation-committed",
     "recovery-authorized",
     "restart-pending",
+    "rollback-cache-purged",
     "rollback-runtime-pending",
     "rollback-runtime-applied",
     "filesystem-restored-runtime-pending",
@@ -145,9 +147,13 @@ PHASE_TRANSITIONS = {
         "recovery-authorized",
     },
     "rollback-runtime-pending": {
-        "restart-pending",
-        "rollback-runtime-applied",
+        "rollback-cache-purged",
         "filesystem-restored-runtime-pending",
+        "recovery-authorized",
+    },
+    "rollback-cache-purged": {
+        "services-restarted",
+        "rollback-runtime-applied",
         "recovery-authorized",
     },
     "rollback-runtime-applied": {"recovery-authorized"},
@@ -156,6 +162,14 @@ PHASE_TRANSITIONS = {
     "recovery-restored": set(),
     "legacy-services-restored": set(),
 }
+ROLLBACK_CACHE_PURGE_PROOF_PHASES = frozenset(
+    {
+        "rollback-cache-purged",
+        "services-restarted",
+        "smoke-passed",
+        "rollback-runtime-applied",
+    }
+)
 MIGRATION_OUTCOME_UNCERTAIN_PHASES = {
     "migration-pending",
     "migration-failed",
@@ -224,14 +238,22 @@ RECORD_KEYS = {
     "timer_active_before",
     "timer_enabled_before",
     "systemd_state_before",
+    "profile_access_cache_purge_proof",
+}
+RECORD_KEYS_WITHOUT_PROFILE_CACHE_PURGE_PROOF = RECORD_KEYS - {
+    "profile_access_cache_purge_proof"
 }
 LEGACY_RECORD_KEYS = RECORD_KEYS - {
     "operation_id",
     "service_enabled_before",
     "timer_enabled_before",
     "systemd_state_before",
+    "profile_access_cache_purge_proof",
 }
 RECORD_KEYS_WITHOUT_SYSTEMD_STATE = RECORD_KEYS - {"systemd_state_before"}
+RECORD_KEYS_WITHOUT_SYSTEMD_AND_PROFILE_CACHE_PURGE_PROOF = (
+    RECORD_KEYS - {"systemd_state_before", "profile_access_cache_purge_proof"}
+)
 QUIESCE_RECORD_KEYS = {
     "version",
     "operation",
@@ -642,9 +664,14 @@ def _validate_record(
         set(record) == LEGACY_RECORD_KEYS
         and record.get("phase") == "recovery-restored"
     )
+    accepted_record_keys = {
+        frozenset(RECORD_KEYS),
+        frozenset(RECORD_KEYS_WITHOUT_SYSTEMD_STATE),
+        frozenset(RECORD_KEYS_WITHOUT_PROFILE_CACHE_PURGE_PROOF),
+        frozenset(RECORD_KEYS_WITHOUT_SYSTEMD_AND_PROFILE_CACHE_PURGE_PROOF),
+    }
     if (
-        set(record) not in (RECORD_KEYS, RECORD_KEYS_WITHOUT_SYSTEMD_STATE)
-        and not legacy_recovery
+        frozenset(record) not in accepted_record_keys and not legacy_recovery
     ) or record.get("version") != STATE_VERSION:
         raise TransactionError("release operation record schema is invalid")
     if "systemd_state_before" not in record:
@@ -652,6 +679,15 @@ def _validate_record(
         # them readable, but normalize the optional field in memory so every
         # subsequent durable write has one unambiguous schema.
         record = {**record, "systemd_state_before": None}
+    if "profile_access_cache_purge_proof" not in record:
+        # Receipts written before cache-purge proof was introduced remain
+        # readable for rollback, but cannot authorize cache-sensitive
+        # completion or service activation.
+        record = {**record, "profile_access_cache_purge_proof": None}
+    if record["profile_access_cache_purge_proof"] is not None:
+        _validate_profile_access_cache_purge_proof_shape(
+            record["profile_access_cache_purge_proof"]
+        )
     if not legacy_recovery and (
         not isinstance(record.get("operation_id"), str)
         or OPERATION_ID_PATTERN.fullmatch(record["operation_id"]) is None
@@ -670,6 +706,8 @@ def _validate_record(
         raise TransactionError("release operation type is invalid")
     if phase not in PHASES:
         raise TransactionError("release operation phase is invalid")
+    if phase == "rollback-cache-purged" and operation != "rollback":
+        raise TransactionError("legacy cache purge phase is rollback-only")
     if transition not in {"exchange", "create", "none"}:
         raise TransactionError("release venv transition is invalid")
     if type(record.get("remove_env_on_recovery")) is not bool:
@@ -794,6 +832,9 @@ def _validate_record(
             legacy_release / "liveqa-runtime"
         ):
             raise TransactionError("legacy services phase has managed LiveQA inputs")
+        _require_profile_access_cache_purge_proof(validated)
+    if validated["profile_access_cache_purge_proof"] is not None:
+        _require_profile_access_cache_purge_proof(validated)
     return validated
 
 
@@ -1019,6 +1060,7 @@ def create_record(
         "timer_active_before": None,
         "timer_enabled_before": None,
         "systemd_state_before": None,
+        "profile_access_cache_purge_proof": None,
     }
     validated = _validate_record(state, record)
     _write_record(state, _record_for_write(validated), creating=True)
@@ -1036,6 +1078,21 @@ def set_phase(state: Path, *, expected: str, phase: str) -> None:
         raise TransactionError(
             f"release operation phase transition is invalid: {expected} -> {phase}"
         )
+    if (
+        record["operation"] == "rollback"
+        and phase in ROLLBACK_CACHE_PURGE_PROOF_PHASES
+    ):
+        _require_profile_access_cache_purge_proof(record)
+    if (
+        record["operation"] == "rollback"
+        and expected in ROLLBACK_CACHE_PURGE_PROOF_PHASES
+    ):
+        _require_profile_access_cache_purge_proof(record)
+    if (
+        record["operation"] == "install"
+        and phase == "legacy-services-restored"
+    ):
+        _require_profile_access_cache_purge_proof(record)
     record["phase"] = phase
     _write_record(state, _record_for_write(record), creating=False)
 
@@ -2001,6 +2058,7 @@ def _verify_recovery_pointers(record: dict[str, object]) -> None:
             "previous-switched": ((rollback_current, rollback_previous),),
             "pointers-switched": ((rollback_current, rollback_previous),),
             "restart-pending": ((rollback_current, rollback_previous),),
+            "rollback-cache-purged": ((rollback_current, rollback_previous),),
             "rollback-runtime-pending": ((rollback_current, rollback_previous),),
             "rollback-runtime-applied": ((rollback_current, rollback_previous),),
             "services-restarted": ((rollback_current, rollback_previous),),
@@ -2366,6 +2424,271 @@ def _cleanup_recovered_install(
         _fsync_directory(state.parent)
 
 
+def _cache_purge_runtime_paths(record: dict[str, object]) -> tuple[Path, Path]:
+    """Resolve the transaction-bound source and venv locations for a purge."""
+    transition = cast(str, record["transition"])
+    if record["operation"] == "rollback":
+        # Rollback activates the older ``candidate_path``.  The purge code
+        # must instead run from the current release being rolled back, which
+        # remains in ``current_before_path`` and whose venv is retained by the
+        # transaction snapshot after an exchange.
+        source_release = cast(Path | None, record["current_before_path"])
+        if source_release is None:
+            raise TransactionError("rollback cache purge source is unavailable")
+        runtime_identity = record["shared_before"]
+    elif record["operation"] == "install":
+        source_release = cast(Path, record["candidate_path"])
+        if transition in {"exchange", "create"}:
+            runtime_identity = record["peer_before"]
+        else:
+            runtime_identity = record["shared_before"]
+    else:
+        raise TransactionError("cache purge operation is invalid")
+    _safe_directory(source_release, label="cache purge source release")
+    if not _valid_identity(runtime_identity):
+        raise TransactionError("cache purge candidate venv identity is invalid")
+    expected_identity = cast(dict[str, int], runtime_identity)
+    locations = _unique_paths(
+        cast(Path, record["shared_venv_path"]),
+        cast(Path, record["peer_path"]),
+        cast(Path, record["snapshot_path"]),
+    )
+    matches = [path for path in locations if _matches(path, expected_identity)]
+    if len(matches) != 1:
+        raise TransactionError("cache purge candidate venv location is ambiguous")
+    return source_release, matches[0]
+
+
+def _cache_purge_runtime(record: dict[str, object]) -> tuple[Path, Path]:
+    """Resolve the source/venv pair and verify its fixed purge interpreter."""
+
+    source_release, venv = _cache_purge_runtime_paths(record)
+    python = venv / "bin/python"
+    try:
+        python_metadata = python.lstat()
+        resolved_python = python.resolve(strict=True)
+        resolved_metadata = resolved_python.lstat()
+    except OSError as exc:
+        raise TransactionError("cache purge candidate interpreter is unavailable") from exc
+    if (
+        not (stat.S_ISLNK(python_metadata.st_mode) or stat.S_ISREG(python_metadata.st_mode))
+        or not stat.S_ISREG(resolved_metadata.st_mode)
+        or resolved_metadata.st_uid != 0
+        or stat.S_IMODE(resolved_metadata.st_mode) & 0o022
+        or not os.access(resolved_python, os.X_OK)
+        or resolved_python != Path("/usr/bin/python3.12")
+    ):
+        raise TransactionError("cache purge candidate interpreter is unsafe")
+    return source_release, python
+
+
+PROFILE_ACCESS_CACHE_PURGE_PROOF_KEYS = {
+    "schema",
+    "operation_id",
+    "operation",
+    "source_role",
+    "source_identity",
+    "venv_identity",
+    "scope",
+}
+
+
+def _validate_profile_access_cache_purge_proof_shape(value: object) -> None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != PROFILE_ACCESS_CACHE_PURGE_PROOF_KEYS
+        or type(value.get("schema")) is not int
+        or value.get("schema") != 1
+        or not isinstance(value.get("operation_id"), str)
+        or OPERATION_ID_PATTERN.fullmatch(cast(str, value["operation_id"])) is None
+        or not isinstance(value.get("operation"), str)
+        or value.get("operation") not in {"install", "rollback"}
+        or not isinstance(value.get("source_role"), str)
+        or value.get("source_role") not in {"candidate", "current-before"}
+        or not _valid_identity(value.get("source_identity"))
+        or not _valid_identity(value.get("venv_identity"))
+        or not isinstance(value.get("scope"), str)
+        or value.get("scope") != "tournament-profile-access-v1"
+    ):
+        raise TransactionError("profile cache purge proof is invalid")
+
+
+def _profile_access_cache_purge_proof_binding(
+    record: dict[str, object],
+) -> dict[str, object]:
+    if not isinstance(record.get("operation_id"), str):
+        raise TransactionError("profile cache purge operation identity is unavailable")
+    source_release, venv = _cache_purge_runtime_paths(record)
+    if record["operation"] == "rollback":
+        source_role = "current-before"
+        source_identity = record["current_before_identity"]
+        venv_identity = record["shared_before"]
+    elif record["operation"] == "install":
+        source_role = "candidate"
+        source_identity = record["candidate_identity"]
+        venv_identity = (
+            record["peer_before"]
+            if record["transition"] in {"exchange", "create"}
+            else record["shared_before"]
+        )
+    else:
+        raise TransactionError("profile cache purge operation is invalid")
+    if not _valid_identity(source_identity) or not _valid_identity(venv_identity):
+        raise TransactionError("profile cache purge identity binding is invalid")
+    source_identity = cast(dict[str, int], source_identity)
+    venv_identity = cast(dict[str, int], venv_identity)
+    source_metadata = _safe_directory(source_release, label="cache purge source release")
+    venv_metadata = _safe_directory(venv, label="cache purge candidate venv")
+    if (
+        _identity(source_metadata) != source_identity
+        or _identity(venv_metadata) != venv_identity
+    ):
+        raise TransactionError("profile cache purge identity binding changed")
+    return {
+        "schema": 1,
+        "operation_id": record["operation_id"],
+        "operation": record["operation"],
+        "source_role": source_role,
+        "source_identity": source_identity,
+        "venv_identity": venv_identity,
+        "scope": "tournament-profile-access-v1",
+    }
+
+
+def _require_profile_access_cache_purge_proof(record: dict[str, object]) -> None:
+    proof = record.get("profile_access_cache_purge_proof")
+    _validate_profile_access_cache_purge_proof_shape(proof)
+    if proof != _profile_access_cache_purge_proof_binding(record):
+        raise TransactionError("profile cache purge proof does not match transaction")
+
+
+def purge_legacy_profile_access_cache(state: Path) -> None:
+    """Purge only source-owned v1 profile ACL keys before old code restarts."""
+
+    record = _load_record(state)
+    phase = cast(str, record["phase"])
+    if record["operation"] == "rollback":
+        if phase != "rollback-runtime-pending":
+            raise TransactionError("rollback cache purge is not at its restart boundary")
+    elif record["operation"] == "install":
+        if phase not in {
+            "migration-pending",
+            "migration-failed",
+            "migration-applied",
+            "filesystem-restored-services-pending",
+            "recovery-restored",
+        }:
+            raise TransactionError("install cache purge is not at its restart boundary")
+        if record["current_before_path"] is None:
+            raise TransactionError("first install has no legacy release to restart")
+    else:
+        raise TransactionError("cache purge operation is invalid")
+
+    source_release, python = _cache_purge_runtime(record)
+    shared = cast(Path, record["shared"])
+    env_file = shared / ".env.platform"
+    _optional_safe_private_file(env_file, label="cache purge shared environment")
+    safe_env_tool = source_release / "tools/platform_safe_env_exec.py"
+    try:
+        safe_tool_metadata = safe_env_tool.lstat()
+    except OSError as exc:
+        raise TransactionError("cache purge environment helper is unavailable") from exc
+    if (
+        not stat.S_ISREG(safe_tool_metadata.st_mode)
+        or safe_tool_metadata.st_uid != 0
+        or safe_tool_metadata.st_nlink != 1
+        or stat.S_IMODE(safe_tool_metadata.st_mode) & 0o022
+        or safe_tool_metadata.st_size > 1024 * 1024
+    ):
+        raise TransactionError("cache purge environment helper is unsafe")
+    try:
+        exported = subprocess.run(
+            [
+                "/usr/bin/python3.12",
+                "-I",
+                str(safe_env_tool),
+                "export-b64",
+                "--path",
+                str(env_file),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+            close_fds=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/root"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TransactionError("cache purge environment export failed") from exc
+    if exported.returncode != 0 or len(exported.stdout) > 1024 * 1024:
+        raise TransactionError("cache purge environment export failed")
+    redis_url: str | None = None
+    seen: set[str] = set()
+    try:
+        for line in exported.stdout.decode("ascii").splitlines():
+            key, separator, encoded = line.partition("\t")
+            if not separator or key in seen:
+                raise ValueError("invalid safe environment export")
+            seen.add(key)
+            if key == "PLATFORM_REDIS_URL":
+                value = base64.b64decode(encoded, validate=True).decode("utf-8")
+                if not value or "\x00" in value or "\n" in value or "\r" in value:
+                    raise ValueError("invalid Redis setting")
+                redis_url = value
+    except (UnicodeError, ValueError) as exc:
+        raise TransactionError("cache purge environment export is invalid") from exc
+    if redis_url is None:
+        raise TransactionError("cache purge Redis setting is unavailable")
+
+    child_env = {
+        "HOME": "/root",
+        "PATH": "/usr/bin:/bin",
+        "PLATFORM_REDIS_URL": redis_url,
+        "PLATFORM_SHARED_DIR": str(shared),
+        "PLATFORM_ENVIRONMENT": "production",
+    }
+    child = (
+        "import asyncio, pathlib, sys; "
+        "root = pathlib.Path(sys.argv[1]).resolve(strict=True); "
+        "sys.path[:0] = [str(root / 'apps/platform_api'), str(root / 'python_packages'), str(root)]; "
+        "from app.services.tournament_profile_access import purge_legacy_profile_access_cache; "
+        "result = asyncio.run(purge_legacy_profile_access_cache()); "
+        "raise SystemExit(0 if type(result) is int and result >= 0 else 1)"
+    )
+    try:
+        result = subprocess.run(
+            [str(python), "-I", "-B", "-c", child, str(source_release)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=60,
+            close_fds=True,
+            env=child_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TransactionError("legacy profile cache purge failed") from exc
+    if result.returncode != 0:
+        raise TransactionError("legacy profile cache purge failed")
+    purge_proof = _profile_access_cache_purge_proof_binding(record)
+    latest = _load_record(state)
+    if (
+        latest["operation_id"] != record["operation_id"]
+        or latest["operation"] != record["operation"]
+        or latest["phase"] != record["phase"]
+        or _profile_access_cache_purge_proof_binding(latest) != purge_proof
+        or (
+            latest["profile_access_cache_purge_proof"] is not None
+            and latest["profile_access_cache_purge_proof"] != purge_proof
+        )
+    ):
+        raise TransactionError("profile cache purge transaction changed")
+    if latest["profile_access_cache_purge_proof"] is None:
+        latest["profile_access_cache_purge_proof"] = purge_proof
+        _write_record(state, _record_for_write(latest), creating=False)
+
+
 def restore_services(state: Path, *, systemctl: str) -> None:
     """Restore a current-only install's exact pre-quiesce service snapshot."""
 
@@ -2381,6 +2704,7 @@ def restore_services(state: Path, *, systemctl: str) -> None:
     validate_service_snapshot(state, require="present")
     _verify_original_pointers(record)
     _restore_venv(record)
+    purge_legacy_profile_access_cache(state)
     service_state = cast(dict[str, str], record["service_state_before"])
     service_enabled = cast(dict[str, str], record["service_enabled_before"])
     for unit in SERVICE_UNITS:
@@ -2501,6 +2825,7 @@ def restore_legacy_services(state: Path, *, systemctl: str) -> None:
     systemctl = _systemctl_path(systemctl)
     record = _load_record(state)
     _validate_legacy_liveqa_recovery(state, record)
+    _require_profile_access_cache_purge_proof(record)
     service_state = cast(dict[str, str], record["service_state_before"])
     service_enabled = cast(dict[str, str], record["service_enabled_before"])
     for unit in SERVICE_UNITS:
@@ -2536,6 +2861,7 @@ def mark_legacy_services_restored(state: Path, *, systemctl: str) -> None:
     systemctl = _systemctl_path(systemctl)
     record = _load_record(state)
     _validate_legacy_liveqa_recovery(state, record)
+    _require_profile_access_cache_purge_proof(record)
     service_state = cast(dict[str, str], record["service_state_before"])
     service_enabled = cast(dict[str, str], record["service_enabled_before"])
     for unit in SERVICE_UNITS:
@@ -2676,7 +3002,7 @@ def recover(
             "resume the deployment or make an explicit operator rollback decision"
         )
     if (
-        record["phase"] == "restart-pending"
+        record["phase"] in {"restart-pending", "rollback-cache-purged"}
         and not (retain and record["operation"] == "rollback")
     ):
         raise TransactionError(
@@ -2742,6 +3068,13 @@ def _validate_success(record: dict[str, object]) -> None:
     shared = cast(Path, record["shared_venv_path"])
     peer = cast(Path, record["peer_path"])
     snapshot = cast(Path, record["snapshot_path"])
+    if record["operation"] == "rollback":
+        if record["phase"] == "restart-pending":
+            raise TransactionError(
+                "legacy rollback restart-pending receipt has no cache purge proof"
+            )
+        if record["phase"] in ROLLBACK_CACHE_PURGE_PROOF_PHASES:
+            _require_profile_access_cache_purge_proof(record)
     if record["operation"] == "install":
         desired_previous = (
             current_before if current_before is not None else previous_before
@@ -2797,9 +3130,16 @@ def _validate_success(record: dict[str, object]) -> None:
 
 def complete(state: Path, *, retain_receipt: bool = False) -> None:
     record = _load_record(state)
+    if record["operation"] == "rollback":
+        if record["phase"] == "restart-pending":
+            raise TransactionError(
+                "legacy rollback restart-pending receipt has no cache purge proof"
+            )
+        _require_profile_access_cache_purge_proof(record)
     if record["phase"] not in {
         "pointers-switched",
         "restart-pending",
+        "rollback-cache-purged",
         "activation-committed",
         "rollback-runtime-applied",
     }:
@@ -2904,6 +3244,10 @@ def _build_parser() -> argparse.ArgumentParser:
     restore_services_parser = commands.add_parser("restore-services")
     restore_services_parser.add_argument("--state", required=True, type=Path)
     restore_services_parser.add_argument("--systemctl", required=True)
+    purge_legacy_profile_cache_parser = commands.add_parser(
+        "purge-legacy-profile-access-cache"
+    )
+    purge_legacy_profile_cache_parser.add_argument("--state", required=True, type=Path)
     validate_legacy_liveqa_parser = commands.add_parser(
         "validate-legacy-liveqa-recovery"
     )
@@ -3035,6 +3379,8 @@ def main() -> int:
             validate_service_snapshot(args.state, require=args.require)
         elif args.command == "restore-services":
             restore_services(args.state, systemctl=args.systemctl)
+        elif args.command == "purge-legacy-profile-access-cache":
+            purge_legacy_profile_access_cache(args.state)
         elif args.command == "validate-legacy-liveqa-recovery":
             validate_legacy_liveqa_recovery(
                 args.state, app_dir=args.app_dir, release=args.release
@@ -3149,7 +3495,16 @@ def main() -> int:
                 else:
                     print(f"{quiesce_record['operation']} {quiesce_record['phase']}")
                 return 0
-            if record["phase"] == "restart-pending":
+            if record["operation"] == "rollback" and record["phase"] in {
+                "restart-pending",
+                *ROLLBACK_CACHE_PURGE_PROOF_PHASES,
+            }:
+                if record["phase"] == "restart-pending":
+                    raise TransactionError(
+                        "legacy rollback restart-pending receipt has no cache purge proof"
+                    )
+                _require_profile_access_cache_purge_proof(record)
+            if record["phase"] in {"restart-pending", "rollback-cache-purged"}:
                 _validate_success(record)
             if args.as_json:
                 print(

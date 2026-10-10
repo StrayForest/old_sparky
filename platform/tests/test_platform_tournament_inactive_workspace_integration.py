@@ -17,7 +17,11 @@ from python_packages.platform_infra.models import (
     TournamentParticipant,
     User,
 )
-from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
+from tests.platform_async_case import (
+    PlatformIsolatedAsyncioTestCase,
+    next_test_asgi_peer,
+    same_origin_request_headers,
+)
 from tests.platform_integration_password import (
     INTEGRATION_PASSWORD,
     patch_integration_registration_hash,
@@ -28,7 +32,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-as04-{uuid4().hex[:8]}"
         self.password = INTEGRATION_PASSWORD
-        self.base_url = "http://testserver"
+        self.base_url = "https://testserver"
         self.app = create_app()
         self.clients = AsyncExitStack()
         await self._cleanup_test_data()
@@ -57,7 +61,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
     async def _new_client(self) -> httpx.AsyncClient:
         return await self.clients.enter_async_context(
             httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=self.app),
+                transport=httpx.ASGITransport(app=self.app, client=next_test_asgi_peer()),
                 base_url=self.base_url,
             )
         )
@@ -80,6 +84,8 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
                         "password": self.password,
                         "display_name": f"as04-{label}"[:15],
                     },
+
+                    headers=same_origin_request_headers(client),
                 ),
                 201,
             )
@@ -114,6 +120,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -122,6 +129,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -129,6 +137,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/invites",
                 json={"note": "AS-04 regression", "max_uses": 2, "expires_at": None},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -138,6 +147,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             await active_member["client"].post(
                 "/api/v1/tournaments/invites/claim",
                 json={"code": invite["code"], "entry_type": "solo", "team_name": None},
+                headers=same_origin_request_headers(active_member["client"]),
             ),
             201,
         )
@@ -145,6 +155,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             await active_member["client"].post(
                 f"/api/v1/tournaments/{slug}/join",
                 json={"entry_type": "solo", "invite_code": invite["code"]},
+                headers=same_origin_request_headers(active_member["client"]),
             ),
             201,
         )
@@ -187,6 +198,8 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
                 await member["client"].post(
                     "/api/v1/tournaments/invites/claim",
                     json={"code": invite["code"], "entry_type": "solo", "team_name": None},
+
+                    headers=same_origin_request_headers(member["client"]),
                 ),
                 201,
             )
@@ -194,6 +207,8 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
                 await member["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo", "invite_code": invite["code"]},
+
+                    headers=same_origin_request_headers(member["client"]),
                 ),
                 201,
             )
@@ -307,18 +322,22 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
                 response = await member["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
                     json={"entry_type": "solo", "invite_code": invite["code"]},
-                    headers={"Idempotency-Key": f"inactive-{participant_status}-join"},
+                    headers=same_origin_request_headers(member["client"], extra={"Idempotency-Key": f"inactive-{participant_status}-join"}),
                 )
                 self.assertEqual(response.status_code, 403, response.text)
             with self.subTest(status=participant_status, suffix="join:DELETE"):
                 response = await member["client"].delete(
                     f"/api/v1/tournaments/{slug}/join",
+
+                    headers=same_origin_request_headers(member["client"]),
                 )
                 self.assertEqual(response.status_code, 403, response.text)
             with self.subTest(status=participant_status, suffix="invites/claim:POST"):
                 response = await member["client"].post(
                     "/api/v1/tournaments/invites/claim",
                     json={"code": invite["code"], "entry_type": "solo", "team_name": None},
+
+                    headers=same_origin_request_headers(member["client"]),
                 )
                 self.assertEqual(response.status_code, 403, response.text)
             with self.subTest(status=participant_status, suffix="participants/manage"):
@@ -365,6 +384,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
                     "visibility": "invite_only",
                     "format_slug": "solo",
                 },
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -373,6 +393,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_open"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
@@ -380,6 +401,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/invites",
                 json={"note": "expired", "max_uses": 1, "expires_at": None},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -395,12 +417,15 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/invites",
                 json={"note": "revoked", "max_uses": 1, "expires_at": None},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
         self._assert_status(
             await organizer["client"].delete(
                 f"/api/v1/tournaments/{slug}/invites/{revoked_invite['id']}"
+            ,
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             204,
         )
@@ -408,6 +433,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/invites",
                 json={"note": "terminal states", "max_uses": 1, "expires_at": None},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             201,
         )
@@ -442,6 +468,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsynci
             await organizer["client"].patch(
                 f"/api/v1/tournaments/{slug}/status",
                 json={"status": "registration_closed"},
+                headers=same_origin_request_headers(organizer["client"]),
             ),
             200,
         )
