@@ -21,9 +21,15 @@ disk floor.
 Before mutation, the workflow holds the canonical release, retained-load,
 source/build and live-QA locks. The guard validates the fixed cache against
 source `4a04b2dffaf0d02c2d3910e7ba28dca9b89de209`, its immutable manifest and
-the exact sandbox-helper identity. It records a root-private, source/run/bundle
-bound intent containing a bounded inventory of the original Chromium subtree.
-The factored current-source validator preserves the 4a existing-cache admission
+the closed 4a provenance tuple: the pinned Node archive, package-lock SHA256
+`bbfe1a66cc39665cffac0b59672877716f53785b92dbb09ff921a2627300f92f`, browser
+manifest SHA256 `ee39bc924bc3d1bd895626c2910f1292d109bbfeeb5abd113acb45e1951cc942`,
+and exact sandbox-helper identity. Ordinary runtime-cache preparation remains
+bound to the current trusted checkout's package lock. The compaction path uses
+the fixed 4a tuple only for this fixed legacy cache; it does not accept caller-
+selected commits or hashes. It records a root-private, source/run/bundle-bound
+intent containing a bounded inventory of the original Chromium subtree. The
+current validator preserves the 4a cache's content, permission, and provenance
 predicates; this operation does not stage or execute a second legacy helper.
 
 ## Transaction and recovery

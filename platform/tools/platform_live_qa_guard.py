@@ -101,6 +101,19 @@ CHROMIUM_SANDBOX_SHA256 = (
     "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
 )
 LEGACY_FALLBACK_RUNTIME_COMMIT = "4a04b2dffaf0d02c2d3910e7ba28dca9b89de209"
+LEGACY_FALLBACK_NODE_ARCHIVE_SHA256 = (
+    "55647180e4ae58ffeaa3294e89aa4abda7c371dfbd64b44cbdb022980177aae0"
+)
+LEGACY_FALLBACK_PACKAGE_LOCK_SHA256 = (
+    "bbfe1a66cc39665cffac0b59672877716f53785b92dbb09ff921a2627300f92f"
+)
+LEGACY_FALLBACK_PLAYWRIGHT_BROWSERS_SHA256 = (
+    "ee39bc924bc3d1bd895626c2910f1292d109bbfeeb5abd113acb45e1951cc942"
+)
+LEGACY_FALLBACK_CHROMIUM_SANDBOX_SIZE = 15232
+LEGACY_FALLBACK_CHROMIUM_SANDBOX_SHA256 = (
+    "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
+)
 LEGACY_COMPACTION_EVENT = "live_qa_fallback_runtime_compaction"
 CHROMIUM_ARCHIVE_RETAINED_PATHS = frozenset(
     {PurePosixPath("chrome-linux64/chrome_sandbox")}
@@ -3182,9 +3195,7 @@ def probe_compacted_legacy_runtime_cache(runtime_path: Path) -> None:
         or resolved != expected
     ):
         raise GuardError("live QA compacted runtime identity is unsafe")
-    _validate_existing_runtime_cache(
-        runtime_path, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
-    )
+    _validate_legacy_fallback_runtime_cache()
     sandbox = runtime_path / CHROMIUM_SANDBOX_RELATIVE
     sandbox_metadata = sandbox.lstat()
     if (
@@ -3307,6 +3318,66 @@ def _validate_existing_runtime_cache(
 ) -> dict[str, object]:
     """Apply the same no-create validator used by existing cache callers."""
 
+    package_lock_digest = hashlib.sha256(
+        (platform_root / "apps/platform_web/package-lock.json").read_bytes()
+    ).hexdigest()
+    return _validate_runtime_cache_provenance(
+        target,
+        commit=commit,
+        node_archive_digest=NODE_ARCHIVE_SHA256,
+        package_lock_digest=package_lock_digest,
+        expected_playwright_browsers_digest=None,
+    )
+
+
+def _validate_legacy_fallback_runtime_cache() -> dict[str, object]:
+    """Validate only the immutable 4a fallback against its source-pinned inputs.
+
+    Normal cache preparation remains bound to the current checkout's package
+    lock. This no-argument legacy path is reserved for the fixed compaction and
+    recovery transaction; callers cannot select a path, source commit, or
+    provenance digest.
+    """
+
+    target = RUNNER_CACHE_ROOT / _runtime_cache_commit_name(
+        LEGACY_FALLBACK_RUNTIME_COMMIT
+    )
+    manifest = _validate_runtime_cache_provenance(
+        target,
+        commit=LEGACY_FALLBACK_RUNTIME_COMMIT,
+        node_archive_digest=LEGACY_FALLBACK_NODE_ARCHIVE_SHA256,
+        package_lock_digest=LEGACY_FALLBACK_PACKAGE_LOCK_SHA256,
+        expected_playwright_browsers_digest=(
+            LEGACY_FALLBACK_PLAYWRIGHT_BROWSERS_SHA256
+        ),
+    )
+    _assert_playwright_revision(target / "web")
+    sandbox = target / CHROMIUM_SANDBOX_RELATIVE
+    sandbox_metadata = sandbox.lstat()
+    if (
+        stat.S_ISLNK(sandbox_metadata.st_mode)
+        or not stat.S_ISREG(sandbox_metadata.st_mode)
+        or sandbox_metadata.st_nlink != 1
+        or sandbox_metadata.st_size != LEGACY_FALLBACK_CHROMIUM_SANDBOX_SIZE
+        or _sha256_regular(
+            sandbox, expected_uid=0, expected_mode=0o4755
+        )
+        != LEGACY_FALLBACK_CHROMIUM_SANDBOX_SHA256
+    ):
+        raise GuardError("fallback Chromium sandbox helper is not pinned")
+    return manifest
+
+
+def _validate_runtime_cache_provenance(
+    target: Path,
+    *,
+    commit: str,
+    node_archive_digest: str,
+    package_lock_digest: str,
+    expected_playwright_browsers_digest: str | None,
+) -> dict[str, object]:
+    """Share strict tree checks while keeping current and legacy pins separate."""
+
     metadata = target.lstat()
     if (
         not stat.S_ISDIR(metadata.st_mode)
@@ -3336,16 +3407,27 @@ def _validate_existing_runtime_cache(
         ignored_relatives=frozenset({Path(".manifest.json")}),
     ):
         raise GuardError("runtime cache content drifted from its manifest")
-    package_lock_digest = hashlib.sha256(
-        (platform_root / "apps/platform_web/package-lock.json").read_bytes()
-    ).hexdigest()
     browsers_manifest_digest = hashlib.sha256(
         (target / "web/node_modules/playwright-core/browsers.json").read_bytes()
     ).hexdigest()
     if (
-        manifest.get("node_archive_sha256") != NODE_ARCHIVE_SHA256
+        manifest.get("node_archive_sha256") != node_archive_digest
         or manifest.get("package_lock_sha256") != package_lock_digest
         or manifest.get("playwright_browsers_sha256") != browsers_manifest_digest
+        or (
+            expected_playwright_browsers_digest is not None
+            and browsers_manifest_digest != expected_playwright_browsers_digest
+        )
+        or (
+            expected_playwright_browsers_digest is not None
+            and _sha256_regular(
+                target / "web/package-lock.json",
+                expected_uid=0,
+                expected_mode=0o444,
+                maximum=4 * 1024 * 1024,
+            )
+            != package_lock_digest
+        )
     ):
         raise GuardError("runtime cache dependency provenance is invalid")
     _validate_cache_tree_permissions(
@@ -4054,9 +4136,11 @@ def _compaction_snapshot(
     manifest, manifest_raw, _manifest_fingerprint = _read_cache_manifest(
         target / ".manifest.json"
     )
-    _validate_existing_runtime_cache(
-        target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
-    )
+    if target != RUNNER_CACHE_ROOT / _runtime_cache_commit_name(
+        LEGACY_FALLBACK_RUNTIME_COMMIT
+    ):
+        raise GuardError("legacy runtime cache path is not fixed")
+    _validate_legacy_fallback_runtime_cache()
     chromium = target / "browsers/chromium-1228"
     chromium_metadata = chromium.lstat()
     _validate_cache_tree_permissions(
@@ -4377,9 +4461,7 @@ def _restore_legacy_runtime_from_intent(
     os.rename(rollback, chromium)
     _sync_directory(rollback.parent)
     _sync_directory(chromium.parent)
-    _validate_existing_runtime_cache(
-        target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
-    )
+    _validate_legacy_fallback_runtime_cache()
     if _tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")})) != record["old_tree_sha256"]:
         raise GuardError("runtime cache original tree was not restored")
 
@@ -4528,9 +4610,7 @@ def compact_legacy_runtime_cache(
         manifest_raw = _atomic_replace_cache_manifest(
             target, new_manifest, temporary_name=temporary_name
         )
-        _validate_existing_runtime_cache(
-            target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
-        )
+        _validate_legacy_fallback_runtime_cache()
         if _tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")})) != new_tree_sha256:
             raise GuardError("compacted runtime cache changed after validation")
         assert_liveqa_idle()
@@ -4598,9 +4678,7 @@ def _finish_legacy_runtime_compaction(
         != validated["new_tree_sha256"]
     ):
         raise GuardError("validated runtime cache no longer matches its receipt")
-    _validate_existing_runtime_cache(
-        target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
-    )
+    _validate_legacy_fallback_runtime_cache()
     assert_liveqa_idle()
     probe_runtime(target)
     assert_liveqa_idle()
@@ -4674,9 +4752,7 @@ def recover_legacy_runtime_cache(
     assert_liveqa_idle()
     if validated is None:
         _restore_legacy_runtime_from_intent(target, intent)
-        _validate_existing_runtime_cache(
-            target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
-        )
+        _validate_legacy_fallback_runtime_cache()
         if _tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")})) != intent["old_tree_sha256"]:
             raise GuardError("runtime cache recovery did not restore original tree")
         probe_runtime(target)

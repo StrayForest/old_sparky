@@ -217,7 +217,8 @@ class LiveQaGuardTests(unittest.TestCase):
             platform_root = base / "platform"
             package_lock = platform_root / "apps/platform_web/package-lock.json"
             package_lock.parent.mkdir(parents=True)
-            package_lock.write_bytes(b'{"name":"synthetic-lock"}\n')
+            legacy_package_lock = b'{"name":"synthetic-4a-lock"}\n'
+            package_lock.write_bytes(b'{"name":"synthetic-current-lock"}\n')
             browsers_payload = {
                 "browsers": [
                     {"name": "chromium", "revision": "1228", "browserVersion": "149.0.7827.55"},
@@ -230,7 +231,7 @@ class LiveQaGuardTests(unittest.TestCase):
             files = {
                 "node/bin/node": b"synthetic pinned node\n",
                 "web/node_modules/playwright-core/browsers.json": browsers_raw,
-                "web/package-lock.json": package_lock.read_bytes(),
+                "web/package-lock.json": legacy_package_lock,
                 "browsers/chromium-1228/chrome-linux64/chrome": b"full chromium payload\n",
                 "browsers/chromium-1228/chrome-linux64/resources.pak": b"unused full payload\n",
                 "browsers/chromium_headless_shell-1228/headless_shell": b"headless shell\n",
@@ -267,7 +268,7 @@ class LiveQaGuardTests(unittest.TestCase):
                 "source_commit": guard.LEGACY_FALLBACK_RUNTIME_COMMIT,
                 "tree_sha256": tree_sha256,
                 "node_archive_sha256": guard.NODE_ARCHIVE_SHA256,
-                "package_lock_sha256": hashlib.sha256(package_lock.read_bytes()).hexdigest(),
+                "package_lock_sha256": hashlib.sha256(legacy_package_lock).hexdigest(),
                 "playwright_browsers_sha256": hashlib.sha256(browsers_raw).hexdigest(),
             }
             os.chmod(target, 0o755)
@@ -276,7 +277,19 @@ class LiveQaGuardTests(unittest.TestCase):
             )
             os.chmod(target, 0o555)
             try:
-                yield platform_root, cache_root, target, manifest
+                with (
+                    mock.patch.object(
+                        guard,
+                        "LEGACY_FALLBACK_PACKAGE_LOCK_SHA256",
+                        hashlib.sha256(legacy_package_lock).hexdigest(),
+                    ),
+                    mock.patch.object(
+                        guard,
+                        "LEGACY_FALLBACK_PLAYWRIGHT_BROWSERS_SHA256",
+                        hashlib.sha256(browsers_raw).hexdigest(),
+                    ),
+                ):
+                    yield platform_root, cache_root, target, manifest
             finally:
                 for path in sorted(
                     (cache_root, *cache_root.rglob("*")),
@@ -1096,6 +1109,23 @@ class LiveQaGuardTests(unittest.TestCase):
 
     @unittest.skipUnless(os.geteuid() == 0, "root-owned cache transaction contract")
     def test_legacy_fallback_compaction_is_reversible_and_resumable(self) -> None:
+        self.assertEqual(
+            guard.LEGACY_FALLBACK_PACKAGE_LOCK_SHA256,
+            "bbfe1a66cc39665cffac0b59672877716f53785b92dbb09ff921a2627300f92f",
+        )
+        self.assertEqual(
+            guard.LEGACY_FALLBACK_NODE_ARCHIVE_SHA256,
+            "55647180e4ae58ffeaa3294e89aa4abda7c371dfbd64b44cbdb022980177aae0",
+        )
+        self.assertEqual(
+            guard.LEGACY_FALLBACK_PLAYWRIGHT_BROWSERS_SHA256,
+            "ee39bc924bc3d1bd895626c2910f1292d109bbfeeb5abd113acb45e1951cc942",
+        )
+        self.assertEqual(guard.LEGACY_FALLBACK_CHROMIUM_SANDBOX_SIZE, 15232)
+        self.assertEqual(
+            guard.LEGACY_FALLBACK_CHROMIUM_SANDBOX_SHA256,
+            "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3",
+        )
         source_sha = "a" * 40
         with self.legacy_runtime_cache_fixture() as (platform_root, cache_root, target, _):
             original_tree = guard._tree_digest(
@@ -1108,6 +1138,39 @@ class LiveQaGuardTests(unittest.TestCase):
                 mock.patch.object(guard, "TRUSTED_PLATFORM_ROOT", platform_root),
                 mock.patch.object(guard, "assert_liveqa_idle"),
             ):
+                current_lock = hashlib.sha256(
+                    (platform_root / "apps/platform_web/package-lock.json").read_bytes()
+                ).hexdigest()
+                cached_lock = hashlib.sha256(
+                    (target / "web/package-lock.json").read_bytes()
+                ).hexdigest()
+                self.assertNotEqual(current_lock, cached_lock)
+                with self.assertRaisesRegex(
+                    guard.GuardError, "dependency provenance"
+                ):
+                    guard._validate_existing_runtime_cache(
+                        target, platform_root, guard.LEGACY_FALLBACK_RUNTIME_COMMIT
+                    )
+                self.assertEqual(
+                    guard._validate_legacy_fallback_runtime_cache()["package_lock_sha256"],
+                    cached_lock,
+                )
+                for pin_name in (
+                    "LEGACY_FALLBACK_PACKAGE_LOCK_SHA256",
+                    "LEGACY_FALLBACK_PLAYWRIGHT_BROWSERS_SHA256",
+                    "LEGACY_FALLBACK_NODE_ARCHIVE_SHA256",
+                    "LEGACY_FALLBACK_CHROMIUM_SANDBOX_SHA256",
+                ):
+                    with (
+                        self.subTest(pin=pin_name),
+                        mock.patch.object(guard, pin_name, "0" * 64),
+                        self.assertRaises(guard.GuardError),
+                    ):
+                        guard._validate_legacy_fallback_runtime_cache()
+                with self.assertRaisesRegex(guard.GuardError, "manifest is invalid"):
+                    guard._validate_existing_runtime_cache(
+                        target, platform_root, "b" * 40
+                    )
                 result = guard.compact_legacy_runtime_cache(
                     run_id=12345,
                     attempt=1,
@@ -1125,7 +1188,7 @@ class LiveQaGuardTests(unittest.TestCase):
                 self.assertEqual(events[1][1]["intent_sha256"], hashlib.sha256(guard._encode_compaction_record(events[0][1])).hexdigest())
                 self.assertEqual(events[2][1]["result"], "compacted")
                 self.assertFalse(cache_root.joinpath(str(events[0][1]["rollback_name"])).exists())
-                self.assertTrue(guard._validate_existing_runtime_cache(target, platform_root, guard.LEGACY_FALLBACK_RUNTIME_COMMIT))
+                self.assertTrue(guard._validate_legacy_fallback_runtime_cache())
                 chromium = target / "browsers/chromium-1228"
                 self.assertEqual(
                     {path.relative_to(chromium).as_posix() for path in chromium.rglob("*")},
