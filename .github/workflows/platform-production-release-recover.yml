@@ -613,6 +613,34 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          input_errors=0
+          check_recovery_input() {
+            local key="$1" value="$2"
+            case "$key" in
+              bundle_sha|route_digest) [[ "$value" =~ ^[0-9a-f]{64}$ ]] && return 0 ;;
+              source_sha) [[ "$value" =~ ^[0-9a-f]{40}$ ]] && return 0 ;;
+              recovery_workflow_sha|publisher_workflow_sha) [[ "$value" =~ ^[0-9a-f]{40,64}$ ]] && return 0 ;;
+              security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|publisher_run_id|publisher_run_attempt|publisher_job_id)
+                [[ "$value" =~ ^[1-9][0-9]{0,31}$ ]] && return 0 ;;
+            esac
+            printf 'RECOVERY_INPUT_INVALID schema=1 key=%s\n' "$key" >&2
+            input_errors=1
+          }
+          check_recovery_input bundle_sha "${BUNDLE_SHA:-}"
+          check_recovery_input source_sha "${SOURCE_SHA:-}"
+          check_recovery_input security_run_id "${SECURITY_RUN_ID:-}"
+          check_recovery_input security_run_attempt "${SECURITY_RUN_ATTEMPT:-}"
+          check_recovery_input recovery_run_id "${RECOVERY_RUN_ID:-}"
+          check_recovery_input recovery_run_attempt "${RECOVERY_RUN_ATTEMPT:-}"
+          check_recovery_input recovery_job_id "${RECOVERY_JOB_ID:-}"
+          check_recovery_input recovery_workflow_sha "${RECOVERY_WORKFLOW_SHA:-}"
+          check_recovery_input publisher_run_id "${PUBLISHER_RUN_ID:-}"
+          check_recovery_input publisher_run_attempt "${PUBLISHER_RUN_ATTEMPT:-}"
+          check_recovery_input publisher_workflow_sha "${PUBLISHER_WORKFLOW_SHA:-}"
+          check_recovery_input publisher_job_id "${PUBLISHER_JOB_ID:-}"
+          check_recovery_input route_digest "${ROUTE_DIGEST:-}"
+          if (( input_errors != 0 )); then exit 1; fi
+          printf 'RECOVERY_INPUTS schema=1 count=13 status=valid\n'
           remote_log="$RUNNER_TEMP/platform-production-release-recovery.log"
           remote_error="$RUNNER_TEMP/platform-production-release-recovery-error.log"
           : >"$remote_log"
@@ -637,7 +665,7 @@ jobs:
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             "bash -s -- '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$PUBLISHER_RUN_ID' '$PUBLISHER_RUN_ATTEMPT' '$PUBLISHER_WORKFLOW_SHA' '$PUBLISHER_JOB_ID' '$ROUTE_DIGEST'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
-          recovery_stage=input
+          recovery_stage=remote_identity
           report_recovery_failure() {
             local status="$?"
             if (( status != 0 )); then
@@ -647,7 +675,10 @@ jobs:
           }
           trap report_recovery_failure EXIT
 
+          recovery_stage=argument_count
+          test "$#" -eq 13
           runtime=/opt/oldsparky/platform
+          recovery_stage=remote_identity
           test "$(id -u)" -eq 0 || { echo "Production recovery must run as root" >&2; exit 1; }
           bundle_sha="$1"
           source_sha="$2"
@@ -662,19 +693,31 @@ jobs:
           publisher_workflow_sha="${11}"
           publisher_job_id="${12}"
           route_digest="${13}"
-          test "$#" -eq 13
+          recovery_stage=bundle_sha
           [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
+          recovery_stage=source_sha
           [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          recovery_stage=security_run_id
           [[ "$security_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          recovery_stage=security_run_attempt
           [[ "$security_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
+          recovery_stage=recovery_run_id
           [[ "$recovery_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          recovery_stage=recovery_run_attempt
           [[ "$recovery_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
+          recovery_stage=recovery_job_id
           [[ "$recovery_job_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          recovery_stage=recovery_workflow_sha
           [[ "$recovery_workflow_sha" =~ ^[0-9a-f]{40,64}$ ]]
+          recovery_stage=publisher_run_id
           [[ "$publisher_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          recovery_stage=publisher_run_attempt
           [[ "$publisher_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
+          recovery_stage=publisher_workflow_sha
           [[ "$publisher_workflow_sha" =~ ^[0-9a-f]{40,64}$ ]]
+          recovery_stage=publisher_job_id
           [[ "$publisher_job_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          recovery_stage=route_digest
           [[ "$route_digest" =~ ^[0-9a-f]{64}$ ]]
           recovery_stage=bundle_input
           bundle_path="/tmp/oldsparky-recovery-bundle-$bundle_sha.zip"
@@ -802,7 +845,7 @@ jobs:
           remote_status="$?"
           set -e
           if (( remote_status != 0 )); then
-            safe_stage="$(grep -E '^RECOVERY_STAGE schema=1 status=failed stage=(input|bundle_input|staging|provenance|bootstrap_extract|generation_install|generation_validate|install_stage_cleanup|quiesce_recovery)$' "$remote_error" | tail -n 1 | sed -E 's/^RECOVERY_STAGE schema=1 status=failed stage=//' || true)"
+            safe_stage="$(grep -E '^RECOVERY_STAGE schema=1 status=failed stage=(remote_identity|argument_count|bundle_sha|source_sha|security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|recovery_workflow_sha|publisher_run_id|publisher_run_attempt|publisher_workflow_sha|publisher_job_id|route_digest|bundle_input|staging|provenance|bootstrap_extract|generation_install|generation_validate|install_stage_cleanup|quiesce_recovery)$' "$remote_error" | tail -n 1 | sed -E 's/^RECOVERY_STAGE schema=1 status=failed stage=//' || true)"
             if [[ -z "$safe_stage" ]]; then safe_stage=transport_or_unclassified; fi
             safe_class=unavailable
             helper_marker=none

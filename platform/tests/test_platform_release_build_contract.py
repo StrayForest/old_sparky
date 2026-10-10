@@ -2218,7 +2218,44 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('generation_name="$bundle_sha"', recover)
         self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover)
         self.assertIn("platform_recover_pending.sh", recover)
-        self.assertIn("recovery_stage=input", recover)
+        input_keys = (
+            "bundle_sha",
+            "source_sha",
+            "security_run_id",
+            "security_run_attempt",
+            "recovery_run_id",
+            "recovery_run_attempt",
+            "recovery_job_id",
+            "recovery_workflow_sha",
+            "publisher_run_id",
+            "publisher_run_attempt",
+            "publisher_workflow_sha",
+            "publisher_job_id",
+            "route_digest",
+        )
+        for key in input_keys:
+            self.assertIn(f"check_recovery_input {key} ", recover)
+        self.assertIn("RECOVERY_INPUTS schema=1 count=13 status=valid", recover)
+        self.assertIn("RECOVERY_INPUT_INVALID schema=1 key=%s\\n", recover)
+        input_stages = (
+            "remote_identity",
+            "argument_count",
+            "bundle_sha",
+            "source_sha",
+            "security_run_id",
+            "security_run_attempt",
+            "recovery_run_id",
+            "recovery_run_attempt",
+            "recovery_job_id",
+            "recovery_workflow_sha",
+            "publisher_run_id",
+            "publisher_run_attempt",
+            "publisher_workflow_sha",
+            "publisher_job_id",
+            "route_digest",
+        )
+        for stage in input_stages:
+            self.assertIn(f"recovery_stage={stage}", recover)
         self.assertIn("trap report_recovery_failure EXIT", recover)
         self.assertIn(
             'RECOVERY_STAGE schema=1 status=failed stage=%s\\n',
@@ -2230,7 +2267,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             )
         ]
         for stage in (
-            "input",
+            *input_stages,
             "bundle_input",
             "staging",
             "provenance",
@@ -2241,6 +2278,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "quiesce_recovery",
         ):
             self.assertIn(stage, recovery_failure)
+        self.assertIn(
+            "stage=(remote_identity|argument_count|bundle_sha|source_sha|security_run_id|security_run_attempt|recovery_run_id|recovery_run_attempt|recovery_job_id|recovery_workflow_sha|publisher_run_id|publisher_run_attempt|publisher_workflow_sha|publisher_job_id|route_digest|bundle_input|staging|provenance|bootstrap_extract|generation_install|generation_validate|install_stage_cleanup|quiesce_recovery)$",
+            recovery_failure,
+        )
         self.assertIn("transport_or_unclassified", recovery_failure)
         self.assertIn(
             "RECOVERY_FAILURE schema=1 stage=%s class=%s helper=%s ssh_rc=%s",
