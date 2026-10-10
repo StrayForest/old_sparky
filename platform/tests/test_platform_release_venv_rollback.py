@@ -402,6 +402,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         current = self.add_installed_release("reuse-current")
         candidate = self.releases_dir / "reuse-candidate"
         previous = self.add_installed_release("reuse-previous")
+        origin = self.add_installed_release("reuse-origin")
         (self.app_dir / "current").symlink_to(current)
 
         def add_proof_release(release: Path) -> None:
@@ -425,20 +426,33 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             (release / "wheelhouse" / "WHEELHOUSE.sha256").write_text("fixture manifest\n")
             (release / "wheelhouse" / "pip-26.1.2-py3-none-any.whl").write_bytes(b"fixture wheel\n")
 
+        def add_rollback(
+            release: Path, transition_value: str, previous_release: Path | None,
+        ) -> Path:
+            rollback_dir = release / ".rollback"
+            rollback_dir.mkdir(mode=0o700)
+            transition_file = rollback_dir / "venv-transition"
+            transition_file.write_text(f"{transition_value}\n")
+            transition_file.chmod(0o600)
+            if transition_value == "snapshot":
+                (rollback_dir / "shared-venv-before-install").mkdir()
+            if previous_release is not None:
+                previous_file = rollback_dir / "previous-release"
+                previous_file.write_text(f"{previous_release}\n")
+                previous_file.chmod(0o600)
+            if transition_value == "unchanged":
+                freeze = release / "requirements-platform.freeze.txt"
+                freeze_record = rollback_dir / "shared-freeze.sha256"
+                freeze_record.write_text(hashlib.sha256(freeze.read_bytes()).hexdigest() + "\n")
+                freeze_record.chmod(0o600)
+            return rollback_dir
+
         add_proof_release(current)
         add_proof_release(previous)
-        rollback = current / ".rollback"
-        rollback.mkdir()
-        transition = rollback / "venv-transition"
-        transition.write_text("unchanged\n")
-        transition.chmod(0o600)
-        previous_file = rollback / "previous-release"
-        previous_file.write_text(f"{previous}\n")
-        previous_file.chmod(0o600)
-        freeze = current / "requirements-platform.freeze.txt"
-        freeze_record = rollback / "shared-freeze.sha256"
-        freeze_record.write_text(hashlib.sha256(freeze.read_bytes()).hexdigest() + "\n")
-        freeze_record.chmod(0o600)
+        add_proof_release(origin)
+        add_rollback(current, "unchanged", previous)
+        add_rollback(previous, "unchanged", origin)
+        add_rollback(origin, "snapshot", None)
         (self.shared_dir / "venv").mkdir()
         venv_python = self.shared_dir / "venv" / "bin" / "python"
         venv_python.parent.mkdir()
@@ -448,6 +462,11 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             'if [ "$*" = "-B -I -m pip freeze --all" ]; then '
             "printf '%s\\n' 'pip==26.1.2'; exit 0; fi\n"
             "exit 1\n",
+        )
+        activation = venv_python.parent / "activate"
+        activation.write_text(
+            f"VIRTUAL_ENV_PROMPT='(.venv-install-{origin.name}.ABC123) '\n",
+            encoding="utf-8",
         )
         quiesce_state = self.shared_dir / ".release-quiesce.json"
         platform_release_transaction.prepare_quiesce(
@@ -465,15 +484,191 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             candidate_may_exist=False,
         )
         add_proof_release(candidate)
+        activation_scripts = platform_verify_venv_reuse._expected_activation_scripts(
+            self.shared_dir / "venv", origin.name,
+        )
+        activation_sha = platform_verify_venv_reuse._activation_scripts_digest(
+            activation_scripts,
+        )
         with mock.patch.object(platform_verify_venv_reuse, "_runtime") as runtime_check, \
-                mock.patch.object(platform_verify_venv_reuse, "_venv_integrity") as integrity_check:
-            platform_verify_venv_reuse.prove(
+                mock.patch.object(
+                    platform_verify_venv_reuse, "_venv_integrity",
+                    return_value=activation_sha,
+                ) as integrity_check:
+            proof = platform_verify_venv_reuse.prove(
                 self.app_dir, current, candidate, self.shared_dir / "venv",
                 Path("/usr/bin/python3.12"), self.shared_dir / ".release-operation.json",
                 quiesce_state, "",
             )
             runtime_check.assert_called_once()
             integrity_check.assert_called_once()
+            integrity_check.assert_called_with(
+                self.shared_dir / "venv", current / "wheelhouse", origin.name,
+            )
+            self.assertEqual(proof["origin_release_slug"], origin.name)
+            self.assertEqual(proof["origin_source_sha"], "a" * 40)
+            self.assertEqual(proof["activation_sha256"], activation_sha)
+
+            # A missing/cyclic legacy chain is never inferred from the prompt.
+            middle_previous = previous / ".rollback" / "previous-release"
+            middle_previous.write_text(f"{current}\n")
+            middle_previous.chmod(0o600)
+            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
+                platform_verify_venv_reuse._derive_venv_origin(
+                    current, self.app_dir, self.shared_dir / "venv",
+                )
+            middle_previous.write_text(f"{origin}\n")
+            middle_previous.chmod(0o600)
+            origin_snapshot = origin / ".rollback" / "shared-venv-before-install"
+            origin_snapshot.rmdir()
+            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
+                platform_verify_venv_reuse._derive_venv_origin(
+                    current, self.app_dir, self.shared_dir / "venv",
+                )
+            origin_snapshot.mkdir()
+
+            # Exercise the same O_EXCL receipt writer used by the installer.
+            installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
+            writer_start = installer.index("persist_venv_origin_receipt() {")
+            writer_end = installer.index("\nLOCK_HELPER=", writer_start)
+            writer_harness = installer[writer_start:writer_end] + \
+                '\npersist_venv_origin_receipt "$VENV_REUSE_PROOF"\n'
+            candidate_rollback = add_rollback(candidate, "unchanged", current)
+            saved = subprocess.run(
+                ["/bin/bash", "-c", writer_harness],
+                env={
+                    "PATH": "/usr/bin:/bin", "HOME": str(self.root),
+                    "VENV_REUSE_PROOF": json.dumps(proof, sort_keys=True, separators=(",", ":")),
+                    "RELEASE_DIR": str(candidate),
+                    "SHARED_VENV_DIR": str(self.shared_dir / "venv"),
+                    "VENV_ROLLBACK_DIR": str(candidate_rollback),
+                },
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(saved.returncode, 0, saved.stderr)
+            origin_receipt = candidate_rollback / "venv-origin.json"
+            self.assertEqual(origin_receipt.stat().st_uid, 0)
+            self.assertEqual(origin_receipt.stat().st_gid, 0)
+            self.assertEqual(origin_receipt.stat().st_nlink, 1)
+            self.assertEqual(stat.S_IMODE(origin_receipt.stat().st_mode), 0o600)
+            self.assertEqual(
+                json.loads(origin_receipt.read_text()),
+                proof,
+            )
+            # The anchor survives pruning intermediate releases; no unbounded
+            # historical release retention is needed for the next reuse.
+            shutil.rmtree(previous)
+            shutil.rmtree(origin)
+            anchored = platform_verify_venv_reuse._derive_venv_origin(
+                candidate, self.app_dir, self.shared_dir / "venv",
+            )
+            self.assertEqual(anchored[0:2], (origin.name, "a" * 40))
+            self.assertIsNotNone(anchored[3])
+            self.assertEqual(
+                platform_verify_venv_reuse._activation_scripts_digest(
+                    platform_verify_venv_reuse._expected_activation_scripts(
+                        self.shared_dir / "venv", anchored[0],
+                    ),
+                ),
+                activation_sha,
+            )
+            bad_anchor = dict(proof)
+            bad_anchor["venv_ino"] = int(proof["venv_ino"]) + 1
+            origin_receipt.write_text(
+                json.dumps(bad_anchor, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            origin_receipt.chmod(0o600)
+            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
+                platform_verify_venv_reuse._derive_venv_origin(
+                    candidate, self.app_dir, self.shared_dir / "venv",
+                )
+            origin_receipt.write_text(
+                json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            origin_receipt.chmod(0o600)
+            # A second strict reuse validates the carried anchor after its
+            # immediate predecessor's origin chain has been pruned.
+            (self.app_dir / "current").unlink()
+            (self.app_dir / "current").symlink_to(candidate)
+            (self.app_dir / "previous").symlink_to(current)
+            next_candidate = self.releases_dir / "reuse-next"
+            add_proof_release(next_candidate)
+            quiesce_state.unlink()
+            platform_release_transaction.prepare_quiesce(
+                quiesce_state,
+                app_dir=self.app_dir,
+                candidate_release=next_candidate,
+                service_states=[
+                    "deadlock-api=active", "deadlock-worker=active", "deadlock-web=active"
+                ],
+                timer_active_before="inactive",
+                service_enabled=[
+                    "deadlock-api=enabled", "deadlock-worker=enabled", "deadlock-web=enabled"
+                ],
+                timer_enabled_before="enabled",
+                candidate_may_exist=True,
+            )
+            with mock.patch.object(platform_verify_venv_reuse, "_runtime") as runtime_check, \
+                    mock.patch.object(
+                        platform_verify_venv_reuse, "_venv_integrity",
+                        return_value=activation_sha,
+                    ) as integrity_check:
+                second_proof = platform_verify_venv_reuse.prove(
+                    self.app_dir, candidate, next_candidate, self.shared_dir / "venv",
+                    Path("/usr/bin/python3.12"),
+                    self.shared_dir / ".release-operation.json", quiesce_state,
+                    str(current),
+                )
+                runtime_check.assert_called_once()
+                integrity_check.assert_called_with(
+                    self.shared_dir / "venv", candidate / "wheelhouse", origin.name,
+                )
+                self.assertEqual(second_proof["origin_release_slug"], origin.name)
+                self.assertEqual(second_proof["activation_sha256"], activation_sha)
+                bad_activation = dict(proof)
+                bad_activation["activation_sha256"] = "0" * 64
+                origin_receipt.write_text(
+                    json.dumps(bad_activation, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+                origin_receipt.chmod(0o600)
+                with mock.patch.object(platform_verify_venv_reuse, "_runtime"), \
+                        mock.patch.object(
+                            platform_verify_venv_reuse, "_venv_integrity",
+                            return_value=activation_sha,
+                        ):
+                    with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
+                        platform_verify_venv_reuse.prove(
+                            self.app_dir, candidate, next_candidate,
+                            self.shared_dir / "venv", Path("/usr/bin/python3.12"),
+                            self.shared_dir / ".release-operation.json", quiesce_state,
+                            str(current),
+                        )
+            origin_receipt.write_text(
+                json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            origin_receipt.chmod(0o600)
+            with self.assertRaises(platform_verify_venv_reuse.ReuseRefused):
+                platform_verify_venv_reuse._expected_activation_scripts(
+                    self.shared_dir / "venv", "wrong-origin",
+                )
+            # Existing receipts are never overwritten or accepted from an
+            # artifact-provided preexisting path.
+            overwritten = subprocess.run(
+                ["/bin/bash", "-c", writer_harness],
+                env={
+                    "PATH": "/usr/bin:/bin", "HOME": str(self.root),
+                    "VENV_REUSE_PROOF": json.dumps(proof, sort_keys=True, separators=(",", ":")),
+                    "RELEASE_DIR": str(candidate),
+                    "SHARED_VENV_DIR": str(self.shared_dir / "venv"),
+                    "VENV_ROLLBACK_DIR": str(candidate_rollback),
+                },
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertNotEqual(overwritten.returncode, 0)
             foreign_candidate = self.releases_dir / "foreign-candidate"
             foreign_candidate.mkdir()
             foreign_metadata = foreign_candidate / "RELEASE.json"

@@ -7,6 +7,7 @@ import re
 import selectors
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -85,6 +86,33 @@ from tools.platform_verify_contract import (
     security_status_permission_issues,
     workflow_level_permission_issues,
 )
+
+
+def _trusted_runuser() -> str:
+    candidates = (
+        shutil.which("runuser"),
+        "/usr/sbin/runuser",
+        "/usr/bin/runuser",
+        "/sbin/runuser",
+    )
+    for candidate in candidates:
+        if not candidate or not Path(candidate).is_absolute():
+            continue
+        path = Path(candidate)
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid == 0
+            and info.st_gid == 0
+            and info.st_nlink == 1
+            and stat.S_IMODE(info.st_mode) & 0o022 == 0
+            and os.access(path, os.X_OK)
+        ):
+            return str(path)
+    raise AssertionError("trusted runuser binary is required for privileged contour tests")
 
 
 def _write_backend_component_fixture(root: Path) -> None:
@@ -806,7 +834,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             }
             if os.geteuid() == 0:
                 launcher = [
-                    shutil.which("runuser") or "/usr/bin/runuser",
+                    _trusted_runuser(),
                     "-u",
                     "nobody",
                     "--",
@@ -1033,11 +1061,6 @@ except lock.VerificationLockError as exc:
                         with verification_resource_lock("backend-integration"):
                             pass
                 return
-            if shutil.which("runuser") is None:
-                with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
-                    with verification_resource_lock("backend-integration"):
-                        pass
-                return
             module_dir = root / "module"
             module_dir.mkdir(mode=0o755)
             module_dir.chmod(0o755)
@@ -1066,7 +1089,7 @@ with lock.verification_resource_lock("backend-integration"):
 """
             with _lock_holder(
                 [
-                    shutil.which("runuser") or "/usr/bin/runuser",
+                    _trusted_runuser(),
                     "-u",
                     "nobody",
                     "--",

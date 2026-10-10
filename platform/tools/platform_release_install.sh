@@ -5,6 +5,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ORIGINAL_ARGS=("$@")
 SKIP_PYTHON_DEPS=0
+VENV_REUSE_PROOF=""
 SEED_ENV_FROM=""
 STAGE_ONLY=0
 
@@ -293,7 +294,8 @@ enforce_required_venv_reuse() {
   [[ -n "$PREVIOUS_TARGET" && -x /usr/bin/python3.12 \
     && -f "$TOOLS_DIR/platform_verify_venv_reuse.py" \
     && ! -L "$TOOLS_DIR/platform_verify_venv_reuse.py" ]] || return 1
-  /usr/bin/python3 -I -S -B "$TOOLS_DIR/platform_verify_venv_reuse.py" \
+  local proof
+  if ! proof="$(/usr/bin/python3 -I -S -B "$TOOLS_DIR/platform_verify_venv_reuse.py" \
     --app "$APP_DIR" \
     --current "$PREVIOUS_TARGET" \
     --candidate "$RELEASE_DIR" \
@@ -301,12 +303,198 @@ enforce_required_venv_reuse() {
     --python /usr/bin/python3.12 \
     --transaction-state "$TRANSACTION_STATE" \
     --quiesce-state "$SHARED_DIR/.release-quiesce.json" \
-    --previous-before "$ORIGINAL_PREVIOUS_TARGET" >/dev/null 2>/dev/null || return 1
+    --previous-before "$ORIGINAL_PREVIOUS_TARGET" 2>/dev/null)"; then
+    return 1
+  fi
+  [[ -n "$proof" && ${#proof} -le 4096 ]] || return 1
+  VENV_REUSE_PROOF="$proof"
   local space available total
   space="$(read_install_space)" || return 1
   read -r available total <<<"$space"
   install_space_floor_ok "$available" "$total" || return 1
   SKIP_PYTHON_DEPS=1
+}
+
+persist_venv_origin_receipt() {
+  local proof="$1"
+  [[ -n "$proof" && ${#proof} -le 4096 ]] || return 1
+  VENV_REUSE_PROOF="$proof" /usr/bin/python3 -I -S -B - \
+    "$RELEASE_DIR" "$SHARED_VENV_DIR" "$VENV_ROLLBACK_DIR" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+fields = {
+    "schema", "release_slug", "release_source_sha", "release_json_sha256",
+    "venv_dev", "venv_ino", "freeze_sha256", "wheelhouse_manifest_sha256",
+    "origin_release_slug", "origin_source_sha", "origin_release_json_sha256",
+    "activation_sha256",
+}
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+def stable_hash(path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                or before.st_nlink != 1 or before.st_size <= 0 or before.st_size > 16 * 1024 * 1024):
+            raise ValueError("input metadata")
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                raise ValueError("short input")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(fd)
+        named = os.stat(path, follow_symlinks=False)
+        def identity(item):
+            return (item.st_dev, item.st_ino, item.st_mode, item.st_uid,
+                    item.st_gid, item.st_nlink, item.st_size,
+                    item.st_mtime_ns, item.st_ctime_ns)
+        if identity(before) != identity(after) or identity(before) != identity(named):
+            raise ValueError("input changed")
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+def stable_bytes(path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o444
+                or before.st_size <= 0 or before.st_size > 65536):
+            raise ValueError("release metadata")
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(16384, remaining))
+            if not chunk:
+                raise ValueError("short release metadata")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(fd)
+        named = os.stat(path, follow_symlinks=False)
+        def identity(item):
+            return (item.st_dev, item.st_ino, item.st_mode, item.st_uid,
+                    item.st_gid, item.st_nlink, item.st_size,
+                    item.st_mtime_ns, item.st_ctime_ns)
+        if identity(before) != identity(after) or identity(before) != identity(named):
+            raise ValueError("release metadata changed")
+        return raw
+    finally:
+        os.close(fd)
+
+try:
+    release, venv, rollback = map(Path, sys.argv[1:4])
+    encoded = os.environ.get("VENV_REUSE_PROOF", "")
+    if not encoded or len(encoded) > 4096 or "\n" in encoded or "\r" in encoded:
+        raise ValueError("proof bounds")
+    payload = json.loads(encoded, object_pairs_hook=unique_object)
+    if (not isinstance(payload, dict) or set(payload) != fields
+            or type(payload.get("schema")) is not int or payload["schema"] != 1):
+        raise ValueError("proof schema")
+    release_info = release.lstat()
+    venv_info = venv.lstat()
+    rollback_info = rollback.lstat()
+    if (stat.S_ISLNK(release_info.st_mode) or not stat.S_ISDIR(release_info.st_mode)
+            or release_info.st_uid != 0 or release_info.st_gid != 0
+            or stat.S_ISLNK(venv_info.st_mode) or not stat.S_ISDIR(venv_info.st_mode)
+            or venv_info.st_uid != 0 or venv_info.st_gid != 0
+            or stat.S_IMODE(venv_info.st_mode) != 0o755
+            or stat.S_ISLNK(rollback_info.st_mode) or not stat.S_ISDIR(rollback_info.st_mode)
+            or rollback_info.st_uid != 0 or rollback_info.st_gid != 0
+            or stat.S_IMODE(rollback_info.st_mode) != 0o700
+            or rollback.parent != release):
+        raise ValueError("directory metadata")
+    release_raw = stable_bytes(release / "RELEASE.json")
+    release_metadata = json.loads(release_raw, object_pairs_hook=unique_object)
+    release_source = release_metadata.get("source_git_commit")
+    if (payload.get("release_slug") != release.name
+            or release_metadata.get("release_slug") != release.name
+            or payload.get("release_source_sha") != release_source
+            or not isinstance(release_source, str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", release_source) is None
+            or payload.get("release_json_sha256") != hashlib.sha256(release_raw).hexdigest()
+            or type(payload.get("venv_dev")) is not int or payload["venv_dev"] != venv_info.st_dev
+            or type(payload.get("venv_ino")) is not int or payload["venv_ino"] != venv_info.st_ino
+            or payload.get("freeze_sha256") != stable_hash(release / "requirements-platform.freeze.txt")
+            or payload.get("wheelhouse_manifest_sha256") != stable_hash(
+                release / "wheelhouse" / "WHEELHOUSE.sha256")):
+        raise ValueError("proof binding")
+    for name in ("release_json_sha256", "freeze_sha256", "wheelhouse_manifest_sha256",
+                 "origin_release_json_sha256", "activation_sha256"):
+        value = payload.get(name)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("proof digest")
+    origin_slug = payload.get("origin_release_slug")
+    origin_source = payload.get("origin_source_sha")
+    if (not isinstance(origin_slug, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", origin_slug) is None
+            or not isinstance(origin_source, str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", origin_source) is None):
+        raise ValueError("proof origin")
+    encoded_receipt = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    dirfd = os.open(rollback, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        opened_dir = os.fstat(dirfd)
+        named_dir = os.stat(rollback, follow_symlinks=False)
+        if ((opened_dir.st_dev, opened_dir.st_ino, opened_dir.st_mode, opened_dir.st_uid,
+             opened_dir.st_gid, opened_dir.st_mtime_ns, opened_dir.st_ctime_ns)
+                != (named_dir.st_dev, named_dir.st_ino, named_dir.st_mode, named_dir.st_uid,
+                    named_dir.st_gid, named_dir.st_mtime_ns, named_dir.st_ctime_ns)):
+            raise ValueError("rollback directory changed")
+        try:
+            os.stat("venv-origin.json", dir_fd=dirfd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("origin receipt already exists")
+        fd = os.open("venv-origin.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                     0o600, dir_fd=dirfd)
+        try:
+            os.fchmod(fd, 0o600)
+            offset = 0
+            while offset < len(encoded_receipt):
+                offset += os.write(fd, encoded_receipt[offset:])
+            os.fsync(fd)
+            written = os.fstat(fd)
+            named = os.stat("venv-origin.json", dir_fd=dirfd, follow_symlinks=False)
+            if ((written.st_dev, written.st_ino, written.st_mode, written.st_uid,
+                 written.st_gid, written.st_nlink, written.st_size)
+                    != (named.st_dev, named.st_ino, named.st_mode, named.st_uid,
+                        named.st_gid, named.st_nlink, named.st_size)
+                    or not stat.S_ISREG(written.st_mode) or written.st_uid != 0
+                    or written.st_gid != 0 or written.st_nlink != 1
+                    or stat.S_IMODE(written.st_mode) != 0o600
+                    or written.st_size != len(encoded_receipt)):
+                raise ValueError("origin receipt metadata")
+        finally:
+            os.close(fd)
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+except (OSError, UnicodeError, ValueError, json.JSONDecodeError, IndexError):
+    raise SystemExit(1) from None
+PY
 }
 
 LOCK_HELPER="$TOOLS_DIR/platform_release_lock.sh"
@@ -896,7 +1084,7 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 0 && -n "$PREVIOUS_TARGET" \
   && -x /usr/bin/python3.12 \
   && -f "$TOOLS_DIR/platform_verify_venv_reuse.py" \
   && ! -L "$TOOLS_DIR/platform_verify_venv_reuse.py" ]]; then
-  if /usr/bin/python3 -I -S -B "$TOOLS_DIR/platform_verify_venv_reuse.py" \
+  if reuse_proof="$(/usr/bin/python3 -I -S -B "$TOOLS_DIR/platform_verify_venv_reuse.py" \
     --app "$APP_DIR" \
     --current "$PREVIOUS_TARGET" \
     --candidate "$RELEASE_DIR" \
@@ -904,8 +1092,11 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 0 && -n "$PREVIOUS_TARGET" \
     --python /usr/bin/python3.12 \
     --transaction-state "$TRANSACTION_STATE" \
     --quiesce-state "$SHARED_DIR/.release-quiesce.json" \
-    --previous-before "$ORIGINAL_PREVIOUS_TARGET" >/dev/null 2>/dev/null; then
-    SKIP_PYTHON_DEPS=1
+    --previous-before "$ORIGINAL_PREVIOUS_TARGET" 2>/dev/null)"; then
+    if [[ -n "$reuse_proof" && ${#reuse_proof} -le 4096 ]]; then
+      VENV_REUSE_PROOF="$reuse_proof"
+      SKIP_PYTHON_DEPS=1
+    fi
   fi
 fi
 
@@ -1067,6 +1258,12 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
       "$VENV_ROLLBACK_PREVIOUS_FILE" \
       "$VENV_ROLLBACK_TRANSITION_FILE" \
       "$VENV_ROLLBACK_FREEZE_FILE"
+    if [[ -n "$VENV_REUSE_PROOF" ]]; then
+      if ! persist_venv_origin_receipt "$VENV_REUSE_PROOF"; then
+        public_status failed venv_policy
+        exit 1
+      fi
+    fi
   fi
   SKIP_TRANSACTION_PEER="$SHARED_DIR/.venv-install-$RELEASE_SLUG.none"
   if [[ "$PREPARE_RECEIPT" -eq 1 ]]; then

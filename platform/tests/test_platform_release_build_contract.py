@@ -6287,11 +6287,31 @@ cleanup
             self.assertEqual(extracted_metadata.st_nlink, 1)
 
             verifier = tools / "platform_verify_venv_reuse.py"
+            verifier_proof = json.dumps(
+                {
+                    "schema": 1,
+                    "release_slug": RELEASE_SLUG,
+                    "release_source_sha": "a" * 40,
+                    "release_json_sha256": "b" * 64,
+                    "venv_dev": 1,
+                    "venv_ino": 2,
+                    "freeze_sha256": "c" * 64,
+                    "wheelhouse_manifest_sha256": "d" * 64,
+                    "origin_release_slug": "origin-release",
+                    "origin_source_sha": "e" * 40,
+                    "origin_release_json_sha256": "f" * 64,
+                    "activation_sha256": "0" * 64,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             verifier.write_text(
                 "import os, sys\n"
                 "with open(os.environ['VERIFIER_MARKER'], 'a', encoding='utf-8') as f:\n"
                 "    f.write('called\\n')\n"
-                "raise SystemExit(int(os.environ['VERIFIER_RC']))\n"
+                "if int(os.environ['VERIFIER_RC']):\n"
+                "    raise SystemExit(int(os.environ['VERIFIER_RC']))\n"
+                "print(os.environ['VERIFIER_PROOF'])\n"
             )
             verifier.chmod(0o644)
 
@@ -6309,7 +6329,9 @@ cleanup
                 + "read_install_space() { printf '%s\\n' \"$TEST_SPACE\"; }\n"
                 + "if enforce_required_venv_reuse; then\n"
                 + "  : >\"$NEW_VENV_SENTINEL\"\n"
-                + "  printf 'accepted:%s\\n' \"$SKIP_PYTHON_DEPS\"\n"
+                + "  printf 'accepted:%s' \"$SKIP_PYTHON_DEPS\"\n"
+                + "  if [[ -n \"${VENV_REUSE_PROOF:-}\" ]]; then printf ':%s' \"$VENV_REUSE_PROOF\"; fi\n"
+                + "  printf '\\n'\n"
                 + "else\n"
                 + "  printf 'rejected:%s\\n' \"$SKIP_PYTHON_DEPS\"\n"
                 + "fi\n"
@@ -6319,6 +6341,7 @@ cleanup
                 policy_text: str | None,
                 *,
                 verifier_rc: int = 0,
+                verifier_output: str = verifier_proof,
                 skip: int = 0,
                 space: str = "6576668672 42949672960",
                 policy_shape: str = "regular",
@@ -6362,6 +6385,7 @@ cleanup
                         "SHARED_VENV_DIR": str(shared / ".venv"),
                         "VERIFIER_MARKER": str(marker),
                         "VERIFIER_RC": str(verifier_rc),
+                        "VERIFIER_PROOF": verifier_output,
                         "TEST_SPACE": space,
                         "NEW_VENV_SENTINEL": str(sentinel),
                         "SKIP_PYTHON_DEPS": str(skip),
@@ -6376,9 +6400,15 @@ cleanup
             valid_policy = '{"schema":1,"transition":"require_proven_reuse"}\n'
             accepted, marker, sentinel = run_guard(valid_policy)
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
-            self.assertEqual(accepted.stdout.strip(), "accepted:1")
+            self.assertEqual(accepted.stdout.strip(), f"accepted:1:{verifier_proof}")
             self.assertTrue(marker.is_file())
             self.assertTrue(sentinel.is_file())
+
+            empty_proof, marker, sentinel = run_guard(valid_policy, verifier_output="")
+            self.assertEqual(empty_proof.returncode, 0, empty_proof.stderr)
+            self.assertEqual(empty_proof.stdout.strip(), "rejected:0")
+            self.assertTrue(marker.is_file())
+            self.assertFalse(sentinel.exists())
 
             missed, marker, sentinel = run_guard(valid_policy, verifier_rc=1)
             self.assertEqual(missed.returncode, 0, missed.stderr)
