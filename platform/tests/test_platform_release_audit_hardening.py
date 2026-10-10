@@ -1711,6 +1711,29 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                             and 'test ! -e "$ssh_dir"' in run
                         )
                     )
+                    cpu_report_bound_cleanup = (
+                        path.name == "platform-production-external-load.yml"
+                        and job_name == "cpu-diagnostic-pair"
+                        and "Remove diagnostic SSH material" in step
+                    )
+                    if cpu_report_bound_cleanup:
+                        always_guarded = re.search(
+                            r"(?m)^\s+if:\s*(?:\$\{\{\s*)?.*always\(\)",
+                            step,
+                        )
+                        self.assertIsNotNone(always_guarded, location)
+                        for required_cleanup_contract in (
+                            "read_private_json(lifecycle_path, 2_048)",
+                            "read_private_json(report_path, 64_000)",
+                            'report.get("ssh_material_safe_to_remove") is not True',
+                            'lifecycle.get("material_hidden") is not True',
+                            "os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW",
+                            "os.unlink(name, dir_fd=directory_fd)",
+                            "os.rmdir(ssh_dir)",
+                        ):
+                            self.assertIn(required_cleanup_contract, run, location)
+                        ssh_material_created = False
+                        ssh_material_cleanup_seen = True
                     if has_ssh_cleanup and "test ! -e" in run:
                         always_guarded = re.search(
                             r"(?m)^\s+if:\s*(?:\$\{\{\s*)?.*always\(\)",
