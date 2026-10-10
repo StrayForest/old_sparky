@@ -95,8 +95,7 @@ secrets, following the [AWS logging best practices](https://docs.aws.amazon.com/
 Apply mode holds locks in the fixed order: platform release operation,
 retained-load, source build output, then live-QA machine lock; this keeps
 release pointers stable through backup/deletion and avoids deadlocks with
-install, rollback, build, retained-load and browser workflows. Backup-only
-uses the same order but performs no retention deletion.
+install, rollback, build, retained-load and browser workflows. Backup-only uses the same order without retention; exceptional cache compaction follows the [dedicated runbook](fallback-runtime-cache-compaction-runbook.md).
 
 Retention intentionally does not recompute each multi-gigabyte tree's content
 digest. Destructive eligibility instead requires the exact 40-hex name,

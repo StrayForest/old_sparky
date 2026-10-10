@@ -29,6 +29,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
+| Exceptional fallback runtime cache compaction | [Fallback cache compaction](fallback-runtime-cache-compaction-runbook.md) |
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |
 | Retained-load cleanup and hermetic web verification | [Retained-load and web verification](retained-load-and-web-verification.md) |
 | Authenticated HTML transport / TTFB hops | [Performance transport runbook](performance-transport-runbook.md) |

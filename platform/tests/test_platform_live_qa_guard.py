@@ -7,7 +7,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import pwd
 import shutil
 import signal
@@ -20,6 +20,7 @@ from uuid import uuid4
 import zipfile
 
 from tests import platform_test_lock_support as lock_support
+from tests import platform_chromium_sandbox_fixture
 
 
 SCRIPT_PATH = (
@@ -204,6 +205,95 @@ class LiveQaGuardTests(unittest.TestCase):
         os.utime(cache, ns=(modified_at_ns, modified_at_ns))
         return cache
 
+    @contextmanager
+    def legacy_runtime_cache_fixture(self):
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            base = Path(temporary)
+            cache_root = base / "cache"
+            cache_root.mkdir(mode=0o755)
+            os.chmod(cache_root, 0o755)
+            target = cache_root / f"runtime-{guard.LEGACY_FALLBACK_RUNTIME_COMMIT}"
+            target.mkdir(mode=0o755)
+            platform_root = base / "platform"
+            package_lock = platform_root / "apps/platform_web/package-lock.json"
+            package_lock.parent.mkdir(parents=True)
+            package_lock.write_bytes(b'{"name":"synthetic-lock"}\n')
+            browsers_payload = {
+                "browsers": [
+                    {"name": "chromium", "revision": "1228", "browserVersion": "149.0.7827.55"},
+                    {"name": "chromium-headless-shell", "revision": "1228", "browserVersion": "149.0.7827.55"},
+                    {"name": "webkit", "revision": "2311", "browserVersion": "26.5"},
+                    {"name": "ffmpeg", "revision": "1011"},
+                ]
+            }
+            browsers_raw = json.dumps(browsers_payload, separators=(",", ":")).encode()
+            files = {
+                "node/bin/node": b"synthetic pinned node\n",
+                "web/node_modules/playwright-core/browsers.json": browsers_raw,
+                "web/package-lock.json": package_lock.read_bytes(),
+                "browsers/chromium-1228/chrome-linux64/chrome": b"full chromium payload\n",
+                "browsers/chromium-1228/chrome-linux64/resources.pak": b"unused full payload\n",
+                "browsers/chromium_headless_shell-1228/headless_shell": b"headless shell\n",
+                "browsers/webkit-2311/pw_run.sh": b"webkit\n",
+                "browsers/ffmpeg-1011/ffmpeg-linux": b"ffmpeg\n",
+            }
+            sandbox = target / guard.CHROMIUM_SANDBOX_RELATIVE
+            for relative, payload in files.items():
+                path = target / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+                if relative in {
+                    "node/bin/node",
+                    "browsers/chromium-1228/chrome-linux64/chrome",
+                    "browsers/chromium_headless_shell-1228/headless_shell",
+                    "browsers/webkit-2311/pw_run.sh",
+                    "browsers/ffmpeg-1011/ffmpeg-linux",
+                }:
+                    os.chmod(path, 0o755)
+            sandbox.parent.mkdir(parents=True, exist_ok=True)
+            sandbox.write_bytes(platform_chromium_sandbox_fixture.read_bytes())
+            for directory_name in (
+                "chromium-1228",
+                "chromium_headless_shell-1228",
+                "webkit-2311",
+                "ffmpeg-1011",
+            ):
+                complete = target / "browsers" / directory_name / "INSTALLATION_COMPLETE"
+                complete.write_bytes(b"")
+            guard._normalize_cache_tree(target, sandbox=sandbox)
+            tree_sha256 = guard._tree_digest(target)
+            manifest = {
+                "version": 1,
+                "source_commit": guard.LEGACY_FALLBACK_RUNTIME_COMMIT,
+                "tree_sha256": tree_sha256,
+                "node_archive_sha256": guard.NODE_ARCHIVE_SHA256,
+                "package_lock_sha256": hashlib.sha256(package_lock.read_bytes()).hexdigest(),
+                "playwright_browsers_sha256": hashlib.sha256(browsers_raw).hexdigest(),
+            }
+            os.chmod(target, 0o755)
+            guard._write_immutable_manifest(
+                target / ".manifest.json", manifest, failure="fixture write failed"
+            )
+            os.chmod(target, 0o555)
+            try:
+                yield platform_root, cache_root, target, manifest
+            finally:
+                for path in sorted(
+                    (cache_root, *cache_root.rglob("*")),
+                    key=lambda item: len(item.parts),
+                    reverse=True,
+                ):
+                    try:
+                        metadata = path.lstat()
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                        os.chmod(path, 0o755)
+                    elif not stat.S_ISLNK(metadata.st_mode):
+                        os.chmod(path, 0o644)
+                if cache_root.exists():
+                    os.chmod(cache_root, 0o755)
+
     def make_release_pointers(
         self, app_dir: Path, *, current: str, previous: str
     ) -> None:
@@ -280,16 +370,23 @@ class LiveQaGuardTests(unittest.TestCase):
         os.chmod(manifest_path, 0o444)
         return trusted, releases, payload, source_sha
 
-    def extract_test_zip(self, source: Path, target: Path) -> None:
+    def extract_test_zip(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        retained_paths: frozenset[PurePosixPath] | None = None,
+    ) -> None:
         def copy_archive(**kwargs: object) -> None:
             shutil.copyfile(source, Path(kwargs["archive"]))
 
         with mock.patch.object(guard, "_download_exact", side_effect=copy_archive):
             guard._download_pinned_zip(
                 "https://downloads.example.invalid/browser.zip",
-                "0" * 64,
+                hashlib.sha256(source.read_bytes()).hexdigest(),
                 source.stat().st_size,
                 target,
+                retained_paths=retained_paths,
             )
 
     def test_lock_path_is_machine_wide_for_different_bundles(self) -> None:
@@ -639,6 +736,62 @@ class LiveQaGuardTests(unittest.TestCase):
                 self.extract_test_zip(source, root / "browser")
             self.assertFalse((root / "escape").exists())
 
+            helper = platform_chromium_sandbox_fixture.read_bytes()
+            source = self.make_zip(
+                root,
+                [
+                    ("chrome-linux64/", b""),
+                    ("chrome-linux64/chrome", b"full chromium executable"),
+                    ("chrome-linux64/resources.pak", b"unused full browser data"),
+                    ("chrome-linux64/chrome_sandbox", helper),
+                ],
+            )
+            target = root / "chromium-1228"
+            self.extract_test_zip(
+                source,
+                target,
+                retained_paths=guard.CHROMIUM_ARCHIVE_RETAINED_PATHS,
+            )
+            sandbox = target / "chrome-linux64/chrome_sandbox"
+            self.assertEqual(sandbox.read_bytes(), helper)
+            self.assertEqual(sandbox.stat().st_size, guard.CHROMIUM_SANDBOX_SIZE)
+            self.assertEqual(
+                hashlib.sha256(sandbox.read_bytes()).hexdigest(),
+                guard.CHROMIUM_SANDBOX_SHA256,
+            )
+            self.assertFalse((target / "chrome-linux64/chrome").exists())
+            self.assertFalse((target / "chrome-linux64/resources.pak").exists())
+            self.assertTrue((target / "INSTALLATION_COMPLETE").is_file())
+            self.assertEqual(
+                {path.relative_to(target).as_posix() for path in target.rglob("*")},
+                {
+                    "chrome-linux64",
+                    "chrome-linux64/chrome_sandbox",
+                    "INSTALLATION_COMPLETE",
+                },
+            )
+
+            source = self.make_zip(root, [("chrome-linux64/chrome", b"binary")])
+            with self.assertRaisesRegex(guard.GuardError, "retained member"):
+                self.extract_test_zip(
+                    source,
+                    root / "missing",
+                    retained_paths=guard.CHROMIUM_ARCHIVE_RETAINED_PATHS,
+                )
+
+            linked = root / "linked-source.zip"
+            info = zipfile.ZipInfo("chrome-linux64/chrome_sandbox")
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            with zipfile.ZipFile(linked, "w") as archive:
+                archive.writestr(info, "../../escape")
+            with self.assertRaisesRegex(guard.GuardError, "escapes"):
+                self.extract_test_zip(
+                    linked,
+                    root / "linked",
+                    retained_paths=guard.CHROMIUM_ARCHIVE_RETAINED_PATHS,
+                )
+
     def test_zip_extraction_rejects_uncompressed_size_over_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -940,6 +1093,262 @@ class LiveQaGuardTests(unittest.TestCase):
                 self.assertRaisesRegex(guard.GuardError, "ownership or device"),
             ):
                 guard._validate_cache_tree_permissions(cache)
+
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned cache transaction contract")
+    def test_legacy_fallback_compaction_is_reversible_and_resumable(self) -> None:
+        source_sha = "a" * 40
+        with self.legacy_runtime_cache_fixture() as (platform_root, cache_root, target, _):
+            original_tree = guard._tree_digest(
+                target, ignored_relatives=frozenset({Path(".manifest.json")})
+            )
+            original_manifest = (target / ".manifest.json").read_bytes()
+            events: list[tuple[str, dict[str, object]]] = []
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache_root),
+                mock.patch.object(guard, "TRUSTED_PLATFORM_ROOT", platform_root),
+                mock.patch.object(guard, "assert_liveqa_idle"),
+            ):
+                result = guard.compact_legacy_runtime_cache(
+                    run_id=12345,
+                    attempt=1,
+                    operation_source_sha=source_sha,
+                    write_intent=lambda record: events.append(("intent", dict(record))),
+                    write_validated=lambda record: events.append(("validated", dict(record))),
+                    write_completion=lambda record: events.append(("complete", dict(record))),
+                    probe_runtime=lambda _path: None,
+                )
+                self.assertEqual([phase for phase, _ in events], ["intent", "validated", "complete"])
+                self.assertEqual(result["result"], "compacted")
+                self.assertEqual(events[0][1]["source_commit"], guard.LEGACY_FALLBACK_RUNTIME_COMMIT)
+                self.assertIn("old_chromium_inventory", events[0][1])
+                self.assertNotIn("old_chromium_inventory", events[1][1])
+                self.assertEqual(events[1][1]["intent_sha256"], hashlib.sha256(guard._encode_compaction_record(events[0][1])).hexdigest())
+                self.assertEqual(events[2][1]["result"], "compacted")
+                self.assertFalse(cache_root.joinpath(str(events[0][1]["rollback_name"])).exists())
+                self.assertTrue(guard._validate_existing_runtime_cache(target, platform_root, guard.LEGACY_FALLBACK_RUNTIME_COMMIT))
+                chromium = target / "browsers/chromium-1228"
+                self.assertEqual(
+                    {path.relative_to(chromium).as_posix() for path in chromium.rglob("*")},
+                    {"INSTALLATION_COMPLETE", "chrome-linux64", "chrome-linux64/chrome_sandbox"},
+                )
+
+        with self.legacy_runtime_cache_fixture() as (platform_root, cache_root, target, _):
+            original_tree = guard._tree_digest(
+                target, ignored_relatives=frozenset({Path(".manifest.json")})
+            )
+            original_manifest = (target / ".manifest.json").read_bytes()
+            records: dict[str, dict[str, object]] = {}
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache_root),
+                mock.patch.object(guard, "TRUSTED_PLATFORM_ROOT", platform_root),
+                mock.patch.object(guard, "assert_liveqa_idle"),
+            ):
+                with self.assertRaisesRegex(guard.GuardError, "probe failure"):
+                    guard.compact_legacy_runtime_cache(
+                        run_id=12346,
+                        attempt=1,
+                        operation_source_sha=source_sha,
+                        write_intent=lambda record: records.setdefault("intent", dict(record)),
+                        write_validated=lambda record: records.setdefault("validated", dict(record)),
+                        write_completion=lambda record: records.setdefault("completion", dict(record)),
+                        probe_runtime=lambda _path: (_ for _ in ()).throw(guard.GuardError("probe failure")),
+                    )
+                self.assertEqual(records["completion"]["result"], "restored")
+                self.assertEqual(records["completion"]["reclaimed_bytes"], 0)
+                self.assertEqual((target / ".manifest.json").read_bytes(), original_manifest)
+                self.assertEqual(
+                    guard._tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")})),
+                    original_tree,
+                )
+                self.assertFalse(cache_root.joinpath(str(records["intent"]["rollback_name"])).exists())
+
+        with self.legacy_runtime_cache_fixture() as (platform_root, cache_root, target, manifest):
+            source = "b" * 40
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache_root),
+                mock.patch.object(guard, "TRUSTED_PLATFORM_ROOT", platform_root),
+            ):
+                (
+                    old_manifest,
+                    manifest_raw,
+                    cache_metadata,
+                    chromium_metadata,
+                    old_tree,
+                    old_non_chromium,
+                    old_chromium_tree,
+                    allocated,
+                    inventory,
+                    inventory_sha,
+                ) = guard._compaction_snapshot(target)
+            rollback_name = guard._compaction_rollback_name(guard.LEGACY_FALLBACK_RUNTIME_COMMIT)
+            intent = guard._compaction_record_base(
+                run_id=12347,
+                attempt=1,
+                operation_source_sha=source,
+                cache_metadata=cache_metadata,
+                manifest=old_manifest,
+                manifest_raw=manifest_raw,
+                manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+                old_tree_sha256=old_tree,
+                old_non_chromium_tree_sha256=old_non_chromium,
+                chromium_metadata=chromium_metadata,
+                chromium_tree_sha256=old_chromium_tree,
+                chromium_allocated_bytes=allocated,
+                chromium_inventory=inventory,
+                chromium_inventory_sha256=inventory_sha,
+                rollback_name=rollback_name,
+            )
+            events: list[dict[str, object]] = []
+            rollback = cache_root / rollback_name
+            os.rename(target / "browsers/chromium-1228", rollback)
+            (target / "browsers/chromium-1228").mkdir(mode=0o755)
+            serialized_intent = json.loads(json.dumps(intent, sort_keys=True))
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache_root),
+                mock.patch.object(guard, "TRUSTED_PLATFORM_ROOT", platform_root),
+                mock.patch.object(guard, "assert_liveqa_idle"),
+            ):
+                restored = guard.recover_legacy_runtime_cache(
+                    serialized_intent,
+                    None,
+                    run_id=12347,
+                    attempt=1,
+                    operation_source_sha=source,
+                    write_completion=lambda record: events.append(dict(record)),
+                    probe_runtime=lambda _path: None,
+                )
+                self.assertEqual(restored["result"], "restored")
+                self.assertEqual(events[0]["phase"], "complete")
+                self.assertEqual(events[0]["new_manifest_sha256"], hashlib.sha256(manifest_raw).hexdigest())
+                self.assertFalse(rollback.exists())
+                self.assertEqual(
+                    guard._tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")})),
+                    old_tree,
+                )
+
+        with self.legacy_runtime_cache_fixture() as (platform_root, cache_root, target, _):
+            source = "c" * 40
+            intent_records: list[dict[str, object]] = []
+            validated_records: list[dict[str, object]] = []
+            completion_records: list[dict[str, object]] = []
+            real_unlink = os.unlink
+            unlink_count = 0
+
+            def fail_after_one_unlink(path, *args, **kwargs):
+                nonlocal unlink_count
+                unlink_count += 1
+                if unlink_count == 2:
+                    raise OSError("injected partial-delete interruption")
+                return real_unlink(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache_root),
+                mock.patch.object(guard, "TRUSTED_PLATFORM_ROOT", platform_root),
+                mock.patch.object(guard, "assert_liveqa_idle"),
+                mock.patch.object(os, "unlink", side_effect=fail_after_one_unlink),
+            ):
+                with self.assertRaises(OSError):
+                    guard.compact_legacy_runtime_cache(
+                        run_id=12348,
+                        attempt=1,
+                        operation_source_sha=source,
+                        write_intent=lambda record: intent_records.append(dict(record)),
+                        write_validated=lambda record: validated_records.append(dict(record)),
+                        write_completion=lambda record: completion_records.append(dict(record)),
+                        probe_runtime=lambda _path: None,
+                    )
+            self.assertEqual(len(intent_records), 1)
+            self.assertEqual(len(validated_records), 1)
+            self.assertFalse(completion_records)
+            rollback = cache_root / str(intent_records[0]["rollback_name"])
+            unknown = rollback / "unexpected-after-validation"
+            unknown.write_bytes(b"must remain fail-closed")
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache_root),
+                mock.patch.object(guard, "TRUSTED_PLATFORM_ROOT", platform_root),
+                mock.patch.object(guard, "assert_liveqa_idle"),
+            ):
+                with self.assertRaisesRegex(guard.GuardError, "inventory does not close"):
+                    guard.recover_legacy_runtime_cache(
+                        intent_records[0],
+                        validated_records[0],
+                        run_id=12348,
+                        attempt=1,
+                        operation_source_sha=source,
+                        write_completion=lambda record: completion_records.append(dict(record)),
+                        probe_runtime=lambda _path: None,
+                    )
+                self.assertTrue(unknown.exists())
+                unknown.unlink()
+                recovered = guard.recover_legacy_runtime_cache(
+                    intent_records[0],
+                    validated_records[0],
+                    run_id=12348,
+                    attempt=1,
+                    operation_source_sha=source,
+                    write_completion=lambda record: completion_records.append(dict(record)),
+                    probe_runtime=lambda _path: None,
+                )
+                self.assertEqual(recovered["result"], "compacted")
+                self.assertEqual(completion_records[-1]["result"], "compacted")
+                self.assertFalse(rollback.exists())
+
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned cache probe contract")
+    def test_legacy_fallback_probe_uses_collected_sandboxed_children(self) -> None:
+        with self.legacy_runtime_cache_fixture() as (platform_root, cache_root, target, _):
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache_root),
+                mock.patch.object(guard, "TRUSTED_PLATFORM_ROOT", platform_root),
+                mock.patch.object(guard, "liveqa_identity", return_value=(12345, 12345)),
+                mock.patch.object(guard, "assert_liveqa_idle") as idle,
+                mock.patch.object(guard, "_assert_runtime_unit_collected") as collected,
+                mock.patch.object(
+                    guard,
+                    "_capture_qa_child",
+                    return_value=(
+                        0,
+                        "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0\n",
+                    ),
+                ) as capture,
+            ):
+                guard.probe_compacted_legacy_runtime_cache(target)
+            self.assertEqual(capture.call_count, 2)
+            self.assertEqual(collected.call_count, 2)
+            idle.assert_has_calls([mock.call(), mock.call(), mock.call()])
+            chromium_command = capture.call_args_list[0].args[0]
+            webkit_command = capture.call_args_list[1].args[0]
+            self.assertEqual(chromium_command[0], "/usr/bin/systemd-run")
+            self.assertIn("--property=PrivateNetwork=yes", chromium_command)
+            self.assertIn("--property=PrivateTmp=yes", chromium_command)
+            self.assertIn("CHROME_DEVEL_SANDBOX=" + str(target / guard.CHROMIUM_SANDBOX_RELATIVE), chromium_command)
+            self.assertTrue(
+                any("chromiumSandbox:true" in argument for argument in chromium_command)
+            )
+            self.assertTrue(any("about:blank" in argument for argument in chromium_command))
+            self.assertNotIn("--no-sandbox", chromium_command)
+            self.assertIn("--property=PrivateNetwork=yes", webkit_command)
+            self.assertTrue(
+                any('else if(k==="webkit")' in argument for argument in webkit_command)
+            )
+
+            with (
+                mock.patch.object(guard, "RUNNER_CACHE_ROOT", cache_root),
+                mock.patch.object(guard, "TRUSTED_PLATFORM_ROOT", platform_root),
+                mock.patch.object(guard, "liveqa_identity", return_value=(12345, 12345)),
+                mock.patch.object(guard, "assert_liveqa_idle"),
+                mock.patch.object(guard, "_assert_runtime_unit_collected") as collected,
+                mock.patch.object(
+                    guard,
+                    "_capture_qa_child",
+                    side_effect=[
+                        (0, "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=none stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=0\n"),
+                        (1, "LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=browser_launch_error stdout_bytes=0 stderr_bytes=0 truncated=false child_exit=1\n"),
+                    ],
+                ),
+            ):
+                with self.assertRaisesRegex(guard.GuardError, "probe failed"):
+                    guard.probe_compacted_legacy_runtime_cache(target)
+            self.assertEqual(collected.call_count, 2)
 
     def test_sandbox_path_rejects_an_additional_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

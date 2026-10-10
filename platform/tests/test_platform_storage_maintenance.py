@@ -119,6 +119,16 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             eviction_run_attempt=None,
             eviction_source_sha=None,
             eviction_bundle_sha256=None,
+            compact_legacy_fallback_runtime_cache=False,
+            compaction_run_id=None,
+            compaction_run_attempt=None,
+            compaction_source_sha=None,
+            compaction_bundle_sha256=None,
+            resume_legacy_fallback_runtime_cache_compaction=False,
+            resume_compaction_run_id=None,
+            resume_compaction_run_attempt=None,
+            resume_compaction_source_sha=None,
+            resume_compaction_bundle_sha256=None,
             private_backup_diagnostics=False,
         )
 
@@ -291,6 +301,67 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             args = maintenance.parse_args()
             self.assertTrue(args.evict_pinned_build_node_cache)
             self.assertEqual(args.eviction_run_id, "12345")
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--verify-existing-backup-only",
+                "--compact-legacy-fallback-runtime-cache",
+                "--compaction-run-id",
+                "12345",
+                "--compaction-run-attempt",
+                "1",
+                "--compaction-source-sha",
+                "c" * 40,
+                "--compaction-bundle-sha256",
+                "d" * 64,
+                "--resume-legacy-fallback-runtime-cache-compaction",
+                "--resume-compaction-run-id",
+                "12344",
+                "--resume-compaction-run-attempt",
+                "2",
+                "--resume-compaction-source-sha",
+                "c" * 40,
+                "--resume-compaction-bundle-sha256",
+                "e" * 64,
+                "--apply",
+            ],
+        ):
+            args = maintenance.parse_args()
+            self.assertTrue(args.compact_legacy_fallback_runtime_cache)
+            self.assertTrue(args.resume_legacy_fallback_runtime_cache_compaction)
+            self.assertEqual(args.compaction_source_sha, "c" * 40)
+            self.assertEqual(args.resume_compaction_run_id, "12344")
+        with mock.patch.object(
+            maintenance.sys,
+            "argv",
+            [
+                "platform_storage_maintenance.py",
+                "--verify-existing-backup-only",
+                "--compact-legacy-fallback-runtime-cache",
+                "--compaction-run-id",
+                "12345",
+                "--compaction-run-attempt",
+                "1",
+                "--compaction-source-sha",
+                "c" * 40,
+                "--compaction-bundle-sha256",
+                "d" * 64,
+                "--resume-legacy-fallback-runtime-cache-compaction",
+                "--resume-compaction-run-id",
+                "12344",
+                "--resume-compaction-run-attempt",
+                "2",
+                "--resume-compaction-source-sha",
+                "f" * 40,
+                "--resume-compaction-bundle-sha256",
+                "e" * 64,
+                "--apply",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                maintenance.parse_args()
         with mock.patch.object(
             maintenance.sys,
             "argv",
@@ -689,6 +760,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         )
         live_qa_prune.assert_not_called()
         retention_plan.assert_not_called()
+
         self.assertTrue(candidate.exists())
         self.assertTrue(web_candidate.exists())
         self.assertEqual(report["production_releases"]["deleted_count"], 0)
@@ -871,6 +943,173 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(payload["phase"], phase)
         live_qa_prune.assert_not_called()
         retention_plan.assert_not_called()
+
+        args.evict_pinned_build_node_cache = False
+        args.compact_legacy_fallback_runtime_cache = True
+        args.compaction_run_id = "123456"
+        args.compaction_run_attempt = "1"
+        args.compaction_source_sha = "f" * 40
+        args.compaction_bundle_sha256 = "a" * 64
+        events.clear()
+        compacted = {
+            "status": "completed",
+            "result": "compacted",
+            "reclaimed_bytes": 397_402_112,
+            "source_commit": "4a04b2dffaf0d02c2d3910e7ba28dca9b89de209",
+            "old_tree_sha256": "b" * 64,
+            "new_tree_sha256": "c" * 64,
+            "intent_receipt": "liveqa-fallback-cache-compaction-123456-1.intent.json",
+            "validated_receipt": "liveqa-fallback-cache-compaction-123456-1.validated.json",
+            "completion_receipt": "liveqa-fallback-cache-compaction-123456-1.completion.json",
+        }
+
+        def compact_cache(app_path: Path, **kwargs: object) -> dict[str, object]:
+            events.append("cache-compact")
+            self.assertEqual(app_path, app_dir)
+            self.assertEqual(kwargs["run_id"], "123456")
+            self.assertEqual(kwargs["run_attempt"], "1")
+            self.assertEqual(kwargs["source_sha"], "f" * 40)
+            self.assertEqual(kwargs["bundle_sha256"], "a" * 64)
+            self.assertIsNone(kwargs["resume_run_id"])
+            return compacted
+
+        with (
+            mock.patch.object(maintenance, "DEFAULT_APP_DIR", app_dir),
+            mock.patch.object(
+                maintenance, "DEFAULT_SOURCE_RELEASE_DIR", self.release_dir
+            ),
+            mock.patch.object(maintenance, "maintenance_lock_scope", tracked_scope),
+            mock.patch.object(maintenance, "live_qa_machine_lock", tracked_live_qa_lock),
+            mock.patch.object(
+                maintenance,
+                "compact_legacy_fallback_runtime_cache",
+                side_effect=compact_cache,
+            ) as compact,
+            mock.patch.object(
+                maintenance, "verify_existing_backup", side_effect=verify_latest
+            ) as verify_backup,
+            mock.patch.object(maintenance, "_plan_and_maybe_apply") as retention_plan,
+            mock.patch.object(
+                maintenance.live_qa_guard,
+                "prune_runtime_cache_release_lock_held",
+            ) as live_qa_prune,
+        ):
+            report = run_maintenance(args)
+
+        self.assertEqual(
+            events,
+            [
+                "locks-enter",
+                "live-qa-enter",
+                "cache-compact",
+                "verify-latest",
+                "live-qa-exit",
+                "locks-exit",
+            ],
+        )
+        compact.assert_called_once()
+        verify_backup.assert_called_once_with(
+            app_dir,
+            max_age_hours=24.0,
+            private_failure_diagnostics=False,
+        )
+        self.assertEqual(
+            report["backup"]["fallback_runtime_cache_compaction"], compacted
+        )
+        live_qa_prune.assert_not_called()
+        retention_plan.assert_not_called()
+
+        if os.geteuid() == 0:
+            self.assertEqual(
+                maintenance.LEGACY_FALLBACK_RUNTIME_COMMIT,
+                maintenance.live_qa_guard.LEGACY_FALLBACK_RUNTIME_COMMIT,
+            )
+            receipt_app = self.root / "compaction-receipt-runtime"
+            receipt_shared = receipt_app / "shared"
+            receipt_shared.mkdir(parents=True)
+            original_manifest = {
+                "version": 1,
+                "source_commit": "4a04b2dffaf0d02c2d3910e7ba28dca9b89de209",
+                "tree_sha256": "1" * 64,
+                "node_archive_sha256": "2" * 64,
+                "package_lock_sha256": "3" * 64,
+                "playwright_browsers_sha256": "4" * 64,
+            }
+            original_manifest_raw = maintenance.live_qa_guard._encode_cache_manifest(
+                original_manifest
+            )
+            intent_record = {
+                "schema": 1,
+                "event": maintenance.FALLBACK_CACHE_COMPACTION_EVENT,
+                "run_id": 123456,
+                "attempt": 1,
+                "operation_source_sha": "f" * 40,
+                "source_commit": "4a04b2dffaf0d02c2d3910e7ba28dca9b89de209",
+                "cache_dev": 27,
+                "cache_ino": 1234,
+                "old_tree_sha256": "1" * 64,
+                "old_non_chromium_tree_sha256": "2" * 64,
+                "old_manifest_sha256": hashlib.sha256(original_manifest_raw).hexdigest(),
+                "old_manifest": original_manifest,
+                "old_manifest_raw_b64": maintenance.base64.b64encode(
+                    original_manifest_raw
+                ).decode("ascii"),
+                "old_chromium_tree_sha256": "4" * 64,
+                "old_chromium_entry_count": 1,
+                "old_chromium_inventory_sha256": "5" * 64,
+                "old_chromium_inventory": [{"path": "root"}],
+                "old_chromium_dev": 27,
+                "old_chromium_ino": 5678,
+                "old_chromium_allocated_bytes": 397_402_112,
+                "old_sandbox_sha256": maintenance.live_qa_guard.CHROMIUM_SANDBOX_SHA256,
+                "rollback_name": ".runtime-4a04b2dffaf0d02c2d3910e7ba28dca9b89de209.chromium-compaction-0123456789abcdef0123456789abcdef",
+                "phase": "intent",
+            }
+            receipt_name = maintenance.write_runtime_cache_compaction_receipt(
+                receipt_app,
+                phase="intent",
+                record=intent_record,
+                run_id="123456",
+                run_attempt="1",
+                source_sha="f" * 40,
+                bundle_sha256="a" * 64,
+            )
+            receipt_stat = (receipt_shared / receipt_name).lstat()
+            self.assertEqual(stat.S_IMODE(receipt_stat.st_mode), 0o600)
+            self.assertEqual((receipt_stat.st_uid, receipt_stat.st_gid), (0, 0))
+            self.assertEqual(receipt_stat.st_nlink, 1)
+            self.assertEqual(
+                maintenance.read_runtime_cache_compaction_receipt(
+                    receipt_app,
+                    phase="intent",
+                    run_id="123456",
+                    run_attempt="1",
+                    source_sha="f" * 40,
+                    bundle_sha256="a" * 64,
+                ),
+                intent_record,
+            )
+            round_tripped = maintenance.read_runtime_cache_compaction_receipt(
+                receipt_app,
+                phase="intent",
+                run_id="123456",
+                run_attempt="1",
+                source_sha="f" * 40,
+                bundle_sha256="a" * 64,
+            )
+            self.assertEqual(
+                maintenance.base64.b64decode(round_tripped["old_manifest_raw_b64"]),
+                original_manifest_raw,
+            )
+            with self.assertRaises(RuntimeError):
+                maintenance.read_runtime_cache_compaction_receipt(
+                    receipt_app,
+                    phase="intent",
+                    run_id="123456",
+                    run_attempt="1",
+                    source_sha="f" * 40,
+                    bundle_sha256="b" * 64,
+                )
 
     def test_backup_only_failure_does_not_prune_or_check_live_qa(self) -> None:
         app_dir = self.root / "runtime" / "platform"
@@ -1111,6 +1350,96 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 check=False,
                 timeout=10,
             )
+
+        summary_validation_script = workflow_python(
+            '/usr/bin/python3 -I - "$backup_report_file" "$operation" '
+            '"$evict_build_node_cache" "$compact_fallback_runtime_cache"'
+        )
+        with tempfile.TemporaryDirectory() as summary_dir_name:
+            summary_dir = Path(summary_dir_name)
+            summary_report_path = summary_dir / "report.json"
+            compact_summary = {
+                "status": "completed",
+                "result": "compacted",
+                "reclaimed_bytes": 397_402_112,
+                "source_commit": "4a04b2dffaf0d02c2d3910e7ba28dca9b89de209",
+                "old_tree_sha256": "1" * 64,
+                "new_tree_sha256": "2" * 64,
+                "intent_receipt": "liveqa-fallback-cache-compaction-123456-1.intent.json",
+                "validated_receipt": "liveqa-fallback-cache-compaction-123456-1.validated.json",
+                "completion_receipt": "liveqa-fallback-cache-compaction-123456-1.completion.json",
+                "resumed_run_id": "123456",
+                "resumed_run_attempt": "1",
+            }
+            summary_payload = {
+                "mode": "verify-existing-backup-only",
+                "ok": True,
+                "backup": {
+                    "status": "completed",
+                    "restore_verified": True,
+                    "alembic_revision_verified": True,
+                    "rotation_mode": "preserve-existing",
+                    "removed_count": 0,
+                    "restored_table_count": 1,
+                    "verified_existing": True,
+                    "created": False,
+                    "sha256": "a" * 64,
+                    "age_hours": 1.0,
+                    "restore_verified_at_utc": "2026-10-10T00:00:00Z",
+                    "build_node_cache": {"status": "not-requested"},
+                    "fallback_runtime_cache_compaction": compact_summary,
+                },
+                "production_releases": {"deleted_count": 0, "reclaimable_bytes": 0},
+                "source_release_artifacts": {"deleted_count": 0, "reclaimable_bytes": 0},
+                "live_qa_runtime_caches": {"deleted_count": 0, "reclaimable_bytes": 0},
+                "transient": {
+                    category: {"count": 0, "reclaimable_bytes": 0}
+                    for category in (
+                        "failed_builds",
+                        "browser_test_artifacts",
+                        "preprod_screenshots",
+                    )
+                },
+            }
+
+            def validate_compaction_summary() -> subprocess.CompletedProcess[str]:
+                summary_report_path.write_text(
+                    json.dumps(summary_payload, sort_keys=True), encoding="utf-8"
+                )
+                return run_inline(
+                    summary_validation_script,
+                    str(summary_report_path),
+                    "verify-existing",
+                    "false",
+                    "true",
+                    "true",
+                    "123457",
+                    "2",
+                    "d" * 40,
+                    "e" * 64,
+                    "123456",
+                    "1",
+                    "f" * 64,
+                )
+
+            resumed_prior = validate_compaction_summary()
+            self.assertEqual(resumed_prior.returncode, 0, resumed_prior.stderr)
+            compact_summary["intent_receipt"] = (
+                "liveqa-fallback-cache-compaction-123457-2.intent.json"
+            )
+            compact_summary["validated_receipt"] = (
+                "liveqa-fallback-cache-compaction-123457-2.validated.json"
+            )
+            compact_summary["completion_receipt"] = (
+                "liveqa-fallback-cache-compaction-123457-2.completion.json"
+            )
+            resumed_recompaction = validate_compaction_summary()
+            self.assertEqual(
+                resumed_recompaction.returncode, 0, resumed_recompaction.stderr
+            )
+            compact_summary["resumed_run_id"] = "123455"
+            mismatched_resume = validate_compaction_summary()
+            self.assertNotEqual(mismatched_resume.returncode, 0)
 
         producer_workflow = (
             REPO_ROOT / ".github/workflows/platform-security.yml"
@@ -1487,7 +1816,22 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 f'backup_report_file="$(mktemp {report_path}.XXXXXX)"',
             )
             completed = subprocess.run(
-                ["bash", "-s", "--", "123456", "1", "create", "none", "none", "false"],
+                [
+                    "bash",
+                    "-s",
+                    "--",
+                    "123456",
+                    "1",
+                    "create",
+                    "none",
+                    "none",
+                    "false",
+                    "false",
+                    "false",
+                    "none",
+                    "none",
+                    "none",
+                ],
                 input=remote_script,
                 text=True,
                 capture_output=True,
@@ -1560,7 +1904,22 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 f'backup_report_file="{typed_report}"',
             )
             typed_completed = subprocess.run(
-                ["bash", "-s", "--", "123457", "1", "create", "none", "none", "false"],
+                [
+                    "bash",
+                    "-s",
+                    "--",
+                    "123457",
+                    "1",
+                    "create",
+                    "none",
+                    "none",
+                    "false",
+                    "false",
+                    "false",
+                    "none",
+                    "none",
+                    "none",
+                ],
                 input=typed_script,
                 text=True,
                 capture_output=True,
@@ -1607,7 +1966,22 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
             typed_report.chmod(0o600)
             uncertain_completed = subprocess.run(
-                ["bash", "-s", "--", "123458", "1", "create", "none", "none", "false"],
+                [
+                    "bash",
+                    "-s",
+                    "--",
+                    "123458",
+                    "1",
+                    "create",
+                    "none",
+                    "none",
+                    "false",
+                    "false",
+                    "false",
+                    "none",
+                    "none",
+                    "none",
+                ],
                 input=typed_script,
                 text=True,
                 capture_output=True,
@@ -1763,7 +2137,16 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
 
             def invoke_wrapper(
-                *, operation: str, evict: str, source_sha: str, bundle_sha: str
+                *,
+                operation: str,
+                evict: str,
+                source_sha: str,
+                bundle_sha: str,
+                compact: str = "false",
+                resume: str = "false",
+                resume_run_id: str = "none",
+                resume_attempt: str = "none",
+                resume_bundle_sha: str = "none",
             ) -> list[str]:
                 report_path = fixture_root / f"report-{operation}-{evict}.json"
                 report_path.write_text("", encoding="utf-8")
@@ -1782,6 +2165,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         str(report_path),
                         operation,
                         evict,
+                        compact,
+                        resume,
+                        resume_run_id,
+                        resume_attempt,
+                        resume_bundle_sha,
                         source_sha,
                         bundle_sha,
                     ],
@@ -1825,6 +2213,48 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             self.assertNotIn("--evict-pinned-build-node-cache", verify_without_eviction)
             self.assertNotIn("--eviction-source-sha", verify_without_eviction)
 
+            compact_argv = invoke_wrapper(
+                operation="verify-existing",
+                evict="false",
+                source_sha=source_sha,
+                bundle_sha=bundle_sha,
+                compact="true",
+            )
+            for option, value in (
+                ("--compact-legacy-fallback-runtime-cache", None),
+                ("--compaction-run-id", "123456"),
+                ("--compaction-run-attempt", "1"),
+                ("--compaction-source-sha", source_sha),
+                ("--compaction-bundle-sha256", bundle_sha),
+            ):
+                self.assertIn(option, compact_argv)
+                if value is not None:
+                    self.assertEqual(compact_argv[compact_argv.index(option) + 1], value)
+            self.assertNotIn("--evict-pinned-build-node-cache", compact_argv)
+
+            resume_bundle = "e" * 64
+            resume_argv = invoke_wrapper(
+                operation="verify-existing",
+                evict="false",
+                source_sha=source_sha,
+                bundle_sha=bundle_sha,
+                compact="true",
+                resume="true",
+                resume_run_id="123455",
+                resume_attempt="2",
+                resume_bundle_sha=resume_bundle,
+            )
+            for option, value in (
+                ("--resume-legacy-fallback-runtime-cache-compaction", None),
+                ("--resume-compaction-run-id", "123455"),
+                ("--resume-compaction-run-attempt", "2"),
+                ("--resume-compaction-source-sha", source_sha),
+                ("--resume-compaction-bundle-sha256", resume_bundle),
+            ):
+                self.assertIn(option, resume_argv)
+                if value is not None:
+                    self.assertEqual(resume_argv[resume_argv.index(option) + 1], value)
+
             create_argv = invoke_wrapper(
                 operation="create", evict="false", source_sha="none", bundle_sha="none"
             )
@@ -1863,6 +2293,11 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     str(report_path),
                     "create",
                     "false",
+                    "false",
+                    "false",
+                    "none",
+                    "none",
+                    "none",
                     "none",
                     "none",
                 ],

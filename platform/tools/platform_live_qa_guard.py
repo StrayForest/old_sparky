@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 import fcntl
 import grp
@@ -25,7 +26,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import Iterable, Iterator, NamedTuple
+from typing import Callable, Iterable, Iterator, Mapping, NamedTuple
 import urllib.error
 import urllib.request
 import zipfile
@@ -45,6 +46,7 @@ RUNNER_CACHE_ROOT = Path("/var/lib/oldsparky-liveqa")
 BUILD_NODE_ROOT = Path("/var/lib/oldsparky-build")
 RUN_GATE_ROOT = Path("/run/oldsparky-liveqa")
 LIVE_QA_SYSTEMD_UNIT = "oldsparky-liveqa-browser.service"
+LIVE_QA_RUNTIME_PROBE_TIMEOUT_SECONDS = 45.0
 LIVE_QA_CHILD_CAPTURE_BYTES = 64 * 1024
 LIVE_QA_CHILD_MARKER_RE = re.compile(
     r"LIVE_QA_CHILD_DIAGNOSTIC schema=1 kind=(none|playwright_cli_usage|"
@@ -98,6 +100,11 @@ CHROMIUM_SANDBOX_SIZE = 15232
 CHROMIUM_SANDBOX_SHA256 = (
     "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
 )
+LEGACY_FALLBACK_RUNTIME_COMMIT = "4a04b2dffaf0d02c2d3910e7ba28dca9b89de209"
+LEGACY_COMPACTION_EVENT = "live_qa_fallback_runtime_compaction"
+CHROMIUM_ARCHIVE_RETAINED_PATHS = frozenset(
+    {PurePosixPath("chrome-linux64/chrome_sandbox")}
+)
 LIVE_QA_BROWSER_ROOTS = frozenset(
     {"chromium-1228", "chromium_headless_shell-1228", "webkit-2311", "ffmpeg-1011"}
 )
@@ -120,6 +127,9 @@ MAX_ZIP_ENTRIES = 20_000
 MAX_ZIP_MEMBER_BYTES = 768 * 1024 * 1024
 MAX_ZIP_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ZIP_SYMLINK_BYTES = 4 * 1024
+MAX_RUNTIME_COMPACTION_ENTRIES = 20_000
+MAX_RUNTIME_COMPACTION_INTENT_BYTES = 8 * 1024 * 1024
+MAX_RUNTIME_COMPACTION_RECORD_BYTES = 16 * 1024
 MAX_TAR_ENTRIES = 20_000
 MAX_TAR_MEMBER_BYTES = 768 * 1024 * 1024
 MAX_TAR_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
@@ -2135,7 +2145,10 @@ def _tree_digest(
     ):
         relative_path = target.relative_to(root)
         relative = relative_path.as_posix()
-        if relative_path in ignored_relatives:
+        if any(
+            relative_path == ignored or ignored in relative_path.parents
+            for ignored in ignored_relatives
+        ):
             continue
         metadata = target.lstat()
         digest.update(relative.encode("utf-8") + b"\0")
@@ -2503,7 +2516,21 @@ def _download_pinned_zip(
     expected_sha256: str,
     expected_size: int,
     target: Path,
+    *,
+    retained_paths: frozenset[PurePosixPath] | None = None,
 ) -> None:
+    retained_names: frozenset[str] | None = None
+    if retained_paths is not None:
+        retained_names = frozenset(path.as_posix() for path in retained_paths)
+        if not retained_names or any(
+            not name
+            or PurePosixPath(name).is_absolute()
+            or any(part in {"", ".", ".."} for part in PurePosixPath(name).parts)
+            or PurePosixPath(*PurePosixPath(name).parts).as_posix() != name
+            for name in retained_names
+        ):
+            raise GuardError("pinned archive retention paths are unsafe")
+    retained_found: set[str] = set()
     archive = target.with_suffix(".zip")
     _download_exact(
         url=url,
@@ -2518,13 +2545,8 @@ def _download_pinned_zip(
             members = _validated_zip_members(source)
             resolved_target = target.resolve(strict=True)
             for member, member_parts, kind in members:
+                member_name = PurePosixPath(*member_parts).as_posix()
                 destination = target.joinpath(*member_parts)
-                mode = member.external_attr >> 16
-                if kind == "directory":
-                    destination.mkdir(parents=True, exist_ok=True)
-                    os.chmod(destination, 0o755)  # nosec B103
-                    continue
-                destination.parent.mkdir(parents=True, exist_ok=True)
                 if kind == "symlink":
                     try:
                         link = source.read(member).decode("utf-8")
@@ -2542,6 +2564,26 @@ def _download_pinned_zip(
                         raise GuardError(
                             "pinned Playwright archive symlink escapes"
                         ) from exc
+                if retained_names is not None:
+                    if kind == "directory":
+                        if not any(
+                            name.startswith(f"{member_name}/")
+                            for name in retained_names
+                        ):
+                            continue
+                    elif member_name not in retained_names:
+                        continue
+                    elif kind != "file":
+                        raise GuardError(
+                            "pinned archive retained member is not a regular file"
+                        )
+                mode = member.external_attr >> 16
+                if kind == "directory":
+                    destination.mkdir(parents=True, exist_ok=True)
+                    os.chmod(destination, 0o755)  # nosec B103
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if kind == "symlink":
                     destination.symlink_to(link)
                 else:
                     with (
@@ -2565,6 +2607,10 @@ def _download_pinned_zip(
                         destination,
                         0o755 if mode & 0o111 else 0o644,
                     )
+                    if retained_names is not None:
+                        retained_found.add(member_name)
+            if retained_names is not None and retained_found != set(retained_names):
+                raise GuardError("pinned archive retained member is unavailable")
         (target / "INSTALLATION_COMPLETE").touch(mode=0o644, exist_ok=False)
     except (OSError, zipfile.BadZipFile) as exc:
         raise GuardError("pinned Playwright archive extraction failed") from exc
@@ -2635,7 +2681,18 @@ def _install_locked_dependencies(target: Path) -> Path:
     browsers = target / "browsers"
     browsers.mkdir()
     for directory_name, url, checksum, byte_size in PLAYWRIGHT_ARCHIVES:
-        _download_pinned_zip(url, checksum, byte_size, browsers / directory_name)
+        retained_paths = (
+            CHROMIUM_ARCHIVE_RETAINED_PATHS
+            if directory_name == "chromium-1228"
+            else None
+        )
+        _download_pinned_zip(
+            url,
+            checksum,
+            byte_size,
+            browsers / directory_name,
+            retained_paths=retained_paths,
+        )
     sandbox = target / CHROMIUM_SANDBOX_RELATIVE
     try:
         metadata = sandbox.lstat()
@@ -3035,6 +3092,136 @@ def _assert_runtime_unit_collected() -> None:
         raise GuardError("transient live QA unit has not been collected")
 
 
+_RUNTIME_BROWSER_PROBE_SCRIPT = (
+    'const p=require(process.argv[2]);const k=process.argv[1];'
+    '(async()=>{let b;try{'
+    'if(k==="chromium")b=await p.chromium.launch({headless:true,chromiumSandbox:true});'
+    'else if(k==="webkit")b=await p.webkit.launch({headless:true});'
+    'else throw new Error("invalid probe");'
+    'const page=await b.newPage();await page.goto("about:blank");await page.close();'
+    '}finally{if(b)await b.close();}})().catch(()=>{process.exitCode=1;});'
+)
+
+
+def _runtime_browser_probe_command(
+    runtime: Path, *, uid: int, gid: int, engine: str
+) -> list[str]:
+    if engine not in {"chromium", "webkit"}:
+        raise GuardError("live QA runtime probe engine is invalid")
+    node = runtime / "node/bin/node"
+    package = runtime / "web/node_modules/playwright-core"
+    browsers = runtime / "browsers"
+    sandbox = runtime / CHROMIUM_SANDBOX_RELATIVE
+    return [
+        "/usr/bin/systemd-run",
+        "--no-ask-password",
+        "--quiet",
+        "--wait",
+        "--collect",
+        "--pipe",
+        "--service-type=exec",
+        "--expand-environment=no",
+        f"--unit={LIVE_QA_SYSTEMD_UNIT}",
+        f"--uid={uid}",
+        f"--gid={gid}",
+        f"--working-directory={runtime}",
+        "--property=KillMode=control-group",
+        "--property=Restart=no",
+        "--property=RuntimeMaxSec=45s",
+        "--property=SendSIGKILL=yes",
+        "--property=TimeoutStopSec=5s",
+        "--property=UMask=0077",
+        "--property=PrivateTmp=yes",
+        "--property=PrivateNetwork=yes",
+        "--property=ProtectHome=yes",
+        "--property=ProtectSystem=strict",
+        "--property=NoNewPrivileges=no",
+        f"--property=BindReadOnlyPaths={runtime}",
+        "--",
+        "/usr/bin/env",
+        "-i",
+        "HOME=/tmp",
+        "LANG=C",
+        f"PATH={runtime / 'node/bin'}:/usr/bin",
+        "TMPDIR=/tmp",
+        "XDG_CACHE_HOME=/tmp/.cache",
+        f"PLAYWRIGHT_BROWSERS_PATH={browsers}",
+        f"CHROME_DEVEL_SANDBOX={sandbox}",
+        str(node),
+        "-e",
+        _RUNTIME_BROWSER_PROBE_SCRIPT,
+        engine,
+        str(package),
+    ]
+
+
+def probe_compacted_legacy_runtime_cache(runtime_path: Path) -> None:
+    """Verify the fixed compacted 4a cache in isolated Chromium and WebKit children.
+
+    The caller must already hold the canonical live-QA lock. This function never
+    accepts a caller-selected runtime, browser, URL, environment or command.
+    """
+
+    expected = RUNNER_CACHE_ROOT / _runtime_cache_commit_name(
+        LEGACY_FALLBACK_RUNTIME_COMMIT
+    )
+    if runtime_path != expected:
+        raise GuardError("live QA runtime probe path is not the fixed fallback")
+    _validate_runtime_cache_root(RUNNER_CACHE_ROOT)
+    try:
+        metadata = runtime_path.lstat()
+        resolved = runtime_path.resolve(strict=True)
+    except OSError as exc:
+        raise GuardError("live QA compacted runtime is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o555
+        or resolved != expected
+    ):
+        raise GuardError("live QA compacted runtime identity is unsafe")
+    _validate_existing_runtime_cache(
+        runtime_path, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
+    )
+    sandbox = runtime_path / CHROMIUM_SANDBOX_RELATIVE
+    sandbox_metadata = sandbox.lstat()
+    if (
+        stat.S_ISLNK(sandbox_metadata.st_mode)
+        or not stat.S_ISREG(sandbox_metadata.st_mode)
+        or sandbox_metadata.st_uid != 0
+        or sandbox_metadata.st_gid != 0
+        or sandbox_metadata.st_nlink != 1
+        or stat.S_IMODE(sandbox_metadata.st_mode) != 0o4755
+        or sandbox_metadata.st_size != CHROMIUM_SANDBOX_SIZE
+        or _sha256_regular(sandbox, expected_uid=0, expected_mode=0o4755)
+        != CHROMIUM_SANDBOX_SHA256
+    ):
+        raise GuardError("live QA compacted runtime sandbox helper is invalid")
+    uid, gid = liveqa_identity()
+    assert_liveqa_idle()
+    for engine in ("chromium", "webkit"):
+        command = _runtime_browser_probe_command(
+            runtime_path, uid=uid, gid=gid, engine=engine
+        )
+        child_exit, marker = _capture_qa_child(
+            command, timeout_seconds=LIVE_QA_RUNTIME_PROBE_TIMEOUT_SECONDS
+        )
+        if child_exit == 124 and not _stop_timed_out_qa_browser_unit():
+            raise GuardError("live QA runtime probe cleanup could not be confirmed")
+        _assert_runtime_unit_collected()
+        assert_liveqa_idle()
+        match = LIVE_QA_CHILD_MARKER_RE.fullmatch(marker)
+        if (
+            child_exit != 0
+            or match is None
+            or match.group(1) != "none"
+            or match.group(5) != "0"
+        ):
+            raise GuardError("live QA compacted runtime browser probe failed")
+
+
 def prepare_runtime_cache(platform_root: Path, commit: str) -> Path:
     if not COMMIT_PATTERN.fullmatch(commit):
         raise GuardError("runtime cache commit is invalid")
@@ -3044,7 +3231,6 @@ def prepare_runtime_cache(platform_root: Path, commit: str) -> Path:
     assert_liveqa_idle()
     _ensure_root_directory(RUNNER_CACHE_ROOT, 0o755)
     target = RUNNER_CACHE_ROOT / f"runtime-{commit}"
-    manifest_path = target / ".manifest.json"
     if target.exists() or target.is_symlink():
         metadata = target.lstat()
         if (
@@ -3053,44 +3239,7 @@ def prepare_runtime_cache(platform_root: Path, commit: str) -> Path:
             or stat.S_IMODE(metadata.st_mode) != 0o555
         ):
             raise GuardError("existing live QA runtime cache is unsafe")
-        manifest = _read_private_json(manifest_path, expected_uid=0, mode=0o444)
-        if (
-            set(manifest)
-            != {
-                "version",
-                "source_commit",
-                "tree_sha256",
-                "node_archive_sha256",
-                "package_lock_sha256",
-                "playwright_browsers_sha256",
-            }
-            or manifest.get("version") != 1
-            or manifest.get("source_commit") != commit
-        ):
-            raise GuardError("runtime cache manifest is invalid")
-        expected = manifest.get("tree_sha256")
-        if not isinstance(expected, str) or expected != _tree_digest(
-            target,
-            ignored_relatives=frozenset({Path(".manifest.json")}),
-        ):
-            raise GuardError("runtime cache content drifted from its manifest")
-        package_lock_digest = hashlib.sha256(
-            (platform_root / "apps/platform_web/package-lock.json").read_bytes()
-        ).hexdigest()
-        browsers_manifest_digest = hashlib.sha256(
-            (target / "web/node_modules/playwright-core/browsers.json").read_bytes()
-        ).hexdigest()
-        if (
-            manifest.get("node_archive_sha256") != NODE_ARCHIVE_SHA256
-            or manifest.get("package_lock_sha256") != package_lock_digest
-            or manifest.get("playwright_browsers_sha256") != browsers_manifest_digest
-        ):
-            raise GuardError("runtime cache dependency provenance is invalid")
-        _validate_cache_tree_permissions(
-            target,
-            sandbox_relative=CHROMIUM_SANDBOX_RELATIVE,
-        )
-        _sandbox_path(target)
+        _validate_existing_runtime_cache(target, platform_root, commit)
         return target
     stage = RUNNER_CACHE_ROOT / f".runtime-{commit}.building-{uuid4().hex}"
     try:
@@ -3151,6 +3300,1413 @@ def prepare_runtime_cache(platform_root: Path, commit: str) -> Path:
             shutil.rmtree(stage)
         raise
     return target
+
+
+def _validate_existing_runtime_cache(
+    target: Path, platform_root: Path, commit: str
+) -> dict[str, object]:
+    """Apply the same no-create validator used by existing cache callers."""
+
+    metadata = target.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o555
+    ):
+        raise GuardError("existing live QA runtime cache is unsafe")
+    manifest = _read_private_json(target / ".manifest.json", expected_uid=0, mode=0o444)
+    if (
+        set(manifest)
+        != {
+            "version",
+            "source_commit",
+            "tree_sha256",
+            "node_archive_sha256",
+            "package_lock_sha256",
+            "playwright_browsers_sha256",
+        }
+        or manifest.get("version") != 1
+        or manifest.get("source_commit") != commit
+    ):
+        raise GuardError("runtime cache manifest is invalid")
+    expected = manifest.get("tree_sha256")
+    if not isinstance(expected, str) or expected != _tree_digest(
+        target,
+        ignored_relatives=frozenset({Path(".manifest.json")}),
+    ):
+        raise GuardError("runtime cache content drifted from its manifest")
+    package_lock_digest = hashlib.sha256(
+        (platform_root / "apps/platform_web/package-lock.json").read_bytes()
+    ).hexdigest()
+    browsers_manifest_digest = hashlib.sha256(
+        (target / "web/node_modules/playwright-core/browsers.json").read_bytes()
+    ).hexdigest()
+    if (
+        manifest.get("node_archive_sha256") != NODE_ARCHIVE_SHA256
+        or manifest.get("package_lock_sha256") != package_lock_digest
+        or manifest.get("playwright_browsers_sha256") != browsers_manifest_digest
+    ):
+        raise GuardError("runtime cache dependency provenance is invalid")
+    _validate_cache_tree_permissions(
+        target,
+        sandbox_relative=CHROMIUM_SANDBOX_RELATIVE,
+    )
+    _sandbox_path(target)
+    return manifest
+
+
+def _canonical_cache_manifest(raw: bytes) -> dict[str, object]:
+    try:
+        payload = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise GuardError("runtime cache manifest is invalid") from exc
+    expected_keys = {
+        "version",
+        "source_commit",
+        "tree_sha256",
+        "node_archive_sha256",
+        "package_lock_sha256",
+        "playwright_browsers_sha256",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or payload.get("version") != 1
+        or not isinstance(payload.get("source_commit"), str)
+        or COMMIT_PATTERN.fullmatch(str(payload["source_commit"])) is None
+        or any(
+            not isinstance(payload.get(key), str)
+            or DIGEST_PATTERN.fullmatch(str(payload[key])) is None
+            for key in expected_keys - {"version", "source_commit"}
+        )
+    ):
+        raise GuardError("runtime cache manifest schema is invalid")
+    canonical = (json.dumps(payload, separators=(",", ":")) + "\n").encode("ascii")
+    if raw != canonical:
+        raise GuardError("runtime cache manifest encoding is not canonical")
+    return payload
+
+
+def _read_cache_manifest(path: Path) -> tuple[dict[str, object], bytes, tuple[int, ...]]:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise GuardError("runtime cache manifest is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o444
+        or metadata.st_size > MAX_JSON_BYTES
+    ):
+        raise GuardError("runtime cache manifest metadata is unsafe")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if _fingerprint(opened) != _fingerprint(metadata):
+            raise GuardError("runtime cache manifest changed while opening")
+        raw = bytearray()
+        while len(raw) <= MAX_JSON_BYTES:
+            chunk = os.read(descriptor, min(64 * 1024, MAX_JSON_BYTES + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > MAX_JSON_BYTES or _fingerprint(os.fstat(descriptor)) != _fingerprint(opened):
+            raise GuardError("runtime cache manifest changed while reading")
+    finally:
+        os.close(descriptor)
+    encoded = bytes(raw)
+    return _canonical_cache_manifest(encoded), encoded, _fingerprint(metadata)
+
+
+def _cache_manifest_payload(
+    original: Mapping[str, object], *, tree_sha256: str
+) -> dict[str, object]:
+    if DIGEST_PATTERN.fullmatch(tree_sha256) is None:
+        raise GuardError("runtime cache digest is invalid")
+    return {
+        "version": 1,
+        "source_commit": original["source_commit"],
+        "tree_sha256": tree_sha256,
+        "node_archive_sha256": original["node_archive_sha256"],
+        "package_lock_sha256": original["package_lock_sha256"],
+        "playwright_browsers_sha256": original["playwright_browsers_sha256"],
+    }
+
+
+def _encode_cache_manifest(payload: Mapping[str, object]) -> bytes:
+    return (json.dumps(dict(payload), separators=(",", ":")) + "\n").encode("ascii")
+
+
+def _atomic_replace_cache_manifest(
+    target: Path, payload: Mapping[str, object], *, temporary_name: str
+) -> bytes:
+    if (
+        not temporary_name.startswith(".manifest.json.compact-")
+        or re.fullmatch(r"\.manifest\.json\.compact-[0-9a-f]{32}", temporary_name)
+        is None
+    ):
+        raise GuardError("runtime cache temporary manifest name is unsafe")
+    temporary = target / temporary_name
+    manifest = target / ".manifest.json"
+    raw = _encode_cache_manifest(payload)
+    if len(raw) > MAX_JSON_BYTES:
+        raise GuardError("runtime cache manifest exceeds its bound")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o444,
+    )
+    try:
+        _write_all(descriptor, raw, failure="runtime cache manifest write failed")
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, manifest)
+    _sync_directory(target)
+    return raw
+
+
+def _read_allocated_tree_bytes(root: Path) -> int:
+    total = 0
+    for path in (root, *_walk_nofollow(root)):
+        metadata = path.lstat()
+        total += metadata.st_blocks * 512
+    return total
+
+
+def _hash_runtime_file(path: Path, *, expected: os.stat_result) -> str:
+    if expected.st_size > MAX_ZIP_MEMBER_BYTES:
+        raise GuardError("runtime cache compaction file exceeds its bound")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        opened = os.fstat(descriptor)
+        if _fingerprint(opened) != _fingerprint(expected):
+            raise GuardError("runtime cache compaction file changed while opening")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > expected.st_size:
+                raise GuardError("runtime cache compaction file exceeds its bound")
+            digest.update(chunk)
+        if total != expected.st_size or _fingerprint(os.fstat(descriptor)) != _fingerprint(opened):
+            raise GuardError("runtime cache compaction file changed while reading")
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _inventory_runtime_tree(root: Path) -> tuple[list[dict[str, object]], str]:
+    paths = [root, *_walk_nofollow(root)]
+    if len(paths) > MAX_RUNTIME_COMPACTION_ENTRIES:
+        raise GuardError("runtime cache compaction subtree has too many entries")
+    entries: list[dict[str, object]] = []
+    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
+        metadata = path.lstat()
+        relative = path.relative_to(root).as_posix()
+        if relative == ".":
+            relative = ""
+        entry: dict[str, object] = {
+            "path": relative,
+            "dev": metadata.st_dev,
+            "ino": metadata.st_ino,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
+            "nlink": metadata.st_nlink,
+            "size": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+            "ctime_ns": metadata.st_ctime_ns,
+        }
+        if stat.S_ISDIR(metadata.st_mode):
+            entry["kind"] = "directory"
+        elif stat.S_ISREG(metadata.st_mode):
+            entry["kind"] = "file"
+            entry["sha256"] = _hash_runtime_file(path, expected=metadata)
+        elif stat.S_ISLNK(metadata.st_mode):
+            link = os.readlink(path)
+            if not _relative_link_stays_within(root, path, link):
+                raise GuardError("runtime cache compaction symlink is unsafe")
+            entry["kind"] = "symlink"
+            entry["target"] = link
+        else:
+            raise GuardError("runtime cache compaction subtree has a special file")
+        entries.append(entry)
+    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("ascii")
+    if len(encoded) > MAX_RUNTIME_COMPACTION_INTENT_BYTES:
+        raise GuardError("runtime cache compaction inventory exceeds its bound")
+    return entries, hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_compaction_inventory(
+    entries: object,
+    *,
+    count: object,
+    digest: object,
+) -> list[dict[str, object]]:
+    if (
+        not isinstance(entries, list)
+        or type(count) is not int
+        or count != len(entries)
+        or count < 1
+        or count > MAX_RUNTIME_COMPACTION_ENTRIES
+    ):
+        raise GuardError("runtime cache compaction inventory is invalid")
+    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("ascii")
+    if (
+        len(encoded) > MAX_RUNTIME_COMPACTION_INTENT_BYTES
+        or not isinstance(digest, str)
+        or hashlib.sha256(encoded).hexdigest() != digest
+    ):
+        raise GuardError("runtime cache compaction inventory digest is invalid")
+    checked: list[dict[str, object]] = []
+    seen: set[str] = set()
+    kind_by_path: dict[str, str] = {}
+    sort_keys: list[str] = []
+    for raw in entries:
+        if not isinstance(raw, dict):
+            raise GuardError("runtime cache compaction inventory entry is invalid")
+        kind = raw.get("kind")
+        keys = {
+            "path", "dev", "ino", "mode", "uid", "gid", "nlink", "size",
+            "mtime_ns", "ctime_ns", "kind",
+        }
+        if kind == "file":
+            keys.add("sha256")
+        elif kind == "symlink":
+            keys.add("target")
+        elif kind != "directory":
+            raise GuardError("runtime cache compaction inventory type is invalid")
+        if set(raw) != keys:
+            raise GuardError("runtime cache compaction inventory fields are invalid")
+        relative = raw.get("path")
+        if not isinstance(relative, str) or relative in seen:
+            raise GuardError("runtime cache compaction inventory path is invalid")
+        if relative:
+            parsed = PurePosixPath(relative)
+            if (
+                parsed.is_absolute()
+                or "\\" in relative
+                or any(part in {"", ".", ".."} for part in parsed.parts)
+                or parsed.as_posix() != relative
+            ):
+                raise GuardError("runtime cache compaction inventory path is unsafe")
+        elif kind != "directory":
+            raise GuardError("runtime cache compaction inventory root is invalid")
+        seen.add(relative)
+        kind_by_path[relative] = str(kind)
+        sort_keys.append(relative)
+        for name in ("dev", "ino", "mode", "uid", "gid", "nlink", "size", "mtime_ns", "ctime_ns"):
+            if type(raw.get(name)) is not int or int(raw[name]) < 0:
+                raise GuardError("runtime cache compaction inventory metadata is invalid")
+        if (
+            raw["dev"] <= 0
+            or raw["ino"] <= 0
+            or raw["uid"] != 0
+            or raw["gid"] != 0
+            or raw["nlink"] < 1
+            or raw["mode"] > 0o7777
+        ):
+            raise GuardError("runtime cache compaction inventory identity is unsafe")
+        if kind == "directory" and (
+            raw["mode"] != 0o555 or raw["nlink"] < 2
+        ):
+            raise GuardError("runtime cache compaction inventory directory is unsafe")
+        if kind == "file" and (
+            raw["nlink"] != 1
+            or raw["mode"] not in {0o444, 0o555, 0o4755}
+            or (raw["mode"] == 0o4755 and relative != "chrome-linux64/chrome_sandbox")
+            or not isinstance(raw.get("sha256"), str)
+            or DIGEST_PATTERN.fullmatch(str(raw["sha256"])) is None
+        ):
+            raise GuardError("runtime cache compaction inventory file is unsafe")
+        if kind == "symlink" and (
+            raw["nlink"] != 1
+            or raw["mode"] != 0o777
+            or not isinstance(raw.get("target"), str)
+            or not _relative_link_stays_within(Path("/inventory"), Path("/inventory") / relative, str(raw["target"]))
+        ):
+            raise GuardError("runtime cache compaction inventory symlink is unsafe")
+        checked.append(dict(raw))
+    if not checked or checked[0].get("path") != "" or checked[0].get("kind") != "directory":
+        raise GuardError("runtime cache compaction inventory root is missing")
+    if any(entry["dev"] != checked[0]["dev"] for entry in checked):
+        raise GuardError("runtime cache compaction inventory crosses devices")
+    if sort_keys != sorted(sort_keys):
+        raise GuardError("runtime cache compaction inventory order is invalid")
+    for entry in checked[1:]:
+        parent = PurePosixPath(str(entry["path"])).parent.as_posix()
+        if parent != "." and kind_by_path.get(parent) != "directory":
+            raise GuardError("runtime cache compaction inventory parent is missing")
+    return checked
+
+
+def _validate_inventory_survivors(
+    root: Path,
+    entries: list[dict[str, object]],
+    *,
+    allow_missing: bool,
+) -> set[str]:
+    expected = {str(entry["path"]): entry for entry in entries}
+    if root.exists() or root.is_symlink():
+        if root.is_symlink():
+            raise GuardError("runtime cache rollback root became a symlink")
+        actual_paths = {""}
+        actual_paths.update(path.relative_to(root).as_posix() for path in _walk_nofollow(root))
+    else:
+        actual_paths = set()
+    unknown = actual_paths - expected.keys()
+    missing = expected.keys() - actual_paths
+    if unknown or (missing and not allow_missing):
+        raise GuardError("runtime cache rollback inventory does not close")
+    for relative in sorted(actual_paths):
+        entry = expected[relative]
+        path = root if not relative else root.joinpath(*PurePosixPath(relative).parts)
+        metadata = path.lstat()
+        kind = (
+            "directory" if stat.S_ISDIR(metadata.st_mode)
+            else "file" if stat.S_ISREG(metadata.st_mode)
+            else "symlink" if stat.S_ISLNK(metadata.st_mode)
+            else "special"
+        )
+        if (
+            kind != entry["kind"]
+            or metadata.st_dev != entry["dev"]
+            or metadata.st_ino != entry["ino"]
+            or stat.S_IMODE(metadata.st_mode) != entry["mode"]
+            or metadata.st_uid != entry["uid"]
+            or metadata.st_gid != entry["gid"]
+        ):
+            raise GuardError("runtime cache rollback entry identity changed")
+        descendants_missing = any(
+            name.startswith(f"{relative}/") if relative else name != ""
+            for name in missing
+        )
+        if kind == "directory" and allow_missing and descendants_missing:
+            if metadata.st_nlink < 2 or metadata.st_nlink > entry["nlink"]:
+                raise GuardError("runtime cache rollback directory links changed")
+        elif (
+            metadata.st_nlink != entry["nlink"]
+            or metadata.st_size != entry["size"]
+            or metadata.st_mtime_ns != entry["mtime_ns"]
+            or (relative != "" and metadata.st_ctime_ns != entry["ctime_ns"])
+        ):
+            raise GuardError("runtime cache rollback entry metadata changed")
+        if kind == "file" and _hash_runtime_file(path, expected=metadata) != entry["sha256"]:
+            raise GuardError("runtime cache rollback file content changed")
+        if kind == "symlink" and os.readlink(path) != entry["target"]:
+            raise GuardError("runtime cache rollback symlink changed")
+    return missing
+
+
+def _delete_inventory_tree(root: Path, entries: list[dict[str, object]]) -> None:
+    missing = _validate_inventory_survivors(root, entries, allow_missing=True)
+    by_path = {str(entry["path"]): entry for entry in entries}
+    if "" in missing:
+        if missing != set(by_path):
+            raise GuardError("runtime cache rollback tree is partially unavailable")
+        return
+    for relative in sorted(
+        (path for path in by_path if path not in missing and path),
+        key=lambda value: (-len(PurePosixPath(value).parts), value),
+    ):
+        entry = by_path[relative]
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        parent = path.parent
+        parent_metadata = parent.lstat()
+        parent_relative = parent.relative_to(root).as_posix()
+        parent_entry = by_path.get("" if parent_relative == "." else parent_relative)
+        if parent_entry is None or (parent_metadata.st_dev, parent_metadata.st_ino) != (
+            parent_entry["dev"], parent_entry["ino"]
+        ):
+            raise GuardError("runtime cache rollback parent changed before unlink")
+        descriptor = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            if (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino) != (
+                parent_entry["dev"], parent_entry["ino"]
+            ):
+                raise GuardError("runtime cache rollback parent changed while opening")
+            current = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
+            current_kind = (
+                "directory" if stat.S_ISDIR(current.st_mode)
+                else "file" if stat.S_ISREG(current.st_mode)
+                else "symlink" if stat.S_ISLNK(current.st_mode)
+                else "special"
+            )
+            if (
+                current_kind != entry["kind"]
+                or (current.st_dev, current.st_ino) != (entry["dev"], entry["ino"])
+                or stat.S_IMODE(current.st_mode) != entry["mode"]
+                or current.st_uid != entry["uid"]
+                or current.st_gid != entry["gid"]
+            ):
+                raise GuardError("runtime cache rollback entry changed before unlink")
+            descendants_missing = any(
+                name.startswith(f"{relative}/") if relative else name != ""
+                for name in missing
+            )
+            if current_kind == "directory" and descendants_missing:
+                if current.st_nlink < 2 or current.st_nlink > entry["nlink"]:
+                    raise GuardError("runtime cache rollback directory changed before unlink")
+            elif (
+                current.st_nlink != entry["nlink"]
+                or current.st_size != entry["size"]
+                or current.st_mtime_ns != entry["mtime_ns"]
+                or current.st_ctime_ns != entry["ctime_ns"]
+            ):
+                raise GuardError("runtime cache rollback entry changed before unlink")
+            if current_kind == "file" and _hash_runtime_file(path, expected=current) != entry["sha256"]:
+                raise GuardError("runtime cache rollback file changed before unlink")
+            if current_kind == "symlink" and os.readlink(path, dir_fd=descriptor) != entry["target"]:
+                raise GuardError("runtime cache rollback link changed before unlink")
+            if entry["kind"] == "directory":
+                os.rmdir(path.name, dir_fd=descriptor)
+            else:
+                os.unlink(path.name, dir_fd=descriptor)
+            os.fsync(descriptor)
+            missing.add(relative)
+        finally:
+            os.close(descriptor)
+    root_entry = by_path[""]
+    root_metadata = root.lstat()
+    if (root_metadata.st_dev, root_metadata.st_ino) != (root_entry["dev"], root_entry["ino"]):
+        raise GuardError("runtime cache rollback root changed before removal")
+    parent_fd = os.open(
+        root.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.rmdir(root.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _runtime_cache_commit_name(commit: str) -> str:
+    return f"runtime-{commit}"
+
+
+def _compaction_rollback_name(commit: str) -> str:
+    return f".runtime-{commit}.chromium-compaction-{uuid4().hex}"
+
+
+def _compaction_temp_manifest_name(rollback_name: str) -> str:
+    match = re.fullmatch(
+        rf"\.runtime-{LEGACY_FALLBACK_RUNTIME_COMMIT}\.chromium-compaction-([0-9a-f]{{32}})",
+        rollback_name,
+    )
+    if match is None:
+        raise GuardError("runtime cache rollback name is invalid")
+    return f".manifest.json.compact-{match.group(1)}"
+
+
+def _compaction_record_base(
+    *,
+    run_id: int,
+    attempt: int,
+    operation_source_sha: str,
+    cache_metadata: os.stat_result,
+    manifest: Mapping[str, object],
+    manifest_raw: bytes,
+    manifest_sha256: str,
+    old_tree_sha256: str,
+    old_non_chromium_tree_sha256: str,
+    chromium_metadata: os.stat_result,
+    chromium_tree_sha256: str,
+    chromium_allocated_bytes: int,
+    chromium_inventory: list[dict[str, object]],
+    chromium_inventory_sha256: str,
+    rollback_name: str,
+) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "event": LEGACY_COMPACTION_EVENT,
+        "run_id": run_id,
+        "attempt": attempt,
+        "operation_source_sha": operation_source_sha,
+        "source_commit": LEGACY_FALLBACK_RUNTIME_COMMIT,
+        "cache_dev": cache_metadata.st_dev,
+        "cache_ino": cache_metadata.st_ino,
+        "old_tree_sha256": old_tree_sha256,
+        "old_non_chromium_tree_sha256": old_non_chromium_tree_sha256,
+        "old_manifest_sha256": manifest_sha256,
+        "old_manifest": dict(manifest),
+        "old_manifest_raw_b64": base64.b64encode(manifest_raw).decode("ascii"),
+        "old_chromium_tree_sha256": chromium_tree_sha256,
+        "old_chromium_entry_count": len(chromium_inventory),
+        "old_chromium_inventory_sha256": chromium_inventory_sha256,
+        "old_chromium_inventory": chromium_inventory,
+        "old_chromium_dev": chromium_metadata.st_dev,
+        "old_chromium_ino": chromium_metadata.st_ino,
+        "old_chromium_allocated_bytes": chromium_allocated_bytes,
+        "old_sandbox_sha256": CHROMIUM_SANDBOX_SHA256,
+        "rollback_name": rollback_name,
+        "phase": "intent",
+    }
+
+
+def _validate_compaction_record(
+    record: Mapping[str, object],
+    *,
+    phase: str,
+    run_id: int,
+    attempt: int,
+    operation_source_sha: str,
+) -> dict[str, object]:
+    common = {
+        "schema",
+        "event",
+        "run_id",
+        "attempt",
+        "operation_source_sha",
+        "source_commit",
+        "cache_dev",
+        "cache_ino",
+        "old_tree_sha256",
+        "old_non_chromium_tree_sha256",
+        "old_manifest_sha256",
+        "old_manifest",
+        "old_manifest_raw_b64",
+        "old_chromium_tree_sha256",
+        "old_chromium_entry_count",
+        "old_chromium_inventory_sha256",
+        "old_chromium_dev",
+        "old_chromium_ino",
+        "old_chromium_allocated_bytes",
+        "old_sandbox_sha256",
+        "rollback_name",
+        "phase",
+    }
+    fields = {
+        "intent": common | {"old_chromium_inventory"},
+        "validated": common | {"intent_sha256", "new_tree_sha256", "new_manifest_sha256"},
+        "complete": common | {"intent_sha256", "new_tree_sha256", "new_manifest_sha256", "reclaimed_bytes", "result"},
+    }
+    payload = dict(record)
+    if (
+        phase not in fields
+        or set(payload) != fields[phase]
+        or payload.get("schema") != 1
+        or payload.get("event") != LEGACY_COMPACTION_EVENT
+        or payload.get("phase") != phase
+        or payload.get("run_id") != run_id
+        or payload.get("attempt") != attempt
+        or payload.get("operation_source_sha") != operation_source_sha
+        or payload.get("source_commit") != LEGACY_FALLBACK_RUNTIME_COMMIT
+        or not isinstance(payload.get("old_manifest"), dict)
+        or payload.get("old_sandbox_sha256") != CHROMIUM_SANDBOX_SHA256
+    ):
+        raise GuardError("runtime cache compaction receipt binding is invalid")
+    if phase == "intent":
+        _validate_compaction_inventory(
+            payload.get("old_chromium_inventory"),
+            count=payload.get("old_chromium_entry_count"),
+            digest=payload.get("old_chromium_inventory_sha256"),
+        )
+        if len(_encode_compaction_record(payload)) > MAX_RUNTIME_COMPACTION_INTENT_BYTES:
+            raise GuardError("runtime cache compaction intent exceeds its bound")
+    elif len(_encode_compaction_record(payload)) > MAX_RUNTIME_COMPACTION_RECORD_BYTES:
+        raise GuardError("runtime cache compaction receipt exceeds its bound")
+    elif (
+        type(payload.get("old_chromium_entry_count")) is not int
+        or int(payload["old_chromium_entry_count"]) < 1
+        or int(payload["old_chromium_entry_count"]) > MAX_RUNTIME_COMPACTION_ENTRIES
+        or not isinstance(payload.get("old_chromium_inventory_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(str(payload["old_chromium_inventory_sha256"])) is None
+        or not isinstance(payload.get("intent_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(str(payload["intent_sha256"])) is None
+    ):
+        raise GuardError("runtime cache compaction inventory binding is invalid")
+    if (
+        not isinstance(payload.get("operation_source_sha"), str)
+        or COMMIT_PATTERN.fullmatch(str(payload["operation_source_sha"])) is None
+    ):
+        raise GuardError("runtime cache compaction receipt source binding is invalid")
+    for name in (
+        "old_tree_sha256",
+        "old_non_chromium_tree_sha256",
+        "old_manifest_sha256",
+        "old_chromium_tree_sha256",
+    ):
+        if not isinstance(payload.get(name), str) or DIGEST_PATTERN.fullmatch(str(payload[name])) is None:
+            raise GuardError("runtime cache compaction receipt digest is invalid")
+    integer_fields = (
+        "cache_dev",
+        "cache_ino",
+        "old_chromium_dev",
+        "old_chromium_ino",
+        "old_chromium_allocated_bytes",
+    )
+    if any(type(payload.get(name)) is not int or int(payload[name]) <= 0 for name in integer_fields):
+        raise GuardError("runtime cache compaction receipt identity is invalid")
+    if re.fullmatch(
+        rf"\.runtime-{LEGACY_FALLBACK_RUNTIME_COMMIT}\.chromium-compaction-[0-9a-f]{{32}}",
+        str(payload.get("rollback_name")),
+    ) is None:
+        raise GuardError("runtime cache compaction rollback binding is invalid")
+    old_manifest = payload["old_manifest"]
+    if not isinstance(old_manifest, dict):
+        raise GuardError("runtime cache compaction manifest binding is invalid")
+    encoded_manifest = payload.get("old_manifest_raw_b64")
+    if (
+        not isinstance(encoded_manifest, str)
+        or len(encoded_manifest) > ((MAX_JSON_BYTES + 2) // 3) * 4
+    ):
+        raise GuardError("runtime cache compaction manifest bytes exceed their bound")
+    try:
+        old_manifest_raw = base64.b64decode(encoded_manifest, validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise GuardError("runtime cache compaction manifest bytes are invalid") from exc
+    if (
+        len(old_manifest_raw) > MAX_JSON_BYTES
+        or base64.b64encode(old_manifest_raw).decode("ascii") != encoded_manifest
+        or _canonical_cache_manifest(old_manifest_raw) != old_manifest
+    ):
+        raise GuardError("runtime cache compaction manifest bytes do not match")
+    if (
+        hashlib.sha256(old_manifest_raw).hexdigest() != payload["old_manifest_sha256"]
+        or old_manifest.get("source_commit") != LEGACY_FALLBACK_RUNTIME_COMMIT
+        or old_manifest.get("tree_sha256") != payload["old_tree_sha256"]
+    ):
+        raise GuardError("runtime cache compaction original manifest binding is invalid")
+    if phase in {"validated", "complete"}:
+        for name in ("new_tree_sha256", "new_manifest_sha256"):
+            if not isinstance(payload.get(name), str) or DIGEST_PATTERN.fullmatch(str(payload[name])) is None:
+                raise GuardError("runtime cache compaction validated digest is invalid")
+    if phase == "complete":
+        if (
+            type(payload.get("reclaimed_bytes")) is not int
+            or int(payload["reclaimed_bytes"]) < 0
+            or payload.get("result") not in {"compacted", "restored"}
+            or (
+                payload.get("result") == "restored"
+                and (
+                    payload["reclaimed_bytes"] != 0
+                    or payload["new_tree_sha256"] != payload["old_tree_sha256"]
+                    or payload["new_manifest_sha256"] != payload["old_manifest_sha256"]
+                )
+            )
+            or (
+                payload.get("result") == "compacted"
+                and payload["reclaimed_bytes"] != payload["old_chromium_allocated_bytes"]
+            )
+        ):
+            raise GuardError("runtime cache compaction completion is invalid")
+    return payload
+
+
+def _encode_compaction_record(payload: Mapping[str, object]) -> bytes:
+    return (json.dumps(dict(payload), sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def _compact_validated_record(
+    intent: Mapping[str, object], *, new_tree_sha256: str, new_manifest_sha256: str
+) -> dict[str, object]:
+    record = {key: value for key, value in intent.items() if key != "old_chromium_inventory"}
+    record["intent_sha256"] = hashlib.sha256(_encode_compaction_record(intent)).hexdigest()
+    record["new_tree_sha256"] = new_tree_sha256
+    record["new_manifest_sha256"] = new_manifest_sha256
+    record["phase"] = "validated"
+    return record
+
+
+def _assert_compaction_records_match(
+    intent: Mapping[str, object], validated: Mapping[str, object]
+) -> None:
+    intent_hash = hashlib.sha256(_encode_compaction_record(intent)).hexdigest()
+    if validated.get("intent_sha256") != intent_hash:
+        raise GuardError("runtime cache recovery intent digest does not match")
+    for key, value in intent.items():
+        if key in {"old_chromium_inventory", "phase"}:
+            continue
+        if validated.get(key) != value:
+            raise GuardError("runtime cache recovery receipts do not match")
+
+
+def _compaction_snapshot(
+    target: Path,
+) -> tuple[
+    dict[str, object], bytes, os.stat_result, os.stat_result, str, str, str, int,
+    list[dict[str, object]], str,
+]:
+    cache_metadata = target.lstat()
+    manifest, manifest_raw, _manifest_fingerprint = _read_cache_manifest(
+        target / ".manifest.json"
+    )
+    _validate_existing_runtime_cache(
+        target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
+    )
+    chromium = target / "browsers/chromium-1228"
+    chromium_metadata = chromium.lstat()
+    _validate_cache_tree_permissions(
+        chromium, sandbox_relative=Path("chrome-linux64/chrome_sandbox")
+    )
+    sandbox = chromium / "chrome-linux64/chrome_sandbox"
+    if (
+        sandbox.stat(follow_symlinks=False).st_size != CHROMIUM_SANDBOX_SIZE
+        or _sha256_regular(sandbox, expected_uid=0, expected_mode=0o4755)
+        != CHROMIUM_SANDBOX_SHA256
+    ):
+        raise GuardError("fallback Chromium sandbox helper is not pinned")
+    inventory, inventory_sha256 = _inventory_runtime_tree(chromium)
+    return (
+        manifest,
+        manifest_raw,
+        cache_metadata,
+        chromium_metadata,
+        _tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")})),
+        _tree_digest(
+            target,
+            ignored_relatives=frozenset(
+                {Path(".manifest.json"), Path("browsers/chromium-1228")}
+            ),
+        ),
+        _tree_digest(chromium),
+        _read_allocated_tree_bytes(chromium),
+        inventory,
+        inventory_sha256,
+    )
+
+
+def _copy_verified_sandbox(source: Path, destination: Path) -> None:
+    try:
+        metadata = source.lstat()
+    except OSError as exc:
+        raise GuardError("fallback Chromium sandbox helper is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o4755
+        or metadata.st_size != CHROMIUM_SANDBOX_SIZE
+    ):
+        raise GuardError("fallback Chromium sandbox helper metadata is unsafe")
+    source_fd = os.open(
+        source,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    destination_fd = -1
+    try:
+        if _fingerprint(os.fstat(source_fd)) != _fingerprint(metadata):
+            raise GuardError("fallback Chromium sandbox helper changed while opening")
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 64 * 1024)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > CHROMIUM_SANDBOX_SIZE:
+                raise GuardError("fallback Chromium sandbox helper exceeds its bound")
+            digest.update(chunk)
+            _write_all(destination_fd, chunk, failure="sandbox helper copy failed")
+        if (
+            copied != CHROMIUM_SANDBOX_SIZE
+            or digest.hexdigest() != CHROMIUM_SANDBOX_SHA256
+            or _fingerprint(os.fstat(source_fd)) != _fingerprint(metadata)
+        ):
+            raise GuardError("fallback Chromium sandbox helper changed while copying")
+        os.fchown(destination_fd, 0, 0)
+        os.fchmod(destination_fd, 0o4755)
+        os.fsync(destination_fd)
+    finally:
+        os.close(source_fd)
+        if destination_fd >= 0:
+            os.close(destination_fd)
+
+
+def _remove_compacted_chromium(target: Path) -> None:
+    chromium = target / "browsers/chromium-1228"
+    try:
+        metadata = chromium.lstat()
+    except FileNotFoundError:
+        return
+    cache_metadata = target.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_dev != cache_metadata.st_dev
+        or stat.S_IMODE(metadata.st_mode) not in {0o555, 0o755}
+    ):
+        raise GuardError("partial compact Chromium subtree is unsafe")
+    entries = {item.name for item in chromium.iterdir()}
+    if entries - {"chrome-linux64", "INSTALLATION_COMPLETE"}:
+        raise GuardError("partial compact Chromium subtree has unexpected entries")
+    complete = chromium / "INSTALLATION_COMPLETE"
+    if complete.exists() or complete.is_symlink():
+        complete_metadata = complete.lstat()
+        if (
+            stat.S_ISLNK(complete_metadata.st_mode)
+            or not stat.S_ISREG(complete_metadata.st_mode)
+            or complete_metadata.st_uid != 0
+            or complete_metadata.st_gid != 0
+            or complete_metadata.st_nlink != 1
+            or complete_metadata.st_size != 0
+            or stat.S_IMODE(complete_metadata.st_mode) != 0o444
+        ):
+            raise GuardError("partial compact Chromium marker is unsafe")
+    linux = chromium / "chrome-linux64"
+    if linux.exists() or linux.is_symlink():
+        linux_metadata = linux.lstat()
+        if (
+            not stat.S_ISDIR(linux_metadata.st_mode)
+            or linux_metadata.st_uid != 0
+            or linux_metadata.st_gid != 0
+            or linux_metadata.st_dev != metadata.st_dev
+            or stat.S_IMODE(linux_metadata.st_mode) not in {0o555, 0o755}
+            or {item.name for item in linux.iterdir()} - {"chrome_sandbox"}
+        ):
+            raise GuardError("partial compact Chromium subtree is unsafe")
+        sandbox = linux / "chrome_sandbox"
+        if sandbox.exists() or sandbox.is_symlink():
+            sandbox_metadata = sandbox.lstat()
+            if (
+                stat.S_ISLNK(sandbox_metadata.st_mode)
+                or not stat.S_ISREG(sandbox_metadata.st_mode)
+                or sandbox_metadata.st_uid != 0
+                or sandbox_metadata.st_gid != 0
+                or sandbox_metadata.st_dev != metadata.st_dev
+                or sandbox_metadata.st_nlink != 1
+                or sandbox_metadata.st_size != CHROMIUM_SANDBOX_SIZE
+                or stat.S_IMODE(sandbox_metadata.st_mode) != 0o4755
+                or _sha256_regular(
+                    sandbox, expected_uid=0, expected_mode=0o4755
+                ) != CHROMIUM_SANDBOX_SHA256
+            ):
+                raise GuardError("partial compact Chromium sandbox is unsafe")
+    if complete.exists() or complete.is_symlink():
+        complete_metadata = complete.lstat()
+        if (
+            stat.S_ISLNK(complete_metadata.st_mode)
+            or not stat.S_ISREG(complete_metadata.st_mode)
+            or complete_metadata.st_uid != 0
+            or complete_metadata.st_gid != 0
+            or complete_metadata.st_dev != metadata.st_dev
+            or complete_metadata.st_nlink != 1
+            or complete_metadata.st_size != 0
+            or stat.S_IMODE(complete_metadata.st_mode) != 0o444
+        ):
+            raise GuardError("partial compact Chromium marker is unsafe")
+    for candidate in (complete, linux / "chrome_sandbox", linux, chromium):
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if candidate.is_dir() and not candidate.is_symlink():
+            candidate.rmdir()
+        else:
+            candidate.unlink()
+    _sync_directory(chromium.parent)
+
+
+def _restore_legacy_runtime_from_intent(
+    target: Path, record: Mapping[str, object]
+) -> None:
+    try:
+        cache_metadata = target.lstat()
+    except OSError as exc:
+        raise GuardError("runtime cache recovery target is unavailable") from exc
+    if (
+        stat.S_ISLNK(cache_metadata.st_mode)
+        or not stat.S_ISDIR(cache_metadata.st_mode)
+        or cache_metadata.st_uid != 0
+        or cache_metadata.st_gid != 0
+        or stat.S_IMODE(cache_metadata.st_mode) != 0o555
+        or (cache_metadata.st_dev, cache_metadata.st_ino)
+        != (record["cache_dev"], record["cache_ino"])
+    ):
+        raise GuardError("runtime cache recovery target identity changed")
+    rollback = RUNNER_CACHE_ROOT / str(record["rollback_name"])
+    old_manifest = dict(record["old_manifest"])
+    encoded_manifest = record.get("old_manifest_raw_b64")
+    if (
+        not isinstance(encoded_manifest, str)
+        or len(encoded_manifest) > ((MAX_JSON_BYTES + 2) // 3) * 4
+    ):
+        raise GuardError("runtime cache rollback manifest bytes are unavailable")
+    try:
+        old_manifest_raw = base64.b64decode(encoded_manifest, validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise GuardError("runtime cache rollback manifest bytes are invalid") from exc
+    if (
+        len(old_manifest_raw) > MAX_JSON_BYTES
+        or base64.b64encode(old_manifest_raw).decode("ascii") != encoded_manifest
+        or _canonical_cache_manifest(old_manifest_raw) != old_manifest
+        or hashlib.sha256(old_manifest_raw).hexdigest() != record["old_manifest_sha256"]
+    ):
+        raise GuardError("runtime cache rollback manifest is not bound")
+    temporary = target / _compaction_temp_manifest_name(str(record["rollback_name"]))
+    expected_non_chromium = str(record["old_non_chromium_tree_sha256"])
+    non_chromium_digest = _tree_digest(
+        target,
+        ignored_relatives=frozenset(
+            {Path(".manifest.json"), Path("browsers/chromium-1228")}
+        ),
+    )
+    if non_chromium_digest != expected_non_chromium:
+        raise GuardError("runtime cache non-Chromium contents changed during compaction")
+    manifest_path = target / ".manifest.json"
+    if not (rollback.exists() or rollback.is_symlink()):
+        if not target.exists() or target.is_symlink():
+            raise GuardError("runtime cache original tree is unavailable")
+        current_manifest, current_raw, _ = _read_cache_manifest(manifest_path)
+        if (
+            current_manifest != old_manifest
+            or current_raw != old_manifest_raw
+            or _tree_digest(
+                target, ignored_relatives=frozenset({Path(".manifest.json")})
+            ) != record["old_tree_sha256"]
+        ):
+            raise GuardError("runtime cache changed without a rollback subtree")
+        if temporary.exists() or temporary.is_symlink():
+            if _read_regular_compaction_manifest(temporary) != old_manifest_raw:
+                raise GuardError("runtime cache temporary manifest is unexpected")
+            temporary.unlink()
+            _sync_directory(target)
+        return
+
+    inventory = _validate_compaction_inventory(
+        record.get("old_chromium_inventory"),
+        count=record.get("old_chromium_entry_count"),
+        digest=record.get("old_chromium_inventory_sha256"),
+    )
+    rollback_metadata = rollback.lstat()
+    if (
+        stat.S_ISLNK(rollback_metadata.st_mode)
+        or not stat.S_ISDIR(rollback_metadata.st_mode)
+        or rollback_metadata.st_dev != cache_metadata.st_dev
+        or (rollback_metadata.st_dev, rollback_metadata.st_ino)
+        != (record["old_chromium_dev"], record["old_chromium_ino"])
+        or _tree_digest(rollback) != record["old_chromium_tree_sha256"]
+    ):
+        raise GuardError("runtime cache rollback subtree changed")
+    _validate_inventory_survivors(rollback, inventory, allow_missing=False)
+    _validate_cache_tree_permissions(
+        rollback, sandbox_relative=Path("chrome-linux64/chrome_sandbox")
+    )
+
+    compacted_manifest_raw: bytes | None = None
+    if temporary.exists() or temporary.is_symlink():
+        temp_raw = _read_regular_compaction_manifest(temporary)
+        temp_payload = _canonical_cache_manifest(temp_raw)
+        if temp_payload == old_manifest:
+            pass
+        elif (
+            _cache_manifest_payload(
+                old_manifest,
+                tree_sha256=str(temp_payload.get("tree_sha256")),
+            )
+            == temp_payload
+            and _tree_digest(
+                target, ignored_relatives=frozenset({Path(".manifest.json")})
+            ) == temp_payload["tree_sha256"]
+        ):
+            compacted_manifest_raw = temp_raw
+        else:
+            raise GuardError("runtime cache temporary manifest is unexpected")
+
+    current_manifest, current_raw, _ = _read_cache_manifest(manifest_path)
+    compacted_manifest: dict[str, object] | None = None
+    if current_raw == old_manifest_raw:
+        # A compact manifest may exist only as the exact atomic-write temporary;
+        # the durable manifest is still old and recovery will discard that temp.
+        pass
+    else:
+        if compacted_manifest_raw is not None:
+            raise GuardError("runtime cache compaction manifest transition is inconsistent")
+        if (
+            current_manifest.get("source_commit") != LEGACY_FALLBACK_RUNTIME_COMMIT
+            or current_manifest.get("node_archive_sha256") != old_manifest["node_archive_sha256"]
+            or current_manifest.get("package_lock_sha256") != old_manifest["package_lock_sha256"]
+            or current_manifest.get("playwright_browsers_sha256") != old_manifest["playwright_browsers_sha256"]
+            or current_manifest.get("tree_sha256")
+            != _tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")}))
+        ):
+            raise GuardError("runtime cache manifest cannot be rolled back")
+        compacted_manifest = current_manifest
+    chromium = target / "browsers/chromium-1228"
+    if chromium.exists() or chromium.is_symlink():
+        _remove_compacted_chromium(target)
+    if compacted_manifest is not None:
+        if temporary.exists() or temporary.is_symlink():
+            temporary.unlink()
+            _sync_directory(target)
+        _atomic_replace_cache_manifest(
+            target,
+            old_manifest,
+            temporary_name=_compaction_temp_manifest_name(str(record["rollback_name"])),
+        )
+    elif temporary.exists() or temporary.is_symlink():
+        temporary.unlink()
+        _sync_directory(target)
+    if chromium.exists() or chromium.is_symlink():
+        raise GuardError("runtime cache compact subtree could not be removed")
+    os.rename(rollback, chromium)
+    _sync_directory(rollback.parent)
+    _sync_directory(chromium.parent)
+    _validate_existing_runtime_cache(
+        target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
+    )
+    if _tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")})) != record["old_tree_sha256"]:
+        raise GuardError("runtime cache original tree was not restored")
+
+
+def _read_regular_compaction_manifest(path: Path) -> bytes:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise GuardError("runtime cache temporary manifest is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o444
+        or metadata.st_size > MAX_JSON_BYTES
+    ):
+        raise GuardError("runtime cache temporary manifest metadata is unsafe")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if _fingerprint(opened) != _fingerprint(metadata):
+            raise GuardError("runtime cache temporary manifest changed")
+        data = os.read(descriptor, MAX_JSON_BYTES + 1)
+        if len(data) > MAX_JSON_BYTES or _fingerprint(os.fstat(descriptor)) != _fingerprint(opened):
+            raise GuardError("runtime cache temporary manifest changed")
+        _canonical_cache_manifest(data)
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def compact_legacy_runtime_cache(
+    *,
+    run_id: int,
+    attempt: int,
+    operation_source_sha: str,
+    write_intent: Callable[[Mapping[str, object]], None],
+    write_validated: Callable[[Mapping[str, object]], None],
+    write_completion: Callable[[Mapping[str, object]], None],
+    probe_runtime: Callable[[Path], None],
+) -> Mapping[str, object]:
+    """Atomically replace only the unused full Chromium payload in fixed 4a cache.
+
+    The caller must hold the canonical release, retained, source/build and live-QA
+    locks. Receipts are durable caller-owned root-private records.
+    """
+
+    if (
+        os.geteuid() != 0
+        or type(run_id) is not int
+        or run_id <= 0
+        or type(attempt) is not int
+        or attempt <= 0
+        or COMMIT_PATTERN.fullmatch(operation_source_sha) is None
+    ):
+        raise GuardError("runtime cache compaction operation binding is invalid")
+    target = RUNNER_CACHE_ROOT / _runtime_cache_commit_name(LEGACY_FALLBACK_RUNTIME_COMMIT)
+    _validate_runtime_cache_root(RUNNER_CACHE_ROOT)
+    root_metadata = RUNNER_CACHE_ROOT.lstat()
+    if root_metadata.st_uid != 0 or root_metadata.st_gid != 0:
+        raise GuardError("runtime cache root identity is unsafe")
+    stale_rollbacks = tuple(
+        RUNNER_CACHE_ROOT.glob(
+            f".runtime-{LEGACY_FALLBACK_RUNTIME_COMMIT}.chromium-compaction-*"
+        )
+    )
+    if stale_rollbacks:
+        raise GuardError("runtime cache has an unresolved compaction rollback")
+    rollback_name = _compaction_rollback_name(LEGACY_FALLBACK_RUNTIME_COMMIT)
+    if os.path.lexists(RUNNER_CACHE_ROOT / rollback_name):
+        raise GuardError("runtime cache compaction rollback name is occupied")
+    (
+        old_manifest,
+        old_manifest_raw,
+        cache_metadata,
+        chromium_metadata,
+        old_tree_sha256,
+        old_non_chromium_tree_sha256,
+        old_chromium_tree_sha256,
+        old_chromium_allocated_bytes,
+        old_chromium_inventory,
+        old_chromium_inventory_sha256,
+    ) = _compaction_snapshot(target)
+    record = _compaction_record_base(
+        run_id=run_id,
+        attempt=attempt,
+        operation_source_sha=operation_source_sha,
+        cache_metadata=cache_metadata,
+        manifest=old_manifest,
+        manifest_raw=old_manifest_raw,
+        manifest_sha256=hashlib.sha256(old_manifest_raw).hexdigest(),
+        old_tree_sha256=old_tree_sha256,
+        old_non_chromium_tree_sha256=old_non_chromium_tree_sha256,
+        chromium_metadata=chromium_metadata,
+        chromium_tree_sha256=old_chromium_tree_sha256,
+        chromium_allocated_bytes=old_chromium_allocated_bytes,
+        chromium_inventory=old_chromium_inventory,
+        chromium_inventory_sha256=old_chromium_inventory_sha256,
+        rollback_name=rollback_name,
+    )
+    assert_liveqa_idle()
+    write_intent(dict(record))
+    validated_attempted = False
+    rollback = RUNNER_CACHE_ROOT / rollback_name
+    target_chromium = target / "browsers/chromium-1228"
+    temporary_name = _compaction_temp_manifest_name(rollback_name)
+    try:
+        if (
+            _compaction_snapshot(target)[4:] != (
+                old_tree_sha256,
+                old_non_chromium_tree_sha256,
+                old_chromium_tree_sha256,
+                old_chromium_allocated_bytes,
+                old_chromium_inventory,
+                old_chromium_inventory_sha256,
+            )
+            or _fingerprint(target.lstat()) != _fingerprint(cache_metadata)
+            or _fingerprint(target_chromium.lstat()) != _fingerprint(chromium_metadata)
+        ):
+            raise GuardError("runtime cache changed after compaction intent")
+        assert_liveqa_idle()
+        os.rename(target_chromium, rollback)
+        _sync_directory(target / "browsers")
+        _sync_directory(RUNNER_CACHE_ROOT)
+        reduced = target_chromium
+        (reduced / "chrome-linux64").mkdir(parents=True, mode=0o755)
+        source_sandbox = rollback / "chrome-linux64/chrome_sandbox"
+        _copy_verified_sandbox(source_sandbox, reduced / "chrome-linux64/chrome_sandbox")
+        marker_fd = os.open(
+            reduced / "INSTALLATION_COMPLETE",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o444,
+        )
+        try:
+            os.fchmod(marker_fd, 0o444)
+            os.fsync(marker_fd)
+        finally:
+            os.close(marker_fd)
+        _normalize_cache_tree(reduced, sandbox=reduced / "chrome-linux64/chrome_sandbox")
+        new_tree_sha256 = _tree_digest(
+            target, ignored_relatives=frozenset({Path(".manifest.json")})
+        )
+        new_manifest = _cache_manifest_payload(old_manifest, tree_sha256=new_tree_sha256)
+        manifest_raw = _atomic_replace_cache_manifest(
+            target, new_manifest, temporary_name=temporary_name
+        )
+        _validate_existing_runtime_cache(
+            target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
+        )
+        if _tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")})) != new_tree_sha256:
+            raise GuardError("compacted runtime cache changed after validation")
+        assert_liveqa_idle()
+        probe_runtime(target)
+        assert_liveqa_idle()
+        validated = _compact_validated_record(
+            record,
+            new_tree_sha256=new_tree_sha256,
+            new_manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+        )
+        validated_attempted = True
+        write_validated(validated)
+        _finish_legacy_runtime_compaction(
+            target,
+            record,
+            validated,
+            write_completion=write_completion,
+            probe_runtime=probe_runtime,
+        )
+        return {
+            **validated,
+            "reclaimed_bytes": old_chromium_allocated_bytes,
+            "result": "compacted",
+            "phase": "complete",
+        }
+    except BaseException:
+        if not validated_attempted:
+            try:
+                assert_liveqa_idle()
+                _restore_legacy_runtime_from_intent(target, record)
+                restored = {
+                    **_compact_validated_record(
+                        record,
+                        new_tree_sha256=old_tree_sha256,
+                        new_manifest_sha256=hashlib.sha256(old_manifest_raw).hexdigest(),
+                    ),
+                    "reclaimed_bytes": 0,
+                    "result": "restored",
+                    "phase": "complete",
+                }
+                write_completion(restored)
+            except BaseException as rollback_exc:
+                raise GuardError("runtime cache compaction failed with rollback incomplete") from rollback_exc
+        raise
+
+
+def _finish_legacy_runtime_compaction(
+    target: Path,
+    intent: Mapping[str, object],
+    validated: Mapping[str, object],
+    *,
+    write_completion: Callable[[Mapping[str, object]], None],
+    probe_runtime: Callable[[Path], None],
+) -> None:
+    rollback = RUNNER_CACHE_ROOT / str(validated["rollback_name"])
+    manifest, raw, _ = _read_cache_manifest(target / ".manifest.json")
+    expected_manifest = _cache_manifest_payload(
+        dict(validated["old_manifest"]),
+        tree_sha256=str(validated["new_tree_sha256"]),
+    )
+    if (
+        hashlib.sha256(raw).hexdigest() != validated["new_manifest_sha256"]
+        or manifest != expected_manifest
+        or _tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")}))
+        != validated["new_tree_sha256"]
+    ):
+        raise GuardError("validated runtime cache no longer matches its receipt")
+    _validate_existing_runtime_cache(
+        target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
+    )
+    assert_liveqa_idle()
+    probe_runtime(target)
+    assert_liveqa_idle()
+    if rollback.exists() or rollback.is_symlink():
+        inventory = _validate_compaction_inventory(
+            intent.get("old_chromium_inventory"),
+            count=intent.get("old_chromium_entry_count"),
+            digest=intent.get("old_chromium_inventory_sha256"),
+        )
+        root_entry = inventory[0]
+        rollback_metadata = rollback.lstat()
+        if (
+            stat.S_ISLNK(rollback_metadata.st_mode)
+            or not stat.S_ISDIR(rollback_metadata.st_mode)
+            or (rollback_metadata.st_dev, rollback_metadata.st_ino)
+            != (root_entry["dev"], root_entry["ino"])
+        ):
+            raise GuardError("validated runtime rollback subtree changed")
+        assert_liveqa_idle()
+        _delete_inventory_tree(rollback, inventory)
+        if rollback.exists() or rollback.is_symlink():
+            raise GuardError("validated runtime rollback cleanup is incomplete")
+        _sync_directory(RUNNER_CACHE_ROOT)
+    completion = {
+        **dict(validated),
+        "reclaimed_bytes": int(validated["old_chromium_allocated_bytes"]),
+        "result": "compacted",
+        "phase": "complete",
+    }
+    write_completion(completion)
+
+
+def recover_legacy_runtime_cache(
+    intent_record: Mapping[str, object],
+    validated_record: Mapping[str, object] | None,
+    *,
+    run_id: int,
+    attempt: int,
+    operation_source_sha: str,
+    write_completion: Callable[[Mapping[str, object]], None],
+    probe_runtime: Callable[[Path], None],
+) -> Mapping[str, object]:
+    """Resume or roll back only the fixed 4a cache transaction from receipts."""
+
+    intent = _validate_compaction_record(
+        intent_record,
+        phase="intent",
+        run_id=run_id,
+        attempt=attempt,
+        operation_source_sha=operation_source_sha,
+    )
+    validated = (
+        None
+        if validated_record is None
+        else _validate_compaction_record(
+            validated_record,
+            phase="validated",
+            run_id=run_id,
+            attempt=attempt,
+            operation_source_sha=operation_source_sha,
+        )
+    )
+    if validated is not None:
+        _assert_compaction_records_match(intent, validated)
+    target = RUNNER_CACHE_ROOT / _runtime_cache_commit_name(LEGACY_FALLBACK_RUNTIME_COMMIT)
+    cache_metadata = target.lstat()
+    if (cache_metadata.st_dev, cache_metadata.st_ino) != (
+        intent["cache_dev"], intent["cache_ino"]
+    ):
+        raise GuardError("runtime cache recovery target changed")
+    assert_liveqa_idle()
+    if validated is None:
+        _restore_legacy_runtime_from_intent(target, intent)
+        _validate_existing_runtime_cache(
+            target, TRUSTED_PLATFORM_ROOT, LEGACY_FALLBACK_RUNTIME_COMMIT
+        )
+        if _tree_digest(target, ignored_relatives=frozenset({Path(".manifest.json")})) != intent["old_tree_sha256"]:
+            raise GuardError("runtime cache recovery did not restore original tree")
+        probe_runtime(target)
+        assert_liveqa_idle()
+        completion = {
+            **_compact_validated_record(
+                intent,
+                new_tree_sha256=str(intent["old_tree_sha256"]),
+                new_manifest_sha256=str(intent["old_manifest_sha256"]),
+            ),
+            "reclaimed_bytes": 0,
+            "result": "restored",
+            "phase": "complete",
+        }
+        write_completion(completion)
+        return completion
+    _assert_compaction_records_match(intent, validated)
+    _finish_legacy_runtime_compaction(
+        target,
+        intent,
+        validated,
+        write_completion=write_completion,
+        probe_runtime=probe_runtime,
+    )
+    return {
+        **dict(validated),
+        "reclaimed_bytes": int(validated["old_chromium_allocated_bytes"]),
+        "result": "compacted",
+        "phase": "complete",
+    }
 
 
 def _validate_runtime_cache_root(root: Path) -> None:

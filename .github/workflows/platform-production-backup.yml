@@ -28,6 +28,28 @@ on:
         required: false
         type: boolean
         default: false
+      compact_fallback_runtime_cache:
+        description: "Explicitly compact the pinned legacy live-QA fallback cache before verifying the newest backup"
+        required: false
+        type: boolean
+        default: false
+      resume_fallback_cache_compaction:
+        description: "Resume an interrupted compaction receipt from this exact source SHA"
+        required: false
+        type: boolean
+        default: false
+      resume_compaction_run_id:
+        description: "Exact prior backup workflow run ID for compaction recovery"
+        required: false
+        type: string
+      resume_compaction_run_attempt:
+        description: "Exact prior backup workflow attempt for compaction recovery"
+        required: false
+        type: string
+      resume_compaction_bundle_sha256:
+        description: "Exact prior attested helper bundle digest for compaction recovery"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -554,6 +576,11 @@ jobs:
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
           BACKUP_OPERATION: ${{ inputs.operation }}
           EVICT_BUILD_NODE_CACHE: ${{ inputs.evict_build_node_cache }}
+          COMPACT_FALLBACK_RUNTIME_CACHE: ${{ inputs.compact_fallback_runtime_cache }}
+          RESUME_FALLBACK_CACHE_COMPACTION: ${{ inputs.resume_fallback_cache_compaction }}
+          RESUME_COMPACTION_RUN_ID: ${{ inputs.resume_compaction_run_id }}
+          RESUME_COMPACTION_RUN_ATTEMPT: ${{ inputs.resume_compaction_run_attempt }}
+          RESUME_COMPACTION_BUNDLE_SHA256: ${{ inputs.resume_compaction_bundle_sha256 }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           BUNDLE_SHA256: ${{ steps.backup-helper.outputs.bundle_sha256 }}
         run: |
@@ -561,15 +588,31 @@ jobs:
           umask 077
           [[ "$BACKUP_OPERATION" = create || "$BACKUP_OPERATION" = verify-existing ]]
           [[ "$EVICT_BUILD_NODE_CACHE" = true || "$EVICT_BUILD_NODE_CACHE" = false ]]
+          [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = true || "$COMPACT_FALLBACK_RUNTIME_CACHE" = false ]]
+          [[ "$RESUME_FALLBACK_CACHE_COMPACTION" = true || "$RESUME_FALLBACK_CACHE_COMPACTION" = false ]]
           if [[ "$BACKUP_OPERATION" = verify-existing ]]; then
             [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
             [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            if [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = true ]]; then
+              [[ "$EVICT_BUILD_NODE_CACHE" = false ]]
+            fi
+            if [[ "$RESUME_FALLBACK_CACHE_COMPACTION" = true ]]; then
+              [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = true ]]
+              [[ "$RESUME_COMPACTION_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+              [[ "$RESUME_COMPACTION_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+              [[ "$RESUME_COMPACTION_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            else
+              [[ -z "$RESUME_COMPACTION_RUN_ID$RESUME_COMPACTION_RUN_ATTEMPT$RESUME_COMPACTION_BUNDLE_SHA256" ]]
+            fi
             bundle_stage="/tmp/oldsparky-backup-verifier-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BACKUP_OPERATION $SOURCE_SHA $BUNDLE_SHA256 $EVICT_BUILD_NODE_CACHE"
+            remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $BACKUP_OPERATION $SOURCE_SHA $BUNDLE_SHA256 $EVICT_BUILD_NODE_CACHE $COMPACT_FALLBACK_RUNTIME_CACHE $RESUME_FALLBACK_CACHE_COMPACTION ${RESUME_COMPACTION_RUN_ID:-none} ${RESUME_COMPACTION_RUN_ATTEMPT:-none} ${RESUME_COMPACTION_BUNDLE_SHA256:-none}"
           else
             [[ "$EVICT_BUILD_NODE_CACHE" = false ]]
+            [[ "$COMPACT_FALLBACK_RUNTIME_CACHE" = false ]]
+            [[ "$RESUME_FALLBACK_CACHE_COMPACTION" = false ]]
+            [[ -z "$RESUME_COMPACTION_RUN_ID$RESUME_COMPACTION_RUN_ATTEMPT$RESUME_COMPACTION_BUNDLE_SHA256" ]]
             bundle_stage=none
-            remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT create none none false"
+            remote_arguments="$GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT create none none false false false none none none"
           fi
           remote_report="$RUNNER_TEMP/platform-production-backup-report.log"
           remote_error="$RUNNER_TEMP/platform-production-backup-ssh-error.log"
@@ -592,13 +635,18 @@ jobs:
             "bash -s -- $remote_arguments" >"$remote_report" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
-          [[ "$#" = 6 ]]
+          [[ "$#" = 11 ]]
           run_id="${1:-}"
           run_attempt="${2:-}"
           operation="${3:-}"
           source_sha="${4:-}"
           bundle_sha="${5:-}"
           evict_build_node_cache="${6:-false}"
+          compact_fallback_runtime_cache="${7:-false}"
+          resume_compaction="${8:-false}"
+          resume_compaction_run_id="${9:-none}"
+          resume_compaction_run_attempt="${10:-none}"
+          resume_compaction_bundle_sha256="${11:-none}"
           [[ "$run_id" =~ ^[1-9][0-9]{0,19}$ ]]
           [[ "$run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
           [[ "$operation" = create || "$operation" = verify-existing ]]
@@ -606,8 +654,22 @@ jobs:
             [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
             [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
             [[ "$evict_build_node_cache" = true || "$evict_build_node_cache" = false ]]
+            [[ "$compact_fallback_runtime_cache" = true || "$compact_fallback_runtime_cache" = false ]]
+            [[ "$resume_compaction" = true || "$resume_compaction" = false ]]
+            if [[ "$compact_fallback_runtime_cache" = true ]]; then
+              [[ "$evict_build_node_cache" = false ]]
+            fi
+            if [[ "$resume_compaction" = true ]]; then
+              [[ "$compact_fallback_runtime_cache" = true ]]
+              [[ "$resume_compaction_run_id" =~ ^[1-9][0-9]{0,19}$ ]]
+              [[ "$resume_compaction_run_attempt" =~ ^[1-9][0-9]{0,5}$ ]]
+              [[ "$resume_compaction_bundle_sha256" =~ ^[0-9a-f]{64}$ ]]
+            else
+              [[ "$resume_compaction_run_id" = none && "$resume_compaction_run_attempt" = none && "$resume_compaction_bundle_sha256" = none ]]
+            fi
           else
-            [[ "$source_sha" = none && "$bundle_sha" = none && "$evict_build_node_cache" = false ]]
+            [[ "$source_sha" = none && "$bundle_sha" = none && "$evict_build_node_cache" = false && "$compact_fallback_runtime_cache" = false && "$resume_compaction" = false ]]
+            [[ "$resume_compaction_run_id" = none && "$resume_compaction_run_attempt" = none && "$resume_compaction_bundle_sha256" = none ]]
           fi
           failure_stage=preflight
           backup_report_file=""
@@ -1135,7 +1197,10 @@ jobs:
           fi
           /usr/bin/python3 -I - "$python_bin" "$maintenance_tool" \
             "$runtime" "$run_id" "$run_attempt" "$backup_report_file" "$operation" \
-            "$evict_build_node_cache" "$source_sha" "$bundle_sha" <<'PY'
+            "$evict_build_node_cache" "$compact_fallback_runtime_cache" \
+            "$resume_compaction" "$resume_compaction_run_id" \
+            "$resume_compaction_run_attempt" "$resume_compaction_bundle_sha256" \
+            "$source_sha" "$bundle_sha" <<'PY'
           import os
           from pathlib import Path
           import re
@@ -1153,12 +1218,29 @@ jobs:
               report_path,
               operation,
               evict_build_node_cache,
+              compact_fallback_runtime_cache,
+              resume_compaction,
+              resume_compaction_run_id,
+              resume_compaction_run_attempt,
+              resume_compaction_bundle_sha256,
               source_sha,
               bundle_sha,
           ) = sys.argv[1:]
           if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id):
               raise SystemExit(125)
           if not re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt):
+              raise SystemExit(125)
+          if compact_fallback_runtime_cache not in {"true", "false"} or resume_compaction not in {"true", "false"}:
+              raise SystemExit(125)
+          if resume_compaction == "true":
+              if (
+                  compact_fallback_runtime_cache != "true"
+                  or not re.fullmatch(r"[1-9][0-9]{0,19}", resume_compaction_run_id)
+                  or not re.fullmatch(r"[1-9][0-9]{0,5}", resume_compaction_run_attempt)
+                  or not re.fullmatch(r"[0-9a-f]{64}", resume_compaction_bundle_sha256)
+              ):
+                  raise SystemExit(125)
+          elif (resume_compaction_run_id, resume_compaction_run_attempt, resume_compaction_bundle_sha256) != ("none", "none", "none"):
               raise SystemExit(125)
           tmp_stat = os.stat("/tmp", follow_symlinks=False)
           if not stat.S_ISDIR(tmp_stat.st_mode) or tmp_stat.st_uid != 0 or not (tmp_stat.st_mode & stat.S_ISVTX):
@@ -1207,8 +1289,28 @@ jobs:
                       "--eviction-run-id", run_id,
                       "--eviction-run-attempt", run_attempt,
                       "--eviction-source-sha", source_sha,
-                      "--eviction-bundle-sha256", bundle_sha,
+                  "--eviction-bundle-sha256", bundle_sha,
                   ))
+              if compact_fallback_runtime_cache == "true":
+                  if evict_build_node_cache != "false":
+                      raise SystemExit(125)
+                  command.extend((
+                      "--compact-legacy-fallback-runtime-cache",
+                      "--compaction-run-id", run_id,
+                      "--compaction-run-attempt", run_attempt,
+                      "--compaction-source-sha", source_sha,
+                      "--compaction-bundle-sha256", bundle_sha,
+                  ))
+                  if resume_compaction == "true":
+                      if resume_compaction_run_id == run_id and resume_compaction_run_attempt == run_attempt:
+                          raise SystemExit(125)
+                      command.extend((
+                          "--resume-legacy-fallback-runtime-cache-compaction",
+                          "--resume-compaction-run-id", resume_compaction_run_id,
+                          "--resume-compaction-run-attempt", resume_compaction_run_attempt,
+                          "--resume-compaction-source-sha", source_sha,
+                          "--resume-compaction-bundle-sha256", resume_compaction_bundle_sha256,
+                      ))
           else:
               raise SystemExit(125)
           def stop_child_group(process):
@@ -1277,7 +1379,7 @@ jobs:
             echo "Production backup summary failed" >&2
             exit 1
           }
-          /usr/bin/python3 -I - "$backup_report_file" "$operation" "$evict_build_node_cache" "$run_id" "$run_attempt" "$source_sha" "$bundle_sha" <<'PY'
+          /usr/bin/python3 -I - "$backup_report_file" "$operation" "$evict_build_node_cache" "$compact_fallback_runtime_cache" "$resume_compaction" "$run_id" "$run_attempt" "$source_sha" "$bundle_sha" "$resume_compaction_run_id" "$resume_compaction_run_attempt" "$resume_compaction_bundle_sha256" <<'PY'
           import json
           from pathlib import Path
           import re
@@ -1286,9 +1388,27 @@ jobs:
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           operation = sys.argv[2]
           evict_cache = sys.argv[3]
-          expected_run_id, expected_attempt, expected_source, expected_bundle = sys.argv[4:]
+          compact_cache = sys.argv[4]
+          resume_compaction = sys.argv[5]
+          expected_run_id, expected_attempt, expected_source, expected_bundle = sys.argv[6:10]
+          expected_resume_run_id, expected_resume_attempt, expected_resume_bundle = sys.argv[10:]
           if evict_cache not in {"true", "false"}:
               raise SystemExit("cache eviction selection is invalid")
+          if compact_cache not in {"true", "false"} or resume_compaction not in {"true", "false"}:
+              raise SystemExit("fallback cache compaction selection is invalid")
+          if resume_compaction == "true":
+              if (
+                  not re.fullmatch(r"[1-9][0-9]{0,19}", expected_resume_run_id)
+                  or not re.fullmatch(r"[1-9][0-9]{0,5}", expected_resume_attempt)
+                  or not re.fullmatch(r"[0-9a-f]{64}", expected_resume_bundle)
+                  or (expected_resume_run_id, expected_resume_attempt)
+                  == (expected_run_id, expected_attempt)
+              ):
+                  raise SystemExit("fallback cache recovery input binding is invalid")
+          elif (expected_resume_run_id, expected_resume_attempt, expected_resume_bundle) != (
+              "none", "none", "none"
+          ):
+              raise SystemExit("unexpected fallback cache recovery input")
           expected_mode = "backup-only" if operation == "create" else "verify-existing-backup-only"
           if operation not in {"create", "verify-existing"} or report.get("mode") != expected_mode or report.get("ok") is not True:
               raise SystemExit("lock-aware backup report mode or health is invalid")
@@ -1354,6 +1474,53 @@ jobs:
               raise SystemExit("unexpected build Node cache operation")
           elif operation == "create" and (evict_cache != "false" or cache is not None):
               raise SystemExit("unexpected build Node cache operation")
+          compaction = backup.get("fallback_runtime_cache_compaction")
+          if operation == "verify-existing" and compact_cache == "true":
+              current_receipts = (
+                  f"liveqa-fallback-cache-compaction-{expected_run_id}-{expected_attempt}.intent.json",
+                  f"liveqa-fallback-cache-compaction-{expected_run_id}-{expected_attempt}.validated.json",
+                  f"liveqa-fallback-cache-compaction-{expected_run_id}-{expected_attempt}.completion.json",
+              )
+              resumed_receipts = (
+                  f"liveqa-fallback-cache-compaction-{expected_resume_run_id}-{expected_resume_attempt}.intent.json",
+                  f"liveqa-fallback-cache-compaction-{expected_resume_run_id}-{expected_resume_attempt}.validated.json",
+                  f"liveqa-fallback-cache-compaction-{expected_resume_run_id}-{expected_resume_attempt}.completion.json",
+              )
+              if resume_compaction == "true":
+                  allowed_receipt_sets = {current_receipts, resumed_receipts}
+              else:
+                  allowed_receipt_sets = {current_receipts}
+              if (
+                  not isinstance(compaction, dict)
+                  or compaction.get("status") != "completed"
+                  or compaction.get("result") != "compacted"
+                  or compaction.get("source_commit") != "4a04b2dffaf0d02c2d3910e7ba28dca9b89de209"
+                  or type(compaction.get("reclaimed_bytes")) is not int
+                  or compaction.get("reclaimed_bytes", 0) < 1
+                  or (
+                      compaction.get("intent_receipt"),
+                      compaction.get("validated_receipt"),
+                      compaction.get("completion_receipt"),
+                  ) not in allowed_receipt_sets
+                  or re.fullmatch(r"[0-9a-f]{64}", str(compaction.get("old_tree_sha256", ""))) is None
+                  or re.fullmatch(r"[0-9a-f]{64}", str(compaction.get("new_tree_sha256", ""))) is None
+              ):
+                  raise SystemExit("fallback runtime cache compaction result is invalid")
+              if resume_compaction == "true" and (
+                  compaction.get("resumed_run_id") != expected_resume_run_id
+                  or compaction.get("resumed_run_attempt") != expected_resume_attempt
+              ):
+                  raise SystemExit("fallback runtime cache recovery binding is invalid")
+              if resume_compaction == "false" and (
+                  "resumed_run_id" in compaction or "resumed_run_attempt" in compaction
+              ):
+                  raise SystemExit("unexpected fallback runtime cache recovery result")
+          elif operation == "verify-existing" and (
+              not isinstance(compaction, dict) or compaction.get("status") != "not-requested"
+          ):
+              raise SystemExit("unexpected fallback runtime cache compaction")
+          elif operation == "create" and (compact_cache != "false" or compaction is not None):
+              raise SystemExit("unexpected fallback runtime cache compaction")
           for section_name in (
               "production_releases",
               "source_release_artifacts",
@@ -1380,7 +1547,7 @@ jobs:
           PY
           failure_stage=public_summary
           public_report="$({
-            /usr/bin/python3 -I - "$public_report" "$operation" "$backup_report_file" "$EVICT_BUILD_NODE_CACHE" <<'PY'
+          /usr/bin/python3 -I - "$public_report" "$operation" "$backup_report_file" "$EVICT_BUILD_NODE_CACHE" "$COMPACT_FALLBACK_RUNTIME_CACHE" <<'PY'
           import json
           from pathlib import Path
           import sys
@@ -1409,6 +1576,22 @@ jobs:
               public["build_node_cache"] = projected
           elif sys.argv[4] != "false":
               raise SystemExit("cache eviction selection is invalid")
+          if sys.argv[5] == "true":
+              report = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+              cache = report["backup"]["fallback_runtime_cache_compaction"]
+              public["fallback_runtime_cache_compaction"] = {
+                  "status": cache["status"],
+                  "result": cache["result"],
+                  "reclaimed_bytes": cache["reclaimed_bytes"],
+                  "source_commit": cache["source_commit"],
+                  "old_tree_sha256": cache["old_tree_sha256"],
+                  "new_tree_sha256": cache["new_tree_sha256"],
+                  "intent_receipt": cache["intent_receipt"],
+                  "validated_receipt": cache["validated_receipt"],
+                  "completion_receipt": cache["completion_receipt"],
+              }
+          elif sys.argv[5] != "false":
+              raise SystemExit("fallback cache compaction selection is invalid")
           print(json.dumps(public, sort_keys=True, separators=(",", ":")))
           PY
           } 2>/dev/null)" || {

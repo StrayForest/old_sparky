@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
 import fcntl
+import hashlib
 import importlib.util
 import json
 import math
@@ -17,7 +19,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, Mapping
 
 # The backup workflow executes this exact attested helper with Python's
 # isolated mode.  `-I` intentionally omits the script directory from
@@ -91,6 +93,10 @@ DEFAULT_SOURCE_RELEASE_DIR = Path("/root/old_sparky/platform/dist/releases")
 DEFAULT_WEB_ARTIFACT_DIR = Path("/root/old_sparky/platform/apps/platform_web")
 SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 SAFE_RUNTIME_ID_RE = re.compile(r"^runtime-[0-9a-f]{40}$")
+FALLBACK_CACHE_COMPACTION_EVENT = "live_qa_fallback_runtime_compaction"
+LEGACY_FALLBACK_RUNTIME_COMMIT = "4a04b2dffaf0d02c2d3910e7ba28dca9b89de209"
+FALLBACK_CACHE_COMPACTION_MAX_INTENT_BYTES = 8 * 1024 * 1024
+FALLBACK_CACHE_COMPACTION_MAX_FINAL_BYTES = 16 * 1024
 RESTORE_DIAGNOSTIC_KEYS = {
     "schema",
     "restore_stage",
@@ -290,6 +296,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eviction-run-attempt")
     parser.add_argument("--eviction-source-sha")
     parser.add_argument("--eviction-bundle-sha256")
+    parser.add_argument(
+        "--compact-legacy-fallback-runtime-cache",
+        action="store_true",
+        help=(
+            "Explicitly compact only the pinned 4a live-QA fallback Chromium "
+            "payload before verify-existing-backup-only; requires canonical locks."
+        ),
+    )
+    parser.add_argument("--compaction-run-id")
+    parser.add_argument("--compaction-run-attempt")
+    parser.add_argument("--compaction-source-sha")
+    parser.add_argument("--compaction-bundle-sha256")
+    parser.add_argument(
+        "--resume-legacy-fallback-runtime-cache-compaction",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--resume-compaction-run-id")
+    parser.add_argument("--resume-compaction-run-attempt")
+    parser.add_argument("--resume-compaction-source-sha")
+    parser.add_argument("--resume-compaction-bundle-sha256")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
@@ -334,6 +361,52 @@ def parse_args() -> argparse.Namespace:
             parser.error("cache eviction requires closed source and workflow bindings")
     elif any(value is not None for value in eviction_bindings):
         parser.error("eviction identity fields require --evict-pinned-build-node-cache")
+    compaction_bindings = (
+        args.compaction_run_id,
+        args.compaction_run_attempt,
+        args.compaction_source_sha,
+        args.compaction_bundle_sha256,
+    )
+    if args.compact_legacy_fallback_runtime_cache:
+        if (
+            not args.verify_existing_backup_only
+            or args.evict_pinned_build_node_cache
+            or re.fullmatch(r"[1-9][0-9]{0,19}", args.compaction_run_id or "") is None
+            or re.fullmatch(r"[1-9][0-9]{0,5}", args.compaction_run_attempt or "") is None
+            or re.fullmatch(r"[0-9a-f]{40}", args.compaction_source_sha or "") is None
+            or re.fullmatch(r"[0-9a-f]{64}", args.compaction_bundle_sha256 or "") is None
+        ):
+            parser.error(
+                "fallback cache compaction requires verify-existing mode and closed source/run bindings"
+            )
+    elif any(value is not None for value in compaction_bindings):
+        parser.error(
+            "compaction identity fields require --compact-legacy-fallback-runtime-cache"
+        )
+    resume_bindings = (
+        args.resume_compaction_run_id,
+        args.resume_compaction_run_attempt,
+        args.resume_compaction_source_sha,
+        args.resume_compaction_bundle_sha256,
+    )
+    if args.resume_legacy_fallback_runtime_cache_compaction:
+        if (
+            not args.verify_existing_backup_only
+            or not args.compact_legacy_fallback_runtime_cache
+            or re.fullmatch(r"[1-9][0-9]{0,19}", args.resume_compaction_run_id or "") is None
+            or re.fullmatch(r"[1-9][0-9]{0,5}", args.resume_compaction_run_attempt or "") is None
+            or re.fullmatch(r"[0-9a-f]{40}", args.resume_compaction_source_sha or "") is None
+            or re.fullmatch(r"[0-9a-f]{64}", args.resume_compaction_bundle_sha256 or "") is None
+        ):
+            parser.error(
+                "compaction recovery requires verify-existing mode and exact receipt bindings"
+            )
+        if args.resume_compaction_source_sha != args.compaction_source_sha and args.compact_legacy_fallback_runtime_cache:
+            parser.error("compaction recovery and current source SHA must match exactly")
+    elif any(value is not None for value in resume_bindings):
+        parser.error(
+            "resume identity fields require --resume-legacy-fallback-runtime-cache-compaction"
+        )
     if args.backup_only and not args.apply:
         parser.error("--backup-only requires --apply")
     if args.verify_existing_backup_only and not args.apply:
@@ -974,6 +1047,636 @@ def write_build_node_cache_receipt(
         os.close(shared_fd)
 
 
+def _compaction_record_bytes(record: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            dict(record),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _runtime_cache_compaction_receipt_name(
+    run_id: str, run_attempt: str, phase: str
+) -> str:
+    if (
+        re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None
+        or re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt) is None
+        or phase not in {"intent", "validated", "completion"}
+    ):
+        raise ValueError("runtime cache compaction receipt identity is invalid")
+    return f"liveqa-fallback-cache-compaction-{run_id}-{run_attempt}.{phase}.json"
+
+
+def _validate_runtime_cache_compaction_record(
+    record: Mapping[str, Any],
+    *,
+    phase: str,
+    run_id: str,
+    run_attempt: str,
+    source_sha: str,
+) -> None:
+    common = {
+        "schema",
+        "event",
+        "run_id",
+        "attempt",
+        "operation_source_sha",
+        "source_commit",
+        "cache_dev",
+        "cache_ino",
+        "old_tree_sha256",
+        "old_manifest_sha256",
+        "old_manifest",
+        "old_manifest_raw_b64",
+        "old_chromium_tree_sha256",
+        "old_chromium_inventory_sha256",
+        "old_chromium_entry_count",
+        "old_chromium_dev",
+        "old_chromium_ino",
+        "old_chromium_allocated_bytes",
+        "old_sandbox_sha256",
+        "old_non_chromium_tree_sha256",
+        "rollback_name",
+        "phase",
+    }
+    phase_fields = {
+        "intent": common | {"old_chromium_inventory"},
+        "validated": common
+        | {
+            "intent_sha256",
+            "new_tree_sha256",
+            "new_manifest_sha256",
+        },
+        "completion": common
+        | {
+            "intent_sha256",
+            "new_tree_sha256",
+            "new_manifest_sha256",
+            "reclaimed_bytes",
+            "result",
+        },
+    }
+    if phase not in phase_fields or set(record) != phase_fields[phase]:
+        raise ValueError("runtime cache compaction record fields are not closed")
+    record_phase = "complete" if phase == "completion" else phase
+    if (
+        type(record.get("schema")) is not int
+        or record.get("schema") != 1
+        or record.get("event") != FALLBACK_CACHE_COMPACTION_EVENT
+        or record.get("phase") != record_phase
+        or type(record.get("run_id")) is not int
+        or record.get("run_id") != int(run_id)
+        or type(record.get("attempt")) is not int
+        or record.get("attempt") != int(run_attempt)
+        or record.get("operation_source_sha") != source_sha
+        or record.get("source_commit")
+        != LEGACY_FALLBACK_RUNTIME_COMMIT
+    ):
+        raise ValueError("runtime cache compaction receipt binding is invalid")
+    for key in (
+        "old_tree_sha256",
+        "old_manifest_sha256",
+        "old_chromium_tree_sha256",
+        "old_chromium_inventory_sha256",
+        "old_sandbox_sha256",
+        "old_non_chromium_tree_sha256",
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", str(record.get(key, ""))) is None:
+            raise ValueError("runtime cache compaction receipt digest is invalid")
+    for key in (
+        "cache_dev",
+        "cache_ino",
+        "old_chromium_dev",
+        "old_chromium_ino",
+    ):
+        if type(record.get(key)) is not int or int(record[key]) < 0:
+            raise ValueError("runtime cache compaction receipt identity is invalid")
+    for key in ("old_chromium_entry_count", "old_chromium_allocated_bytes"):
+        if type(record.get(key)) is not int or int(record[key]) < 0:
+            raise ValueError("runtime cache compaction receipt byte/count field is invalid")
+    rollback = record.get("rollback_name")
+    if not isinstance(rollback, str) or re.fullmatch(
+        rf"\.runtime-{LEGACY_FALLBACK_RUNTIME_COMMIT}\.chromium-compaction-[0-9a-f]{{32}}",
+        rollback,
+    ) is None:
+        raise ValueError("runtime cache compaction rollback name is invalid")
+    if phase == "intent":
+        if not isinstance(record.get("old_manifest"), dict) or not isinstance(
+            record.get("old_chromium_inventory"), list
+        ):
+            raise ValueError("runtime cache compaction inventory is invalid")
+        if record.get("old_chromium_entry_count") != len(
+            record["old_chromium_inventory"]
+        ):
+            raise ValueError("runtime cache compaction inventory count is invalid")
+    encoded_manifest = record.get("old_manifest_raw_b64")
+    if (
+        not isinstance(encoded_manifest, str)
+        or len(encoded_manifest) > ((live_qa_guard.MAX_JSON_BYTES + 2) // 3) * 4
+    ):
+        raise ValueError("runtime cache compaction manifest bytes exceed their bound")
+    try:
+        old_manifest_raw = base64.b64decode(encoded_manifest, validate=True)
+        parsed_manifest = live_qa_guard._canonical_cache_manifest(old_manifest_raw)
+    except (ValueError, base64.binascii.Error, live_qa_guard.GuardError) as exc:
+        raise ValueError("runtime cache compaction manifest bytes are invalid") from exc
+    if (
+        len(old_manifest_raw) > live_qa_guard.MAX_JSON_BYTES
+        or base64.b64encode(old_manifest_raw).decode("ascii") != encoded_manifest
+        or parsed_manifest != record.get("old_manifest")
+        or hashlib.sha256(old_manifest_raw).hexdigest()
+        != record.get("old_manifest_sha256")
+        or parsed_manifest.get("tree_sha256") != record.get("old_tree_sha256")
+        or parsed_manifest.get("source_commit")
+        != LEGACY_FALLBACK_RUNTIME_COMMIT
+    ):
+        raise ValueError("runtime cache compaction manifest bytes do not match")
+    if phase in {"validated", "completion"}:
+        for key in ("intent_sha256", "new_tree_sha256", "new_manifest_sha256"):
+            if re.fullmatch(r"[0-9a-f]{64}", str(record.get(key, ""))) is None:
+                raise ValueError("runtime cache compaction validated digest is invalid")
+    if phase == "completion" and (
+        type(record.get("reclaimed_bytes")) is not int
+        or int(record["reclaimed_bytes"]) < 0
+        or record.get("result") not in {"compacted", "restored"}
+    ):
+        raise ValueError("runtime cache compaction completion is invalid")
+
+
+def write_runtime_cache_compaction_receipt(
+    app_dir: Path,
+    *,
+    phase: str,
+    record: Mapping[str, Any],
+    run_id: str,
+    run_attempt: str,
+    source_sha: str,
+    bundle_sha256: str,
+) -> str:
+    """Write one bounded, durable source/run-bound compaction phase receipt."""
+
+    if os.geteuid() != 0:
+        raise RuntimeError("runtime cache compaction receipts require root")
+    if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None or re.fullmatch(
+        r"[0-9a-f]{64}", bundle_sha256
+    ) is None:
+        raise ValueError("runtime cache compaction artifact binding is invalid")
+    _validate_runtime_cache_compaction_record(
+        record,
+        phase=phase,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        source_sha=source_sha,
+    )
+    encoded_record = _compaction_record_bytes(record)
+    limit = (
+        FALLBACK_CACHE_COMPACTION_MAX_INTENT_BYTES
+        if phase == "intent"
+        else FALLBACK_CACHE_COMPACTION_MAX_FINAL_BYTES
+    )
+    if len(encoded_record) > limit:
+        raise ValueError("runtime cache compaction receipt exceeds its bound")
+    payload = {
+        "schema": 1,
+        "event": FALLBACK_CACHE_COMPACTION_EVENT,
+        "phase": phase,
+        "run_id": int(run_id),
+        "run_attempt": int(run_attempt),
+        "source_sha": source_sha,
+        "bundle_sha256": bundle_sha256,
+        "record_sha256": hashlib.sha256(encoded_record).hexdigest(),
+        "record": dict(record),
+    }
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("ascii")
+    if len(encoded) > limit:
+        raise ValueError("runtime cache compaction envelope exceeds its bound")
+
+    shared_dir = app_dir / "shared"
+    try:
+        before = shared_dir.lstat()
+        shared_fd = os.open(
+            shared_dir,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise RuntimeError("shared directory is unavailable for compaction receipt") from exc
+    try:
+        opened_dir = os.fstat(shared_fd)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or not stat.S_ISDIR(opened_dir.st_mode)
+            or (before.st_dev, before.st_ino) != (opened_dir.st_dev, opened_dir.st_ino)
+            or opened_dir.st_uid != 0
+            or opened_dir.st_gid != 0
+            or opened_dir.st_nlink < 2
+            or stat.S_IMODE(opened_dir.st_mode) & 0o022
+        ):
+            raise RuntimeError("shared directory is unsafe for compaction receipt")
+        name = _runtime_cache_compaction_receipt_name(run_id, run_attempt, phase)
+        fd = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=shared_fd,
+        )
+        try:
+            opened = os.fstat(fd)
+            entry = os.stat(name, dir_fd=shared_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != 0
+                or opened.st_gid != 0
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino)
+            ):
+                raise RuntimeError("compaction receipt file metadata is unsafe")
+            view = memoryview(encoded)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise RuntimeError("compaction receipt write made no progress")
+                view = view[written:]
+            os.fsync(fd)
+            after = os.fstat(fd)
+            if (
+                (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+                or after.st_uid != 0
+                or after.st_gid != 0
+                or after.st_nlink != 1
+                or stat.S_IMODE(after.st_mode) != 0o600
+                or after.st_size != len(encoded)
+            ):
+                raise RuntimeError("compaction receipt changed while writing")
+            os.fsync(shared_fd)
+            final_dir = os.fstat(shared_fd)
+            final_path = os.lstat(shared_dir)
+            if (
+                (final_dir.st_dev, final_dir.st_ino)
+                != (opened_dir.st_dev, opened_dir.st_ino)
+                or (final_path.st_dev, final_path.st_ino)
+                != (opened_dir.st_dev, opened_dir.st_ino)
+            ):
+                raise RuntimeError("shared directory changed while writing receipt")
+        finally:
+            os.close(fd)
+        return name
+    finally:
+        os.close(shared_fd)
+
+
+def read_runtime_cache_compaction_receipt(
+    app_dir: Path,
+    *,
+    phase: str,
+    run_id: str,
+    run_attempt: str,
+    source_sha: str,
+    bundle_sha256: str,
+) -> dict[str, Any] | None:
+    """Read one exact receipt; absence is distinct from malformed state."""
+
+    shared_dir = app_dir / "shared"
+    name = _runtime_cache_compaction_receipt_name(run_id, run_attempt, phase)
+    try:
+        shared_before = shared_dir.lstat()
+        shared_fd = os.open(
+            shared_dir,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise RuntimeError("shared directory is unavailable for compaction receipt") from exc
+    try:
+        shared_open = os.fstat(shared_fd)
+        if (
+            not stat.S_ISDIR(shared_before.st_mode)
+            or (shared_before.st_dev, shared_before.st_ino)
+            != (shared_open.st_dev, shared_open.st_ino)
+            or shared_open.st_uid != 0
+            or shared_open.st_gid != 0
+            or stat.S_IMODE(shared_open.st_mode) & 0o022
+        ):
+            raise RuntimeError("shared directory is unsafe for compaction receipt")
+        try:
+            entry = os.stat(name, dir_fd=shared_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        limit = (
+            FALLBACK_CACHE_COMPACTION_MAX_INTENT_BYTES
+            if phase == "intent"
+            else FALLBACK_CACHE_COMPACTION_MAX_FINAL_BYTES
+        )
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_uid != 0
+            or entry.st_gid != 0
+            or entry.st_nlink != 1
+            or stat.S_IMODE(entry.st_mode) != 0o600
+            or entry.st_size <= 0
+            or entry.st_size > limit
+        ):
+            raise RuntimeError("compaction receipt metadata is unsafe")
+        fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=shared_fd,
+        )
+        try:
+            before = os.fstat(fd)
+            def fingerprint(value: os.stat_result) -> tuple[int, ...]:
+                return (
+                    value.st_dev,
+                    value.st_ino,
+                    value.st_mode,
+                    value.st_uid,
+                    value.st_gid,
+                    value.st_nlink,
+                    value.st_size,
+                    value.st_mtime_ns,
+                    value.st_ctime_ns,
+                )
+            if fingerprint(before) != fingerprint(entry):
+                raise RuntimeError("compaction receipt changed while opening")
+            chunks = bytearray()
+            while len(chunks) <= limit:
+                chunk = os.read(fd, min(65536, limit + 1 - len(chunks)))
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+            after = os.fstat(fd)
+            final_entry = os.stat(name, dir_fd=shared_fd, follow_symlinks=False)
+            if (
+                len(chunks) > limit
+                or fingerprint(before) != fingerprint(after)
+                or fingerprint(before) != fingerprint(final_entry)
+            ):
+                raise RuntimeError("compaction receipt changed while reading")
+        finally:
+            os.close(fd)
+        def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate receipt key")
+                result[key] = value
+            return result
+        payload = json.loads(bytes(chunks), object_pairs_hook=reject_duplicates)
+        expected_keys = {
+            "schema",
+            "event",
+            "phase",
+            "run_id",
+            "run_attempt",
+            "source_sha",
+            "bundle_sha256",
+            "record_sha256",
+            "record",
+        }
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != expected_keys
+            or type(payload.get("schema")) is not int
+            or payload.get("schema") != 1
+            or payload.get("event") != FALLBACK_CACHE_COMPACTION_EVENT
+            or payload.get("phase") != phase
+            or payload.get("run_id") != int(run_id)
+            or type(payload.get("run_id")) is not int
+            or payload.get("run_attempt") != int(run_attempt)
+            or type(payload.get("run_attempt")) is not int
+            or payload.get("source_sha") != source_sha
+            or payload.get("bundle_sha256") != bundle_sha256
+            or not isinstance(payload.get("record"), dict)
+        ):
+            raise RuntimeError("compaction receipt binding is invalid")
+        encoded_record = _compaction_record_bytes(payload["record"])
+        if hashlib.sha256(encoded_record).hexdigest() != payload.get("record_sha256"):
+            raise RuntimeError("compaction receipt record digest is invalid")
+        canonical = (
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("ascii")
+        if canonical != bytes(chunks):
+            raise RuntimeError("compaction receipt encoding is not canonical")
+        _validate_runtime_cache_compaction_record(
+            payload["record"],
+            phase=phase,
+            run_id=run_id,
+            run_attempt=run_attempt,
+            source_sha=source_sha,
+        )
+        return payload["record"]
+    finally:
+        os.close(shared_fd)
+
+
+def _runtime_cache_compaction_summary(
+    record: Mapping[str, Any],
+    *,
+    receipt_names: Mapping[str, str],
+    resumed_from: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    if record.get("phase") != "complete" or record.get("result") not in {
+        "compacted",
+        "restored",
+    }:
+        raise RuntimeError("runtime cache compaction did not complete")
+    result: dict[str, Any] = {
+        "status": "completed",
+        "result": record["result"],
+        "reclaimed_bytes": record.get("reclaimed_bytes"),
+        "source_commit": record.get("source_commit"),
+        "old_tree_sha256": record.get("old_tree_sha256"),
+        "new_tree_sha256": record.get("new_tree_sha256"),
+        "intent_receipt": receipt_names.get("intent"),
+        "validated_receipt": receipt_names.get("validated"),
+        "completion_receipt": receipt_names.get("completion"),
+    }
+    if resumed_from is not None:
+        result["resumed_run_id"] = resumed_from[0]
+        result["resumed_run_attempt"] = resumed_from[1]
+    return result
+
+
+def compact_legacy_fallback_runtime_cache(
+    app_dir: Path,
+    *,
+    run_id: str,
+    run_attempt: str,
+    source_sha: str,
+    bundle_sha256: str,
+    resume_run_id: str | None = None,
+    resume_run_attempt: str | None = None,
+    resume_source_sha: str | None = None,
+    resume_bundle_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Compact or recover only the fixed 4a fallback under caller-held locks."""
+
+    if (
+        re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None
+        or re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt) is None
+        or re.fullmatch(r"[0-9a-f]{40}", source_sha) is None
+        or re.fullmatch(r"[0-9a-f]{64}", bundle_sha256) is None
+    ):
+        raise ValueError("runtime cache compaction operation binding is invalid")
+    receipt_names: dict[str, str] = {}
+    last_records: dict[str, dict[str, Any]] = {}
+
+    def writer(phase: str) -> Callable[[Mapping[str, object]], None]:
+        def write(record: Mapping[str, object]) -> None:
+            if phase in receipt_names:
+                raise RuntimeError("runtime cache compaction receipt phase repeated")
+            name = write_runtime_cache_compaction_receipt(
+                app_dir,
+                phase=phase,
+                record=record,
+                run_id=run_id,
+                run_attempt=run_attempt,
+                source_sha=source_sha,
+                bundle_sha256=bundle_sha256,
+            )
+            receipt_names[phase] = name
+            last_records[phase] = dict(record)
+
+        return write
+
+    resumed_from: tuple[str, str] | None = None
+    resumed_compacted = False
+    if resume_run_id is not None:
+        if (
+            resume_run_attempt is None
+            or resume_source_sha is None
+            or resume_bundle_sha256 is None
+            or resume_source_sha != source_sha
+        ):
+            raise ValueError("runtime cache recovery must use the exact current source SHA")
+        intent = read_runtime_cache_compaction_receipt(
+            app_dir,
+            phase="intent",
+            run_id=resume_run_id,
+            run_attempt=resume_run_attempt,
+            source_sha=resume_source_sha,
+            bundle_sha256=resume_bundle_sha256,
+        )
+        validated = read_runtime_cache_compaction_receipt(
+            app_dir,
+            phase="validated",
+            run_id=resume_run_id,
+            run_attempt=resume_run_attempt,
+            source_sha=resume_source_sha,
+            bundle_sha256=resume_bundle_sha256,
+        )
+        prior_completion = read_runtime_cache_compaction_receipt(
+            app_dir,
+            phase="completion",
+            run_id=resume_run_id,
+            run_attempt=resume_run_attempt,
+            source_sha=resume_source_sha,
+            bundle_sha256=resume_bundle_sha256,
+        )
+        if intent is None or prior_completion is not None:
+            raise RuntimeError("runtime cache recovery receipt state is not pending")
+        def write_recovery_completion(record: Mapping[str, object]) -> None:
+            name = write_runtime_cache_compaction_receipt(
+                app_dir,
+                phase="completion",
+                record=record,
+                run_id=resume_run_id,
+                run_attempt=resume_run_attempt,
+                source_sha=resume_source_sha,
+                bundle_sha256=resume_bundle_sha256,
+            )
+            receipt_names["completion"] = name
+            last_records["completion"] = dict(record)
+
+        recovered = live_qa_guard.recover_legacy_runtime_cache(
+            intent,
+            validated,
+            run_id=int(resume_run_id),
+            attempt=int(resume_run_attempt),
+            operation_source_sha=resume_source_sha,
+            write_completion=write_recovery_completion,
+            probe_runtime=live_qa_guard.probe_compacted_legacy_runtime_cache,
+        )
+        if "completion" not in receipt_names:
+            raise RuntimeError("runtime cache recovery completion receipt is missing")
+        resumed_from = (resume_run_id, resume_run_attempt)
+        resumed_compacted = recovered.get("result") == "compacted"
+        if recovered.get("result") not in {"compacted", "restored"}:
+            raise RuntimeError("runtime cache recovery outcome is invalid")
+        persisted_completion = read_runtime_cache_compaction_receipt(
+            app_dir,
+            phase="completion",
+            run_id=resume_run_id,
+            run_attempt=resume_run_attempt,
+            source_sha=resume_source_sha,
+            bundle_sha256=resume_bundle_sha256,
+        )
+        if persisted_completion != last_records["completion"]:
+            raise RuntimeError("runtime cache recovery receipt readback changed")
+        if resumed_compacted:
+            return _runtime_cache_compaction_summary(
+                recovered,
+                receipt_names={
+                    "intent": _runtime_cache_compaction_receipt_name(
+                        resume_run_id, resume_run_attempt, "intent"
+                    ),
+                    "validated": _runtime_cache_compaction_receipt_name(
+                        resume_run_id, resume_run_attempt, "validated"
+                    ),
+                    "completion": receipt_names["completion"],
+                },
+                resumed_from=resumed_from,
+            )
+        receipt_names.clear()
+        last_records.clear()
+
+    if not resumed_compacted:
+        current_result = live_qa_guard.compact_legacy_runtime_cache(
+            run_id=int(run_id),
+            attempt=int(run_attempt),
+            operation_source_sha=source_sha,
+            write_intent=writer("intent"),
+            write_validated=writer("validated"),
+            write_completion=writer("completion"),
+            probe_runtime=live_qa_guard.probe_compacted_legacy_runtime_cache,
+        )
+        if set(receipt_names) != {"intent", "validated", "completion"}:
+            raise RuntimeError("runtime cache compaction receipts are incomplete")
+        for phase in ("intent", "validated", "completion"):
+            persisted = read_runtime_cache_compaction_receipt(
+                app_dir,
+                phase=phase,
+                run_id=run_id,
+                run_attempt=run_attempt,
+                source_sha=source_sha,
+                bundle_sha256=bundle_sha256,
+            )
+            if persisted != last_records[phase]:
+                raise RuntimeError("runtime cache compaction receipt readback changed")
+        return _runtime_cache_compaction_summary(
+            current_result, receipt_names=receipt_names, resumed_from=resumed_from
+        )
+    raise RuntimeError("runtime cache compaction state is invalid")
+
+
 @contextmanager
 def live_qa_machine_lock() -> Iterator[None]:
     """Join the existing live-QA machine lock after release/build locks."""
@@ -1148,7 +1851,7 @@ def maintenance_lock_scope(
                 args.source_release_dir,
                 initialize_if_missing=getattr(
                     args, "evict_pinned_build_node_cache", False
-                ),
+                ) or getattr(args, "compact_legacy_fallback_runtime_cache", False),
             ) as source_release_dir:
                 yield source_release_dir
 
@@ -1250,7 +1953,9 @@ def _plan_and_maybe_apply(
 def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     app_dir = args.app_dir.resolve(strict=True)
-    if getattr(args, "evict_pinned_build_node_cache", False):
+    if getattr(args, "evict_pinned_build_node_cache", False) or getattr(
+        args, "compact_legacy_fallback_runtime_cache", False
+    ):
         try:
             canonical_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
         except OSError as exc:
@@ -1366,6 +2071,51 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                                 args, "private_backup_diagnostics", False
                             ),
                         )
+                elif getattr(args, "compact_legacy_fallback_runtime_cache", False):
+                    try:
+                        canonical_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
+                        canonical_build_dir = DEFAULT_SOURCE_RELEASE_DIR.resolve(
+                            strict=True
+                        )
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "canonical backup verification lock roots are unavailable"
+                        ) from exc
+                    if (
+                        app_dir != canonical_app_dir
+                        or source_release_dir is None
+                        or source_release_dir != canonical_build_dir
+                    ):
+                        raise RuntimeError(
+                            "canonical app/build lock roots are required for fallback cache compaction"
+                        )
+                    # All four canonical locks stay held across compaction,
+                    # browser probes, receipts and the backup restore drill.
+                    with live_qa_machine_lock():
+                        cache_result = compact_legacy_fallback_runtime_cache(
+                            app_dir,
+                            run_id=args.compaction_run_id,
+                            run_attempt=args.compaction_run_attempt,
+                            source_sha=args.compaction_source_sha,
+                            bundle_sha256=args.compaction_bundle_sha256,
+                            resume_run_id=getattr(args, "resume_compaction_run_id", None),
+                            resume_run_attempt=getattr(
+                                args, "resume_compaction_run_attempt", None
+                            ),
+                            resume_source_sha=getattr(
+                                args, "resume_compaction_source_sha", None
+                            ),
+                            resume_bundle_sha256=getattr(
+                                args, "resume_compaction_bundle_sha256", None
+                            ),
+                        )
+                        backup_result = verify_existing_backup(
+                            app_dir,
+                            max_age_hours=args.backup_max_age_hours,
+                            private_failure_diagnostics=getattr(
+                                args, "private_backup_diagnostics", False
+                            ),
+                        )
                 else:
                     backup_result = verify_existing_backup(
                         app_dir,
@@ -1381,7 +2131,16 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
                     (),
                     (),
                     {
-                        "build_node_cache": cache_result,
+                        "build_node_cache": (
+                            cache_result
+                            if getattr(args, "evict_pinned_build_node_cache", False)
+                            else {"status": "not-requested"}
+                        ),
+                        "fallback_runtime_cache_compaction": (
+                            cache_result
+                            if getattr(args, "compact_legacy_fallback_runtime_cache", False)
+                            else {"status": "not-requested"}
+                        ),
                         **backup_result,
                         "status": "completed",
                     },

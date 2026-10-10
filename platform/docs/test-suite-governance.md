@@ -275,13 +275,12 @@ Privileged release tests prove promoted dependencies stay readable, relocation r
 Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity; tampering is refused. The origin proof follows a bounded, cycle-checked unchanged-release chain until the installer writes its root-private candidate-bound receipt. Owner tests cover two unchanged hops, pruning intermediate releases, receipt tampering and chain gaps; proof misses fail before fresh-venv allocation when required. These root-owned cases remain in `backend-privileged`; bootstrap extraction and release-size projection tests in `test_platform_validate_release_artifact` belong here because they validate the privileged release boundary.
 `test_platform_cpu_profile` also owns the fixed-schema diagnostic-plan, process CPU-window, and bounded CPU-profile contracts in `performance-contract`; they cover exact service/process/phase binding, one-use request selection, released-runtime identity, and fixed-category summaries without exporting raw frames.
 
-The canonical AST snapshot is 1,822 tests (1,750 backend, including 580 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 295, tool-contract 425, integration 256, privileged 580, and performance-contract 194.
+The canonical AST snapshot is 1,824 tests (1,752 backend, including 582 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 295, tool-contract 425, integration 256, privileged 582, and performance-contract 194.
 Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
 
-`test_platform_backup_restore_drill` and `test_platform_storage_maintenance` own
-newest-pair restore and lock-held cache-eviction contracts in `backend-privileged`;
-`test_platform_release_build_contract` covers pinned cache integrity/regeneration.
+`test_platform_backup_restore_drill` and `test_platform_storage_maintenance` own newest-pair restore, lock-held build-cache eviction and fallback-compaction integration in `backend-privileged`; `test_platform_release_build_contract` covers pinned cache integrity/regeneration.
+`test_platform_live_qa_guard` owns the reversible Chromium subtree transaction, partial-delete recovery and sandboxed probes in the same contour.
 
 The `platform-host-tools-candidate.yml` workflow is a separate trusted `workflow_run` contract, not
 a production gate. Its validator and bundle tests belong to `backend-tool-contract` through
