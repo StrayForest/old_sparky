@@ -3684,11 +3684,12 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 encoding="utf-8",
             )
             candidate.verify_jobs(path, context, real_runtime_summary)
-            for label, changed_summary, changed_jobs in (
+            for label, changed_summary, changed_jobs, summary_is_valid in (
                 (
                     "runtime-required-but-skipped",
                     {**real_runtime_summary, "requires_real_release_runtime": False},
                     real_runtime_jobs,
+                    False,
                 ),
                 (
                     "runtime-job-summary-mismatch",
@@ -3699,12 +3700,11 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                         else job
                         for job in real_runtime_jobs
                     ],
+                    True,
                 ),
             ):
                 with self.subTest(real_runtime=label):
-                    if label == "runtime-job-summary-mismatch":
-                        # This summary is intentionally unchanged and valid;
-                        # only the exact-attempt job row below is inconsistent.
+                    if summary_is_valid:
                         candidate._validate_summary(changed_summary, context)
                     else:
                         with self.assertRaises(candidate.CandidateError):
