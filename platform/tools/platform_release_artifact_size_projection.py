@@ -83,6 +83,19 @@ def _stable_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _stable_directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Bind a directory object while allowing its expected child entries to change."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
 def _directory(path: Path, *, private: bool = False) -> os.stat_result:
     try:
         metadata = path.lstat()
@@ -594,7 +607,8 @@ def project(
         _stable_identity(artifact.lstat()) != _stable_identity(archive_metadata)
         or _stable_identity(checksum.lstat()) != _stable_identity(checksum_metadata)
         or _stable_identity(release_dir.lstat()) != _stable_identity(release_identity)
-        or _stable_identity(bootstrap_root.lstat()) != _stable_identity(bootstrap_identity)
+        or _stable_directory_identity(bootstrap_root.lstat())
+        != _stable_directory_identity(bootstrap_identity)
     ):
         raise ProjectionError("metadata")
 

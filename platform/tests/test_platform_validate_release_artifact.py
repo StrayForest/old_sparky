@@ -418,6 +418,75 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         self.assertEqual(projection["measurement_coexist_allocated_bytes"], 2048)
         self.assertIsNone(projection["pr_same_repository"])
         self.assertFalse(any("path" in key for key in projection))
+
+        # Exercise the complete evidence path: bootstrap extraction is expected
+        # to add the release child, changing directory timestamps while keeping
+        # the original private directory object and security metadata intact.
+        release_output = repository / "platform/dist/releases"
+        release_output.mkdir(parents=True)
+        artifact = release_output / f"{RELEASE_SLUG}.tar.gz"
+        ArchiveBuilder(
+            artifact,
+            release_payload(source_git_commit=merge_sha),
+        ).write()
+        checksum = Path(f"{artifact}.sha256")
+        artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        checksum.write_text(
+            f"{artifact_sha256}  {artifact.name}\n", encoding="ascii"
+        )
+        validator.validate_archive(
+            artifact,
+            release_slug=RELEASE_SLUG,
+            extract_to=release_output,
+            expected_source_commit=merge_sha,
+        )
+        output = self.root / "size-projection.json"
+        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        complete = size_projection.project(
+            measurement_root=self.root,
+            release_slug=RELEASE_SLUG,
+            source_sha=merge_sha,
+            artifact_sha256=artifact_sha256,
+            event_type="pull_request",
+            repository="StrayForest/old_sparky",
+            tested_sha=merge_sha,
+            run_id="123456789",
+            run_attempt="1",
+            pr_head_sha=head_sha,
+            pr_base_sha=base_sha,
+            pr_base_ref="dev",
+            pr_head_repository="StrayForest/old_sparky",
+            pr_base_repository="StrayForest/old_sparky",
+            output=output,
+        )
+        self.assertEqual(complete["artifact_sha256"], artifact_sha256)
+        self.assertIs(complete["evidence_only"], True)
+        self.assertIs(complete["deployable"], False)
+        self.assertGreater(complete["bootstrap_allocated_bytes"], 0)
+        self.assertEqual(json.loads(output.read_text()), complete)
+        bound_root = self.root / "bootstrap-identity-fixture"
+        bound_root.mkdir(mode=0o700)
+        bound_identity = size_projection._stable_directory_identity(
+            bound_root.lstat()
+        )
+        (bound_root / RELEASE_SLUG).mkdir()
+        self.assertEqual(
+            size_projection._stable_directory_identity(bound_root.lstat()),
+            bound_identity,
+        )
+        moved_root = self.root / "bootstrap-identity-original"
+        bound_root.rename(moved_root)
+        bound_root.mkdir(mode=0o700)
+        self.assertNotEqual(
+            size_projection._stable_directory_identity(bound_root.lstat()),
+            bound_identity,
+        )
+        bound_root.chmod(0o755)
+        self.assertNotEqual(
+            size_projection._stable_directory_identity(bound_root.lstat()),
+            bound_identity,
+        )
         with self.assertRaisesRegex(size_projection.ProjectionError, "projection"):
             size_projection._projection_document(
                 source_sha=merge_sha,
