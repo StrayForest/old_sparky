@@ -4217,6 +4217,17 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn('PROJECTION_DIR_ID: ${{ steps.real-runtime-build.outputs.projection_dir_id }}', public_cleanup)
         self.assertIn('"$(stat -c \'%d:%i\' -- "$projection_dir")" == "$PROJECTION_DIR_ID"', public_cleanup)
         self.assertIn('"$(stat -c \'%u:%g:%a:%h:%F\' -- "$projection_dir")" == "$(id -u):$(id -g):700:2:directory"', public_cleanup)
+        self.assertIn("local cleanup_stage=none", real)
+        self.assertIn('if [[ "$cleanup_stage" == "none" ]]; then', real)
+        self.assertIn("mark_cleanup_failure projection_copy", real)
+        self.assertIn("mark_cleanup_failure release_root_remove", real)
+        self.assertIn("mark_cleanup_failure disk_floor", real)
+        self.assertIn("reason=cleanup stage=%s", real)
+        self.assertIn(
+            "reason=cleanup stage=disk_floor disk_after_bytes=%s min_free_bytes=%s",
+            real,
+        )
+        self.assertIn("disk_after_bytes=unknown min_free_bytes=%s", real)
         cleanup_step = self._workflow_step_run(
             workflow, "Remove exact release size projection temporary directory"
         )

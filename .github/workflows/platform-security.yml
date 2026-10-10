@@ -1173,6 +1173,14 @@ jobs:
             local safe_diagnostic=""
             local sanitizer_rc=1
             local builder_run_ready=0
+            local cleanup_stage=none
+            mark_cleanup_failure() {
+              local stage="$1"
+              cleanup_rc=1
+              if [[ "$cleanup_stage" == "none" ]]; then
+                cleanup_stage="$stage"
+              fi
+            }
             trap - EXIT
             set +e
             if (( builder_started == 1 )) && [[ -n "$canonical_rc" ]]; then
@@ -1330,38 +1338,48 @@ jobs:
                   && ( "$output_metadata" == "${runner_uid}:${runner_gid}:600:1:regular file"
                     || "$output_metadata" == "${runner_uid}:${runner_gid}:600:1:regular empty file" ) ]]; then
                   sudo -n /usr/bin/install -o "$runner_uid" -g "$runner_gid" -m 0600 \
-                    -- "$size_projection_path" "$public_projection_path" 2>/dev/null || cleanup_rc=1
+                    -- "$size_projection_path" "$public_projection_path" 2>/dev/null || mark_cleanup_failure projection_copy
                   copied_bytes="$(stat -c '%s' -- "$public_projection_path" 2>/dev/null)"
                   if [[ ! "$copied_bytes" =~ ^[0-9]{1,5}$ ]] || (( copied_bytes > 8192 )) \
                     || ! sudo -n /usr/bin/cmp -s -- "$size_projection_path" "$public_projection_path"; then
-                    cleanup_rc=1
+                    mark_cleanup_failure projection_copy
                   fi
                 else
-                  cleanup_rc=1
+                  mark_cleanup_failure projection_copy
                 fi
               else
-                cleanup_rc=1
+                mark_cleanup_failure projection_copy
               fi
             fi
             if [[ -n "$release_root" ]]; then
               if [[ -d "$release_root" && ! -L "$release_root" ]]; then
                 current_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root" 2>/dev/null)"
                 if [[ -n "$release_root_id" && "$current_id" == "$release_root_id" ]]; then
-                  sudo -n /bin/rm -rf -- "$release_root" 2>/dev/null || cleanup_rc=1
+                  sudo -n /bin/rm -rf -- "$release_root" 2>/dev/null || mark_cleanup_failure release_root_remove
                 else
-                  cleanup_rc=1
+                  mark_cleanup_failure release_root_remove
                 fi
               elif [[ -e "$release_root" || -L "$release_root" ]]; then
-                cleanup_rc=1
+                mark_cleanup_failure release_root_remove
               fi
-              [[ ! -e "$release_root" && ! -L "$release_root" ]] || cleanup_rc=1
+              [[ ! -e "$release_root" && ! -L "$release_root" ]] || mark_cleanup_failure release_root_remove
             fi
             disk_after_bytes="$(free_bytes 2>/dev/null || true)"
             if [[ ! "$disk_after_bytes" =~ ^[0-9]+$ ]] || (( disk_after_bytes < min_free_bytes )); then
-              cleanup_rc=1
+              mark_cleanup_failure disk_floor
             fi
             if (( cleanup_rc != 0 )); then
-              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup\n'
+              if [[ "$cleanup_stage" == "disk_floor" ]]; then
+                if [[ "$disk_after_bytes" =~ ^[0-9]{1,20}$ ]]; then
+                  printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=disk_floor disk_after_bytes=%s min_free_bytes=%s\n' \
+                    "$disk_after_bytes" "$min_free_bytes"
+                else
+                  printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=disk_floor disk_after_bytes=unknown min_free_bytes=%s\n' \
+                    "$min_free_bytes"
+                fi
+              else
+                printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=%s\n' "$cleanup_stage"
+              fi
               exit 1
             fi
             if (( builder_run_ready == 1 && parser_rc != 0 )); then
