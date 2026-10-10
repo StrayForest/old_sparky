@@ -1366,6 +1366,31 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     for path in output_dir.iterdir()
                 )
             )
+            isolated_tools = fixture_root / "attested-tools"
+            staged_archive_sha = hashlib.sha256(producer_archive.read_bytes()).hexdigest()
+            staged_extraction = run_inline(
+                extraction_script,
+                str(producer_archive),
+                staged_archive_sha,
+                source_sha,
+                str(isolated_tools),
+            )
+            self.assertEqual(staged_extraction.returncode, 0, staged_extraction.stderr)
+            isolated_help = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(isolated_tools / "platform_storage_maintenance.py"),
+                    "--help",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(isolated_help.returncode, 0, isolated_help.stderr)
+            self.assertIn("--verify-existing-backup-only", isolated_help.stdout)
         self.assertIn('backup.get("restore_verified") is not True', workflow)
         self.assertIn('backup.get("checksum_present") is not True', workflow)
         self.assertIn('public["mode"] = "backup-only" if sys.argv[2] == "create" else "verify-existing-backup-only"', workflow)
@@ -1388,14 +1413,22 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         )
         remote_script = run_script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE\n", 1)[0]
         remote_script = remote_script.replace(
-            "runtime=/opt/oldsparky/platform", "runtime=/not-a-production-tree"
+            "runtime=/opt/oldsparky/platform", "runtime=__TEST_RUNTIME__"
         )
         remote_script = remote_script.replace(
             'test "$(id -u)" -eq 0 || { echo "Production backup must run as root" >&2; exit 1; }',
             ":",
         )
         with tempfile.TemporaryDirectory() as temporary_dir:
-            report_path = Path(temporary_dir) / "remote-report"
+            test_root = Path(temporary_dir)
+            runtime = test_root / "platform"
+            shared = runtime / "shared"
+            shared.mkdir(parents=True, mode=0o755)
+            shared.chmod(0o755)
+            remote_script = remote_script.replace(
+                "runtime=__TEST_RUNTIME__", f"runtime={runtime}"
+            )
+            report_path = test_root / "remote-report"
             remote_script = remote_script.replace(
                 'backup_report_file="$(mktemp /tmp/oldsparky-production-backup-report.XXXXXX)"',
                 f'backup_report_file="$(mktemp {report_path}.XXXXXX)"',
@@ -1413,7 +1446,70 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 r"^BACKUP_FAILURE schema=1 stage=preflight exit_code=[1-9][0-9]{0,2}\n$",
             )
             self.assertIn("Current release symlink is missing", completed.stderr)
-            self.assertEqual(list(Path(temporary_dir).iterdir()), [])
+            receipt_path = shared / "backup-failure-123456-1.json"
+            receipt_stat = receipt_path.lstat()
+            self.assertTrue(stat.S_ISREG(receipt_stat.st_mode))
+            self.assertEqual(receipt_stat.st_uid, os.geteuid())
+            self.assertEqual(stat.S_IMODE(receipt_stat.st_mode), 0o600)
+            self.assertEqual(receipt_stat.st_nlink, 1)
+            receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+            self.assertEqual(
+                set(receipt),
+                {
+                    "schema", "event", "run_id", "attempt", "operation", "source_sha",
+                    "bundle_sha256", "stage", "exit_code", "report_state",
+                    "report_error_class", "report_bytes", "report_sha256", "stderr_state",
+                    "stderr_exception_class", "stderr_bytes", "stderr_sha256",
+                },
+            )
+            self.assertEqual(receipt["event"], "platform_backup_failure")
+            self.assertEqual(receipt["stage"], "preflight")
+            self.assertEqual(receipt["exit_code"], completed.returncode)
+            self.assertEqual(receipt["report_error_class"], "none")
+            self.assertEqual(receipt["stderr_exception_class"], "none")
+            self.assertNotIn("Current release symlink is missing", receipt_path.read_text())
+            self.assertFalse(report_path.exists())
+
+            typed_runtime = test_root / "typed-platform"
+            typed_shared = typed_runtime / "shared"
+            typed_shared.mkdir(parents=True, mode=0o755)
+            typed_shared.chmod(0o755)
+            typed_report = test_root / "typed-report.json"
+            typed_report.write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "failed",
+                        "error_class": "backup",
+                        "error": "fixture-private detail must not be retained",
+                    }
+                ),
+                encoding="ascii",
+            )
+            typed_report.chmod(0o600)
+            typed_script = remote_script.replace(
+                f"runtime={runtime}", f"runtime={typed_runtime}"
+            ).replace(
+                f'backup_report_file="$(mktemp {report_path}.XXXXXX)"',
+                f'backup_report_file="{typed_report}"',
+            )
+            typed_completed = subprocess.run(
+                ["bash", "-s", "--", "123457", "1", "create", "none", "none", "false"],
+                input=typed_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(typed_completed.returncode, 0)
+            typed_receipt_path = typed_shared / "backup-failure-123457-1.json"
+            typed_receipt = json.loads(typed_receipt_path.read_text(encoding="ascii"))
+            self.assertEqual(typed_receipt["report_state"], "typed_failure")
+            self.assertEqual(typed_receipt["report_error_class"], "backup")
+            self.assertNotIn(
+                "fixture-private detail",
+                typed_receipt_path.read_text(encoding="ascii"),
+            )
+            self.assertFalse(typed_report.exists())
 
     def _assert_backup_child_group_is_terminated(self, workflow_path: Path) -> None:
         workflow = yaml.safe_load(workflow_path.read_text())

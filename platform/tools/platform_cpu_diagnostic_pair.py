@@ -40,6 +40,7 @@ ACTOR_PAYLOAD_CAP = 16_384
 PAIR_PAYLOAD_CAP = 24_576
 WORKER_OUTPUT_CAP = 64_000
 REPORT_CAP = 64_000
+SSH_LIFECYCLE_RECEIPT_CAP = 2_048
 ROOT_USAGE_OUTPUT_CAP = 8_192
 USAGE_ROW_FIELDS = frozenset({
     "service", "phase", "expected_targets", "observed_targets", "event_count",
@@ -112,8 +113,11 @@ def _decode_canonical(raw: bytes, *, cap: int) -> dict[str, Any]:
     return value
 
 
-def _read_private_file(path: Path, *, cap: int) -> bytes:
+def _read_private_file(path: Path, *, cap: int, exact_mode: int | None = None) -> bytes:
     try:
+        path_before = path.lstat()
+        if stat.S_ISLNK(path_before.st_mode):
+            raise PairError("input file path is a symbolic link")
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except OSError as exc:
         raise PairError("input file unavailable") from exc
@@ -126,6 +130,9 @@ def _read_private_file(path: Path, *, cap: int) -> bytes:
             or stat.S_IMODE(before.st_mode) & 0o077
             or before.st_size <= 0
             or before.st_size > cap
+            or (exact_mode is not None and stat.S_IMODE(before.st_mode) != exact_mode)
+            or (path_before.st_dev, path_before.st_ino)
+            != (before.st_dev, before.st_ino)
         ):
             raise PairError("input file metadata rejected")
         data = bytearray()
@@ -135,11 +142,30 @@ def _read_private_file(path: Path, *, cap: int) -> bytes:
                 break
             data.extend(block)
         after = os.fstat(fd)
+        path_after = path.lstat()
         if (
             len(data) != before.st_size
             or len(data) > cap
-            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (
+                before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+                before.st_gid, before.st_nlink, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            )
+            != (
+                after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                after.st_gid, after.st_nlink, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            )
+            or (
+                path_after.st_dev, path_after.st_ino, path_after.st_mode,
+                path_after.st_uid, path_after.st_gid, path_after.st_nlink,
+                path_after.st_size, path_after.st_mtime_ns, path_after.st_ctime_ns,
+            )
+            != (
+                after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                after.st_gid, after.st_nlink, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            )
         ):
             raise PairError("input file changed during read")
         return bytes(data)
@@ -1016,11 +1042,18 @@ def _parent(args: argparse.Namespace) -> int:
         or stat.S_IMODE(report_directory.st_mode) & 0o077
     ):
         raise PairError("report directory permissions rejected")
+    ssh_dir_identity = _validate_private_ssh_directory(ssh_dir)
     ssh_files = {
         name: bytearray(_read_private_file(ssh_dir / name, cap=64 * 1024))
         for name in ("config", "id_ed25519", "known_hosts")
     }
-    control_path = _control_path(ssh_config)
+    ssh_lifecycle: dict[str, Any] = {
+        "closed": True,
+        "mux_off_enforced": False,
+        "last_command_returned": False,
+        "directory_dev": ssh_dir_identity.st_dev,
+        "directory_ino": ssh_dir_identity.st_ino,
+    }
     plan: dict[str, Any] = {
         "schema": 1,
         "operation": "prepare",
@@ -1047,6 +1080,10 @@ def _parent(args: argparse.Namespace) -> int:
     report: dict[str, Any] = {
         "schema": 1,
         "workload": WORKLOAD,
+        "source_sha": args.source_sha,
+        "app_target_sha": args.app_target_sha,
+        "external_run_id": args.external_run_id,
+        "external_run_attempt": args.external_run_attempt,
         "status": "incomplete",
         "capacity_slo_credit": False,
         "diagnostic_credit": False,
@@ -1060,22 +1097,48 @@ def _parent(args: argparse.Namespace) -> int:
         "input_handoff_sha256": hashlib.sha256(handoff_raw).hexdigest(),
         "namespace_closed": False,
         "plan_cleanup": "unknown",
+        "ssh_material_safe_to_remove": False,
+        "ssh_material_binding": None,
         "result": None,
     }
     worker_report_path = Path(args.report).with_name(Path(args.report).name + ".worker")
+    ssh_lifecycle_receipt_path = Path(args.report).with_name("ssh-lifecycle.json")
+    if _path_exists_nofollow(ssh_lifecycle_receipt_path):
+        raise PairError("SSH lifecycle receipt destination already exists")
     try:
         prepare_attempted = True
         prepared, release_slug, _unused_usage = _ssh_plan(
-            args, host, user, ssh_config, ssh_key, plan
+            args, host, user, ssh_config, ssh_key, plan, ssh_lifecycle
         )
         if not prepared:
             raise PairError("root plan prepare failed")
         if release_slug is None or RELEASE_SLUG_RE.fullmatch(release_slug) is None:
             raise PairError("root release binding rejected")
         plan["release_slug"] = release_slug
-        _hide_ssh_material(
-            host, user, ssh_config, ssh_dir, ssh_files, control_path, ssh_hidden
+        _hide_ssh_material(ssh_dir, ssh_files, ssh_lifecycle, ssh_hidden)
+        lifecycle_receipt = {
+            "schema": 1,
+            "event": "cpu_diagnostic_ssh_lifecycle",
+            "source_sha": args.source_sha,
+            "run_id": args.external_run_id,
+            "attempt": args.external_run_attempt,
+            "config_dir_dev": ssh_dir_identity.st_dev,
+            "config_dir_ino": ssh_dir_identity.st_ino,
+            "material_hidden": True,
+        }
+        _require_path_absent(ssh_dir)
+        _write_report(ssh_lifecycle_receipt_path, lifecycle_receipt)
+        _validate_ssh_lifecycle_receipt(
+            ssh_lifecycle_receipt_path,
+            expected={
+                "source_sha": args.source_sha,
+                "run_id": args.external_run_id,
+                "attempt": args.external_run_attempt,
+                "config_dir_dev": ssh_dir_identity.st_dev,
+                "config_dir_ino": ssh_dir_identity.st_ino,
+            },
         )
+        _require_path_absent(ssh_dir)
 
         pair_payload = {
             "schema": 1,
@@ -1137,6 +1200,10 @@ def _parent(args: argparse.Namespace) -> int:
         report: dict[str, Any] = {
             "schema": 1,
             "workload": WORKLOAD,
+            "source_sha": args.source_sha,
+            "app_target_sha": args.app_target_sha,
+            "external_run_id": args.external_run_id,
+            "external_run_attempt": args.external_run_attempt,
             "status": "incomplete",
             "capacity_slo_credit": False,
             "diagnostic_credit": False,
@@ -1148,6 +1215,7 @@ def _parent(args: argparse.Namespace) -> int:
             },
             "fixture_manifest_sha256": manifest_sha,
             "namespace_closed": closed,
+            "ssh_material_safe_to_remove": False,
             "worker_exit_code": (
                 result.returncode if result.returncode in {0, 1, 2} else None
             ),
@@ -1161,6 +1229,7 @@ def _parent(args: argparse.Namespace) -> int:
                 else "other"
             ),
             "plan_cleanup": "pending",
+            "ssh_material_binding": None,
             "result": {
                 key: child_report.get(key)
                 for key in (
@@ -1175,25 +1244,41 @@ def _parent(args: argparse.Namespace) -> int:
             cleaned = False
             usage_summary: dict[str, Any] | None = None
             try:
-                _wait_past(plan["on_end_ms"] + 1_000)
-                _restore_hidden_ssh_material(ssh_dir, ssh_files, ssh_hidden)
-                cleanup_request = {"schema": 1, "operation": "cleanup", "run_id": plan["run_id"]}
-                cleaned, _cleanup_slug, usage_summary = _ssh_plan(
-                    args, host, user, ssh_config, ssh_key, cleanup_request,
-                    allow_noop_cleanup=not prepared,
-                )
-                report["plan_cleanup"] = "complete" if cleaned else "failed"
+                if ssh_lifecycle.get("closed") is not True:
+                    report["plan_cleanup"] = "failed"
+                else:
+                    _wait_past(plan["on_end_ms"] + 1_000)
+                    _restore_hidden_ssh_material(
+                        ssh_dir, ssh_files, ssh_hidden, ssh_lifecycle
+                    )
+                    cleanup_request = {"schema": 1, "operation": "cleanup", "run_id": plan["run_id"]}
+                    cleaned, _cleanup_slug, usage_summary = _ssh_plan(
+                        args, host, user, ssh_config, ssh_key, cleanup_request,
+                        ssh_lifecycle,
+                        allow_noop_cleanup=not prepared,
+                    )
+                    report["plan_cleanup"] = "complete" if cleaned else "failed"
             except (OSError, PairError, subprocess.SubprocessError):
                 report["plan_cleanup"] = "failed"
             finally:
-                try:
-                    _stop_ssh_master(host, user, ssh_config)
-                except PairError:
-                    cleaned = False
-                try:
-                    _remove_ssh_files(ssh_dir, ssh_files, control_path)
-                except PairError:
-                    cleaned = False
+                if ssh_lifecycle.get("closed") is True:
+                    try:
+                        metadata = _validate_private_ssh_directory(ssh_dir)
+                        can_remove_material = bool(
+                            ssh_lifecycle.get("mux_off_enforced") is True
+                            and ssh_lifecycle.get("last_command_returned") is True
+                        )
+                        if can_remove_material:
+                            report["ssh_material_binding"] = {
+                                "source_sha": args.source_sha,
+                                "run_id": args.external_run_id,
+                                "attempt": args.external_run_attempt,
+                                "config_dir_dev": metadata.st_dev,
+                                "config_dir_ino": metadata.st_ino,
+                            }
+                            report["ssh_material_safe_to_remove"] = True
+                    except PairError:
+                        cleaned = False
             if not cleaned:
                 status = 2
                 report["status"] = "incomplete"
@@ -1244,15 +1329,18 @@ def _ssh_plan(
     config: Path,
     key: Path,
     payload: dict[str, Any],
+    lifecycle: dict[str, Any],
     *,
     allow_noop_cleanup: bool = False,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
+    lifecycle["last_command_returned"] = False
     data = json.dumps(
         payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
     ).encode("ascii") + b"\n"
     command = [
         "/usr/bin/ssh", "-F", str(config), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
         "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+        "-o", "ControlMaster=no", "-o", "ControlPersist=no", "-o", "ControlPath=none",
         "-i", str(key), f"{user}@{host}", "/usr/bin/python3.12", "-I", "-B",
         "/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py",
         "cpu-diagnostic-plan",
@@ -1269,13 +1357,17 @@ def _ssh_plan(
         )
     except OSError:
         return False, None, None
-    assert process.stdin is not None and process.stdout is not None
+    lifecycle["closed"] = False
+    lifecycle["mux_off_enforced"] = True
     output = bytearray()
-    selector = selectors.DefaultSelector()
-    descriptor = process.stdout.fileno()
-    os.set_blocking(descriptor, False)
-    selector.register(descriptor, selectors.EVENT_READ)
+    selector: selectors.BaseSelector | None = None
     try:
+        if process.stdin is None or process.stdout is None:
+            raise PairError("SSH process pipes were not created")
+        selector = selectors.DefaultSelector()
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        selector.register(descriptor, selectors.EVENT_READ)
         process.stdin.write(data)
         process.stdin.flush()
         process.stdin.close()
@@ -1285,6 +1377,7 @@ def _ssh_plan(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_worker(process)
+                lifecycle["closed"] = True
                 return False, None, None
             for key_event, _mask in selector.select(min(remaining, 0.1)):
                 try:
@@ -1298,8 +1391,12 @@ def _ssh_plan(
                 output.extend(chunk)
                 if len(output) > ROOT_USAGE_OUTPUT_CAP:
                     _terminate_worker(process)
+                    lifecycle["closed"] = True
                     return False, None, None
-        if process.wait(timeout=0) != 0 or not output.endswith(b"\n") or output.count(b"\n") != 1:
+        _confirm_worker_closed(process)
+        lifecycle["closed"] = True
+        lifecycle["last_command_returned"] = True
+        if process.returncode != 0 or not output.endswith(b"\n") or output.count(b"\n") != 1:
             return False, None, None
         if payload.get("operation") == "prepare":
             try:
@@ -1324,50 +1421,144 @@ def _ssh_plan(
         return True, None, usage
     except (OSError, subprocess.SubprocessError):
         _terminate_worker(process)
+        lifecycle["closed"] = True
         return False, None, None
     finally:
-        selector.close()
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
-        try:
-            process.stdout.close()
-        except OSError:
-            pass
+        if selector is not None:
+            selector.close()
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.stdout is not None:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            _terminate_worker(process)
+            lifecycle["closed"] = True
+        else:
+            _confirm_worker_closed(process)
+            lifecycle["closed"] = True
 
 
-def _control_path(config: Path) -> Path:
-    raw = _read_private_file(config, cap=64 * 1024).decode("ascii")
-    matches = re.findall(r"(?m)^\s*ControlPath\s+(/tmp/[A-Za-z0-9._/-]{1,160})\s*$", raw)
-    if len(matches) != 1 or ".." in Path(matches[0]).parts:
-        raise PairError("SSH control path is not closed")
-    if not Path(matches[0]).name.startswith("old-sparky-external-load-ssh-"):
-        raise PairError("SSH control path namespace rejected")
-    return Path(matches[0])
-
-
-def _stop_ssh_master(host: str, user: str, config: Path) -> None:
+def _process_group_exists(process_group_id: int) -> bool:
     try:
-        result = subprocess.run(
-            ["/usr/bin/ssh", "-F", str(config), "-O", "exit", f"{user}@{host}"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "UTC"},
-            close_fds=True,
-            check=False,
-            timeout=5,
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError as exc:
+        raise PairError("SSH process group state is not observable") from exc
+    except OSError as exc:
+        raise PairError("SSH process group state is not observable") from exc
+    return True
+
+
+def _wait_process_group_closed(process_group_id: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_group_exists(process_group_id):
+            return True
+        time.sleep(0.025)
+    return not _process_group_exists(process_group_id)
+
+
+def _confirm_worker_closed(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.wait(timeout=0)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_worker(process)
+        raise PairError("SSH child did not exit before returning") from exc
+    if _process_group_exists(process.pid):
+        _terminate_worker(process)
+        raise PairError("SSH process group outlived its child")
+
+
+def _validate_private_ssh_directory(directory: Path) -> os.stat_result:
+    try:
+        before = directory.lstat()
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o700
+        ):
+            raise PairError("SSH private directory identity rejected")
+        descriptor = os.open(
+            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise PairError("SSH control master did not close") from exc
-    if result.returncode != 0:
-        raise PairError("SSH control master did not close")
+        try:
+            opened = os.fstat(descriptor)
+            after = directory.lstat()
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or (before.st_dev, before.st_ino)
+                != (opened.st_dev, opened.st_ino)
+                or (opened.st_dev, opened.st_ino)
+                != (after.st_dev, after.st_ino)
+            ):
+                raise PairError("SSH private directory changed during validation")
+            return opened
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise PairError("SSH private directory identity unavailable") from exc
 
 
-def _remove_ssh_files(directory: Path, contents: dict[str, bytearray], control_path: Path) -> None:
-    if control_path.exists() or control_path.is_symlink():
-        raise PairError("SSH control socket remains after close")
+def _path_exists_nofollow(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise PairError("SSH lifecycle path state unavailable") from exc
+    return True
+
+
+def _require_path_absent(path: Path) -> None:
+    if _path_exists_nofollow(path):
+        raise PairError("SSH material path remains after hide")
+
+
+def _validate_ssh_lifecycle_receipt(path: Path, *, expected: dict[str, Any]) -> None:
+    raw = _read_private_file(path, cap=SSH_LIFECYCLE_RECEIPT_CAP, exact_mode=0o600)
+    if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise PairError("SSH lifecycle receipt encoding rejected")
+    receipt = _decode_canonical(raw[:-1], cap=SSH_LIFECYCLE_RECEIPT_CAP)
+    if set(receipt) != {
+        "schema", "event", "source_sha", "run_id", "attempt",
+        "config_dir_dev", "config_dir_ino", "material_hidden",
+    }:
+        raise PairError("SSH lifecycle receipt schema rejected")
+    if (
+        type(receipt.get("schema")) is not int
+        or receipt["schema"] != 1
+        or receipt.get("event") != "cpu_diagnostic_ssh_lifecycle"
+        or receipt.get("material_hidden") is not True
+        or not isinstance(receipt.get("source_sha"), str)
+        or not isinstance(receipt.get("run_id"), str)
+        or not isinstance(receipt.get("attempt"), str)
+        or type(receipt.get("config_dir_dev")) is not int
+        or type(receipt.get("config_dir_ino")) is not int
+    ):
+        raise PairError("SSH lifecycle receipt state rejected")
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        raise PairError("SSH lifecycle receipt binding rejected")
+
+
+def _remove_ssh_files(
+    directory: Path, contents: dict[str, bytearray], lifecycle: dict[str, Any]
+) -> None:
+    if lifecycle.get("closed") is not True:
+        raise PairError("SSH process lifecycle is not closed")
+    metadata = _validate_private_ssh_directory(directory)
+    if (metadata.st_dev, metadata.st_ino) != (
+        lifecycle.get("directory_dev"), lifecycle.get("directory_ino")
+    ):
+        raise PairError("SSH private directory identity changed")
     for name in contents:
         path = directory / name
         if path.is_symlink() or (path.exists() and not path.is_file()):
@@ -1386,7 +1577,9 @@ def _remove_ssh_files(directory: Path, contents: dict[str, bytearray], control_p
         raise PairError("SSH private directory is not empty") from exc
 
 
-def _restore_ssh_files(directory: Path, contents: dict[str, bytearray]) -> None:
+def _restore_ssh_files(
+    directory: Path, contents: dict[str, bytearray], lifecycle: dict[str, Any]
+) -> None:
     directory_fd = -1
     try:
         try:
@@ -1403,6 +1596,8 @@ def _restore_ssh_files(directory: Path, contents: dict[str, bytearray]) -> None:
             or stat.S_IMODE(directory_metadata.st_mode) != 0o700
         ):
             raise PairError("SSH private directory changed during restore")
+        lifecycle["directory_dev"] = directory_metadata.st_dev
+        lifecycle["directory_ino"] = directory_metadata.st_ino
         existing_names = set(os.listdir(directory_fd))
         if not existing_names <= set(contents):
             raise PairError("unexpected SSH material remains during restore")
@@ -1460,28 +1655,27 @@ def _restore_ssh_files(directory: Path, contents: dict[str, bytearray]) -> None:
 
 
 def _hide_ssh_material(
-    host: str,
-    user: str,
-    config: Path,
     directory: Path,
     contents: dict[str, bytearray],
-    control_path: Path,
+    lifecycle: dict[str, Any],
     state: dict[str, bool],
 ) -> None:
-    _stop_ssh_master(host, user, config)
+    if lifecycle.get("closed") is not True:
+        raise PairError("SSH process lifecycle is not closed")
     # Record the hidden state before unlinking any file so partial removal
     # always enters the restoration path.
     state["value"] = True
-    _remove_ssh_files(directory, contents, control_path)
+    _remove_ssh_files(directory, contents, lifecycle)
 
 
 def _restore_hidden_ssh_material(
     directory: Path,
     contents: dict[str, bytearray],
     state: dict[str, bool],
+    lifecycle: dict[str, Any],
 ) -> None:
     if state.get("value") is True:
-        _restore_ssh_files(directory, contents)
+        _restore_ssh_files(directory, contents, lifecycle)
         state["value"] = False
 
 
@@ -1536,16 +1730,32 @@ def _read_worker_all(stream: Any, process: subprocess.Popen[bytes], *, deadline:
 def _terminate_worker(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, 15)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        raise PairError("SSH process group could not be terminated") from exc
+    try:
         process.wait(timeout=2)
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, 9)
-        except OSError:
+        except ProcessLookupError:
             pass
+        except OSError as exc:
+            raise PairError("SSH process group could not be killed") from exc
         try:
             process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
+        except subprocess.TimeoutExpired as exc:
+            raise PairError("SSH child could not be reaped") from exc
+    if _process_group_exists(process.pid):
+        try:
+            os.killpg(process.pid, 9)
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            raise PairError("SSH process group could not be killed") from exc
+        if not _wait_process_group_closed(process.pid, 2):
+            raise PairError("SSH process group remained after kill")
 
 
 def main(argv: list[str] | None = None) -> int:

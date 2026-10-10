@@ -19,6 +19,14 @@ import subprocess
 import sys
 from typing import Any, Iterator
 
+# The backup workflow executes this exact attested helper with Python's
+# isolated mode.  `-I` intentionally omits the script directory from
+# `sys.path`, so explicitly add only this file's sibling tools directory for
+# the closed, source- and hash-validated helper bundle.
+_SCRIPT_TOOLS_DIR = str(Path(__file__).resolve(strict=True).parent)
+if _SCRIPT_TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_TOOLS_DIR)
+
 
 def _load_staged_disk_policy() -> Any:
     helper_path = Path(__file__).resolve().with_name("platform_disk_policy.py")

@@ -613,9 +613,192 @@ jobs:
           backup_report_file=""
           helper_stage=""
           helper_stage_identity=""
+          backup_capture_file="/tmp/oldsparky-production-backup-${run_id}-${run_attempt}.stderr"
           backup_failure_marker() {
             exit_code=$?
             trap - EXIT
+            if (( exit_code != 0 )); then
+              /usr/bin/python3 -I -B - "$runtime/shared" "$run_id" "$run_attempt" \
+                "$operation" "$source_sha" "$bundle_sha" "$failure_stage" "$exit_code" \
+                "$backup_report_file" "$backup_capture_file" <<'PY' >/dev/null 2>&1 || :
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import sys
+
+          shared_path, run_id, attempt, operation, source_sha, bundle_sha, stage, exit_code, report_path, capture_path = sys.argv[1:]
+          stages = {
+              "preflight", "helper_bundle_validation", "backup_create", "backup_verify_existing",
+              "summary_validation", "public_summary", "private_capture_cleanup", "helper_cleanup",
+              "report_cleanup", "complete",
+          }
+          if (
+              not re.fullmatch(r"[1-9][0-9]{0,19}", run_id)
+              or not re.fullmatch(r"[1-9][0-9]{0,5}", attempt)
+              or operation not in {"create", "verify-existing"}
+              or stage not in stages
+              or not re.fullmatch(r"[1-9][0-9]{0,2}", exit_code)
+              or (source_sha != "none" and re.fullmatch(r"[0-9a-f]{40}", source_sha) is None)
+              or (bundle_sha != "none" and re.fullmatch(r"[0-9a-f]{64}", bundle_sha) is None)
+          ):
+              raise SystemExit(1)
+
+          def identity(value):
+              return (
+                  value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+                  value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+              )
+
+          def directory_identity(value):
+              return (
+                  value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+                  value.st_nlink,
+              )
+
+          def reject_duplicate_keys(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError
+                  result[key] = value
+              return result
+
+          def read_private(path, cap):
+              if not path:
+                  return "absent", b""
+              try:
+                  before = os.lstat(path)
+              except FileNotFoundError:
+                  return "absent", b""
+              if (
+                  not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                  or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+                  or before.st_size < 0 or before.st_size > cap
+              ):
+                  return "unsafe", b""
+              fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(fd)
+                  if identity(opened) != identity(before):
+                      return "changed", b""
+                  chunks = bytearray()
+                  while len(chunks) <= cap:
+                      block = os.read(fd, min(8192, cap + 1 - len(chunks)))
+                      if not block:
+                          break
+                      chunks.extend(block)
+                  finished = os.fstat(fd)
+              finally:
+                  os.close(fd)
+              after = os.lstat(path)
+              if len(chunks) > cap or identity(finished) != identity(before) or identity(after) != identity(before):
+                  return "changed", b""
+              return "read", bytes(chunks)
+
+          report_state, report_bytes = read_private(report_path, 1_048_576)
+          stderr_state, stderr_bytes = read_private(capture_path, 65_536)
+          report_error_class = "none"
+          if report_state == "read":
+              try:
+                  report = json.loads(
+                      report_bytes.decode("utf-8"),
+                      object_pairs_hook=reject_duplicate_keys,
+                  )
+              except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                  report_state = "invalid_json"
+              else:
+                  allowed = {"backup", "lock", "integrity", "configuration", "storage"}
+                  if isinstance(report, dict) and report.get("ok") is False and report.get("status") == "failed" and report.get("error_class") in allowed:
+                      report_error_class = report["error_class"]
+                      report_state = "typed_failure"
+                  elif isinstance(report, dict) and report.get("ok") is True:
+                      report_state = "success_payload"
+                  else:
+                      report_state = "unclassified_json"
+          stderr_exception = "none"
+          if stderr_state == "read":
+              match = re.search(rb"(?m)^([A-Za-z][A-Za-z0-9_]*(?:Error|Exception|SyntaxError|SystemExit)):", stderr_bytes)
+              allowed_exceptions = {
+                  "ModuleNotFoundError", "ImportError", "FileNotFoundError", "PermissionError",
+                  "RuntimeError", "ValueError", "OSError", "SyntaxError", "SystemExit",
+              }
+              if match is not None:
+                  candidate = match.group(1).decode("ascii")
+                  if candidate in allowed_exceptions:
+                      stderr_exception = candidate
+
+          shared_fd = os.open(shared_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              shared = os.fstat(shared_fd)
+              shared_path_stat = os.lstat(shared_path)
+              if (
+                  not stat.S_ISDIR(shared.st_mode) or shared.st_uid != 0 or shared.st_gid != 0
+                  or stat.S_IMODE(shared.st_mode) != 0o755 or shared.st_nlink < 2
+                  or identity(shared) != identity(shared_path_stat)
+              ):
+                  raise SystemExit(1)
+              filename = f"backup-failure-{run_id}-{attempt}.json"
+              record = {
+                  "schema": 1,
+                  "event": "platform_backup_failure",
+                  "run_id": run_id,
+                  "attempt": attempt,
+                  "operation": operation,
+                  "source_sha": None if source_sha == "none" else source_sha,
+                  "bundle_sha256": None if bundle_sha == "none" else bundle_sha,
+                  "stage": stage,
+                  "exit_code": int(exit_code),
+                  "report_state": report_state,
+                  "report_error_class": report_error_class,
+                  "report_bytes": len(report_bytes),
+                  "report_sha256": hashlib.sha256(report_bytes).hexdigest() if report_bytes else None,
+                  "stderr_state": stderr_state,
+                  "stderr_exception_class": stderr_exception,
+                  "stderr_bytes": len(stderr_bytes),
+                  "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest() if stderr_bytes else None,
+              }
+              encoded = (json.dumps(record, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+              descriptor = os.open(
+                  filename,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                  0o600,
+                  dir_fd=shared_fd,
+              )
+              try:
+                  os.fchown(descriptor, 0, 0)
+                  os.fchmod(descriptor, 0o600)
+                  view = memoryview(encoded)
+                  while view:
+                      written = os.write(descriptor, view)
+                      if written <= 0:
+                          raise SystemExit(1)
+                      view = view[written:]
+                  os.fsync(descriptor)
+                  written = os.fstat(descriptor)
+                  named = os.stat(filename, dir_fd=shared_fd, follow_symlinks=False)
+                  if (
+                      not stat.S_ISREG(written.st_mode) or written.st_uid != 0 or written.st_gid != 0
+                      or stat.S_IMODE(written.st_mode) != 0o600 or written.st_nlink != 1
+                      or written.st_size != len(encoded)
+                      or (written.st_dev, written.st_ino) != (named.st_dev, named.st_ino)
+                  ):
+                      raise SystemExit(1)
+              finally:
+                  os.close(descriptor)
+              os.fsync(shared_fd)
+              final_shared = os.fstat(shared_fd)
+              final_path = os.lstat(shared_path)
+              if (
+                  directory_identity(final_shared) != directory_identity(shared)
+                  or directory_identity(final_path) != directory_identity(shared)
+              ):
+                  raise SystemExit(1)
+          finally:
+              os.close(shared_fd)
+          PY
+            fi
             if [[ "$operation" = verify-existing && -n "$helper_stage" && -n "$helper_stage_identity" ]]; then
               if /usr/bin/python3 -I -B - "$helper_stage" "$helper_stage_identity" "$bundle_sha" "$source_sha" <<'PY'
           import hashlib

@@ -305,6 +305,78 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(worker_report["status"], "complete")
         self.assertEqual(executor_stub.shutdown_args, (False, True))
 
+        # The parent validates its early receipt before it launches the
+        # namespace child. Bind the accepted receipt to this exact run/source
+        # and original SSH-directory inode; wrong bindings fail closed.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_dir = Path(temp_dir)
+            os.chmod(receipt_dir, 0o700)
+            receipt_path = receipt_dir / "ssh-lifecycle.json"
+            receipt = {
+                "schema": 1,
+                "event": "cpu_diagnostic_ssh_lifecycle",
+                "source_sha": "b" * 40,
+                "run_id": "12345",
+                "attempt": "1",
+                "config_dir_dev": 27,
+                "config_dir_ino": 1234,
+                "material_hidden": True,
+            }
+            cpu_pair._write_report(receipt_path, receipt)
+            expected_receipt_binding = {
+                "source_sha": "b" * 40,
+                "run_id": "12345",
+                "attempt": "1",
+                "config_dir_dev": 27,
+                "config_dir_ino": 1234,
+            }
+            cpu_pair._validate_ssh_lifecycle_receipt(
+                receipt_path, expected=expected_receipt_binding
+            )
+            with self.assertRaises(cpu_pair.PairError):
+                cpu_pair._validate_ssh_lifecycle_receipt(
+                    receipt_path,
+                    expected={**expected_receipt_binding, "attempt": "2"},
+                )
+            receipt_path.unlink()
+            receipt["material_hidden"] = "true"
+            cpu_pair._write_report(receipt_path, receipt)
+            with self.assertRaises(cpu_pair.PairError):
+                cpu_pair._validate_ssh_lifecycle_receipt(
+                    receipt_path, expected=expected_receipt_binding
+                )
+            receipt_path.unlink()
+            receipt["material_hidden"] = True
+            cpu_pair._write_report(receipt_path, receipt)
+            hardlink_path = receipt_dir / "receipt-hardlink"
+            os.link(receipt_path, hardlink_path)
+            with self.assertRaises(cpu_pair.PairError):
+                cpu_pair._validate_ssh_lifecycle_receipt(
+                    receipt_path, expected=expected_receipt_binding
+                )
+            hardlink_path.unlink()
+            receipt_path.unlink()
+            target_path = receipt_dir / "receipt-target"
+            cpu_pair._write_report(target_path, receipt)
+            receipt_path.symlink_to(target_path.name)
+            with self.assertRaises(cpu_pair.PairError):
+                cpu_pair._validate_ssh_lifecycle_receipt(
+                    receipt_path, expected=expected_receipt_binding
+                )
+            receipt_path.unlink()
+            target_path.unlink()
+            receipt_path.write_bytes(
+                b'{"schema":1,"event":"cpu_diagnostic_ssh_lifecycle",'
+                b'"source_sha":"' + (b"b" * 40) + b'","run_id":"12345",'
+                b'"attempt":"1","config_dir_dev":27,"config_dir_ino":1234,'
+                b'"material_hidden":true,"material_hidden":true}\n'
+            )
+            os.chmod(receipt_path, 0o600)
+            with self.assertRaises(cpu_pair.PairError):
+                cpu_pair._validate_ssh_lifecycle_receipt(
+                    receipt_path, expected=expected_receipt_binding
+                )
+
         # A partial unlink fails before any child is launched. The pre-marked
         # hidden state still restores the entire exact secret set.
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -318,6 +390,12 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             for name, value in secrets.items():
                 (secret_dir / name).write_bytes(value)
                 os.chmod(secret_dir / name, 0o600)
+            secret_dir_stat = secret_dir.stat()
+            lifecycle = {
+                "closed": True,
+                "directory_dev": secret_dir_stat.st_dev,
+                "directory_ino": secret_dir_stat.st_ino,
+            }
             hidden_state = {"value": False}
 
             def partial_remove(*_args: object) -> None:
@@ -325,21 +403,113 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
                 raise cpu_pair.PairError("simulated partial unlink")
 
             with (
-                patch.object(cpu_pair, "_stop_ssh_master"),
                 patch.object(cpu_pair, "_remove_ssh_files", side_effect=partial_remove),
                 self.assertRaises(cpu_pair.PairError),
             ):
                 cpu_pair._hide_ssh_material(
-                    "host", "user", secret_dir / "config", secret_dir,
-                    secrets, secret_dir / "control", hidden_state,
+                    secret_dir, secrets, lifecycle, hidden_state,
                 )
             self.assertTrue(hidden_state["value"])
-            cpu_pair._restore_hidden_ssh_material(secret_dir, secrets, hidden_state)
+            cpu_pair._restore_hidden_ssh_material(
+                secret_dir, secrets, hidden_state, lifecycle
+            )
             self.assertFalse(hidden_state["value"])
             for name, expected_bytes in secrets.items():
                 restored = secret_dir / name
                 self.assertEqual(restored.read_bytes(), bytes(expected_bytes))
                 self.assertEqual(restored.stat().st_mode & 0o777, 0o600)
+
+        # The remote plan uses one-shot SSH even if the supplied config is
+        # changed later. The actual child is reaped before the lifecycle state
+        # permits credential removal.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secret_dir = Path(temp_dir) / "external-ssh"
+            secret_dir.mkdir(mode=0o700)
+            secrets = {
+                "config": bytearray(b"ssh config"),
+                "id_ed25519": bytearray(b"private key"),
+                "known_hosts": bytearray(b"host key"),
+            }
+            for name, value in secrets.items():
+                path = secret_dir / name
+                path.write_bytes(value)
+                os.chmod(path, 0o600)
+            secret_dir_stat = secret_dir.stat()
+            lifecycle = {
+                "closed": True,
+                "mux_off_enforced": False,
+                "last_command_returned": False,
+                "directory_dev": secret_dir_stat.st_dev,
+                "directory_ino": secret_dir_stat.st_ino,
+            }
+            actual_popen = cpu_pair.subprocess.Popen
+            captured: dict[str, object] = {}
+
+            def fake_ssh(command: list[str], **kwargs: object):
+                captured["command"] = command
+                script = (
+                    "import sys; sys.stdin.buffer.read(); "
+                    "sys.stdout.write('CPU_DIAGNOSTIC_PLAN status=prepared "
+                    "targets=3 release_slug=release-123456789012\\n')"
+                )
+                return actual_popen([cpu_pair.sys.executable, "-c", script], **kwargs)
+
+            with patch.object(cpu_pair.subprocess, "Popen", side_effect=fake_ssh):
+                prepared, release_slug, usage = cpu_pair._ssh_plan(
+                    SimpleNamespace(), "example.org", "deploy", secret_dir / "config",
+                    secret_dir / "id_ed25519", {"operation": "prepare"}, lifecycle,
+                )
+            self.assertTrue(prepared)
+            self.assertEqual(release_slug, "release-123456789012")
+            self.assertIsNone(usage)
+            self.assertEqual(lifecycle, {
+                "closed": True,
+                "mux_off_enforced": True,
+                "last_command_returned": True,
+                "directory_dev": secret_dir_stat.st_dev,
+                "directory_ino": secret_dir_stat.st_ino,
+            })
+            command = captured["command"]
+            self.assertIsInstance(command, list)
+            for option in ("ControlMaster=no", "ControlPersist=no", "ControlPath=none"):
+                self.assertIn(option, command)
+            cpu_pair._remove_ssh_files(secret_dir, secrets, lifecycle)
+            self.assertFalse(secret_dir.exists())
+
+        # If child death is not yet proven, cleanup refuses to unlink secrets.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            secret_dir = Path(temp_dir) / "external-ssh"
+            secret_dir.mkdir(mode=0o700)
+            secrets = {
+                "config": bytearray(b"ssh config"),
+                "id_ed25519": bytearray(b"private key"),
+                "known_hosts": bytearray(b"host key"),
+            }
+            for name, value in secrets.items():
+                path = secret_dir / name
+                path.write_bytes(value)
+                os.chmod(path, 0o600)
+            secret_dir_stat = secret_dir.stat()
+            lifecycle = {
+                "closed": False,
+                "directory_dev": secret_dir_stat.st_dev,
+                "directory_ino": secret_dir_stat.st_ino,
+            }
+            process = cpu_pair.subprocess.Popen(
+                [cpu_pair.sys.executable, "-c", "import time; time.sleep(30)"],
+                stdin=cpu_pair.subprocess.DEVNULL,
+                stdout=cpu_pair.subprocess.DEVNULL,
+                stderr=cpu_pair.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            with self.assertRaises(cpu_pair.PairError):
+                cpu_pair._remove_ssh_files(secret_dir, secrets, lifecycle)
+            self.assertTrue((secret_dir / "id_ed25519").exists())
+            cpu_pair._terminate_worker(process)
+            lifecycle["closed"] = True
+            self.assertIsNotNone(process.poll())
+            cpu_pair._remove_ssh_files(secret_dir, secrets, lifecycle)
+            self.assertFalse(secret_dir.exists())
 
     def test_pair_actor_payload_requires_eight_isolated_credentials_on_one_workspace(self) -> None:
         payload = {

@@ -1558,6 +1558,7 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         # Fixture setup and DB cleanup retain their current-release helpers;
         # only completion-marker creation and exact export deletion use C6.
         fixture_setup = self.jobs["fixture-setup"]
+        cpu_job = self.jobs["cpu-diagnostic-pair"]
         self.assertIn(
             "/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py external-fixture",
             fixture_setup,
@@ -1570,10 +1571,15 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             fixture_setup, "Remove fixture-setup SSH material"
         )
         finalizer_cleanup = _step_script(finalizer, "Remove finalizer SSH material")
+        cpu_configure = _step_script(
+            cpu_job, "Configure pinned production SSH for the trusted parent"
+        )
+        cpu_cleanup = _step_script(cpu_job, "Remove diagnostic SSH material")
 
         for job, configure_name, directory_name in (
             (fixture_setup, "Configure production SSH", "production-external-load-ssh-setup"),
             (finalizer, "Configure finalizer SSH", "production-external-load-ssh-finalize"),
+            (cpu_job, "Configure pinned production SSH for the trusted parent", "external-ssh"),
         ):
             configure = _step_script(job, configure_name)
             with tempfile.TemporaryDirectory(prefix="external-load-ssh-config-") as temp:
@@ -1628,9 +1634,196 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
                 self.assertNotIn("ControlMaster auto", configure)
                 self.assertNotIn("ControlPersist 15m", configure)
 
-        for cleanup in (fixture_cleanup, finalizer_cleanup):
+        for cleanup in (fixture_cleanup, finalizer_cleanup, cpu_cleanup):
             self.assertNotIn('"$control_path"', cleanup)
             self.assertNotIn("-O exit", cleanup)
+
+        self.assertNotIn("control_path=", cpu_configure)
+        self.assertIn("ControlMaster no", cpu_configure)
+        self.assertIn("ControlPersist no", cpu_configure)
+        self.assertIn("ControlPath none", cpu_configure)
+        self.assertNotIn("ControlMaster auto", cpu_configure)
+        self.assertNotIn("ControlPersist 15m", cpu_configure)
+        self.assertNotIn("old-sparky-external-load-ssh-cpudiag-", cpu_configure)
+        self.assertNotIn("old-sparky-external-load-ssh-cpudiag-", cpu_cleanup)
+
+        source_sha = "a" * 40
+        run_id = "123456789"
+        attempt = "1"
+
+        def run_cpu_cleanup(runner_temp: Path) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["/bin/bash", "-c", cpu_cleanup],
+                capture_output=True,
+                text=True,
+                env={
+                    "RUNNER_TEMP": str(runner_temp),
+                    "TARGET_SHA": source_sha,
+                    "GITHUB_RUN_ID": run_id,
+                    "GITHUB_RUN_ATTEMPT": attempt,
+                },
+                timeout=10,
+            )
+
+        def make_cpu_ssh_dir(runner_temp: Path) -> tuple[Path, dict[str, object]]:
+            ssh_dir = runner_temp / "external-ssh"
+            ssh_dir.mkdir(mode=0o700)
+            for name, value in {
+                "id_ed25519": "fixture key",
+                "known_hosts": "fixture host key",
+                "config": "Host *\n  ControlMaster no\n  ControlPersist no\n  ControlPath none\n",
+            }.items():
+                path = ssh_dir / name
+                path.write_text(value, encoding="ascii")
+                path.chmod(0o600)
+            metadata = ssh_dir.stat(follow_symlinks=False)
+            binding: dict[str, object] = {
+                "source_sha": source_sha,
+                "run_id": run_id,
+                "attempt": attempt,
+                "config_dir_dev": metadata.st_dev,
+                "config_dir_ino": metadata.st_ino,
+            }
+            return ssh_dir, binding
+
+        def write_cpu_report(
+            runner_temp: Path,
+            binding: dict[str, object],
+            *,
+            safe: object = True,
+            report_binding: dict[str, object] | None = None,
+        ) -> Path:
+            report_dir = runner_temp / "cpu-diagnostic-report"
+            report_dir.mkdir(mode=0o700)
+            report_path = report_dir / "report.json"
+            payload = {
+                "schema": 1,
+                "source_sha": source_sha,
+                "external_run_id": run_id,
+                "external_run_attempt": attempt,
+                "ssh_material_safe_to_remove": safe,
+                "ssh_material_binding": binding if report_binding is None else report_binding,
+            }
+            report_path.write_text(
+                json.dumps(payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="ascii",
+            )
+            report_path.chmod(0o600)
+            lifecycle_path = report_dir / "ssh-lifecycle.json"
+            lifecycle_payload = {
+                "schema": 1,
+                "event": "cpu_diagnostic_ssh_lifecycle",
+                "source_sha": source_sha,
+                "run_id": run_id,
+                "attempt": attempt,
+                "config_dir_dev": binding["config_dir_dev"],
+                "config_dir_ino": binding["config_dir_ino"],
+                "material_hidden": True,
+            }
+            lifecycle_path.write_text(
+                json.dumps(
+                    lifecycle_payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+                ) + "\n",
+                encoding="ascii",
+            )
+            lifecycle_path.chmod(0o600)
+            return report_path
+
+        # The exact positive report binds the expected source, run, attempt,
+        # and inode before removing only this run's private SSH material.
+        with tempfile.TemporaryDirectory(prefix="external-load-cpudiag-cleanup-") as temp:
+            runner_temp = Path(temp)
+            ssh_dir, binding = make_cpu_ssh_dir(runner_temp)
+            write_cpu_report(runner_temp, binding)
+            unrelated_socket = runner_temp / "old-sparky-external-load-ssh-cpudiag-other"
+            unrelated_socket.write_text("unrelated run marker", encoding="ascii")
+            completed = run_cpu_cleanup(runner_temp)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(ssh_dir.exists())
+            self.assertEqual(unrelated_socket.read_text(encoding="ascii"), "unrelated run marker")
+
+        # Missing, false, string-true, stale, replaced, or symlink reports
+        # fail closed and leave the exact SSH material available for diagnosis.
+        for report_case in (
+            "missing", "false", "string_true", "stale", "replaced", "symlink", "duplicate",
+            "early_missing", "early_stale", "early_false", "early_symlink",
+        ):
+            with self.subTest(report_case=report_case), tempfile.TemporaryDirectory(
+                prefix="external-load-cpudiag-cleanup-reject-"
+            ) as temp:
+                runner_temp = Path(temp)
+                ssh_dir, binding = make_cpu_ssh_dir(runner_temp)
+                report_dir = runner_temp / "cpu-diagnostic-report"
+                report_dir.mkdir(mode=0o700)
+                report_path = report_dir / "report.json"
+                lifecycle_path = report_dir / "ssh-lifecycle.json"
+                lifecycle_payload = {
+                    "schema": 1,
+                    "event": "cpu_diagnostic_ssh_lifecycle",
+                    "source_sha": source_sha,
+                    "run_id": run_id,
+                    "attempt": attempt,
+                    "config_dir_dev": binding["config_dir_dev"],
+                    "config_dir_ino": binding["config_dir_ino"],
+                    "material_hidden": True,
+                }
+                if report_case != "early_missing":
+                    if report_case == "early_stale":
+                        lifecycle_payload["run_id"] = "123456788"
+                    if report_case == "early_false":
+                        lifecycle_payload["material_hidden"] = False
+                    lifecycle_bytes = json.dumps(
+                        lifecycle_payload,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                    if report_case == "early_symlink":
+                        target = report_dir / "lifecycle-target.json"
+                        target.write_text(lifecycle_bytes, encoding="ascii")
+                        target.chmod(0o600)
+                        lifecycle_path.symlink_to(target.name)
+                    else:
+                        lifecycle_path.write_text(lifecycle_bytes, encoding="ascii")
+                        lifecycle_path.chmod(0o600)
+                if report_case != "missing":
+                    stale_binding = dict(binding)
+                    if report_case == "stale":
+                        stale_binding["run_id"] = "123456788"
+                    if report_case == "replaced":
+                        stale_binding["config_dir_ino"] = int(binding["config_dir_ino"]) + 1
+                    payload = {
+                        "schema": 1,
+                        "ssh_material_safe_to_remove": "true" if report_case == "string_true" else False if report_case == "false" else True,
+                        "ssh_material_binding": stale_binding,
+                    }
+                    if report_case == "symlink":
+                        target = report_dir / "target.json"
+                        target.write_text(json.dumps(payload), encoding="ascii")
+                        target.chmod(0o600)
+                        report_path.symlink_to(target.name)
+                    elif report_case == "duplicate":
+                        report_path.write_text(
+                            '{"schema":1,"schema":1,"source_sha":"'
+                            + source_sha
+                            + '","external_run_id":"'
+                            + run_id
+                            + '","external_run_attempt":"'
+                            + attempt
+                            + '","ssh_material_safe_to_remove":true,"ssh_material_binding":'
+                            + json.dumps(stale_binding)
+                            + "}\n",
+                            encoding="ascii",
+                        )
+                        report_path.chmod(0o600)
+                    else:
+                        report_path.write_text(json.dumps(payload), encoding="ascii")
+                        report_path.chmod(0o600)
+                completed = run_cpu_cleanup(runner_temp)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertTrue((ssh_dir / "id_ed25519").is_file())
 
         with tempfile.TemporaryDirectory(prefix="external-load-ssh-cleanup-") as temp:
             runner_temp = Path(temp)

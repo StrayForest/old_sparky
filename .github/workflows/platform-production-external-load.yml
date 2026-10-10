@@ -1356,8 +1356,13 @@ jobs:
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/external-ssh"
-          control_path="/tmp/old-sparky-external-load-ssh-cpudiag-$GITHUB_RUN_ID"
           install -d -m 700 "$ssh_dir"
+          report_dir="$RUNNER_TEMP/cpu-diagnostic-report"
+          install -d -m 700 "$report_dir"
+          test -d "$report_dir" && test ! -L "$report_dir"
+          test "$(stat -c '%u:%g:%a' -- "$report_dir")" = "$(id -u):$(id -g):700"
+          test ! -e "$report_dir/report.json" && test ! -L "$report_dir/report.json"
+          test ! -e "$report_dir/ssh-lifecycle.json" && test ! -L "$report_dir/ssh-lifecycle.json"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"; rm -f -- "$ssh_scan"; ssh_scan_ok=0
@@ -1375,8 +1380,7 @@ jobs:
           {
             printf '%s\n' 'Host *' '  StrictHostKeyChecking yes'
             printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
-            printf '%s\n' '  ControlMaster auto' '  ControlPersist 15m'
-            printf '  ControlPath %s\n' "$control_path"
+            printf '%s\n' '  ControlMaster no' '  ControlPersist no' '  ControlPath none'
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
 
@@ -1389,7 +1393,6 @@ jobs:
         run: |
           set -euo pipefail
           report_dir="$RUNNER_TEMP/cpu-diagnostic-report"
-          install -d -m 700 "$report_dir"
           report_path="$report_dir/report.json"
           set +e
           /usr/bin/python3 platform/tools/platform_cpu_diagnostic_pair.py parent \
@@ -1419,44 +1422,214 @@ jobs:
       - name: Remove diagnostic SSH material
         if: ${{ always() }}
         shell: bash
-        env:
-          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set +e
           ssh_dir="$RUNNER_TEMP/external-ssh"
-          control_path="/tmp/old-sparky-external-load-ssh-cpudiag-$GITHUB_RUN_ID"
-          cleanup_status=0
-          if [[ -L "$control_path" ]]; then
-            cleanup_status=1
-          elif [[ -S "$control_path" ]]; then
-            ssh -F "$ssh_dir/config" -O exit "$PROD_SSH_USER@$PROD_SSH_HOST" >/dev/null 2>&1 \
-              || cleanup_status=$?
-            [[ ! -e "$control_path" && ! -L "$control_path" ]] || cleanup_status=1
-          elif [[ -e "$control_path" ]]; then
-            cleanup_status=1
-          fi
-          if [[ -L "$ssh_dir" ]]; then
-            cleanup_status=1
-          elif [[ -d "$ssh_dir" ]]; then
-            expected_dir_owner="$(id -u):700"
-            observed_dir_owner="$(stat -c '%u:%a' -- "$ssh_dir" 2>/dev/null)" \
-              || cleanup_status=1
-            if [[ "$observed_dir_owner" == "$expected_dir_owner" ]]; then
-              rm -rf -- "$ssh_dir" || cleanup_status=$?
-            else
-              cleanup_status=1
-            fi
-          elif [[ -e "$ssh_dir" ]]; then
-            cleanup_status=1
-          fi
-          test ! -e "$control_path" && test ! -L "$control_path" || cleanup_status=1
-          test ! -e "$ssh_dir" && test ! -L "$ssh_dir" || cleanup_status=1
-          if [[ ! -e "$control_path" && ! -L "$control_path" \
-              && ! -e "$ssh_dir" && ! -L "$ssh_dir" && "$cleanup_status" == 0 ]]; then
-            exit 0
-          fi
-          exit 1
+          report_path="$RUNNER_TEMP/cpu-diagnostic-report/report.json"
+          lifecycle_path="$RUNNER_TEMP/cpu-diagnostic-report/ssh-lifecycle.json"
+          /usr/bin/python3 -B -I - "$ssh_dir" "$report_path" "$lifecycle_path" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+
+          ssh_dir, report_path, lifecycle_path, source_sha, run_id, attempt = sys.argv[1:]
+
+          def object_without_duplicates(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError
+                  value[key] = item
+              return value
+
+          def metadata_tuple(value):
+              return (
+                  value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+                  value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+              )
+
+          def read_private_json(path, cap):
+              before = os.lstat(path)
+              if (
+                  not stat.S_ISREG(before.st_mode)
+                  or before.st_uid != os.geteuid()
+                  or before.st_gid != os.getegid()
+                  or stat.S_IMODE(before.st_mode) != 0o600
+                  or before.st_nlink != 1
+                  or before.st_size <= 0
+                  or before.st_size > cap
+              ):
+                  raise ValueError
+              fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(fd)
+                  if (
+                      not stat.S_ISREG(opened.st_mode)
+                      or opened.st_uid != os.geteuid()
+                      or opened.st_gid != os.getegid()
+                      or stat.S_IMODE(opened.st_mode) != 0o600
+                      or opened.st_nlink != 1
+                      or metadata_tuple(opened) != metadata_tuple(before)
+                  ):
+                      raise ValueError
+                  chunks = bytearray()
+                  while len(chunks) <= cap:
+                      block = os.read(fd, min(8192, cap + 1 - len(chunks)))
+                      if not block:
+                          break
+                      chunks.extend(block)
+                  finished = os.fstat(fd)
+              finally:
+                  os.close(fd)
+              after = os.lstat(path)
+              if (
+                  len(chunks) > cap
+                  or metadata_tuple(finished) != metadata_tuple(before)
+                  or metadata_tuple(after) != metadata_tuple(before)
+                  or not chunks.endswith(b"\n")
+                  or chunks.count(b"\n") != 1
+              ):
+                  raise ValueError
+              payload = json.loads(
+                  bytes(chunks[:-1]).decode("ascii"), object_pairs_hook=object_without_duplicates
+              )
+              canonical = json.dumps(
+                  payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+              ).encode("ascii") + b"\n"
+              if canonical != bytes(chunks):
+                  raise ValueError
+              return payload
+
+          try:
+              report_dir = os.path.dirname(report_path)
+              report_directory = os.lstat(report_dir)
+              if (
+                  not stat.S_ISDIR(report_directory.st_mode)
+                  or report_directory.st_uid != os.geteuid()
+                  or report_directory.st_gid != os.getegid()
+                  or stat.S_IMODE(report_directory.st_mode) != 0o700
+              ):
+                  raise ValueError
+              if not re.fullmatch(r"[0-9a-f]{40,64}", source_sha):
+                  raise ValueError
+              if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id):
+                  raise ValueError
+              if not re.fullmatch(r"[1-9][0-9]{0,8}", attempt):
+                  raise ValueError
+              lifecycle = read_private_json(lifecycle_path, 2_048)
+              if not isinstance(lifecycle, dict) or set(lifecycle) != {
+                  "schema", "event", "source_sha", "run_id", "attempt",
+                  "config_dir_dev", "config_dir_ino", "material_hidden",
+              }:
+                  raise ValueError
+              if (
+                  type(lifecycle.get("schema")) is not int
+                  or lifecycle["schema"] != 1
+                  or lifecycle.get("event") != "cpu_diagnostic_ssh_lifecycle"
+                  or lifecycle.get("source_sha") != source_sha
+                  or lifecycle.get("run_id") != run_id
+                  or lifecycle.get("attempt") != attempt
+                  or lifecycle.get("material_hidden") is not True
+                  or type(lifecycle.get("config_dir_dev")) is not int
+                  or type(lifecycle.get("config_dir_ino")) is not int
+                  or lifecycle["config_dir_dev"] < 0
+                  or lifecycle["config_dir_ino"] <= 0
+              ):
+                  raise ValueError
+              if os.path.lexists(ssh_dir):
+                  raise ValueError
+              report = read_private_json(report_path, 64_000)
+              if not isinstance(report, dict) or type(report.get("schema")) is not int or report["schema"] != 1:
+                  raise ValueError
+              if report.get("ssh_material_safe_to_remove") is not True:
+                  raise ValueError
+              if (
+                  report.get("source_sha") != source_sha
+                  or report.get("external_run_id") != run_id
+                  or report.get("external_run_attempt") != attempt
+              ):
+                  raise ValueError
+              binding = report.get("ssh_material_binding")
+              expected_keys = {"source_sha", "run_id", "attempt", "config_dir_dev", "config_dir_ino"}
+              if not isinstance(binding, dict) or set(binding) != expected_keys:
+                  raise ValueError
+              if (
+                  binding.get("source_sha") != source_sha
+                  or binding.get("run_id") != run_id
+                  or binding.get("attempt") != attempt
+                  or type(binding.get("config_dir_dev")) is not int
+                  or type(binding.get("config_dir_ino")) is not int
+                  or binding["config_dir_dev"] < 0
+                  or binding["config_dir_ino"] <= 0
+              ):
+                  raise ValueError
+              directory_stat = os.lstat(ssh_dir)
+              if (
+                  not stat.S_ISDIR(directory_stat.st_mode)
+                  or directory_stat.st_uid != os.geteuid()
+                  or directory_stat.st_gid != os.getegid()
+                  or stat.S_IMODE(directory_stat.st_mode) != 0o700
+                  or directory_stat.st_nlink != 2
+                  or (directory_stat.st_dev, directory_stat.st_ino)
+                  != (binding["config_dir_dev"], binding["config_dir_ino"])
+              ):
+                  raise ValueError
+              directory_fd = os.open(ssh_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  opened_directory = os.fstat(directory_fd)
+                  if (
+                      not stat.S_ISDIR(opened_directory.st_mode)
+                      or opened_directory.st_uid != os.geteuid()
+                      or opened_directory.st_gid != os.getegid()
+                      or stat.S_IMODE(opened_directory.st_mode) != 0o700
+                      or opened_directory.st_nlink != 2
+                      or metadata_tuple(opened_directory) != metadata_tuple(directory_stat)
+                  ):
+                      raise ValueError
+                  if set(os.listdir(directory_fd)) != {"config", "id_ed25519", "known_hosts"}:
+                      raise ValueError
+                  for name in ("config", "id_ed25519", "known_hosts"):
+                      fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+                      try:
+                          member = os.fstat(fd)
+                          current_member = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                          if (
+                              not stat.S_ISREG(member.st_mode)
+                              or member.st_uid != os.geteuid()
+                              or member.st_gid != os.getegid()
+                              or stat.S_IMODE(member.st_mode) != 0o600
+                              or member.st_nlink != 1
+                              or (member.st_dev, member.st_ino)
+                              != (current_member.st_dev, current_member.st_ino)
+                              or metadata_tuple(member) != metadata_tuple(current_member)
+                          ):
+                              raise ValueError
+                          os.unlink(name, dir_fd=directory_fd)
+                      finally:
+                          os.close(fd)
+                  if os.listdir(directory_fd):
+                      raise ValueError
+              finally:
+                  os.close(directory_fd)
+              current = os.lstat(ssh_dir)
+              if (
+                  not stat.S_ISDIR(current.st_mode)
+                  or current.st_uid != os.geteuid()
+                  or current.st_gid != os.getegid()
+                  or stat.S_IMODE(current.st_mode) != 0o700
+                  or current.st_nlink != 2
+                  or (current.st_dev, current.st_ino)
+                  != (directory_stat.st_dev, directory_stat.st_ino)
+              ):
+                  raise ValueError
+              os.rmdir(ssh_dir)
+              if os.path.lexists(ssh_dir):
+                  raise ValueError
+          except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit(1)
+          PY
 
   fixture-finalize:
     name: Signal fixture completion and collect origin evidence
