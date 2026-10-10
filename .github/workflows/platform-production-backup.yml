@@ -313,6 +313,14 @@ jobs:
               "platform_build_node_cache.py",
               "platform_storage_maintenance.py",
           )
+          expected_source_modes = {
+              "platform_backup_restore_drill.py": 0o755,
+              "platform_disk_policy.py": 0o644,
+              "platform_live_qa_guard.py": 0o755,
+              "platform_release_retention.py": 0o755,
+              "platform_build_node_cache.py": 0o644,
+              "platform_storage_maintenance.py": 0o755,
+          }
           with zipfile.ZipFile(bundle_path) as archive:
               infos = archive.infolist()
               expected_paths = {f"platform-backup-verifier/{name}" for name in expected_names}
@@ -336,7 +344,7 @@ jobs:
                       raise SystemExit("backup verifier manifest row is not closed")
                   path = row.get("path")
                   name = path.removeprefix("platform/tools/") if isinstance(path, str) else ""
-                  if name not in expected_names or name in seen or row.get("source_mode") != 0o644 or type(row.get("size")) is not int or row["size"] <= 0 or re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", ""))) is None:
+                  if name not in expected_names or name in seen or row.get("source_mode") != expected_source_modes.get(name) or type(row.get("size")) is not int or row["size"] <= 0 or re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", ""))) is None:
                       raise SystemExit("backup verifier manifest row binding is invalid")
                   seen.add(name)
                   item = by_name[f"platform-backup-verifier/{name}"]
@@ -629,6 +637,14 @@ jobs:
               "platform_build_node_cache.py",
               "platform_storage_maintenance.py",
           )
+          expected_source_modes = {
+              "platform_backup_restore_drill.py": 0o755,
+              "platform_disk_policy.py": 0o644,
+              "platform_live_qa_guard.py": 0o755,
+              "platform_release_retention.py": 0o755,
+              "platform_build_node_cache.py": 0o644,
+              "platform_storage_maintenance.py": 0o755,
+          }
           try:
               root_st = root.lstat()
           except FileNotFoundError:
@@ -746,6 +762,14 @@ jobs:
               "platform_build_node_cache.py",
               "platform_storage_maintenance.py",
           )
+          expected_source_modes = {
+              "platform_backup_restore_drill.py": 0o755,
+              "platform_disk_policy.py": 0o644,
+              "platform_live_qa_guard.py": 0o755,
+              "platform_release_retention.py": 0o755,
+              "platform_build_node_cache.py": 0o644,
+              "platform_storage_maintenance.py": 0o755,
+          }
           raw = archive_path.read_bytes()
           if hashlib.sha256(raw).hexdigest() != expected_archive_sha:
               raise SystemExit("backup helper archive digest mismatch")
@@ -773,7 +797,7 @@ jobs:
                       raise SystemExit("backup helper manifest row is not closed")
                   path = row.get("path")
                   name = path.removeprefix("platform/tools/") if isinstance(path, str) else ""
-                  if name not in names or name in seen or row.get("source_mode") != 0o644 or type(row.get("size")) is not int or not 0 < row["size"] <= 2 * 1024 * 1024 or re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", ""))) is None:
+                  if name not in names or name in seen or row.get("source_mode") != expected_source_modes.get(name) or type(row.get("size")) is not int or not 0 < row["size"] <= 2 * 1024 * 1024 or re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", ""))) is None:
                       raise SystemExit("backup helper manifest row binding is invalid")
                   seen.add(name)
                   info = by_name[f"platform-backup-verifier/{name}"]

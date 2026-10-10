@@ -1041,12 +1041,32 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             workflow.index('printf \'%s\\n\' "$public_report"'),
         )
 
-        def workflow_python(marker: str) -> str:
-            marker_start = workflow.index(marker)
-            body_start = workflow.index("\n", marker_start) + 1
-            body_end = workflow.index("\n          PY", body_start)
-            return textwrap.dedent(workflow[body_start:body_end])
+        def workflow_python(marker: str, source: str = workflow) -> str:
+            marker_start = source.index(marker)
+            body_start = source.index("\n", marker_start) + 1
+            body_end = source.index("\n          PY", body_start)
+            return textwrap.dedent(source[body_start:body_end])
 
+        def run_inline(
+            script: str, *arguments: str
+        ) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, "-I", "-B", "-", *arguments],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+        producer_workflow = (
+            REPO_ROOT / ".github/workflows/platform-security.yml"
+        ).read_text(encoding="utf-8")
+        producer_script = workflow_python(
+            '/usr/bin/python3 -I - "$GITHUB_WORKSPACE" '
+            '"$RUNNER_TEMP/platform-backup-verifier.zip"',
+            producer_workflow,
+        )
         attestation_script = workflow_python(
             '/usr/bin/python3 -I -B - "$artifact_dir/attestation.json"'
         )
@@ -1085,6 +1105,74 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "platform_build_node_cache.py",
                 "platform_storage_maintenance.py",
             )
+            source_modes = {
+                "platform_backup_restore_drill.py": 0o755,
+                "platform_disk_policy.py": 0o644,
+                "platform_live_qa_guard.py": 0o755,
+                "platform_release_retention.py": 0o755,
+                "platform_build_node_cache.py": 0o644,
+                "platform_storage_maintenance.py": 0o755,
+            }
+
+            producer_root = fixture_root / "checkout"
+            producer_tools = producer_root / "platform" / "tools"
+            producer_tools.mkdir(parents=True)
+            for name in names:
+                source = REPO_ROOT / "platform" / "tools" / name
+                self.assertEqual(
+                    stat.S_IMODE(source.lstat().st_mode), source_modes[name], name
+                )
+                target = producer_tools / name
+                target.write_bytes(source.read_bytes())
+                target.chmod(source_modes[name])
+            producer_archive = fixture_root / "producer-bundle.zip"
+            producer_result = run_inline(
+                producer_script,
+                str(producer_root),
+                str(producer_archive),
+                source_sha,
+                "StrayForest/old_sparky",
+            )
+            self.assertEqual(producer_result.returncode, 0, producer_result.stderr)
+            with zipfile.ZipFile(producer_archive) as produced:
+                produced_manifest = json.loads(
+                    produced.read("platform-backup-verifier/manifest.json")
+                )
+                produced_rows = {
+                    row["path"].removeprefix("platform/tools/"): row
+                    for row in produced_manifest["files"]
+                }
+                self.assertEqual(
+                    {name: row["source_mode"] for name, row in produced_rows.items()},
+                    source_modes,
+                )
+                for name in names:
+                    info = produced.getinfo(f"platform-backup-verifier/{name}")
+                    self.assertEqual(
+                        stat.S_IMODE(info.external_attr >> 16), 0o444, name
+                    )
+                    self.assertEqual(
+                        hashlib.sha256(produced.read(info)).hexdigest(),
+                        produced_rows[name]["sha256"],
+                        name,
+                    )
+            producer_bundle_valid = run_inline(
+                bundle_validation_script, str(producer_archive), source_sha
+            )
+            self.assertEqual(
+                producer_bundle_valid.returncode, 0, producer_bundle_valid.stderr
+            )
+            wrong_mode_name = "platform_disk_policy.py"
+            (producer_tools / wrong_mode_name).chmod(0o755)
+            wrong_mode_result = run_inline(
+                producer_script,
+                str(producer_root),
+                str(fixture_root / "wrong-mode.zip"),
+                source_sha,
+                "StrayForest/old_sparky",
+            )
+            self.assertNotEqual(wrong_mode_result.returncode, 0)
+
             payloads = {
                 name: f"bounded fixture {name}\n".encode("ascii")
                 for name in names
@@ -1092,7 +1180,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             manifest_rows = [
                 {
                     "path": f"platform/tools/{name}",
-                    "source_mode": 0o644,
+                    "source_mode": source_modes[name],
                     "size": len(payloads[name]),
                     "sha256": hashlib.sha256(payloads[name]).hexdigest(),
                 }
@@ -1132,18 +1220,6 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         )
                         duplicate.external_attr = (stat.S_IFREG | 0o444) << 16
                         archive.writestr(duplicate, payloads[names[0]])
-
-            def run_inline(
-                script: str, *arguments: str
-            ) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(
-                    [sys.executable, "-I", "-B", "-", *arguments],
-                    input=script,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=10,
-                )
 
             write_bundle()
             bundle_sha = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
@@ -1237,6 +1313,19 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         }
                     },
                     "inner member digest",
+                ),
+                (
+                    {
+                        "manifest": {
+                            **valid_manifest,
+                            "files": [
+                                {**manifest_rows[1], "source_mode": 0o755},
+                                *manifest_rows[:1],
+                                *manifest_rows[2:],
+                            ],
+                        }
+                    },
+                    "wrong source mode",
                 ),
                 ({"duplicate_member": True}, "duplicate ZIP member"),
                 ({"member_mode": stat.S_IFLNK | 0o777}, "symlink ZIP member"),
