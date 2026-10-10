@@ -764,7 +764,9 @@ jobs:
           PY
           recovery_stage=bootstrap_extract
           bootstrap_tool="$install_stage/platform_recovery_bootstrap.py"
-          /usr/bin/python3 -I - "$bundle_path" "$bootstrap_tool" <<'PY'
+          /usr/bin/python3 -I - "$bundle_path" "$install_stage" "$source_sha" <<'PY'
+          import hashlib
+          import json
           import os
           import stat
           import sys
@@ -772,25 +774,96 @@ jobs:
           from pathlib import Path
           bundle = Path(sys.argv[1])
           destination = Path(sys.argv[2])
-          expected = "platform-recovery-bootstrap/platform_recovery_bootstrap.py"
+          expected_source_sha = sys.argv[3]
+          member_root = "platform-recovery-bootstrap/"
+          required = (
+              "platform_recovery_bootstrap.py",
+              "platform_release_systemd_state.py",
+              "platform_release_transaction.py",
+          )
+          max_file_bytes = 768 * 1024
+          max_manifest_bytes = 256 * 1024
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError("duplicate manifest key")
+                  result[key] = value
+              return result
+          directory = destination.lstat()
+          if (stat.S_ISLNK(directory.st_mode) or not stat.S_ISDIR(directory.st_mode)
+                  or directory.st_uid != 0 or directory.st_gid != 0
+                  or stat.S_IMODE(directory.st_mode) != 0o700):
+              raise SystemExit("recovery bootstrap staging directory is unsafe")
           with zipfile.ZipFile(bundle) as archive:
-              infos = [info for info in archive.infolist() if info.filename == expected]
-              if len(infos) != 1:
-                  raise SystemExit("immutable recovery bootstrap member is missing")
-              info = infos[0]
-              mode = (info.external_attr >> 16) & 0o177777
-              if info.create_system != 3 or info.is_dir() or not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o444:
-                  raise SystemExit("immutable recovery bootstrap member metadata is unsafe")
-              data = archive.read(info)
-              if len(data) != info.file_size:
-                  raise SystemExit("immutable recovery bootstrap member is truncated")
-          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
-          with os.fdopen(descriptor, "wb") as stream:
-              stream.write(data)
-              stream.flush()
-              os.fsync(stream.fileno())
-          os.chown(destination, 0, 0)
-          os.chmod(destination, 0o444)
+              infos = archive.infolist()
+              names = [info.filename for info in infos]
+              if len(names) != len(set(names)):
+                  raise SystemExit("immutable recovery archive has duplicate members")
+              manifest_name = member_root + "manifest.json"
+              manifest_infos = [info for info in infos if info.filename == manifest_name]
+              if len(manifest_infos) != 1:
+                  raise SystemExit("immutable recovery manifest is missing")
+              manifest_info = manifest_infos[0]
+              manifest_mode = (manifest_info.external_attr >> 16) & 0o177777
+              if (manifest_info.create_system != 3 or manifest_info.is_dir()
+                      or not stat.S_ISREG(manifest_mode)
+                      or stat.S_IMODE(manifest_mode) != 0o444
+                      or manifest_info.file_size > max_manifest_bytes):
+                  raise SystemExit("immutable recovery manifest metadata is unsafe")
+              manifest_raw = archive.read(manifest_info)
+              if len(manifest_raw) != manifest_info.file_size:
+                  raise SystemExit("immutable recovery manifest is truncated")
+              manifest = json.loads(manifest_raw.decode("ascii"), object_pairs_hook=unique_object)
+              if (not isinstance(manifest, dict) or manifest.get("schema") != 1
+                      or manifest.get("source_sha") != expected_source_sha
+                      or "recover_pending" not in manifest.get("capabilities", [])):
+                  raise SystemExit("immutable recovery manifest source is invalid")
+              records = manifest.get("files")
+              if not isinstance(records, list):
+                  raise SystemExit("immutable recovery manifest file list is invalid")
+              selected = {}
+              for record in records:
+                  if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
+                      raise SystemExit("immutable recovery manifest record is invalid")
+                  path = record.get("path")
+                  if path in required:
+                      if path in selected or record.get("mode") != 0o444:
+                          raise SystemExit("immutable recovery import record is invalid")
+                      selected[path] = record.get("sha256")
+              if set(selected) != set(required):
+                  raise SystemExit("immutable recovery import closure is incomplete")
+              extracted = []
+              for relative in required:
+                  name = member_root + relative
+                  member_infos = [info for info in infos if info.filename == name]
+                  if len(member_infos) != 1:
+                      raise SystemExit("immutable recovery import member is missing")
+                  info = member_infos[0]
+                  mode = (info.external_attr >> 16) & 0o177777
+                  if (info.create_system != 3 or info.is_dir() or not stat.S_ISREG(mode)
+                          or stat.S_IMODE(mode) != 0o444 or info.file_size > max_file_bytes):
+                      raise SystemExit("immutable recovery import member metadata is unsafe")
+                  data = archive.read(info)
+                  if (len(data) != info.file_size
+                          or hashlib.sha256(data).hexdigest() != selected[relative]):
+                      raise SystemExit("immutable recovery import member digest is invalid")
+                  extracted.append((relative, data))
+          for relative, data in extracted:
+              target = destination / relative
+              descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
+              with os.fdopen(descriptor, "wb") as stream:
+                  stream.write(data)
+                  stream.flush()
+                  os.fsync(stream.fileno())
+              os.chown(target, 0, 0)
+              os.chmod(target, 0o444)
+              metadata = target.lstat()
+              if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+                      or metadata.st_gid != 0 or metadata.st_nlink != 1
+                      or stat.S_IMODE(metadata.st_mode) != 0o444
+                      or metadata.st_size != len(data)):
+                  raise SystemExit("immutable recovery import member install is unsafe")
           PY
           recovery_stage=generation_install
           /usr/bin/python3 -I -B "$bootstrap_tool" install \
