@@ -1174,11 +1174,14 @@ jobs:
             local sanitizer_rc=1
             local builder_run_ready=0
             local cleanup_stage=none
+            local cleanup_predicate=none
             mark_cleanup_failure() {
               local stage="$1"
+              local predicate="$2"
               cleanup_rc=1
               if [[ "$cleanup_stage" == "none" ]]; then
                 cleanup_stage="$stage"
+                cleanup_predicate="$predicate"
               fi
             }
             trap - EXIT
@@ -1326,59 +1329,70 @@ jobs:
               local output_metadata=""
               local output_dir_metadata=""
               local output_dir_id=""
-              if [[ -n "$size_projection_path" && -f "$size_projection_path" \
-                && ! -L "$size_projection_path" && -n "$public_projection_path" \
-                && -f "$public_projection_path" && ! -L "$public_projection_path" ]]; then
+              if [[ -z "$size_projection_path" || ! -f "$size_projection_path" \
+                || -L "$size_projection_path" ]]; then
+                mark_cleanup_failure projection_copy source_file
+              elif [[ -z "$public_projection_path" || ! -f "$public_projection_path" \
+                || -L "$public_projection_path" ]]; then
+                mark_cleanup_failure projection_copy destination_file
+              else
                 output_dir_metadata="$(stat -c '%u:%g:%a:%h:%F' -- "$public_projection_dir" 2>/dev/null)"
                 output_dir_id="$(stat -c '%d:%i' -- "$public_projection_dir" 2>/dev/null)"
                 output_metadata="$(stat -c '%u:%g:%a:%h:%F' -- "$public_projection_path" 2>/dev/null)"
-                if [[ -d "$public_projection_dir" && ! -L "$public_projection_dir" \
-                  && "$output_dir_metadata" == "${runner_uid}:${runner_gid}:700:2:directory" \
-                  && -n "$public_projection_dir_id" && "$output_dir_id" == "$public_projection_dir_id" \
-                  && ( "$output_metadata" == "${runner_uid}:${runner_gid}:600:1:regular file"
-                    || "$output_metadata" == "${runner_uid}:${runner_gid}:600:1:regular empty file" ) ]]; then
-                  sudo -n /usr/bin/install -o "$runner_uid" -g "$runner_gid" -m 0600 \
-                    -- "$size_projection_path" "$public_projection_path" 2>/dev/null || mark_cleanup_failure projection_copy
-                  copied_bytes="$(stat -c '%s' -- "$public_projection_path" 2>/dev/null)"
-                  if [[ ! "$copied_bytes" =~ ^[0-9]{1,5}$ ]] || (( copied_bytes > 8192 )) \
-                    || ! sudo -n /usr/bin/cmp -s -- "$size_projection_path" "$public_projection_path"; then
-                    mark_cleanup_failure projection_copy
-                  fi
+                if [[ ! -d "$public_projection_dir" || -L "$public_projection_dir" ]]; then
+                  mark_cleanup_failure projection_copy directory_type
+                elif [[ "$output_dir_metadata" != "${runner_uid}:${runner_gid}:700:2:directory" ]]; then
+                  mark_cleanup_failure projection_copy directory_metadata
+                elif [[ -z "$public_projection_dir_id" || "$output_dir_id" != "$public_projection_dir_id" ]]; then
+                  mark_cleanup_failure projection_copy directory_identity
+                elif [[ "$output_metadata" != "${runner_uid}:${runner_gid}:600:1:regular file" \
+                  && "$output_metadata" != "${runner_uid}:${runner_gid}:600:1:regular empty file" ]]; then
+                  mark_cleanup_failure projection_copy destination_metadata
                 else
-                  mark_cleanup_failure projection_copy
+                  if ! sudo -n /usr/bin/install -o "$runner_uid" -g "$runner_gid" -m 0600 \
+                    -- "$size_projection_path" "$public_projection_path" 2>/dev/null; then
+                    mark_cleanup_failure projection_copy install_failed
+                  fi
+                  copied_bytes="$(stat -c '%s' -- "$public_projection_path" 2>/dev/null)"
+                  if [[ ! "$copied_bytes" =~ ^[0-9]{1,5}$ ]] || (( copied_bytes > 8192 )); then
+                    mark_cleanup_failure projection_copy copied_size
+                  elif ! sudo -n /usr/bin/cmp -s -- "$size_projection_path" "$public_projection_path"; then
+                    mark_cleanup_failure projection_copy content_mismatch
+                  fi
                 fi
-              else
-                mark_cleanup_failure projection_copy
               fi
             fi
             if [[ -n "$release_root" ]]; then
               if [[ -d "$release_root" && ! -L "$release_root" ]]; then
                 current_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root" 2>/dev/null)"
                 if [[ -n "$release_root_id" && "$current_id" == "$release_root_id" ]]; then
-                  sudo -n /bin/rm -rf -- "$release_root" 2>/dev/null || mark_cleanup_failure release_root_remove
+                  sudo -n /bin/rm -rf -- "$release_root" 2>/dev/null || mark_cleanup_failure release_root_remove remove_failed
                 else
-                  mark_cleanup_failure release_root_remove
+                  mark_cleanup_failure release_root_remove identity_mismatch
                 fi
               elif [[ -e "$release_root" || -L "$release_root" ]]; then
-                mark_cleanup_failure release_root_remove
+                mark_cleanup_failure release_root_remove unexpected_entry
               fi
-              [[ ! -e "$release_root" && ! -L "$release_root" ]] || mark_cleanup_failure release_root_remove
+              [[ ! -e "$release_root" && ! -L "$release_root" ]] || mark_cleanup_failure release_root_remove residual_entry
             fi
             disk_after_bytes="$(free_bytes 2>/dev/null || true)"
-            if [[ ! "$disk_after_bytes" =~ ^[0-9]+$ ]] || (( disk_after_bytes < min_free_bytes )); then
-              mark_cleanup_failure disk_floor
+            if [[ ! "$disk_after_bytes" =~ ^[0-9]+$ ]]; then
+              mark_cleanup_failure disk_floor free_value_invalid
+            elif (( disk_after_bytes < min_free_bytes )); then
+              mark_cleanup_failure disk_floor minimum_not_met
             fi
             if (( cleanup_rc != 0 )); then
               if [[ "$cleanup_stage" == "disk_floor" ]]; then
                 if [[ "$disk_after_bytes" =~ ^[0-9]{1,20}$ ]]; then
-                  printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=disk_floor disk_after_bytes=%s min_free_bytes=%s\n' \
-                    "$disk_after_bytes" "$min_free_bytes"
+                  printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=%s predicate=%s disk_after_bytes=%s min_free_bytes=%s\n' \
+                    "$cleanup_stage" "$cleanup_predicate" "$disk_after_bytes" "$min_free_bytes"
                 else
-                  printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=disk_floor disk_after_bytes=unknown min_free_bytes=%s\n' \
-                    "$min_free_bytes"
+                  printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=%s predicate=%s disk_after_bytes=unknown min_free_bytes=%s\n' \
+                    "$cleanup_stage" "$cleanup_predicate" "$min_free_bytes"
                 fi
               else
-                printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=%s\n' "$cleanup_stage"
+                printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup stage=%s predicate=%s\n' \
+                  "$cleanup_stage" "$cleanup_predicate"
               fi
               exit 1
             fi

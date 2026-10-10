@@ -4189,7 +4189,7 @@ fail 'private lock detail must not cross the public channel'
         ).read_text()
         self.assertIn("--extract-bootstrap-to", size_projection_helper)
         self.assertIn('public_projection_dir_id="$(stat -c \'%d:%i\' -- "$public_projection_dir" 2>/dev/null)"', real)
-        self.assertIn('"$output_dir_id" == "$public_projection_dir_id"', real)
+        self.assertIn('"$output_dir_id" != "$public_projection_dir_id"', real)
         self.assertIn('"${runner_uid}:${runner_gid}:700:2:directory"', real)
         self.assertIn("Upload evidence-only release size projection", real)
         self.assertIn("path: ${{ steps.real-runtime-build.outputs.projection_path }}", real)
@@ -4204,7 +4204,7 @@ fail 'private lock detail must not cross the public channel'
             placeholder_setup,
         )
         self.assertIn(
-            '|| "$output_metadata" == "${runner_uid}:${runner_gid}:600:1:regular empty file"',
+            '&& "$output_metadata" != "${runner_uid}:${runner_gid}:600:1:regular empty file"',
             real,
         )
         upload_start = real.index("- name: Upload evidence-only release size projection")
@@ -4218,16 +4218,43 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn('"$(stat -c \'%d:%i\' -- "$projection_dir")" == "$PROJECTION_DIR_ID"', public_cleanup)
         self.assertIn('"$(stat -c \'%u:%g:%a:%h:%F\' -- "$projection_dir")" == "$(id -u):$(id -g):700:2:directory"', public_cleanup)
         self.assertIn("local cleanup_stage=none", real)
+        self.assertIn("local cleanup_predicate=none", real)
         self.assertIn('if [[ "$cleanup_stage" == "none" ]]; then', real)
+        self.assertIn('cleanup_predicate="$predicate"', real)
+        for cleanup_predicate in (
+            "source_file",
+            "destination_file",
+            "directory_type",
+            "directory_metadata",
+            "directory_identity",
+            "destination_metadata",
+            "install_failed",
+            "copied_size",
+            "content_mismatch",
+        ):
+            self.assertIn(f"mark_cleanup_failure projection_copy {cleanup_predicate}", real)
+        for cleanup_predicate in (
+            "remove_failed",
+            "identity_mismatch",
+            "unexpected_entry",
+            "residual_entry",
+        ):
+            self.assertIn(f"mark_cleanup_failure release_root_remove {cleanup_predicate}", real)
+        for cleanup_predicate in ("free_value_invalid", "minimum_not_met"):
+            self.assertIn(f"mark_cleanup_failure disk_floor {cleanup_predicate}", real)
         self.assertIn("mark_cleanup_failure projection_copy", real)
         self.assertIn("mark_cleanup_failure release_root_remove", real)
         self.assertIn("mark_cleanup_failure disk_floor", real)
+        self.assertIn("predicate=%s", real)
         self.assertIn("reason=cleanup stage=%s", real)
         self.assertIn(
-            "reason=cleanup stage=disk_floor disk_after_bytes=%s min_free_bytes=%s",
+            "reason=cleanup stage=%s predicate=%s disk_after_bytes=%s min_free_bytes=%s",
             real,
         )
-        self.assertIn("disk_after_bytes=unknown min_free_bytes=%s", real)
+        self.assertIn(
+            "reason=cleanup stage=%s predicate=%s disk_after_bytes=unknown min_free_bytes=%s",
+            real,
+        )
         cleanup_step = self._workflow_step_run(
             workflow, "Remove exact release size projection temporary directory"
         )
