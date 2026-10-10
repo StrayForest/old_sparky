@@ -2219,6 +2219,36 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover)
         self.assertIn("platform_recover_pending.sh", recover)
         self.assertIn("cleanup_remote_upload", recover)
+        recovery_transfer = recover[
+            recover_transfer:recover_install
+        ]
+        self.assertIn(
+            '"$(stat -c \'%F:%u:%g:%h:%a\' "$stage")" = "directory:0:0:2:700"',
+            recovery_transfer,
+        )
+        self.assertIn(
+            '"$(stat -c \'%F:%u:%g:%h:%a\' "$stage" 2>/dev/null)" == "directory:0:0:2:700"',
+            recovery_transfer,
+        )
+        self.assertIn(
+            '"$(stat -c \'%u:%h:%a\' "$bundle")" = "0:1:600"',
+            recovery_transfer,
+        )
+        self.assertEqual(recovery_transfer.count("directory:0:0:2:700"), 3)
+        self.assertIn("remote_stage_identity=\"\"", recovery_transfer)
+        self.assertIn("remote_stage_result=", recovery_transfer)
+        self.assertIn(
+            "IFS='|' read -r remote_stage remote_stage_identity",
+            recovery_transfer,
+        )
+        self.assertEqual(recovery_transfer.count("%d:%i"), 3)
+        self.assertIn('"$expected_identity"', recovery_transfer)
+        self.assertIn('rmdir -- "$d" 2>/dev/null || true', recovery_transfer)
+        self.assertIn(
+            '"$(stat -c \'%u:%h:%a\' "$final")" = "0:1:600"',
+            recovery_transfer,
+        )
+        self.assertNotIn('"0:1:700"', recovery_transfer)
         self.assertNotIn("$runtime/current/tools", recover)
         self.assertNotIn("platform_release_rollback.sh", recover)
 

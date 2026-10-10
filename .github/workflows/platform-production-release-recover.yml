@@ -530,21 +530,26 @@ jobs:
             -i "$SSH_DIR/id_ed25519"
           )
           remote_stage=""
+          remote_stage_identity=""
+          remote_stage_result=""
           cleanup_remote_upload() {
             local status="$?"
             trap - EXIT
             if [[ -n "$remote_stage" ]]; then
               set +e
               timeout --foreground 10s ssh "${ssh_common[@]}" \
-                "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage'" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$remote_stage_identity'" \
                 >/dev/null 2>&1 <<'CLEANUP'
           set -u
           stage="$1"
+          expected_identity="$2"
           [[ "$stage" =~ ^/tmp/oldsparky-recovery-upload\.[A-Za-z0-9]{6}$ ]] || exit 0
+          [[ "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]] || exit 0
           if [[ -e "$stage" || -L "$stage" ]]; then
             [[ -d "$stage" && ! -L "$stage" ]] || exit 0
             [[ "$(id -u)" -eq 0 ]] || exit 0
-            [[ "$(stat -c '%u:%h:%a' "$stage" 2>/dev/null)" == "0:1:700" ]] || exit 0
+            [[ "$(stat -c '%F:%u:%g:%h:%a' "$stage" 2>/dev/null)" == "directory:0:0:2:700" ]] || exit 0
+            [[ "$(stat -c '%d:%i' "$stage" 2>/dev/null)" == "$expected_identity" ]] || exit 0
             rm -f -- "$stage/bundle.zip" || true
             rmdir -- "$stage" || true
           fi
@@ -554,18 +559,23 @@ jobs:
             exit "$status"
           }
           trap cleanup_remote_upload EXIT
-          remote_stage="$(timeout --foreground 300s ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" 'umask 077; test "$(id -u)" -eq 0; d="$(mktemp -d --tmpdir=/tmp oldsparky-recovery-upload.XXXXXX)"; chmod 700 "$d"; printf "%s" "$d"')"
+          remote_stage_result="$(timeout --foreground 300s ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" 'set -euo pipefail; umask 077; test "$(id -u)" -eq 0; d="$(mktemp -d --tmpdir=/tmp oldsparky-recovery-upload.XXXXXX)"; chmod 700 "$d"; if [[ ! -d "$d" || -L "$d" || "$(stat -c '\''%F:%u:%g:%h:%a'\'' "$d")" != "directory:0:0:2:700" ]]; then rmdir -- "$d" 2>/dev/null || true; exit 1; fi; printf "%s|%s" "$d" "$(stat -c '\''%d:%i'\'' "$d")"')"
+          IFS='|' read -r remote_stage remote_stage_identity <<<"$remote_stage_result"
           [[ "$remote_stage" =~ ^/tmp/oldsparky-recovery-upload\.[A-Za-z0-9]{6}$ ]]
+          [[ "$remote_stage_identity" =~ ^[0-9]+:[0-9]+$ ]]
           timeout --foreground 300s scp -p "${ssh_common[@]}" "$BUNDLE_PATH" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/bundle.zip"
-          timeout --foreground 300s ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA'" <<'REMOTE'
+          timeout --foreground 300s ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$remote_stage_identity' '$BUNDLE_SHA'" <<'REMOTE'
           set -Eeuo pipefail
           stage="$1"
-          expected="$2"
+          expected_identity="$2"
+          expected="$3"
           [[ "$stage" =~ ^/tmp/oldsparky-recovery-upload\.[A-Za-z0-9]{6}$ ]]
+          [[ "$expected_identity" =~ ^[0-9]+:[0-9]+$ ]]
           [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
           test "$(id -u)" -eq 0
           test -d "$stage" && test ! -L "$stage"
-          test "$(stat -c '%u:%h:%a' "$stage")" = "0:1:700"
+          test "$(stat -c '%F:%u:%g:%h:%a' "$stage")" = "directory:0:0:2:700"
+          test "$(stat -c '%d:%i' "$stage")" = "$expected_identity"
           bundle="$stage/bundle.zip"
           test -f "$bundle" && test ! -L "$bundle"
           test "$(stat -c '%u:%h:%a' "$bundle")" = "0:1:600"
