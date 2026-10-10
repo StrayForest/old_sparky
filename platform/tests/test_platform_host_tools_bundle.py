@@ -967,7 +967,7 @@ class HostToolsBundleTests(unittest.TestCase):
             "      - name: Validate host-tools artifact envelope and bundle", 1
         )[1].split("      - name: Validate root SSH identity and installed generation", 1)[0]
         self.assertIn(
-            'grep -Fqx "capability=retained_load_source_binding" "$inner_root/capabilities.txt"',
+            'if capabilities_path.read_text(encoding="ascii") != expected_capabilities:',
             artifact_validation,
         )
         self.assertIn("needs.host-capability-preflight.outputs.host_tools_sha", preflight)
@@ -1018,7 +1018,7 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertEqual(handoff_steps[0].count('certificate.get("extensions", certificate)'), 1)
         self.assertEqual(production.count('certificate.get("extensions", certificate)'), 1)
         production_policy_start = production.index("          attestation_matches = 0\n")
-        production_policy_end = production.index("\n          expected_files = {", production_policy_start)
+        production_policy_end = production.index("\n          common_files = {", production_policy_start)
         production_policy = "\n".join(
             line[10:] if line.startswith("          ") else line
             for line in production[production_policy_start:production_policy_end].splitlines()
@@ -2837,6 +2837,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                     "PROD_SSH_USER": "operator",
                     "PROD_SSH_KEY": "fixture-key",
                     "HOST_TOOLS_SHA": SOURCE_SHA,
+                    "HOST_TOOLS_TOOLSET_VERSION": "production-host-tools-v4",
                     "HOST_TOOLS_GENERATION": expected_generation,
                     "HOST_TOOLS_DISPATCHER": expected_dispatcher,
                     "HOST_TOOLS_SSH_DIR": str(ssh_dir),
