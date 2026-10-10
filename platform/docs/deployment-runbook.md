@@ -369,18 +369,19 @@ health, Cloudflare and maintenance timer enablement, and installs the
 off-site-backup unit/timer without silently enabling off-site backup before its
 manual restore-drill gate.
 
-New shared virtual environments and pip-installed code use a local `umask 022`
-subshell so API/worker identities can traverse and read them; the installer's
-outer `umask 077` still protects receipts, temporary files and service envs.
+New environments and pip-installed code use a local `umask 022` so API/worker
+identities can read them; outer `umask 077` still protects receipts and envs.
 Candidate cache cleanup permits service-owned entries only after
-`legacy-services-restored`, fresh readiness and loaded web
-`KillMode=control-group`; dirfd/no-follow checks apply only to that exact cache
-subtree. Other candidate entries remain root-owned; unsafe state retains receipt.
+`legacy-services-restored`, fresh readiness and web `KillMode=control-group`;
+dirfd/no-follow checks stay within that subtree. Other entries stay root-owned; unsafe state retains the receipt.
 
 If candidate activation fails, the workflow records read-only filesystem,
-inode, mount and API sandbox facts, plus a sanitized systemd snapshot and the
-last three minutes of API, worker and web journals before retaining the receipt
-for the documented recovery decision.
+inode, mount and API sandbox facts, a sanitized systemd snapshot and three
+minutes of API, worker and web journals, then retains the receipt for recovery.
+If it cannot accept one complete `RELEASE_DEPLOY` marker, it emits a closed `RELEASE_REMOTE_DIAGNOSTIC`: stages are `pre_ssh_dev_head`, `remote_dispatch` or `marker_validation`; reasons are
+`dev_head_probe_failed`, `dev_head_mismatch`, `remote_failed_without_marker` or `marker_missing_or_invalid`.
+It includes only stdout/stderr byte counts. `ssh_rc` is local timeout/SSH status,
+or `unavailable` before SSH; valid deployment markers remain authoritative.
 
 Use `release-state-machine.md` for phase-specific recovery. An ERR/TERM/INT
 after the snapshot may restore the old runtime and only services that were

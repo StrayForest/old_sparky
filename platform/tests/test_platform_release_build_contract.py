@@ -5131,7 +5131,10 @@ cleanup
             self.assertIn('Authorization: Bearer $GH_TOKEN', body)
             self.assertIn("current dev head SHA is malformed", body)
             self.assertIn('payload["commit"]["sha"]', body)
-            self.assertIn('test "$dev_sha" = "$TARGET_SHA"', body)
+        self.assertIn('test "$dev_sha" = "$TARGET_SHA"', upload)
+        self.assertIn('if [[ "$dev_sha" != "$TARGET_SHA" ]]; then', activation)
+        self.assertIn("emit_pre_ssh_diagnostic dev_head_mismatch", activation)
+        self.assertIn('exit 1', activation)
 
         first_api_read = upload.index("branch_json=")
         first_remote_dispatch = upload.index(
@@ -5149,7 +5152,7 @@ cleanup
         activation_api_read = activation.index("branch_json=")
         activation_ssh = activation.index("ssh -")
         self.assertLess(activation_api_read, activation_ssh)
-        self.assertIn("Refusing activation", activation)
+        self.assertIn("stage=pre_ssh_dev_head ssh_rc=unavailable", activation)
         self.assertIn('production-deploy < "$input_path"', activation)
         self.assertNotIn("bash -s --", activation)
 
@@ -5321,16 +5324,18 @@ cleanup
             )
             curl = fake_bin / "curl"
             curl.write_text(
-                "#!/bin/sh\nprintf '%s\\n' '{\"commit\":{\"sha\":\""
-                + sha
-                + "\"}}'\n",
+                "#!/bin/sh\n"
+                "if [ \"$TEST_CURL_STATUS\" != 0 ]; then "
+                "printf '%s\\n' 'private curl sentinel' >&2; exit \"$TEST_CURL_STATUS\"; fi\n"
+                "printf '{\"commit\":{\"sha\":\"%s\"}}\\n' \"$TEST_BRANCH_SHA\"\n",
                 encoding="utf-8",
             )
             timeout = fake_bin / "timeout"
             timeout.write_text("#!/bin/sh\nshift 2\nexec \"$@\"\n", encoding="utf-8")
             ssh = fake_bin / "ssh"
             ssh.write_text(
-                "#!/bin/sh\ncat \"$TEST_REMOTE_STDOUT\"\n"
+                "#!/bin/sh\ntouch \"$TEST_SSH_CALLED\"\n"
+                "cat \"$TEST_REMOTE_STDOUT\"\n"
                 "cat \"$TEST_REMOTE_STDERR\" >&2\n"
                 "exit \"$TEST_REMOTE_STATUS\"\n",
                 encoding="utf-8",
@@ -5357,7 +5362,44 @@ cleanup
                 "TEST_REMOTE_STDOUT": str(private_stdout),
                 "TEST_REMOTE_STDERR": str(private_stderr),
                 "TEST_REMOTE_STATUS": "255",
+                "TEST_SSH_CALLED": str(root / "ssh-called"),
+                "TEST_CURL_STATUS": "0",
+                "TEST_BRANCH_SHA": sha,
             }
+
+            def run_pre_ssh(*, curl_status: str, branch_sha: str) -> subprocess.CompletedProcess[str]:
+                called = Path(environment["TEST_SSH_CALLED"])
+                called.unlink(missing_ok=True)
+                return subprocess.run(
+                    ["/bin/bash", "-c", activation],
+                    env={
+                        **environment,
+                        "TEST_CURL_STATUS": curl_status,
+                        "TEST_BRANCH_SHA": branch_sha,
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            for curl_status, branch_sha, expected_status, reason in (
+                ("22", sha, 22, "dev_head_probe_failed"),
+                ("0", "malformed", 1, "dev_head_probe_failed"),
+                ("0", "b" * 40, 1, "dev_head_mismatch"),
+            ):
+                with self.subTest(pre_ssh=(curl_status, branch_sha, reason)):
+                    result = run_pre_ssh(curl_status=curl_status, branch_sha=branch_sha)
+                    self.assertEqual(result.returncode, expected_status, result.stderr)
+                    self.assertEqual(
+                        result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        "stage=pre_ssh_dev_head ssh_rc=unavailable "
+                        f"reason={reason} stdout_bytes=0 stderr_bytes=0\n",
+                    )
+                    self.assertFalse(Path(environment["TEST_SSH_CALLED"]).exists())
+                    self.assertNotIn("private", result.stdout + result.stderr)
+
             fallback = subprocess.run(
                 ["/bin/bash", "-c", activation],
                 env=environment,
@@ -5369,10 +5411,9 @@ cleanup
             self.assertEqual(fallback.returncode, 255, fallback.stderr)
             self.assertEqual(
                 fallback.stdout,
-                "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport "
-                "release_slug=unavailable source_sha=unavailable\n"
                 "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
-                "reason=ssh_or_remote_255 remote_exit=255 stdout_bytes=23 stderr_bytes=23\n",
+                "stage=remote_dispatch ssh_rc=255 reason=remote_failed_without_marker "
+                "stdout_bytes=23 stderr_bytes=23\n",
             )
             self.assertNotIn("private", fallback.stdout + fallback.stderr)
 
@@ -5461,7 +5502,16 @@ cleanup
                         diagnostic, status=remote_status, remote_stderr=""
                     )
                     self.assertEqual(result.returncode, remote_status, result.stderr)
-                    self.assertEqual(result.stdout, diagnostic + "\n")
+                    self.assertEqual(
+                        result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        f"stage=remote_dispatch ssh_rc={remote_status} "
+                        "reason=remote_failed_without_marker "
+                        f"stdout_bytes={len((diagnostic + chr(10)).encode())} stderr_bytes=0\n",
+                    )
+                    self.assertNotIn("child_exit", result.stdout)
+                    self.assertNotIn("observed_bytes", result.stdout)
+                    self.assertNotIn("dispatcher_exit", result.stdout)
                     self.assertEqual(result.stderr, "")
 
             rejected_diagnostics = (
@@ -5486,9 +5536,17 @@ cleanup
                         diagnostic, status=remote_status, remote_stderr=""
                     )
                     self.assertEqual(result.returncode, remote_status or 1)
-                    self.assertIn(
-                        "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport",
+                    expected_stage = "remote_dispatch" if remote_status else "marker_validation"
+                    expected_reason = (
+                        "remote_failed_without_marker"
+                        if remote_status
+                        else "marker_missing_or_invalid"
+                    )
+                    self.assertEqual(
                         result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        f"stage={expected_stage} ssh_rc={remote_status} reason={expected_reason} "
+                        f"stdout_bytes={len((diagnostic + chr(10)).encode())} stderr_bytes=0\n",
                     )
                     self.assertNotIn(diagnostic, result.stdout)
                     self.assertNotIn("private", result.stdout + result.stderr)
@@ -5512,8 +5570,13 @@ cleanup
                         remote_stderr=remote_stderr,
                     )
                     self.assertEqual(result.returncode, 7)
-                    self.assertIn("class=remote_or_transport", result.stdout)
-                    self.assertNotIn("reason=missing_marker child_exit=7", result.stdout)
+                    self.assertEqual(
+                        result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        "stage=remote_dispatch ssh_rc=7 reason=remote_failed_without_marker "
+                        f"stdout_bytes={len((malformed_stdout + chr(10)).encode())} "
+                        f"stderr_bytes={len(remote_stderr.encode())}\n",
+                    )
                     self.assertNotIn("private", result.stdout + result.stderr)
 
             malformed_markers = (
@@ -5529,13 +5592,12 @@ cleanup
                 with self.subTest(malformed_marker=marker):
                     result = run_outer_consumer(marker, status=1)
                     self.assertEqual(result.returncode, 1)
-                    self.assertIn(
-                        "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport",
+                    self.assertEqual(
                         result.stdout,
-                    )
-                    self.assertIn(
-                        "reason=unrecognized_stdout remote_exit=1",
-                        result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        "stage=remote_dispatch ssh_rc=1 reason=remote_failed_without_marker "
+                        f"stdout_bytes={len((marker + chr(10)).encode())} "
+                        f"stderr_bytes={len(remote_stderr.encode())}\n",
                     )
                     self.assertNotIn(marker, result.stdout)
                     self.assertNotIn("private", result.stdout + result.stderr)
