@@ -2237,6 +2237,63 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertIn(f"check_recovery_input {key} ", recover)
         self.assertIn("RECOVERY_INPUTS schema=1 count=13 status=valid", recover)
         self.assertIn("RECOVERY_INPUT_INVALID schema=1 key=%s\\n", recover)
+        output_copy_start = recover.index('          {\n            echo "source_sha=')
+        output_copy_end_marker = '          } >> "$GITHUB_OUTPUT"'
+        output_copy_end = recover.index(output_copy_end_marker, output_copy_start)
+        output_copy = textwrap.dedent(
+            recover[output_copy_start : output_copy_end + len(output_copy_end_marker)]
+        )
+        copied_keys = (
+            "route_digest",
+            "recovery_workflow_sha",
+            "publisher_workflow_sha",
+            "publisher_job_id",
+        )
+        for key in copied_keys:
+            self.assertNotIn(f'echo "{key}=', output_copy)
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = Path(temporary) / "github-output"
+            original_values = {
+                "route_digest": "a" * 64,
+                "recovery_workflow_sha": "b" * 40,
+                "publisher_workflow_sha": "c" * 40,
+                "publisher_job_id": "12345",
+            }
+            output_path.write_text(
+                "".join(f"{key}={value}\n" for key, value in original_values.items()),
+                encoding="ascii",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "GITHUB_OUTPUT": str(output_path),
+                    "source_sha": "d" * 40,
+                    "SECURITY_RUN_ID": "10001",
+                    "SECURITY_RUN_ATTEMPT": "1",
+                    "bundle_sha": "e" * 64,
+                    "bundle_path": "/tmp/recovery-bundle.zip",
+                    "recovery_run_id": "10002",
+                    "recovery_run_attempt": "1",
+                    "recovery_job_id": "20002",
+                    "PUBLISHER_RUN_ID": "10003",
+                    "PUBLISHER_RUN_ATTEMPT": "1",
+                }
+            )
+            completed = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + output_copy],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            output_lines = output_path.read_text(encoding="ascii").splitlines()
+            for key, value in original_values.items():
+                self.assertEqual(
+                    [line.partition("=")[2] for line in output_lines if line.startswith(f"{key}=")],
+                    [value],
+                )
         input_stages = (
             "remote_identity",
             "argument_count",
