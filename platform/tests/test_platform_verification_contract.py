@@ -1368,7 +1368,10 @@ except lock.VerificationLockError as exc:
                 for issue in release_runtime_workflow_issues(missing_manual_route)
             )
         )
-        missing_dev_route = workflow_text.replace(
+        real_job_start = workflow_text.index("  release-runtime-real:\n")
+        missing_dev_route = workflow_text[:real_job_start] + workflow_text[
+            real_job_start:
+        ].replace(
             "github.ref == 'refs/heads/dev'",
             "github.ref == 'refs/heads/main'",
             1,
