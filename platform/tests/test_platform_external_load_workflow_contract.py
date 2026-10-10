@@ -1738,6 +1738,11 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             write_cpu_report(runner_temp, binding)
             unrelated_socket = runner_temp / "old-sparky-external-load-ssh-cpudiag-other"
             unrelated_socket.write_text("unrelated run marker", encoding="ascii")
+            # The early lifecycle receipt proves the directory was hidden
+            # before the namespace child. The helper restores it afterward
+            # for final SSH cleanup, so this finalizer must bind and remove
+            # the restored directory rather than require it to stay absent.
+            self.assertTrue(ssh_dir.is_dir())
             completed = run_cpu_cleanup(runner_temp)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertFalse(ssh_dir.exists())

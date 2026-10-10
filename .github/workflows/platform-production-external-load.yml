@@ -1538,8 +1538,6 @@ jobs:
                   or lifecycle["config_dir_ino"] <= 0
               ):
                   raise ValueError
-              if os.path.lexists(ssh_dir):
-                  raise ValueError
               report = read_private_json(report_path, 64_000)
               if not isinstance(report, dict) or type(report.get("schema")) is not int or report["schema"] != 1:
                   raise ValueError
