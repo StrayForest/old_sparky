@@ -1341,12 +1341,25 @@ def _validate_summary(summary: Mapping[str, object], context: RunContext) -> Non
     conditional = summary.get("conditional_gate_results")
     if not isinstance(conditional, Mapping) or set(conditional) != {"release-runtime", "release-runtime-real"}:
         raise CandidateError("security final summary conditional results are invalid")
-    if conditional.get("release-runtime") not in {"success", "skipped"} or conditional.get("release-runtime-real") != "skipped":
+    if conditional.get("release-runtime") not in {"success", "skipped"}:
         raise CandidateError("security final summary conditional route is invalid")
-    if summary.get("requires_real_release_runtime") is not False:
-        raise CandidateError("pull request summary requires a real release runtime")
-    if summary.get("requires_release_runtime") is not (conditional.get("release-runtime") == "success"):
+    requires_runtime = summary.get("runtime_sensitive") is True or summary.get("fallback") is True
+    if summary.get("requires_release_runtime") is not requires_runtime:
         raise CandidateError("security final summary runtime requirement is inconsistent")
+    if summary.get("requires_release_runtime") is not (conditional.get("release-runtime") == "success"):
+        raise CandidateError("security final summary conditional runtime result is inconsistent")
+    same_repository_dev_pr = (
+        context.original_base_ref == "dev"
+        and context.original_base_repository == context.repository
+        and context.original_head_repository == context.repository
+    )
+    if not same_repository_dev_pr:
+        raise CandidateError("security final summary PR repositories are not canonical")
+    if summary.get("requires_real_release_runtime") is not requires_runtime:
+        raise CandidateError("pull request real runtime requirement is inconsistent")
+    expected_real_result = "success" if requires_runtime else "skipped"
+    if conditional.get("release-runtime-real") != expected_real_result:
+        raise CandidateError("security final summary real runtime result is inconsistent")
     if summary.get("missing_or_failed") != [] or summary.get("route_errors") != [] or summary.get("passed") is not True:
         raise CandidateError("security final summary did not pass closed")
     if summary.get("status_start_result") != "skipped":
@@ -1409,6 +1422,9 @@ def verify_jobs(jobs_path: Path, context: RunContext, summary: Mapping[str, obje
         raise CandidateError("summary required the release runtime fixture")
     if summary.get("requires_release_runtime") is False and by_name["Conditional release runtime fixture"].get("conclusion") != "skipped":
         raise CandidateError("release runtime fixture was unexpectedly run")
+    expected_real = "success" if summary.get("requires_real_release_runtime") is True else "skipped"
+    if by_name["Trusted dev immutable release runtime"].get("conclusion") != expected_real:
+        raise CandidateError("real release runtime job does not match the validated summary")
 
 
 def verify_security_run(
