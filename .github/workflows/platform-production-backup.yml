@@ -700,6 +700,7 @@ jobs:
           report_state, report_bytes = read_private(report_path, 1_048_576)
           stderr_state, stderr_bytes = read_private(capture_path, 65_536)
           report_error_class = "none"
+          restore_diagnostic = None
           if report_state == "read":
               try:
                   report = json.loads(
@@ -713,6 +714,100 @@ jobs:
                   if isinstance(report, dict) and report.get("ok") is False and report.get("status") == "failed" and report.get("error_class") in allowed:
                       report_error_class = report["error_class"]
                       report_state = "typed_failure"
+                      diagnostic = report.get("restore_diagnostic")
+                      if diagnostic is not None:
+                          stages = {
+                              "pre_create_admission", "create_database", "extension_setup",
+                              "schema_setup", "restore_platform", "restore_public",
+                              "validate_table_count", "validate_connectivity", "validate_revision",
+                              "validate_extensions", "drop_database",
+                          }
+                          reasons = {
+                              "none", "disk_floor", "disk_unavailable", "child_unstopped",
+                              "command_start_failed", "command_failed",
+                          }
+                          drops = {
+                              "not_required", "drop_failed", "database_present",
+                              "absence_unconfirmed", "confirmed_absent",
+                          }
+                          expected = {
+                              "schema", "restore_stage", "guard_reason", "free_bytes",
+                              "required_free_bytes", "temporary_database_created",
+                              "drop_outcome", "temporary_database_absent",
+                              "archive_sha256", "archive_size_bytes",
+                          }
+                          valid = (
+                              isinstance(diagnostic, dict)
+                              and set(diagnostic) == expected
+                              and type(diagnostic.get("schema")) is int
+                              and diagnostic["schema"] == 1
+                              and type(diagnostic.get("restore_stage")) is str
+                              and diagnostic.get("restore_stage") in stages
+                              and type(diagnostic.get("guard_reason")) is str
+                              and diagnostic.get("guard_reason") in reasons
+                              and type(diagnostic.get("drop_outcome")) is str
+                              and diagnostic.get("drop_outcome") in drops
+                              and (
+                                  diagnostic.get("temporary_database_created") is None
+                                  or type(diagnostic.get("temporary_database_created")) is bool
+                              )
+                              and type(diagnostic.get("archive_sha256")) is str
+                              and re.fullmatch(r"[0-9a-f]{64}", diagnostic["archive_sha256"]) is not None
+                              and type(diagnostic.get("archive_size_bytes")) is int
+                              and diagnostic["archive_size_bytes"] >= 0
+                              and (
+                                  diagnostic.get("temporary_database_absent") is None
+                                  or type(diagnostic.get("temporary_database_absent")) is bool
+                              )
+                              and all(
+                                  diagnostic.get(key) is None
+                                  or (type(diagnostic[key]) is int and diagnostic[key] >= 0)
+                                  for key in ("free_bytes", "required_free_bytes")
+                              )
+                              and (
+                                  diagnostic.get("guard_reason") != "disk_floor"
+                                  or (
+                                      type(diagnostic.get("free_bytes")) is int
+                                      and type(diagnostic.get("required_free_bytes")) is int
+                                      and diagnostic["free_bytes"] < diagnostic["required_free_bytes"]
+                                  )
+                              )
+                              and (
+                                  diagnostic.get("temporary_database_created") is not False
+                                  or (
+                                      diagnostic.get("drop_outcome") == "not_required"
+                                      and diagnostic.get("temporary_database_absent") is None
+                                  )
+                              )
+                              and (
+                                  diagnostic.get("temporary_database_created") is not None
+                                  or (
+                                      diagnostic.get("restore_stage") == "create_database"
+                                      and diagnostic.get("drop_outcome") == "not_required"
+                                      and diagnostic.get("temporary_database_absent") is None
+                                  )
+                              )
+                              and (
+                                  diagnostic.get("temporary_database_created") is not True
+                                  or diagnostic.get("drop_outcome") != "not_required"
+                              )
+                              and (
+                                  diagnostic.get("drop_outcome") != "confirmed_absent"
+                                  or diagnostic.get("temporary_database_absent") is True
+                              )
+                              and (
+                                  diagnostic.get("drop_outcome") != "database_present"
+                                  or diagnostic.get("temporary_database_absent") is False
+                              )
+                              and (
+                                  diagnostic.get("drop_outcome") not in {"drop_failed", "absence_unconfirmed"}
+                                  or diagnostic.get("temporary_database_absent") is None
+                              )
+                          )
+                          if valid:
+                              restore_diagnostic = diagnostic
+                          else:
+                              report_state = "unclassified_json"
                   elif isinstance(report, dict) and report.get("ok") is True:
                       report_state = "success_payload"
                   else:
@@ -752,6 +847,7 @@ jobs:
                   "exit_code": int(exit_code),
                   "report_state": report_state,
                   "report_error_class": report_error_class,
+                  "restore_diagnostic": restore_diagnostic,
                   "report_bytes": len(report_bytes),
                   "report_sha256": hashlib.sha256(report_bytes).hexdigest() if report_bytes else None,
                   "stderr_state": stderr_state,

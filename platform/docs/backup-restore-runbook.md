@@ -90,6 +90,14 @@ intent or during removal stops the workflow for operator review; it does not
 start the restore or alter a backup pair. This operation does not evict the
 separate live-QA runtime cache.
 
+When an existing-backup restore stops, the root-private run receipt records a
+closed restore phase and guard reason, the observed free bytes and required
+threshold when available, whether the temporary database was created, and the
+drop outcome. It records catalog-confirmed absence only after the exact drill
+database is checked through the admin connection. Missing evidence stays
+unknown; the receipt never includes the database name, raw command output,
+exception text, or credentials.
+
 For this opt-in only, if the canonical local build-output lock path
 `/root/old_sparky/platform/dist/releases` is absent, maintenance initializes
 the fixed `dist` and `releases` directories as root-owned mode `0755`

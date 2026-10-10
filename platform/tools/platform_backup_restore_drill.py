@@ -10,6 +10,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import stat
 import subprocess
@@ -59,10 +60,18 @@ RESTORE_DISK_MINIMUM_BYTES = minimum_free_bytes(DEFAULT_MIN_FREE_GIB)
 class RestoreGuardStop(RuntimeError):
     """A fixed, non-sensitive reason for stopping an owned restore child."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(
+        self,
+        reason: str,
+        *,
+        free_bytes: int | None = None,
+        required_free_bytes: int | None = None,
+    ) -> None:
         if reason not in _RESTORE_GUARD_MESSAGES:
             raise ValueError("unknown restore guard reason")
         self.reason = reason
+        self.free_bytes = free_bytes
+        self.required_free_bytes = required_free_bytes
         super().__init__(_RESTORE_GUARD_MESSAGES[reason])
 
 
@@ -73,6 +82,96 @@ _RESTORE_GUARD_MESSAGES = {
     "command_start_failed": "Backup or restore command could not be started.",
     "command_failed": "Backup or restore command exited unsuccessfully.",
 }
+_RESTORE_DIAGNOSTIC_STAGES = {
+    "pre_create_admission",
+    "create_database",
+    "extension_setup",
+    "schema_setup",
+    "restore_platform",
+    "restore_public",
+    "validate_table_count",
+    "validate_connectivity",
+    "validate_revision",
+    "validate_extensions",
+    "drop_database",
+}
+_RESTORE_DROP_OUTCOMES = {
+    "not_required",
+    "drop_failed",
+    "database_present",
+    "absence_unconfirmed",
+    "confirmed_absent",
+}
+
+
+def _valid_restore_diagnostic(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "restore_stage",
+        "guard_reason",
+        "free_bytes",
+        "required_free_bytes",
+        "temporary_database_created",
+        "drop_outcome",
+        "temporary_database_absent",
+        "archive_sha256",
+        "archive_size_bytes",
+    }:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(value.get("restore_stage")) is not str
+        or value["restore_stage"] not in _RESTORE_DIAGNOSTIC_STAGES
+        or type(value.get("guard_reason")) is not str
+        or value["guard_reason"] not in {"none", *_RESTORE_GUARD_MESSAGES.keys()}
+        or type(value.get("drop_outcome")) is not str
+        or value["drop_outcome"] not in _RESTORE_DROP_OUTCOMES
+        or (
+            value.get("temporary_database_created") is not None
+            and type(value.get("temporary_database_created")) is not bool
+        )
+        or (
+            value.get("temporary_database_absent") is not None
+            and type(value.get("temporary_database_absent")) is not bool
+        )
+    ):
+        return False
+    if not all(
+        value.get(key) is None or (type(value[key]) is int and value[key] >= 0)
+        for key in ("free_bytes", "required_free_bytes")
+    ):
+        return False
+    if (
+        type(value.get("archive_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["archive_sha256"]) is None
+        or type(value.get("archive_size_bytes")) is not int
+        or value["archive_size_bytes"] < 0
+    ):
+        return False
+    if value["guard_reason"] == "disk_floor":
+        if (
+            type(value.get("free_bytes")) is not int
+            or type(value.get("required_free_bytes")) is not int
+            or value["free_bytes"] >= value["required_free_bytes"]
+        ):
+            return False
+    if value["temporary_database_created"] is False or value["temporary_database_created"] is None:
+        return (
+            (value["temporary_database_created"] is False or value["restore_stage"] == "create_database")
+            and
+            value["drop_outcome"] == "not_required"
+            and value["temporary_database_absent"] is None
+        )
+    if value["drop_outcome"] == "not_required":
+        return False
+    if value["drop_outcome"] == "confirmed_absent":
+        return value["temporary_database_absent"] is True
+    if value["drop_outcome"] == "database_present":
+        return value["temporary_database_absent"] is False
+    if value["drop_outcome"] in {"drop_failed", "absence_unconfirmed"}:
+        return value["temporary_database_absent"] is None
+    return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -241,8 +340,13 @@ def require_restore_headroom(*paths: pathlib.Path) -> None:
         if not snapshot.valid:
             raise RestoreGuardStop("disk_unavailable")
         floor = _required_disk_floor(snapshot.total_bytes)
-        if snapshot.free_bytes < floor + RESTORE_DISK_LEAD_BYTES:
-            raise RestoreGuardStop("disk_floor")
+        required_free_bytes = floor + RESTORE_DISK_LEAD_BYTES
+        if snapshot.free_bytes < required_free_bytes:
+            raise RestoreGuardStop(
+                "disk_floor",
+                free_bytes=snapshot.free_bytes,
+                required_free_bytes=required_free_bytes,
+            )
 
 
 def _stop_owned_child(process: subprocess.Popen[bytes]) -> None:
@@ -777,12 +881,24 @@ def verify_latest_existing_backup(
     admin_target = parse_database_url(admin_url, require_platformdb=False) if admin_url else None
     require_commands("pg_restore", "createdb", "dropdb", "psql")
     run_command(["pg_restore", "--list", str(dump_path)], capture_output=True)
-    table_count = perform_restore_drill(
-        dump_path,
-        app_target=app_target,
-        admin_target=admin_target,
-        timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
-    )
+    try:
+        table_count = perform_restore_drill(
+            dump_path,
+            app_target=app_target,
+            admin_target=admin_target,
+            timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
+        )
+    except Exception as exc:
+        diagnostic = getattr(exc, "restore_diagnostic", None)
+        if isinstance(diagnostic, dict):
+            diagnostic = {
+                **diagnostic,
+                "archive_sha256": archive_sha256,
+                "archive_size_bytes": dump_identity[7],
+            }
+            if _valid_restore_diagnostic(diagnostic):
+                setattr(exc, "restore_diagnostic", diagnostic)
+        raise
 
     # A restore can cross the source-age deadline; check the original creation time again.
     _, age_hours = _verify_backup_age(metadata, max_age_hours=max_age_hours)
@@ -979,12 +1095,25 @@ def perform_restore_drill(
         drop_command = remote_admin_command("drop", effective_admin, app_target, drill_database)
         admin_command_target = effective_admin
 
-    created = False
+    created: bool | None = False
+    failure_stage = "pre_create_admission"
+    failure: BaseException | None = None
+    failure_traceback = None
+    failure_reason = "none"
+    failure_free_bytes: int | None = None
+    failure_required_free_bytes: int | None = None
+    drop_outcome = "not_required"
+    database_absent: bool | None = None
+    table_count: int | None = None
     try:
         require_restore_headroom()
+        failure_stage = "create_database"
+        # A failed connection can leave the server-side create outcome uncertain.
+        created = None
         run_command(create_command, target=admin_command_target)
         created = True
         restore_target = app_target.with_database(drill_database)
+        failure_stage = "extension_setup"
         for extension in REQUIRED_PLATFORM_EXTENSIONS:
             run_command(
                 [
@@ -997,6 +1126,7 @@ def perform_restore_drill(
                 target=restore_target,
                 capture_output=True,
             )
+        failure_stage = "schema_setup"
         run_command(
             [
                 "psql",
@@ -1008,10 +1138,13 @@ def perform_restore_drill(
             target=restore_target,
             capture_output=True,
         )
+        failure_stage = "restore_platform"
         for selector in (
             ("--schema=platform",),
             ("--schema=public",),
         ):
+            if selector == ("--schema=public",):
+                failure_stage = "restore_public"
             run_restore_command(
                 [
                     "pg_restore",
@@ -1024,6 +1157,7 @@ def perform_restore_drill(
                 ],
                 target=restore_target,
             )
+        failure_stage = "validate_table_count"
         table_count_result = run_command(
             [
                 "psql",
@@ -1040,6 +1174,7 @@ def perform_restore_drill(
         table_count = int(table_count_result.stdout.strip())
         if table_count <= 0:
             raise RuntimeError("Restore drill produced no tables in the platform schema.")
+        failure_stage = "validate_connectivity"
         connectivity_result = run_command(
             [
                 "psql",
@@ -1055,6 +1190,7 @@ def perform_restore_drill(
         )
         if connectivity_result.stdout.strip() != "1":
             raise RuntimeError("Restore drill connectivity verification failed.")
+        failure_stage = "validate_revision"
         revision_result = run_command(
             [
                 "psql",
@@ -1071,6 +1207,7 @@ def perform_restore_drill(
         revisions = [line.strip() for line in revision_result.stdout.splitlines() if line.strip()]
         if len(revisions) != 1:
             raise RuntimeError("Restore drill did not recover exactly one Alembic revision.")
+        failure_stage = "validate_extensions"
         extension_count_result = run_command(
             [
                 "psql",
@@ -1086,10 +1223,122 @@ def perform_restore_drill(
         )
         if int(extension_count_result.stdout.strip()) != len(REQUIRED_PLATFORM_EXTENSIONS):
             raise RuntimeError("Restore drill is missing a required platform PostgreSQL extension.")
-        return table_count
-    finally:
-        if created:
+    except BaseException as exc:
+        failure = exc
+        failure_traceback = exc.__traceback__
+        if isinstance(exc, RestoreGuardStop):
+            failure_reason = exc.reason
+            failure_free_bytes = exc.free_bytes
+            failure_required_free_bytes = exc.required_free_bytes
+    if created is True:
+        primary_failure_stage = failure_stage if failure is not None else None
+        failure_stage = "drop_database"
+        try:
             run_command(drop_command, target=admin_command_target)
+        except BaseException as exc:
+            drop_outcome = "drop_failed"
+            if failure is None:
+                failure = exc
+                failure_traceback = exc.__traceback__
+                failure_reason = exc.reason if isinstance(exc, RestoreGuardStop) else "none"
+                failure_stage = "drop_database"
+        else:
+            try:
+                absence_command, absence_target = _database_absence_command(
+                    drill_database,
+                    app_target=app_target,
+                    admin_target=admin_command_target,
+                    use_local_admin=use_local_admin,
+                )
+                absence_result = run_command(
+                    absence_command,
+                    target=absence_target,
+                    capture_output=True,
+                )
+                absence_value = absence_result.stdout.strip()
+                if absence_value == "0":
+                    database_absent = True
+                    drop_outcome = "confirmed_absent"
+                elif absence_value == "1":
+                    database_absent = False
+                    drop_outcome = "database_present"
+                    if failure is None:
+                        failure = RuntimeError("Restore drill database remained after drop.")
+                        failure_traceback = failure.__traceback__
+                        failure_stage = "drop_database"
+                else:
+                    drop_outcome = "absence_unconfirmed"
+                    if failure is None:
+                        failure = RuntimeError("Restore drill database absence was not confirmed.")
+                        failure_traceback = failure.__traceback__
+                        failure_stage = "drop_database"
+            except BaseException as exc:
+                drop_outcome = "absence_unconfirmed"
+                if failure is None:
+                    failure = exc
+                    failure_traceback = exc.__traceback__
+                    failure_stage = "drop_database"
+        if failure is not None and primary_failure_stage is not None:
+            # Preserve the primary failure stage and reason when cleanup also fails.
+            failure_stage = primary_failure_stage
+    if failure is not None:
+        diagnostic = {
+            "schema": 1,
+            "restore_stage": failure_stage,
+            "guard_reason": failure_reason,
+            "free_bytes": failure_free_bytes,
+            "required_free_bytes": failure_required_free_bytes,
+            "temporary_database_created": created,
+            "drop_outcome": drop_outcome,
+            "temporary_database_absent": database_absent,
+        }
+        try:
+            setattr(failure, "restore_diagnostic", diagnostic)
+        except Exception:
+            pass
+        raise failure.with_traceback(failure_traceback)
+    if table_count is None:
+        raise RuntimeError("Restore drill did not produce a table count.")
+    return table_count
+
+
+def _database_absence_command(
+    database: str,
+    *,
+    app_target: DatabaseTarget,
+    admin_target: DatabaseTarget | None,
+    use_local_admin: bool,
+) -> tuple[list[str], DatabaseTarget | None]:
+    if not re.fullmatch(r"platform_restore_drill_[a-z0-9_]{1,80}", database):
+        raise ValueError("restore drill database identity is invalid")
+    sql = f"SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_database WHERE datname = '{database}') THEN 1 ELSE 0 END;"
+    if use_local_admin:
+        command = [
+            "runuser",
+            "-u",
+            "postgres",
+            "--",
+            "psql",
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--dbname",
+            "postgres",
+            "--command",
+            sql,
+        ]
+        return command, None
+    effective_admin = admin_target or app_target.with_database("postgres")
+    command = [
+        "psql",
+        "--no-psqlrc",
+        "--tuples-only",
+        "--no-align",
+        *connection_args(effective_admin),
+        "--command",
+        sql,
+    ]
+    return command, effective_admin
 
 
 def require_commands(*commands: str) -> None:
@@ -1378,7 +1627,11 @@ def main() -> int:
         ):
             error_message += " [backup_integrity=preexisting_inventory_changed]"
         if args.as_json:
-            print(json.dumps({"ok": False, "error": error_message}, ensure_ascii=False, indent=2))
+            report: dict[str, Any] = {"ok": False, "error": error_message}
+            diagnostic = getattr(exc, "restore_diagnostic", None)
+            if _valid_restore_diagnostic(diagnostic):
+                report["restore_diagnostic"] = diagnostic
+            print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
             print(f"[FAIL] {error_message}", file=sys.stderr)
         return 1

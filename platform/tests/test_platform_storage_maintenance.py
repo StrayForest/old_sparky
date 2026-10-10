@@ -383,6 +383,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             )
 
         self.assertEqual(run.call_count, 4)
+        backup_script = str(REPO_ROOT / "platform" / "tools" / "platform_backup_restore_drill.py")
+        for call in run.call_args_list:
+            self.assertEqual(call.args[0][:3], [sys.executable, "-B", backup_script])
         self.assertIn("--keep", run.call_args_list[0].args[0])
         self.assertIn("14", run.call_args_list[0].args[0])
         self.assertIn("--rotate-existing", run.call_args_list[0].args[0])
@@ -398,18 +401,68 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertTrue(preserved_result["preexisting_archives_preserved"])
         self.assertEqual(preserved_result["preexisting_archive_count"], 9)
 
+        with mock.patch.object(
+            maintenance.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, json.dumps({"ok": True}), ""),
+        ) as verify_run:
+            maintenance.verify_existing_backup(
+                self.root / "runtime" / "platform", max_age_hours=24.0
+            )
+        verify_command = verify_run.call_args.args[0]
+        self.assertEqual(verify_command[:3], [sys.executable, "-B", backup_script])
+        self.assertIn("--verify-latest-existing", verify_command)
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            probe = Path(temporary_dir)
+            (probe / "probe_helper.py").write_text("VALUE = 1\n", encoding="ascii")
+            (probe / "probe.py").write_text(
+                "import probe_helper\nassert probe_helper.VALUE == 1\n",
+                encoding="ascii",
+            )
+            no_bytecode = subprocess.run(
+                [sys.executable, "-B", str(probe / "probe.py")],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(no_bytecode.returncode, 0, no_bytecode.stderr.decode("utf-8", "replace"))
+            self.assertFalse((probe / "__pycache__").exists())
+
+        diagnostic = {
+            "schema": 1,
+            "restore_stage": "restore_platform",
+            "guard_reason": "disk_floor",
+            "free_bytes": 10,
+            "required_free_bytes": 20,
+            "temporary_database_created": True,
+            "drop_outcome": "confirmed_absent",
+            "temporary_database_absent": True,
+            "archive_sha256": "a" * 64,
+            "archive_size_bytes": 120,
+        }
         failure = subprocess.CompletedProcess(
-            [], 1, json.dumps({"ok": False, "error": "private failure detail"}), "child diagnostic"
+            [],
+            1,
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "private failure detail",
+                    "restore_diagnostic": diagnostic,
+                }
+            ),
+            "child diagnostic",
         )
         private_stderr = io.StringIO()
         with (
             mock.patch.object(maintenance.subprocess, "run", return_value=failure),
             mock.patch.object(maintenance.sys, "stderr", private_stderr),
         ):
-            with self.assertRaisesRegex(RuntimeError, "Platform backup failed"):
+            with self.assertRaisesRegex(RuntimeError, "Platform backup failed") as failure_error:
                 maintenance._run_backup_command(
                     ["fixed-backup-child"], forward_failure_diagnostics=True
                 )
+        self.assertEqual(failure_error.exception.restore_diagnostic, diagnostic)
         self.assertIn("private failure detail", private_stderr.getvalue())
         self.assertIn("child diagnostic", private_stderr.getvalue())
         public_stderr = io.StringIO()
@@ -1458,7 +1511,8 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 {
                     "schema", "event", "run_id", "attempt", "operation", "source_sha",
                     "bundle_sha256", "stage", "exit_code", "report_state",
-                    "report_error_class", "report_bytes", "report_sha256", "stderr_state",
+                    "report_error_class", "restore_diagnostic", "report_bytes",
+                    "report_sha256", "stderr_state",
                     "stderr_exception_class", "stderr_bytes", "stderr_sha256",
                 },
             )
@@ -1482,6 +1536,18 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                         "status": "failed",
                         "error_class": "backup",
                         "error": "fixture-private detail must not be retained",
+                        "restore_diagnostic": {
+                            "schema": 1,
+                            "restore_stage": "restore_platform",
+                            "guard_reason": "disk_floor",
+                            "free_bytes": 10,
+                            "required_free_bytes": 20,
+                            "temporary_database_created": True,
+                            "drop_outcome": "confirmed_absent",
+                            "temporary_database_absent": True,
+                            "archive_sha256": "a" * 64,
+                            "archive_size_bytes": 120,
+                        },
                     }
                 ),
                 encoding="ascii",
@@ -1505,6 +1571,12 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             typed_receipt = json.loads(typed_receipt_path.read_text(encoding="ascii"))
             self.assertEqual(typed_receipt["report_state"], "typed_failure")
             self.assertEqual(typed_receipt["report_error_class"], "backup")
+            self.assertEqual(
+                typed_receipt["restore_diagnostic"]["guard_reason"], "disk_floor"
+            )
+            self.assertEqual(
+                typed_receipt["restore_diagnostic"]["required_free_bytes"], 20
+            )
             self.assertNotIn(
                 "fixture-private detail",
                 typed_receipt_path.read_text(encoding="ascii"),

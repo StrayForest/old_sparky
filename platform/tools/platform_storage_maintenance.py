@@ -91,6 +91,111 @@ DEFAULT_SOURCE_RELEASE_DIR = Path("/root/old_sparky/platform/dist/releases")
 DEFAULT_WEB_ARTIFACT_DIR = Path("/root/old_sparky/platform/apps/platform_web")
 SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 SAFE_RUNTIME_ID_RE = re.compile(r"^runtime-[0-9a-f]{40}$")
+RESTORE_DIAGNOSTIC_KEYS = {
+    "schema",
+    "restore_stage",
+    "guard_reason",
+    "free_bytes",
+    "required_free_bytes",
+    "temporary_database_created",
+    "drop_outcome",
+    "temporary_database_absent",
+    "archive_sha256",
+    "archive_size_bytes",
+}
+RESTORE_STAGES = {
+    "pre_create_admission",
+    "create_database",
+    "extension_setup",
+    "schema_setup",
+    "restore_platform",
+    "restore_public",
+    "validate_table_count",
+    "validate_connectivity",
+    "validate_revision",
+    "validate_extensions",
+    "drop_database",
+}
+RESTORE_GUARD_REASONS = {
+    "none",
+    "disk_floor",
+    "disk_unavailable",
+    "child_unstopped",
+    "command_start_failed",
+    "command_failed",
+}
+RESTORE_DROP_OUTCOMES = {
+    "not_required",
+    "drop_failed",
+    "database_present",
+    "absence_unconfirmed",
+    "confirmed_absent",
+}
+
+
+def _valid_restore_diagnostic(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != RESTORE_DIAGNOSTIC_KEYS:
+        return False
+    if (
+        type(value.get("schema")) is not int
+        or value["schema"] != 1
+        or type(value.get("restore_stage")) is not str
+        or value["restore_stage"] not in RESTORE_STAGES
+        or type(value.get("guard_reason")) is not str
+        or value["guard_reason"] not in RESTORE_GUARD_REASONS
+        or type(value.get("drop_outcome")) is not str
+        or value["drop_outcome"] not in RESTORE_DROP_OUTCOMES
+        or (
+            value.get("temporary_database_created") is not None
+            and type(value.get("temporary_database_created")) is not bool
+        )
+        or (
+            value.get("temporary_database_absent") is not None
+            and type(value.get("temporary_database_absent")) is not bool
+        )
+    ):
+        return False
+    for key in ("free_bytes", "required_free_bytes"):
+        if value.get(key) is not None and (
+            type(value[key]) is not int or value[key] < 0
+        ):
+            return False
+    if (
+        type(value.get("archive_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["archive_sha256"]) is None
+        or type(value.get("archive_size_bytes")) is not int
+        or value["archive_size_bytes"] < 0
+    ):
+        return False
+    if value["guard_reason"] == "disk_floor":
+        if (
+            type(value.get("free_bytes")) is not int
+            or type(value.get("required_free_bytes")) is not int
+            or value["free_bytes"] >= value["required_free_bytes"]
+        ):
+            return False
+    if value["temporary_database_created"] is False or value["temporary_database_created"] is None:
+        return (
+            (value["temporary_database_created"] is False or value["restore_stage"] == "create_database")
+            and
+            value["drop_outcome"] == "not_required"
+            and value["temporary_database_absent"] is None
+        )
+    if value["drop_outcome"] == "not_required":
+        return False
+    if value["drop_outcome"] == "confirmed_absent":
+        return value["temporary_database_absent"] is True
+    if value["drop_outcome"] == "database_present":
+        return value["temporary_database_absent"] is False
+    if value["drop_outcome"] in {"drop_failed", "absence_unconfirmed"}:
+        return value["temporary_database_absent"] is None
+    return False
+
+
+class BackupCommandFailure(RuntimeError):
+    def __init__(self, diagnostic: dict[str, Any] | None = None) -> None:
+        self.restore_diagnostic = diagnostic
+        super().__init__("Platform backup failed.")
 
 
 def _safe_release_id(value: Any) -> str | None:
@@ -517,7 +622,10 @@ def _run_backup_command(
                 sys.stderr.write("\n".join(diagnostic_parts)[:65536])
                 if not diagnostic_parts[-1].endswith("\n"):
                     sys.stderr.write("\n")
-        raise RuntimeError("Platform backup failed.")
+        diagnostic = result.get("restore_diagnostic") if isinstance(result, dict) else None
+        raise BackupCommandFailure(
+            diagnostic if _valid_restore_diagnostic(diagnostic) else None
+        )
     return result
 
 
@@ -535,6 +643,7 @@ def run_backup(
     shared_dir = app_dir / "shared"
     create_command = [
         sys.executable,
+        "-B",
         str(script),
         "--env-file",
         str(shared_dir / ".env.platform"),
@@ -552,6 +661,7 @@ def run_backup(
     check_result = _run_backup_command(
         [
             sys.executable,
+            "-B",
             str(script),
             "--env-file",
             str(shared_dir / ".env.platform"),
@@ -629,6 +739,7 @@ def verify_existing_backup(
     result = _run_backup_command(
         [
             sys.executable,
+            "-B",
             str(script),
             "--env-file",
             str(shared_dir / ".env.platform"),
@@ -1466,12 +1577,16 @@ def main() -> int:
         else:
             error_class = "storage"
         if args.as_json:
+            result: dict[str, Any] = {
+                "ok": False,
+                "status": "failed",
+                "error_class": error_class,
+            }
+            diagnostic = getattr(exc, "restore_diagnostic", None)
+            if _valid_restore_diagnostic(diagnostic):
+                result["restore_diagnostic"] = diagnostic
             print(
-                json.dumps(
-                    {"ok": False, "status": "failed", "error_class": error_class},
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                json.dumps(result, ensure_ascii=False, indent=2)
             )
         else:
             print(f"[FAIL] Platform storage maintenance ({error_class})", file=sys.stderr)

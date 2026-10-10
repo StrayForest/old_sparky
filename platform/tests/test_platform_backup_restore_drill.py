@@ -86,6 +86,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "20260801_0036\n", ""),
             subprocess.CompletedProcess([], 0, "1\n", ""),
             subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "0\n", ""),
         ]
 
         with tempfile.TemporaryDirectory() as temporary_dir, mock.patch.object(
@@ -172,7 +173,13 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 return -signal.SIGKILL
 
         child = RestoreChild()
-        command_results = [subprocess.CompletedProcess([], 0, "", "") for _ in range(4)]
+        command_results = [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "0\n", ""),
+        ]
         with (
             tempfile.TemporaryDirectory() as temporary_dir,
             mock.patch.object(backup_drill, "snapshot_for_path", side_effect=(high, high, low)),
@@ -182,7 +189,7 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                 backup_drill, "run_command", side_effect=command_results
             ) as run_command,
         ):
-            with self.assertRaisesRegex(backup_drill.RestoreGuardStop, "low-disk safety guard"):
+            with self.assertRaisesRegex(backup_drill.RestoreGuardStop, "low-disk safety guard") as failure:
                 backup_drill.perform_restore_drill(
                     pathlib.Path(temporary_dir) / "backup.dump",
                     app_target=target,
@@ -197,12 +204,135 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
         self.assertTrue(child.killed)
         self.assertEqual(child.wait_calls, 2)
         self.assertEqual(child.wait_timeouts, [1.0, None])
-        drop_command = run_command.call_args_list[-1].args[0]
+        drop_command = run_command.call_args_list[-2].args[0]
         self.assertIn("dropdb", drop_command)
         self.assertEqual(
             drop_command[-1],
             f"platform_restore_drill_20260720t120000z_{os.getpid()}",
         )
+        diagnostic = failure.exception.restore_diagnostic
+        self.assertEqual(diagnostic["restore_stage"], "restore_platform")
+        self.assertEqual(diagnostic["guard_reason"], "disk_floor")
+        self.assertEqual(diagnostic["free_bytes"], low.free_bytes)
+        self.assertEqual(
+            diagnostic["required_free_bytes"],
+            floor + backup_drill.RESTORE_DISK_LEAD_BYTES,
+        )
+        self.assertTrue(diagnostic["temporary_database_created"])
+        self.assertEqual(diagnostic["drop_outcome"], "confirmed_absent")
+        self.assertIs(diagnostic["temporary_database_absent"], True)
+
+        before_create = backup_drill.RestoreGuardStop(
+            "disk_floor", free_bytes=10, required_free_bytes=20
+        )
+        with (
+            mock.patch.object(
+                backup_drill, "require_restore_headroom", side_effect=before_create
+            ),
+            mock.patch.object(backup_drill, "run_command") as preflight_commands,
+        ):
+            with self.assertRaises(backup_drill.RestoreGuardStop) as preflight_failure:
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/unused.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    timestamp_slug="20260720T120000Z",
+                )
+        preflight_commands.assert_not_called()
+        preflight_diagnostic = preflight_failure.exception.restore_diagnostic
+        self.assertEqual(preflight_diagnostic["restore_stage"], "pre_create_admission")
+        self.assertEqual(preflight_diagnostic["guard_reason"], "disk_floor")
+        self.assertIs(preflight_diagnostic["temporary_database_created"], False)
+        self.assertEqual(preflight_diagnostic["drop_outcome"], "not_required")
+        self.assertIsNone(preflight_diagnostic["temporary_database_absent"])
+
+        with (
+            mock.patch.object(backup_drill, "require_restore_headroom"),
+            mock.patch.object(
+                backup_drill,
+                "run_command",
+                side_effect=subprocess.CalledProcessError(1, ["createdb"]),
+            ) as create_command,
+        ):
+            with self.assertRaises(subprocess.CalledProcessError) as create_failure:
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/unused.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    timestamp_slug="20260720T120000Z",
+                )
+        create_command.assert_called_once()
+        create_diagnostic = create_failure.exception.restore_diagnostic
+        self.assertEqual(create_diagnostic["restore_stage"], "create_database")
+        self.assertIsNone(create_diagnostic["temporary_database_created"])
+        self.assertEqual(create_diagnostic["drop_outcome"], "not_required")
+        self.assertIsNone(create_diagnostic["temporary_database_absent"])
+
+        drop_failure_commands = [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CalledProcessError(1, ["dropdb"]),
+        ]
+        with (
+            mock.patch.object(backup_drill, "require_restore_headroom"),
+            mock.patch.object(
+                backup_drill,
+                "run_command",
+                side_effect=drop_failure_commands,
+            ),
+            mock.patch.object(
+                backup_drill,
+                "run_restore_command",
+                side_effect=backup_drill.RestoreGuardStop(
+                    "disk_floor", free_bytes=10, required_free_bytes=20
+                ),
+            ),
+        ):
+            with self.assertRaises(backup_drill.RestoreGuardStop) as drop_failure:
+                backup_drill.perform_restore_drill(
+                    pathlib.Path("/unused.dump"),
+                    app_target=target,
+                    admin_target=None,
+                    timestamp_slug="20260720T120000Z",
+                )
+        drop_diagnostic = drop_failure.exception.restore_diagnostic
+        self.assertEqual(drop_diagnostic["restore_stage"], "restore_platform")
+        self.assertEqual(drop_diagnostic["guard_reason"], "disk_floor")
+        self.assertEqual(drop_diagnostic["drop_outcome"], "drop_failed")
+        self.assertIsNone(drop_diagnostic["temporary_database_absent"])
+
+        serialized_error = backup_drill.RestoreGuardStop("disk_floor")
+        serialized_diagnostic = {
+            **diagnostic,
+            "archive_sha256": "a" * 64,
+            "archive_size_bytes": 120,
+        }
+        serialized_error.restore_diagnostic = serialized_diagnostic
+        cli_args = argparse.Namespace(
+            check_latest=False,
+            verify_latest_existing=True,
+            dump_only=False,
+            verify_dump=None,
+            output_dir="/private/backups",
+            env_file="/private/env",
+            max_age_hours=24.0,
+            admin_database_url=None,
+            as_json=True,
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(backup_drill, "parse_args", return_value=cli_args),
+            mock.patch.object(
+                backup_drill,
+                "verify_latest_existing_backup",
+                side_effect=serialized_error,
+            ),
+            mock.patch("sys.stdout", output),
+        ):
+            self.assertEqual(backup_drill.main(), 1)
+        serialized = json.loads(output.getvalue())
+        self.assertEqual(serialized["restore_diagnostic"], serialized_diagnostic)
         self._assert_unavailable_disk_fails_before_child_start(target)
         self._assert_normal_guarded_child_completes(target, high)
         self._assert_low_space_abort_stops_only_owned_dump()
@@ -513,6 +643,34 @@ class PlatformBackupRestoreDrillTests(unittest.TestCase):
                     return backup_drill.verify_latest_existing_backup(
                         output_dir, env_file, max_age_hours=24
                     )
+
+            size_omitted_v1 = dict(updated)
+            size_omitted_v1["format_version"] = 1
+            size_omitted_v1.pop("size_bytes", None)
+            write_metadata(size_omitted_v1)
+            original_v1_bytes = metadata_path.read_bytes()
+            failure = subprocess.CalledProcessError(1, ["createdb"])
+            failure.restore_diagnostic = {
+                "schema": 1,
+                "restore_stage": "create_database",
+                "guard_reason": "none",
+                "free_bytes": None,
+                "required_free_bytes": None,
+                "temporary_database_created": None,
+                "drop_outcome": "not_required",
+                "temporary_database_absent": None,
+            }
+            with self.assertRaises(subprocess.CalledProcessError) as failed_v1:
+                restore_hook(lambda *_args, **_kwargs: (_ for _ in ()).throw(failure))
+            self.assertEqual(
+                failed_v1.exception.restore_diagnostic["archive_size_bytes"],
+                dump_path.stat().st_size,
+            )
+            self.assertEqual(
+                failed_v1.exception.restore_diagnostic["archive_sha256"],
+                hashlib.sha256(dump_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(metadata_path.read_bytes(), original_v1_bytes)
 
             baseline = dict(updated)
             baseline["completed_at_utc"] = original_created_at
