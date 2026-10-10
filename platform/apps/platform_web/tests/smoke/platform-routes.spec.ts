@@ -3772,11 +3772,52 @@ test("password reset uses six-digit codes and creates a session", async ({ page 
   await expectNoHorizontalOverflow(page);
 });
 
-test("password reset uses one Turnstile challenge before code entry", async ({ page }) => {
+test("password reset uses one Turnstile challenge before code entry", async ({ page }, testInfo) => {
   const actions: string[] = [];
   const requestBodies: Array<Record<string, unknown>> = [];
   let resetAttempts = 0;
   const csrfTokenRequests = await trackCsrfTokenRequests(page);
+
+  await page.addInitScript(() => {
+    type TurnstileDiagnostic = {
+      scriptStubExecuted: boolean;
+      renderCalls: number;
+      renderCallsCapped: boolean;
+      renderActions: string[];
+      renderActionsCapped: boolean;
+      widgetStateTransitions: string[];
+    };
+    const diagnosticWindow = window as Window & { __turnstileDiagnostic?: TurnstileDiagnostic };
+    diagnosticWindow.__turnstileDiagnostic = {
+      scriptStubExecuted: false,
+      renderCalls: 0,
+      renderCallsCapped: false,
+      renderActions: [],
+      renderActionsCapped: false,
+      widgetStateTransitions: []
+    };
+    new MutationObserver((records) => {
+      const diagnostic = diagnosticWindow.__turnstileDiagnostic;
+      if (!diagnostic) {
+        return;
+      }
+      for (const record of records) {
+        const target = record.target;
+        if (!(target instanceof HTMLElement) || !target.classList.contains("auth-turnstile")) {
+          continue;
+        }
+        const state = target.getAttribute("data-state");
+        if (
+          state &&
+          ["loading", "checking", "verified", "expired", "error"].includes(state) &&
+          diagnostic.widgetStateTransitions.length < 8 &&
+          diagnostic.widgetStateTransitions.at(-1) !== state
+        ) {
+          diagnostic.widgetStateTransitions.push(state);
+        }
+      }
+    }).observe(document, { attributes: true, subtree: true, attributeFilter: ["data-state"] });
+  });
 
   await page.route("**/api/v1/auth/security-config", async (route) => {
     await route.fulfill({
@@ -3794,8 +3835,26 @@ test("password reset uses one Turnstile challenge before code entry", async ({ p
     await route.fulfill({
       status: 200,
       contentType: "application/javascript",
-      body: `window.turnstile = {
+      body: `if (window.__turnstileDiagnostic) {
+        window.__turnstileDiagnostic.scriptStubExecuted = true;
+      }
+      window.turnstile = {
         render(container, options) {
+          const diagnostic = window.__turnstileDiagnostic;
+          if (diagnostic) {
+            if (diagnostic.renderCalls < 16) {
+              diagnostic.renderCalls += 1;
+            } else {
+              diagnostic.renderCallsCapped = true;
+            }
+            if (["login", "register", "reset_request", "verification_resend"].includes(options.action)) {
+              if (diagnostic.renderActions.length < 4) {
+                diagnostic.renderActions.push(options.action);
+              } else {
+                diagnostic.renderActionsCapped = true;
+              }
+            }
+          }
           container.dataset.turnstileAction = options.action;
           setTimeout(() => options.callback("token-" + options.action), 250);
           return options.action;
@@ -3828,7 +3887,43 @@ test("password reset uses one Turnstile challenge before code entry", async ({ p
   await expect(page.locator(".auth-turnstile")).toHaveCount(0);
   await page.getByLabel("Email").fill("unknown@example.test");
   await page.getByRole("button", { name: "Отправить код" }).click();
-  await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "reset_request");
+  try {
+    await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "reset_request");
+  } catch (error) {
+    const diagnostic = await page.evaluate(() => {
+      type TurnstileDiagnostic = {
+        scriptStubExecuted: boolean;
+        renderCalls: number;
+        renderCallsCapped: boolean;
+        renderActions: string[];
+        renderActionsCapped: boolean;
+        widgetStateTransitions: string[];
+      };
+      type TurnstileApiProbe = { render?: unknown };
+      const diagnosticWindow = window as Window & {
+        __turnstileDiagnostic?: TurnstileDiagnostic;
+        turnstile?: TurnstileApiProbe;
+      };
+      const widget = document.querySelector<HTMLElement>(".auth-turnstile");
+      const probe = diagnosticWindow.__turnstileDiagnostic;
+      return {
+        scriptStubExecuted: probe?.scriptStubExecuted ?? false,
+        turnstileRenderAvailable: typeof diagnosticWindow.turnstile?.render === "function",
+        renderCalls: probe?.renderCalls ?? 0,
+        renderCallsCapped: probe?.renderCallsCapped ?? false,
+        renderActions: probe?.renderActions.slice(0, 4) ?? [],
+        renderActionsCapped: probe?.renderActionsCapped ?? false,
+        widgetMounted: widget !== null,
+        widgetState: widget?.getAttribute("data-state") ?? null,
+        widgetStateTransitions: probe?.widgetStateTransitions.slice(0, 8) ?? []
+      };
+    });
+    await testInfo.attach("turnstile-lifecycle-diagnostic.json", {
+      body: Buffer.from(JSON.stringify(diagnostic)),
+      contentType: "application/json"
+    });
+    throw error;
+  }
   actions.push(await page.locator(".auth-turnstile-frame").getAttribute("data-turnstile-action") ?? "");
   await page.getByRole("button", { name: "Отправить код" }).click();
   await expect(page.locator(".auth-turnstile")).toHaveCount(0);
