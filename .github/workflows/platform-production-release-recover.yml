@@ -637,6 +637,15 @@ jobs:
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             "bash -s -- '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$RECOVERY_WORKFLOW_SHA' '$PUBLISHER_RUN_ID' '$PUBLISHER_RUN_ATTEMPT' '$PUBLISHER_WORKFLOW_SHA' '$PUBLISHER_JOB_ID' '$ROUTE_DIGEST'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
+          recovery_stage=input
+          report_recovery_failure() {
+            local status="$?"
+            if (( status != 0 )); then
+              printf 'RECOVERY_STAGE schema=1 status=failed stage=%s\n' "$recovery_stage" >&2
+            fi
+            exit "$status"
+          }
+          trap report_recovery_failure EXIT
 
           runtime=/opt/oldsparky/platform
           test "$(id -u)" -eq 0 || { echo "Production recovery must run as root" >&2; exit 1; }
@@ -667,21 +676,27 @@ jobs:
           [[ "$publisher_workflow_sha" =~ ^[0-9a-f]{40,64}$ ]]
           [[ "$publisher_job_id" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$route_digest" =~ ^[0-9a-f]{64}$ ]]
+          recovery_stage=bundle_input
           bundle_path="/tmp/oldsparky-recovery-bundle-$bundle_sha.zip"
           test -f "$bundle_path" && test ! -L "$bundle_path"
           test "$(stat -c '%u:%h:%a' "$bundle_path" 2>/dev/null)" = "0:1:600"
           test "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$bundle_sha"
+          recovery_stage=staging
           install_stage="$(mktemp -d --tmpdir=/tmp oldsparky-recovery-install.XXXXXX)"
           [[ "$install_stage" =~ ^/tmp/oldsparky-recovery-install\.[A-Za-z0-9]{6}$ ]]
           chmod 700 "$install_stage"
           cleanup_remote_recovery() {
             local status="$?"
             trap - EXIT
+            if (( status != 0 )); then
+              printf 'RECOVERY_STAGE schema=1 status=failed stage=%s\n' "$recovery_stage" >&2
+            fi
             rm -rf -- "$install_stage" || true
             rm -f -- "$bundle_path" || true
             exit "$status"
           }
           trap cleanup_remote_recovery EXIT
+          recovery_stage=provenance
           provenance_path="$install_stage/provenance.json"
           /usr/bin/python3 -I - "$provenance_path" "$security_run_id" "$security_run_attempt" "$source_sha" "$recovery_run_id" "$recovery_run_attempt" "$recovery_job_id" "$recovery_workflow_sha" "$route_digest" <<'PY'
           import json
@@ -708,6 +723,7 @@ jobs:
               stream.flush()
               os.fsync(stream.fileno())
           PY
+          recovery_stage=bootstrap_extract
           bootstrap_tool="$install_stage/platform_recovery_bootstrap.py"
           /usr/bin/python3 -I - "$bundle_path" "$bootstrap_tool" <<'PY'
           import os
@@ -737,11 +753,13 @@ jobs:
           os.chown(destination, 0, 0)
           os.chmod(destination, 0o444)
           PY
+          recovery_stage=generation_install
           /usr/bin/python3 -I -B "$bootstrap_tool" install \
             --bundle "$bundle_path" --app-dir "$runtime" \
             --expected-bundle-sha "$bundle_sha" \
             --provenance "$provenance_path" --capability recover_pending \
             >/dev/null
+          recovery_stage=generation_validate
           generation_name="$bundle_sha"
           trusted_generation="$runtime/shared/.release-recovery/generations/$generation_name"
           test -d "$trusted_generation" && test ! -L "$trusted_generation"
@@ -769,9 +787,11 @@ jobs:
           done
           test -f "$lock_helper" && test ! -L "$lock_helper" \
             || { echo "Canonical release lock helper is missing or unsafe" >&2; exit 1; }
+          recovery_stage=install_stage_cleanup
           rm -rf -- "$install_stage"
           # The immutable generation wrapper owns lock, transaction, systemd and
           # runtime restoration for every supported topology.
+          recovery_stage=quiesce_recovery
           set +e
           "$trusted_generation/platform_recover_pending.sh" \
             --app-dir "$runtime" --systemctl /usr/bin/systemctl
@@ -782,6 +802,20 @@ jobs:
           remote_status="$?"
           set -e
           if (( remote_status != 0 )); then
+            safe_stage="$(grep -E '^RECOVERY_STAGE schema=1 status=failed stage=(input|bundle_input|staging|provenance|bootstrap_extract|generation_install|generation_validate|install_stage_cleanup|quiesce_recovery)$' "$remote_error" | tail -n 1 | sed -E 's/^RECOVERY_STAGE schema=1 status=failed stage=//' || true)"
+            if [[ -z "$safe_stage" ]]; then safe_stage=transport_or_unclassified; fi
+            safe_class=unavailable
+            helper_marker=none
+            if grep -Fqx 'RECOVERY_BOOTSTRAP schema=1 status=failed capability=abort_retained_only deployable=false' "$remote_error"; then
+              helper_marker=bootstrap_failed
+            fi
+            if [[ "$safe_stage" == quiesce_recovery ]]; then
+              safe_class="$(grep -E '^RELEASE_RUNTIME schema=1 status=failed class=(argument|generation|layout|lock|nginx|privilege|runtime|service_state|systemd_state|topology|transaction) release_slug=[A-Za-z0-9][A-Za-z0-9._-]{0,179} source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_error" | tail -n 1 | sed -E 's/^RELEASE_RUNTIME schema=1 status=failed class=([^ ]+).*/\1/' || true)"
+              if [[ -z "$safe_class" ]]; then safe_class=unavailable; fi
+            fi
+            [[ "$remote_status" =~ ^[0-9]{1,3}$ ]] || remote_status=unknown
+            printf 'RECOVERY_FAILURE schema=1 stage=%s class=%s helper=%s ssh_rc=%s\n' \
+              "$safe_stage" "$safe_class" "$helper_marker" "$remote_status"
             printf '%s\n' 'RELEASE_RUNTIME schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
             exit 1
           fi
