@@ -478,6 +478,15 @@ layout and capabilities are unchanged. Pin-only **E2**
 closure digests. The strict resolver selects C2 from E2, but neither commit
 proves that C2 has been provisioned or installed.
 
+The capability-order compatibility correction uses **C3**
+`16eee656fbca10c485728b34b8490917b4de64a2`, descended from **E2**. It changes
+only the v4 capability tuple order to the exact order accepted by the trusted
+builder; the 15-member closure, capability set and component groups are
+unchanged. Pin-only **E3**
+`dfb291ca0ca31e001aecc58f2c75e4e06eddf26b` names C3 and records its exact
+closure digests. The strict resolver selects C3 from E3, but this selection
+does not prove that C3 has been provisioned or installed.
+
 1. Commit **C** changes the host-control closure. The previously installed pin
    cannot authorize the modified closure, so ordinary deployment remains
    blocked.
