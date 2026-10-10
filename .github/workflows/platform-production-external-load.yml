@@ -1410,16 +1410,8 @@ jobs:
           echo "pair_status=$pair_status" >> "$GITHUB_OUTPUT"
           exit "$pair_status"
 
-      - name: Publish only the bounded diagnostic summary
-        if: ${{ always() }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: platform-production-cpu-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/cpu-diagnostic-report/report.json
-          if-no-files-found: warn
-          retention-days: 1
-
       - name: Remove diagnostic SSH material
+        id: remove-diagnostic-ssh-material
         if: ${{ always() }}
         shell: bash
         run: |
@@ -1628,6 +1620,15 @@ jobs:
           except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
               raise SystemExit(1)
           PY
+
+      - name: Publish only the bounded diagnostic summary
+        if: ${{ always() && steps.remove-diagnostic-ssh-material.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-cpu-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cpu-diagnostic-report/report.json
+          if-no-files-found: warn
+          retention-days: 1
 
   fixture-finalize:
     name: Signal fixture completion and collect origin evidence

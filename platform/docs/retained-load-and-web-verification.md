@@ -2,7 +2,7 @@
 
 - Status: Active reference and operator how-to
 - Owner: Performance and web verification owners
-- Last reviewed: 2026-10-01
+- Last reviewed: 2026-10-10
 
 This document owns the detailed retained-load cleanup, hermetic web verification,
 external-load workflow barrier and evidence-projection contracts. The
@@ -64,6 +64,11 @@ still fails the run. Unknown statuses or error classes, extra failed checks,
 incomplete counts, partial work, observer failures, cleanup failures or
 artifact-identity mismatches remain invalid pipeline results and cannot be
 reclassified as completed failures.
+
+The optional CPU diagnostic pair removes its run-bound SSH files before the
+summary is uploaded to Actions. Cleanup runs even after a pair failure; the
+sanitized failure summary may still be retained when cleanup succeeds, while a
+cleanup failure blocks third-party upload and leaves the run failed.
 
 The QA system sampler keeps full process identity and CPU collection for all
 `/proc` rows while reading per-process RSS and I/O counters only for the seven

@@ -1571,6 +1571,45 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             fixture_setup, "Remove fixture-setup SSH material"
         )
         finalizer_cleanup = _step_script(finalizer, "Remove finalizer SSH material")
+        cpu_steps = yaml.safe_load(self.source)["jobs"]["cpu-diagnostic-pair"]["steps"]
+        cpu_step_indexes = {
+            step.get("name"): index for index, step in enumerate(cpu_steps)
+        }
+        cleanup_step = next(
+            step for step in cpu_steps if step.get("name") == "Remove diagnostic SSH material"
+        )
+        upload_step = next(
+            step for step in cpu_steps if step.get("name") == "Publish only the bounded diagnostic summary"
+        )
+        self.assertLess(
+            cpu_step_indexes["Run the fixed authenticated workspace CPU pair"],
+            cpu_step_indexes["Remove diagnostic SSH material"],
+        )
+        self.assertLess(
+            cpu_step_indexes["Remove diagnostic SSH material"],
+            cpu_step_indexes["Publish only the bounded diagnostic summary"],
+        )
+        self.assertEqual(cleanup_step.get("id"), "remove-diagnostic-ssh-material")
+        self.assertEqual(cleanup_step.get("if"), "${{ always() }}")
+        self.assertEqual(
+            sum(step.get("id") == cleanup_step["id"] for step in cpu_steps), 1
+        )
+        self.assertEqual(
+            upload_step.get("if"),
+            "${{ always() && steps.remove-diagnostic-ssh-material.outcome == 'success' }}",
+        )
+        # Pair failure still permits publication of its sanitized report once
+        # cleanup succeeds; cleanup failure blocks third-party upload.
+        self.assertNotIn("steps.cpu-pair.outcome", upload_step["if"])
+        for pair_outcome in ("success", "failure", "cancelled"):
+            for cleanup_outcome, expected_upload in (
+                ("success", True),
+                ("failure", False),
+                ("cancelled", False),
+                ("skipped", False),
+            ):
+                with self.subTest(pair_outcome=pair_outcome, cleanup_outcome=cleanup_outcome):
+                    self.assertEqual(cleanup_outcome == "success", expected_upload)
         cpu_configure = _step_script(
             cpu_job, "Configure pinned production SSH for the trusted parent"
         )

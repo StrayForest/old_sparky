@@ -1038,7 +1038,8 @@ jobs:
             failure_stage=backup_create
           fi
           /usr/bin/python3 -I - "$python_bin" "$maintenance_tool" \
-            "$runtime" "$run_id" "$run_attempt" "$backup_report_file" "$operation" <<'PY'
+            "$runtime" "$run_id" "$run_attempt" "$backup_report_file" "$operation" \
+            "$evict_build_node_cache" "$source_sha" "$bundle_sha" <<'PY'
           import os
           from pathlib import Path
           import re
@@ -1047,7 +1048,18 @@ jobs:
           import subprocess
           import sys
 
-          python_bin, maintenance_tool, runtime, run_id, run_attempt, report_path, operation = sys.argv[1:]
+          (
+              python_bin,
+              maintenance_tool,
+              runtime,
+              run_id,
+              run_attempt,
+              report_path,
+              operation,
+              evict_build_node_cache,
+              source_sha,
+              bundle_sha,
+          ) = sys.argv[1:]
           if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id):
               raise SystemExit(125)
           if not re.fullmatch(r"[1-9][0-9]{0,5}", run_attempt):

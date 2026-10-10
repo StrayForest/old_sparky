@@ -1680,9 +1680,15 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                         )
                         self.assertNotIn("secrets.PROD_SSH_", step, location)
                     if uses and ssh_material_cleanup_seen:
+                        cleanup_step_id = (
+                            "remove-diagnostic-ssh-material"
+                            if path.name == "platform-production-external-load.yml"
+                            and job_name == "cpu-diagnostic-pair"
+                            else "cleanup_ssh"
+                        )
                         self.assertRegex(
                             step,
-                            r"steps\.cleanup_ssh\.outcome\s*==\s*['\"]success['\"]",
+                            rf"steps\.{re.escape(cleanup_step_id)}\.outcome\s*==\s*['\"]success['\"]",
                             f"{location} must not run after an unsuccessful SSH cleanup",
                         )
                         self.assertNotRegex(

@@ -1631,6 +1631,90 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         wrapper_script = wrapper_script.replace(
             "capture_stat.st_uid != 0", "capture_stat.st_uid != os.geteuid()"
         ).replace("report_stat.st_uid != 0", "report_stat.st_uid != os.geteuid()")
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            fixture_root = Path(temporary_dir)
+            fake_maintenance = fixture_root / "fake_maintenance.py"
+            fake_maintenance.write_text(
+                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            capture_path = fixture_root / "private.stderr"
+            bound_wrapper = wrapper_script.replace(
+                "capture_path = Path(sys.argv[7])",
+                f"capture_path = Path({str(capture_path)!r})",
+            )
+
+            def invoke_wrapper(
+                *, operation: str, evict: str, source_sha: str, bundle_sha: str
+            ) -> list[str]:
+                report_path = fixture_root / f"report-{operation}-{evict}.json"
+                report_path.write_text("", encoding="utf-8")
+                os.chmod(report_path, 0o600)
+                capture_path.unlink(missing_ok=True)
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-",
+                        sys.executable,
+                        str(fake_maintenance),
+                        "/opt/oldsparky/platform",
+                        "123456",
+                        "1",
+                        str(report_path),
+                        operation,
+                        evict,
+                        source_sha,
+                        bundle_sha,
+                    ],
+                    input=bound_wrapper,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                return json.loads(report_path.read_text(encoding="utf-8"))
+
+            source_sha = "a" * 40
+            bundle_sha = "b" * 64
+            verify_argv = invoke_wrapper(
+                operation="verify-existing",
+                evict="true",
+                source_sha=source_sha,
+                bundle_sha=bundle_sha,
+            )
+            self.assertIn("--verify-existing-backup-only", verify_argv)
+            for pair in (
+                ("--evict-pinned-build-node-cache", None),
+                ("--eviction-run-id", "123456"),
+                ("--eviction-run-attempt", "1"),
+                ("--eviction-source-sha", source_sha),
+                ("--eviction-bundle-sha256", bundle_sha),
+            ):
+                option, value = pair
+                self.assertIn(option, verify_argv)
+                if value is not None:
+                    self.assertEqual(verify_argv[verify_argv.index(option) + 1], value)
+
+            verify_without_eviction = invoke_wrapper(
+                operation="verify-existing",
+                evict="false",
+                source_sha=source_sha,
+                bundle_sha=bundle_sha,
+            )
+            self.assertIn("--verify-existing-backup-only", verify_without_eviction)
+            self.assertNotIn("--evict-pinned-build-node-cache", verify_without_eviction)
+            self.assertNotIn("--eviction-source-sha", verify_without_eviction)
+
+            create_argv = invoke_wrapper(
+                operation="create", evict="false", source_sha="none", bundle_sha="none"
+            )
+            self.assertIn("--backup-only", create_argv)
+            self.assertNotIn("--verify-existing-backup-only", create_argv)
+            self.assertNotIn("--evict-pinned-build-node-cache", create_argv)
+
         command_start = wrapper_script.index("command = [")
         command_end = wrapper_script.index("def stop_child_group", command_start)
         child_code = "import sys; sys.stderr.buffer.write(b'x' * 100000); raise SystemExit(7)"
@@ -1661,6 +1745,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                     "1",
                     str(report_path),
                     "create",
+                    "false",
+                    "none",
+                    "none",
                 ],
                 input=wrapper_script,
                 text=True,
