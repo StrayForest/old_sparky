@@ -1199,6 +1199,30 @@ class HostToolsBundleTests(unittest.TestCase):
                 manifest["components"],
                 {key: list(value) for key, value in bundle.COMPONENT_FILES.items()},
             )
+            trusted_v4_capabilities = (
+                "artifact_prepare",
+                "input_guard",
+                "production_dispatcher",
+                "production_supervisor",
+                "production_deploy_control",
+                "release_baseline",
+                "retained_load_export_cleanup",
+                "retained_load_source_binding",
+                "python_isolated",
+                "python_bytecode_disabled",
+                "cpu_diagnostic_plan_control",
+            )
+            self.assertEqual(manifest["capabilities"], list(trusted_v4_capabilities))
+            with zipfile.ZipFile(first) as archive:
+                capability_lines = archive.read("platform-host-tools/capabilities.txt")
+                self.assertEqual(
+                    [
+                        line.removeprefix("capability=")
+                        for line in capability_lines.decode("ascii").splitlines()
+                        if line.startswith("capability=")
+                    ],
+                    list(trusted_v4_capabilities),
+                )
             self.assertNotIn("platform_release_deploy.sh", bundle.HOST_TOOL_FILES)
             self.assertNotIn("platform_run_api.sh", bundle.HOST_TOOL_FILES)
             contract = root / "contract"
@@ -1219,6 +1243,55 @@ class HostToolsBundleTests(unittest.TestCase):
                 "platform_cpu_diagnostic_plan.py",
                 [record["path"].removeprefix("platform-host-tools/") for record in manifest["files"]],
             )
+
+            # The trusted T builder accepts only the fixed v4 capability
+            # order. Reordered or extra capabilities must not be normalized
+            # as an equivalent set.
+            wrong_order_source = self._source_fixture(root / "wrong-order")
+            wrong_order_helper = wrong_order_source / "platform" / "tools" / "platform_host_tools_bundle.py"
+            wrong_order_text = wrong_order_helper.read_text(encoding="utf-8")
+            ordered_capability_block = (
+                '    "python_isolated",\n'
+                '    "python_bytecode_disabled",\n'
+                '    "cpu_diagnostic_plan_control",\n'
+            )
+            self.assertIn(ordered_capability_block, wrong_order_text)
+            wrong_order_helper.write_text(
+                wrong_order_text.replace(
+                    ordered_capability_block,
+                    '    "cpu_diagnostic_plan_control",\n'
+                    '    "python_isolated",\n'
+                    '    "python_bytecode_disabled",\n',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            wrong_order_archive = root / "wrong-order.zip"
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.build_bundle(wrong_order_source, SOURCE_SHA, wrong_order_archive)
+            self.assertFalse(wrong_order_archive.exists())
+
+            extra_capability_source = self._source_fixture(root / "extra-capability")
+            extra_capability_helper = (
+                extra_capability_source / "platform" / "tools" / "platform_host_tools_bundle.py"
+            )
+            extra_capability_text = extra_capability_helper.read_text(encoding="utf-8")
+            self.assertIn(ordered_capability_block, extra_capability_text)
+            extra_capability_helper.write_text(
+                extra_capability_text.replace(
+                    ordered_capability_block,
+                    '    "python_isolated",\n'
+                    '    "python_bytecode_disabled",\n'
+                    '    "cpu_diagnostic_plan_control",\n'
+                    '    "unapproved_capability",\n',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            extra_capability_archive = root / "extra-capability.zip"
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.build_bundle(extra_capability_source, SOURCE_SHA, extra_capability_archive)
+            self.assertFalse(extra_capability_archive.exists())
 
             # Exercise the immutable v3 compatibility layout as an explicit
             # legacy declaration. The production v4 active declaration above
