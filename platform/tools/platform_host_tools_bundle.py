@@ -90,9 +90,9 @@ CAPABILITIES = (
     "release_baseline",
     "retained_load_export_cleanup",
     "retained_load_source_binding",
-    "cpu_diagnostic_plan_control",
     "python_isolated",
     "python_bytecode_disabled",
+    "cpu_diagnostic_plan_control",
 )
 LEGACY_COMPONENT_FILES = {
     "prepare_artifact": PREPARE_ARTIFACT_FILES,
