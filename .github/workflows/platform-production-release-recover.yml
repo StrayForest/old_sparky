@@ -452,17 +452,13 @@ jobs:
             echo "source_sha=$source_sha"
             echo "security_run_id=$SECURITY_RUN_ID"
             echo "security_run_attempt=$SECURITY_RUN_ATTEMPT"
-            echo "route_digest=$(awk -F= '$1 == \"route_digest\" {print $2}' \"$GITHUB_OUTPUT\" | tail -n 1)"
             echo "bundle_sha=$bundle_sha"
             echo "bundle_path=$bundle_path"
             echo "recovery_run_id=$recovery_run_id"
             echo "recovery_run_attempt=$recovery_run_attempt"
             echo "recovery_job_id=$recovery_job_id"
-            echo "recovery_workflow_sha=$(awk -F= '$1 == \"recovery_workflow_sha\" {print $2}' \"$GITHUB_OUTPUT\" | tail -n 1)"
             echo "publisher_run_id=$PUBLISHER_RUN_ID"
             echo "publisher_run_attempt=$PUBLISHER_RUN_ATTEMPT"
-            echo "publisher_workflow_sha=$(awk -F= '$1 == \"publisher_workflow_sha\" {print $2}' \"$GITHUB_OUTPUT\" | tail -n 1)"
-            echo "publisher_job_id=$(awk -F= '$1 == \"publisher_job_id\" {print $2}' \"$GITHUB_OUTPUT\" | tail -n 1)"
           } >> "$GITHUB_OUTPUT"
       - name: Validate production SSH inputs
         shell: bash
