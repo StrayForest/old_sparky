@@ -1327,7 +1327,8 @@ jobs:
                 if [[ -d "$public_projection_dir" && ! -L "$public_projection_dir" \
                   && "$output_dir_metadata" == "${runner_uid}:${runner_gid}:700:2:directory" \
                   && -n "$public_projection_dir_id" && "$output_dir_id" == "$public_projection_dir_id" \
-                  && "$output_metadata" == "${runner_uid}:${runner_gid}:600:1:regular file" ]]; then
+                  && ( "$output_metadata" == "${runner_uid}:${runner_gid}:600:1:regular file"
+                    || "$output_metadata" == "${runner_uid}:${runner_gid}:600:1:regular empty file" ) ]]; then
                   sudo -n /usr/bin/install -o "$runner_uid" -g "$runner_gid" -m 0600 \
                     -- "$size_projection_path" "$public_projection_path" 2>/dev/null || cleanup_rc=1
                   copied_bytes="$(stat -c '%s' -- "$public_projection_path" 2>/dev/null)"
@@ -1428,7 +1429,7 @@ jobs:
           public_projection_path="$public_projection_dir/measurement.json"
           : >"$public_projection_path"
           chmod 0600 "$public_projection_path" || { failure_reason=size_projection_temp_failed; exit 1; }
-          [[ "$(stat -c '%u:%g:%a:%h:%F' -- "$public_projection_path" 2>/dev/null)" == "$(id -u):$(id -g):600:1:regular file" ]] || {
+          [[ "$(stat -c '%u:%g:%a:%h:%F' -- "$public_projection_path" 2>/dev/null)" == "$(id -u):$(id -g):600:1:regular empty file" ]] || {
             failure_reason=size_projection_temp_failed
             exit 1
           }
@@ -1670,7 +1671,9 @@ jobs:
             [[ "$(stat -c '%u:%g:%a:%h:%F' -- "$projection_dir")" == "$(id -u):$(id -g):700:2:directory" ]]
             projection_file="$projection_dir/measurement.json"
             [[ -f "$projection_file" && ! -L "$projection_file" ]]
-            [[ "$(stat -c '%u:%g:%a:%h:%F' -- "$projection_file")" == "$(id -u):$(id -g):600:1:regular file" ]]
+            projection_file_metadata="$(stat -c '%u:%g:%a:%h:%F' -- "$projection_file")"
+            [[ "$projection_file_metadata" == "$(id -u):$(id -g):600:1:regular file" \
+              || "$projection_file_metadata" == "$(id -u):$(id -g):600:1:regular empty file" ]]
             rm -- "$projection_file"
             rmdir -- "$projection_dir"
           fi

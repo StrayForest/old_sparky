@@ -4195,6 +4195,18 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn("path: ${{ steps.real-runtime-build.outputs.projection_path }}", real)
         self.assertIn("if: ${{ success() }}", real)
         self.assertIn("retention-days: 14", real)
+        placeholder_setup = real[
+            real.index('public_projection_path="$public_projection_dir/measurement.json"') :
+            real.index('disk_before_bytes="$(free_bytes)"')
+        ]
+        self.assertIn(
+            '== "$(id -u):$(id -g):600:1:regular empty file"',
+            placeholder_setup,
+        )
+        self.assertIn(
+            '|| "$output_metadata" == "${runner_uid}:${runner_gid}:600:1:regular empty file"',
+            real,
+        )
         upload_start = real.index("- name: Upload evidence-only release size projection")
         upload_end = real.index("- name: Remove exact release size projection temporary directory", upload_start)
         upload_step = real[upload_start:upload_end]
@@ -4205,7 +4217,63 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn('PROJECTION_DIR_ID: ${{ steps.real-runtime-build.outputs.projection_dir_id }}', public_cleanup)
         self.assertIn('"$(stat -c \'%d:%i\' -- "$projection_dir")" == "$PROJECTION_DIR_ID"', public_cleanup)
         self.assertIn('"$(stat -c \'%u:%g:%a:%h:%F\' -- "$projection_dir")" == "$(id -u):$(id -g):700:2:directory"', public_cleanup)
+        cleanup_step = self._workflow_step_run(
+            workflow, "Remove exact release size projection temporary directory"
+        )
+        self.assertIn('== "$(id -u):$(id -g):600:1:regular empty file"', cleanup_step)
+        self.assertIn('== "$(id -u):$(id -g):600:1:regular file"', cleanup_step)
         self.assertLess(public_cleanup.index('"$PROJECTION_DIR_ID"'), public_cleanup.index('rm -- "$projection_file"'))
+
+        # Exercise the exact setup and always-cleanup shell bodies against both
+        # zero-byte failure placeholders and completed JSON projections.
+        with tempfile.TemporaryDirectory(prefix="release-size-placeholder-") as temporary:
+            temp_root = Path(temporary)
+            projection_dir = temp_root / "setup"
+            projection_dir.mkdir(mode=0o700)
+            setup_result = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + placeholder_setup],
+                env={**os.environ, "public_projection_dir": str(projection_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(setup_result.returncode, 0, setup_result.stderr)
+            placeholder = projection_dir / "measurement.json"
+            self.assertEqual(placeholder.read_bytes(), b"")
+            self.assertEqual(
+                subprocess.check_output(
+                    ["stat", "-c", "%F", "--", str(placeholder)], text=True
+                ).strip(),
+                "regular empty file",
+            )
+
+            cleanup_body = self._workflow_step_run(
+                real, "Remove exact release size projection temporary directory"
+            )
+            for projection_bytes in (b"", b'{"evidence_only":true}\n'):
+                candidate = temp_root / "platform-release-size-123-1"
+                candidate.mkdir(mode=0o700)
+                projection_file = candidate / "measurement.json"
+                projection_file.write_bytes(projection_bytes)
+                projection_file.chmod(0o600)
+                candidate_id = subprocess.check_output(
+                    ["stat", "-c", "%d:%i", "--", str(candidate)], text=True
+                ).strip()
+                cleanup_result = subprocess.run(
+                    ["bash", "-c", cleanup_body],
+                    env={
+                        **os.environ,
+                        "RUNNER_TEMP": str(temp_root),
+                        "PROOF_RUN_ID": "123",
+                        "PROOF_RUN_ATTEMPT": "1",
+                        "PROJECTION_DIR_ID": candidate_id,
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(cleanup_result.returncode, 0, cleanup_result.stderr)
+                self.assertFalse(candidate.exists())
         self.assertLess(
             real.index("diagnostic_parser"),
             real.index('/bin/rm -rf -- "$release_root"'),
