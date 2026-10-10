@@ -4223,6 +4223,7 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn('cleanup_predicate="$predicate"', real)
         for cleanup_predicate in (
             "source_file",
+            "source_metadata",
             "destination_file",
             "directory_type",
             "directory_metadata",
@@ -4246,6 +4247,9 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn("mark_cleanup_failure release_root_remove", real)
         self.assertIn("mark_cleanup_failure disk_floor", real)
         self.assertIn("predicate=%s", real)
+        self.assertIn('sudo -n /usr/bin/test -f "$size_projection_path"', real)
+        self.assertIn('sudo -n /usr/bin/test ! -L "$size_projection_path"', real)
+        self.assertIn('!= "0:0:600:1:regular file"', real)
         self.assertIn("reason=cleanup stage=%s", real)
         self.assertIn(
             "reason=cleanup stage=%s predicate=%s disk_after_bytes=%s min_free_bytes=%s",
@@ -4266,6 +4270,28 @@ fail 'private lock detail must not cross the public channel'
         # zero-byte failure placeholders and completed JSON projections.
         with tempfile.TemporaryDirectory(prefix="release-size-placeholder-") as temporary:
             temp_root = Path(temporary)
+            temp_root.chmod(0o755)
+            private_source_dir = temp_root / "root-private-source"
+            private_source_dir.mkdir(mode=0o700)
+            private_source = private_source_dir / "size-projection.json"
+            private_source.write_text("{}\n", encoding="ascii")
+            private_source.chmod(0o600)
+            self.assertIsNotNone(shutil.which("runuser"))
+            runner_probe = subprocess.run(
+                [
+                    "runuser",
+                    "-u",
+                    "nobody",
+                    "--",
+                    "/usr/bin/test",
+                    "-f",
+                    str(private_source),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(runner_probe.returncode, 0)
             projection_dir = temp_root / "setup"
             projection_dir.mkdir(mode=0o700)
             setup_result = subprocess.run(

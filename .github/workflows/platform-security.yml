@@ -1329,9 +1329,14 @@ jobs:
               local output_metadata=""
               local output_dir_metadata=""
               local output_dir_id=""
-              if [[ -z "$size_projection_path" || ! -f "$size_projection_path" \
-                || -L "$size_projection_path" ]]; then
+              if [[ -z "$size_projection_path" ]]; then
                 mark_cleanup_failure projection_copy source_file
+              elif ! sudo -n /usr/bin/test -f "$size_projection_path" 2>/dev/null \
+                || ! sudo -n /usr/bin/test ! -L "$size_projection_path" 2>/dev/null; then
+                mark_cleanup_failure projection_copy source_file
+              elif [[ "$(sudo -n /usr/bin/stat -c '%u:%g:%a:%h:%F' -- "$size_projection_path" 2>/dev/null)" \
+                != "0:0:600:1:regular file" ]]; then
+                mark_cleanup_failure projection_copy source_metadata
               elif [[ -z "$public_projection_path" || ! -f "$public_projection_path" \
                 || -L "$public_projection_path" ]]; then
                 mark_cleanup_failure projection_copy destination_file
