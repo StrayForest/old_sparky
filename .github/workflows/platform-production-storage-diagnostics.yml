@@ -120,7 +120,19 @@ jobs:
           current="$runtime/current"
           python_bin="$runtime/shared/venv/bin/python"
           summary_tool="$current/tools/platform_storage_evidence_summary.py"
+          backup_tool="$current/tools/platform_backup_restore_drill.py"
           input_guard="$current/tools/platform_workflow_input_guard.py"
+          backup_file=""
+          timer_file=""
+          timer_dir=""
+          retention_file=""
+          cleanup_private_files() {
+            [[ -z "$backup_file" ]] || rm -f -- "$backup_file"
+            [[ -z "$timer_file" ]] || rm -f -- "$timer_file"
+            [[ -z "$timer_dir" ]] || rmdir -- "$timer_dir" 2>/dev/null || true
+            [[ -z "$retention_file" ]] || rm -f -- "$retention_file"
+          }
+          trap cleanup_private_files EXIT
 
           test "$(id -u)" -eq 0 || report_failure identity privilege_required 1
           test -f "$input_guard" && test ! -L "$input_guard" \
@@ -131,24 +143,118 @@ jobs:
           test -x "$python_bin" || report_failure identity python_unavailable 1
           test -f "$summary_tool" && test ! -L "$summary_tool" \
             || report_failure identity summary_helper_unavailable 1
+          test -f "$backup_tool" && test ! -L "$backup_tool" \
+            || report_failure identity backup_check_unavailable 1
 
-          active_sha="$(/usr/bin/python3 -I - "$current/RELEASE.json" <<'PY'
+          release_identity="$(/usr/bin/python3 -I - "$runtime" "$expected_sha" <<'PY'
           import json
+          import os
           from pathlib import Path
+          import re
+          import stat
           import sys
 
-          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          print(payload.get("source_git_commit") or "")
-          PY
-          )"
-          test "$active_sha" = "$expected_sha" \
-            || report_failure identity source_mismatch 1
+          runtime = Path(sys.argv[1])
+          expected_sha = sys.argv[2]
+          sha_re = re.compile(r"[0-9a-f]{40}\Z")
+          slug_re = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}\Z")
 
-          current_id="$(basename "$(readlink -f "$current")")"
-          [[ "$current_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] \
-            || report_failure identity release_id_invalid 1
-          printf '{"schema":1,"kind":"platform_storage_diagnostics","active_release_id":"%s","active_source_sha":"%s"}\n' \
-            "$current_id" "$active_sha"
+          def pairs_no_duplicates(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError
+                  result[key] = value
+              return result
+
+          def stable_release(pointer):
+              before = pointer.lstat()
+              if not stat.S_ISLNK(before.st_mode):
+                  raise ValueError
+              link_text = os.readlink(pointer)
+              target = pointer.resolve(strict=True)
+              releases = (runtime / "releases").resolve(strict=True)
+              if target.parent != releases or not slug_re.fullmatch(target.name):
+                  raise ValueError
+              release_file = target / "RELEASE.json"
+              named = release_file.lstat()
+              if (
+                  not stat.S_ISREG(named.st_mode)
+                  or named.st_uid != os.geteuid()
+                  or named.st_nlink != 1
+                  or named.st_size <= 0
+                  or named.st_size > 65536
+              ):
+                  raise ValueError
+              descriptor = os.open(
+                  release_file,
+                  os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+              )
+              try:
+                  opened = os.fstat(descriptor)
+                  if (
+                      not stat.S_ISREG(opened.st_mode)
+                      or opened.st_uid != os.geteuid()
+                      or opened.st_nlink != 1
+                      or (opened.st_dev, opened.st_ino, opened.st_size)
+                      != (named.st_dev, named.st_ino, named.st_size)
+                  ):
+                      raise ValueError
+                  chunks = []
+                  remaining = 65537
+                  while remaining:
+                      chunk = os.read(descriptor, min(8192, remaining))
+                      if not chunk:
+                          break
+                      chunks.append(chunk)
+                      remaining -= len(chunk)
+                  raw = b"".join(chunks)
+                  after = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              after_named = release_file.lstat()
+              pointer_after = pointer.lstat()
+              if (
+                  len(raw) != named.st_size
+                  or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                  != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                  or (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)
+                  != (after_named.st_dev, after_named.st_ino, after_named.st_size, after_named.st_mtime_ns)
+                  or (before.st_dev, before.st_ino, before.st_mtime_ns)
+                  != (pointer_after.st_dev, pointer_after.st_ino, pointer_after.st_mtime_ns)
+                  or os.readlink(pointer) != link_text
+              ):
+                  raise ValueError
+              payload = json.loads(raw, object_pairs_hook=pairs_no_duplicates)
+              if (
+                  not isinstance(payload, dict)
+                  or payload.get("release_slug") != target.name
+                  or not isinstance(payload.get("source_git_commit"), str)
+                  or not sha_re.fullmatch(payload["source_git_commit"])
+              ):
+                  raise ValueError
+              return target.name, payload["source_git_commit"]
+
+          try:
+              if not sha_re.fullmatch(expected_sha):
+                  raise ValueError
+              current_id, active_sha = stable_release(runtime / "current")
+              previous_id, previous_sha = stable_release(runtime / "previous")
+              if active_sha != expected_sha or current_id == previous_id:
+                  raise ValueError
+              print("\t".join((current_id, active_sha, previous_id, previous_sha)))
+          except Exception:
+              raise SystemExit(2)
+          PY
+          )" \
+            || report_failure identity release_identity_unavailable 1
+          IFS=$'\t' read -r current_id active_sha previous_id previous_sha <<<"$release_identity"
+          [[ "$current_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ && \
+             "$previous_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ && \
+             "$active_sha" =~ ^[0-9a-f]{40}$ && "$previous_sha" =~ ^[0-9a-f]{40}$ ]] \
+            || report_failure identity release_identity_invalid 1
+          printf '{"schema":1,"kind":"platform_storage_diagnostics","active_release_id":"%s","active_source_sha":"%s","previous_release_id":"%s","previous_source_sha":"%s"}\n' \
+            "$current_id" "$active_sha" "$previous_id" "$previous_sha"
 
           CURRENT_STAGE=retained_load_lock
           retained_load_lock=/run/lock/oldsparky-retained-load-matrix.lock
@@ -262,6 +368,190 @@ jobs:
               | /usr/bin/python3 -I "$summary_tool" --mode service --service "$service"
           done
 
+          CURRENT_STAGE=maintenance_timer_state
+          timer_dir="$(mktemp -d)"
+          chmod 700 "$timer_dir"
+          timer_file="$timer_dir/systemctl-show.out"
+          (set -o noclobber; : >"$timer_file") \
+            || report_failure maintenance_timer_state output_unavailable 2
+          chmod 600 "$timer_file"
+          if (ulimit -f 16; timeout --foreground 5s systemctl show deadlock-maintenance.timer \
+            --property=LoadState,ActiveState,SubState,UnitFileState,LastTriggerUSec,NextElapseUSecRealtime,FragmentPath,DropInPaths \
+            --no-pager >"$timer_file" 2>/dev/null) 2>/dev/null; then
+            timer_rc=0
+          else
+            timer_rc=$?
+          fi
+          timer_size="$(stat -c '%s' -- "$timer_file" 2>/dev/null)" \
+            || report_failure maintenance_timer_state output_unavailable 2
+          [[ "$timer_size" =~ ^[0-9]{1,5}$ ]] && (( timer_size <= 16384 )) \
+            || report_failure maintenance_timer_state output_limit 2
+          (( timer_rc == 0 )) \
+            || report_failure maintenance_timer_state producer_failed "$timer_rc"
+          timer_summary="$(/usr/bin/python3 -I - "$current" 3<"$timer_file" <<'PY'
+          import datetime as dt
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+          from zoneinfo import ZoneInfo
+
+          expected_keys = {
+              "LoadState", "ActiveState", "SubState", "UnitFileState",
+              "LastTriggerUSec", "NextElapseUSecRealtime", "FragmentPath", "DropInPaths",
+          }
+          raw = os.read(3, 16385)
+          if len(raw) > 16384:
+              raise SystemExit(2)
+          try:
+              lines = raw.decode("utf-8", "strict").splitlines()
+              values = {}
+              for line in lines:
+                  key, separator, value = line.partition("=")
+                  if not separator or key not in expected_keys or key in values:
+                      raise ValueError
+                  values[key] = value
+              if set(values) != expected_keys:
+                  raise ValueError
+
+              enum_values = {
+                  "LoadState": {"loaded", "not-found", "error", "bad-setting", "merged", "masked"},
+                  "ActiveState": {"active", "reloading", "inactive", "failed", "activating", "deactivating"},
+                  "SubState": {"dead", "waiting", "running", "elapsed", "failed", "start", "stop"},
+                  "UnitFileState": {
+                      "enabled", "enabled-runtime", "linked", "linked-runtime", "static",
+                      "indirect", "disabled", "masked", "masked-runtime", "alias",
+                      "generated", "transient", "bad", "not-found",
+                  },
+              }
+              for key, allowed in enum_values.items():
+                  if values[key] not in allowed:
+                      raise ValueError
+
+              def parse_time(value):
+                  if value in {"", "n/a"}:
+                      return None
+                  match = re.fullmatch(
+                      r"(?:(Mon|Tue|Wed|Thu|Fri|Sat|Sun) )?"
+                      r"([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2}) "
+                      r"(UTC|GMT|EET|EEST)",
+                      value,
+                  )
+                  if not match:
+                      raise ValueError
+                  weekday, year, month, day, hour, minute, second, zone_name = match.groups()
+                  local = dt.datetime(
+                      int(year), int(month), int(day), int(hour), int(minute), int(second)
+                  )
+                  if weekday and local.strftime("%a") != weekday:
+                      raise ValueError
+                  zone = ZoneInfo("Europe/Helsinki") if zone_name in {"EET", "EEST"} else dt.UTC
+                  aware = local.replace(tzinfo=zone)
+                  if aware.strftime("%Z") != zone_name:
+                      raise ValueError
+                  return aware.astimezone(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+              last_trigger = parse_time(values["LastTriggerUSec"])
+              next_trigger = parse_time(values["NextElapseUSecRealtime"])
+              if last_trigger is None:
+                  last_state = "not_triggered"
+              else:
+                  last_state = "present"
+              if next_trigger is None:
+                  next_state = "unavailable"
+              else:
+                  next_state = "present"
+
+              expected_fragment = Path("/etc/systemd/system/deadlock-maintenance.timer")
+              if values["FragmentPath"] != str(expected_fragment):
+                  raise ValueError
+              current = Path(sys.argv[1])
+              source_file = current / "deploy/systemd/deadlock-maintenance.timer"
+
+              def stable_digest(path):
+                  named = path.lstat()
+                  if (
+                  not stat.S_ISREG(named.st_mode)
+                  or named.st_uid != os.geteuid()
+                      or named.st_nlink != 1
+                      or named.st_size <= 0
+                      or named.st_size > 16384
+                  ):
+                      raise ValueError
+                  descriptor = os.open(
+                      path,
+                      os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+                  )
+                  digest = hashlib.sha256()
+                  try:
+                      opened = os.fstat(descriptor)
+                      if (
+                          not stat.S_ISREG(opened.st_mode)
+                          or opened.st_uid != os.geteuid()
+                          or opened.st_nlink != 1
+                          or (opened.st_dev, opened.st_ino, opened.st_size)
+                          != (named.st_dev, named.st_ino, named.st_size)
+                      ):
+                          raise ValueError
+                      total = 0
+                      while True:
+                          chunk = os.read(descriptor, 4096)
+                          if not chunk:
+                              break
+                          total += len(chunk)
+                          if total > 16384:
+                              raise ValueError
+                          digest.update(chunk)
+                      after = os.fstat(descriptor)
+                  finally:
+                      os.close(descriptor)
+                  after_named = path.lstat()
+                  if (
+                      total != named.st_size
+                      or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                      != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                      or (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)
+                      != (after_named.st_dev, after_named.st_ino, after_named.st_size, after_named.st_mtime_ns)
+                  ):
+                      raise ValueError
+                  return digest.hexdigest()
+
+              source_digest = stable_digest(source_file)
+              installed_digest = stable_digest(expected_fragment)
+              dropins = values["DropInPaths"].split() if values["DropInPaths"] else []
+              if len(dropins) > 8 or any(not item.startswith("/") or len(item) > 256 for item in dropins):
+                  raise ValueError
+              result = {
+                  "schema": 1,
+                  "kind": "maintenance_timer_state",
+                  "status": "ok",
+                  "load_state": values["LoadState"],
+                  "active_state": values["ActiveState"],
+                  "sub_state": values["SubState"],
+                  "unit_file_state": values["UnitFileState"],
+                  "last_trigger_state": last_state,
+                  "last_trigger_utc": last_trigger,
+                  "next_trigger_state": next_state,
+                  "next_trigger_utc": next_trigger,
+                  "unit_source_match": source_digest == installed_digest,
+                  "source_sha256": source_digest,
+                  "installed_sha256": installed_digest,
+                  "dropin_count": len(dropins),
+                  "dropin_identity": "none" if not dropins else "unexpected_present",
+              }
+              import json
+              print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+          except Exception:
+              raise SystemExit(2)
+          PY
+          )" \
+            || report_failure maintenance_timer_state summary_contract 2
+          rm -f -- "$timer_file"
+          timer_file=""
+          printf '%s\n' "$timer_summary"
+
           CURRENT_STAGE=category_usage
           emit_category_size() {
             local category="$1"
@@ -282,9 +572,56 @@ jobs:
           emit_category_size live_qa_runtime /var/lib/oldsparky-liveqa
           emit_category_size backups "$runtime/shared/backups"
 
+          CURRENT_STAGE=backup_check
+          backup_file="$(mktemp)"
+          chmod 600 "$backup_file"
+          if timeout --foreground 180s "$python_bin" "$backup_tool" \
+            --output-dir "$runtime/shared/backups" --check-latest --max-age-hours 24 --json \
+            >"$backup_file" 2>/dev/null; then
+            backup_rc=0
+          else
+            backup_rc=$?
+          fi
+          backup_summary="$(/usr/bin/python3 -I "$summary_tool" --mode backup --phase check \
+            <"$backup_file" 2>/dev/null)" \
+            || report_failure backup_check summary_contract "$(( backup_rc != 0 ? backup_rc : 2 ))"
+          printf '%s\n' "$backup_summary"
+          backup_assessment="$(/usr/bin/python3 -I - "$backup_summary" <<'PY'
+          import json
+          import sys
+
+          try:
+              report = json.loads(sys.argv[1])
+              age = report.get("age_hours")
+              valid_age = (
+                  isinstance(age, (int, float))
+                  and not isinstance(age, bool)
+                  and 0 <= age <= 24
+              )
+              complete = (
+                  report.get("kind") == "backup_evidence"
+                  and report.get("phase") == "check"
+                  and report.get("status") == "ok"
+                  and report.get("restore_verified") is True
+                  and report.get("alembic_revision_verified") is True
+                  and report.get("checksum_present") is True
+                  and valid_age
+              )
+              print("ok" if complete else "incomplete")
+          except Exception:
+              print("invalid")
+          PY
+          )"
+          rm -f -- "$backup_file"
+          backup_file=""
+          if (( backup_rc != 0 )); then
+            report_failure backup_check producer_failed "$backup_rc"
+          elif [[ "$backup_assessment" != ok ]]; then
+            report_failure backup_check verification_incomplete 1
+          fi
+
           CURRENT_STAGE=retention_tempfile
           retention_file="$(mktemp)"
-          trap 'rm -f -- "$retention_file"' EXIT
           CURRENT_STAGE=retention_dry_run
           if "$python_bin" "$current/tools/platform_storage_maintenance.py" --json \
             >"$retention_file" 2>/dev/null; then
@@ -401,6 +738,11 @@ jobs:
               "$CURRENT_STAGE" "$failure_code"
             exit "$failure_code"
           fi
+          CURRENT_STAGE=identity_recheck
+          test -L "$current" && test -L "$runtime/previous" \
+            && test "$(readlink -f "$current")" = "$runtime/releases/$current_id" \
+            && test "$(readlink -f "$runtime/previous")" = "$runtime/releases/$previous_id" \
+            || report_failure identity_recheck release_pointer_changed 1
           printf '{"schema":1,"kind":"collection_status","status":"ok","stage":"complete","exit_code":0}\n'
           REMOTE
           remote_exit_code=$?

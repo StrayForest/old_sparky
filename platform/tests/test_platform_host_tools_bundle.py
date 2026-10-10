@@ -3567,6 +3567,14 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 "parents": list(context.tested_parents),
             }
             candidate._validate_summary(alias_split_summary, context)
+            run_proof_summary = {
+                **summary,
+                "proof_mode": "standard",
+                "proof_run_id": context.run_id,
+                "proof_run_attempt": context.run_attempt,
+                "baseline_guard_result": "skipped",
+            }
+            candidate._validate_summary(run_proof_summary, context)
             for label, changed in (
                 ("arbitrary-tested-sha", {**summary, "tested_sha": "9" * 40}),
                 ("source-as-tested-sha", {**summary, "tested_sha": context.original_source_head_sha}),
@@ -3583,6 +3591,42 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 (
                     "split-extra-key",
                     {**split_summary, "unexpected": True},
+                ),
+                (
+                    "proof-run-id",
+                    {**run_proof_summary, "proof_run_id": "9002"},
+                ),
+                (
+                    "proof-run-id-type",
+                    {**run_proof_summary, "proof_run_id": 9001},
+                ),
+                (
+                    "proof-run-attempt",
+                    {**run_proof_summary, "proof_run_attempt": "3"},
+                ),
+                (
+                    "proof-run-attempt-bool",
+                    {**run_proof_summary, "proof_run_attempt": True},
+                ),
+                (
+                    "proof-mode",
+                    {**run_proof_summary, "proof_mode": "baseline-reconcile"},
+                ),
+                (
+                    "proof-mode-type",
+                    {**run_proof_summary, "proof_mode": []},
+                ),
+                (
+                    "proof-baseline-guard",
+                    {**run_proof_summary, "baseline_guard_result": "success"},
+                ),
+                (
+                    "proof-baseline-guard-type",
+                    {**run_proof_summary, "baseline_guard_result": None},
+                ),
+                (
+                    "proof-extra-key",
+                    {**run_proof_summary, "untrusted": True},
                 ),
             ):
                 with self.subTest(summary_identity=label):
