@@ -1480,8 +1480,24 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         for path in (*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")):
             workflow = path.read_text(encoding="utf-8")
             if "platform/tools/" in workflow:
-                self.assertRegex(workflow, r"actions/checkout@[0-9a-f]{40}", path.name)
-                self.assertIn("persist-credentials: false", workflow, path.name)
+                if path.name == "platform-production-backup.yml":
+                    # This workflow consumes only the source-bound helper
+                    # bundle produced by the exact successful dev security
+                    # run; it deliberately does not checkout or execute a
+                    # workflow-branch tree.
+                    self.assertNotRegex(
+                        workflow,
+                        r"(?m)^\s+uses:\s*actions/checkout@",
+                        path.name,
+                    )
+                    self.assertIn('run.get("event") != "push"', workflow)
+                    self.assertIn('run.get("head_branch") != "dev"', workflow)
+                    self.assertIn('run.get("head_sha") != source_sha', workflow)
+                    self.assertIn("gh attestation verify \"$bundle_path\"", workflow)
+                    self.assertIn('manifest.get("source_sha") != source_sha', workflow)
+                else:
+                    self.assertRegex(workflow, r"actions/checkout@[0-9a-f]{40}", path.name)
+                    self.assertIn("persist-credentials: false", workflow, path.name)
 
         profile_fixture = (
             WORKFLOW_DIR / "platform-production-profile-review-fixture.yml"
