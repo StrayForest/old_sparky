@@ -32,6 +32,7 @@ from tests.test_platform_validate_release_artifact import (
 )
 from tools import platform_workflow_remote_dispatch
 from tools import platform_live_qa_runtime_install
+from tools import platform_recovery_bootstrap
 from tools import platform_fetch_artifact_metadata
 from tools import platform_configure_shared_env
 
@@ -2218,6 +2219,120 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('generation_name="$bundle_sha"', recover)
         self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover)
         self.assertIn("platform_recover_pending.sh", recover)
+        extraction_match = re.search(
+            r'''/usr/bin/python3 -I - "\$bundle_path" "\$install_stage" "\$source_sha" <<'PY'\n(?P<script>.*?)\n          PY\n          recovery_stage=generation_install''',
+            recover,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(extraction_match)
+        extraction_script = textwrap.dedent(extraction_match.group("script"))
+        self.assertIn("platform_release_systemd_state.py", extraction_script)
+        self.assertIn("platform_release_transaction.py", extraction_script)
+        self.assertIn("manifest.get(\"source_sha\") != expected_source_sha", extraction_script)
+        self.assertIn("hashlib.sha256(data).hexdigest() != selected[relative]", extraction_script)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "source"
+            source_tools = source_root / "platform" / "tools"
+            source_tools.mkdir(parents=True)
+            for name in platform_recovery_bootstrap.RECOVERY_FILES:
+                source_file = TOOLS_DIR / name
+                copied = source_tools / name
+                shutil.copyfile(source_file, copied)
+                copied.chmod(0o755 if name.endswith(".sh") else 0o644)
+            source_sha = "a" * 40
+            provenance = {
+                "repository": "StrayForest/old_sparky",
+                "workflow": "Platform security and build",
+                "job": "Verification contract",
+                "run_id": "12345",
+                "run_attempt": "1",
+                "recovery_workflow_sha": source_sha,
+                "source_sha": source_sha,
+                "artifact_name": "platform-ci-route-12345-1",
+                "artifact_sha256": "b" * 64,
+                "deployable": False,
+            }
+            bundle = root / "bundle.zip"
+            platform_recovery_bootstrap.build_bundle(
+                source_root,
+                source_sha=source_sha,
+                provenance=provenance,
+                output=bundle,
+            )
+            provenance_path = root / "provenance.json"
+            provenance_path.write_text(
+                json.dumps(provenance, sort_keys=True, separators=(",", ":")),
+                encoding="ascii",
+            )
+            provenance_path.chmod(0o600)
+            destination = root / "install-stage"
+            destination.mkdir(mode=0o700)
+            destination.chmod(0o700)
+            extraction = subprocess.run(
+                [sys.executable, "-I", "-", str(bundle), str(destination), source_sha],
+                input=extraction_script,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(extraction.returncode, 0, extraction.stderr)
+            for sibling in (
+                "platform_recovery_bootstrap.py",
+                "platform_release_systemd_state.py",
+                "platform_release_transaction.py",
+            ):
+                metadata = (destination / sibling).lstat()
+                self.assertTrue(stat.S_ISREG(metadata.st_mode))
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o444)
+                self.assertEqual(metadata.st_nlink, 1)
+                self.assertEqual(metadata.st_uid, 0)
+                self.assertEqual(metadata.st_gid, 0)
+            validated = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(destination / "platform_recovery_bootstrap.py"),
+                    "validate",
+                    "--bundle",
+                    str(bundle),
+                    "--source-sha",
+                    source_sha,
+                    "--provenance",
+                    str(provenance_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+            validation_result = json.loads(validated.stdout)
+            self.assertEqual(validation_result["capability"], "recovery_bootstrap")
+            self.assertEqual(validation_result["capabilities"], ["abort_retained_only", "recover_pending"])
+            self.assertEqual(validation_result["deployable"], False)
+            missing_bundle = root / "missing-import.zip"
+            with zipfile.ZipFile(bundle) as original, zipfile.ZipFile(
+                missing_bundle, "w", compression=zipfile.ZIP_STORED
+            ) as incomplete:
+                for info in original.infolist():
+                    if info.filename.endswith("/platform_release_transaction.py"):
+                        continue
+                    incomplete.writestr(info, original.read(info))
+            missing_stage = root / "missing-stage"
+            missing_stage.mkdir(mode=0o700)
+            rejected = subprocess.run(
+                [sys.executable, "-I", "-", str(missing_bundle), str(missing_stage), source_sha],
+                input=extraction_script,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(list(missing_stage.iterdir()), [])
         input_keys = (
             "bundle_sha",
             "source_sha",
