@@ -7,6 +7,7 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -129,6 +130,14 @@ def parse_args() -> argparse.Namespace:
         "--check-latest",
         action="store_true",
         help="Only verify the newest retained backup metadata and checksum.",
+    )
+    parser.add_argument(
+        "--verify-latest-existing",
+        action="store_true",
+        help=(
+            "Restore and verify only the newest retained archive, then mark its existing "
+            "metadata verified without creating or rotating a backup."
+        ),
     )
     parser.add_argument(
         "--verify-dump",
@@ -372,6 +381,451 @@ def check_latest_backup(output_dir: pathlib.Path, *, max_age_hours: float) -> di
         ),
         "restored_table_count": metadata.get("restored_table_count"),
         "sha256": actual_sha256,
+    }
+
+
+def _stable_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _backup_directory_identity(path: pathlib.Path) -> tuple[int, int, int, int, int, int]:
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise RuntimeError("Backup output directory has unsafe metadata.")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+    )
+
+
+def _read_private_json(
+    path: pathlib.Path,
+    *,
+    expected_gid: int | None = None,
+    max_bytes: int = 1_048_576,
+) -> tuple[bytes, dict[str, Any], tuple[int, ...]]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or (expected_gid is not None and before.st_gid != expected_gid)
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > max_bytes
+        ):
+            raise RuntimeError("Latest backup metadata has unsafe file metadata.")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(fd, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(fd)
+        identity = _stable_file_identity(before)
+        if len(raw) > max_bytes or _stable_file_identity(after) != identity:
+            raise RuntimeError("Latest backup metadata changed while being read.")
+    finally:
+        os.close(fd)
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate metadata key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("invalid constant")),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("Latest backup metadata is malformed.") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("Latest backup metadata must be a JSON object.")
+    return raw, value, identity
+
+
+def _verify_backup_age(metadata: dict[str, Any], *, max_age_hours: float) -> tuple[dt.datetime, float]:
+    try:
+        timestamp = metadata["completed_at_utc"]
+        if not isinstance(timestamp, str):
+            raise ValueError("timestamp type")
+        parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("naive timestamp")
+        completed_at = parsed.astimezone(dt.UTC)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Latest backup creation timestamp is invalid.") from exc
+    now = utc_now()
+    age_hours = (now - completed_at).total_seconds() / 3600
+    if age_hours < 0 or not math.isfinite(age_hours) or age_hours > max_age_hours:
+        raise RuntimeError("Latest backup is outside the permitted creation-age window.")
+    return completed_at, age_hours
+
+
+def _latest_pair_for_verification(
+    output_dir: pathlib.Path,
+    *,
+    max_age_hours: float,
+) -> tuple[
+    pathlib.Path,
+    pathlib.Path,
+    bytes,
+    dict[str, Any],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, int, int, int, int, int],
+    str,
+    float,
+]:
+    if not math.isfinite(max_age_hours) or max_age_hours <= 0:
+        raise ValueError("--max-age-hours must be positive.")
+    directory_identity = _backup_directory_identity(output_dir)
+    metadata_path = newest_metadata(output_dir)
+    metadata_raw, metadata, metadata_identity = _read_private_json(
+        metadata_path, expected_gid=directory_identity[3]
+    )
+    dump_name = metadata.get("dump_file")
+    if (
+        not isinstance(dump_name, str)
+        or pathlib.PurePath(dump_name).name != dump_name
+        or not dump_name.startswith("platformdb-")
+        or not dump_name.endswith(".dump")
+        or metadata_path.name != pathlib.Path(dump_name).with_suffix(".json").name
+    ):
+        raise RuntimeError("Latest backup metadata has an invalid archive binding.")
+    _, age_hours = _verify_backup_age(metadata, max_age_hours=max_age_hours)
+    dump_path = output_dir / dump_name
+    dump_stat = dump_path.lstat()
+    if (
+        not stat.S_ISREG(dump_stat.st_mode)
+        or dump_stat.st_uid != os.geteuid()
+        or dump_stat.st_gid != directory_identity[3]
+        or stat.S_IMODE(dump_stat.st_mode) != 0o600
+        or dump_stat.st_nlink != 1
+        or dump_stat.st_size <= 0
+    ):
+        raise RuntimeError("Latest backup archive has unsafe file metadata.")
+    dump_identity = _stable_file_identity(dump_stat)
+    actual_sha256 = sha256_file(dump_path)
+    version = metadata.get("format_version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version not in {1, 2}:
+        raise RuntimeError("Latest backup metadata format is unsupported.")
+    if metadata.get("sha256") != actual_sha256:
+        raise RuntimeError("Latest backup archive checksum does not match metadata.")
+    size_bytes = metadata.get("size_bytes")
+    if size_bytes is not None and (
+        isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes != dump_stat.st_size
+    ):
+        raise RuntimeError("Latest backup archive size does not match metadata.")
+    if metadata.get("database", "platformdb") != "platformdb":
+        raise RuntimeError("Latest backup metadata does not identify platformdb.")
+    schemas = metadata.get("schemas", ["platform", "public"])
+    if not isinstance(schemas, list) or schemas != ["platform", "public"]:
+        raise RuntimeError("Latest backup metadata has an unsupported schema set.")
+    extensions = metadata.get("required_extensions", list(REQUIRED_PLATFORM_EXTENSIONS))
+    if not isinstance(extensions, list) or extensions != list(REQUIRED_PLATFORM_EXTENSIONS):
+        raise RuntimeError("Latest backup metadata has an unsupported extension set.")
+    for flag in ("restore_verified", "alembic_revision_verified"):
+        if flag in metadata and not isinstance(metadata[flag], bool):
+            raise RuntimeError("Latest backup metadata has an invalid verification flag.")
+    if "restore_error" in metadata and metadata["restore_error"] is not None and not isinstance(
+        metadata["restore_error"], str
+    ):
+        raise RuntimeError("Latest backup metadata has an invalid restore diagnostic.")
+    if newest_metadata(output_dir) != metadata_path:
+        raise RuntimeError("Latest backup selection changed during verification.")
+    return (
+        metadata_path,
+        dump_path,
+        metadata_raw,
+        metadata,
+        metadata_identity,
+        dump_identity,
+        directory_identity,
+        actual_sha256,
+        age_hours,
+    )
+
+
+def _publish_verified_metadata(
+    output_dir: pathlib.Path,
+    metadata_path: pathlib.Path,
+    *,
+    original_raw: bytes,
+    original_identity: tuple[int, ...],
+    directory_identity: tuple[int, int, int, int, int, int],
+    updated: dict[str, Any],
+    max_age_hours: float,
+) -> None:
+    if _backup_directory_identity(output_dir) != directory_identity:
+        raise RuntimeError("Backup output directory changed before metadata staging.")
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{metadata_path.name}.", suffix=".verify.tmp", dir=output_dir
+    )
+    temporary_path: pathlib.Path | None = pathlib.Path(temporary_name)
+    temp_identity: tuple[int, int] | None = None
+    published_identity: tuple[int, int] | None = None
+    rollback_path: pathlib.Path | None = None
+    rollback_identity: tuple[int, int] | None = None
+    try:
+        expected_bytes = (json.dumps(updated, indent=2, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        )
+        initial = os.fstat(fd)
+        temp_identity = (initial.st_dev, initial.st_ino)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            written = handle.write(expected_bytes)
+            if written != len(expected_bytes):
+                raise RuntimeError("Verified backup metadata staging write was incomplete.")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600, follow_symlinks=False)
+        if _backup_directory_identity(output_dir) != directory_identity:
+            raise RuntimeError("Backup output directory changed during metadata staging.")
+        staged = temporary_path.lstat()
+        if (
+            (staged.st_dev, staged.st_ino) != temp_identity
+            or not stat.S_ISREG(staged.st_mode)
+            or staged.st_uid != os.geteuid()
+            or staged.st_gid != directory_identity[3]
+            or stat.S_IMODE(staged.st_mode) != 0o600
+            or staged.st_nlink != 1
+            or staged.st_size != len(expected_bytes)
+        ):
+            raise RuntimeError("Verified backup metadata staging identity changed.")
+        verify_fd = os.open(
+            temporary_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            verify_before = os.fstat(verify_fd)
+            staged_bytes = b""
+            while len(staged_bytes) <= len(expected_bytes):
+                chunk = os.read(verify_fd, min(65536, len(expected_bytes) + 1 - len(staged_bytes)))
+                if not chunk:
+                    break
+                staged_bytes += chunk
+            verify_after = os.fstat(verify_fd)
+            if (
+                _stable_file_identity(verify_before) != _stable_file_identity(verify_after)
+                or staged_bytes != expected_bytes
+            ):
+                raise RuntimeError("Verified backup metadata staging bytes changed.")
+        finally:
+            os.close(verify_fd)
+        current_raw, _, current_identity = _read_private_json(
+            metadata_path, expected_gid=directory_identity[3]
+        )
+        if current_raw != original_raw or current_identity != original_identity:
+            raise RuntimeError("Latest backup metadata changed before verification commit.")
+        if _backup_directory_identity(output_dir) != directory_identity:
+            raise RuntimeError("Backup output directory changed before verification commit.")
+        if newest_metadata(output_dir) != metadata_path:
+            raise RuntimeError("Latest backup selection changed before verification commit.")
+        _verify_backup_age(updated, max_age_hours=max_age_hours)
+        os.replace(temporary_path, metadata_path)
+        temporary_path = None
+        published_identity = temp_identity
+        published_stat = metadata_path.lstat()
+        published_identity = (published_stat.st_dev, published_stat.st_ino)
+        if (
+            not stat.S_ISREG(published_stat.st_mode)
+            or published_stat.st_uid != os.geteuid()
+            or published_stat.st_gid != directory_identity[3]
+            or stat.S_IMODE(published_stat.st_mode) != 0o600
+            or published_stat.st_nlink != 1
+            or published_stat.st_size != len(expected_bytes)
+        ):
+            raise RuntimeError("Verified backup metadata publication metadata changed.")
+        directory_fd = os.open(
+            output_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        if published_identity is not None:
+            try:
+                current = metadata_path.lstat()
+                if (current.st_dev, current.st_ino) == published_identity and stat.S_ISREG(
+                    current.st_mode
+                ):
+                    rollback_fd, rollback_name = tempfile.mkstemp(
+                        prefix=f".{metadata_path.name}.", suffix=".rollback.tmp", dir=output_dir
+                    )
+                    rollback_path = pathlib.Path(rollback_name)
+                    rollback_stat = os.fstat(rollback_fd)
+                    rollback_identity = (rollback_stat.st_dev, rollback_stat.st_ino)
+                    with os.fdopen(rollback_fd, "wb", closefd=True) as handle:
+                        handle.write(original_raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.chmod(rollback_path, 0o600, follow_symlinks=False)
+                    staged_rollback = rollback_path.lstat()
+                    if (
+                        (staged_rollback.st_dev, staged_rollback.st_ino) != rollback_identity
+                        or not stat.S_ISREG(staged_rollback.st_mode)
+                        or staged_rollback.st_uid != os.geteuid()
+                        or staged_rollback.st_gid != directory_identity[3]
+                        or staged_rollback.st_nlink != 1
+                        or stat.S_IMODE(staged_rollback.st_mode) != 0o600
+                    ):
+                        raise RuntimeError("Backup metadata rollback staging identity changed.")
+                    current = metadata_path.lstat()
+                    if (current.st_dev, current.st_ino) != published_identity:
+                        raise RuntimeError("Backup metadata changed before rollback.")
+                    os.replace(rollback_path, metadata_path)
+                    rollback_path = None
+                    rollback_directory_fd = os.open(
+                        output_dir,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    try:
+                        os.fsync(rollback_directory_fd)
+                    finally:
+                        os.close(rollback_directory_fd)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Backup metadata commit failed and exact rollback could not be confirmed."
+                ) from rollback_error
+        raise
+    finally:
+        if temp_identity is not None and temporary_path is not None:
+            try:
+                current = temporary_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if (current.st_dev, current.st_ino) == temp_identity and stat.S_ISREG(current.st_mode):
+                    temporary_path.unlink()
+        if rollback_path is not None and rollback_identity is not None:
+            try:
+                current = rollback_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if (current.st_dev, current.st_ino) == rollback_identity and stat.S_ISREG(
+                    current.st_mode
+                ):
+                    rollback_path.unlink()
+
+
+def verify_latest_existing_backup(
+    output_dir: pathlib.Path,
+    env_file: pathlib.Path,
+    max_age_hours: float = 24.0,
+    *,
+    admin_database_url: str | None = None,
+) -> dict[str, Any]:
+    """Re-verify only the newest existing backup and update its sidecar on success.
+
+    Callers are responsible for the canonical host lock. The archive bytes and original
+    creation timestamp remain untouched; any failed restore leaves both retained files
+    byte-for-byte unchanged.
+    """
+    (
+        metadata_path,
+        dump_path,
+        original_raw,
+        metadata,
+        metadata_identity,
+        dump_identity,
+        directory_identity,
+        archive_sha256,
+        _,
+    ) = _latest_pair_for_verification(output_dir, max_age_hours=max_age_hours)
+    file_env = load_env(env_file)
+    merged_env = {**file_env, **os.environ}
+    database_url = merged_env.get("PLATFORM_DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("PLATFORM_DATABASE_URL is required to run a restore drill.")
+    app_target = parse_database_url(database_url)
+    admin_url = admin_database_url or merged_env.get("PLATFORM_BACKUP_ADMIN_URL")
+    admin_target = parse_database_url(admin_url, require_platformdb=False) if admin_url else None
+    require_commands("pg_restore", "createdb", "dropdb", "psql")
+    run_command(["pg_restore", "--list", str(dump_path)], capture_output=True)
+    table_count = perform_restore_drill(
+        dump_path,
+        app_target=app_target,
+        admin_target=admin_target,
+        timestamp_slug=utc_now().strftime("%Y%m%dT%H%M%SZ"),
+    )
+
+    # A restore can cross the source-age deadline; check the original creation time again.
+    _, age_hours = _verify_backup_age(metadata, max_age_hours=max_age_hours)
+    latest = _latest_pair_for_verification(output_dir, max_age_hours=max_age_hours)
+    if (
+        latest[0] != metadata_path
+        or latest[2] != original_raw
+        or latest[4] != metadata_identity
+        or latest[6] != directory_identity
+    ):
+        raise RuntimeError("Latest backup metadata changed during restore verification.")
+    dump_after = dump_path.lstat()
+    if (
+        _stable_file_identity(dump_after) != dump_identity
+        or sha256_file(dump_path) != archive_sha256
+    ):
+        raise RuntimeError("Latest backup archive changed during restore verification.")
+    updated = dict(metadata)
+    updated["restore_verified"] = True
+    updated["alembic_revision_verified"] = True
+    updated["restored_table_count"] = table_count
+    _, age_hours = _verify_backup_age(metadata, max_age_hours=max_age_hours)
+    verified_at = utc_now()
+    updated["restore_verified_at_utc"] = verified_at.isoformat().replace("+00:00", "Z")
+    _publish_verified_metadata(
+        output_dir,
+        metadata_path,
+        original_raw=original_raw,
+        original_identity=metadata_identity,
+        directory_identity=directory_identity,
+        updated=updated,
+        max_age_hours=max_age_hours,
+    )
+    return {
+        "ok": True,
+        "metadata_file": str(metadata_path),
+        "dump_file": str(dump_path),
+        "age_hours": round(age_hours, 3),
+        "restore_verified": True,
+        "alembic_revision_verified": True,
+        "restored_table_count": table_count,
+        "sha256": archive_sha256,
+        "restore_verified_at_utc": updated["restore_verified_at_utc"],
     }
 
 
@@ -890,11 +1344,26 @@ def verify_existing_dump(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> int:
     args = parse_args()
     try:
-        selected_modes = int(args.check_latest) + int(args.dump_only) + int(args.verify_dump is not None)
+        selected_modes = (
+            int(args.check_latest)
+            + int(getattr(args, "verify_latest_existing", False))
+            + int(args.dump_only)
+            + int(args.verify_dump is not None)
+        )
         if selected_modes > 1:
-            raise ValueError("--dump-only, --check-latest, and --verify-dump are mutually exclusive.")
+            raise ValueError(
+                "--dump-only, --check-latest, --verify-latest-existing, and --verify-dump "
+                "are mutually exclusive."
+            )
         if args.verify_dump is not None:
             result = verify_existing_dump(args)
+        elif getattr(args, "verify_latest_existing", False):
+            result = verify_latest_existing_backup(
+                pathlib.Path(args.output_dir),
+                pathlib.Path(args.env_file),
+                max_age_hours=args.max_age_hours,
+                admin_database_url=args.admin_database_url,
+            )
         elif args.check_latest:
             result = check_latest_backup(pathlib.Path(args.output_dir), max_age_hours=args.max_age_hours)
         else:

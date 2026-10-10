@@ -923,6 +923,10 @@ jobs:
     if: ${{ always() && needs.classifier.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.proof_mode != 'baseline-runtime' || needs.baseline-runtime-guard.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -975,6 +979,130 @@ jobs:
           path: platform/ci-backend/verification-contract
           if-no-files-found: error
           retention-days: 14
+
+      - name: Build exact-source backup verifier helper bundle
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/dev' && needs.classifier.outputs.class == 'full' }}
+        shell: bash
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          /usr/bin/python3 -I - "$GITHUB_WORKSPACE" "$RUNNER_TEMP/platform-backup-verifier.zip" "$TARGET_SHA" "$GITHUB_REPOSITORY" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+          import zipfile
+
+          root = Path(sys.argv[1]).resolve(strict=True)
+          archive_path = Path(sys.argv[2])
+          source_sha, repository = sys.argv[3:]
+          if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+              raise SystemExit("backup verifier source SHA is malformed")
+          if repository != "StrayForest/old_sparky":
+              raise SystemExit("backup verifier repository is not trusted")
+          expected_names = (
+              "platform_backup_restore_drill.py",
+              "platform_disk_policy.py",
+              "platform_live_qa_guard.py",
+              "platform_release_retention.py",
+              "platform_build_node_cache.py",
+              "platform_storage_maintenance.py",
+          )
+          entries = []
+          payloads = {}
+          total = 0
+          for name in expected_names:
+              path = root / "platform" / "tools" / name
+              before = path.lstat()
+              if (
+                  not stat.S_ISREG(before.st_mode)
+                  or stat.S_ISLNK(before.st_mode)
+                  or before.st_uid != os.getuid()
+                  or before.st_nlink != 1
+                  or stat.S_IMODE(before.st_mode) != 0o644
+                  or before.st_size <= 0
+                  or before.st_size > 2 * 1024 * 1024
+              ):
+                  raise SystemExit("backup verifier source member metadata is invalid")
+              fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+              try:
+                  opened = os.fstat(fd)
+                  if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                      before.st_dev, before.st_ino, before.st_size
+                  ):
+                      raise SystemExit("backup verifier source member changed before read")
+                  chunks = []
+                  while True:
+                      chunk = os.read(fd, 65536)
+                      if not chunk:
+                          break
+                      chunks.append(chunk)
+                  after = os.fstat(fd)
+                  if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+                      opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns
+                  ):
+                      raise SystemExit("backup verifier source member changed during read")
+              finally:
+                  os.close(fd)
+              data = b"".join(chunks)
+              if len(data) != before.st_size:
+                  raise SystemExit("backup verifier source member length changed")
+              total += len(data)
+              payloads[name] = data
+              entries.append({
+                  "path": f"platform/tools/{name}",
+                  "source_mode": 0o644,
+                  "size": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+              })
+          if total > 8 * 1024 * 1024:
+              raise SystemExit("backup verifier source bundle exceeds its fixed bound")
+          manifest = {
+              "schema": 1,
+              "repository": repository,
+              "source_sha": source_sha,
+              "files": entries,
+          }
+          manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          if archive_path.exists() or archive_path.is_symlink():
+              raise SystemExit("backup verifier archive path already exists")
+          archive_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+          with zipfile.ZipFile(archive_path, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for name in expected_names:
+                  info = zipfile.ZipInfo(f"platform-backup-verifier/{name}", (1980, 1, 1, 0, 0, 0))
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = (stat.S_IFREG | 0o444) << 16
+                  archive.writestr(info, payloads[name])
+              info = zipfile.ZipInfo("platform-backup-verifier/manifest.json", (1980, 1, 1, 0, 0, 0))
+              info.compress_type = zipfile.ZIP_DEFLATED
+              info.external_attr = (stat.S_IFREG | 0o444) << 16
+              archive.writestr(info, manifest_bytes)
+          os.chmod(archive_path, 0o600)
+          info = archive_path.lstat()
+          if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
+              raise SystemExit("backup verifier archive metadata is invalid")
+          PY
+
+      - name: Publish exact-source backup verifier helper bundle
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/dev' && needs.classifier.outputs.class == 'full' }}
+        id: publish-backup-verifier
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-backup-verifier-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-backup-verifier.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest exact-source backup verifier helper bundle
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/dev' && needs.classifier.outputs.class == 'full' }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ runner.temp }}/platform-backup-verifier.zip
 
   release-runtime:
     name: Conditional release runtime fixture

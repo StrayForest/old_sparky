@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
+import fcntl
 import importlib.util
 import json
 import math
@@ -50,6 +51,7 @@ except ImportError:  # Direct execution from the tools directory.
 
 try:
     from . import platform_live_qa_guard as live_qa_guard
+    from . import platform_build_node_cache
     from .platform_release_retention import (
         RetentionPlan,
         apply_plan as apply_release_plan,
@@ -62,6 +64,7 @@ try:
     )
 except ImportError:  # Direct execution from the tools directory.
     import platform_live_qa_guard as live_qa_guard
+    import platform_build_node_cache
     from platform_release_retention import (
         RetentionPlan,
         apply_plan as apply_release_plan,
@@ -75,6 +78,7 @@ except ImportError:  # Direct execution from the tools directory.
 
 
 DEFAULT_APP_DIR = Path("/opt/oldsparky/platform")
+DEFAULT_PLATFORM_SOURCE_ROOT = Path("/root/old_sparky/platform")
 DEFAULT_SOURCE_RELEASE_DIR = Path("/root/old_sparky/platform/dist/releases")
 DEFAULT_WEB_ARTIFACT_DIR = Path("/root/old_sparky/platform/apps/platform_web")
 SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
@@ -153,6 +157,26 @@ def parse_args() -> argparse.Namespace:
             "release, retained-load, build and live-QA lock order."
         ),
     )
+    parser.add_argument(
+        "--verify-existing-backup-only",
+        action="store_true",
+        help=(
+            "Restore-verify only the newest existing backup under canonical host "
+            "locks; do not create or rotate an archive."
+        ),
+    )
+    parser.add_argument(
+        "--evict-pinned-build-node-cache",
+        action="store_true",
+        help=(
+            "Explicitly remove only the validated pinned build-Node cache before "
+            "verify-existing-backup-only; requires the canonical maintenance locks."
+        ),
+    )
+    parser.add_argument("--eviction-run-id")
+    parser.add_argument("--eviction-run-attempt")
+    parser.add_argument("--eviction-source-sha")
+    parser.add_argument("--eviction-bundle-sha256")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
@@ -175,10 +199,34 @@ def parse_args() -> argparse.Namespace:
         parser.error("--backup-max-age-hours must be finite and positive")
     if args.backup_only and args.skip_backup:
         parser.error("--backup-only cannot be combined with --skip-backup")
+    if args.backup_only and args.verify_existing_backup_only:
+        parser.error("backup-only modes are mutually exclusive")
+    if args.verify_existing_backup_only and args.skip_backup:
+        parser.error("--verify-existing-backup-only cannot be combined with --skip-backup")
+    if args.evict_pinned_build_node_cache and not args.verify_existing_backup_only:
+        parser.error("--evict-pinned-build-node-cache requires --verify-existing-backup-only")
+    eviction_bindings = (
+        args.eviction_run_id,
+        args.eviction_run_attempt,
+        args.eviction_source_sha,
+        args.eviction_bundle_sha256,
+    )
+    if args.evict_pinned_build_node_cache:
+        if (
+            re.fullmatch(r"[1-9][0-9]{0,19}", args.eviction_run_id or "") is None
+            or re.fullmatch(r"[1-9][0-9]{0,5}", args.eviction_run_attempt or "") is None
+            or re.fullmatch(r"[0-9a-f]{40}", args.eviction_source_sha or "") is None
+            or re.fullmatch(r"[0-9a-f]{64}", args.eviction_bundle_sha256 or "") is None
+        ):
+            parser.error("cache eviction requires closed source and workflow bindings")
+    elif any(value is not None for value in eviction_bindings):
+        parser.error("eviction identity fields require --evict-pinned-build-node-cache")
     if args.backup_only and not args.apply:
         parser.error("--backup-only requires --apply")
-    if args.private_backup_diagnostics and not args.backup_only:
-        parser.error("--private-backup-diagnostics requires --backup-only")
+    if args.verify_existing_backup_only and not args.apply:
+        parser.error("--verify-existing-backup-only requires --apply")
+    if args.private_backup_diagnostics and not (args.backup_only or args.verify_existing_backup_only):
+        parser.error("--private-backup-diagnostics requires a backup-only mode")
     if args.report_keep < 1:
         parser.error("--report-keep must be at least 1")
     if not 1 <= args.live_qa_runtime_keep <= 100:
@@ -558,6 +606,269 @@ def run_backup(
     }
 
 
+def verify_existing_backup(
+    app_dir: Path,
+    *,
+    max_age_hours: float,
+    private_failure_diagnostics: bool = False,
+) -> dict[str, Any]:
+    """Verify the newest existing backup while the caller holds maintenance locks."""
+
+    if not math.isfinite(max_age_hours) or max_age_hours <= 0:
+        raise ValueError("backup max age must be finite and positive")
+    script = Path(__file__).with_name("platform_backup_restore_drill.py")
+    shared_dir = app_dir / "shared"
+    result = _run_backup_command(
+        [
+            sys.executable,
+            str(script),
+            "--env-file",
+            str(shared_dir / ".env.platform"),
+            "--output-dir",
+            str(shared_dir / "backups"),
+            "--verify-latest-existing",
+            "--max-age-hours",
+            str(max_age_hours),
+            "--preserve-existing",
+            "--json",
+        ],
+        forward_failure_diagnostics=private_failure_diagnostics,
+    )
+    return {
+        "status": "verified-existing",
+        "verified_existing": True,
+        "created": False,
+        "rotation_mode": "preserve-existing",
+        "removed_count": 0,
+        **result,
+    }
+
+
+def write_build_node_cache_receipt(
+    app_dir: Path,
+    *,
+    phase: str,
+    record: dict[str, Any],
+    run_id: str,
+    run_attempt: str,
+    source_sha: str,
+    bundle_sha256: str,
+) -> str:
+    """Durably record only closed cache-eviction identity and byte fields."""
+
+    if os.geteuid() != 0:
+        raise RuntimeError("build Node cache receipts require root")
+    if phase not in {"intent", "completion"}:
+        raise ValueError("build Node cache receipt phase is invalid")
+    if re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is None or re.fullmatch(
+        r"[1-9][0-9]{0,5}", run_attempt
+    ) is None:
+        raise ValueError("build Node cache receipt run identity is invalid")
+    if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None or re.fullmatch(
+        r"[0-9a-f]{64}", bundle_sha256
+    ) is None:
+        raise ValueError("build Node cache receipt source binding is invalid")
+
+    intent_keys = {
+        "schema",
+        "event",
+        "node_version",
+        "cache_dev",
+        "cache_ino",
+        "manifest_tree_sha256",
+        "total_bytes",
+        "status",
+    }
+    if phase == "intent":
+        if set(record) != intent_keys or record.get("status") != "intent":
+            raise ValueError("build Node cache intent record is not closed")
+    else:
+        status = record.get("status")
+        expected_keys = intent_keys | {"reclaimed_bytes"}
+        if status == "removed":
+            expected_keys.add("regeneration")
+        if set(record) != expected_keys or status not in {"removed", "already-absent"}:
+            raise ValueError("build Node cache completion record is not closed")
+        if status == "removed" and record.get("regeneration") != "pinned_archive_required":
+            raise ValueError("build Node cache regeneration binding is invalid")
+    if (
+        type(record.get("schema")) is not int
+        or record["schema"] != 1
+        or record.get("event") != "build_node_cache_eviction"
+        or record.get("node_version") != live_qa_guard.NODE_VERSION
+        or type(record.get("total_bytes")) is not int
+        or record["total_bytes"] < 0
+    ):
+        raise ValueError("build Node cache receipt fields are invalid")
+    cache_dev = record.get("cache_dev")
+    cache_ino = record.get("cache_ino")
+    tree_sha = record.get("manifest_tree_sha256")
+    if cache_dev is None:
+        if cache_ino is not None or tree_sha is not None or record["total_bytes"] != 0:
+            raise ValueError("absent build Node cache identity is inconsistent")
+    elif (
+        type(cache_dev) is not int
+        or cache_dev < 0
+        or type(cache_ino) is not int
+        or cache_ino <= 0
+        or not isinstance(tree_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", tree_sha) is None
+    ):
+        raise ValueError("build Node cache identity is invalid")
+    if phase == "completion":
+        reclaimed = record.get("reclaimed_bytes")
+        if type(reclaimed) is not int or reclaimed < 0:
+            raise ValueError("build Node cache reclaimed-byte count is invalid")
+        if record["status"] == "removed" and reclaimed != record["total_bytes"]:
+            raise ValueError("build Node cache reclaimed-byte count changed")
+        if record["status"] == "already-absent" and (
+            cache_dev is not None or reclaimed != 0
+        ):
+            raise ValueError("absent build Node cache completion is inconsistent")
+
+    shared_dir = app_dir / "shared"
+    try:
+        shared_before = shared_dir.lstat()
+        shared_fd = os.open(
+            shared_dir,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise RuntimeError("shared directory is unavailable for cache receipt") from exc
+    try:
+        shared_open = os.fstat(shared_fd)
+        if (
+            not stat.S_ISDIR(shared_before.st_mode)
+            or not stat.S_ISDIR(shared_open.st_mode)
+            or (shared_before.st_dev, shared_before.st_ino)
+            != (shared_open.st_dev, shared_open.st_ino)
+            or shared_open.st_uid != 0
+            or shared_open.st_gid != 0
+            or shared_open.st_nlink < 2
+            or stat.S_IMODE(shared_open.st_mode) & 0o022
+        ):
+            raise RuntimeError("shared directory is unsafe for cache receipt")
+        receipt_name = (
+            f"build-node-cache-eviction-{run_id}-{run_attempt}.{phase}.json"
+        )
+        payload = {
+            "schema": 1,
+            "event": "build_node_cache_eviction",
+            "phase": phase,
+            "run_id": int(run_id),
+            "run_attempt": int(run_attempt),
+            "source_sha": source_sha,
+            "bundle_sha256": bundle_sha256,
+            **record,
+            "recorded_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        }
+        encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "ascii"
+        )
+        fd = os.open(
+            receipt_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=shared_fd,
+        )
+        try:
+            opened = os.fstat(fd)
+            entry_stat = os.stat(
+                receipt_name, dir_fd=shared_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != 0
+                or opened.st_gid != 0
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or (opened.st_dev, opened.st_ino)
+                != (entry_stat.st_dev, entry_stat.st_ino)
+            ):
+                raise RuntimeError("cache receipt file metadata is unsafe")
+            view = memoryview(encoded)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise RuntimeError("cache receipt write made no progress")
+                view = view[written:]
+            os.fsync(fd)
+            after = os.fstat(fd)
+            if (
+                after.st_dev != opened.st_dev
+                or after.st_ino != opened.st_ino
+                or not stat.S_ISREG(after.st_mode)
+                or after.st_uid != 0
+                or after.st_gid != 0
+                or after.st_nlink != 1
+                or stat.S_IMODE(after.st_mode) != 0o600
+                or after.st_size != len(encoded)
+            ):
+                raise RuntimeError("cache receipt file changed while writing")
+            verify_fd = os.open(
+                receipt_name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=shared_fd,
+            )
+            try:
+                verify_before = os.fstat(verify_fd)
+                chunks = bytearray()
+                while len(chunks) <= len(encoded):
+                    chunk = os.read(verify_fd, min(4096, len(encoded) + 1 - len(chunks)))
+                    if not chunk:
+                        break
+                    chunks.extend(chunk)
+                verify_after = os.fstat(verify_fd)
+                if (
+                    (verify_before.st_dev, verify_before.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                    or (verify_after.st_dev, verify_after.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                    or bytes(chunks) != encoded
+                ):
+                    raise RuntimeError("cache receipt readback does not match")
+            finally:
+                os.close(verify_fd)
+            os.fsync(shared_fd)
+            shared_after = os.fstat(shared_fd)
+            shared_path_after = shared_dir.lstat()
+            if (
+                (shared_after.st_dev, shared_after.st_ino)
+                != (shared_open.st_dev, shared_open.st_ino)
+                or (shared_path_after.st_dev, shared_path_after.st_ino)
+                != (shared_open.st_dev, shared_open.st_ino)
+            ):
+                raise RuntimeError("shared directory changed while writing cache receipt")
+        finally:
+            os.close(fd)
+        return receipt_name
+    finally:
+        os.close(shared_fd)
+
+
+@contextmanager
+def live_qa_machine_lock() -> Iterator[None]:
+    """Join the existing live-QA machine lock after release/build locks."""
+
+    descriptor = live_qa_guard._open_machine_lock()
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def write_report(report_dir: Path, report: dict[str, Any], *, keep: int) -> Path:
     report_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -583,16 +894,124 @@ def write_report(report_dir: Path, report: dict[str, Any], *, keep: int) -> Path
     return report_path
 
 
-@contextmanager
-def source_release_lock(path: Path) -> Iterator[Path | None]:
-    """Join the build directory flock, or freeze a proven-absent source contour."""
+def _open_dir_at(parent_fd: int, name: str) -> int:
+    return os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=parent_fd,
+    )
 
+
+def _validate_source_lock_directory(fd: int, *, device: int) -> os.stat_result:
+    opened = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != 0
+        or opened.st_gid != 0
+        or stat.S_IMODE(opened.st_mode) != 0o755
+        or opened.st_dev != device
+        or opened.st_nlink < 2
+    ):
+        raise RuntimeError("unsafe canonical source build lock directory")
+    return opened
+
+
+def _ensure_canonical_source_release_lock_directory(path: Path) -> tuple[int, int]:
+    """Create only the fixed builder lock path, with no-follow inode checks."""
+
+    expected = DEFAULT_SOURCE_RELEASE_DIR
+    platform_root = DEFAULT_PLATFORM_SOURCE_ROOT
+    if path != expected or expected != platform_root / "dist" / "releases":
+        raise RuntimeError("source build lock initialization is not canonical")
+    if not platform_root.is_absolute():
+        raise RuntimeError("canonical platform source root must be absolute")
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    root_fd = os.open("/", flags)
+    descriptors = [root_fd]
+    try:
+        root_stat = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid != 0
+            or root_stat.st_gid != 0
+            or root_stat.st_mode & 0o022
+        ):
+            raise RuntimeError("unsafe filesystem root for source build lock")
+        device = root_stat.st_dev
+        current_fd = root_fd
+        parts = platform_root.parts[1:] + ("dist", "releases")
+        for index, component in enumerate(parts):
+            created = False
+            try:
+                child_fd = _open_dir_at(current_fd, component)
+            except FileNotFoundError:
+                # Only the two final, fixed builder directories may be created.
+                if index < len(parts) - 2:
+                    raise RuntimeError("canonical source lock parent is absent")
+                os.mkdir(component, 0o755, dir_fd=current_fd)
+                os.fsync(current_fd)
+                child_fd = _open_dir_at(current_fd, component)
+                created = True
+            descriptors.append(child_fd)
+            if created:
+                # The workflow runs with umask 077; normalize only the inode
+                # created by this call, never an existing directory.
+                os.fchown(child_fd, 0, 0)
+                os.fchmod(child_fd, 0o755)
+                os.fsync(child_fd)
+            child_stat = os.fstat(child_fd)
+            path_stat = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(child_stat.st_mode)
+                or stat.S_ISLNK(path_stat.st_mode)
+                or (path_stat.st_dev, path_stat.st_ino)
+                != (child_stat.st_dev, child_stat.st_ino)
+                or child_stat.st_uid != 0
+                or child_stat.st_gid != 0
+                or child_stat.st_dev != device
+                or child_stat.st_mode & 0o022
+            ):
+                raise RuntimeError("unsafe canonical source build lock parent")
+            if component in {"dist", "releases"} and stat.S_IMODE(
+                child_stat.st_mode
+            ) != 0o755:
+                raise RuntimeError("canonical source build directory mode mismatch")
+            current_fd = child_fd
+        final_stat = _validate_source_lock_directory(current_fd, device=device)
+        return final_stat.st_dev, final_stat.st_ino
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+@contextmanager
+def source_release_lock(
+    path: Path, *, initialize_if_missing: bool = False
+) -> Iterator[Path | None]:
+    """Join the builder flock, optionally initializing its one fixed lock path."""
+
+    expected_identity: tuple[int, int] | None = None
     if not os.path.lexists(path):
-        yield None
-        return
+        if not initialize_if_missing:
+            yield None
+            return
+        expected_identity = _ensure_canonical_source_release_lock_directory(path)
+    elif initialize_if_missing:
+        # The opt-in path validates even existing components before locking.
+        expected_identity = _ensure_canonical_source_release_lock_directory(path)
     with exclusive_directory_lock(
         path, label="platform release build output"
     ) as resolved:
+        if expected_identity is not None:
+            current = os.stat(path, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or (current.st_dev, current.st_ino) != expected_identity
+                or resolved != path
+            ):
+                raise RuntimeError("canonical source build lock identity changed")
         yield resolved
 
 
@@ -606,7 +1025,12 @@ def maintenance_lock_scope(
     # release -> retained-load -> build -> live-QA.
     with release_operation_lock(app_dir):
         with exclusive_retained_load_lock():
-            with source_release_lock(args.source_release_dir) as source_release_dir:
+            with source_release_lock(
+                args.source_release_dir,
+                initialize_if_missing=getattr(
+                    args, "evict_pinned_build_node_cache", False
+                ),
+            ) as source_release_dir:
                 yield source_release_dir
 
 
@@ -707,6 +1131,20 @@ def _plan_and_maybe_apply(
 def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     app_dir = args.app_dir.resolve(strict=True)
+    if getattr(args, "evict_pinned_build_node_cache", False):
+        try:
+            canonical_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(
+                "canonical backup verification app root is unavailable"
+            ) from exc
+        if (
+            app_dir != canonical_app_dir
+            or args.source_release_dir != DEFAULT_SOURCE_RELEASE_DIR
+        ):
+            raise RuntimeError(
+                "canonical app/build lock roots are required for pinned Node cache eviction"
+            )
     disk_before_snapshot = disk_snapshot_for_path(Path("/"))
 
     if args.apply:
@@ -715,7 +1153,127 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
         # only the first; deploy takes the first two; builds take only the
         # third; standalone live-QA retention takes first then the fourth.
         with maintenance_lock_scope(args, app_dir=app_dir) as source_release_dir:
-            if getattr(args, "backup_only", False):
+            if getattr(args, "verify_existing_backup_only", False):
+                # The lock owner never creates or rotates a backup in this mode.
+                # The backup tool only updates the selected newest sidecar after
+                # its existing archive passes the complete restore drill.
+                cache_result: dict[str, Any] = {"status": "not-requested"}
+                backup_result: dict[str, Any]
+                if getattr(args, "evict_pinned_build_node_cache", False):
+                    try:
+                        canonical_app_dir = DEFAULT_APP_DIR.resolve(strict=True)
+                        canonical_build_dir = DEFAULT_SOURCE_RELEASE_DIR.resolve(
+                            strict=True
+                        )
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "canonical backup verification lock roots are unavailable"
+                        ) from exc
+                    if (
+                        app_dir != canonical_app_dir
+                        or source_release_dir is None
+                        or source_release_dir != canonical_build_dir
+                    ):
+                        raise RuntimeError(
+                            "canonical app/build lock roots are required for pinned Node cache eviction"
+                        )
+                    # maintenance_lock_scope holds release, retained-load and
+                    # source/build-output locks. Hold the final canonical lock
+                    # across both cache eviction and the existing restore drill.
+                    with live_qa_machine_lock():
+                        intent_record: dict[str, Any] | None = None
+                        receipt_names: dict[str, str] = {}
+
+                        def write_intent(record: dict[str, Any]) -> None:
+                            nonlocal intent_record
+                            if intent_record is not None:
+                                raise RuntimeError("cache eviction intent was already recorded")
+                            receipt_names["intent"] = write_build_node_cache_receipt(
+                                app_dir,
+                                phase="intent",
+                                record=record,
+                                run_id=args.eviction_run_id,
+                                run_attempt=args.eviction_run_attempt,
+                                source_sha=args.eviction_source_sha,
+                                bundle_sha256=args.eviction_bundle_sha256,
+                            )
+                            intent_record = dict(record)
+
+                        def write_completion(record: dict[str, Any]) -> None:
+                            if intent_record is None:
+                                raise RuntimeError("cache eviction completion has no intent")
+                            for key in (
+                                "schema",
+                                "event",
+                                "node_version",
+                                "cache_dev",
+                                "cache_ino",
+                                "manifest_tree_sha256",
+                                "total_bytes",
+                            ):
+                                if record.get(key) != intent_record.get(key):
+                                    raise RuntimeError(
+                                        "cache eviction completion does not match its intent"
+                                    )
+                            receipt_names["completion"] = write_build_node_cache_receipt(
+                                app_dir,
+                                phase="completion",
+                                record=record,
+                                run_id=args.eviction_run_id,
+                                run_attempt=args.eviction_run_attempt,
+                                source_sha=args.eviction_source_sha,
+                                bundle_sha256=args.eviction_bundle_sha256,
+                            )
+
+                        cache_result = platform_build_node_cache.evict_pinned_build_node_cache(
+                            write_intent=write_intent,
+                            write_completion=write_completion,
+                        )
+                        if set(receipt_names) != {"intent", "completion"}:
+                            raise RuntimeError("cache eviction receipts are incomplete")
+                        cache_result = {
+                            **cache_result,
+                            "intent_receipt": receipt_names["intent"],
+                            "completion_receipt": receipt_names["completion"],
+                            "run_id": args.eviction_run_id,
+                            "run_attempt": args.eviction_run_attempt,
+                            "source_sha": args.eviction_source_sha,
+                            "bundle_sha256": args.eviction_bundle_sha256,
+                        }
+                        backup_result = verify_existing_backup(
+                            app_dir,
+                            max_age_hours=args.backup_max_age_hours,
+                            private_failure_diagnostics=getattr(
+                                args, "private_backup_diagnostics", False
+                            ),
+                        )
+                else:
+                    backup_result = verify_existing_backup(
+                        app_dir,
+                        max_age_hours=args.backup_max_age_hours,
+                        private_failure_diagnostics=getattr(
+                            args, "private_backup_diagnostics", False
+                        ),
+                    )
+                maintenance_result = (
+                    RetentionPlan((), (), ()),
+                    ArtifactRetentionPlan((), (), ()),
+                    (),
+                    (),
+                    (),
+                    {
+                        "build_node_cache": cache_result,
+                        **backup_result,
+                        "status": "completed",
+                    },
+                    {
+                        "failed_builds": 0,
+                        "browser_test_artifacts": 0,
+                        "preprod_screenshots": 0,
+                    },
+                )
+                live_qa_plan = live_qa_guard.RuntimeCacheRetentionPlan((), (), (), ())
+            elif getattr(args, "backup_only", False):
                 # Do not construct or apply release, artifact, transient or
                 # live-QA retention plans in this mode. The backup owner may
                 # Preserve every pre-existing archive; archive rotation belongs
@@ -807,7 +1365,9 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "ok": storage_ok,
         "mode": (
-            "backup-only"
+            "verify-existing-backup-only"
+            if getattr(args, "verify_existing_backup_only", False)
+            else "backup-only"
             if getattr(args, "backup_only", False)
             else "apply" if args.apply else "dry-run"
         ),

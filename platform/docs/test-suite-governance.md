@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-10-09
+- Last reviewed: 2026-10-10
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
@@ -278,6 +278,10 @@ Venv reuse requires an exact active quiesce receipt and wheel/`RECORD` integrity
 The canonical AST snapshot is 1,822 tests (1,750 backend, including 580 privileged) across 165 modules, with every ID assigned exactly once. The 72 verification-contract tests are separately owned; the five backend contours are unit 295, tool-contract 425, integration 256, privileged 580, and performance-contract 194.
 Release retention tests own locked candidate-set rechecks and belong to
 `backend-privileged`.
+
+`test_platform_backup_restore_drill` and `test_platform_storage_maintenance` own
+newest-pair restore and lock-held cache-eviction contracts in `backend-privileged`;
+`test_platform_release_build_contract` covers pinned cache integrity/regeneration.
 
 The `platform-host-tools-candidate.yml` workflow is a separate trusted `workflow_run` contract, not
 a production gate. Its validator and bundle tests belong to `backend-tool-contract` through

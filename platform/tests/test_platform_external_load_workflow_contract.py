@@ -1569,6 +1569,69 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
         fixture_cleanup = _step_script(
             fixture_setup, "Remove fixture-setup SSH material"
         )
+        finalizer_cleanup = _step_script(finalizer, "Remove finalizer SSH material")
+
+        for job, configure_name, directory_name in (
+            (fixture_setup, "Configure production SSH", "production-external-load-ssh-setup"),
+            (finalizer, "Configure finalizer SSH", "production-external-load-ssh-finalize"),
+        ):
+            configure = _step_script(job, configure_name)
+            with tempfile.TemporaryDirectory(prefix="external-load-ssh-config-") as temp:
+                runner_temp = Path(temp)
+                fake_bin = runner_temp / "fake-bin"
+                fake_bin.mkdir()
+                (fake_bin / "timeout").write_text(
+                    "#!/bin/bash\nshift 2\nexec \"$@\"\n", encoding="ascii"
+                )
+                (fake_bin / "ssh-keyscan").write_text(
+                    "#!/bin/bash\nprintf '%s ssh-ed25519 AAAA\\n' \"${!#}\"\n",
+                    encoding="ascii",
+                )
+                (fake_bin / "ssh-keygen").write_text(
+                    "#!/bin/bash\nprintf '%s\\n' '256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y fixture-host (ED25519)'\n",
+                    encoding="ascii",
+                )
+                for executable in fake_bin.iterdir():
+                    executable.chmod(0o755)
+                env_file = runner_temp / "github-env"
+                env_file.touch()
+                configure_env = {
+                    **os.environ,
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_RUN_ID": f"codex-config-{os.getpid()}",
+                    "GITHUB_ENV": str(env_file),
+                    "PROD_SSH_HOST": "fixture-host",
+                    "PROD_SSH_KEY": "fixture-only-key-material",
+                    "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                }
+                completed = subprocess.run(
+                    ["/bin/bash", "-c", configure],
+                    capture_output=True,
+                    text=True,
+                    env=configure_env,
+                    timeout=10,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                ssh_dir = runner_temp / directory_name
+                resolved = subprocess.run(
+                    ["/usr/bin/ssh", "-G", "-F", str(ssh_dir / "config"), "fixture-user@fixture-host"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(resolved.returncode, 0, resolved.stderr)
+                self.assertRegex(resolved.stdout, r"(?m)^controlmaster false$")
+                self.assertNotRegex(resolved.stdout, r"(?m)^controlpath ")
+                self.assertRegex(resolved.stdout, r"(?m)^controlpersist no$")
+                self.assertIn("ControlPath none", configure)
+                self.assertNotIn("control_path=", configure)
+                self.assertNotIn("ControlMaster auto", configure)
+                self.assertNotIn("ControlPersist 15m", configure)
+
+        for cleanup in (fixture_cleanup, finalizer_cleanup):
+            self.assertNotIn('"$control_path"', cleanup)
+            self.assertNotIn("-O exit", cleanup)
+
         with tempfile.TemporaryDirectory(prefix="external-load-ssh-cleanup-") as temp:
             runner_temp = Path(temp)
             ssh_dir = runner_temp / "production-external-load-ssh-setup"
@@ -1621,7 +1684,6 @@ class ExternalLoadWorkflowContractTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertEqual(output_path.read_text(encoding="ascii"), "")
 
-        finalizer_cleanup = _step_script(finalizer, "Remove finalizer SSH material")
         self.assertLess(
             finalizer_cleanup.index('test -z "${SSH_DIR:-}"'),
             finalizer_cleanup.index("ssh_cleanup_status=0"),

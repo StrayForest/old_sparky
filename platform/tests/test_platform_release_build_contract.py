@@ -35,6 +35,8 @@ from tools import platform_live_qa_runtime_install
 from tools import platform_recovery_bootstrap
 from tools import platform_fetch_artifact_metadata
 from tools import platform_configure_shared_env
+from tools import platform_build_node_cache
+from tools import platform_live_qa_guard
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from platform_render_service_envs import render_service_env  # noqa: E402
@@ -5018,15 +5020,17 @@ cleanup
         self.assertIn("observer_deadline=$(( $(date +%s) + 10800 ))", supervisor)
         self.assertIn("ControlMaster auto", workflow)
         self.assertIn("ControlPersist 15m", workflow)
-        self.assertIn(
+        self.assertIn("'  ControlMaster no'", workflow)
+        self.assertIn("'  ControlPersist no'", workflow)
+        self.assertIn("'  ControlPath none'", workflow)
+        self.assertNotIn(
             'control_path="/tmp/old-sparky-external-load-ssh-setup-$GITHUB_RUN_ID"',
             workflow,
         )
-        self.assertIn(
+        self.assertNotIn(
             'control_path="/tmp/old-sparky-external-load-ssh-finalize-$GITHUB_RUN_ID"',
             workflow,
         )
-        self.assertIn("ControlPath %s", workflow)
         self.assertIn("Remove fixture-setup SSH material", workflow)
         self.assertIn("Remove finalizer SSH material", workflow)
         self.assertIn("platform_workflow_remote_dispatch.py", workflow)
@@ -5131,7 +5135,10 @@ cleanup
             self.assertIn('Authorization: Bearer $GH_TOKEN', body)
             self.assertIn("current dev head SHA is malformed", body)
             self.assertIn('payload["commit"]["sha"]', body)
-            self.assertIn('test "$dev_sha" = "$TARGET_SHA"', body)
+        self.assertIn('test "$dev_sha" = "$TARGET_SHA"', upload)
+        self.assertIn('if [[ "$dev_sha" != "$TARGET_SHA" ]]; then', activation)
+        self.assertIn("emit_pre_ssh_diagnostic dev_head_mismatch", activation)
+        self.assertIn('exit 1', activation)
 
         first_api_read = upload.index("branch_json=")
         first_remote_dispatch = upload.index(
@@ -5149,7 +5156,7 @@ cleanup
         activation_api_read = activation.index("branch_json=")
         activation_ssh = activation.index("ssh -")
         self.assertLess(activation_api_read, activation_ssh)
-        self.assertIn("Refusing activation", activation)
+        self.assertIn("stage=pre_ssh_dev_head ssh_rc=unavailable", activation)
         self.assertIn('production-deploy < "$input_path"', activation)
         self.assertNotIn("bash -s --", activation)
 
@@ -5321,16 +5328,18 @@ cleanup
             )
             curl = fake_bin / "curl"
             curl.write_text(
-                "#!/bin/sh\nprintf '%s\\n' '{\"commit\":{\"sha\":\""
-                + sha
-                + "\"}}'\n",
+                "#!/bin/sh\n"
+                "if [ \"$TEST_CURL_STATUS\" != 0 ]; then "
+                "printf '%s\\n' 'private curl sentinel' >&2; exit \"$TEST_CURL_STATUS\"; fi\n"
+                "printf '{\"commit\":{\"sha\":\"%s\"}}\\n' \"$TEST_BRANCH_SHA\"\n",
                 encoding="utf-8",
             )
             timeout = fake_bin / "timeout"
             timeout.write_text("#!/bin/sh\nshift 2\nexec \"$@\"\n", encoding="utf-8")
             ssh = fake_bin / "ssh"
             ssh.write_text(
-                "#!/bin/sh\ncat \"$TEST_REMOTE_STDOUT\"\n"
+                "#!/bin/sh\ntouch \"$TEST_SSH_CALLED\"\n"
+                "cat \"$TEST_REMOTE_STDOUT\"\n"
                 "cat \"$TEST_REMOTE_STDERR\" >&2\n"
                 "exit \"$TEST_REMOTE_STATUS\"\n",
                 encoding="utf-8",
@@ -5357,7 +5366,44 @@ cleanup
                 "TEST_REMOTE_STDOUT": str(private_stdout),
                 "TEST_REMOTE_STDERR": str(private_stderr),
                 "TEST_REMOTE_STATUS": "255",
+                "TEST_SSH_CALLED": str(root / "ssh-called"),
+                "TEST_CURL_STATUS": "0",
+                "TEST_BRANCH_SHA": sha,
             }
+
+            def run_pre_ssh(*, curl_status: str, branch_sha: str) -> subprocess.CompletedProcess[str]:
+                called = Path(environment["TEST_SSH_CALLED"])
+                called.unlink(missing_ok=True)
+                return subprocess.run(
+                    ["/bin/bash", "-c", activation],
+                    env={
+                        **environment,
+                        "TEST_CURL_STATUS": curl_status,
+                        "TEST_BRANCH_SHA": branch_sha,
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            for curl_status, branch_sha, expected_status, reason in (
+                ("22", sha, 22, "dev_head_probe_failed"),
+                ("0", "malformed", 1, "dev_head_probe_failed"),
+                ("0", "b" * 40, 1, "dev_head_mismatch"),
+            ):
+                with self.subTest(pre_ssh=(curl_status, branch_sha, reason)):
+                    result = run_pre_ssh(curl_status=curl_status, branch_sha=branch_sha)
+                    self.assertEqual(result.returncode, expected_status, result.stderr)
+                    self.assertEqual(
+                        result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        "stage=pre_ssh_dev_head ssh_rc=unavailable "
+                        f"reason={reason} stdout_bytes=0 stderr_bytes=0\n",
+                    )
+                    self.assertFalse(Path(environment["TEST_SSH_CALLED"]).exists())
+                    self.assertNotIn("private", result.stdout + result.stderr)
+
             fallback = subprocess.run(
                 ["/bin/bash", "-c", activation],
                 env=environment,
@@ -5369,10 +5415,9 @@ cleanup
             self.assertEqual(fallback.returncode, 255, fallback.stderr)
             self.assertEqual(
                 fallback.stdout,
-                "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport "
-                "release_slug=unavailable source_sha=unavailable\n"
                 "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
-                "reason=ssh_or_remote_255 remote_exit=255 stdout_bytes=23 stderr_bytes=23\n",
+                "stage=remote_dispatch ssh_rc=255 reason=remote_failed_without_marker "
+                "stdout_bytes=23 stderr_bytes=23\n",
             )
             self.assertNotIn("private", fallback.stdout + fallback.stderr)
 
@@ -5461,7 +5506,16 @@ cleanup
                         diagnostic, status=remote_status, remote_stderr=""
                     )
                     self.assertEqual(result.returncode, remote_status, result.stderr)
-                    self.assertEqual(result.stdout, diagnostic + "\n")
+                    self.assertEqual(
+                        result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        f"stage=remote_dispatch ssh_rc={remote_status} "
+                        "reason=remote_failed_without_marker "
+                        f"stdout_bytes={len((diagnostic + chr(10)).encode())} stderr_bytes=0\n",
+                    )
+                    self.assertNotIn("child_exit", result.stdout)
+                    self.assertNotIn("observed_bytes", result.stdout)
+                    self.assertNotIn("dispatcher_exit", result.stdout)
                     self.assertEqual(result.stderr, "")
 
             rejected_diagnostics = (
@@ -5486,9 +5540,17 @@ cleanup
                         diagnostic, status=remote_status, remote_stderr=""
                     )
                     self.assertEqual(result.returncode, remote_status or 1)
-                    self.assertIn(
-                        "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport",
+                    expected_stage = "remote_dispatch" if remote_status else "marker_validation"
+                    expected_reason = (
+                        "remote_failed_without_marker"
+                        if remote_status
+                        else "marker_missing_or_invalid"
+                    )
+                    self.assertEqual(
                         result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        f"stage={expected_stage} ssh_rc={remote_status} reason={expected_reason} "
+                        f"stdout_bytes={len((diagnostic + chr(10)).encode())} stderr_bytes=0\n",
                     )
                     self.assertNotIn(diagnostic, result.stdout)
                     self.assertNotIn("private", result.stdout + result.stderr)
@@ -5512,8 +5574,13 @@ cleanup
                         remote_stderr=remote_stderr,
                     )
                     self.assertEqual(result.returncode, 7)
-                    self.assertIn("class=remote_or_transport", result.stdout)
-                    self.assertNotIn("reason=missing_marker child_exit=7", result.stdout)
+                    self.assertEqual(
+                        result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        "stage=remote_dispatch ssh_rc=7 reason=remote_failed_without_marker "
+                        f"stdout_bytes={len((malformed_stdout + chr(10)).encode())} "
+                        f"stderr_bytes={len(remote_stderr.encode())}\n",
+                    )
                     self.assertNotIn("private", result.stdout + result.stderr)
 
             malformed_markers = (
@@ -5529,13 +5596,12 @@ cleanup
                 with self.subTest(malformed_marker=marker):
                     result = run_outer_consumer(marker, status=1)
                     self.assertEqual(result.returncode, 1)
-                    self.assertIn(
-                        "RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport",
+                    self.assertEqual(
                         result.stdout,
-                    )
-                    self.assertIn(
-                        "reason=unrecognized_stdout remote_exit=1",
-                        result.stdout,
+                        "RELEASE_REMOTE_DIAGNOSTIC schema=1 status=failed "
+                        "stage=remote_dispatch ssh_rc=1 reason=remote_failed_without_marker "
+                        f"stdout_bytes={len((marker + chr(10)).encode())} "
+                        f"stderr_bytes={len(remote_stderr.encode())}\n",
                     )
                     self.assertNotIn(marker, result.stdout)
                     self.assertNotIn("private", result.stdout + result.stderr)
@@ -6090,6 +6156,368 @@ cleanup
         self.assertNotIn("rsync", script)
         self.assertNotIn('node_modules/" "$STAGING_DIR', script)
         self.assertIn("rm -rf node_modules .next/cache", script)
+
+        cache_source = (TOOLS_DIR / "platform_build_node_cache.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("def evict_pinned_build_node_cache(", cache_source)
+        self.assertIn("caller must hold all four canonical locks", cache_source)
+        self.assertIn("node-v26.3.1", cache_source)
+        self.assertIn("pinned_archive_required", cache_source)
+        self.assertNotIn("def main(", cache_source)
+
+        def record_callbacks(records: list[tuple[str, dict[str, object]]]):
+            def write_intent(record: object) -> None:
+                assert isinstance(record, dict)
+                records.append(("intent", record))
+
+            def write_completion(record: object) -> None:
+                assert isinstance(record, dict)
+                records.append(("completion", record))
+
+            return write_intent, write_completion
+
+        def no_op_receipts() -> tuple[object, object]:
+            return (lambda _record: None, lambda _record: None)
+
+        def make_pinned_cache(base: Path) -> tuple[Path, Path, Path]:
+            build_root = base / "build-root"
+            build_root.mkdir(mode=0o755)
+            os.chmod(build_root, 0o755)
+            cache = build_root / f"node-v{platform_live_qa_guard.NODE_VERSION}"
+            node_dir = cache / "bin"
+            node_dir.mkdir(parents=True)
+            node_file = node_dir / "node"
+            node_file.write_bytes(b"pinned-node-fixture\n")
+            os.chmod(node_file, 0o555)
+            os.chmod(node_dir, 0o555)
+            tree_sha = platform_live_qa_guard._tree_digest(cache)
+            manifest = cache / ".manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "node_archive_sha256": platform_live_qa_guard.NODE_ARCHIVE_SHA256,
+                        "tree_sha256": tree_sha,
+                    },
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(manifest, 0o444)
+            os.chmod(cache, 0o555)
+            return build_root, cache, node_file
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            build_root, cache, node_file = make_pinned_cache(fixture_root)
+            proc_root = fixture_root / "proc-empty"
+            proc_root.mkdir()
+            records: list[tuple[str, dict[str, object]]] = []
+            write_intent, write_completion = record_callbacks(records)
+            with patch.object(platform_live_qa_guard, "BUILD_NODE_ROOT", build_root):
+                result = platform_build_node_cache._evict_cache(
+                    build_root,
+                    proc_root,
+                    write_intent=write_intent,
+                    write_completion=write_completion,
+                )
+            self.assertEqual(result["status"], "removed")
+            self.assertEqual(result["node_version"], "26.3.1")
+            self.assertEqual(result["regeneration"], "pinned_archive_required")
+            self.assertGreater(result["reclaimed_bytes"], 0)
+            self.assertFalse(cache.exists())
+            self.assertEqual([kind for kind, _ in records], ["intent", "completion"])
+            self.assertEqual(records[0][1]["status"], "intent")
+            self.assertEqual(records[1][1]["status"], "removed")
+            for field in ("cache_dev", "cache_ino", "manifest_tree_sha256"):
+                self.assertEqual(records[0][1][field], records[1][1][field])
+            self.assertEqual(records[0][1]["total_bytes"], records[1][1]["total_bytes"])
+            self.assertEqual(
+                set(records[0][1]),
+                {
+                    "schema",
+                    "event",
+                    "node_version",
+                    "cache_dev",
+                    "cache_ino",
+                    "manifest_tree_sha256",
+                    "total_bytes",
+                    "status",
+                },
+            )
+            self.assertEqual(records[1][1]["regeneration"], "pinned_archive_required")
+
+            absent_records: list[tuple[str, dict[str, object]]] = []
+            absent_intent, absent_completion = record_callbacks(absent_records)
+            absent_result = platform_build_node_cache._evict_cache(
+                build_root,
+                proc_root,
+                write_intent=absent_intent,
+                write_completion=absent_completion,
+            )
+            self.assertEqual(absent_result["status"], "already-absent")
+            self.assertIsNone(absent_records[0][1]["cache_ino"])
+            self.assertEqual(absent_records[0][1]["total_bytes"], 0)
+            self.assertEqual(absent_records[1][1]["status"], "already-absent")
+            self.assertNotIn("regeneration", absent_records[1][1])
+
+            def fake_pinned_download(stage: Path) -> None:
+                regenerated_node = stage / "node" / "bin" / "node"
+                regenerated_node.parent.mkdir(parents=True)
+                regenerated_node.write_bytes(b"regenerated-from-pinned-fixture\n")
+
+            with (
+                patch.object(platform_live_qa_guard, "BUILD_NODE_ROOT", build_root),
+                patch.object(
+                    platform_live_qa_guard,
+                    "_download_node_runtime",
+                    side_effect=fake_pinned_download,
+                ) as download,
+            ):
+                regenerated = platform_live_qa_guard.prepare_build_node()
+            download.assert_called_once()
+            regenerated_manifest = json.loads(
+                (regenerated / ".manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(regenerated, cache)
+            self.assertEqual(
+                regenerated_manifest["node_archive_sha256"],
+                platform_live_qa_guard.NODE_ARCHIVE_SHA256,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            build_root, cache, node_file = make_pinned_cache(fixture_root)
+            proc_root = fixture_root / "proc-active"
+            fake_process = proc_root / "12345"
+            fake_process.mkdir(parents=True)
+            (fake_process / "fd").mkdir()
+            (fake_process / "exe").symlink_to("/usr/bin/python3")
+            (fake_process / "cwd").symlink_to(fixture_root)
+            (fake_process / "root").symlink_to("/")
+            node_metadata = node_file.stat()
+            maps_prefix = (
+                f"1000-2000 r-xp 00000000 "
+                f"{os.major(node_metadata.st_dev):x}:{os.minor(node_metadata.st_dev):x} "
+            ).encode("ascii")
+            maps_row = (
+                maps_prefix
+                + f"{node_metadata.st_ino} /different-mount/node".encode("ascii")
+            )
+            # Split the identity-bearing maps row exactly across the scanner's
+            # 64 KiB read boundary. The inode must still be detected even
+            # though the path is an alias outside the cache's textual prefix.
+            maps_path = fake_process / "maps"
+            row_start = 64 * 1024 - len(maps_prefix)
+            maps_path.write_bytes(b"x" * (row_start - 1) + b"\n" + maps_row)
+            self.assertEqual(
+                maps_path.read_bytes()[64 * 1024 - 1 : 64 * 1024],
+                maps_prefix[-1:],
+            )
+            with self.assertRaisesRegex(
+                platform_build_node_cache.BuildNodeCacheError, "is in use"
+            ):
+                platform_build_node_cache._evict_cache(
+                    build_root,
+                    proc_root,
+                    write_intent=no_op_receipts()[0],
+                    write_completion=no_op_receipts()[1],
+                )
+            self.assertTrue(cache.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            build_root, cache, node_file = make_pinned_cache(fixture_root)
+            proc_root = fixture_root / "proc-closing-fd"
+            fake_process = proc_root / "12346"
+            fd_root = fake_process / "fd"
+            fd_root.mkdir(parents=True)
+            (fake_process / "exe").symlink_to("/usr/bin/python3")
+            (fake_process / "cwd").symlink_to(fixture_root)
+            (fake_process / "root").symlink_to("/")
+            closing_fd = fd_root / "7"
+            closing_fd.symlink_to(node_file)
+            node_metadata = node_file.stat()
+            maps_row = (
+                "1000-2000 r-xp 00000000 "
+                f"{os.major(node_metadata.st_dev):x}:{os.minor(node_metadata.st_dev):x} "
+                f"{node_metadata.st_ino} /different-mount/node\n"
+            ).encode("ascii")
+            (fake_process / "maps").write_bytes(maps_row)
+            real_readlink = os.readlink
+
+            def fd_closes_during_enumeration(path: os.PathLike[str] | str, *args: object, **kwargs: object) -> str:
+                if Path(path) == closing_fd:
+                    raise FileNotFoundError("fixture fd closed during scan")
+                return real_readlink(path, *args, **kwargs)
+
+            with patch.object(
+                platform_build_node_cache.os,
+                "readlink",
+                side_effect=fd_closes_during_enumeration,
+            ):
+                with self.assertRaisesRegex(
+                    platform_build_node_cache.BuildNodeCacheError, "is in use"
+                ):
+                    platform_build_node_cache._evict_cache(
+                        build_root,
+                        proc_root,
+                        write_intent=no_op_receipts()[0],
+                        write_completion=no_op_receipts()[1],
+                    )
+            self.assertTrue(cache.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            build_root, cache, node_file = make_pinned_cache(fixture_root)
+            proc_root = fixture_root / "proc-empty"
+            proc_root.mkdir()
+            unexpected = cache / "unexpected"
+            unexpected.write_bytes(b"extra")
+            os.chmod(unexpected, 0o444)
+            with self.assertRaisesRegex(
+                platform_build_node_cache.BuildNodeCacheError, "manifest"
+            ):
+                platform_build_node_cache._evict_cache(
+                    build_root,
+                    proc_root,
+                    write_intent=no_op_receipts()[0],
+                    write_completion=no_op_receipts()[1],
+                )
+            self.assertTrue(cache.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            build_root, cache, node_file = make_pinned_cache(fixture_root)
+            proc_root = fixture_root / "proc-empty"
+            proc_root.mkdir()
+            outside_link = fixture_root / "outside-hardlink"
+            os.link(node_file, outside_link)
+            with self.assertRaisesRegex(
+                platform_build_node_cache.BuildNodeCacheError, "failed validation"
+            ):
+                platform_build_node_cache._evict_cache(
+                    build_root,
+                    proc_root,
+                    write_intent=no_op_receipts()[0],
+                    write_completion=no_op_receipts()[1],
+                )
+            self.assertTrue(cache.exists())
+            self.assertTrue(outside_link.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            build_root = fixture_root / "build-root"
+            build_root.mkdir(mode=0o755)
+            os.chmod(build_root, 0o755)
+            outside = fixture_root / "outside"
+            outside.mkdir()
+            cache = build_root / f"node-v{platform_live_qa_guard.NODE_VERSION}"
+            cache.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(
+                platform_build_node_cache.BuildNodeCacheError, "root is unsafe"
+            ):
+                platform_build_node_cache._evict_cache(
+                    build_root,
+                    fixture_root / "proc-empty",
+                    write_intent=no_op_receipts()[0],
+                    write_completion=no_op_receipts()[1],
+                )
+            self.assertTrue(outside.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            build_root, cache, node_file = make_pinned_cache(fixture_root)
+            proc_root = fixture_root / "proc-empty"
+            proc_root.mkdir()
+            original_reference_check = platform_build_node_cache._process_references
+            calls = 0
+
+            def mutate_after_reference_scan(
+                snapshot: object, *, build_root: Path, proc_root: Path
+            ) -> bool:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    metadata = node_file.stat()
+                    os.utime(
+                        node_file,
+                        ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000),
+                    )
+                return original_reference_check(
+                    snapshot, build_root=build_root, proc_root=proc_root
+                )
+
+            with patch.object(
+                platform_build_node_cache,
+                "_process_references",
+                side_effect=mutate_after_reference_scan,
+            ):
+                with self.assertRaisesRegex(
+                    platform_build_node_cache.BuildNodeCacheError,
+                    "changed during preflight",
+                ):
+                    platform_build_node_cache._evict_cache(
+                        build_root,
+                        proc_root,
+                        write_intent=no_op_receipts()[0],
+                        write_completion=no_op_receipts()[1],
+                    )
+            self.assertTrue(cache.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            build_root, cache, _node_file = make_pinned_cache(fixture_root)
+            proc_root = fixture_root / "proc-empty"
+            proc_root.mkdir()
+            completion_calls: list[dict[str, object]] = []
+
+            def fail_intent(_record: object) -> None:
+                raise OSError("synthetic receipt failure")
+
+            def forbidden_completion(record: object) -> None:
+                assert isinstance(record, dict)
+                completion_calls.append(record)
+
+            with self.assertRaisesRegex(
+                platform_build_node_cache.BuildNodeCacheError, "intent was not durable"
+            ):
+                platform_build_node_cache._evict_cache(
+                    build_root,
+                    proc_root,
+                    write_intent=fail_intent,
+                    write_completion=forbidden_completion,
+                )
+            self.assertTrue(cache.exists())
+            self.assertEqual(completion_calls, [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            build_root, cache, _node_file = make_pinned_cache(fixture_root)
+            proc_root = fixture_root / "proc-empty"
+            proc_root.mkdir()
+            intents: list[dict[str, object]] = []
+
+            def accept_intent(record: object) -> None:
+                assert isinstance(record, dict)
+                intents.append(record)
+
+            def fail_completion(_record: object) -> None:
+                raise OSError("synthetic completion failure")
+
+            with self.assertRaisesRegex(
+                platform_build_node_cache.BuildNodeCacheError,
+                "removed but completion receipt failed",
+            ):
+                platform_build_node_cache._evict_cache(
+                    build_root,
+                    proc_root,
+                    write_intent=accept_intent,
+                    write_completion=fail_completion,
+                )
+            self.assertFalse(cache.exists())
+            self.assertEqual(intents[0]["status"], "intent")
 
     def test_clean_git_archive_preserves_runtime_helper_paths_and_bytes(self) -> None:
         helper_names = (
