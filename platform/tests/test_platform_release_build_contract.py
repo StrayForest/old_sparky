@@ -4124,6 +4124,46 @@ fail 'private lock detail must not cross the public channel'
         self.assertIn("platform_release_phase_telemetry.py", workflow)
         self.assertIn('PLATFORM_RELEASE_PHASE_LOG=\"$marker_log\"', workflow)
         real = workflow_job(workflow, "release-runtime-real")
+        self.assertIn("name: Trusted dev immutable release runtime", real)
+        self.assertIn("github.event_name == 'push'", real)
+        self.assertIn("github.event_name == 'workflow_dispatch'", real)
+        self.assertIn("github.ref == 'refs/heads/dev'", real)
+        self.assertIn("github.event.pull_request.base.ref == 'dev'", real)
+        self.assertIn(
+            "github.event.pull_request.base.repo.full_name == github.repository",
+            real,
+        )
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            real,
+        )
+        self.assertIn("github.event.pull_request.base.sha", real)
+        self.assertIn("github.event.pull_request.head.sha", real)
+        self.assertIn("parents != [target, base_sha, head_sha]", real)
+        self.assertLess(
+            real.index("Bind same-repository PR merge tree before runtime build"),
+            real.index("Run canonical immutable release builder on trusted dev"),
+        )
+        self.assertIn("permissions:\n      contents: read", real)
+        self.assertNotIn("environment:", real)
+        self.assertNotIn("secrets.", real)
+        finalizer = workflow_job(workflow, "status-final")
+        self.assertIn("same_repository_dev_pr", finalizer)
+        self.assertIn('event_name == "push"', finalizer)
+        self.assertIn('event_name == "workflow_dispatch"', finalizer)
+        self.assertIn('os.environ.get("WORKFLOW_REF") == "refs/heads/dev"', finalizer)
+        self.assertIn('os.environ.get("PR_BASE_REF") == "dev"', finalizer)
+        self.assertIn(
+            'requires_release_runtime = baseline_mode or runtime_sensitive or '
+            'raw_fallback == "true"',
+            finalizer,
+        )
+        self.assertIn("or raw_fallback == \"true\"", finalizer)
+        self.assertIn(
+            "requires_real_release_runtime = requires_release_runtime and trusted_real_event",
+            finalizer,
+        )
+        self.assertIn('real_runtime_result != "success"', finalizer)
         self.assertIn("builder_started=0", real)
         self.assertIn("local builder_run_ready=0", real)
         self.assertIn(
@@ -4142,7 +4182,30 @@ fail 'private lock detail must not cross the public channel'
         self.assertNotIn("tee", real)
         self.assertNotIn('cat "$build_log"', real)
         self.assertNotIn("BASH_COMMAND", real)
-        self.assertNotIn("actions/upload-artifact@", real)
+        self.assertIn("platform_release_artifact_size_projection.py", real)
+        self.assertIn('--repository "$GITHUB_REPOSITORY"', real)
+        size_projection_helper = (
+            REPO_ROOT / "platform/tools/platform_release_artifact_size_projection.py"
+        ).read_text()
+        self.assertIn("--extract-bootstrap-to", size_projection_helper)
+        self.assertIn('public_projection_dir_id="$(stat -c \'%d:%i\' -- "$public_projection_dir" 2>/dev/null)"', real)
+        self.assertIn('"$output_dir_id" == "$public_projection_dir_id"', real)
+        self.assertIn('"${runner_uid}:${runner_gid}:700:2:directory"', real)
+        self.assertIn("Upload evidence-only release size projection", real)
+        self.assertIn("path: ${{ steps.real-runtime-build.outputs.projection_path }}", real)
+        self.assertIn("if: ${{ success() }}", real)
+        self.assertIn("retention-days: 14", real)
+        upload_start = real.index("- name: Upload evidence-only release size projection")
+        upload_end = real.index("- name: Remove exact release size projection temporary directory", upload_start)
+        upload_step = real[upload_start:upload_end]
+        self.assertNotIn("release_archive", upload_step)
+        self.assertNotIn("canonical-builder.log", upload_step)
+        self.assertIn("if: ${{ always() }}", real[upload_end:])
+        public_cleanup = real[upload_end:]
+        self.assertIn('PROJECTION_DIR_ID: ${{ steps.real-runtime-build.outputs.projection_dir_id }}', public_cleanup)
+        self.assertIn('"$(stat -c \'%d:%i\' -- "$projection_dir")" == "$PROJECTION_DIR_ID"', public_cleanup)
+        self.assertIn('"$(stat -c \'%u:%g:%a:%h:%F\' -- "$projection_dir")" == "$(id -u):$(id -g):700:2:directory"', public_cleanup)
+        self.assertLess(public_cleanup.index('"$PROJECTION_DIR_ID"'), public_cleanup.index('rm -- "$projection_file"'))
         self.assertLess(
             real.index("diagnostic_parser"),
             real.index('/bin/rm -rf -- "$release_root"'),
@@ -4283,6 +4346,10 @@ marker_log=""
 canonical_builder_rc=""
 builder_started=0
 diagnostic_parser=/no/such/parser
+size_projection_path=""
+public_projection_dir=""
+public_projection_path=""
+projection_ready=0
 {cleanup_script}
 free_bytes() {{ printf '9999999999\\n'; }}
 set +e

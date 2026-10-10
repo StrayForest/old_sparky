@@ -3648,6 +3648,73 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 "baseline_guard_result": "skipped",
             }
             candidate._validate_summary(run_proof_summary, context)
+            # The trusted same-repository/dev PR route may run the immutable
+            # builder for runtime-sensitive or conservative-fallback changes.
+            # Its success must be bound by both the closed summary and the
+            # exact workflow-job row; legacy non-sensitive PRs retain the
+            # skipped shape above.
+            real_runtime_summary = {
+                **run_proof_summary,
+                "fallback": False,
+                "runtime_sensitive": True,
+                "requires_release_runtime": True,
+                "requires_real_release_runtime": True,
+                "conditional_gate_results": {
+                    "release-runtime": "success",
+                    "release-runtime-real": "success",
+                },
+            }
+            candidate._validate_summary(real_runtime_summary, context)
+            real_runtime_jobs = [
+                {
+                    **job,
+                    "conclusion": (
+                        "success"
+                        if job["name"] in {
+                            "Conditional release runtime fixture",
+                            "Trusted dev immutable release runtime",
+                        }
+                        else job["conclusion"]
+                    ),
+                }
+                for job in jobs
+            ]
+            path.write_text(
+                json.dumps({"total_count": len(real_runtime_jobs), "jobs": real_runtime_jobs}),
+                encoding="utf-8",
+            )
+            candidate.verify_jobs(path, context, real_runtime_summary)
+            for label, changed_summary, changed_jobs in (
+                (
+                    "runtime-required-but-skipped",
+                    {**real_runtime_summary, "requires_real_release_runtime": False},
+                    real_runtime_jobs,
+                ),
+                (
+                    "runtime-job-summary-mismatch",
+                    real_runtime_summary,
+                    [
+                        {**job, "conclusion": "skipped"}
+                        if job["name"] == "Trusted dev immutable release runtime"
+                        else job
+                        for job in real_runtime_jobs
+                    ],
+                ),
+            ):
+                with self.subTest(real_runtime=label):
+                    if label == "runtime-job-summary-mismatch":
+                        # This summary is intentionally unchanged and valid;
+                        # only the exact-attempt job row below is inconsistent.
+                        candidate._validate_summary(changed_summary, context)
+                    else:
+                        with self.assertRaises(candidate.CandidateError):
+                            candidate._validate_summary(changed_summary, context)
+                    path.write_text(
+                        json.dumps({"total_count": len(changed_jobs), "jobs": changed_jobs}),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.verify_jobs(path, context, changed_summary)
             for label, changed in (
                 ("arbitrary-tested-sha", {**summary, "tested_sha": "9" * 40}),
                 ("source-as-tested-sha", {**summary, "tested_sha": context.original_source_head_sha}),

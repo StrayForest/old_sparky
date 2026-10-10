@@ -1556,8 +1556,22 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         issues.append("release-runtime-real must have contents: read permissions")
     for marker, message in (
         ("github.event_name == 'push'", "push route condition"),
-        ("github.event_name == 'workflow_dispatch'", "manual route condition"),
+        (
+            "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&",
+            "manual route condition",
+        ),
         ("github.ref == 'refs/heads/dev'", "canonical dev ref condition"),
+        ("github.event_name == 'pull_request'", "same-repository dev PR route condition"),
+        ("github.event.pull_request.base.ref == 'dev'", "same-repository dev PR base ref"),
+        (
+            "github.event.pull_request.base.repo.full_name == github.repository",
+            "same-repository dev PR base repository",
+        ),
+        (
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            "same-repository dev PR head repository",
+        ),
+        ("parents != [target, base_sha, head_sha]", "same-repository dev PR merge-parent binding"),
         ("needs.classifier.outputs.runtime_sensitive == 'true'", "runtime-sensitive condition"),
         ("needs.classifier.outputs.fallback == 'true'", "fallback condition"),
     ):
@@ -1633,7 +1647,22 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         issues.append("canonical release builder must emit machine-readable phases")
     if "secrets." in real or "PROD_SSH_" in real or "SSH_PRIVATE_KEY" in real:
         issues.append("release-runtime-real must not receive production credentials")
-    if "actions/upload-artifact@" in real or "actions/attest-build-provenance@" in real:
+    projection_upload = (
+        "      - name: Upload evidence-only release size projection\n"
+        "        if: ${{ success() }}\n"
+        "        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0\n"
+        "        with:\n"
+        "          name: platform-release-size-${{ github.run_id }}-${{ github.run_attempt }}\n"
+        "          path: ${{ steps.real-runtime-build.outputs.projection_path }}\n"
+        "          if-no-files-found: error\n"
+        "          retention-days: 14\n"
+    )
+    upload_steps = tuple(
+        step.rstrip("\n")
+        for step in _workflow_step_blocks(real)
+        if "actions/upload-artifact@" in step
+    )
+    if upload_steps != (projection_upload.rstrip("\n"),) or "actions/attest-build-provenance@" in real:
         issues.append("release-runtime-real must not publish or attest an artifact")
     if "GITHUB_WORKSPACE/platform/dist/releases" in real or "/root/old_sparky" in real:
         issues.append("release-runtime-real must use task-owned output, not production paths")
