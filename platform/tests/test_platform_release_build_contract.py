@@ -5020,15 +5020,17 @@ cleanup
         self.assertIn("observer_deadline=$(( $(date +%s) + 10800 ))", supervisor)
         self.assertIn("ControlMaster auto", workflow)
         self.assertIn("ControlPersist 15m", workflow)
-        self.assertIn(
+        self.assertIn("'  ControlMaster no'", workflow)
+        self.assertIn("'  ControlPersist no'", workflow)
+        self.assertIn("'  ControlPath none'", workflow)
+        self.assertNotIn(
             'control_path="/tmp/old-sparky-external-load-ssh-setup-$GITHUB_RUN_ID"',
             workflow,
         )
-        self.assertIn(
+        self.assertNotIn(
             'control_path="/tmp/old-sparky-external-load-ssh-finalize-$GITHUB_RUN_ID"',
             workflow,
         )
-        self.assertIn("ControlPath %s", workflow)
         self.assertIn("Remove fixture-setup SSH material", workflow)
         self.assertIn("Remove finalizer SSH material", workflow)
         self.assertIn("platform_workflow_remote_dispatch.py", workflow)

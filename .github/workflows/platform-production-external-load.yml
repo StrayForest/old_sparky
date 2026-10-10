@@ -623,7 +623,6 @@ jobs:
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/production-external-load-ssh-setup"
-          control_path="/tmp/old-sparky-external-load-ssh-setup-$GITHUB_RUN_ID"
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
@@ -643,9 +642,9 @@ jobs:
             printf '%s\n' 'Host *'
             printf '%s\n' '  StrictHostKeyChecking yes'
             printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
-            printf '%s\n' '  ControlMaster auto'
-            printf '%s\n' '  ControlPersist 15m'
-            printf '  ControlPath %s\n' "$control_path"
+            printf '%s\n' '  ControlMaster no'
+            printf '%s\n' '  ControlPersist no'
+            printf '%s\n' '  ControlPath none'
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
           printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
@@ -748,7 +747,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           ssh_dir="$RUNNER_TEMP/production-external-load-ssh-setup"
-          control_path="/tmp/old-sparky-external-load-ssh-setup-$GITHUB_RUN_ID"
           handoff="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
 
           if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
@@ -759,22 +757,15 @@ jobs:
               "$ssh_dir/known_hosts.scan" \
               "$ssh_dir/known_hosts.scan.1" \
               "$ssh_dir/known_hosts.scan.2" \
-              "$ssh_dir/config" \
-              "$ssh_dir/control.sock" \
-              "$ssh_dir/control-master" \
-              "$ssh_dir/control-master.sock"
+              "$ssh_dir/config"
             test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
             test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
             test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
             test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
-            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
-            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
-            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
             rmdir -- "$ssh_dir"
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
-          rm -f -- "$control_path" "$handoff"
-          test ! -e "$control_path" && test ! -L "$control_path"
+          rm -f -- "$handoff"
           test ! -e "$handoff" && test ! -L "$handoff"
           printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
           unset SSH_DIR
@@ -1866,7 +1857,6 @@ jobs:
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/production-external-load-ssh-finalize"
-          control_path="/tmp/old-sparky-external-load-ssh-finalize-$GITHUB_RUN_ID"
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"; chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"; rm -f -- "$ssh_scan"; ssh_scan_ok=0
@@ -1881,7 +1871,7 @@ jobs:
           done
           test "$ssh_scan_ok" = 1 || { echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2; exit 1; }
           install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
-          { printf '%s\n' 'Host *' '  StrictHostKeyChecking yes'; printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"; printf '%s\n' '  ControlMaster auto' '  ControlPersist 15m'; printf '  ControlPath %s\n' "$control_path"; } > "$ssh_dir/config"
+          { printf '%s\n' 'Host *' '  StrictHostKeyChecking yes'; printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"; printf '%s\n' '  ControlMaster no' '  ControlPersist no' '  ControlPath none'; } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"; printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Signal fixture completion and collect origin evidence
@@ -2141,7 +2131,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           ssh_dir="$RUNNER_TEMP/production-external-load-ssh-finalize"
-          control_path="/tmp/old-sparky-external-load-ssh-finalize-$GITHUB_RUN_ID"
           input_path="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
           cleanup_input_path="$RUNNER_TEMP/external-input/platform-production-external-load-cleanup.json"
           control_email_path="$RUNNER_TEMP/platform-production-control-email"
@@ -2154,22 +2143,15 @@ jobs:
               "$ssh_dir/known_hosts.scan" \
               "$ssh_dir/known_hosts.scan.1" \
               "$ssh_dir/known_hosts.scan.2" \
-              "$ssh_dir/config" \
-              "$ssh_dir/control.sock" \
-              "$ssh_dir/control-master" \
-              "$ssh_dir/control-master.sock"
+              "$ssh_dir/config"
             test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
             test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
             test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
             test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
-            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
-            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
-            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
             rmdir -- "$ssh_dir"
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
-          rm -f -- "$control_path" "$input_path" "$cleanup_input_path" "$control_email_path"
-          test ! -e "$control_path" && test ! -L "$control_path"
+          rm -f -- "$input_path" "$cleanup_input_path" "$control_email_path"
           test ! -e "$input_path" && test ! -L "$input_path"
           test ! -e "$cleanup_input_path" && test ! -L "$cleanup_input_path"
           test ! -e "$control_email_path" && test ! -L "$control_email_path"
